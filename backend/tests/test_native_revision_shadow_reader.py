@@ -11,7 +11,7 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -31,8 +31,10 @@ from app.services.legacy_revision_bridge import (
     LegacyInventoryDocument,
     LegacyLineageEntry,
     LegacyRevisionBridge,
+    LogicalLineageProjectionError,
     SelectorResolution,
     SelectorUnknownError,
+    project_logical_lineage,
 )
 from app.services.native_revision_shadow import (
     NativeRevisionShadowComparator,
@@ -1194,13 +1196,158 @@ async def test_legacy_reader_rejects_malformed_added_genesis_patch():
         )
 
 
-async def test_legacy_reader_matches_inventory_after_subsecond_lineage_boundary():
+async def test_legacy_reader_projects_final_delta_with_same_creation_anchor_as_inventory():
     document = _document()
     created_at = document.created_at.replace(microsecond=487_280)
-    current_at = created_at.replace(microsecond=0) + timedelta(seconds=1)
+    anchor_at = created_at.replace(microsecond=0)
+    equal_at = created_at.astimezone(timezone(timedelta(hours=9)))
+    current_at = created_at.replace(microsecond=0) + timedelta(seconds=2)
+    anchor_oid = _oid("b")
+    update_oid = _oid("c")
     document = replace(
         document,
         created_at=created_at,
+        lineage=(
+            LegacyLineageEntry(anchor_oid, "notes/original.md", anchor_at),
+            LegacyLineageEntry(update_oid, "notes/original.md", equal_at),
+            LegacyLineageEntry(
+                document.current_commit,
+                document.current_path,
+                current_at,
+            ),
+        ),
+        activity=replace(document.activity, committed_at=current_at),
+    )
+    git = _NoWriteGit(document)
+    raw = git.manual_fixed_ref_history(
+        "p2-manual",
+        _oid("f"),
+        document.current_path,
+        current_commit=document.current_commit,
+    )
+    raw["history"][0]["path_at_revision"] = "notes/stale-current-path.md"
+    raw["history"].insert(2, dict(raw["history"][1]))
+    raw["history"].append(
+        {
+            "legacy_git_oid": _oid("d"),
+            "path_at_revision": "notes/pre-document.md",
+            "committed_at": anchor_at - timedelta(seconds=1),
+        }
+    )
+    git.snapshot_override = raw
+
+    history = await LegacyFixedRefShadowReader(
+        git=git,
+        vault_name="p2-manual",
+    ).history(
+        document,
+        selector=document.current_commit,
+        fixed_ref=_oid("f"),
+    )
+
+    assert [entry["selector"] for entry in history["entries"]] == [
+        document.current_commit,
+        update_oid,
+        anchor_oid,
+    ]
+
+
+async def test_unanchored_projection_excludes_an_older_path_lifecycle():
+    created_at = datetime(2026, 8, 11, 12, 0, 0, 500_000, tzinfo=UTC)
+    create_oid = _oid("b")
+    current_oid = _oid("c")
+    prior_lifecycle_oid = _oid("a")
+
+    lineage = project_logical_lineage(
+        (
+            {
+                "legacy_git_oid": current_oid,
+                "path_at_revision": "notes/current.md",
+                "committed_at": created_at + timedelta(seconds=1),
+            },
+            {
+                "legacy_git_oid": create_oid,
+                "path_at_revision": "notes/current.md",
+                "committed_at": created_at,
+            },
+            {
+                "legacy_git_oid": prior_lifecycle_oid,
+                "path_at_revision": "notes/current.md",
+                "committed_at": created_at - timedelta(microseconds=1),
+            },
+        ),
+        current_commit=current_oid,
+        current_path="notes/current.md",
+        created_at=created_at,
+    )
+
+    assert [entry.legacy_git_oid for entry in lineage] == [create_oid, current_oid]
+
+
+async def test_unanchored_projection_keeps_precreation_current_as_only_revision():
+    created_at = datetime(2026, 8, 11, 12, 0, 0, 500_000, tzinfo=UTC)
+    current_oid = _oid("c")
+
+    lineage = project_logical_lineage(
+        (
+            {
+                "legacy_git_oid": current_oid,
+                "path_at_revision": "notes/current.md",
+                "committed_at": created_at - timedelta(microseconds=1),
+            },
+            {
+                "legacy_git_oid": _oid("a"),
+                "path_at_revision": "notes/prior.md",
+                "committed_at": created_at - timedelta(seconds=1),
+            },
+        ),
+        current_commit=current_oid,
+        current_path="notes/current.md",
+        created_at=created_at,
+    )
+
+    assert [entry.legacy_git_oid for entry in lineage] == [current_oid]
+
+
+async def test_anchored_projection_fails_closed_when_anchor_is_absent_or_duplicated():
+    created_at = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
+    current_oid = _oid("c")
+    anchor_oid = _oid("b")
+    current = {
+        "legacy_git_oid": current_oid,
+        "path_at_revision": "notes/current.md",
+        "committed_at": created_at,
+    }
+
+    with pytest.raises(LogicalLineageProjectionError, match="anchor is absent"):
+        project_logical_lineage(
+            (current,),
+            current_commit=current_oid,
+            current_path="notes/current.md",
+            created_at=created_at,
+            oldest_anchor_oid=anchor_oid,
+        )
+
+    anchor = {
+        "legacy_git_oid": anchor_oid,
+        "path_at_revision": "notes/current.md",
+        "committed_at": created_at - timedelta(microseconds=1),
+    }
+    with pytest.raises(LogicalLineageProjectionError, match="duplicate oldest anchor"):
+        project_logical_lineage(
+            (current, anchor, dict(anchor)),
+            current_commit=current_oid,
+            current_path="notes/current.md",
+            created_at=created_at,
+            oldest_anchor_oid=anchor_oid,
+        )
+
+
+async def test_legacy_reader_treats_precreation_current_as_sole_anchor():
+    document = _document()
+    current_at = document.created_at - timedelta(microseconds=1)
+    document = replace(
+        document,
         lineage=(
             LegacyLineageEntry(
                 document.current_commit,
@@ -1219,11 +1366,9 @@ async def test_legacy_reader_matches_inventory_after_subsecond_lineage_boundary(
     )
     raw["history"].append(
         {
-            "legacy_git_oid": _oid("b"),
-            "path_at_revision": document.current_path,
-            # Git's second-resolution --since boundary can include this row,
-            # while the C9 inventory excludes it against precise created_at.
-            "committed_at": created_at.replace(microsecond=0),
+            "legacy_git_oid": _oid("0"),
+            "path_at_revision": "notes/pre-document.md",
+            "committed_at": current_at - timedelta(seconds=1),
         }
     )
     git.snapshot_override = raw
@@ -1238,7 +1383,7 @@ async def test_legacy_reader_matches_inventory_after_subsecond_lineage_boundary(
     )
 
     assert [entry["selector"] for entry in history["entries"]] == [
-        document.current_commit
+        document.current_commit,
     ]
 
 

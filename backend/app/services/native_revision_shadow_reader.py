@@ -26,6 +26,8 @@ from app.services.document_service import _parse_markdown
 from app.services.git_service import FixedRefHistoryError, GitService
 from app.services.legacy_revision_bridge import (
     LegacyInventoryDocument,
+    LogicalLineageProjectionError,
+    project_logical_lineage,
 )
 from app.services.native_revision_service import NativeRevisionService
 from app.services.uri_service import doc_uri
@@ -359,33 +361,20 @@ class LegacyFixedRefShadowReader:
         expected_history = [
             (entry.legacy_git_oid, entry.path_at_revision, entry.committed_at) for entry in reversed(document.lineage)
         ]
-        observed_history = []
-        seen: set[str] = set()
-        for entry in snapshot.history:
-            oid = entry.get("legacy_git_oid")
-            committed_at = entry.get("committed_at")
-            if (
-                not isinstance(oid, str)
-                or _OID_RE.fullmatch(oid) is None
-                or not isinstance(committed_at, datetime)
-            ):
-                raise ShadowReaderScopeError("legacy fixed-ref history is invalid")
-            if oid in seen:
-                continue
-            if oid != document.current_commit and committed_at < document.created_at:
-                continue
-            seen.add(oid)
-            observed_history.append(
-                (
-                    oid,
-                    (
-                        document.current_path
-                        if oid == document.current_commit
-                        else entry.get("path_at_revision")
-                    ),
-                    committed_at,
-                )
+        try:
+            projected = project_logical_lineage(
+                snapshot.history,
+                current_commit=document.current_commit,
+                current_path=document.current_path,
+                created_at=document.created_at,
+                oldest_anchor_oid=document.lineage[0].legacy_git_oid,
             )
+        except LogicalLineageProjectionError as exc:
+            raise ShadowReaderScopeError("legacy fixed-ref history is invalid") from exc
+        observed_history = [
+            (entry.legacy_git_oid, entry.path_at_revision, entry.committed_at)
+            for entry in reversed(projected)
+        ]
         if observed_history != expected_history:
             raise ShadowReaderScopeError("legacy fixed-ref history differs from C9 inventory")
 

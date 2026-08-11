@@ -309,6 +309,11 @@ async def test_inventory_is_fixed_ref_bounded_and_manual_only(tmp_path):
             assert body == b"new v2\n"
             assert doc.byte_size == len(body)
         assert doc.lineage[-1].legacy_git_oid == fixture["current_oid"]
+        assert [entry.legacy_git_oid for entry in doc.lineage] == [
+            fixture["initial_oid"],
+            fixture["move_oid"],
+            fixture["current_oid"],
+        ]
         assert [entry.path_at_revision for entry in doc.lineage] == [
             "same.md", "renamed.md", "renamed.md",
         ]
@@ -394,6 +399,54 @@ async def test_inventory_is_fixed_ref_bounded_and_manual_only(tmp_path):
                 "SELECT count(*) FROM native_resources WHERE namespace_id = $1",
                 fixture["namespace_id"],
             ) == 0
+
+
+async def test_inventory_rejects_duplicate_completed_ordinal_zero_anchor(tmp_path):
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _make_fixture(pool, tmp_path)
+        bridge = LegacyRevisionBridge(pool, git=fixture["git"])
+        backfill = NativeRevisionBackfill(pool, git=fixture["git"], bridge=bridge)
+        run, _ = await backfill.prepare_run(
+            namespace_id=fixture["namespace_id"],
+            fixed_ref=fixture["unrelated_tip"],
+            coverage_version="c9-anchor-duplicate-base",
+        )
+        assert (await backfill.backfill_run(run.run_id)).status == "complete"
+
+        duplicate_run_id = uuid.uuid4()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO native_revision_migration_runs
+                    (run_id, namespace_id, fixed_git_oid, coverage_version,
+                     inventory_digest, status, started_at, completed_at)
+                VALUES ($1, $2, $3, 'c9-anchor-duplicate-corruption',
+                        $4, 'complete', NOW(), NOW())
+                """,
+                duplicate_run_id,
+                fixture["namespace_id"],
+                "e" * 40,
+                "d" * 64,
+            )
+            await conn.execute(
+                """
+                INSERT INTO legacy_revision_mappings
+                    (namespace_id, resource_id, legacy_git_oid, path_at_revision,
+                     resolution, native_revision_id, run_id, lineage_ordinal)
+                VALUES ($1, $2, $3, 'corrupt-prior.md', 'bridge', NULL, $4, 0)
+                """,
+                fixture["namespace_id"],
+                fixture["document_one"],
+                "a" * 40,
+                duplicate_run_id,
+            )
+
+        with pytest.raises(InventoryEligibilityError, match="duplicate ordinal-zero"):
+            await bridge.capture_inventory(
+                namespace_id=fixture["namespace_id"],
+                fixed_ref=fixture["unrelated_tip"],
+                coverage_version="c9-anchor-duplicate-check",
+            )
 
 
 async def test_backfill_inventory_is_metadata_only_and_materializes_one_body_at_a_time(

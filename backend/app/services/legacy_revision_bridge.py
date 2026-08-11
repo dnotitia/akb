@@ -7,7 +7,7 @@ import hashlib
 import json
 import re
 import uuid
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -64,6 +64,10 @@ class SelectorAmbiguousError(ConflictError):
     def __init__(self, selector: str):
         super().__init__(f"legacy revision selector is ambiguous: {selector}")
         self.code = "legacy_revision_selector_ambiguous"
+
+
+class LogicalLineageProjectionError(ValueError):
+    """Raw fixed-ref history cannot form one logical Document lineage."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +158,77 @@ def _require_oid(value: str, field: str) -> None:
 
 def _iso(value: datetime) -> str:
     return value.astimezone(UTC).isoformat()
+
+
+def project_logical_lineage(
+    history: Iterable[Mapping[str, object]],
+    *,
+    current_commit: str,
+    current_path: str,
+    created_at: datetime,
+    oldest_anchor_oid: str | None = None,
+) -> tuple[LegacyLineageEntry, ...]:
+    """Project newest-first Git rows onto one oldest-first Document lineage."""
+
+    if created_at.tzinfo is None or created_at.utcoffset() is None:
+        raise LogicalLineageProjectionError("created_at must be timezone-aware")
+    if oldest_anchor_oid is not None and _OID_RE.fullmatch(oldest_anchor_oid) is None:
+        raise LogicalLineageProjectionError("oldest anchor must be a full Git OID")
+    created_at_utc = created_at.astimezone(UTC)
+    newest: list[LegacyLineageEntry] = []
+    seen: set[str] = set()
+    anchor_found = False
+    for entry in history:
+        if not isinstance(entry, Mapping):
+            raise LogicalLineageProjectionError("history entry must be a mapping")
+        oid = entry.get("legacy_git_oid")
+        if not isinstance(oid, str) or _OID_RE.fullmatch(oid) is None:
+            raise LogicalLineageProjectionError("history contains an invalid OID")
+        if anchor_found:
+            if oid == oldest_anchor_oid:
+                raise LogicalLineageProjectionError(
+                    "history contains a duplicate oldest anchor"
+                )
+            continue
+        committed_at = entry.get("committed_at")
+        if (
+            not isinstance(committed_at, datetime)
+            or committed_at.tzinfo is None
+            or committed_at.utcoffset() is None
+        ):
+            raise LogicalLineageProjectionError(
+                "history contains an invalid commit timestamp"
+            )
+        path = current_path if oid == current_commit else entry.get("path_at_revision")
+        if not isinstance(path, str) or not path.strip():
+            raise LogicalLineageProjectionError("history contains an invalid path")
+        if oid in seen:
+            if oid == oldest_anchor_oid:
+                raise LogicalLineageProjectionError(
+                    "history contains a duplicate oldest anchor"
+                )
+            continue
+        seen.add(oid)
+        if (
+            oldest_anchor_oid is None
+            and oid != current_commit
+            and committed_at.astimezone(UTC) < created_at_utc
+        ):
+            continue
+        newest.append(
+            LegacyLineageEntry(
+                legacy_git_oid=oid,
+                path_at_revision=path,
+                committed_at=committed_at,
+            )
+        )
+        if oid == oldest_anchor_oid:
+            anchor_found = True
+    if oldest_anchor_oid is not None and not anchor_found:
+        raise LogicalLineageProjectionError(
+            "completed oldest anchor is absent from fixed-ref history"
+        )
+    return tuple(reversed(newest))
 
 
 class LegacyRevisionBridge:
@@ -313,6 +388,20 @@ class LegacyRevisionBridge:
                 # vault-level external-Git marker above remains a hard reject.
                 rows = [row for row in rows if row.get("source") == "manual"]
 
+                completed_anchor_rows = (
+                    await self.repository.list_completed_lineage_anchors(
+                        namespace_id=namespace_id,
+                        conn=conn,
+                    )
+                )
+                completed_anchors: dict[uuid.UUID, str] = {}
+                for anchor in completed_anchor_rows:
+                    if anchor.resource_id in completed_anchors:
+                        raise InventoryEligibilityError(
+                            "completed lineage has duplicate ordinal-zero anchors"
+                        )
+                    completed_anchors[anchor.resource_id] = anchor.legacy_git_oid
+
                 documents: list[LegacyInventoryDocument] = []
                 for row in rows:
                     aliases: list[LegacyInventoryAlias] = []
@@ -409,35 +498,23 @@ class LegacyRevisionBridge:
                             MappingProxyType(dict(change)) for change in changed_paths
                         ),
                     )
-                    newest: list[LegacyLineageEntry] = []
-                    seen: set[str] = set()
-                    for entry in history:
-                        oid = entry["legacy_git_oid"]
-                        if not isinstance(oid, str) or _OID_RE.fullmatch(oid) is None:
-                            raise InventoryEligibilityError(
-                                f"document {row['id']} history contains an invalid OID"
-                            )
-                        if oid in seen:
-                            continue
-                        committed_at = entry["committed_at"]
-                        if oid != current_commit and committed_at < created_at:
-                            continue
-                        seen.add(oid)
-                        newest.append(
-                            LegacyLineageEntry(
-                                legacy_git_oid=oid,
-                                path_at_revision=(
-                                    row["path"] if oid == current_commit
-                                    else entry["path_at_revision"]
-                                ),
-                                committed_at=committed_at,
-                            )
+                    try:
+                        lineage = project_logical_lineage(
+                            history,
+                            current_commit=current_commit,
+                            current_path=row["path"],
+                            created_at=created_at,
+                            oldest_anchor_oid=completed_anchors.get(row["id"]),
                         )
+                    except LogicalLineageProjectionError as exc:
+                        raise InventoryEligibilityError(
+                            f"document {row['id']} history is invalid"
+                        ) from exc
+                    seen = {entry.legacy_git_oid for entry in lineage}
                     if current_commit not in seen:
                         raise InventoryEligibilityError(
                             f"document {row['id']} current_commit is absent from fixed-ref history"
                         )
-                    lineage = tuple(reversed(newest))
                     if not lineage or lineage[-1].legacy_git_oid != current_commit:
                         raise InventoryEligibilityError(
                             f"document {row['id']} lineage does not end at current_commit"

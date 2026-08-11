@@ -683,6 +683,33 @@ class NativeRevisionMigrationRepository:
                 rows = await acquired.fetch(sql, namespace_id, resource_id)
         return [_mapping(row) for row in rows]
 
+    async def list_completed_lineage_anchors(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        conn: asyncpg.Connection | None = None,
+    ) -> list[LegacyRevisionMapping]:
+        """List immutable ordinal-zero anchors with one bulk namespace read."""
+
+        sql = """
+            SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
+                   m.path_at_revision, m.resolution, m.native_revision_id,
+                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+              FROM legacy_revision_mappings m
+              JOIN native_revision_migration_runs r
+                ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
+             WHERE m.namespace_id = $1
+               AND m.lineage_ordinal = 0
+               AND r.status = 'complete'
+             ORDER BY m.resource_id, m.legacy_git_oid
+        """
+        if conn is not None:
+            rows = await conn.fetch(sql, namespace_id)
+        else:
+            async with self.pool.acquire() as acquired:
+                rows = await acquired.fetch(sql, namespace_id)
+        return [_mapping(row) for row in rows]
+
     async def list_resource_mappings_for_reconcile(
         self,
         *,
