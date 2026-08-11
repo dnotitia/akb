@@ -138,6 +138,48 @@ def test_read_tool_invoked_as_a_write_is_still_audited(audit_dir, monkeypatch):
     )
 
 
+def test_grep_replace_audit_records_commit_recovery_receipts(audit_dir):
+    class _U:
+        username, user_id = "bob", "u2"
+
+    audit_log.record_tool(
+        "akb_grep",
+        {"vault": "v", "pattern": "x", "replace": "y", "max_replacements": 2},
+        _U(),
+        {
+            "total_docs": 2,
+            "replaced_docs": 1,
+            "unchanged_docs": 0,
+            "max_replacements": 2,
+            "replacement_complete": False,
+            "replacements": [
+                {
+                    "uri": "akb://v/doc/a.md",
+                    "commit": "new-commit",
+                    "previous_commit": "parent-commit",
+                }
+            ],
+            "error": "write stopped",
+            "code": "write_busy",
+        },
+        is_write=True,
+    )
+
+    rows = [
+        json.loads(line)
+        for line in _read_lines(audit_dir / f"akb-audit-{_today()}.jsonl")
+    ]
+    assert [row["action"] for row in rows] == ["akb_grep.replace", "akb_grep"]
+    assert rows[0]["target"] == "uri=akb://v/doc/a.md"
+    assert rows[0]["meta"] == {
+        "commit": "new-commit",
+        "previous_commit": "parent-commit",
+    }
+    assert rows[1]["outcome"] == "error"
+    assert rows[1]["meta"]["replacement_complete"] is False
+    assert rows[1]["meta"]["replaced_docs"] == 1
+
+
 def test_read_only_set_agrees_with_the_mcp_scope_table(tmp_path, monkeypatch):
     """The two classifications must not drift: a tool that needs
     `akb:vault:write` to invoke is by definition state-changing, so it

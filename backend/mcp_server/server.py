@@ -32,6 +32,7 @@ from mcp.types import TextContent
 from app.db.postgres import get_pool, init_db, close_pool
 from app.exceptions import ConflictError, NotFoundError, ValidationError, WriteBusyError
 from app.services.document_service import EditError
+from app.services.grep_replace import DEFAULT_MAX_REPLACEMENTS
 from app.services.revision_backend import get_revision_backend
 from app.services.search_service import SearchService
 from app.services.kg_service import get_resource_relations, get_graph, get_provenance, link_resources, unlink_resources
@@ -765,6 +766,7 @@ async def _handle_grep(args: dict, uid: str, user: _MCPUser) -> dict:
         agent_id=user.username if replace is not None else None,
         user_id=uid,
         limit=args.get("limit", 20),
+        max_replacements=args.get("max_replacements", DEFAULT_MAX_REPLACEMENTS),
         count_only=args.get("count_only", False),
         files_with_matches=args.get("files_with_matches", False),
         measurement_include_text_files=args.get("measurement_include_text_files", False),
