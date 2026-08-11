@@ -19,6 +19,7 @@ import pytest
 from git import Repo
 
 from app.repositories.native_revision_migration_repo import (
+    LegacyRevisionMapping,
     MigrationItem,
     MigrationRun,
 )
@@ -37,6 +38,7 @@ from app.services.native_revision_shadow_reader import (
     ShadowReaderScopeError,
 )
 from app.services.native_revision_backfill import NativeRevisionBackfill
+from app.services.native_revision_reconcile import NativeRevisionReconcile
 
 
 pytestmark = pytest.mark.asyncio
@@ -249,6 +251,29 @@ class _ReadRepository:
         assert run_id == self.run.run_id
         return [self.item]
 
+    async def exact_mapping(
+        self,
+        *,
+        resource_id: uuid.UUID,
+        legacy_git_oid: str,
+    ) -> LegacyRevisionMapping | None:
+        if (
+            resource_id != self.item.legacy_document_id
+            or legacy_git_oid != self.item.legacy_head_oid
+        ):
+            return None
+        return LegacyRevisionMapping(
+            namespace_id=self.run.namespace_id,
+            resource_id=resource_id,
+            legacy_git_oid=legacy_git_oid,
+            path_at_revision=self.item.captured_path,
+            resolution="native",
+            native_revision_id=self.item.native_head_revision_id,
+            run_id=self.run.run_id,
+            lineage_ordinal=1,
+            fixed_git_oid=self.run.fixed_git_oid,
+        )
+
 
 class _InventoryBridge:
     def __init__(self, inventory: LegacyInventory):
@@ -334,21 +359,57 @@ class _WireReader:
 
 class _NoWriteGit:
     def __init__(self, *documents: LegacyInventoryDocument):
+        self.documents = documents
         self.bodies = {
             (document.current_path, document.current_commit): document.body
             for document in documents
         }
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.snapshot_override: dict[str, Any] | None = None
+        self.diff_override: dict[str, Any] | None = None
 
     def manual_fixed_ref_history(self, *args, **kwargs) -> dict[str, Any]:
         self.calls.append(("manual_fixed_ref_history", args))
-        return {
+        document = next(
+            document
+            for document in self.documents
+            if document.current_path == args[2]
+        )
+        result = {
             "fixed_ref": args[1],
             "current_commit": kwargs["current_commit"],
             "body": self.bodies[(args[2], kwargs["current_commit"])],
-            "history": [],
-            "activity": {},
+            "history": [
+                {
+                    "legacy_git_oid": entry.legacy_git_oid,
+                    "path_at_revision": entry.path_at_revision,
+                    "committed_at": entry.committed_at,
+                }
+                for entry in reversed(document.lineage)
+            ],
+            "activity": {
+                "legacy_git_oid": document.activity.legacy_git_oid,
+                "committed_at": document.activity.committed_at,
+                "actor": document.activity.actor,
+                "subject": document.activity.subject,
+                "summary": document.activity.summary,
+                "action": document.activity.action,
+                "path_from": document.activity.path_from,
+                "path_to": document.activity.path_to,
+                "changed_paths": [dict(change) for change in document.activity.changed_paths],
+            },
         }
+        return self.snapshot_override if self.snapshot_override is not None else result
+
+    def file_diff(self, *args) -> dict[str, Any]:
+        self.calls.append(("file_diff", args))
+        result = {
+            "file": args[1],
+            "commit": args[2],
+            "type": "modified",
+            "diff": "@@ -1 +1 @@\n-old body\n+current body",
+        }
+        return self.diff_override if self.diff_override is not None else result
 
 
 @dataclass
@@ -388,7 +449,72 @@ class _NoWriteNative:
             text=body.decode(),
             digest=document.body_digest,
             byte_size=len(body),
+            occurred_at=document.activity.committed_at,
         )
+
+
+class _NoWriteNativeRepository:
+    def __init__(self, *entries: tuple[LegacyInventoryDocument, str]):
+        self.entries = {
+            document.resource_id: (document, native_id)
+            for document, native_id in entries
+        }
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.history_overrides: dict[uuid.UUID, list[dict[str, Any]]] = {}
+        self.revision_overrides: dict[uuid.UUID, dict[str, Any] | None] = {}
+        self.activity_override: dict[str, Any] | None = None
+
+    def _revision(self, resource_id: uuid.UUID) -> dict[str, Any]:
+        document, native_id = self.entries[resource_id]
+        return {
+            "namespace_id": uuid.UUID("22222222-2222-4222-8222-222222222222"),
+            "resource_id": document.resource_id,
+            "revision_id": native_id,
+            "parent_revision_id": None,
+            "surface": "document",
+            "action": "create",
+            "path_at_revision": document.current_path,
+            "path_from": None,
+            "path_to": document.current_path,
+            "message": "C9 fixed-ref native genesis",
+            "subject": None,
+            "summary": None,
+            "actor": "akb-native-revision-migration",
+            "occurred_at": document.activity.committed_at,
+        }
+
+    async def list_history(self, **kwargs) -> list[dict[str, Any]]:
+        self.calls.append(("list_history", kwargs))
+        if kwargs["resource_id"] in self.history_overrides:
+            return self.history_overrides[kwargs["resource_id"]]
+        return [self._revision(kwargs["resource_id"])]
+
+    async def get_revision(self, **kwargs) -> dict[str, Any] | None:
+        self.calls.append(("get_revision", kwargs))
+        if kwargs["resource_id"] in self.revision_overrides:
+            return self.revision_overrides[kwargs["resource_id"]]
+        row = self._revision(kwargs["resource_id"])
+        return row if row["revision_id"] == kwargs["revision_id"] else None
+
+    async def get_activity_for_revision(self, **kwargs) -> dict[str, Any] | None:
+        self.calls.append(("get_activity_for_revision", kwargs))
+        if self.activity_override is not None:
+            return self.activity_override
+        row = self._revision(kwargs["resource_id"])
+        if row["revision_id"] != kwargs["revision_id"]:
+            return None
+        return {
+            "resource_id": row["resource_id"],
+            "revision_id": row["revision_id"],
+            "action": row["action"],
+            "actor": row["actor"],
+            "subject": row["subject"],
+            "summary": row["summary"],
+            "changed_path_from": row["path_from"],
+            "changed_path_to": row["path_to"],
+            "occurred_at": row["occurred_at"],
+            "path_at_revision": row["path_at_revision"],
+        }
 
 
 async def test_product_readers_are_scoped_and_read_only():
@@ -406,29 +532,33 @@ async def test_product_readers_are_scoped_and_read_only():
     await legacy.activity(document, selector=document.current_commit, fixed_ref=fixed_ref)
     assert result["current_commit"] == document.current_commit
     assert result["content"] == "# Migration candidate\n\nsecret body"
-    assert [name for name, _ in git.calls] == ["manual_fixed_ref_history"]
+    assert [name for name, _ in git.calls] == ["manual_fixed_ref_history", "file_diff"]
 
     result["projection"]["revision"] = "caller-mutation"
     result["content"] = "caller-mutation"
     reread = await legacy.get(document, selector=document.current_commit, fixed_ref=fixed_ref)
     assert reread["projection"]["revision"] == document.current_commit
     assert reread["content"] == "# Migration candidate\n\nsecret body"
-    assert len(git.calls) == 1
+    assert len(git.calls) == 2
 
     await legacy.get(second, selector=second.current_commit, fixed_ref=fixed_ref)
     await legacy.history(second, selector=second.current_commit, fixed_ref=fixed_ref)
     await legacy.diff(second, selector=second.current_commit, fixed_ref=fixed_ref)
     await legacy.activity(second, selector=second.current_commit, fixed_ref=fixed_ref)
-    assert len(git.calls) == 2
+    assert len(git.calls) == 4
 
     await legacy.get(document, selector=document.current_commit, fixed_ref=fixed_ref)
-    assert len(git.calls) == 3
+    assert len(git.calls) == 5
 
     with pytest.raises(ShadowReaderScopeError):
         await legacy.get(document, selector=_oid("e"), fixed_ref=fixed_ref)
-    assert len(git.calls) == 3
+    assert len(git.calls) == 5
 
     native_service = _NoWriteNative(
+        (document, native_id),
+        (second, second_native_id),
+    )
+    native_repository = _NoWriteNativeRepository(
         (document, native_id),
         (second, second_native_id),
     )
@@ -437,6 +567,7 @@ async def test_product_readers_are_scoped_and_read_only():
         namespace_id=uuid.UUID("22222222-2222-4222-8222-222222222222"),
         vault_name="p2-manual",
         native_service=native_service,
+        native_repository=native_repository,
     )
     candidate = await native.get(document, selector=native_id, fixed_ref=fixed_ref)
     await native.history(document, selector=native_id, fixed_ref=fixed_ref)
@@ -444,6 +575,12 @@ async def test_product_readers_are_scoped_and_read_only():
     await native.activity(document, selector=native_id, fixed_ref=fixed_ref)
     assert candidate["current_commit"] == native_id
     assert [name for name, _ in native_service.calls] == ["get_resource_revision"]
+    assert [name for name, _ in native_repository.calls] == [
+        "list_history",
+        "get_revision",
+        "get_revision",
+        "get_activity_for_revision",
+    ]
 
     candidate["projection"]["revision"] = "caller-mutation"
     candidate["content"] = "caller-mutation"
@@ -451,15 +588,136 @@ async def test_product_readers_are_scoped_and_read_only():
     assert candidate_reread["projection"]["revision"] == native_id
     assert candidate_reread["content"] == "# Migration candidate\n\nsecret body"
     assert len(native_service.calls) == 1
+    assert len(native_repository.calls) == 4
 
     await native.get(second, selector=second_native_id, fixed_ref=fixed_ref)
     await native.history(second, selector=second_native_id, fixed_ref=fixed_ref)
     await native.diff(second, selector=second_native_id, fixed_ref=fixed_ref)
     await native.activity(second, selector=second_native_id, fixed_ref=fixed_ref)
     assert len(native_service.calls) == 2
+    assert len(native_repository.calls) == 8
 
     await native.get(document, selector=native_id, fixed_ref=fixed_ref)
     assert len(native_service.calls) == 3
+
+
+async def test_legacy_reader_fails_closed_on_missing_or_corrupt_product_facts():
+    document = _document()
+    fixed_ref = _oid("f")
+
+    missing_history_git = _NoWriteGit(document)
+    raw = missing_history_git.manual_fixed_ref_history(
+        "p2-manual",
+        fixed_ref,
+        document.current_path,
+        current_commit=document.current_commit,
+    )
+    missing_history_git.snapshot_override = {**raw, "history": raw["history"][:-1]}
+    with pytest.raises(ShadowReaderScopeError, match="history"):
+        await LegacyFixedRefShadowReader(
+            git=missing_history_git,
+            vault_name="p2-manual",
+        ).history(document, selector=document.current_commit, fixed_ref=fixed_ref)
+
+    corrupt_activity_git = _NoWriteGit(document)
+    raw = corrupt_activity_git.manual_fixed_ref_history(
+        "p2-manual",
+        fixed_ref,
+        document.current_path,
+        current_commit=document.current_commit,
+    )
+    corrupt_activity_git.snapshot_override = {
+        **raw,
+        "activity": {**raw["activity"], "actor": "wrong-actor"},
+    }
+    with pytest.raises(ShadowReaderScopeError, match="activity"):
+        await LegacyFixedRefShadowReader(
+            git=corrupt_activity_git,
+            vault_name="p2-manual",
+        ).activity(document, selector=document.current_commit, fixed_ref=fixed_ref)
+
+    corrupt_diff_git = _NoWriteGit(document)
+    corrupt_diff_git.diff_override = {
+        "file": document.current_path,
+        "commit": _oid("0"),
+        "type": "modified",
+        "diff": "@@ corrupt @@",
+    }
+    with pytest.raises(ShadowReaderScopeError, match="diff"):
+        await LegacyFixedRefShadowReader(
+            git=corrupt_diff_git,
+            vault_name="p2-manual",
+        ).diff(document, selector=document.current_commit, fixed_ref=fixed_ref)
+
+
+async def test_native_reader_fails_closed_on_missing_corrupt_or_reordered_product_facts():
+    document = _document()
+    native_id = _oid("c")
+    fixed_ref = _oid("f")
+    namespace_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+    service = _NoWriteNative((document, native_id))
+
+    missing_history = _NoWriteNativeRepository((document, native_id))
+    missing_history.history_overrides[document.resource_id] = []
+    with pytest.raises(ShadowReaderScopeError, match="history"):
+        await NativeRevisionShadowReader(
+            pool=None,
+            namespace_id=namespace_id,
+            vault_name="p2-manual",
+            native_service=service,
+            native_repository=missing_history,
+        ).history(document, selector=native_id, fixed_ref=fixed_ref)
+
+    reordered_history = _NoWriteNativeRepository((document, native_id))
+    current = reordered_history._revision(document.resource_id)
+    older = {
+        **current,
+        "revision_id": _oid("9"),
+        "parent_revision_id": None,
+        "occurred_at": current["occurred_at"] - timedelta(seconds=1),
+    }
+    current = {**current, "parent_revision_id": older["revision_id"]}
+    reordered_history.history_overrides[document.resource_id] = [older, current]
+    with pytest.raises(ShadowReaderScopeError, match="history"):
+        await NativeRevisionShadowReader(
+            pool=None,
+            namespace_id=namespace_id,
+            vault_name="p2-manual",
+            native_service=service,
+            native_repository=reordered_history,
+        ).history(document, selector=native_id, fixed_ref=fixed_ref)
+
+    corrupt_diff = _NoWriteNativeRepository((document, native_id))
+    corrupt_diff.revision_overrides[document.resource_id] = {
+        **corrupt_diff._revision(document.resource_id),
+        "path_at_revision": "wrong.md",
+    }
+    with pytest.raises(ShadowReaderScopeError, match="diff"):
+        await NativeRevisionShadowReader(
+            pool=None,
+            namespace_id=namespace_id,
+            vault_name="p2-manual",
+            native_service=service,
+            native_repository=corrupt_diff,
+        ).diff(document, selector=native_id, fixed_ref=fixed_ref)
+
+    corrupt_activity = _NoWriteNativeRepository((document, native_id))
+    activity = await corrupt_activity.get_activity_for_revision(
+        namespace_id=namespace_id,
+        surface="document",
+        resource_id=document.resource_id,
+        revision_id=native_id,
+    )
+    assert activity is not None
+    corrupt_activity.activity_override = {**activity, "action": "move"}
+    with pytest.raises(ShadowReaderScopeError, match="activity"):
+        await NativeRevisionShadowReader(
+            pool=None,
+            namespace_id=namespace_id,
+            vault_name="p2-manual",
+            native_service=service,
+            native_repository=corrupt_activity,
+        ).activity(document, selector=native_id, fixed_ref=fixed_ref)
 
 
 async def test_failed_cache_replacement_evicts_the_prior_resource():
@@ -486,6 +744,10 @@ async def test_failed_cache_replacement_evicts_the_prior_resource():
         namespace_id=uuid.UUID("22222222-2222-4222-8222-222222222222"),
         vault_name="p2-manual",
         native_service=native_service,
+        native_repository=_NoWriteNativeRepository(
+            (document, native_id),
+            (invalid, invalid_native_id),
+        ),
     )
     await native.get(document, selector=native_id, fixed_ref=fixed_ref)
     with pytest.raises(ShadowReaderScopeError, match="body differs from C9 inventory"):
@@ -512,28 +774,31 @@ async def test_comparator_receipt_is_redacted_and_classified():
     assert str(document.resource_id) not in encoded
     assert str(run.run_id) not in encoded
     assert "raw_candidate" not in receipt
-    assert receipt["schema_version"] == 2
-    assert receipt["protocol_version"].endswith("/v2")
+    assert receipt["schema_version"] == 3
+    assert receipt["protocol_version"].endswith("/v3")
     assert "legacy" not in receipt["resources"][0]["operations"]["get"]
     assert receipt["summary"]["unexplained_mismatch_count"] == 0
     assert receipt["summary"]["mismatch_count"] == 12
-    assert receipt["resources"][0]["operations"]["get"]["mismatches"] == [
+    assert receipt["resources"][0]["operations"]["get"]["classified_mismatches"] == [
         {
-            "path": "$.content",
-            "rule_id": "BR-05",
-            "classification": "formatting_only",
-        },
-        {
-            "path": "$.current_commit",
             "rule_id": "BR-01",
             "classification": "revision_token",
+            "count": 1,
         },
         {
-            "path": "$.projection.revision",
             "rule_id": "BR-04",
             "classification": "projection_revision",
+            "count": 1,
+        },
+        {
+            "rule_id": "BR-05",
+            "classification": "formatting_only",
+            "count": 1,
         },
     ]
+    assert document.current_commit not in encoded
+    assert run.fixed_git_oid not in encoded
+    assert run.inventory_digest not in encoded
 
 
 async def test_product_readers_compare_a_completed_pg_backfill_without_writes(tmp_path):
@@ -624,4 +889,107 @@ async def test_product_readers_compare_a_completed_pg_backfill_without_writes(tm
         assert "notes/migration-candidate.md" not in encoded
         assert str(resource_id) not in encoded
         assert str(run.run_id) not in encoded
-        assert receipt["run"]["fixed_ref"] == fixed_ref
+        assert fixed_ref not in encoded
+
+
+async def test_reconcile_c10_resolves_changed_and_unchanged_heads_across_runs(tmp_path):
+    async with _fresh_schema(tmp_path) as pool:
+        git = GitService(storage_path=str(tmp_path / "git"))
+        vault_name = f"shadow-reconcile-{uuid.uuid4().hex}"
+        git.init_vault(vault_name)
+        first_oid = git.commit_file(
+            vault_name,
+            "first.md",
+            "first r1\n",
+            "[create] first.md\n\nagent: legacy-writer\naction: create\nsummary: create first",
+        )
+        second_oid = git.commit_file(
+            vault_name,
+            "second.md",
+            "second r1\n",
+            "[create] second.md\n\nagent: legacy-writer\naction: create\nsummary: create second",
+        )
+        fixed_r1 = git.commit_file(vault_name, "r1-tip.md", "tip\n", "fixed R1 tip")
+        bare = Repo(str(git._bare_path(vault_name)))
+        committed = {
+            "first.md": bare.commit(first_oid).committed_datetime,
+            "second.md": bare.commit(second_oid).committed_datetime,
+        }
+        resource_ids = {path: uuid.uuid4() for path in committed}
+        async with pool.acquire() as conn:
+            namespace_id = await conn.fetchval(
+                """
+                INSERT INTO vaults (name, git_path, status)
+                VALUES ($1, $2, 'active')
+                RETURNING id
+                """,
+                vault_name,
+                str(git._bare_path(vault_name)),
+            )
+            for path, oid in (("first.md", first_oid), ("second.md", second_oid)):
+                await conn.execute(
+                    """
+                    INSERT INTO documents
+                        (id, vault_id, path, title, created_at, updated_at,
+                         current_commit, source)
+                    VALUES ($1, $2, $3, $3, $4, $4, $5, 'manual')
+                    """,
+                    resource_ids[path],
+                    namespace_id,
+                    path,
+                    committed[path] - timedelta(seconds=1),
+                    oid,
+                )
+
+        bridge = LegacyRevisionBridge(pool, git=git)
+        backfill = NativeRevisionBackfill(pool, git=git, bridge=bridge)
+        initial_run, initial_inventory = await backfill.prepare_run(
+            namespace_id=namespace_id,
+            fixed_ref=fixed_r1,
+            coverage_version="p2-shadow-reconcile-initial-v1",
+        )
+        assert len(initial_inventory.documents) == 2
+        assert (await backfill.backfill_run(initial_run.run_id)).status == "complete"
+
+        changed_oid = git.commit_file(
+            vault_name,
+            "first.md",
+            "first r2\n",
+            "[update] first.md\n\nagent: legacy-writer\naction: update\nsummary: update first",
+        )
+        fixed_r2 = git.commit_file(vault_name, "r2-tip.md", "tip\n", "fixed R2 tip")
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE documents
+                   SET current_commit = $2, updated_at = NOW()
+                 WHERE id = $1
+                """,
+                resource_ids["first.md"],
+                changed_oid,
+            )
+
+        reconciler = NativeRevisionReconcile(pool, git=git, bridge=bridge)
+        final = await reconciler.reconcile(namespace_id=namespace_id, fixed_ref=fixed_r2)
+        assert final.status == "complete"
+        assert final.changed_items == 1
+        assert final.unchanged_items == 1
+        assert len(await backfill.repository.list_items(final.run_id)) == 1
+
+        before = await _authority_counts(pool)
+        comparator = NativeRevisionShadowComparator(
+            pool=pool,
+            bridge=bridge,
+            legacy_reader=LegacyFixedRefShadowReader(git=git, vault_name=vault_name),
+            candidate_reader=NativeRevisionShadowReader(
+                pool,
+                namespace_id=namespace_id,
+                vault_name=vault_name,
+                selector_bridge=bridge,
+            ),
+        )
+        receipt = await comparator.compare_run(final.run_id)
+        assert await _authority_counts(pool) == before
+        assert receipt["status"] == "passed"
+        assert receipt["summary"]["resource_count"] == 2
+        assert receipt["summary"]["operation_count"] == 8

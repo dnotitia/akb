@@ -19,6 +19,7 @@ from uuid import UUID
 import asyncpg
 
 from app.exceptions import ConflictError, NotFoundError
+from app.repositories.native_revision_repo import NativeRevisionRepository
 from app.services.document_service import _parse_markdown
 from app.services.git_service import FixedRefHistoryError, GitService
 from app.services.legacy_revision_bridge import (
@@ -51,6 +52,31 @@ class NativeRevisionReadService(Protocol):
     ): ...
 
 
+class NativeRevisionReadRepository(Protocol):
+    async def get_revision(
+        self,
+        *,
+        resource_id,
+        revision_id: str,
+    ) -> dict[str, Any] | None: ...
+
+    async def list_history(
+        self,
+        *,
+        resource_id,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]: ...
+
+    async def get_activity_for_revision(
+        self,
+        *,
+        namespace_id,
+        surface: str,
+        resource_id,
+        revision_id: str,
+    ) -> dict[str, Any] | None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class _LegacySnapshotKey:
     resource_id: UUID
@@ -66,6 +92,8 @@ class _LegacyMaterialization:
     fixed_ref: str
     current_commit: str
     body: bytes
+    history: tuple[dict[str, Any], ...]
+    activity: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +116,8 @@ class _NativeMaterialization:
     digest: str
     byte_size: int
     action: str
+    parent_revision_id: str | None
+    occurred_at: Any
 
 
 def _require_oid(value: str, field: str) -> None:
@@ -183,6 +213,55 @@ class LegacyFixedRefShadowReader:
         except UnicodeDecodeError as exc:
             raise ShadowReaderScopeError("legacy fixed-ref body is not valid UTF-8") from exc
 
+        expected_history = [
+            (entry.legacy_git_oid, entry.path_at_revision, entry.committed_at)
+            for entry in reversed(document.lineage)
+        ]
+        observed_history = [
+            (
+                entry.get("legacy_git_oid"),
+                entry.get("path_at_revision"),
+                entry.get("committed_at"),
+            )
+            for entry in snapshot.history
+        ]
+        if observed_history != expected_history:
+            raise ShadowReaderScopeError(
+                "legacy fixed-ref history differs from C9 inventory"
+            )
+
+        activity = document.activity
+        expected_activity = (
+            activity.legacy_git_oid,
+            activity.committed_at,
+            activity.actor,
+            activity.subject,
+            activity.summary,
+            activity.action,
+            activity.path_from,
+            activity.path_to,
+            tuple(dict(change) for change in activity.changed_paths),
+        )
+        raw_activity = snapshot.activity
+        changed_paths = raw_activity.get("changed_paths")
+        if not isinstance(changed_paths, (list, tuple)):
+            raise ShadowReaderScopeError("legacy fixed-ref activity is invalid")
+        observed_activity = (
+            raw_activity.get("legacy_git_oid"),
+            raw_activity.get("committed_at"),
+            raw_activity.get("actor"),
+            raw_activity.get("subject"),
+            raw_activity.get("summary"),
+            raw_activity.get("action"),
+            raw_activity.get("path_from"),
+            raw_activity.get("path_to"),
+            tuple(dict(change) for change in changed_paths if isinstance(change, Mapping)),
+        )
+        if observed_activity != expected_activity:
+            raise ShadowReaderScopeError(
+                "legacy fixed-ref activity differs from C9 inventory"
+            )
+
     async def _fixed_snapshot(
         self,
         document: LegacyInventoryDocument,
@@ -227,10 +306,18 @@ class LegacyFixedRefShadowReader:
             if not isinstance(raw_snapshot, Mapping):
                 raise ShadowReaderScopeError("legacy fixed-ref materialization is invalid")
             body = raw_snapshot.get("body")
+            history = raw_snapshot.get("history")
+            activity = raw_snapshot.get("activity")
             materialized_fixed_ref = raw_snapshot.get("fixed_ref")
             materialized_current_commit = raw_snapshot.get("current_commit")
             if not isinstance(body, bytes):
                 raise ShadowReaderScopeError("legacy fixed-ref materialization returned no body")
+            if not isinstance(history, list) or not all(
+                isinstance(entry, Mapping) for entry in history
+            ):
+                raise ShadowReaderScopeError("legacy fixed-ref history is invalid")
+            if not isinstance(activity, Mapping):
+                raise ShadowReaderScopeError("legacy fixed-ref activity is invalid")
             if not isinstance(materialized_fixed_ref, str) or not isinstance(
                 materialized_current_commit,
                 str,
@@ -240,6 +327,8 @@ class LegacyFixedRefShadowReader:
                 fixed_ref=materialized_fixed_ref,
                 current_commit=materialized_current_commit,
                 body=bytes(body),
+                history=tuple(dict(entry) for entry in history),
+                activity=dict(activity),
             )
             self._validate_materialization(snapshot, document, fixed_ref=fixed_ref)
             self._snapshot_cache = (key, snapshot)
@@ -300,6 +389,34 @@ class LegacyFixedRefShadowReader:
         if selector != document.current_commit:
             raise ShadowReaderScopeError("legacy diff selector is outside the frozen current head")
         snapshot = await self._fixed_snapshot(document, fixed_ref=fixed_ref)
+        try:
+            raw_diff = await asyncio.to_thread(
+                self.git.file_diff,
+                self.vault_name,
+                document.current_path,
+                selector,
+            )
+        except (OSError, ValueError) as exc:
+            raise ShadowReaderScopeError("legacy fixed-ref diff failed") from exc
+        if not isinstance(raw_diff, Mapping):
+            raise ShadowReaderScopeError("legacy fixed-ref diff is invalid")
+        diff_type = raw_diff.get("type")
+        allowed_types = {
+            "create": {"added"},
+            "update": {"modified"},
+            "move": {"added", "modified"},
+            "delete": {"deleted"},
+        }[document.activity.action]
+        if (
+            raw_diff.get("file") != document.current_path
+            or raw_diff.get("commit") != selector
+            or diff_type not in allowed_types
+            or not isinstance(raw_diff.get("diff"), str)
+            or not raw_diff.get("diff")
+        ):
+            raise ShadowReaderScopeError(
+                "legacy fixed-ref diff differs from C9 inventory"
+            )
         _, body = _parsed_body(snapshot.body.decode("utf-8"))
         return {
             "file": document.current_path,
@@ -347,6 +464,7 @@ class NativeRevisionShadowReader:
         namespace_id,
         vault_name: str,
         native_service: NativeRevisionReadService | None = None,
+        native_repository: NativeRevisionReadRepository | None = None,
         selector_bridge: LegacyRevisionBridge | None = None,
     ):
         if native_service is None and pool is None:
@@ -357,6 +475,15 @@ class NativeRevisionShadowReader:
         self.namespace_id = namespace_id
         self.vault_name = vault_name
         self.native_service = native_service or NativeRevisionService(pool)  # type: ignore[arg-type]
+        if native_repository is None:
+            if pool is not None:
+                native_repository = NativeRevisionRepository(pool)
+            else:
+                candidate = getattr(self.native_service, "repository", None)
+                if candidate is None:
+                    raise ValueError("pool or native_repository is required")
+                native_repository = candidate
+        self.native_repository = native_repository
         self.selector_bridge = selector_bridge
         self._snapshot_lock = asyncio.Lock()
         self._snapshot_cache: tuple[_NativeSnapshotKey, _NativeMaterialization] | None = None
@@ -377,6 +504,10 @@ class NativeRevisionShadowReader:
             or snapshot.byte_size != document.byte_size
         ):
             raise ShadowReaderScopeError("native revision facts differ from C9 inventory")
+        if snapshot.parent_revision_id is not None:
+            _require_oid(snapshot.parent_revision_id, "native parent revision")
+        if snapshot.occurred_at is None:
+            raise ShadowReaderScopeError("native revision chronology is missing")
         try:
             body = snapshot.text.encode("utf-8", errors="strict")
         except UnicodeEncodeError as exc:
@@ -435,10 +566,82 @@ class NativeRevisionShadowReader:
                 digest=_value(raw_snapshot, "digest"),
                 byte_size=_value(raw_snapshot, "byte_size"),
                 action=action if isinstance(action, str) and action else "create",
+                parent_revision_id=_value(raw_snapshot, "parent_revision_id"),
+                occurred_at=_value(raw_snapshot, "occurred_at"),
             )
             self._validate_materialization(snapshot, document, selector=selector)
             self._snapshot_cache = (key, snapshot)
             return snapshot
+
+    @staticmethod
+    def _row_path(row: Mapping[str, Any]) -> Any:
+        return row.get("path_at_revision", row.get("path"))
+
+    @classmethod
+    def _validate_selected_revision(
+        cls,
+        row: Mapping[str, Any],
+        snapshot: _NativeMaterialization,
+        document: LegacyInventoryDocument,
+        *,
+        source: str,
+    ) -> None:
+        if (
+            row.get("resource_id") != document.resource_id
+            or row.get("revision_id") != snapshot.revision_id
+            or cls._row_path(row) != document.current_path
+            or row.get("action") != snapshot.action
+            or row.get("parent_revision_id") != snapshot.parent_revision_id
+            or row.get("occurred_at") != snapshot.occurred_at
+        ):
+            raise ShadowReaderScopeError(
+                f"native revision {source} differs from the selected Revision"
+            )
+
+    async def _native_history_rows(
+        self,
+        document: LegacyInventoryDocument,
+        snapshot: _NativeMaterialization,
+    ) -> list[dict[str, Any]]:
+        rows = await self.native_repository.list_history(
+            resource_id=document.resource_id,
+            limit=len(document.lineage) + 1,
+        )
+        if not isinstance(rows, list) or not rows or not all(
+            isinstance(row, Mapping) for row in rows
+        ):
+            raise ShadowReaderScopeError("native revision history is missing or invalid")
+        copied = [dict(row) for row in rows]
+        self._validate_selected_revision(
+            copied[0],
+            snapshot,
+            document,
+            source="history",
+        )
+        revision_ids = [row.get("revision_id") for row in copied]
+        if len(set(revision_ids)) != len(revision_ids) or any(
+            not isinstance(revision_id, str) or _OID_RE.fullmatch(revision_id) is None
+            for revision_id in revision_ids
+        ):
+            raise ShadowReaderScopeError("native revision history has invalid selectors")
+        if any(row.get("occurred_at") is None for row in copied):
+            raise ShadowReaderScopeError("native revision history has missing chronology")
+        ordered = sorted(
+            copied,
+            key=lambda row: (row["occurred_at"], row["revision_id"]),
+            reverse=True,
+        )
+        if [row["revision_id"] for row in copied] != [
+            row["revision_id"] for row in ordered
+        ]:
+            raise ShadowReaderScopeError("native revision history order is invalid")
+        for index, row in enumerate(copied):
+            expected_parent = (
+                copied[index + 1]["revision_id"] if index + 1 < len(copied) else None
+            )
+            if row.get("parent_revision_id") != expected_parent:
+                raise ShadowReaderScopeError("native revision history parent chain is invalid")
+        return copied
 
     async def _verify_selector_bridge(
         self,
@@ -446,6 +649,7 @@ class NativeRevisionShadowReader:
         *,
         native_revision_id: str,
         fixed_ref: str,
+        history_rows: list[dict[str, Any]],
     ) -> None:
         if self.selector_bridge is None:
             return
@@ -453,20 +657,45 @@ class NativeRevisionShadowReader:
             resource_id=document.resource_id,
             selector=native_revision_id,
         )
-        if native.kind != "native" or native.native_revision_id != native_revision_id:
+        if (
+            native.kind != "native"
+            or native.native_revision_id != native_revision_id
+            or native.path_at_revision != document.current_path
+        ):
             raise ShadowReaderScopeError("native history head is not bound to the C9 selector")
-        for entry in document.lineage[:-1]:
+        native_lineage: list[str] = []
+        for entry in document.lineage:
             resolution = await self.selector_bridge.resolve_selector(
                 resource_id=document.resource_id,
                 selector=entry.legacy_git_oid,
             )
             if (
-                resolution.kind != "bridge"
-                or resolution.fixed_git_oid != fixed_ref
+                resolution.kind not in {"native", "bridge"}
                 or resolution.legacy_git_oid != entry.legacy_git_oid
                 or resolution.path_at_revision != entry.path_at_revision
+                or not isinstance(resolution.fixed_git_oid, str)
+                or _OID_RE.fullmatch(resolution.fixed_git_oid) is None
             ):
                 raise ShadowReaderScopeError("retained selector is not bound to the C9 fixed-ref bridge")
+            if resolution.kind == "native":
+                if (
+                    not isinstance(resolution.native_revision_id, str)
+                    or _OID_RE.fullmatch(resolution.native_revision_id) is None
+                ):
+                    raise ShadowReaderScopeError("native history mapping has no Revision token")
+                native_lineage.append(resolution.native_revision_id)
+        current = await self.selector_bridge.resolve_selector(
+            resource_id=document.resource_id,
+            selector=document.current_commit,
+        )
+        if (
+            current.kind != "native"
+            or current.native_revision_id != native_revision_id
+            or current.fixed_git_oid != fixed_ref
+        ):
+            raise ShadowReaderScopeError("native history head has the wrong owning fixed ref")
+        if [row["revision_id"] for row in history_rows] != list(reversed(native_lineage)):
+            raise ShadowReaderScopeError("native revision history differs from completed mappings")
 
     async def get(
         self,
@@ -502,11 +731,13 @@ class NativeRevisionShadowReader:
         selector: str,
         fixed_ref: str,
     ) -> dict[str, Any]:
-        await self._native_snapshot(document, selector=selector, fixed_ref=fixed_ref)
+        snapshot = await self._native_snapshot(document, selector=selector, fixed_ref=fixed_ref)
+        history_rows = await self._native_history_rows(document, snapshot)
         await self._verify_selector_bridge(
             document,
             native_revision_id=selector,
             fixed_ref=fixed_ref,
+            history_rows=history_rows,
         )
         return {
             "history_source": "fixed-ref-bridge",
@@ -522,6 +753,41 @@ class NativeRevisionShadowReader:
         fixed_ref: str,
     ) -> dict[str, Any]:
         snapshot = await self._native_snapshot(document, selector=selector, fixed_ref=fixed_ref)
+        raw_selected = await self.native_repository.get_revision(
+            resource_id=document.resource_id,
+            revision_id=selector,
+        )
+        if not isinstance(raw_selected, Mapping):
+            raise ShadowReaderScopeError("native revision diff selection is missing")
+        self._validate_selected_revision(
+            raw_selected,
+            snapshot,
+            document,
+            source="diff",
+        )
+        if snapshot.action == "create":
+            if snapshot.parent_revision_id is not None:
+                raise ShadowReaderScopeError("native revision diff has an invalid create parent")
+        elif snapshot.action in {"replace", "move"}:
+            if snapshot.parent_revision_id is None:
+                raise ShadowReaderScopeError("native revision diff has no parent")
+            try:
+                parent = await self.native_service.get_resource_revision(
+                    namespace_id=self.namespace_id,
+                    surface="document",
+                    resource_id=document.resource_id,
+                    revision_id=snapshot.parent_revision_id,
+                )
+            except NotFoundError as exc:
+                raise ShadowReaderScopeError("native revision diff parent is missing") from exc
+            if (
+                _value(parent, "resource_id") != document.resource_id
+                or _value(parent, "revision_id") != snapshot.parent_revision_id
+                or not isinstance(_value(parent, "text"), str)
+            ):
+                raise ShadowReaderScopeError("native revision diff parent is invalid")
+        else:
+            raise ShadowReaderScopeError("native revision diff action is unsupported")
         _, body = _parsed_body(snapshot.text)
         return {
             "file": document.current_path,
@@ -539,17 +805,69 @@ class NativeRevisionShadowReader:
         fixed_ref: str,
     ) -> dict[str, Any]:
         snapshot = await self._native_snapshot(document, selector=selector, fixed_ref=fixed_ref)
+        raw_selected = await self.native_repository.get_revision(
+            resource_id=document.resource_id,
+            revision_id=selector,
+        )
+        if not isinstance(raw_selected, Mapping):
+            raise ShadowReaderScopeError("native revision activity selection is missing")
+        self._validate_selected_revision(
+            raw_selected,
+            snapshot,
+            document,
+            source="activity",
+        )
+        raw_activity = await self.native_repository.get_activity_for_revision(
+            namespace_id=self.namespace_id,
+            surface="document",
+            resource_id=document.resource_id,
+            revision_id=selector,
+        )
+        if not isinstance(raw_activity, Mapping):
+            raise ShadowReaderScopeError("native revision activity is missing")
+        activity = raw_activity
+        expected = (
+            document.resource_id,
+            selector,
+            raw_selected.get("action"),
+            raw_selected.get("actor"),
+            raw_selected.get("subject"),
+            raw_selected.get("summary"),
+            raw_selected.get("path_from"),
+            raw_selected.get("path_to"),
+            raw_selected.get("occurred_at"),
+            self._row_path(raw_selected),
+        )
+        observed = (
+            activity.get("resource_id"),
+            activity.get("revision_id"),
+            activity.get("action"),
+            activity.get("actor"),
+            activity.get("subject"),
+            activity.get("summary"),
+            activity.get("changed_path_from"),
+            activity.get("changed_path_to"),
+            activity.get("occurred_at"),
+            activity.get("path_at_revision"),
+        )
+        if observed != expected:
+            raise ShadowReaderScopeError(
+                "native revision activity differs from persisted Revision facts"
+            )
+        actor = activity.get("actor")
+        if not isinstance(actor, str) or not actor:
+            raise ShadowReaderScopeError("native revision activity actor is invalid")
         return {
             "events": [
                 {
                     "hash": selector,
-                    "subject": None,
+                    "subject": activity.get("subject"),
                     "author": {
-                        "id": "akb-native-revision-migration",
-                        "display": "Migration",
+                        "id": actor,
+                        "display": actor,
                     },
-                    "action": snapshot.action,
-                    "summary": "C9 fixed-ref native genesis",
+                    "action": activity.get("action"),
+                    "summary": activity.get("summary"),
                     "projection_revision": selector,
                 }
             ]

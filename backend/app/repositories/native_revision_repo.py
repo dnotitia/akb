@@ -767,6 +767,43 @@ class NativeRevisionRepository:
             )
         return [dict(row) for row in rows]
 
+    async def get_activity_for_revision(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        surface: str,
+        resource_id: uuid.UUID,
+        revision_id: str,
+    ) -> dict | None:
+        """Read one persisted activity fact through its exact Resource selector."""
+
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT a.resource_id, a.revision_id, a.action, a.actor,
+                       a.subject, a.summary, a.changed_path_from,
+                       a.changed_path_to, a.occurred_at,
+                       r.path_at_revision
+                  FROM native_revision_activity a
+                  JOIN native_revisions r
+                    ON r.namespace_id = a.namespace_id
+                   AND r.resource_id = a.resource_id
+                   AND r.revision_id = a.revision_id
+                  JOIN native_resources rs
+                    ON rs.namespace_id = a.namespace_id
+                   AND rs.resource_id = a.resource_id
+                 WHERE a.namespace_id = $1
+                   AND rs.surface = $2
+                   AND a.resource_id = $3
+                   AND a.revision_id = $4
+                """,
+                namespace_id,
+                surface,
+                resource_id,
+                revision_id,
+            )
+        return dict(row) if row is not None else None
+
     async def list_recent_document_heads(
         self,
         *,

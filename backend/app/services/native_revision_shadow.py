@@ -15,6 +15,7 @@ import asyncpg
 
 from app.exceptions import ConflictError, NotFoundError
 from app.repositories.native_revision_migration_repo import (
+    LegacyRevisionMapping,
     MigrationItem,
     MigrationRun,
     NativeRevisionMigrationRepository,
@@ -89,6 +90,21 @@ class MigrationReadRepository(Protocol):
 
     async def list_items(self, run_id: uuid.UUID) -> list[MigrationItem]: ...
 
+    async def exact_mapping(
+        self,
+        *,
+        resource_id: uuid.UUID,
+        legacy_git_oid: str,
+    ) -> LegacyRevisionMapping | None: ...
+
+
+class _NativeBinding:
+    __slots__ = ("fixed_ref", "native_revision_id")
+
+    def __init__(self, *, fixed_ref: str, native_revision_id: str):
+        self.fixed_ref = fixed_ref
+        self.native_revision_id = native_revision_id
+
 
 class InventoryReader(Protocol):
     async def inventory_for_run(self, run: MigrationRun) -> LegacyInventory: ...
@@ -131,7 +147,7 @@ class ShadowReader(Protocol):
 class NativeRevisionShadowComparator:
     """Compare legacy and candidate reads without opening a write path."""
 
-    protocol_version = "akb-native-revision-p2-w1-c10/v2"
+    protocol_version = "akb-native-revision-p2-w1-c10/v3"
 
     def __init__(
         self,
@@ -166,7 +182,7 @@ class NativeRevisionShadowComparator:
         self._validate_inventory_binding(run, inventory)
         documents = self._documents(inventory)
         items = await self.repository.list_items(parsed_run_id)
-        native_ids = self._native_ids(run, documents, items)
+        bindings = await self._native_bindings(run, documents, items)
 
         resources = []
         for document in sorted(documents, key=lambda item: str(item.resource_id)):
@@ -175,39 +191,34 @@ class NativeRevisionShadowComparator:
                     run,
                     inventory,
                     document,
-                    native_ids[document.resource_id],
+                    bindings[document.resource_id],
                 )
             )
 
         receipt: dict[str, Any] = {
-            "schema_version": 2,
+            "schema_version": 3,
             "protocol_version": self.protocol_version,
             "status": "passed",
             "passed": True,
             "claim_scope": "semantic_candidate_evidence",
             "write_authority": "legacy_only",
-            "comparison_ref": "one completed C9 fixed_ref",
+            "comparison_ref": "completed immutable mapping owners",
             "final_p2_coverage_claim": False,
             "cutover_claim": False,
             "scope": {
                 "claim_scope": "semantic_candidate_evidence",
                 "write_authority": "legacy_only",
-                "comparison_ref": "one completed C9 fixed_ref",
+                "comparison_ref": "completed immutable mapping owners",
                 "final_coverage_gate": "P2 L1-L6 product-backed evidence before final coverage selection",
                 "p3_fence_cutover_out_of_scope": True,
             },
-            "run": {
-                "run_key": self._public_key(self._value(run, "run_id"), "run"),
-                "status": "complete",
-                "fixed_ref": self._value(run, "fixed_git_oid"),
-                "inventory_digest": self._value(run, "inventory_digest"),
-            },
+            "run": {"status": "complete"},
             "resources": resources,
             "summary": {
                 "resource_count": len(resources),
                 "operation_count": len(resources) * len(_OPERATIONS),
                 "mismatch_count": sum(
-                    len(operation["mismatches"])
+                    operation["mismatch_count"]
                     for resource in resources
                     for operation in resource["operations"].values()
                 ),
@@ -218,7 +229,7 @@ class NativeRevisionShadowComparator:
                         mismatch["rule_id"]
                         for resource in resources
                         for operation in resource["operations"].values()
-                        for mismatch in operation["mismatches"]
+                        for mismatch in operation["classified_mismatches"]
                     }
                 ),
             },
@@ -235,9 +246,10 @@ class NativeRevisionShadowComparator:
         run: MigrationRun,
         inventory: LegacyInventory,
         document: LegacyInventoryDocument,
-        native_revision_id: str,
+        binding: _NativeBinding,
     ) -> dict[str, Any]:
-        del inventory
+        del run, inventory
+        native_revision_id = binding.native_revision_id
         operations: dict[str, Any] = {}
         for operation in _OPERATIONS:
             selector = document.current_commit
@@ -246,7 +258,7 @@ class NativeRevisionShadowComparator:
                 operation,
                 document,
                 selector=selector,
-                fixed_ref=run.fixed_git_oid,
+                fixed_ref=binding.fixed_ref,
             )
             candidate_selector = native_revision_id
             raw_candidate = await self._read(
@@ -254,7 +266,7 @@ class NativeRevisionShadowComparator:
                 operation,
                 document,
                 selector=candidate_selector,
-                fixed_ref=run.fixed_git_oid,
+                fixed_ref=binding.fixed_ref,
             )
             candidate = raw_candidate
             if operation == "activity":
@@ -272,15 +284,12 @@ class NativeRevisionShadowComparator:
                 native_revision_id,
             )
             operations[operation] = {
-                "mismatches": mismatches,
                 "normalized_equal": True,
                 "mismatch_count": len(mismatches),
                 "mismatch_classes": sorted({mismatch["classification"] for mismatch in mismatches}),
+                "classified_mismatches": self._count_operation_mismatches(mismatches),
             }
-        return {
-            "resource_key": self._public_key(document.resource_id, "resource"),
-            "operations": operations,
-        }
+        return {"operations": operations}
 
     async def _read(
         self,
@@ -523,26 +532,24 @@ class NativeRevisionShadowComparator:
             seen.add(document.resource_id)
         return documents
 
-    @classmethod
-    def _native_ids(
-        cls,
+    async def _native_bindings(
+        self,
         run: MigrationRun,
         documents: tuple[LegacyInventoryDocument, ...],
         items: list[MigrationItem],
-    ) -> dict[uuid.UUID, str]:
+    ) -> dict[uuid.UUID, _NativeBinding]:
         documents_by_id = {document.resource_id: document for document in documents}
-        expected = set(documents_by_id)
-        result: dict[uuid.UUID, str] = {}
+        items_by_id: dict[uuid.UUID, MigrationItem] = {}
         for item in items:
-            resource_id = cls._value(item, "legacy_document_id")
-            if resource_id in result:
+            resource_id = self._value(item, "legacy_document_id")
+            if resource_id in items_by_id:
                 raise ShadowComparisonError("C9 migration items contain duplicate resources")
             document = documents_by_id.get(resource_id)
             if document is None:
                 raise ShadowComparisonError("C9 migration item is outside the frozen inventory")
             expected_binding = (
-                cls._value(run, "run_id"),
-                cls._value(run, "namespace_id"),
+                self._value(run, "run_id"),
+                self._value(run, "namespace_id"),
                 document.resource_id,
                 document.resource_id,
                 document.current_path,
@@ -552,28 +559,95 @@ class NativeRevisionShadowComparator:
                 "complete",
             )
             observed_binding = (
-                cls._value(item, "run_id"),
-                cls._value(item, "namespace_id"),
+                self._value(item, "run_id"),
+                self._value(item, "namespace_id"),
                 resource_id,
-                cls._value(item, "native_resource_id"),
-                cls._value(item, "captured_path"),
-                cls._value(item, "legacy_head_oid"),
-                cls._value(item, "body_digest"),
-                cls._value(item, "byte_size"),
-                cls._value(item, "status"),
+                self._value(item, "native_resource_id"),
+                self._value(item, "captured_path"),
+                self._value(item, "legacy_head_oid"),
+                self._value(item, "body_digest"),
+                self._value(item, "byte_size"),
+                self._value(item, "status"),
             )
             if observed_binding != expected_binding:
                 raise ShadowComparisonError(
                     "C9 migration item binding differs from the completed run inventory"
                 )
-            native_id = cls._value(item, "native_head_revision_id")
+            native_id = self._value(item, "native_head_revision_id")
             if not isinstance(native_id, str) or _OID_RE.fullmatch(native_id) is None:
                 raise ShadowComparisonError(
                     "completed C9 item binding has no valid native head token"
                 )
-            result[resource_id] = native_id
-        if set(result) != expected:
-            raise ShadowComparisonError("C9 migration items do not cover every inventory resource")
+            items_by_id[resource_id] = item
+
+        result: dict[uuid.UUID, _NativeBinding] = {}
+        for document in documents:
+            mapping = await self.repository.exact_mapping(
+                resource_id=document.resource_id,
+                legacy_git_oid=document.current_commit,
+            )
+            native_id = self._value(mapping, "native_revision_id") if mapping else None
+            fixed_ref = self._value(mapping, "fixed_git_oid") if mapping else None
+            expected_mapping = (
+                self._value(run, "namespace_id"),
+                document.resource_id,
+                document.current_commit,
+                document.current_path,
+                "native",
+                len(document.lineage) - 1,
+            )
+            observed_mapping = (
+                self._value(mapping, "namespace_id") if mapping else None,
+                self._value(mapping, "resource_id") if mapping else None,
+                self._value(mapping, "legacy_git_oid") if mapping else None,
+                self._value(mapping, "path_at_revision") if mapping else None,
+                self._value(mapping, "resolution") if mapping else None,
+                self._value(mapping, "lineage_ordinal") if mapping else None,
+            )
+            if (
+                observed_mapping != expected_mapping
+                or not isinstance(native_id, str)
+                or _OID_RE.fullmatch(native_id) is None
+                or not isinstance(fixed_ref, str)
+                or _OID_RE.fullmatch(fixed_ref) is None
+            ):
+                raise ShadowComparisonError(
+                    "completed immutable mapping differs from the frozen inventory"
+                )
+
+            owner_run_id = self._value(mapping, "run_id")
+            owner = (
+                run
+                if owner_run_id == self._value(run, "run_id")
+                else await self.repository.get_run(owner_run_id)
+            )
+            if (
+                owner is None
+                or self._value(owner, "status") != "complete"
+                or self._value(owner, "namespace_id") != self._value(run, "namespace_id")
+                or self._value(owner, "fixed_git_oid") != fixed_ref
+            ):
+                raise ShadowComparisonError(
+                    "immutable mapping owner is not a completed fixed-ref run"
+                )
+
+            current_item = items_by_id.get(document.resource_id)
+            if owner_run_id == self._value(run, "run_id"):
+                if (
+                    current_item is None
+                    or self._value(current_item, "native_head_revision_id") != native_id
+                ):
+                    raise ShadowComparisonError(
+                        "current-run mapping has no matching completed migration item"
+                    )
+            elif current_item is not None:
+                raise ShadowComparisonError(
+                    "current-run item attempts to re-home an immutable mapping"
+                )
+            result[document.resource_id] = _NativeBinding(
+                fixed_ref=fixed_ref,
+                native_revision_id=native_id,
+            )
         return result
 
     @staticmethod
@@ -583,19 +657,26 @@ class NativeRevisionShadowComparator:
         return document.lineage[0].legacy_git_oid
 
     @staticmethod
-    def _public_key(value: Any, prefix: str) -> str:
-        """Return a stable receipt key without retaining a raw UUID."""
-        digest = hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
-        return f"{prefix}-{digest}"
+    def _count_operation_mismatches(
+        mismatches: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        counts: dict[tuple[str, str], int] = {}
+        for mismatch in mismatches:
+            key = (mismatch["rule_id"], mismatch["classification"])
+            counts[key] = counts.get(key, 0) + 1
+        return [
+            {"rule_id": rule_id, "classification": classification, "count": count}
+            for (rule_id, classification), count in sorted(counts.items())
+        ]
 
     @staticmethod
     def _classified_mismatches(resources: list[dict[str, Any]]) -> list[dict[str, Any]]:
         counts: dict[tuple[str, str, str], int] = {}
         for resource in resources:
             for operation, result in resource["operations"].items():
-                for mismatch in result["mismatches"]:
+                for mismatch in result["classified_mismatches"]:
                     key = (operation, mismatch["rule_id"], mismatch["classification"])
-                    counts[key] = counts.get(key, 0) + 1
+                    counts[key] = counts.get(key, 0) + mismatch["count"]
         return [
             {
                 "operation": operation,

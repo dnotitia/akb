@@ -14,6 +14,7 @@ import asyncpg
 import pytest
 
 from app.repositories.native_revision_migration_repo import (
+    LegacyRevisionMapping,
     MigrationInventoryDriftError,
     MigrationItem,
     MigrationRun,
@@ -55,6 +56,35 @@ class _ReadRepository:
         self.list_items_calls += 1
         assert run_id == self.run.run_id
         return list(self.items)
+
+    async def exact_mapping(
+        self,
+        *,
+        resource_id: uuid.UUID,
+        legacy_git_oid: str,
+    ) -> LegacyRevisionMapping | None:
+        item = next(
+            (
+                item
+                for item in self.items
+                if item.legacy_document_id == resource_id
+                and item.legacy_head_oid == legacy_git_oid
+            ),
+            None,
+        )
+        if item is None:
+            return None
+        return LegacyRevisionMapping(
+            namespace_id=self.run.namespace_id,
+            resource_id=resource_id,
+            legacy_git_oid=legacy_git_oid,
+            path_at_revision=item.captured_path,
+            resolution="native",
+            native_revision_id=item.native_head_revision_id,
+            run_id=self.run.run_id,
+            lineage_ordinal=1,
+            fixed_git_oid=self.run.fixed_git_oid,
+        )
 
 
 class _Bridge:
@@ -158,15 +188,24 @@ def _fixtures() -> tuple[MigrationRun, LegacyInventory, list[MigrationItem], dic
 
 
 class _Reader:
-    def __init__(self, native_ids: dict[uuid.UUID, str], *, candidate: bool):
+    def __init__(
+        self,
+        native_ids: dict[uuid.UUID, str],
+        *,
+        candidate: bool,
+        fixed_refs: dict[uuid.UUID, str] | None = None,
+    ):
         self.native_ids = native_ids
         self.candidate = candidate
+        self.fixed_refs = fixed_refs or {
+            resource_id: _oid("f") for resource_id in native_ids
+        }
         self.calls: list[tuple[str, uuid.UUID]] = []
         self.unknown_delta = False
 
     async def get(self, document: LegacyInventoryDocument, *, selector: str, fixed_ref: str) -> dict[str, Any]:
         self.calls.append(("get", document.resource_id))
-        assert fixed_ref == _oid("f")
+        assert fixed_ref == self.fixed_refs[document.resource_id]
         native_id = self.native_ids[document.resource_id]
         if self.candidate:
             selector = native_id
@@ -255,6 +294,38 @@ class _Reader:
         }
 
 
+class _CrossRunReadRepository:
+    def __init__(
+        self,
+        final_run: MigrationRun,
+        owner_run: MigrationRun,
+        item: MigrationItem,
+        mappings: dict[uuid.UUID, LegacyRevisionMapping],
+    ):
+        self.runs = {final_run.run_id: final_run, owner_run.run_id: owner_run}
+        self.final_run = final_run
+        self.item = item
+        self.mappings = mappings
+
+    async def get_run(self, run_id: uuid.UUID) -> MigrationRun | None:
+        return self.runs.get(run_id)
+
+    async def list_items(self, run_id: uuid.UUID) -> list[MigrationItem]:
+        assert run_id == self.final_run.run_id
+        return [self.item]
+
+    async def exact_mapping(
+        self,
+        *,
+        resource_id: uuid.UUID,
+        legacy_git_oid: str,
+    ) -> LegacyRevisionMapping | None:
+        mapping = self.mappings.get(resource_id)
+        if mapping is None or mapping.legacy_git_oid != legacy_git_oid:
+            return None
+        return mapping
+
+
 async def _table_counts() -> tuple[tuple[str, int], ...]:
     try:
         conn = await asyncpg.connect(_DSN, timeout=2)
@@ -303,18 +374,16 @@ async def test_completed_run_compares_every_resource_and_is_immutable():
     assert receipt["final_p2_coverage_claim"] is False
     assert receipt["cutover_claim"] is False
     assert len(receipt["resources"]) == 2
-    assert [row["resource_key"] for row in receipt["resources"]] == sorted(
-        f"resource-{hashlib.sha256(str(document.resource_id).encode()).hexdigest()[:16]}"
-        for document in inventory.documents
-    )
     assert set(receipt["summary"]["used_rules"]) == {f"BR-0{index}" for index in range(1, 8)}
     for resource in receipt["resources"]:
         assert set(resource["operations"]) == {"get", "history", "diff", "activity"}
         for operation in resource["operations"].values():
             assert operation["normalized_equal"] is True
-            assert operation["mismatch_count"] == len(operation["mismatches"])
-            for mismatch in operation["mismatches"]:
-                assert set(mismatch) == {"path", "rule_id", "classification"}
+            assert operation["mismatch_count"] == sum(
+                mismatch["count"] for mismatch in operation["classified_mismatches"]
+            )
+            for mismatch in operation["classified_mismatches"]:
+                assert set(mismatch) == {"rule_id", "classification", "count"}
     encoded = json.dumps(receipt, sort_keys=True)
     assert all(document.body.decode() not in encoded for document in inventory.documents)
     assert all(str(document.resource_id) not in encoded for document in inventory.documents)
@@ -322,6 +391,66 @@ async def test_completed_run_compares_every_resource_and_is_immutable():
     assert len(legacy.calls) == len(inventory.documents) * 4
     assert len(candidate.calls) == len(inventory.documents) * 4
     assert receipt["receipt_digest"] == (await comparator.compare_run(run.run_id))["receipt_digest"]
+
+
+async def test_completed_reconcile_resolves_an_unchanged_mapping_from_its_owner_run():
+    run, inventory, items, native_ids = _fixtures()
+    changed, unchanged = inventory.documents
+    owner_run = replace(
+        run,
+        run_id=uuid.UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+        fixed_git_oid=_oid("a"),
+        coverage_version="c9-owner-v1",
+        inventory_digest="e" * 64,
+    )
+    mappings = {
+        changed.resource_id: LegacyRevisionMapping(
+            namespace_id=run.namespace_id,
+            resource_id=changed.resource_id,
+            legacy_git_oid=changed.current_commit,
+            path_at_revision=changed.current_path,
+            resolution="native",
+            native_revision_id=native_ids[changed.resource_id],
+            run_id=run.run_id,
+            lineage_ordinal=1,
+            fixed_git_oid=run.fixed_git_oid,
+        ),
+        unchanged.resource_id: LegacyRevisionMapping(
+            namespace_id=run.namespace_id,
+            resource_id=unchanged.resource_id,
+            legacy_git_oid=unchanged.current_commit,
+            path_at_revision=unchanged.current_path,
+            resolution="native",
+            native_revision_id=native_ids[unchanged.resource_id],
+            run_id=owner_run.run_id,
+            lineage_ordinal=1,
+            fixed_git_oid=owner_run.fixed_git_oid,
+        ),
+    }
+    fixed_refs = {
+        changed.resource_id: run.fixed_git_oid,
+        unchanged.resource_id: owner_run.fixed_git_oid,
+    }
+    comparator = NativeRevisionShadowComparator(
+        repository=_CrossRunReadRepository(run, owner_run, items[0], mappings),
+        bridge=_Bridge(inventory),
+        legacy_reader=_Reader(
+            native_ids,
+            candidate=False,
+            fixed_refs=fixed_refs,
+        ),
+        candidate_reader=_Reader(
+            native_ids,
+            candidate=True,
+            fixed_refs=fixed_refs,
+        ),
+    )
+
+    receipt = await comparator.compare_run(run.run_id)
+
+    assert receipt["status"] == "passed"
+    assert receipt["summary"]["resource_count"] == 2
+    assert receipt["summary"]["operation_count"] == 8
 
 
 async def test_incomplete_run_and_inventory_drift_are_rejected_before_reads():
