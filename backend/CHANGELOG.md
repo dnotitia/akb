@@ -63,6 +63,17 @@ sets rather than retaining complete Markdown bodies. Existing imported
 protocol-relative image sources remain renderable with a no-referrer policy;
 clickable protocol-relative links remain blocked.
 
+### Added app installation lifecycle commands
+
+Added administrator install, restore, fresh, status, and uninstall commands
+for app/Vault installations, plus the app-principal status projection. The
+service uses the existing registry transaction and grant-generation
+invariants for exact replay, concurrent conflict handling, immediate grant
+revocation, retained-resource restore, and resource-free fresh installation.
+Responses are bounded and redacted, administrator authority is checked before
+resource lookup, and lifecycle responses are marked `no-store`. No schema
+migration was required.
+
 ### Added app identity credential exchange and capability enforcement
 
 System administrators can now issue, list, rotate, and revoke exchange-only app
