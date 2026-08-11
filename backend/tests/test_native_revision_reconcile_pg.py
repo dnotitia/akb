@@ -241,6 +241,72 @@ async def _advance_fixture(fixture: dict, *, move: bool, revision: str = "r2") -
     return result
 
 
+async def _advance_move_update_suffix(fixture: dict, *, repeated: bool) -> dict:
+    git = fixture["git"]
+    vault_name = fixture["vault_name"]
+    current_path = "doc.md"
+    suffix_oids = []
+
+    move_oid = git.move_file(
+        vault_name,
+        current_path,
+        "draft.md",
+        "[move] doc.md -> draft.md\n\nagent: legacy-writer\naction: move\nsummary: first move",
+    )
+    suffix_oids.append(move_oid)
+    current_path = "draft.md"
+    update_oid = git.commit_file(
+        vault_name,
+        current_path,
+        "r2 body\n",
+        "[update] draft.md\n\nagent: legacy-writer\naction: update\nsummary: update after move",
+    )
+    suffix_oids.append(update_oid)
+
+    if repeated:
+        move_oid = git.move_file(
+            vault_name,
+            current_path,
+            "renamed.md",
+            "[move] draft.md -> renamed.md\n\nagent: legacy-writer\naction: move\nsummary: second move",
+        )
+        suffix_oids.append(move_oid)
+        current_path = "renamed.md"
+        update_oid = git.commit_file(
+            vault_name,
+            current_path,
+            "r3 body\n",
+            "[update] renamed.md\n\nagent: legacy-writer\naction: update\nsummary: update after second move",
+        )
+        suffix_oids.append(update_oid)
+
+    final_oid = suffix_oids[-1]
+    async with fixture["pool"].acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE documents
+               SET path = $2, current_commit = $3, updated_at = NOW()
+             WHERE id = $1
+            """,
+            fixture["document_id"],
+            current_path,
+            final_oid,
+        )
+    fixed_ref = git.commit_file(
+        vault_name,
+        "suffix-tip.md",
+        "tip\n",
+        "fixed move/update suffix tip",
+    )
+    return {
+        **fixture,
+        "suffix_oids": tuple(suffix_oids),
+        "final_oid": final_oid,
+        "final_path": current_path,
+        "fixed_suffix": fixed_ref,
+    }
+
+
 async def _authority_snapshot(pool, namespace_id: uuid.UUID, resource_id: uuid.UUID) -> list[dict]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -386,6 +452,200 @@ async def test_update_then_final_move_collapses_to_one_move_and_binds_suffix(tmp
         assert mappings[-1]["native_revision_id"] == revisions[-1]["revision_id"]
         assert alias["old_path"] == "doc.md"
         assert alias["created_revision_id"] == revisions[-1]["revision_id"]
+
+
+async def test_move_then_update_collapses_to_move_and_resolves_suffix_mappings(tmp_path):
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _advance_move_update_suffix(
+            await _make_fixture(pool, tmp_path),
+            repeated=False,
+        )
+        result = await NativeRevisionReconcile(
+            pool,
+            git=fixture["git"],
+            bridge=fixture["bridge"],
+        ).reconcile(
+            namespace_id=fixture["namespace_id"],
+            fixed_ref=fixture["fixed_suffix"],
+        )
+
+        assert result.status == "complete"
+        assert result.items[0].action == "move"
+        async with pool.acquire() as conn:
+            revision = await conn.fetchrow(
+                """
+                SELECT revision_id, parent_revision_id, action, path_from, path_to
+                  FROM native_revisions
+                 WHERE resource_id = $1 AND action <> 'create'
+                """,
+                fixture["document_id"],
+            )
+            mappings = await conn.fetch(
+                """
+                SELECT legacy_git_oid, path_at_revision, resolution, native_revision_id
+                  FROM legacy_revision_mappings
+                 WHERE resource_id = $1
+                 ORDER BY lineage_ordinal
+                """,
+                fixture["document_id"],
+            )
+        assert revision["action"] == "move"
+        assert revision["path_from"] == "doc.md"
+        assert revision["path_to"] == "draft.md"
+        assert [row["legacy_git_oid"] for row in mappings] == [
+            fixture["initial_oid"],
+            *fixture["suffix_oids"],
+        ]
+        assert [row["path_at_revision"] for row in mappings] == [
+            "doc.md",
+            "draft.md",
+            "draft.md",
+        ]
+        assert [row["resolution"] for row in mappings] == ["native", "bridge", "native"]
+
+        intermediate = await fixture["bridge"].resolve_selector(
+            resource_id=fixture["document_id"],
+            selector=fixture["suffix_oids"][0],
+        )
+        final = await fixture["bridge"].resolve_selector(
+            resource_id=fixture["document_id"],
+            selector=fixture["final_oid"],
+        )
+        assert intermediate.kind == "bridge"
+        assert intermediate.path_at_revision == "draft.md"
+        assert intermediate.native_revision_id is None
+        assert final.kind == "native"
+        assert final.native_revision_id == revision["revision_id"]
+
+
+async def test_repeated_move_update_suffix_resumes_replays_and_collapses_once(tmp_path):
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _advance_move_update_suffix(
+            await _make_fixture(pool, tmp_path),
+            repeated=True,
+        )
+        fired = False
+
+        async def failpoint(name: str):
+            nonlocal fired
+            if name == "authority.before_commit" and not fired:
+                fired = True
+                raise RuntimeError("interrupt repeated suffix publication")
+
+        failing = NativeRevisionReconcile(
+            pool,
+            git=fixture["git"],
+            bridge=fixture["bridge"],
+            failpoint=failpoint,
+        )
+        with pytest.raises(BackfillFailpointError):
+            await failing.reconcile(
+                namespace_id=fixture["namespace_id"],
+                fixed_ref=fixture["fixed_suffix"],
+            )
+
+        async with pool.acquire() as conn:
+            run_id = await conn.fetchval(
+                """
+                SELECT run_id
+                  FROM native_revision_migration_runs
+                 WHERE namespace_id = $1 AND fixed_git_oid = $2
+                """,
+                fixture["namespace_id"],
+                fixture["fixed_suffix"],
+            )
+            assert await conn.fetchval(
+                "SELECT count(*) FROM native_revisions WHERE resource_id = $1",
+                fixture["document_id"],
+            ) == 1
+
+        clean = NativeRevisionReconcile(pool, git=fixture["git"], bridge=fixture["bridge"])
+        resumed = await clean.reconcile_run(run_id)
+        assert resumed.status == "complete"
+        assert resumed.items[0].action == "move"
+        async with pool.acquire() as conn:
+            revision = await conn.fetchrow(
+                """
+                SELECT revision_id, action, path_from, path_to
+                  FROM native_revisions
+                 WHERE resource_id = $1 AND action <> 'create'
+                """,
+                fixture["document_id"],
+            )
+            mappings = await conn.fetch(
+                """
+                SELECT legacy_git_oid, path_at_revision, resolution,
+                       native_revision_id, run_id
+                  FROM legacy_revision_mappings
+                 WHERE resource_id = $1
+                 ORDER BY lineage_ordinal
+                """,
+                fixture["document_id"],
+            )
+            before_replay = await conn.fetchrow(
+                """
+                SELECT
+                    (SELECT count(*) FROM native_revisions) AS revisions,
+                    (SELECT count(*) FROM legacy_revision_mappings) AS mappings,
+                    (SELECT count(*) FROM native_revision_activity) AS activity,
+                    (SELECT count(*) FROM native_resource_path_aliases) AS aliases
+                """
+            )
+
+        assert revision["action"] == "move"
+        assert revision["path_from"] == "doc.md"
+        assert revision["path_to"] == "renamed.md"
+        assert [row["legacy_git_oid"] for row in mappings] == [
+            fixture["initial_oid"],
+            *fixture["suffix_oids"],
+        ]
+        assert [row["path_at_revision"] for row in mappings] == [
+            "doc.md",
+            "draft.md",
+            "draft.md",
+            "renamed.md",
+            "renamed.md",
+        ]
+        assert [row["resolution"] for row in mappings] == [
+            "native",
+            "bridge",
+            "bridge",
+            "bridge",
+            "native",
+        ]
+        assert all(row["run_id"] == run_id for row in mappings[1:])
+        assert mappings[-1]["native_revision_id"] == revision["revision_id"]
+
+        for oid in fixture["suffix_oids"][:-1]:
+            resolution = await fixture["bridge"].resolve_selector(
+                resource_id=fixture["document_id"],
+                selector=oid,
+            )
+            assert resolution.kind == "bridge"
+            assert resolution.native_revision_id is None
+        final = await fixture["bridge"].resolve_selector(
+            resource_id=fixture["document_id"],
+            selector=fixture["final_oid"],
+        )
+        assert final.kind == "native"
+        assert final.native_revision_id == revision["revision_id"]
+
+        replay = await clean.reconcile(
+            namespace_id=fixture["namespace_id"],
+            fixed_ref=fixture["fixed_suffix"],
+        )
+        assert replay.idempotent_replay is True
+        async with pool.acquire() as conn:
+            after_replay = await conn.fetchrow(
+                """
+                SELECT
+                    (SELECT count(*) FROM native_revisions) AS revisions,
+                    (SELECT count(*) FROM legacy_revision_mappings) AS mappings,
+                    (SELECT count(*) FROM native_revision_activity) AS activity,
+                    (SELECT count(*) FROM native_resource_path_aliases) AS aliases
+                """
+            )
+        assert dict(after_replay) == dict(before_replay)
 
 
 async def test_unchanged_final_ref_has_no_item_or_native_fact(tmp_path):

@@ -186,7 +186,9 @@ def _canonical_transition(parent_text: str, current_text: str) -> str:
 
 def _apply_unified_patch(parent_text: str, patch: str, diff_type: str) -> str:
     """Apply the exact Git patch to an independently read parent body."""
-    patch_lines = patch.splitlines()
+    patch_lines = patch.split("\n")
+    if patch_lines and patch_lines[-1] == "":
+        patch_lines.pop()
     hunk_indexes = [
         index for index, line in enumerate(patch_lines) if _HUNK_RE.fullmatch(line)
     ]
@@ -211,21 +213,36 @@ def _apply_unified_patch(parent_text: str, patch: str, diff_type: str) -> str:
         ):
             raise ShadowReaderScopeError("legacy fixed-ref diff patch has invalid headers")
 
-    source = parent_text.split("\n")
-    output: list[str] = []
+    source = parent_text.split("\n") if parent_text else []
+    source_has_newline = parent_text.endswith("\n")
+    if source_has_newline:
+        source.pop()
+    output: list[tuple[str, bool]] = []
     source_index = 0
     patch_index = hunk_indexes[0]
+    old_terminal_closed = False
+    new_terminal_closed = False
     while patch_index < len(patch_lines):
         header = _HUNK_RE.fullmatch(patch_lines[patch_index])
         if header is None:
             raise ShadowReaderScopeError("legacy fixed-ref diff patch has trailing data")
         old_start = int(header.group(1))
-        old_count = int(header.group(2) or "1")
-        new_count = int(header.group(4) or "1")
+        old_count = int(header.group(2)) if header.group(2) is not None else 1
+        new_count = int(header.group(4)) if header.group(4) is not None else 1
         hunk_source = 0 if old_start == 0 else old_start - 1
         if hunk_source < source_index or hunk_source > len(source):
             raise ShadowReaderScopeError("legacy fixed-ref diff patch has an invalid parent range")
-        output.extend(source[source_index:hunk_source])
+        if old_terminal_closed and hunk_source > source_index:
+            raise ShadowReaderScopeError("legacy fixed-ref diff patch has an invalid newline marker")
+        if new_terminal_closed and hunk_source > source_index:
+            raise ShadowReaderScopeError("legacy fixed-ref diff patch has an invalid newline marker")
+        output.extend(
+            (
+                source[index],
+                index < len(source) - 1 or source_has_newline,
+            )
+            for index in range(source_index, hunk_source)
+        )
         source_index = hunk_source
         observed_old = 0
         observed_new = 0
@@ -236,24 +253,57 @@ def _apply_unified_patch(parent_text: str, patch: str, diff_type: str) -> str:
             line = patch_lines[patch_index]
             patch_index += 1
             if line == r"\ No newline at end of file":
-                continue
+                raise ShadowReaderScopeError("legacy fixed-ref diff patch has an invalid newline marker")
             if not line or line[0] not in {" ", "+", "-"}:
                 raise ShadowReaderScopeError("legacy fixed-ref diff patch has invalid hunk data")
             marker, value = line[0], line[1:]
+            no_newline = False
+            if patch_index < len(patch_lines) and patch_lines[patch_index] == r"\ No newline at end of file":
+                no_newline = True
+                patch_index += 1
+            old_line = marker in {" ", "-"}
+            new_line = marker in {" ", "+"}
+            if old_line and old_terminal_closed or new_line and new_terminal_closed:
+                raise ShadowReaderScopeError("legacy fixed-ref diff patch has an invalid newline marker")
             if marker in {" ", "-"}:
                 if source_index >= len(source) or source[source_index] != value:
                     raise ShadowReaderScopeError(
                         "legacy fixed-ref diff patch differs from parent body"
                     )
+                source_line_has_newline = source_index < len(source) - 1 or source_has_newline
+                if no_newline != (not source_line_has_newline):
+                    raise ShadowReaderScopeError(
+                        "legacy fixed-ref diff patch has an invalid newline marker"
+                    )
+                source_line = source[source_index]
                 source_index += 1
                 observed_old += 1
+                if no_newline:
+                    old_terminal_closed = True
+            else:
+                source_line = ""
             if marker in {" ", "+"}:
-                output.append(value)
+                if marker == " ":
+                    output.append((source_line, not no_newline))
+                else:
+                    output.append((value, not no_newline))
                 observed_new += 1
+                if no_newline:
+                    new_terminal_closed = True
         if (observed_old, observed_new) != (old_count, new_count):
             raise ShadowReaderScopeError("legacy fixed-ref diff patch has invalid hunk counts")
-    output.extend(source[source_index:])
-    return "\n".join(output)
+    if old_terminal_closed and source_index != len(source):
+        raise ShadowReaderScopeError("legacy fixed-ref diff patch has an invalid newline marker")
+    if new_terminal_closed and source_index != len(source):
+        raise ShadowReaderScopeError("legacy fixed-ref diff patch has an invalid newline marker")
+    output.extend(
+        (
+            source[index],
+            index < len(source) - 1 or source_has_newline,
+        )
+        for index in range(source_index, len(source))
+    )
+    return "".join(value + ("\n" if has_newline else "") for value, has_newline in output)
 
 
 def _history_entries(

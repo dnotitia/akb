@@ -36,6 +36,7 @@ from app.services.legacy_revision_bridge import (
 )
 from app.services.native_revision_shadow import NativeRevisionShadowComparator
 from app.services.native_revision_shadow_reader import (
+    _apply_unified_patch,
     LegacyFixedRefShadowReader,
     NativeRevisionShadowReader,
     ShadowReaderScopeError,
@@ -128,6 +129,38 @@ async def _authority_counts(pool) -> tuple[tuple[str, int], ...]:
 
 def _oid(char: str) -> str:
     return char * 40
+
+
+@pytest.mark.parametrize(
+    ("parent_text", "patch", "expected"),
+    [
+        pytest.param(
+            "text\n",
+            "@@ -1 +1 @@\n-text\n+text\n\\ No newline at end of file\n",
+            "text",
+            id="newline-to-no-newline",
+        ),
+        pytest.param(
+            "text",
+            "@@ -1 +1 @@\n-text\n\\ No newline at end of file\n+text\n",
+            "text\n",
+            id="no-newline-to-newline",
+        ),
+    ],
+)
+async def test_apply_unified_patch_preserves_terminal_newline_state(
+    parent_text: str,
+    patch: str,
+    expected: str,
+):
+    assert _apply_unified_patch(parent_text, patch, "modified") == expected
+
+
+async def test_apply_unified_patch_rejects_forged_parent_line():
+    patch = "@@ -1 +1 @@\n-forged\n+text\n"
+
+    with pytest.raises(ShadowReaderScopeError, match="differs from parent body"):
+        _apply_unified_patch("text\n", patch, "modified")
 
 
 def _document() -> LegacyInventoryDocument:

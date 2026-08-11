@@ -524,17 +524,31 @@ class NativeRevisionReconcile:
                 "final legacy lineage does not end at current_commit",
                 code="native_revision_reconcile_divergent_lineage",
             )
-        base_index = next(
-            (
-                index
-                for index, entry in enumerate(document.lineage)
-                if entry.legacy_git_oid == head_mapping.legacy_git_oid
-            ),
-            None,
-        )
-        if base_index is None or base_index >= len(document.lineage) - 1:
+        lineage_oids = [entry.legacy_git_oid for entry in document.lineage]
+        if len(set(lineage_oids)) != len(lineage_oids):
+            raise ReconcileIntegrityError(
+                "final fixed-ref lineage contains an ambiguous legacy OID",
+                code="native_revision_reconcile_divergent_lineage",
+            )
+        base_indexes = [
+            index
+            for index, entry in enumerate(document.lineage)
+            if entry.legacy_git_oid == head_mapping.legacy_git_oid
+        ]
+        if len(base_indexes) != 1 or base_indexes[0] >= len(document.lineage) - 1:
             raise ReconcileIntegrityError(
                 "final fixed-ref lineage has no new suffix",
+                code="native_revision_reconcile_divergent_lineage",
+            )
+        base_index = base_indexes[0]
+        suffix = document.lineage[base_index:]
+        if (
+            any(not entry.path_at_revision for entry in suffix)
+            or suffix[0].path_at_revision != resource["path"]
+            or suffix[-1].path_at_revision != document.current_path
+        ):
+            raise ReconcileIntegrityError(
+                "final fixed-ref suffix has missing or divergent path lineage",
                 code="native_revision_reconcile_divergent_lineage",
             )
 
@@ -576,36 +590,45 @@ class NativeRevisionReconcile:
                     code="native_revision_reconcile_divergent_lineage",
                 )
 
-        old_path = resource["path"]
+        # Terminal activity describes only the final OID.  Validate it against
+        # that local edge, then classify the aggregate transition across the
+        # complete suffix from the native base to the frozen final state.
+        previous_path = suffix[-2].path_at_revision
+        if document.activity.path_to != document.current_path:
+            raise ReconcileIntegrityError(
+                "final legacy activity disagrees with the lineage destination",
+                code="native_revision_reconcile_divergent_lineage",
+            )
         if document.activity.action == "update":
-            if (
-                document.current_path != old_path
-                or document.activity.path_from is not None
-                or document.activity.path_to != document.current_path
-            ):
-                raise ReconcileIntegrityError(
-                    "update final ref does not preserve the native path",
-                    code="native_revision_reconcile_divergent_lineage",
-                )
-            return _PendingChange(
-                document=document,
-                action="replace",
-                parent_revision_id=resource["revision_id"],
-                path_from=old_path,
+            terminal_edge_is_valid = (
+                document.activity.path_from is None
+                and previous_path == document.current_path
+            )
+        else:
+            terminal_edge_is_valid = (
+                document.activity.path_from == previous_path
+                and previous_path != document.current_path
+            )
+        if not terminal_edge_is_valid:
+            raise ReconcileIntegrityError(
+                "final legacy activity disagrees with the terminal lineage edge",
+                code="native_revision_reconcile_divergent_lineage",
             )
 
-        if (
-            document.current_path == old_path
-            or document.activity.path_from != old_path
-            or document.activity.path_to != document.current_path
-        ):
+        old_path = resource["path"]
+        path_changed = document.current_path != old_path
+        body_changed = (
+            resource.get("digest") != document.body_digest
+            or resource.get("byte_size") != document.byte_size
+        )
+        if not path_changed and not body_changed:
             raise ReconcileIntegrityError(
-                "move final ref does not match the native current path",
+                "final fixed-ref suffix has no aggregate body or path change",
                 code="native_revision_reconcile_divergent_lineage",
             )
         return _PendingChange(
             document=document,
-            action="move",
+            action="move" if path_changed else "replace",
             parent_revision_id=resource["revision_id"],
             path_from=old_path,
         )
