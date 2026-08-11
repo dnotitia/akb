@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -117,11 +119,11 @@ def test_extract_asset_ids_is_conservative_around_code() -> None:
     assert extract_asset_ids(markdown) == {visible, titled, referenced}
 
 
-def test_asset_urls_use_one_lowercase_canonical_form() -> None:
+def test_asset_urls_accept_case_variants_and_normalize_to_one_uuid() -> None:
     asset_id = uuid.uuid4()
     assert extract_asset_ids(f"![ok](/api/assets/{asset_id})") == {asset_id}
-    assert extract_asset_ids(f"![prefix](/API/assets/{asset_id})") == set()
-    assert extract_asset_ids(f"![uuid](/api/assets/{str(asset_id).upper()})") == set()
+    assert extract_asset_ids(f"![prefix](/API/assets/{asset_id})") == {asset_id}
+    assert extract_asset_ids(f"![uuid](/api/assets/{str(asset_id).upper()})") == {asset_id}
 
 
 @pytest.mark.asyncio
@@ -658,6 +660,25 @@ def test_publication_view_grant_is_short_lived(
     assert public._verify_view_grant("share", grant) is False
 
 
+def test_legacy_publication_view_grant_remains_valid_during_rollout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.routes import public
+
+    now = 1_000_000
+    monkeypatch.setattr(public.time, "time", lambda: float(now))
+    monkeypatch.setattr(public.settings, "publication_view_grant_ttl_secs", 600)
+    monkeypatch.setattr(public.settings, "publication_view_grant_session_secs", 3600)
+    message = f"grant:share:{now}".encode()
+    signature = hmac.new(
+        public.settings.jwt_secret.encode(), message, hashlib.sha256,
+    ).hexdigest()
+    legacy_grant = f"{now}.{signature}"
+
+    assert public._verify_view_grant("share", legacy_grant) is True
+    assert public._parse_view_grant("other", legacy_grant) is None
+
+
 def test_publication_view_grant_cannot_rotate_past_fixed_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -680,7 +701,7 @@ def test_publication_view_grant_cannot_rotate_past_fixed_session(
 
 
 @pytest.mark.asyncio
-async def test_expired_view_grant_rotates_without_counting_another_view(
+async def test_expired_legacy_view_grant_rotates_without_counting_another_view(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from starlette.requests import Request
@@ -690,7 +711,12 @@ async def test_expired_view_grant_rotates_without_counting_another_view(
     monkeypatch.setattr(public.time, "time", lambda: float(now))
     monkeypatch.setattr(public.settings, "publication_view_grant_ttl_secs", 600)
     monkeypatch.setattr(public.settings, "publication_view_grant_session_secs", 3600)
-    old_grant = public._make_view_grant("share")
+    signature = hmac.new(
+        public.settings.jwt_secret.encode(),
+        f"grant:share:{now}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    old_grant = f"{now}.{signature}"
     now += 601
     observed: dict = {}
 

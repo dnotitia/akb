@@ -127,7 +127,7 @@ from app.repositories.document_repo import (
 )
 from app.repositories.events_repo import emit_event
 from app.repositories.vault_external_git_repo import VaultExternalGitRepository
-from app.repositories.vault_repo import VaultRepository
+from app.repositories.vault_repo import VaultRepository, lock_vault_for_child_write
 from app.services.git_service import GitService
 from app.services import asset_service
 from app.services.index_service import (
@@ -410,11 +410,7 @@ class DocumentService:
                     # row prevents vault deletion (which locks the parent and
                     # then cascades children) from deadlocking an image-bearing
                     # document write in the opposite order.
-                    vault_exists = await lock_conn.fetchval(
-                        "SELECT id FROM vaults WHERE id = $1 FOR KEY SHARE",
-                        vault_id,
-                    )
-                    if vault_exists is None:
+                    if not await lock_vault_for_child_write(lock_conn, vault_id):
                         raise NotFoundError("Vault", vault_name)
                     await acquire_path_lock(lock_conn, vault_id, file_path)
                     yield lock_conn
@@ -428,11 +424,7 @@ class DocumentService:
             pool = await get_pool()
             async with pool.acquire() as lock_conn:
                 async with lock_conn.transaction():
-                    vault_exists = await lock_conn.fetchval(
-                        "SELECT id FROM vaults WHERE id = $1 FOR KEY SHARE",
-                        vault_id,
-                    )
-                    if vault_exists is None:
+                    if not await lock_vault_for_child_write(lock_conn, vault_id):
                         raise NotFoundError("Vault", vault_name)
                     for p in sorted({path_a, path_b}):
                         await acquire_path_lock(lock_conn, vault_id, p)

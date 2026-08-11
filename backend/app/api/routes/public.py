@@ -118,19 +118,38 @@ def _make_view_grant(slug: str, *, issued_at: int | None = None) -> str:
 
 
 def _parse_view_grant(slug: str, grant: str | None) -> tuple[int, int] | None:
+    """Validate current and pre-session view-grant wire formats.
+
+    The two-field form was issued before bounded grant rotation existed. It is
+    accepted for its original TTL and can rotate only inside the same fixed
+    session bound, so an already-open page survives a rolling deployment
+    without spending another publication view or gaining a longer lifetime.
+    """
     if not grant:
         return None
-    try:
-        issued_str, expires_str, sig = grant.split(".", 2)
-        issued = int(issued_str)
-        expires = int(expires_str)
-    except (ValueError, AttributeError):
+    parts = grant.split(".")
+    if len(parts) == 2:
+        issued_str, sig = parts
+        try:
+            issued = int(issued_str)
+        except ValueError:
+            return None
+        expires = issued + settings.publication_view_grant_ttl_secs
+        msg = f"grant:{slug}:{issued_str}".encode("utf-8")
+    elif len(parts) == 3:
+        issued_str, expires_str, sig = parts
+        try:
+            issued = int(issued_str)
+            expires = int(expires_str)
+        except ValueError:
+            return None
+        msg = f"grant:{slug}:{issued_str}:{expires_str}".encode("utf-8")
+    else:
         return None
     if expires < issued:
         return None
     if expires > issued + settings.publication_view_grant_session_secs:
         return None
-    msg = f"grant:{slug}:{issued_str}:{expires_str}".encode("utf-8")
     expected = hmac.new(settings.jwt_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, sig):
         return None

@@ -362,6 +362,27 @@ describe("MarkdownEditor image insertion", () => {
     ));
   });
 
+  it("leaves mixed rich-text clipboard content to the normal paste path", () => {
+    const { container } = render(
+      <MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />,
+    );
+    const file = new File(["image"], "sheet.png", { type: "image/png" });
+    const editor = container.querySelector('[contenteditable="true"]');
+
+    const allowed = fireEvent.paste(editor!, {
+      clipboardData: {
+        files: [file],
+        getData: (type: string) =>
+          type === "text/html"
+            ? "<table><tr><td>Copied cell</td></tr></table>"
+            : "Copied cell",
+      },
+    });
+
+    expect(allowed).toBe(true);
+    expect(apiMocks.uploadAsset).not.toHaveBeenCalled();
+  });
+
   it("discards an uploaded image omitted from the accepted markdown", async () => {
     apiMocks.uploadAsset.mockResolvedValue({
       id: ASSET_ID,

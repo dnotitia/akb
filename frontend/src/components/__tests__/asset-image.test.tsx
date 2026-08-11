@@ -33,9 +33,9 @@ describe("AssetImage", () => {
     vi.restoreAllMocks();
   });
 
-  it("recognizes only canonical private asset URLs", () => {
+  it("normalizes case variants of private asset URLs", () => {
     expect(assetIdFromUrl(ASSET_URL)).toBe(ASSET_ID);
-    expect(assetIdFromUrl(ASSET_URL.toUpperCase())).toBeNull();
+    expect(assetIdFromUrl(ASSET_URL.toUpperCase())).toBe(ASSET_ID);
     expect(assetIdFromUrl(`/api/assets/not-a-uuid`)).toBeNull();
     expect(assetIdFromUrl(`https://example.test/api/assets/${ASSET_ID}`)).toBeNull();
   });

@@ -244,7 +244,7 @@ itAsync("_putImage rejects unsupported image types before network access", async
   }
 });
 
-itAsync("_discardImage accepts only canonical asset URLs", async () => {
+itAsync("_discardImage normalizes case variants of canonical asset URLs", async () => {
   const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
   const assetId = "11111111-2222-4333-8444-555555555555";
   const calls = [];
@@ -267,10 +267,15 @@ itAsync("_discardImage accepts only canonical asset URLs", async () => {
     () => proxy._discardImage({ vault: "myvault", url: `https://example.com/${assetId}` }),
     /Invalid document image URL/,
   );
-  await assert.rejects(
-    () => proxy._discardImage({ vault: "myvault", url: `/API/assets/${assetId}` }),
-    /Invalid document image URL/,
-  );
+  calls.length = 0;
+  await proxy._discardImage({
+    vault: "myvault",
+    url: `/API/assets/${assetId.toUpperCase()}`,
+  });
+  assert.deepEqual(calls, [{
+    method: "DELETE",
+    path: `/api/v1/assets/myvault/${assetId}`,
+  }]);
 });
 
 itAsync("_discardImage surfaces backend lookup failures", async () => {

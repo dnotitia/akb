@@ -70,7 +70,7 @@ const DOCUMENT_IMAGE_MIMES = new Set([
   "image/gif",
   "image/webp",
 ]);
-const ASSET_URL_RE = /^\/api\/assets\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/?$/;
+const ASSET_URL_RE = /^\/api\/assets\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/?$/i;
 
 function parseAssetUrl(url) {
   if (typeof url !== "string") throw new Error("image url must be a string");
@@ -80,7 +80,7 @@ function parseAssetUrl(url) {
       `Invalid document image URL: '${url}'. Expected /api/assets/<uuid>.`,
     );
   }
-  return match[1];
+  return match[1].toLowerCase();
 }
 
 function markdownAltText(value) {

@@ -381,6 +381,25 @@ function transferredImages(transfer: DataTransfer): File[] {
   return Array.from(transfer.files).filter((file) => file.type.startsWith("image/"));
 }
 
+function isStandaloneImageClipboard(transfer: DataTransfer): boolean {
+  const html = transfer.getData("text/html").trim();
+  const plain = transfer.getData("text/plain").trim();
+  if (!html) return plain.length === 0;
+
+  // Browser "Copy image" commonly provides both an image File and an HTML
+  // <img> flavor, sometimes with a plain-text label or URL. Rich document
+  // clipboard payloads from office tools also carry image Files, but their
+  // HTML contains meaningful text. Remove image/metadata-only nodes and let
+  // the normal Plate paste path keep the payload whenever text remains.
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  if (!template.content.querySelector("img")) return false;
+  for (const node of template.content.querySelectorAll("img, meta, link, style")) {
+    node.remove();
+  }
+  return !(template.content.textContent ?? "").trim();
+}
+
 interface RibbonButtonProps {
   label: string;
   active?: boolean;
@@ -954,10 +973,7 @@ export function MarkdownEditor({
           if (readOnly) return;
           const files = transferredImages(event.clipboardData);
           if (files.length === 0) return;
-          // Browser "Copy image" clipboards commonly include an <img> HTML
-          // flavor beside the binary file. The file is the authoritative
-          // signal; allowing the default paste here would insert only the
-          // remote HTML/source URL and skip AKB's upload validation.
+          if (!isStandaloneImageClipboard(event.clipboardData)) return;
           event.preventDefault();
           if (uploadInFlightRef.current) {
             deferredImageFilesRef.current.push(...files);

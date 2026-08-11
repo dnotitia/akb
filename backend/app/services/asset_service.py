@@ -19,6 +19,7 @@ from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import AKBError, ValidationError
 from app.repositories import vault_files_repo
+from app.repositories.vault_repo import lock_vault_for_child_write
 from app.services.adapters import s3_adapter
 from app.services.m1_file_measurement import measurement_enabled
 from app.services.s3_delete_worker import enqueue_delete
@@ -38,7 +39,8 @@ IMAGE_ASSET_MAX_TOTAL_FRAME_PIXELS = 48_000_000
 
 _ASSET_ID = r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 _ASSET_URL_RE = re.compile(
-    rf"^{re.escape(ASSET_URL_PREFIX)}(?P<id>{_ASSET_ID})/?$"
+    rf"^{re.escape(ASSET_URL_PREFIX)}(?P<id>{_ASSET_ID})/?$",
+    re.IGNORECASE,
 )
 _MARKDOWN_PARSER = MarkdownIt("commonmark")
 
@@ -115,7 +117,7 @@ def extract_asset_ids(markdown: str) -> set[uuid.UUID]:
     links, and raw HTML never produce an image token and therefore cannot retain
     or publicly authorize bytes.
     """
-    if ASSET_URL_PREFIX not in markdown:
+    if ASSET_URL_PREFIX not in markdown.lower():
         return set()
 
     result: set[uuid.UUID] = set()
@@ -137,7 +139,7 @@ def extract_asset_ids(markdown: str) -> set[uuid.UUID]:
 
 async def extract_asset_ids_async(markdown: str) -> set[uuid.UUID]:
     """Parse a document manifest without occupying the asyncio event loop."""
-    if ASSET_URL_PREFIX not in markdown:
+    if ASSET_URL_PREFIX not in markdown.lower():
         return set()
     return await asyncio.to_thread(extract_asset_ids, markdown)
 
@@ -345,11 +347,7 @@ async def create_image_asset(
             # phase. This serializes queued uploads with permanent deletion and
             # ensures that every committed pending row is included in the
             # deletion sweep.
-            vault_exists = await conn.fetchval(
-                "SELECT id FROM vaults WHERE id = $1 FOR KEY SHARE",
-                vault_id,
-            )
-            if vault_exists is None:
+            if not await lock_vault_for_child_write(conn, vault_id):
                 raise AKBError(
                     "Vault was deleted while the image upload was queued",
                     status_code=409,
@@ -384,11 +382,7 @@ async def create_image_asset(
                 # Serialize final publication with vault deletion. The S3 call
                 # has completed, so this transaction contains only bounded DB
                 # work and does not pin a pool connection on remote latency.
-                vault_exists = await conn.fetchval(
-                    "SELECT id FROM vaults WHERE id = $1 FOR KEY SHARE",
-                    vault_id,
-                )
-                if vault_exists is None:
+                if not await lock_vault_for_child_write(conn, vault_id):
                     raise AKBError(
                         "Vault was deleted while the image upload was starting",
                         status_code=409,

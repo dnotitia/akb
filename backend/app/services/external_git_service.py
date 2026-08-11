@@ -36,6 +36,7 @@ from app.db.postgres import get_pool
 from app.exceptions import AKBError, MirrorMarkerError
 from app.repositories.document_repo import CollectionRepository, DocumentRepository
 from app.repositories.events_repo import emit_event
+from app.repositories.vault_repo import lock_vault_for_child_write
 from app.repositories.vault_external_git_repo import VaultExternalGitRepository
 from app.services.git_service import GitService
 from app.services.index_service import (
@@ -506,6 +507,11 @@ class ExternalGitService:
         coll_repo = CollectionRepository(pool)
         async with pool.acquire() as conn:
             async with conn.transaction():
+                if not await lock_vault_for_child_write(conn, vault_id):
+                    raise AKBError(
+                        "Vault was deleted during external Git synchronization",
+                        status_code=409,
+                    )
                 previous_asset_state = await doc_repo.find_asset_sync_state_for_update(
                     vault_id, path, conn=conn,
                 )
@@ -627,6 +633,8 @@ class ExternalGitService:
         from app.services.kg_service import delete_document_relations
         async with pool.acquire() as conn:
             async with conn.transaction():
+                if not await lock_vault_for_child_write(conn, vault_id):
+                    return "already_absent"
                 row = await conn.fetchrow(
                     """
                     SELECT id, collection_id, created_by, external_blob
