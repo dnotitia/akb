@@ -90,11 +90,11 @@ async def insert_or_adopt(
     key it waits and then returns the winner. DO NOTHING returns no row on
     conflict, forcing a follow-up SELECT that races the other transaction.
 
-    The re-`collection_id` is the only field touched on adopt: it re-attaches a
-    file whose collection row was dropped (`collections.id ON DELETE SET NULL`)
-    so the row agrees with the collection its key encodes. Descriptive fields
-    are left alone — first writer wins — so a repeat upload cannot silently
-    rewrite metadata that something else may already be reading.
+    Re-adoption refreshes ``updated_at`` as an upload lease. Otherwise a
+    previously abandoned pending row could remain past the GC cutoff while a
+    new transfer is actively using it. Descriptive fields are left alone —
+    first writer wins — so a repeat upload cannot silently rewrite metadata
+    that something else may already be reading.
     """
     row = await conn.fetchrow(
         """
@@ -103,7 +103,11 @@ async def insert_or_adopt(
              mime_type, size_bytes, description, created_by)
         VALUES ($1, $2, $3, 'file', 'pending', $4, $5, $6, $7, $8, $9)
         ON CONFLICT (vault_id, s3_key) DO UPDATE
-            SET collection_id = EXCLUDED.collection_id
+            SET collection_id = EXCLUDED.collection_id,
+                updated_at = CASE
+                    WHEN vault_files.upload_state = 'pending' THEN NOW()
+                    ELSE vault_files.updated_at
+                END
         RETURNING id
         """,
         file_id, vault_id, collection_id, name, s3_key,
@@ -550,13 +554,43 @@ async def delete_unclaimed_attachment(
     file_id: uuid.UUID,
     created_by: str,
 ) -> dict | None:
-    """Delete one caller-owned upload only if no document ever claimed it."""
+    """Delete one finalized caller upload only if no document claimed it."""
     row = await conn.fetchrow(
         """
         DELETE FROM vault_files
          WHERE id = $1
            AND vault_id = $2
            AND kind = 'attachment'
+           AND upload_state = 'confirmed'
+           AND attachment_claimed_at IS NULL
+           AND created_by = $3
+        RETURNING id, s3_key
+        """,
+        file_id, vault_id, created_by,
+    )
+    return dict(row) if row else None
+
+
+async def delete_failed_pending_attachment(
+    conn,
+    *,
+    vault_id: uuid.UUID,
+    file_id: uuid.UUID,
+    created_by: str,
+) -> dict | None:
+    """Remove a failed pending upload after its object write has settled.
+
+    This is intentionally separate from the user-facing discard predicate:
+    callers must not remove metadata while an accepted object write may still
+    be in flight.
+    """
+    row = await conn.fetchrow(
+        """
+        DELETE FROM vault_files
+         WHERE id = $1
+           AND vault_id = $2
+           AND kind = 'attachment'
+           AND upload_state = 'pending'
            AND attachment_claimed_at IS NULL
            AND created_by = $3
         RETURNING id, s3_key

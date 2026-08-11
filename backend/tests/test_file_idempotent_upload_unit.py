@@ -325,6 +325,57 @@ async def test_same_bytes_same_name_twice_is_one_row(pool, vault_id):
         assert await _row_count(conn, vault_id) == 1
 
 
+async def test_re_adopting_stale_pending_file_wins_gc_race(pool, vault_id):
+    """An adopted upload refreshes its lease before stale-file GC can delete it."""
+    key = _s3_key("v", "IS", "restarted.bin", content_hash=_HASH_A)
+    async with pool.acquire() as conn:
+        original_id = await _put(conn, vault_id, key)
+        await conn.execute(
+            "UPDATE vault_files SET updated_at = NOW() - INTERVAL '2 days' WHERE id = $1",
+            original_id,
+        )
+
+    adopted = asyncio.Event()
+    release = asyncio.Event()
+
+    async def adopter() -> uuid.UUID:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                adopted_id = await _put(conn, vault_id, key)
+                adopted.set()
+                await release.wait()
+                return adopted_id
+
+    async def collector():
+        await adopted.wait()
+        async with pool.acquire() as conn:
+            return await conn.fetchval(
+                """
+                DELETE FROM vault_files
+                 WHERE id = $1
+                   AND upload_state = 'pending'
+                   AND updated_at < NOW() - INTERVAL '24 hours'
+                RETURNING id
+                """,
+                original_id,
+            )
+
+    adopt_task = asyncio.create_task(adopter())
+    collect_task = asyncio.create_task(collector())
+    await adopted.wait()
+    await asyncio.sleep(0.05)
+    assert not collect_task.done()
+    release.set()
+
+    assert await adopt_task == original_id
+    assert await collect_task is None
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM vault_files WHERE id = $1",
+            original_id,
+        ) == 1
+
+
 async def test_legacy_confirm_write_advances_pending_upload_state(pool, vault_id):
     """An older pod only sets hash_verified_at; the migration trigger keeps a
     rolling deployment from leaving that successfully uploaded File hidden."""

@@ -37,6 +37,16 @@ describe("AssetImage", () => {
     expect(assetIdFromUrl(`https://example.test/api/assets/${ASSET_ID}`)).toBeNull();
   });
 
+  it("preserves protocol-relative images without sending a referrer", () => {
+    render(
+      <MarkdownRender markdown="![Imported diagram](//cdn.example.test/diagram.png)" />,
+    );
+
+    const image = screen.getByRole("img", { name: "Imported diagram" });
+    expect(image).toHaveAttribute("src", "//cdn.example.test/diagram.png");
+    expect(image).toHaveAttribute("referrerpolicy", "no-referrer");
+  });
+
   it("loads authenticated assets through a protected blob request", async () => {
     apiMocks.getAssetBlob.mockResolvedValue(new Blob(["image"], { type: "image/png" }));
     const { unmount } = render(

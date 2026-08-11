@@ -299,7 +299,7 @@ async def test_cancelled_upload_settles_put_before_enqueuing_delete(
         asset_service.vault_files_repo, "insert_pending_attachment", fake_insert,
     )
     monkeypatch.setattr(
-        asset_service.vault_files_repo, "delete_unclaimed_attachment", fake_delete,
+        asset_service.vault_files_repo, "delete_failed_pending_attachment", fake_delete,
     )
     monkeypatch.setattr(asset_service, "enqueue_delete", fake_enqueue)
 
@@ -324,6 +324,37 @@ async def test_cancelled_upload_settles_put_before_enqueuing_delete(
 
     assert events.index("put_finished") < events.index("delete_metadata")
     assert events.index("delete_metadata") < events.index("enqueue_delete")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("delete_name", "expected_state"),
+    [
+        ("delete_unclaimed_attachment", "confirmed"),
+        ("delete_failed_pending_attachment", "pending"),
+    ],
+)
+async def test_user_discard_and_failed_upload_cleanup_have_separate_state_guards(
+    delete_name: str,
+    expected_state: str,
+) -> None:
+    from app.repositories import vault_files_repo
+
+    captured: dict[str, object] = {}
+
+    class _Conn:
+        async def fetchrow(self, query, *args):
+            captured.update(query=" ".join(query.split()), args=args)
+            return None
+
+    await getattr(vault_files_repo, delete_name)(
+        _Conn(),
+        vault_id=uuid.uuid4(),
+        file_id=uuid.uuid4(),
+        created_by="alice",
+    )
+
+    assert f"upload_state = '{expected_state}'" in str(captured["query"])
 
 
 @pytest.mark.asyncio
@@ -425,7 +456,7 @@ async def test_public_asset_grant_does_not_bypass_password_access(
 
 
 @pytest.mark.asyncio
-async def test_public_document_body_and_asset_manifest_share_pinned_cache(
+async def test_public_asset_manifest_cache_does_not_retain_document_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from app.services import publication_service
@@ -466,7 +497,7 @@ async def test_public_document_body_and_asset_manifest_share_pinned_cache(
     async def fake_find(_publication):
         return row
 
-    publication_service._read_pinned_document_body.cache_clear()
+    publication_service._PINNED_DOCUMENT_ASSET_CACHE.clear()
     monkeypatch.setattr(
         publication_service,
         "_get_doc_service",
@@ -478,13 +509,22 @@ async def test_public_document_body_and_asset_manifest_share_pinned_cache(
         asset_ids = await publication_service.resolve_document_publication_asset_ids(
             publication,
         )
+        repeated_asset_ids = await asyncio.gather(
+            *(
+                publication_service.resolve_document_publication_asset_ids(publication)
+                for _ in range(8)
+            )
+        )
     finally:
-        publication_service._read_pinned_document_body.cache_clear()
+        publication_service._PINNED_DOCUMENT_ASSET_CACHE.clear()
 
+    # Page resolution seeds the compact UUID manifest, so subordinate image
+    # requests neither reread Git nor retain the complete body.
     assert reads == 1
     assert str(visible) in rendered["content"]
     assert str(hidden) not in rendered["content"]
     assert asset_ids == frozenset({visible})
+    assert repeated_asset_ids == [asset_ids] * 8
 
 
 @pytest.mark.asyncio
@@ -531,7 +571,7 @@ async def test_legacy_public_document_resolves_head_into_pinned_cache(
     async def fake_find(_publication):
         return row
 
-    publication_service._read_pinned_document_body.cache_clear()
+    publication_service._PINNED_DOCUMENT_ASSET_CACHE.clear()
     monkeypatch.setattr(
         publication_service,
         "_get_doc_service",
@@ -544,7 +584,7 @@ async def test_legacy_public_document_resolves_head_into_pinned_cache(
             publication,
         )
     finally:
-        publication_service._read_pinned_document_body.cache_clear()
+        publication_service._PINNED_DOCUMENT_ASSET_CACHE.clear()
 
     assert heads == 2
     assert reads == 1

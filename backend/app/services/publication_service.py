@@ -17,11 +17,12 @@ import math
 import re
 import secrets
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from functools import lru_cache
+from threading import Lock
 from typing import Any
 
 import asyncpg
@@ -1193,56 +1194,118 @@ def _read_document_body_uncached(
     )
 
 
-@lru_cache(maxsize=64)
-def _read_pinned_document_body(
+_ManifestKey = tuple[str, str, str, str | None]
+
+
+class _PinnedDocumentAssetCache:
+    """Small thread-safe LRU that retains UUID manifests, never document text."""
+
+    def __init__(self, maxsize: int):
+        self._maxsize = maxsize
+        self._entries: OrderedDict[_ManifestKey, frozenset[uuid.UUID]] = OrderedDict()
+        self._lock = Lock()
+
+    def get(self, key: _ManifestKey) -> frozenset[uuid.UUID] | None:
+        with self._lock:
+            value = self._entries.get(key)
+            if value is not None:
+                self._entries.move_to_end(key)
+            return value
+
+    def put(self, key: _ManifestKey, value: frozenset[uuid.UUID]) -> None:
+        with self._lock:
+            self._entries[key] = value
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._maxsize:
+                self._entries.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+_PINNED_DOCUMENT_ASSET_CACHE = _PinnedDocumentAssetCache(maxsize=64)
+
+
+def _read_pinned_document_asset_ids(
     vault_name: str,
     path: str,
     commit_hash: str,
     section_filter: str | None,
-) -> _ResolvedDocumentBody:
-    """Cache an immutable Git representation and its exact image manifest."""
+) -> frozenset[uuid.UUID]:
+    """Cache only the manifest derived from an immutable Git representation."""
+    key = (vault_name, path, commit_hash, section_filter)
+    cached = _PINNED_DOCUMENT_ASSET_CACHE.get(key)
+    if cached is not None:
+        return cached
     resolved = _read_document_body_uncached(
         vault_name, path, commit_hash, section_filter,
     )
     if resolved.content_unavailable:
-        # functools.lru_cache never stores exceptions. Keep transient Git/filesystem
-        # failures retryable instead of pinning the placeholder for this process.
+        # Keep transient Git/filesystem failures retryable instead of pinning
+        # the placeholder for this process.
         raise _UncacheableDocumentBody(resolved)
-    return resolved
+    _PINNED_DOCUMENT_ASSET_CACHE.put(key, resolved.asset_ids)
+    return resolved.asset_ids
+
+
+async def _resolve_document_commit(doc_row) -> str | None:
+    """Return the immutable commit used for one document representation."""
+    commit_hash = doc_row["current_commit"]
+    if commit_hash is None:
+        # Legacy rows used floating HEAD. Resolve it once per request so both
+        # body and manifest helpers can address an immutable representation.
+        commit_hash = await asyncio.to_thread(
+            _get_doc_service().git.current_commit,
+            doc_row["vault_name"],
+        )
+    return commit_hash
 
 
 async def _resolve_document_body(
     doc_row,
     section_filter: str | None,
 ) -> _ResolvedDocumentBody:
-    commit_hash = doc_row["current_commit"]
-    if commit_hash is None:
-        # Legacy rows used floating HEAD. Resolve HEAD first, then use the same
-        # immutable cache as current rows: a later commit produces a new cache
-        # key, while N image requests for one page do not re-read and re-parse
-        # the complete Git file.
-        commit_hash = await asyncio.to_thread(
-            _get_doc_service().git.current_commit,
-            doc_row["vault_name"],
+    commit_hash = await _resolve_document_commit(doc_row)
+    resolved = await asyncio.to_thread(
+        _read_document_body_uncached,
+        doc_row["vault_name"],
+        doc_row["path"],
+        commit_hash,
+        section_filter,
+    )
+    if commit_hash is not None and not resolved.content_unavailable:
+        _PINNED_DOCUMENT_ASSET_CACHE.put(
+            (doc_row["vault_name"], doc_row["path"], commit_hash, section_filter),
+            resolved.asset_ids,
         )
-        if commit_hash is None:
-            return await asyncio.to_thread(
-                _read_document_body_uncached,
-                doc_row["vault_name"],
-                doc_row["path"],
-                None,
-                section_filter,
-            )
+    return resolved
+
+
+async def _resolve_document_asset_ids(
+    doc_row,
+    section_filter: str | None,
+) -> frozenset[uuid.UUID]:
+    commit_hash = await _resolve_document_commit(doc_row)
+    if commit_hash is None:
+        resolved = await asyncio.to_thread(
+            _read_document_body_uncached,
+            doc_row["vault_name"],
+            doc_row["path"],
+            None,
+            section_filter,
+        )
+        return resolved.asset_ids
     try:
         return await asyncio.to_thread(
-            _read_pinned_document_body,
+            _read_pinned_document_asset_ids,
             doc_row["vault_name"],
             doc_row["path"],
             commit_hash,
             section_filter,
         )
     except _UncacheableDocumentBody as exc:
-        return exc.resolved
+        return exc.resolved.asset_ids
 
 
 async def _find_published_document(publication: dict):
@@ -1332,11 +1395,10 @@ async def resolve_document_publication_asset_ids(publication: dict) -> frozenset
     if publication["resource_type"] != ResourceType.DOCUMENT:
         raise PublicationError("Not a document publication", status_code=400)
     doc_row = await _find_published_document(publication)
-    resolved_body = await _resolve_document_body(
+    return await _resolve_document_asset_ids(
         doc_row,
         publication.get("section_filter"),
     )
-    return resolved_body.asset_ids
 
 
 _HEADING_RE = re.compile(r"^(#+)\s+(.*)$")

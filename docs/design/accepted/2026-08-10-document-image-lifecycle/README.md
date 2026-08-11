@@ -2,7 +2,7 @@
 status: accepted
 stage: applied
 created: 2026-08-10
-updated: 2026-08-10
+updated: 2026-08-11
 ---
 
 # Document image lifecycle
@@ -28,6 +28,11 @@ code spans/fences or ordinary links as authorization.
 An attachment may be reused by multiple documents in the same vault. Its live
 visibility is the union of those current document references; it has no
 independent public toggle.
+
+External image compatibility remains separate from managed attachment
+authorization. Existing HTTP(S), relative, and protocol-relative image sources
+render with a no-referrer policy; unsafe executable schemes remain blocked.
+Clickable links continue to use the stricter navigation URL policy.
 
 ## Reference model
 
@@ -79,6 +84,8 @@ images still consumes exactly one view-cap entry. The grant controls counting,
 not content access: a password-protected publication also requires its existing
 one-hour password token on every image request. The exact section manifest is
 checked before any attachment UUID reaches object storage.
+The immutable-revision cache retains only this bounded UUID manifest, not the
+complete Markdown body.
 
 ## Deletion and retention
 
@@ -105,7 +112,10 @@ server-side decoding succeeds, AKB commits an unreadable pending attachment row
 before the S3 PUT, performs the remote PUT without holding a database connection,
 then marks it confirmed and hash-verified in a short transaction. Normal failures
 enqueue the key for deletion immediately; a hard process exit leaves the pending
-row for the same bounded collector. Image
+row for the same bounded collector. Re-adopting a content-addressed pending File
+refreshes its collection deadline. User-facing discard accepts only confirmed
+attachments; failure cleanup has a separate pending-only predicate and runs
+after the object write settles. Image
 decoding runs in a bounded worker-thread path so multi-frame validation cannot
 block the API event loop.
 Request cancellation shields and settles an in-flight boto3 PUT before cleanup

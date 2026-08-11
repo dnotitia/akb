@@ -397,7 +397,7 @@ async def create_image_asset(
         try:
             async with pool.acquire() as conn:
                 async with conn.transaction():
-                    row = await vault_files_repo.delete_unclaimed_attachment(
+                    row = await vault_files_repo.delete_failed_pending_attachment(
                         conn,
                         vault_id=vault_id,
                         file_id=file_id,

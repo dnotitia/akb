@@ -15,7 +15,11 @@ export type AssetContext =
 
 function safeExternalImageUrl(src: string): string | null {
   const trimmed = src.trim();
-  if (!trimmed || trimmed.startsWith("//")) return null;
+  if (!trimmed) return null;
+  // Preserve protocol-relative image sources used by imported Markdown.
+  // Images are non-navigational and are always rendered with no-referrer;
+  // clickable links continue to reject this form in sanitizeLinkUrl().
+  if (trimmed.startsWith("//")) return trimmed;
   const safe = sanitizeLinkUrl(trimmed);
   if (safe !== "#") return safe;
   // `sanitizeLinkUrl` intentionally targets navigation and rejects bare

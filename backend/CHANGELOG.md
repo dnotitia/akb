@@ -44,7 +44,10 @@ Slow request bodies use a separately bounded admission pool and deadline instead
 of occupying image decode and object-storage slots. Regular File upload readiness
 now uses an explicit `upload_state`: pre-hash legacy Files remain confirmed and
 visible, while newly initiated transfers are pending and stale pending rows are
-collected after 24 hours by default.
+collected after 24 hours by default. Re-adopting a content-addressed pending
+File refreshes its upload lease before collection, and user-initiated image
+discard is limited to finalized uploads so an active object transfer cannot
+lose its metadata owner.
 
 Document updates preserve pre-existing broken placeholders but reject newly
 introduced unavailable, expired, or cross-vault asset URLs. Public image
@@ -54,6 +57,11 @@ containing multiple images consumes exactly one view-cap entry. The grant never
 replaces publication access: password-protected image requests must also carry
 the one-hour password token and continue to revalidate the exact published
 section before storage is touched.
+
+Pinned public-document image manifests cache only their bounded attachment UUID
+sets rather than retaining complete Markdown bodies. Existing imported
+protocol-relative image sources remain renderable with a no-referrer policy;
+clickable protocol-relative links remain blocked.
 
 ### Added app identity credential exchange and capability enforcement
 
