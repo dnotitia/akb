@@ -217,7 +217,7 @@ curl -sk -X DELETE "$BASE_URL/api/v1/vaults/$OTHER_VAULT" -H "Authorization: Bea
 
 echo ""
 echo "═══════════════════════════════════════════"
-echo "  Passed: $PASS   Failed: $FAIL"
+echo "  Results: $PASS passed, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then
   echo "  Failures:"
   printf '    - %s\n' "${ERRORS[@]}"
