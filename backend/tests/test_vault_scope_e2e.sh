@@ -139,7 +139,7 @@ mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_delete_vault" "{\"vault\":\"$NONGDN_VAULT\"
 # ── Summary ──────────────────────────────────────────────────
 echo ""
 echo "════════════════════════════════════════════"
-echo "  PASS: $PASS    FAIL: $FAIL"
+echo "  Results: $PASS passed, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then
   printf '  %s\n' "${ERRORS[@]}"
   exit 1

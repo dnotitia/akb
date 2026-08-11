@@ -12,6 +12,12 @@ cd "${REPO_ROOT}"
 
 step() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 
+# ─── E2E suite manifest ───────────────────────────────────────────
+# Fails fast when a new shell E2E suite is neither run by the hosted gate nor
+# deliberately deferred with a reviewed reason.
+step "E2E suite manifest"
+python backend/scripts/ci/e2e_suite_runner.py --check-manifest --repo-root "${REPO_ROOT}"
+
 # ─── backend: ruff (lint) ──────────────────────────────────────────
 step "ruff (backend)"
 ruff check backend/
