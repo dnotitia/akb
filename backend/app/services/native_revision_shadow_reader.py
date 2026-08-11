@@ -9,6 +9,7 @@ the Resource identity and the native genesis Revision published by C9.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import hashlib
 import re
 from collections.abc import Mapping
@@ -18,19 +19,21 @@ from uuid import UUID
 
 import asyncpg
 
-from app.exceptions import ConflictError, NotFoundError
+from app.exceptions import AKBError, ConflictError, NotFoundError
 from app.repositories.native_revision_repo import NativeRevisionRepository
 from app.services.document_service import _parse_markdown
 from app.services.git_service import FixedRefHistoryError, GitService
 from app.services.legacy_revision_bridge import (
     LegacyInventoryDocument,
-    LegacyRevisionBridge,
 )
 from app.services.native_revision_service import NativeRevisionService
 from app.services.uri_service import doc_uri
 
 
 _OID_RE = re.compile(r"^[0-9a-f]{40}$")
+_HUNK_RE = re.compile(
+    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$"
+)
 
 
 class ShadowReaderScopeError(ConflictError):
@@ -75,6 +78,15 @@ class NativeRevisionReadRepository(Protocol):
         resource_id,
         revision_id: str,
     ) -> dict[str, Any] | None: ...
+
+
+class SelectorBridge(Protocol):
+    async def resolve_selector(
+        self,
+        *,
+        resource_id,
+        selector: str,
+    ): ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,18 +161,99 @@ def _validate_lineage(document: LegacyInventoryDocument) -> None:
 
 
 def _snapshot_diff(text: str) -> str:
-    """Render one deterministic content snapshot for both read models.
-
-    C10 compares a Git parent-based diff with the native fixed-ref snapshot
-    basis.  The basis is the approved semantic difference; the selected
-    current body must still be the same.  This deliberately avoids making the
-    native genesis pretend it has a legacy parent.
-    """
+    """Render the shared final-state form after a verified transition."""
     normalized = text.replace("\r\n", "\n")
     lines = normalized.splitlines()
     if not lines:
         return "@@ snapshot @@\n"
     return "@@ snapshot @@\n" + "\n".join(f" {line}" for line in lines)
+
+
+def _canonical_transition(parent_text: str, current_text: str) -> str:
+    """Derive the parity envelope through both immutable transition bodies."""
+    delta = tuple(
+        difflib.ndiff(
+            parent_text.splitlines(keepends=True),
+            current_text.splitlines(keepends=True),
+        )
+    )
+    rebuilt = "".join(difflib.restore(delta, 2))
+    if rebuilt != current_text:
+        raise ShadowReaderScopeError("shadow reader transition could not reproduce current body")
+    _, body = _parsed_body(rebuilt)
+    return _snapshot_diff(body)
+
+
+def _apply_unified_patch(parent_text: str, patch: str, diff_type: str) -> str:
+    """Apply the exact Git patch to an independently read parent body."""
+    patch_lines = patch.splitlines()
+    hunk_indexes = [
+        index for index, line in enumerate(patch_lines) if _HUNK_RE.fullmatch(line)
+    ]
+    if not hunk_indexes:
+        prefix = "+" if diff_type == "added" else "-" if diff_type == "deleted" else None
+        if prefix is None or any(not line.startswith(prefix) for line in patch_lines):
+            raise ShadowReaderScopeError("legacy fixed-ref diff patch is not canonical unified data")
+        materialized = "\n".join(line[1:] for line in patch_lines)
+        if diff_type == "deleted":
+            if materialized != parent_text:
+                raise ShadowReaderScopeError("legacy fixed-ref diff patch differs from parent body")
+            return ""
+        if parent_text:
+            raise ShadowReaderScopeError("legacy fixed-ref added patch has a non-empty parent")
+        return materialized
+
+    if hunk_indexes[0] != 0:
+        allowed_headers = {"diff --git", "index ", "--- ", "+++ "}
+        if any(
+            not any(line.startswith(prefix) for prefix in allowed_headers)
+            for line in patch_lines[: hunk_indexes[0]]
+        ):
+            raise ShadowReaderScopeError("legacy fixed-ref diff patch has invalid headers")
+
+    source = parent_text.split("\n")
+    output: list[str] = []
+    source_index = 0
+    patch_index = hunk_indexes[0]
+    while patch_index < len(patch_lines):
+        header = _HUNK_RE.fullmatch(patch_lines[patch_index])
+        if header is None:
+            raise ShadowReaderScopeError("legacy fixed-ref diff patch has trailing data")
+        old_start = int(header.group(1))
+        old_count = int(header.group(2) or "1")
+        new_count = int(header.group(4) or "1")
+        hunk_source = 0 if old_start == 0 else old_start - 1
+        if hunk_source < source_index or hunk_source > len(source):
+            raise ShadowReaderScopeError("legacy fixed-ref diff patch has an invalid parent range")
+        output.extend(source[source_index:hunk_source])
+        source_index = hunk_source
+        observed_old = 0
+        observed_new = 0
+        patch_index += 1
+        while patch_index < len(patch_lines) and _HUNK_RE.fullmatch(
+            patch_lines[patch_index]
+        ) is None:
+            line = patch_lines[patch_index]
+            patch_index += 1
+            if line == r"\ No newline at end of file":
+                continue
+            if not line or line[0] not in {" ", "+", "-"}:
+                raise ShadowReaderScopeError("legacy fixed-ref diff patch has invalid hunk data")
+            marker, value = line[0], line[1:]
+            if marker in {" ", "-"}:
+                if source_index >= len(source) or source[source_index] != value:
+                    raise ShadowReaderScopeError(
+                        "legacy fixed-ref diff patch differs from parent body"
+                    )
+                source_index += 1
+                observed_old += 1
+            if marker in {" ", "+"}:
+                output.append(value)
+                observed_new += 1
+        if (observed_old, observed_new) != (old_count, new_count):
+            raise ShadowReaderScopeError("legacy fixed-ref diff patch has invalid hunk counts")
+    output.extend(source[source_index:])
+    return "\n".join(output)
 
 
 def _history_entries(
@@ -417,12 +510,40 @@ class LegacyFixedRefShadowReader:
             raise ShadowReaderScopeError(
                 "legacy fixed-ref diff differs from C9 inventory"
             )
-        _, body = _parsed_body(snapshot.body.decode("utf-8"))
+        previous = document.lineage[-2] if len(document.lineage) > 1 else None
+        try:
+            current_text, parent_text = await asyncio.gather(
+                asyncio.to_thread(
+                    self.git.read_file,
+                    self.vault_name,
+                    document.current_path,
+                    commit=selector,
+                ),
+                asyncio.to_thread(
+                    self.git.read_file,
+                    self.vault_name,
+                    previous.path_at_revision,
+                    commit=previous.legacy_git_oid,
+                )
+                if previous is not None
+                else asyncio.sleep(0, result=""),
+            )
+        except (OSError, ValueError) as exc:
+            raise ShadowReaderScopeError("legacy fixed-ref diff body reads failed") from exc
+        if not isinstance(current_text, str) or not isinstance(parent_text, str):
+            raise ShadowReaderScopeError("legacy fixed-ref diff body facts are missing")
+        snapshot_text = snapshot.body.decode("utf-8")
+        if current_text != snapshot_text:
+            raise ShadowReaderScopeError("legacy fixed-ref diff current body differs from C9 facts")
+        patch_parent = "" if diff_type == "added" else parent_text
+        applied = _apply_unified_patch(patch_parent, raw_diff["diff"], diff_type)
+        if applied != current_text:
+            raise ShadowReaderScopeError("legacy fixed-ref diff patch differs from current body")
         return {
             "file": document.current_path,
             "commit": selector,
             "basis": "git-parent",
-            "text": _snapshot_diff(body),
+            "text": _canonical_transition(parent_text, applied),
             "format": "unified",
         }
 
@@ -465,12 +586,14 @@ class NativeRevisionShadowReader:
         vault_name: str,
         native_service: NativeRevisionReadService | None = None,
         native_repository: NativeRevisionReadRepository | None = None,
-        selector_bridge: LegacyRevisionBridge | None = None,
+        selector_bridge: SelectorBridge | None = None,
     ):
         if native_service is None and pool is None:
             raise ValueError("pool or native_service is required")
         if not isinstance(vault_name, str) or not vault_name.strip():
             raise ValueError("vault_name must be non-empty")
+        if selector_bridge is None:
+            raise ValueError("selector_bridge is required for product shadow evidence")
         self.pool = pool
         self.namespace_id = namespace_id
         self.vault_name = vault_name
@@ -553,22 +676,7 @@ class NativeRevisionShadowReader:
                 )
             except NotFoundError as exc:
                 raise ShadowReaderScopeError("native revision is outside the C9 Resource scope") from exc
-            text = _value(raw_snapshot, "text")
-            if not isinstance(text, str):
-                raise ShadowReaderScopeError("native revision materialization returned no text")
-            action = _value(raw_snapshot, "action")
-            snapshot = _NativeMaterialization(
-                resource_id=_value(raw_snapshot, "resource_id"),
-                revision_id=_value(raw_snapshot, "revision_id"),
-                surface=_value(raw_snapshot, "surface"),
-                path=_value(raw_snapshot, "path"),
-                text=text,
-                digest=_value(raw_snapshot, "digest"),
-                byte_size=_value(raw_snapshot, "byte_size"),
-                action=action if isinstance(action, str) and action else "create",
-                parent_revision_id=_value(raw_snapshot, "parent_revision_id"),
-                occurred_at=_value(raw_snapshot, "occurred_at"),
-            )
+            snapshot = self._materialization(raw_snapshot)
             self._validate_materialization(snapshot, document, selector=selector)
             self._snapshot_cache = (key, snapshot)
             return snapshot
@@ -598,6 +706,74 @@ class NativeRevisionShadowReader:
                 f"native revision {source} differs from the selected Revision"
             )
 
+    @classmethod
+    def _validate_revision_body_facts(
+        cls,
+        row: Mapping[str, Any],
+        snapshot: _NativeMaterialization,
+        *,
+        namespace_id: Any,
+        source: str,
+    ) -> None:
+        try:
+            body = snapshot.text.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as exc:
+            raise ShadowReaderScopeError(
+                f"native revision {source} body facts are invalid"
+            ) from exc
+        if (
+            not isinstance(snapshot.revision_id, str)
+            or _OID_RE.fullmatch(snapshot.revision_id) is None
+            or snapshot.surface != "document"
+            or not isinstance(snapshot.path, str)
+            or not snapshot.path
+            or snapshot.action not in {"create", "replace", "move"}
+            or snapshot.occurred_at is None
+            or (
+                snapshot.parent_revision_id is not None
+                and (
+                    not isinstance(snapshot.parent_revision_id, str)
+                    or _OID_RE.fullmatch(snapshot.parent_revision_id) is None
+                )
+            )
+            or row.get("namespace_id") != namespace_id
+            or row.get("resource_id") != snapshot.resource_id
+            or row.get("revision_id") != snapshot.revision_id
+            or row.get("surface") != snapshot.surface
+            or cls._row_path(row) != snapshot.path
+            or row.get("action") != snapshot.action
+            or row.get("parent_revision_id") != snapshot.parent_revision_id
+            or row.get("occurred_at") != snapshot.occurred_at
+            or row.get("digest") != snapshot.digest
+            or row.get("byte_size") != snapshot.byte_size
+            or len(body) != snapshot.byte_size
+            or hashlib.sha256(body).hexdigest() != snapshot.digest
+        ):
+            raise ShadowReaderScopeError(
+                f"native revision {source} body facts differ from persisted Revision"
+            )
+
+    @staticmethod
+    def _materialization(raw_snapshot: Any) -> _NativeMaterialization:
+        text = _value(raw_snapshot, "text")
+        if not isinstance(text, str):
+            raise ShadowReaderScopeError("native revision materialization returned no text")
+        action = _value(raw_snapshot, "action")
+        if not isinstance(action, str) or not action:
+            raise ShadowReaderScopeError("native revision materialization returned no action")
+        return _NativeMaterialization(
+            resource_id=_value(raw_snapshot, "resource_id"),
+            revision_id=_value(raw_snapshot, "revision_id"),
+            surface=_value(raw_snapshot, "surface"),
+            path=_value(raw_snapshot, "path"),
+            text=text,
+            digest=_value(raw_snapshot, "digest"),
+            byte_size=_value(raw_snapshot, "byte_size"),
+            action=action,
+            parent_revision_id=_value(raw_snapshot, "parent_revision_id"),
+            occurred_at=_value(raw_snapshot, "occurred_at"),
+        )
+
     async def _native_history_rows(
         self,
         document: LegacyInventoryDocument,
@@ -612,12 +788,6 @@ class NativeRevisionShadowReader:
         ):
             raise ShadowReaderScopeError("native revision history is missing or invalid")
         copied = [dict(row) for row in rows]
-        self._validate_selected_revision(
-            copied[0],
-            snapshot,
-            document,
-            source="history",
-        )
         revision_ids = [row.get("revision_id") for row in copied]
         if len(set(revision_ids)) != len(revision_ids) or any(
             not isinstance(revision_id, str) or _OID_RE.fullmatch(revision_id) is None
@@ -626,22 +796,40 @@ class NativeRevisionShadowReader:
             raise ShadowReaderScopeError("native revision history has invalid selectors")
         if any(row.get("occurred_at") is None for row in copied):
             raise ShadowReaderScopeError("native revision history has missing chronology")
-        ordered = sorted(
-            copied,
-            key=lambda row: (row["occurred_at"], row["revision_id"]),
-            reverse=True,
+        rows_by_id = {row["revision_id"]: row for row in copied}
+        selected = rows_by_id.get(snapshot.revision_id)
+        if selected is None:
+            raise ShadowReaderScopeError("native revision history has no selected head")
+        self._validate_selected_revision(
+            selected,
+            snapshot,
+            document,
+            source="history",
         )
-        if [row["revision_id"] for row in copied] != [
-            row["revision_id"] for row in ordered
-        ]:
-            raise ShadowReaderScopeError("native revision history order is invalid")
-        for index, row in enumerate(copied):
-            expected_parent = (
-                copied[index + 1]["revision_id"] if index + 1 < len(copied) else None
+        ordered: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        revision_id: str | None = snapshot.revision_id
+        while revision_id is not None:
+            if revision_id in seen:
+                raise ShadowReaderScopeError("native revision history parent cycle is invalid")
+            row = rows_by_id.get(revision_id)
+            if row is None:
+                raise ShadowReaderScopeError("native revision history parent is missing")
+            if row.get("resource_id") != document.resource_id:
+                raise ShadowReaderScopeError("native revision history crosses Resource scope")
+            parent_id = row.get("parent_revision_id")
+            if parent_id is not None and (
+                not isinstance(parent_id, str) or _OID_RE.fullmatch(parent_id) is None
+            ):
+                raise ShadowReaderScopeError("native revision history parent is invalid")
+            seen.add(revision_id)
+            ordered.append(row)
+            revision_id = parent_id
+        if len(ordered) != len(copied):
+            raise ShadowReaderScopeError(
+                "native revision history has disconnected extra rows"
             )
-            if row.get("parent_revision_id") != expected_parent:
-                raise ShadowReaderScopeError("native revision history parent chain is invalid")
-        return copied
+        return ordered
 
     async def _verify_selector_bridge(
         self,
@@ -651,12 +839,18 @@ class NativeRevisionShadowReader:
         fixed_ref: str,
         history_rows: list[dict[str, Any]],
     ) -> None:
-        if self.selector_bridge is None:
-            return
-        native = await self.selector_bridge.resolve_selector(
-            resource_id=document.resource_id,
-            selector=native_revision_id,
-        )
+        async def resolve(selector: str, source: str):
+            try:
+                return await self.selector_bridge.resolve_selector(
+                    resource_id=document.resource_id,
+                    selector=selector,
+                )
+            except (AKBError, AttributeError, TypeError, ValueError) as exc:
+                raise ShadowReaderScopeError(
+                    f"{source} selector is not bound to the completed C9 bridge"
+                ) from exc
+
+        native = await resolve(native_revision_id, "native history head")
         if (
             native.kind != "native"
             or native.native_revision_id != native_revision_id
@@ -665,10 +859,7 @@ class NativeRevisionShadowReader:
             raise ShadowReaderScopeError("native history head is not bound to the C9 selector")
         native_lineage: list[str] = []
         for entry in document.lineage:
-            resolution = await self.selector_bridge.resolve_selector(
-                resource_id=document.resource_id,
-                selector=entry.legacy_git_oid,
-            )
+            resolution = await resolve(entry.legacy_git_oid, "retained")
             if (
                 resolution.kind not in {"native", "bridge"}
                 or resolution.legacy_git_oid != entry.legacy_git_oid
@@ -684,10 +875,7 @@ class NativeRevisionShadowReader:
                 ):
                     raise ShadowReaderScopeError("native history mapping has no Revision token")
                 native_lineage.append(resolution.native_revision_id)
-        current = await self.selector_bridge.resolve_selector(
-            resource_id=document.resource_id,
-            selector=document.current_commit,
-        )
+        current = await resolve(document.current_commit, "current retained")
         if (
             current.kind != "native"
             or current.native_revision_id != native_revision_id
@@ -765,14 +953,27 @@ class NativeRevisionShadowReader:
             document,
             source="diff",
         )
+        self._validate_revision_body_facts(
+            raw_selected,
+            snapshot,
+            namespace_id=self.namespace_id,
+            source="selected",
+        )
+        parent_text = ""
         if snapshot.action == "create":
             if snapshot.parent_revision_id is not None:
                 raise ShadowReaderScopeError("native revision diff has an invalid create parent")
         elif snapshot.action in {"replace", "move"}:
             if snapshot.parent_revision_id is None:
                 raise ShadowReaderScopeError("native revision diff has no parent")
+            raw_parent = await self.native_repository.get_revision(
+                resource_id=document.resource_id,
+                revision_id=snapshot.parent_revision_id,
+            )
+            if not isinstance(raw_parent, Mapping):
+                raise ShadowReaderScopeError("native revision diff parent row is missing")
             try:
-                parent = await self.native_service.get_resource_revision(
+                raw_parent_snapshot = await self.native_service.get_resource_revision(
                     namespace_id=self.namespace_id,
                     surface="document",
                     resource_id=document.resource_id,
@@ -780,20 +981,21 @@ class NativeRevisionShadowReader:
                 )
             except NotFoundError as exc:
                 raise ShadowReaderScopeError("native revision diff parent is missing") from exc
-            if (
-                _value(parent, "resource_id") != document.resource_id
-                or _value(parent, "revision_id") != snapshot.parent_revision_id
-                or not isinstance(_value(parent, "text"), str)
-            ):
-                raise ShadowReaderScopeError("native revision diff parent is invalid")
+            parent_snapshot = self._materialization(raw_parent_snapshot)
+            self._validate_revision_body_facts(
+                raw_parent,
+                parent_snapshot,
+                namespace_id=self.namespace_id,
+                source="parent",
+            )
+            parent_text = parent_snapshot.text
         else:
             raise ShadowReaderScopeError("native revision diff action is unsupported")
-        _, body = _parsed_body(snapshot.text)
         return {
             "file": document.current_path,
             "commit": selector,
             "basis": "fixed-ref-snapshot",
-            "text": _snapshot_diff(body),
+            "text": _canonical_transition(parent_text, snapshot.text),
             "format": "unified",
         }
 
