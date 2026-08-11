@@ -154,7 +154,7 @@ letting the indexing worker re-populate.
 |------|-------------|
 | `akb_list_vaults` / `akb_create_vault` | Vault management |
 | `akb_put` / `akb_get` / `akb_update` / `akb_delete` | Document CRUD (Git commit + indexing) |
-| `akb_put_file` / `akb_get_file` / `akb_delete_file` | File attachments — proxy-side (requires local filesystem) |
+| `akb_put_file` / `akb_get_file` / `akb_update_file` / `akb_delete_file` | File attachments — proxy-side (requires local filesystem) |
 | `akb_create_table` / `akb_alter_table` / `akb_drop_table` / `akb_sql` | Tabular content — per-doc tables + SQL |
 | `akb_browse` | Tree traversal (collection → docs) |
 | `akb_search` / `akb_grep` | Hybrid search (dense + BM25) / literal grep |

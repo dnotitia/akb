@@ -1445,8 +1445,37 @@ Downloads from S3 to a local path. Handled by akb-mcp stdio proxy.
 ## Example
 ```
 akb_get_file(uri="akb://eng/file/abc123", save_to="/tmp/downloads/")
-→ {"name": "diagram.png", "save_to": "/tmp/downloads/diagram.png", "size_bytes": 45000}
+→ {"name": "diagram.png", "save_to": "/tmp/downloads/diagram.png", "size_bytes": 45000,
+   "content_hash": "…", "version": "…"}
 ```""",
+
+    "akb_update_file": """# akb_update_file — Replace a File
+
+Replaces an existing file's bytes while preserving its AKB URI. Handled by the
+akb-mcp stdio proxy. The proxy hashes the local file first, so an identical
+replacement returns `unchanged=true` without uploading bytes.
+
+## Parameters
+| Param | Required | Description |
+|-------|----------|-------------|
+| uri | ✓ | Existing file AKB URI |
+| file_path | ✓ | Absolute path to the local replacement file |
+| expected_content_hash | | Hash returned by `akb_get_file`; stale values return 409 |
+| expected_version | | Opaque `version` returned by `akb_get_file`; stale values return 409 |
+| mime_type | | New MIME type; existing type is preserved when omitted |
+
+## Example
+```
+current = akb_get_file(uri="akb://eng/file/abc123", save_to="/tmp/current.pdf")
+akb_update_file(
+  uri="akb://eng/file/abc123",
+  file_path="/tmp/revised.pdf",
+  expected_content_hash=current["content_hash"],
+  expected_version=current["version"])
+```
+
+When both preconditions are supplied, both must still match at confirmation.
+Re-read the file before retrying a 409 conflict.""",
 
     "akb_delete_file": """# akb_delete_file — Delete a File
 
@@ -1488,7 +1517,7 @@ Permissions: SELECT=reader, INSERT/UPDATE/DELETE=writer""",
 Binary files (images, PDFs, exports) stored in S3 with metadata in PostgreSQL.
 Files appear in `akb_browse` alongside documents and tables.
 
-File tools (`akb_put_file`, `akb_get_file`, `akb_delete_file`) work with local file paths —
+File tools (`akb_put_file`, `akb_get_file`, `akb_update_file`, `akb_delete_file`) work with local file paths —
 they are handled by the akb-mcp stdio proxy which streams files directly to/from S3.
 
 ## Tools
@@ -1497,6 +1526,7 @@ they are handled by the akb-mcp stdio proxy which streams files directly to/from
 |------|-------------|
 | `akb_put_file` | Upload a local file to vault storage |
 | `akb_get_file` | Download a file to a local path |
+| `akb_update_file` | Replace a file with optional hash/version preconditions |
 | `akb_delete_file` | Delete a file |
 | `akb_browse` | Files appear in unified browse |
 | `akb_link` | Connect file to documents or tables |
@@ -1512,6 +1542,13 @@ result = akb_put_file(vault="eng", file_path="/path/to/diagram.png", collection=
 ```
 akb_get_file(uri="akb://eng/file/abc123", save_to="/tmp/downloads/")
 # → {name: "diagram.png", save_to: "/tmp/downloads/diagram.png", size_bytes: 45000}
+```
+
+## Replace without clobbering a concurrent update
+```
+current = akb_get_file(uri="akb://eng/file/abc123", save_to="/tmp/diagram.png")
+akb_update_file(uri="akb://eng/file/abc123", file_path="/tmp/new-diagram.png",
+  expected_content_hash=current["content_hash"], expected_version=current["version"])
 ```
 
 ## Link a file to a document

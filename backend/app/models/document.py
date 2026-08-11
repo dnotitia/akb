@@ -199,6 +199,7 @@ class BrowseItem(BaseModel):
     size_bytes: int | None = None
     etag: str | None = None
     storage_version: str | None = None
+    version: str | None = None
 
 
 class BrowseResponse(BaseModel):
