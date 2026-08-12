@@ -11,6 +11,8 @@ This is the Phase 0 architecture decision for
 [#357](https://github.com/dnotitia/akb/issues/357). Implementation is pending.
 The record fixes the authority and security boundaries that later phases must
 preserve without fixing their route layout, claim schema, or code structure.
+Public revision and review summaries are recorded in
+[`rounds/`](rounds/README.md) and [`feedback/`](feedback/README.md).
 
 ## Relationship to Workspace Account Governance
 
@@ -63,8 +65,14 @@ auth_mode = local | sso
 
 `local` and `sso` are mutually exclusive security modes. There is no new
 hybrid mode, and an unavailable or failed authentication path never falls back
-to the other mode. Legacy configuration may be translated during an explicit,
-bounded migration, but it does not become a third runtime mode.
+to the other mode.
+
+A fresh install with a missing or unknown `auth_mode` fails installation or
+startup before serving an authentication surface. It must not silently default
+to `local`. Only an explicit legacy migration may derive a mode from existing
+settings, and only when those settings identify one mode unambiguously. The
+migration persists the derived canonical mode before normal startup; ambiguous
+legacy state fails closed and requires an explicit operator choice.
 
 ### Credential authority
 
@@ -79,6 +87,15 @@ and user access credentials. A successful login does not mint an AKB user
 session token. Refresh credentials, if used, remain under the OIDC authority's
 protocol and are not accepted as AKB API bearer credentials.
 
+Every versioned OIDC verifier profile binds three mandatory semantic
+invariants: the exact configured issuer, the intended AKB audience/resource,
+and the accepted credential/token type. A cryptographically valid credential
+that is missing or mismatches any of them is rejected before account
+projection, with no retry against another profile and no authentication
+fallback. Concrete identifiers and the provider-specific representation of
+these semantics belong to the versioned profile; this ADR does not prescribe
+claim field names.
+
 PATs and service credentials are orthogonal to the human login mode. Each
 trusted API surface declares whether it accepts them and what scope they carry;
 selecting `local` or `sso` neither reclassifies them as user sessions nor grants
@@ -92,9 +109,12 @@ are considered. A selected profile may read a JOSE header only to enforce that
 the token exactly matches that profile's algorithm and trusted key source.
 
 The untrusted `alg` header never selects an algorithm, verifier, issuer, or key
-source. If parsing, signature validation, claim validation, account projection,
-or account-status validation fails, the request is rejected. The system does
-not try another profile or fall back to local authentication.
+source. Exact issuer, intended AKB audience/resource, and accepted
+credential/token type are validated by the already-selected profile. A
+mismatch is rejected before a verified principal is accepted or account
+projection begins. If parsing, signature validation, other profile validation,
+projection, or account-status validation fails, the request is rejected. The
+system does not try another profile or fall back to local authentication.
 
 ### One authorization path
 
@@ -148,7 +168,7 @@ following.
 
 | Class | Contracts fixed by this ADR | Change or retirement rule |
 | --- | --- | --- |
-| Permanent | One canonical mode; no hybrid or failure fallback; mode-selected verification; no AKB user session minted in `sso`; common principal-to-actor authorization; separate ordinary and product-admin surfaces; PAT/service orthogonality | Changing one requires an ADR that explicitly supersedes this record. |
+| Permanent | One required canonical mode with no silent default; no hybrid or failure fallback; mode-selected verification; exact OIDC issuer, AKB audience/resource, and credential/token type validation before projection; no AKB user session minted in `sso`; common principal-to-actor authorization; separate ordinary and product-admin surfaces; PAT/service orthogonality | Changing one requires an ADR that explicitly supersedes this record. |
 | Versioned | Local asymmetric session profile; OIDC access-token profile; public login-options and admin-control schemas | Introduce a new named version with compatibility, migration, and retirement rules. Do not silently widen an existing verifier profile. |
 | Migration-only | Acceptance of legacy symmetric AKB sessions and any compatibility for legacy hybrid configuration | Must have a bounded entry condition and the retirement criteria below. Remove its code, configuration, and tests when retired. |
 
@@ -162,8 +182,9 @@ removed after the maximum validity of those tokens and the declared rollback
 window have both elapsed. The legacy signing secret, configuration, verifier,
 and migration tests are removed together.
 
-Legacy hybrid compatibility, if required, may help an upgrade select and
-persist one canonical mode; it must not trial multiple verifiers or keep both
+Legacy hybrid compatibility, if required, may derive and persist one canonical
+mode only through an explicit migration and only from unambiguous legacy state.
+It must not silently choose `local`, trial multiple verifiers, or keep both
 ordinary login methods active. It is removed once every supported upgrade path
 persists `auth_mode`, ambiguous legacy combinations are rejected, and the
 declared rollback window has closed. Its compatibility flags, adapters, and
@@ -180,16 +201,35 @@ failing test.
 
 | Later phase | Tests it owns |
 | --- | --- |
-| Mode boundary | Mode-specific positive paths; wrong-mode and malformed credentials; header-directed verifier and key-source attacks; no verifier fallback; shared `AkbActor` authorization; no AKB user-session issuance in `sso`; any bounded symmetric-session migration. |
-| Installation and admin bootstrap | Canonical configuration and upgrade validation; key persistence and rollover for the selected local profile; explicit product-admin provisioning; mode-appropriate admin recovery; any bounded legacy-hybrid migration. |
+| Mode boundary | Mode-specific positive paths; missing or mismatched exact OIDC issuer, intended AKB audience/resource, and accepted credential/token type; wrong-mode and malformed credentials; header-directed verifier and key-source attacks; rejection before projection; no verifier retry or fallback; shared `AkbActor` authorization; no AKB user-session issuance in `sso`; any bounded symmetric-session migration. |
+| Installation and admin bootstrap | Fresh-install rejection of missing or unknown `auth_mode`; explicit unambiguous legacy derivation and persistence; rejection of ambiguous legacy state; key persistence and rollover for the selected local profile; explicit product-admin provisioning; mode-appropriate admin recovery; any bounded legacy-hybrid migration. |
 | Login and IdP control | UI and API capability agreement by mode; enabled-provider projection; fail-closed login-options behavior; disabled-provider and secret redaction; separation of ordinary login from product-admin control. |
 | Browser session cutover | OIDC access, refresh, expiry, logout, revocation, and account suspension across AKB and first-party clients; proof that the `sso` path does not issue, store, or forward an AKB user session token. |
+
+Mode-boundary acceptance requires:
+
+- a credential matching the selected OIDC profile's exact issuer, intended AKB
+  audience/resource, and accepted credential/token type can proceed to
+  projection;
+- a missing or mismatched value for any of those three invariants is rejected
+  before projection creates or resolves an account; and
+- rejection does not invoke another verifier, derive another credential type,
+  or fall back to local authentication.
+
+Installation-boundary acceptance requires:
+
+- a fresh install with missing or unknown `auth_mode` fails closed before the
+  service accepts authentication traffic; and
+- a legacy migration derives and persists a mode only from unambiguous state,
+  while ambiguous state requires an explicit choice.
 
 Permanent tests assert externally observable authority, allow/deny, projection,
 and authorization outcomes. Versioned tests name the profile or schema version
 they cover. Migration-only tests state their deletion gate. Tests must not
 freeze internal call graphs, class names, file names, field ordering, or an
-exhaustive route and claim matrix.
+exhaustive route and claim matrix. OIDC tests assert the issuer,
+audience/resource, and credential-type semantics rather than provider-specific
+claim field names.
 
 ## Open Decisions
 
@@ -197,6 +237,9 @@ The following remain open until their owning implementation phase:
 
 - the first asymmetric local profile's algorithm, key parameters, claims,
   storage, publication, and rotation details;
+- the concrete OIDC issuer and AKB audience/resource identifiers, accepted
+  credential type, and provider-specific representation selected by the first
+  versioned OIDC profile;
 - immediate reauthentication versus a bounded legacy symmetric-session window,
   including the window's exact duration;
 - whether legacy hybrid installations require a bounded compatibility release
