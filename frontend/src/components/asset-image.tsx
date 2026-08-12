@@ -50,6 +50,7 @@ export function AssetImage({
   assetContext,
   className,
   onError,
+  onLoad,
   ...imgProps
 }: AssetImageProps) {
   const assetId = assetIdFromUrl(src);
@@ -103,10 +104,12 @@ export function AssetImage({
         objectUrl = URL.createObjectURL(blob);
         setLoadState({ key: assetKey, blobUrl: objectUrl, failed: false });
       })
-      .catch((error: unknown) => {
-        if (!(error instanceof DOMException && error.name === "AbortError")) {
-          setLoadState({ key: assetKey, blobUrl: null, failed: true });
-        }
+      .catch(() => {
+        // Ignore only this component's own cleanup abort.  A shared request
+        // aborted by session expiry is a real visible failure; otherwise the
+        // component would remain in its loading state forever.
+        if (controller.signal.aborted) return;
+        setLoadState({ key: assetKey, blobUrl: null, failed: true });
       });
 
     return () => {
@@ -176,8 +179,25 @@ export function AssetImage({
       decoding={imgProps.decoding ?? "async"}
       referrerPolicy="no-referrer"
       className={frameClass}
+      onLoad={(event) => {
+        // A successful retry completes this refresh cycle.  A later expiry may
+        // acquire one more counted window; duplicate errors within a cycle are
+        // still suppressed by the latch set in onError.
+        if (publicationRetry?.key === renderKey) {
+          publicationRefreshKeyRef.current = null;
+        }
+        onLoad?.(event);
+      }}
       onError={(event) => {
         if (assetId && publicationSlug && renderKey) {
+          const latestUrl = publicationAssetUrl(publicationSlug, assetId);
+          if (latestUrl !== resolvedSrc) {
+            // Another image may already have refreshed this publication after
+            // this element rendered its URL. Rebind to that grant before
+            // spending another view on a redundant refresh.
+            setPublicationRetry({ key: renderKey, url: latestUrl });
+            return;
+          }
           if (publicationRefreshKeyRef.current !== renderKey) {
             // Mark the refresh before starting it. The browser can report the
             // same failed URL more than once, but only one grant rotation

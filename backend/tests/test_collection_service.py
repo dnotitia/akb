@@ -240,6 +240,26 @@ async def test_create_unknown_vault_raises_not_found(service):
         )
 
 
+@pytest.mark.asyncio
+async def test_create_losing_a_vault_delete_returns_conflict(
+    service, pool, vault_id, vault_name, monkeypatch,
+):
+    """A delete after access lookup is a retryable conflict, not an FK 500."""
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM vaults WHERE id = $1", vault_id)
+
+    async def stale_lookup(_self, _vault):
+        return vault_id
+
+    monkeypatch.setattr(VaultRepository, "get_id_by_name", stale_lookup)
+
+    from app.exceptions import ConflictError
+    with pytest.raises(ConflictError):
+        await service.create(
+            vault=vault_name, path="race", summary=None, agent_id=None,
+        )
+
+
 # ── delete ────────────────────────────────────────────────────────
 
 

@@ -92,6 +92,27 @@ def strip_code_spans(content: str) -> str:
 
 # ── Link extraction from markdown body ───────────────────────
 
+def normalize_document_link_ref(ref: str) -> str:
+    """Normalize Markdown's path prefixes to an AKB vault-relative ref.
+
+    Historical AKB documents use vault-relative paths even when authors spell
+    them with ``./``, one or more ``../`` segments, or a leading ``/``.  Remove
+    only those complete prefixes.  ``str.lstrip('./')`` is intentionally not
+    used: it treats its argument as a character set and corrupts legitimate
+    names such as ``.well-known.md``.
+    """
+    normalized = ref
+    while True:
+        if normalized.startswith("../"):
+            normalized = normalized[3:]
+        elif normalized.startswith("./"):
+            normalized = normalized[2:]
+        elif normalized.startswith("/"):
+            normalized = normalized[1:]
+        else:
+            return normalized
+
+
 def extract_markdown_links(content: str) -> list[str]:
     """Extract internal document references from markdown links.
 
@@ -104,10 +125,10 @@ def extract_markdown_links(content: str) -> list[str]:
 
     def _add(raw: str) -> None:
         """Normalize one link target and append it (deduped). Filters
-        external URLs / anchors; keeps akb:// URIs verbatim; strips a
-        leading './' and any '#fragment' from relative paths."""
+        external URLs / anchors; keeps akb:// URIs verbatim; normalizes
+        explicit vault-relative prefixes and strips any '#fragment'."""
         target = raw.strip()
-        if not target or target.startswith(("http://", "https://", "mailto:", "#")):
+        if not target or target.startswith(("http://", "https://", "mailto:", "//", "#")):
             return
         if target.lower().startswith(ASSET_URL_PREFIX):
             return
@@ -116,10 +137,9 @@ def extract_markdown_links(content: str) -> list[str]:
                 targets.append(target)
                 seen.add(target)
             return
-        if target.startswith("./"):
-            target = target[2:]
         if "#" in target:
             target = target.split("#")[0]
+        target = normalize_document_link_ref(target)
         if target and target not in seen:
             targets.append(target)
             seen.add(target)
@@ -1200,6 +1220,8 @@ async def _resolve_doc_ref(conn, vault_id: uuid.UUID, ref: str) -> uuid.UUID | N
          several matches — but the suffix is anchored at `/`, so
          `api.md` cannot match `funapi.md`).
     """
+    ref = normalize_document_link_ref(ref)
+
     # UUID + exact-path arms share the same predicate as `find_by_ref`
     # / `drill_down` — keep the substring-match ban centralised.
     from app.repositories.document_repo import DocumentRepository

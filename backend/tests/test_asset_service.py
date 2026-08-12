@@ -699,7 +699,7 @@ def test_non_ascii_hmac_inputs_fail_closed() -> None:
     assert public._verify_token("share", "1000000.é") is False
 
 
-def test_publication_view_grant_cannot_rotate_past_fixed_session(
+def test_bounded_publication_view_grant_has_a_fixed_session_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from app.api.routes import public
@@ -712,16 +712,13 @@ def test_publication_view_grant_cannot_rotate_past_fixed_session(
     grant = public._make_view_grant("share")
 
     now += 3599
-    rotated = public._renew_view_grant("share", grant)
-    assert rotated is not None
-    issued, expires = public._parse_view_grant("share", rotated) or (0, 0)
-    assert expires == issued + 3600
+    assert public._validate_view_grant_renewal("share", grant) is not None
 
     now += 2
-    assert public._renew_view_grant("share", rotated) is None
+    assert public._validate_view_grant_renewal("share", grant) is None
 
 
-def test_bounded_grant_rotation_does_not_downgrade_during_legacy_emission(
+def test_grant_lifetime_reports_the_signed_remaining_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from app.api.routes import public
@@ -730,19 +727,14 @@ def test_bounded_grant_rotation_does_not_downgrade_during_legacy_emission(
     monkeypatch.setattr(public.time, "time", lambda: now)
     monkeypatch.setattr(public.settings, "publication_view_grant_ttl_secs", 600)
     monkeypatch.setattr(public.settings, "publication_view_grant_session_secs", 3600)
-    monkeypatch.setattr(public.settings, "publication_view_grant_emit_legacy", True)
-    grant = public._make_bounded_view_grant("share")
+    grant = public._make_bounded_view_grant("share", issued_at=int(now) - 3_500)
 
-    now += 601
-    rotated = public._renew_view_grant("share", grant)
-
-    assert rotated is not None
-    assert len(rotated.split(".")) == 3
-    assert public._verify_view_grant("share", rotated) is True
+    assert public._view_grant_remaining_seconds("share", grant) == 100
+    assert public._view_grant_session_remaining_seconds("share", grant) == 100
 
 
 @pytest.mark.asyncio
-async def test_default_page_open_emits_a_renewable_session_grant(
+async def test_default_page_open_renews_as_a_new_counted_legacy_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The rolling default keeps a legacy fetch grant without disabling refresh."""
@@ -755,7 +747,10 @@ async def test_default_page_open_emits_a_renewable_session_grant(
     monkeypatch.setattr(public.settings, "publication_view_grant_ttl_secs", 600)
     monkeypatch.setattr(public.settings, "publication_view_grant_session_secs", 3600)
 
-    async def fake_resolve(*_args, **_kwargs):
+    resolve_calls: list[dict] = []
+
+    async def fake_resolve(*_args, **kwargs):
+        resolve_calls.append(kwargs)
         return {"resource_type": public.ResourceType.DOCUMENT, "vault_id": uuid.uuid4()}
 
     async def fake_document(_publication):
@@ -783,8 +778,79 @@ async def test_default_page_open_emits_a_renewable_session_grant(
     })
     renewed = await public.renew_publication_view_grant("share", renewal_request)
 
-    assert len(renewed["view_grant"].split(".")) == 3
+    # The renewed fetch capability stays readable by old pods while legacy
+    # emission is enabled.  The bounded three-field capability remains a
+    # separate renewal proof for the new frontend.
+    assert len(renewed["view_grant"].split(".")) == 2
+    assert len(renewed["view_grant_session"].split(".")) == 3
     assert public._verify_view_grant("share", renewed["view_grant"]) is True
+    assert renewed["expires_in"] == 600
+    assert renewed["session_expires_in"] == 3600
+    assert resolve_calls[-1]["increment_view"] is True
+    assert resolve_calls[-1]["enforce_view_cap"] is True
+
+
+@pytest.mark.asyncio
+async def test_view_grant_renewal_enforces_the_publication_view_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi import HTTPException
+    from starlette.requests import Request
+    from app.api.routes import public
+    from app.services.publication_service import PublicationViewLimitReached
+
+    now = 1_000_000.0
+    monkeypatch.setattr(public.time, "time", lambda: now)
+    monkeypatch.setattr(public.settings, "publication_view_grant_ttl_secs", 600)
+    monkeypatch.setattr(public.settings, "publication_view_grant_session_secs", 3600)
+    session_grant = public._make_bounded_view_grant("share")
+
+    async def capped(*_args, **kwargs):
+        assert kwargs["increment_view"] is True
+        assert kwargs["enforce_view_cap"] is True
+        raise PublicationViewLimitReached()
+
+    monkeypatch.setattr(public, "_resolve_with_access", capped)
+    request = Request({
+        "type": "http", "method": "POST", "path": "/", "headers": [],
+        "query_string": f"grant={session_grant}".encode(),
+    })
+
+    with pytest.raises(HTTPException) as exc:
+        await public.renew_publication_view_grant("share", request)
+
+    assert exc.value.status_code == 410
+
+
+@pytest.mark.asyncio
+async def test_post_rollout_renewal_emits_one_bounded_grant_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from starlette.requests import Request
+    from app.api.routes import public
+
+    now = 1_000_000.0
+    monkeypatch.setattr(public.time, "time", lambda: now)
+    monkeypatch.setattr(public.settings, "publication_view_grant_ttl_secs", 600)
+    monkeypatch.setattr(public.settings, "publication_view_grant_session_secs", 3600)
+    monkeypatch.setattr(public.settings, "publication_view_grant_emit_legacy", False)
+    session_grant = public._make_bounded_view_grant("share")
+
+    async def resolved(*_args, **_kwargs):
+        return {"slug": "share"}
+
+    monkeypatch.setattr(public, "_resolve_with_access", resolved)
+    request = Request({
+        "type": "http", "method": "POST", "path": "/", "headers": [],
+        "query_string": f"grant={session_grant}".encode(),
+    })
+
+    renewed = await public.renew_publication_view_grant("share", request)
+
+    assert len(renewed["view_grant"].split(".")) == 3
+    assert renewed["view_grant_session"] == renewed["view_grant"]
+    assert renewed["expires_in"] == 600
+    assert renewed["session_expires_in"] == 3600
 
 
 @pytest.mark.asyncio

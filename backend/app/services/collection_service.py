@@ -19,7 +19,7 @@ from app.exceptions import ConflictError, NotFoundError
 from app.repositories import table_data_repo, table_registry_repo, vault_files_repo
 from app.repositories.document_repo import CollectionRepository, DocumentRepository
 from app.repositories.events_repo import emit_event
-from app.repositories.vault_repo import VaultRepository
+from app.repositories.vault_repo import VaultRepository, lock_vault_for_child_write
 from app.services.git_service import GitService
 from app.services.index_service import (
     delete_document_chunks, delete_file_chunks, delete_table_chunks,
@@ -133,25 +133,18 @@ class CollectionService:
         if not vault_id:
             raise NotFoundError("Vault", vault)
 
-        # `create_empty` returns the *current* row state, not the
-        # caller's inputs. On a no-op (created=False) the stored
-        # summary / doc_count win — the contract is "report what's in
-        # the DB," so an idempotent re-create against an existing
-        # collection with 5 docs surfaces doc_count=5, not 0.
-        _cid, created, name, cur_summary, cur_doc_count = await coll_repo.create_empty(
-            vault_id, norm, summary=summary,
-        )
-
-        # emit_event MUST run inside the same transaction as its
-        # domain row so the event is dropped on rollback. The repo
-        # insert above is already committed (it owns its own
-        # transaction), so this transaction protects only the event
-        # write — fine, since the event is the only remaining side
-        # effect and the rule we're enforcing is "no event without a
-        # successful domain write," which holds either way.
         pool = await get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
+                if not await lock_vault_for_child_write(conn, vault_id):
+                    raise ConflictError("Vault was deleted during collection creation")
+                # Return the current row state on an idempotent no-op, and keep
+                # the row plus its event in one transaction.
+                (
+                    _cid, created, name, cur_summary, cur_doc_count,
+                ) = await coll_repo.create_empty(
+                    vault_id, norm, summary=summary, conn=conn,
+                )
                 # Collections are not URI-addressable resources (the URI
                 # scheme is doc/table/file only), so resource_uri stays
                 # None. Subscribers reconstruct identity from payload.path.
@@ -244,6 +237,8 @@ class CollectionService:
 
         async with pool.acquire() as conn:
             async with conn.transaction():
+                if not await lock_vault_for_child_write(conn, vault_id):
+                    raise ConflictError("Vault was deleted during collection deletion")
                 # ── Lock + snapshot under prefix ────────────────
                 # Target row may or may not exist (nested-parent
                 # case). FOR UPDATE on a missing row is a no-op; we

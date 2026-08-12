@@ -26,6 +26,7 @@ from app.exceptions import AKBError, ConflictError, NotFoundError
 from app.repositories import vault_files_repo
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
+from app.repositories.vault_repo import lock_vault_for_child_write
 from app.services.adapters import s3_adapter
 from app.services.index_service import (
     build_file_chunk, delete_file_chunks, write_source_chunks,
@@ -380,6 +381,8 @@ class FileService:
         pool = await get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
+                if not await lock_vault_for_child_write(conn, vault_id):
+                    raise ConflictError("Vault was deleted during file upload")
                 collection_id = None
                 if collection_path:
                     coll_repo = CollectionRepository(pool)

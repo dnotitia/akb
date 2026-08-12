@@ -31,7 +31,7 @@ import pytest_asyncio
 from starlette.requests import Request
 
 from app.api import file_write_context
-from app.exceptions import AKBError
+from app.exceptions import AKBError, ConflictError
 from app.repositories import vault_files_repo
 from app.repositories.vault_repo import VaultRepository
 from app.services.file_service import (
@@ -315,6 +315,114 @@ async def _row_count(conn, vault_id) -> int:
     return await conn.fetchval(
         "SELECT count(*) FROM vault_files WHERE vault_id = $1", vault_id,
     )
+
+
+async def test_file_initiation_losing_a_vault_delete_returns_conflict(
+    pool, vault_id, monkeypatch,
+):
+    """A stale authorized vault id must not surface an FK violation as a 500."""
+    from app.services import file_service as fs
+
+    async with pool.acquire() as conn:
+        vault_name = await conn.fetchval(
+            "SELECT name FROM vaults WHERE id = $1", vault_id,
+        )
+        await conn.execute("DELETE FROM vaults WHERE id = $1", vault_id)
+
+    async def fake_get_pool():
+        return pool
+
+    monkeypatch.setattr(fs, "get_pool", fake_get_pool)
+    monkeypatch.setattr(fs, "measurement_enabled", lambda: False)
+    monkeypatch.setattr(fs.s3_adapter, "ensure_bucket", lambda _bucket: None)
+
+    with pytest.raises(ConflictError):
+        await fs.FileService().initiate_upload(
+            vault_name=vault_name,
+            vault_id=vault_id,
+            collection="",
+            filename="race.bin",
+            actor_id="tester",
+        )
+
+
+async def test_file_initiation_serializes_with_a_concurrent_vault_delete(
+    pool, vault_id, monkeypatch,
+):
+    """The parent lock keeps a winning child transaction free of FK races."""
+    from app.repositories.vault_repo import lock_vault_for_child_write as real_lock
+    from app.services import file_service as fs
+
+    async with pool.acquire() as conn:
+        vault_name = await conn.fetchval(
+            "SELECT name FROM vaults WHERE id = $1", vault_id,
+        )
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated_lock(conn, locked_vault_id):
+        locked = await real_lock(conn, locked_vault_id)
+        entered.set()
+        await release.wait()
+        return locked
+
+    async def fake_get_pool():
+        return pool
+
+    monkeypatch.setattr(fs, "get_pool", fake_get_pool)
+    monkeypatch.setattr(fs, "measurement_enabled", lambda: False)
+    monkeypatch.setattr(fs, "lock_vault_for_child_write", gated_lock)
+    monkeypatch.setattr(fs.s3_adapter, "ensure_bucket", lambda _bucket: None)
+    monkeypatch.setattr(
+        fs.s3_adapter,
+        "presign_put",
+        lambda key, **_kwargs: f"https://storage.invalid/{key}",
+    )
+
+    upload = asyncio.create_task(fs.FileService().initiate_upload(
+        vault_name=vault_name,
+        vault_id=vault_id,
+        collection="",
+        filename="serialized.bin",
+        actor_id="tester",
+    ))
+    await asyncio.wait_for(entered.wait(), 2)
+
+    delete_started = asyncio.Event()
+
+    async def delete_vault():
+        async with pool.acquire() as conn:
+            delete_started.set()
+            return await conn.execute("DELETE FROM vaults WHERE id = $1", vault_id)
+
+    deletion = asyncio.create_task(delete_vault())
+    await asyncio.wait_for(delete_started.wait(), 2)
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 2
+    blocked = False
+    while loop.time() < deadline and not deletion.done():
+        async with pool.acquire() as watch:
+            blocked = bool(await watch.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_stat_activity
+                     WHERE datname = current_database()
+                       AND wait_event_type = 'Lock'
+                       AND query LIKE 'DELETE FROM vaults WHERE id = $1%'
+                )
+                """,
+            ))
+        if blocked:
+            break
+        await asyncio.sleep(0.01)
+
+    assert blocked, "vault deletion did not wait for the child-write parent lock"
+    release.set()
+    result = await asyncio.wait_for(upload, 2)
+    assert result["kind"] == "file"
+    assert await asyncio.wait_for(deletion, 2) == "DELETE 1"
 
 
 async def test_same_bytes_same_name_twice_is_one_row(pool, vault_id):

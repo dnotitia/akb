@@ -127,6 +127,29 @@ describe("editor image asset API", () => {
     );
   });
 
+  it("does not expire the whole session when best-effort discard gets 401", async () => {
+    let finishImage: ((response: Response) => void) | undefined;
+    let imageSignal: AbortSignal | undefined;
+    fetchMock
+      .mockImplementationOnce((_url: string, init?: RequestInit) => {
+        imageSignal = init?.signal as AbortSignal;
+        return new Promise<Response>((resolve) => { finishImage = resolve; });
+      })
+      .mockResolvedValueOnce(new Response(null, { status: 401 }));
+
+    const image = getAssetBlob(ASSET_ID, "team");
+    await expect(discardAsset("team", ASSET_ID)).rejects.toThrow("Unauthorized");
+
+    expect(localStorage.getItem("akb_token")).toBe("test-token");
+    expect(imageSignal?.aborted).toBe(false);
+    finishImage?.({
+      ok: true,
+      status: 200,
+      blob: vi.fn().mockResolvedValue(new Blob(["image"])),
+    } as unknown as Response);
+    await expect(image).resolves.toBeInstanceOf(Blob);
+  });
+
   it("carries the publication token and view grant in asset URLs", () => {
     setPublicationToken("public slug", "password token");
     setViewGrant("public slug", "view grant");
@@ -145,8 +168,12 @@ describe("editor image asset API", () => {
         view_grant_session: "1000.4600.session",
       }))
       .mockResolvedValueOnce(jsonResponse({
-        view_grant: "1601.2201.renewed",
-        view_grant_session: "1000.4600.rotated",
+        view_grant: "1601.renewed",
+        view_grant_session: "1601.5201.rotated",
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        view_grant: "2202.renewed-again",
+        view_grant_session: "2202.5802.rotated-again",
       }));
 
     await getPublication("share");
@@ -156,7 +183,33 @@ describe("editor image asset API", () => {
       "/api/v1/public/share/grant?grant=1000.4600.session",
     );
     expect(publicationAssetUrl("share", ASSET_ID)).toContain(
-      "grant=1601.2201.renewed",
+      "grant=1601.renewed",
     );
+
+    await refreshPublicationViewGrant("share");
+    expect(fetchMock.mock.calls[2]?.[0]).toBe(
+      "/api/v1/public/share/grant?grant=1601.5201.rotated",
+    );
+  });
+
+  it("deduplicates concurrent refreshes for every image in one publication", async () => {
+    setViewGrant("share", "1000.legacy");
+    let finish: ((response: Response) => void) | undefined;
+    fetchMock.mockImplementationOnce(
+      () => new Promise<Response>((resolve) => { finish = resolve; }),
+    );
+
+    const first = refreshPublicationViewGrant("share");
+    const second = refreshPublicationViewGrant("share");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    finish?.(jsonResponse({
+      view_grant: "1601.renewed",
+      view_grant_session: "1601.5201.session",
+    }));
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      "1601.renewed",
+      "1601.renewed",
+    ]);
   });
 });

@@ -15,7 +15,7 @@ import pytest
 import pytest_asyncio
 
 from app.config import settings
-from app.exceptions import AKBError, ForbiddenError, NotFoundError
+from app.exceptions import AKBError, ConflictError, ForbiddenError, NotFoundError
 from app.models.file import BodyPlacementObservation
 from app.repositories import vault_files_repo
 from app.services import m1_file_measurement as m1
@@ -110,6 +110,54 @@ async def context(pool, tmp_path, monkeypatch):
 
 def _token(url: str) -> str:
     return url.rsplit("/", 1)[-1]
+
+
+@pytest.mark.asyncio
+async def test_measurement_upload_checks_the_parent_vault_lock(monkeypatch):
+    """The measurement facade follows the same vault-delete contract."""
+    class FakeTransaction:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class FakeConnection:
+        def transaction(self):
+            return FakeTransaction()
+
+    class FakeAcquire:
+        async def __aenter__(self):
+            return FakeConnection()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class FakePool:
+        def acquire(self):
+            return FakeAcquire()
+
+    async def fake_pool():
+        return FakePool()
+
+    async def deleted_vault(_conn, _vault_id):
+        return False
+
+    monkeypatch.setattr(m1, "get_pool", fake_pool)
+    monkeypatch.setattr(m1, "measurement_enabled", lambda: True)
+    monkeypatch.setattr(m1, "lock_vault_for_child_write", deleted_vault)
+
+    with pytest.raises(ConflictError):
+        await m1.MeasurementFileService().initiate_upload(
+            vault_name="deleted",
+            vault_id=uuid.uuid4(),
+            collection="",
+            filename="race.bin",
+            actor_id="tester",
+            mime_type="application/octet-stream",
+            description="",
+            content_hash=None,
+        )
 
 
 @pytest.mark.asyncio

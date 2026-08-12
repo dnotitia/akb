@@ -152,14 +152,18 @@ function expireUnauthorizedSession(redirect: boolean) {
 async function authenticatedFetch(
   input: RequestInfo | URL,
   init?: RequestInit,
-  { redirectOnUnauthorized = true } = {},
+  { unauthorized = "expire-and-redirect" }: {
+    unauthorized?: "expire-and-redirect" | "preserve-session";
+  } = {},
 ): Promise<Response> {
   const res = await fetch(input, {
     ...init,
     headers: withBearerToken(init?.headers),
   });
   if (res.status === 401) {
-    expireUnauthorizedSession(redirectOnUnauthorized);
+    if (unauthorized === "expire-and-redirect") {
+      expireUnauthorizedSession(true);
+    }
     throw new Error("Unauthorized");
   }
   return res;
@@ -489,7 +493,9 @@ export async function discardAsset(vault: string, fileId: string): Promise<void>
   const res = await authenticatedFetch(
     `${API_BASE}/assets/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}`,
     { method: "DELETE", keepalive: true },
-    { redirectOnUnauthorized: false },
+    // Cleanup is best effort and may race with logout.  Its 401 must not
+    // invalidate an otherwise live session or abort unrelated image reads.
+    { unauthorized: "preserve-session" },
   );
   if (res.ok) return;
   await throwJsonApiError(res);
@@ -902,28 +908,46 @@ export async function getPublicationMeta(slug: string): Promise<any> {
   return res.json();
 }
 
-/** Rotate a subordinate-fetch grant without spending another publication view. */
-export async function refreshPublicationViewGrant(slug: string): Promise<string> {
-  const search = new URLSearchParams();
-  const token = getPublicationToken(slug);
-  const renewalGrant = getViewGrantSession(slug) ?? getViewGrant(slug);
-  if (token) search.set("token", token);
-  if (renewalGrant) search.set("grant", renewalGrant);
-  const qs = search.toString();
-  const res = await fetch(
-    `${API_BASE}/public/${encodeURIComponent(slug)}/grant${qs ? `?${qs}` : ""}`,
-    { method: "POST" },
-  );
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok || !body.view_grant) {
-    throw new Error(body.detail || body.error || "Publication grant expired");
-  }
-  setViewGrant(slug, body.view_grant);
-  setViewGrantSession(
-    slug,
-    body.view_grant_session ?? body.view_grant,
-  );
-  return body.view_grant;
+const publicationGrantRefreshes = new Map<string, Promise<string>>();
+
+/** Acquire one newly counted subordinate-fetch window for a publication. */
+export function refreshPublicationViewGrant(slug: string): Promise<string> {
+  const existing = publicationGrantRefreshes.get(slug);
+  if (existing) return existing;
+
+  const refresh = (async () => {
+    const search = new URLSearchParams();
+    const token = getPublicationToken(slug);
+    const renewalGrant = getViewGrantSession(slug) ?? getViewGrant(slug);
+    if (token) search.set("token", token);
+    if (renewalGrant) search.set("grant", renewalGrant);
+    const qs = search.toString();
+    const res = await fetch(
+      `${API_BASE}/public/${encodeURIComponent(slug)}/grant${qs ? `?${qs}` : ""}`,
+      { method: "POST" },
+    );
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || !body.view_grant) {
+      throw new Error(body.detail || body.error || "Publication grant expired");
+    }
+    setViewGrant(slug, body.view_grant);
+    if (body.view_grant_session) {
+      setViewGrantSession(slug, body.view_grant_session);
+    } else if (body.view_grant.split(".").length === 3) {
+      // Compatibility with a bounded-grant backend that predates the separate
+      // session field.  Never promote a two-field fetch grant here.
+      setViewGrantSession(slug, body.view_grant);
+    }
+    return body.view_grant;
+  })();
+
+  const tracked = refresh.finally(() => {
+    if (publicationGrantRefreshes.get(slug) === tracked) {
+      publicationGrantRefreshes.delete(slug);
+    }
+  });
+  publicationGrantRefreshes.set(slug, tracked);
+  return tracked;
 }
 
 export interface PublicationCapabilities {

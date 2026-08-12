@@ -8,7 +8,11 @@ previously became dangling `links_to` edges (ghost graph nodes).
 """
 from __future__ import annotations
 
-from app.services.kg_service import extract_markdown_links, strip_code_spans
+from app.services.kg_service import (
+    extract_markdown_links,
+    normalize_document_link_ref,
+    strip_code_spans,
+)
 
 
 def test_inline_code_uri_is_not_extracted():
@@ -65,10 +69,19 @@ def test_relative_image_target_remains_a_document_relation():
     ]
 
 
-def test_parent_relative_link_keeps_its_parent_traversal():
+def test_parent_relative_link_is_normalized_to_a_vault_relative_ref():
     assert extract_markdown_links("[shared](../shared/spec.md)") == [
-        "../shared/spec.md"
+        "shared/spec.md"
     ]
+
+
+def test_document_link_prefix_matrix_is_explicit_and_preserves_dotfiles():
+    assert normalize_document_link_ref("./design/spec.md") == "design/spec.md"
+    assert normalize_document_link_ref("../shared/spec.md") == "shared/spec.md"
+    assert normalize_document_link_ref("../../shared/spec.md") == "shared/spec.md"
+    assert normalize_document_link_ref("/root/spec.md") == "root/spec.md"
+    assert normalize_document_link_ref(".well-known.md") == ".well-known.md"
+    assert normalize_document_link_ref("...draft.md") == "...draft.md"
 
 
 def test_strip_code_spans_removes_code_keeps_prose():

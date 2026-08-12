@@ -185,11 +185,16 @@ def _verify_view_grant(slug: str, grant: str | None) -> bool:
     return issued <= now + 30 and now <= expires
 
 
-def _renew_view_grant(slug: str, grant: str | None) -> str | None:
-    # A legacy grant carried only its original short TTL. Converting it into a
-    # rotatable session would silently extend that capability and bypass view
-    # limits beyond the contract under which it was issued. During the rollout
-    # compatibility phase it remains readable, but never renewable.
+def _validate_view_grant_renewal(
+    slug: str, grant: str | None,
+) -> tuple[int, int] | None:
+    """Validate the bounded proof used to request another counted window.
+
+    Two-field grants remain fetch-only rollout capabilities.  A three-field
+    grant can prove that the caller opened the page recently, but renewal still
+    goes through the normal publication view counter and cap.  This keeps the
+    session proof from turning one counted view into an hour-long bypass.
+    """
     if not grant or len(grant.split(".")) != 3:
         return None
     parsed = _parse_view_grant(slug, grant)
@@ -199,10 +204,30 @@ def _renew_view_grant(slug: str, grant: str | None) -> str | None:
     now = int(time.time())
     if issued > now + 30 or now >= issued + settings.publication_view_grant_session_secs:
         return None
-    # The incoming grant is already the bounded format. Keep its wire form
-    # even while new page opens emit legacy grants for old-server rollout
-    # compatibility; downgrading here would return an already-expired TTL.
-    return _make_bounded_view_grant(slug, issued_at=issued)
+    return parsed
+
+
+def _view_grant_remaining_seconds(slug: str, grant: str) -> int:
+    """Return the signed capability's actual remaining lifetime."""
+    parsed = _parse_view_grant(slug, grant)
+    if parsed is None:
+        return 0
+    _issued, expires = parsed
+    return max(0, expires - int(time.time()))
+
+
+def _view_grant_session_remaining_seconds(slug: str, grant: str) -> int:
+    """Return how long a bounded grant remains eligible for renewal."""
+    if len(grant.split(".")) != 3:
+        return 0
+    parsed = _parse_view_grant(slug, grant)
+    if parsed is None:
+        return 0
+    issued, _expires = parsed
+    return max(
+        0,
+        issued + settings.publication_view_grant_session_secs - int(time.time()),
+    )
 
 
 def _extract_view_grant(request: Request) -> str | None:
@@ -624,28 +649,37 @@ async def publication_auth(slug: str, req: PasswordAuthRequest, request: Request
 
 @router.post("/public/{slug}/grant", summary="Rotate a document view grant")
 async def renew_publication_view_grant(slug: str, request: Request):
-    """Rotate an expired subordinate-fetch grant inside one counted view.
+    """Exchange a bounded page proof for one newly counted fetch window.
 
-    The original issue time is retained, so repeated rotations cannot outlive
-    the bounded page session. Publication expiry/unpublish/password checks are
-    re-run, while the already-counted view is never charged again.
+    Publication access, expiry, password, and ``max_views`` are all rechecked.
+    While legacy emission is enabled the fetch grant remains two-field so both
+    old and new backend pods can serve image requests during a rolling update;
+    the three-field session proof is returned separately.
     """
-    grant = _renew_view_grant(slug, _extract_view_grant(request))
-    if grant is None:
+    if _validate_view_grant_renewal(slug, _extract_view_grant(request)) is None:
         raise HTTPException(status_code=404, detail="Publication grant not found")
     try:
         await _resolve_with_access(
             slug,
             request,
-            increment_view=False,
-            enforce_view_cap=False,
+            increment_view=True,
+            enforce_view_cap=True,
         )
     except PublicationError as exc:
         raise _publication_error_to_http(exc)
+    grant = _make_view_grant(slug)
+    session_grant = (
+        grant
+        if len(grant.split(".")) == 3
+        else _make_bounded_view_grant(slug)
+    )
     return {
         "view_grant": grant,
-        "view_grant_session": grant,
-        "expires_in": settings.publication_view_grant_ttl_secs,
+        "view_grant_session": session_grant,
+        "expires_in": _view_grant_remaining_seconds(slug, grant),
+        "session_expires_in": _view_grant_session_remaining_seconds(
+            slug, session_grant,
+        ),
     }
 
 

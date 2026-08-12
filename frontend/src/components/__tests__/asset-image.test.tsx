@@ -74,6 +74,25 @@ describe("AssetImage", () => {
     await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith("blob:private-image"));
   });
 
+  it("shows an unavailable state when a live private request is aborted", async () => {
+    apiMocks.getAssetBlob.mockRejectedValue(new DOMException("Aborted", "AbortError"));
+
+    render(
+      <AssetImage
+        src={ASSET_URL}
+        alt="Interrupted diagram"
+        assetContext={{ mode: "authenticated", vault: "team" }}
+      />,
+    );
+
+    expect(await screen.findByRole("img", {
+      name: "Image unavailable: Interrupted diagram",
+    })).toBeVisible();
+    expect(screen.queryByRole("status", {
+      name: "Loading image: Interrupted diagram",
+    })).toBeNull();
+  });
+
   it("passes the exact historical document context to the byte request", async () => {
     apiMocks.getAssetBlob.mockResolvedValue(new Blob(["image"], { type: "image/png" }));
     render(
@@ -163,9 +182,10 @@ describe("AssetImage", () => {
 
   it("rotates an expired publication grant and retries the lazy image", async () => {
     let finishRefresh: ((grant: string) => void) | undefined;
-    apiMocks.publicationAssetUrl
-      .mockReturnValueOnce("/api/v1/public/slug/assets/id?grant=expired")
-      .mockReturnValue("/api/v1/public/slug/assets/id?grant=renewed");
+    let grant = "expired";
+    apiMocks.publicationAssetUrl.mockImplementation(
+      () => `/api/v1/public/slug/assets/id?grant=${grant}`,
+    );
     apiMocks.refreshPublicationViewGrant.mockImplementation(
       () => new Promise<string>((resolve) => { finishRefresh = resolve; }),
     );
@@ -183,11 +203,88 @@ describe("AssetImage", () => {
 
     await waitFor(() => expect(apiMocks.refreshPublicationViewGrant).toHaveBeenCalledTimes(1));
     expect(apiMocks.refreshPublicationViewGrant).toHaveBeenCalledWith("slug");
+    grant = "renewed";
     finishRefresh?.("renewed");
     await waitFor(() => expect(screen.getByRole("img", { name: "Late diagram" })).toHaveAttribute(
       "src",
       "/api/v1/public/slug/assets/id?grant=renewed",
     ));
+  });
+
+  it("can refresh again after a renewed publication image loaded", async () => {
+    let grant = "first";
+    apiMocks.publicationAssetUrl.mockImplementation(
+      () => `/api/v1/public/slug/assets/id?grant=${grant}`,
+    );
+    apiMocks.refreshPublicationViewGrant
+      .mockImplementationOnce(async () => {
+        grant = "second";
+        return grant;
+      })
+      .mockImplementationOnce(async () => {
+        grant = "third";
+        return grant;
+      });
+
+    render(
+      <AssetImage
+        src={ASSET_URL}
+        alt="Long-lived diagram"
+        assetContext={{ mode: "publication", slug: "slug" }}
+      />,
+    );
+    let image = screen.getByRole("img", { name: "Long-lived diagram" });
+    fireEvent.error(image);
+    await waitFor(() => expect(image).toHaveAttribute(
+      "src", "/api/v1/public/slug/assets/id?grant=second",
+    ));
+
+    fireEvent.load(image);
+    fireEvent.error(image);
+    await waitFor(() => expect(apiMocks.refreshPublicationViewGrant).toHaveBeenCalledTimes(2));
+    image = screen.getByRole("img", { name: "Long-lived diagram" });
+    await waitFor(() => expect(image).toHaveAttribute(
+      "src", "/api/v1/public/slug/assets/id?grant=third",
+    ));
+  });
+
+  it("reuses a grant refreshed by another image instead of counting again", async () => {
+    const secondId = "0d5028f7-cd47-42c5-8ed8-121742d085ec";
+    let grant = "expired";
+    apiMocks.publicationAssetUrl.mockImplementation(
+      (_slug: string, assetId: string) => `/public/${assetId}?grant=${grant}`,
+    );
+    apiMocks.refreshPublicationViewGrant.mockImplementation(async () => {
+      grant = "renewed";
+      return grant;
+    });
+
+    render(
+      <>
+        <AssetImage
+          src={ASSET_URL}
+          alt="First late diagram"
+          assetContext={{ mode: "publication", slug: "slug" }}
+        />
+        <AssetImage
+          src={`/api/assets/${secondId}`}
+          alt="Second late diagram"
+          assetContext={{ mode: "publication", slug: "slug" }}
+        />
+      </>,
+    );
+    const first = screen.getByRole("img", { name: "First late diagram" });
+    const second = screen.getByRole("img", { name: "Second late diagram" });
+
+    fireEvent.error(first);
+    await waitFor(() => expect(first).toHaveAttribute(
+      "src", `/public/${ASSET_ID}?grant=renewed`,
+    ));
+    fireEvent.error(second);
+    await waitFor(() => expect(second).toHaveAttribute(
+      "src", `/public/${secondId}?grant=renewed`,
+    ));
+    expect(apiMocks.refreshPublicationViewGrant).toHaveBeenCalledTimes(1);
   });
 
   it("does not refetch when a parent recreates an equivalent asset context", async () => {

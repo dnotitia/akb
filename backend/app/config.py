@@ -717,9 +717,9 @@ class Settings(BaseModel):
     # read both forms; after the fleet is fully upgraded this can be disabled
     # to emit bounded, rotatable three-field grants.
     publication_view_grant_emit_legacy: bool = True
-    # An expired per-request grant may be rotated without spending another
-    # view, but only inside this fixed page-session window. Rotation preserves
-    # the original issue time, so it cannot extend the capability indefinitely.
+    # A bounded proof may request another view-counted fetch window only inside
+    # this page-session interval. The publication max_views check still runs on
+    # every renewal; this interval limits replay, it does not bypass the cap.
     publication_view_grant_session_secs: int = Field(default=3600, ge=600, le=3600)
 
     # Vector store (hybrid dense + BM25). Driver-pluggable.
