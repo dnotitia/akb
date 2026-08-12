@@ -27,6 +27,8 @@ lease fencing, replay/resume, redacted status, and monotonic installation/
 observed-state convergence. Added admin and self-app request/status routes,
 worker lifecycle registration, migration 062, and the repository-owned
 `app-release-rollout` E2E fixture scenario.
+The fixture now gives each advertised app its own valid release transition and
+owned installation coordinates for generic multi-app isolation checks.
 
 ### Fixed repository-owned E2E reset and restart lifecycle
 

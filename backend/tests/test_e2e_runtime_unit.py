@@ -601,6 +601,53 @@ def test_rollout_fixture_discovery_is_generic_and_redacted(tmp_path):
     assert discovery["controls"]["fault_injection"]["body"]["kind"] == "missing_owned_table"
 
 
+def test_rollout_discovery_advertises_same_coordinates_for_each_app(tmp_path):
+    runtime = E2ERuntime(
+        RuntimeConfig(
+            checkout=REPO_ROOT,
+            runtime_root=tmp_path / "runtime",
+            mode="serve",
+            compose_file=COMPOSE_FILE,
+            compose_project="akb-e2e-rollout-app-coordinates-unit",
+            scenario="app-release-rollout",
+        )
+    )
+    runtime._fixture_catalog = {
+        "status": "ready",
+        "scenario": "app-release-rollout",
+        "apps": {
+            "target": {
+                "id": "target-app",
+                "rollout": {
+                    "release_id": "target-release",
+                    "manifest_checksum": "a" * 64,
+                    "request": {"method": "POST", "path": "/api/v1/apps/target-app/rollouts"},
+                    "status": {"method": "GET", "path": "/api/v1/apps/target-app/rollouts/{rollout_id}"},
+                },
+            },
+            "foreign": {
+                "id": "foreign-app",
+                "rollout": {
+                    "release_id": "foreign-release",
+                    "manifest_checksum": "b" * 64,
+                    "request": {"method": "POST", "path": "/api/v1/apps/foreign-app/rollouts"},
+                    "status": {"method": "GET", "path": "/api/v1/apps/foreign-app/rollouts/{rollout_id}"},
+                },
+            },
+        },
+    }
+
+    discovery = runtime.fixture_discovery()
+    apps = discovery["apps"]
+    assert set(apps) == {"target", "foreign"}
+    assert {item["rollout"]["request"]["method"] for item in apps.values()} == {"POST"}
+    assert {item["rollout"]["status"]["method"] for item in apps.values()} == {"GET"}
+    assert {item["rollout"]["release_id"] for item in apps.values()} == {
+        "target-release",
+        "foreign-release",
+    }
+
+
 def test_rollout_fault_control_discovery_uses_fixture_ids_and_kinds(tmp_path):
     runtime = E2ERuntime(
         RuntimeConfig(

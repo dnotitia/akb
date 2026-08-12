@@ -984,8 +984,11 @@ class E2ERuntime:
         unsupported_release, unsupported_checksum, _unsupported_manifest = await self._insert_rollout_release(
             connection, app_id=target_app_id, version="9.0.0", valid=False
         )
-        foreign_release, foreign_checksum, _foreign_manifest = await self._insert_rollout_release(
+        foreign_current, foreign_current_checksum, _foreign_current_manifest = await self._insert_rollout_release(
             connection, app_id=foreign_app_id, version="1.0.0", valid=True
+        )
+        foreign_next, foreign_checksum, _foreign_next_manifest = await self._insert_rollout_release(
+            connection, app_id=foreign_app_id, version="2.0.0", valid=True
         )
         target_grants = [(owner_id, "owner")]
         installations: list[dict[str, object]] = []
@@ -1065,18 +1068,62 @@ class E2ERuntime:
             grants=target_grants,
             granted_by=system_admin_id,
         )
+        foreign_table_name = "rollout_data"
+        foreign_table_id = uuid.uuid4()
+        foreign_physical_table = f"vt_{foreign_vault_name.replace('-', '_')}__{foreign_table_name}"
+        await connection.execute(
+            f"CREATE TABLE {foreign_physical_table} (id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), value TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+        )
+        await connection.execute(
+            "INSERT INTO vault_tables(id,vault_id,name,description,columns,unique_keys,indexes,created_by) VALUES($1,$2,$3,'',$4::jsonb,'[]'::jsonb,'[]'::jsonb,$5)",
+            foreign_table_id,
+            foreign_vault_id,
+            foreign_table_name,
+            json.dumps([{"name": "value", "type": "text"}], separators=(",", ":")),
+            str(owner_id),
+        )
+        await connection.executemany(
+            f"INSERT INTO {foreign_physical_table}(value) VALUES($1)", [(None,) for _ in range(25)]
+        )
         foreign_installation_id = await self._insert_fixture_installation(
             connection,
             app_id=foreign_app_id,
             vault_id=foreign_vault_id,
-            desired_release_id=foreign_release,
-            current_release_id=foreign_release,
+            desired_release_id=foreign_current,
+            current_release_id=foreign_current,
             lifecycle="active",
             capabilities=["installation:read", "inventory:read", "rollout:read", "rollout:request"],
-            resources=[],
-            observed_release_id=foreign_release,
+            resources=[("table", foreign_table_name, "owned")],
+            observed_release_id=foreign_current,
             observed_release_version="1.0.0",
         )
+        def rollout_coordinates(
+            app_id: uuid.UUID,
+            release_id: uuid.UUID,
+            checksum: str,
+        ) -> dict[str, object]:
+            return {
+                "release_id": str(release_id),
+                "manifest_checksum": checksum,
+                "request": {
+                    "service": "app",
+                    "method": "POST",
+                    "path": f"/api/v1/apps/{app_id}/rollouts",
+                    "body": {
+                        "release_id": str(release_id),
+                        "manifest_checksum": checksum,
+                        "idempotency_key": "uuid-v4",
+                    },
+                    "headers": {"Idempotency-Key": "uuid-v4"},
+                },
+                "status": {
+                    "service": "app",
+                    "method": "GET",
+                    "path": f"/api/v1/apps/{app_id}/rollouts/{{rollout_id}}",
+                },
+            }
+        target_rollout_coordinates = rollout_coordinates(target_app_id, next_release, next_checksum)
+        foreign_rollout_coordinates = rollout_coordinates(foreign_app_id, foreign_next, foreign_checksum)
         random_ids = {
             "app_id": str(uuid.uuid4()),
             "release_id": str(uuid.uuid4()),
@@ -1088,19 +1135,25 @@ class E2ERuntime:
             "scenario": self.config.scenario,
             "namespace": namespace,
             "actors": {"system_admin": {"id": str(system_admin_id), "role": "system_admin"}, "target_owner": {"id": str(owner_id), "role": "owner"}},
-            "apps": {"target": {"id": str(target_app_id)}, "foreign": {"id": str(foreign_app_id)}},
+            "apps": {
+                "target": {"id": str(target_app_id), "rollout": target_rollout_coordinates},
+                "foreign": {"id": str(foreign_app_id), "rollout": foreign_rollout_coordinates},
+            },
             "releases": {
                 "target_current": {"id": str(old_release), "version": "1.0.0", "manifest_checksum": old_checksum},
                 "target_next": {"id": str(next_release), "version": "2.0.0", "manifest_checksum": next_checksum},
                 "target_unsupported": {"id": str(unsupported_release), "version": "9.0.0", "manifest_checksum": unsupported_checksum},
-                "foreign": {"id": str(foreign_release), "version": "1.0.0", "manifest_checksum": foreign_checksum},
+                "foreign_current": {"id": str(foreign_current), "version": "1.0.0", "manifest_checksum": foreign_current_checksum},
+                "foreign_next": {"id": str(foreign_next), "version": "2.0.0", "manifest_checksum": foreign_checksum},
             },
             "installations": installations,
             "tables": tables,
             "scope_cases": {
                 "other_app": {
                     "app_id": str(foreign_app_id),
-                    "release_id": str(foreign_release),
+                    "release_id": str(foreign_next),
+                    "manifest_checksum": foreign_checksum,
+                    "current_release_id": str(foreign_current),
                     "installation_id": str(foreign_installation_id),
                     "vault_id": str(foreign_vault_id),
                 },
@@ -1110,8 +1163,12 @@ class E2ERuntime:
                 "admin": {
                     "credential": {"service": "app", "method": "POST", "path": f"/api/v1/apps/{target_app_id}/credentials", "body": {"deployment": "fixture"}},
                     "exchange": {"service": "app", "method": "POST", "path": "/api/v1/auth/app-token", "body": {"credential": "<issued-value>"}},
-                    "request": {"service": "app", "method": "POST", "path": f"/api/v1/apps/{target_app_id}/rollouts", "body": {"release_id": str(next_release), "manifest_checksum": next_checksum, "idempotency_key": "uuid-v4"}, "headers": {"Idempotency-Key": "uuid-v4"}},
-                    "status": {"service": "app", "method": "GET", "path": f"/api/v1/apps/{target_app_id}/rollouts/{{rollout_id}}"},
+                    "request": target_rollout_coordinates["request"],
+                    "status": target_rollout_coordinates["status"],
+                    "apps": {
+                        "target": target_rollout_coordinates,
+                        "foreign": foreign_rollout_coordinates,
+                    },
                 },
                 "self_app": {
                     "request": {"service": "app", "method": "POST", "path": "/api/v1/app/rollouts", "body": {"release_id": str(next_release), "manifest_checksum": next_checksum}, "headers": {"Idempotency-Key": "uuid-v4"}},
