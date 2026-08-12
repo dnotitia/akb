@@ -109,44 +109,84 @@ class M1PgBodyStore:
             expected_size=expected_size,
         )
         async with self.pool.acquire() as conn:
+            return await self._prepare_verified_in_conn(
+                conn,
+                namespace_id=namespace_id,
+                canonical=canonical,
+                digest=digest,
+            )
+
+    async def prepare_text_in_conn(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        namespace_id: uuid.UUID,
+        payload: str | bytes,
+        expected_digest: str | None = None,
+        expected_size: int | None = None,
+    ) -> PreparedReferencePayload:
+        """Prepare a body on the caller's active PostgreSQL transaction."""
+        if not conn.is_in_transaction():
+            raise ValidationError("Transaction-aware body preparation requires an active transaction")
+        canonical, digest = await asyncio.to_thread(
+            self._verified_bytes,
+            payload,
+            expected_digest=expected_digest,
+            expected_size=expected_size,
+        )
+        return await self._prepare_verified_in_conn(
+            conn,
+            namespace_id=namespace_id,
+            canonical=canonical,
+            digest=digest,
+        )
+
+    async def _prepare_verified_in_conn(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        namespace_id: uuid.UUID,
+        canonical: bytes,
+        digest: str,
+    ) -> PreparedReferencePayload:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO m1_reference_payloads (
+                namespace_id, content_profile, digest, byte_size, encoding,
+                selected_placement, verification_profile, canonical_bytes
+            )
+            VALUES ($1, 'text', $2, $3, 'utf-8', $4, $5, $6)
+            ON CONFLICT DO NOTHING
+            RETURNING payload_id, namespace_id, content_profile, digest,
+                      byte_size, encoding, selected_placement,
+                      verification_profile, canonical_bytes
+            """,
+            namespace_id,
+            digest,
+            len(canonical),
+            self.selected_placement,
+            self.verification_profile,
+            canonical,
+        )
+        if row is None:
             row = await conn.fetchrow(
                 """
-                INSERT INTO m1_reference_payloads (
-                    namespace_id, content_profile, digest, byte_size, encoding,
-                    selected_placement, verification_profile, canonical_bytes
-                )
-                VALUES ($1, 'text', $2, $3, 'utf-8', $4, $5, $6)
-                ON CONFLICT DO NOTHING
-                RETURNING payload_id, namespace_id, content_profile, digest,
-                          byte_size, encoding, selected_placement,
-                          verification_profile, canonical_bytes
+                SELECT payload_id, namespace_id, content_profile, digest,
+                       byte_size, encoding, selected_placement,
+                       verification_profile, canonical_bytes
+                  FROM m1_reference_payloads
+                 WHERE namespace_id = $1
+                   AND digest = $2
+                   AND byte_size = $3
+                   AND selected_placement = $4
+                   AND verification_profile = $5
                 """,
                 namespace_id,
                 digest,
                 len(canonical),
                 self.selected_placement,
                 self.verification_profile,
-                canonical,
             )
-            if row is None:
-                row = await conn.fetchrow(
-                    """
-                    SELECT payload_id, namespace_id, content_profile, digest,
-                           byte_size, encoding, selected_placement,
-                           verification_profile, canonical_bytes
-                      FROM m1_reference_payloads
-                     WHERE namespace_id = $1
-                       AND digest = $2
-                       AND byte_size = $3
-                       AND selected_placement = $4
-                       AND verification_profile = $5
-                    """,
-                    namespace_id,
-                    digest,
-                    len(canonical),
-                    self.selected_placement,
-                    self.verification_profile,
-                )
         if row is None:
             raise PgBodyIntegrityError(
                 "PostgreSQL body disappeared during placement-scoped deduplication"

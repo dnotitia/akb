@@ -268,8 +268,8 @@ async def pool():
     for mig_name in (
         "015_events_outbox.py",
         "019_s3_delete_outbox.py",
-        "064_vault_file_upload_state.py",
-        "065_vault_file_lifecycle_indexes.py",
+        "067_vault_file_upload_state.py",
+        "068_vault_file_lifecycle_indexes.py",
     ):
         mig_path = backend_dir / "app" / "db" / "migrations" / mig_name
         spec = importlib.util.spec_from_file_location(mig_name, str(mig_path))
@@ -675,7 +675,7 @@ async def test_s3_key_probes_have_dedicated_indexes(pool):
         / "app"
         / "db"
         / "migrations"
-        / "067_vault_files_s3_key_lookup.py"
+        / "070_vault_files_s3_key_lookup.py"
     )
     import importlib.util
     spec = importlib.util.spec_from_file_location("migration_067", migration_path)

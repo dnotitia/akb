@@ -12,9 +12,10 @@ import json
 import secrets
 import uuid
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Final, Protocol
+from typing import Final, Protocol, runtime_checkable
 
 import asyncpg
 
@@ -66,6 +67,21 @@ class TextPayloadStore(Protocol):
     ) -> PreparedReferencePayload: ...
 
     async def open_verified(self, payload_id: uuid.UUID) -> bytes: ...
+
+
+@runtime_checkable
+class TransactionAwareTextPayloadStore(TextPayloadStore, Protocol):
+    """Payload-store capability for publication in a caller-owned PG TX."""
+
+    async def prepare_text_in_conn(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        namespace_id: uuid.UUID,
+        payload: str | bytes,
+        expected_digest: str | None = None,
+        expected_size: int | None = None,
+    ) -> PreparedReferencePayload: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +257,11 @@ class NativeRevisionService:
             raise ValidationError("Expected native Revision ID must be exactly 40 lowercase hex")
 
     @staticmethod
+    def _validate_revision_selector(revision_id: str) -> None:
+        if not 7 <= len(revision_id) <= 40 or any(ch not in "0123456789abcdef" for ch in revision_id):
+            raise ValidationError("Native Revision selector must be 7..40 lowercase hex")
+
+    @staticmethod
     def _from_row(row: dict, *, replay: bool) -> NativeMutationResult:
         return NativeMutationResult(
             resource_id=row["resource_id"],
@@ -258,11 +279,17 @@ class NativeRevisionService:
         # P0 froze this at random 20 bytes rendered as 40 lowercase hex.
         return secrets.token_hex(20)
 
-    async def _allocate_revision_id(self) -> str:
+    async def _allocate_revision_id(self, conn: asyncpg.Connection | None = None) -> str:
         """Reject observed collisions and retry with a fresh server token."""
         for _ in range(3):
             candidate = self._opaque_revision_id()
-            async with self.pool.acquire() as conn:
+            if conn is None:
+                async with self.pool.acquire() as acquired:
+                    exists = await acquired.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM native_revisions WHERE revision_id = $1)",
+                        candidate,
+                    )
+            else:
                 exists = await conn.fetchval(
                     "SELECT EXISTS(SELECT 1 FROM native_revisions WHERE revision_id = $1)",
                     candidate,
@@ -270,6 +297,16 @@ class NativeRevisionService:
             if not exists:
                 return candidate
         raise ConflictError("Unable to allocate a unique native Revision ID after collisions")
+
+    @asynccontextmanager
+    async def _authority_transaction(self, conn: asyncpg.Connection | None):
+        """Use a caller-owned connection, or preserve ordinary create semantics."""
+        if conn is not None:
+            yield conn
+            return
+        async with self.pool.acquire() as acquired:
+            async with acquired.transaction():
+                yield acquired
 
     async def _lock_live_reference(
         self,
@@ -350,6 +387,83 @@ class NativeRevisionService:
             expected_digest=expected_digest,
             expected_size=expected_size,
         )
+        result = await self._create_prepared_text(
+            namespace_id=namespace_id,
+            surface=surface,
+            path=path,
+            actor=actor,
+            mutation_id=mutation_id,
+            resource_id=resource_id,
+            message=message,
+            subject=subject,
+            summary=summary,
+            prepared=prepared,
+        )
+        await self._hit("authority.after_commit_before_response")
+        return result
+
+    async def create_text_in_conn(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        namespace_id: uuid.UUID,
+        surface: str,
+        path: str,
+        payload: str | bytes,
+        actor: str,
+        mutation_id: uuid.UUID,
+        resource_id: uuid.UUID | None = None,
+        message: str | None = None,
+        subject: str | None = None,
+        summary: str | None = None,
+        expected_digest: str | None = None,
+        expected_size: int | None = None,
+    ) -> NativeMutationResult:
+        """Create text within an existing caller-owned PostgreSQL transaction."""
+        if not conn.is_in_transaction():
+            raise ValidationError("Transaction-aware native publication requires an active transaction")
+        if not isinstance(self.payload_store, TransactionAwareTextPayloadStore):
+            raise TypeError("Native publication requires a transaction-aware payload store")
+        self._validate_common(surface=surface, path=path, actor=actor, mutation_id=mutation_id)
+        if resource_id is not None and not isinstance(resource_id, uuid.UUID):
+            raise ValidationError("Native Resource ID must be a UUID")
+        await self._hit("payload.before_prepare")
+        prepared = await self.payload_store.prepare_text_in_conn(
+            conn,
+            namespace_id=namespace_id,
+            payload=payload,
+            expected_digest=expected_digest,
+            expected_size=expected_size,
+        )
+        return await self._create_prepared_text(
+            namespace_id=namespace_id,
+            surface=surface,
+            path=path,
+            actor=actor,
+            mutation_id=mutation_id,
+            resource_id=resource_id,
+            message=message,
+            subject=subject,
+            summary=summary,
+            prepared=prepared,
+            conn=conn,
+        )
+
+    async def _create_prepared_text(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        surface: str,
+        path: str,
+        actor: str,
+        mutation_id: uuid.UUID,
+        resource_id: uuid.UUID | None,
+        message: str | None,
+        subject: str | None,
+        summary: str | None,
+        prepared: PreparedReferencePayload,
+        conn: asyncpg.Connection | None = None,
+    ) -> NativeMutationResult:
         await self._hit("payload.after_verified")
         fingerprint = self._fingerprint(
             action="create",
@@ -377,8 +491,8 @@ class NativeRevisionService:
             prepared=prepared,
             fingerprint=fingerprint,
             resource_id=resource_id,
+            conn=conn,
         )
-        await self._hit("authority.after_commit_before_response")
         return result
 
     async def _publish_create(
@@ -395,120 +509,120 @@ class NativeRevisionService:
         prepared: PreparedReferencePayload,
         fingerprint: str,
         resource_id: uuid.UUID | None,
+        conn: asyncpg.Connection | None = None,
     ) -> NativeMutationResult:
         resource_id = resource_id or uuid.uuid4()
-        revision_id = await self._allocate_revision_id()
+        revision_id = await self._allocate_revision_id(conn=conn)
         manifest_id = uuid.uuid4()
         activity_id = uuid.uuid4()
         intent_id = uuid.uuid4()
         try:
-            async with self.pool.acquire() as conn:
-                async with conn.transaction():
-                    await self.repository.lock_mutation(conn, namespace_id, mutation_id)
-                    prior = await self.repository.find_mutation(conn, namespace_id, mutation_id)
-                    if prior is not None:
-                        if prior["request_fingerprint"] != fingerprint:
-                            raise ConflictError("Native idempotency key was reused with different input")
-                        return self._from_row(prior, replay=True)
+            async with self._authority_transaction(conn) as conn:
+                await self.repository.lock_mutation(conn, namespace_id, mutation_id)
+                prior = await self.repository.find_mutation(conn, namespace_id, mutation_id)
+                if prior is not None:
+                    if prior["request_fingerprint"] != fingerprint:
+                        raise ConflictError("Native idempotency key was reused with different input")
+                    return self._from_row(prior, replay=True)
 
-                    await self.repository.lock_paths(conn, namespace_id, surface, path)
-                    if await self.repository.find_live_path(conn, namespace_id, surface, path) is not None:
-                        raise ConflictError(f"Native Resource already exists at path: {path}")
-                    reused_alias = await self.repository.find_live_alias(
+                await self.repository.lock_paths(conn, namespace_id, surface, path)
+                if await self.repository.find_live_path(conn, namespace_id, surface, path) is not None:
+                    raise ConflictError(f"Native Resource already exists at path: {path}")
+                reused_alias = await self.repository.find_live_alias(
+                    conn,
+                    namespace_id=namespace_id,
+                    surface=surface,
+                    old_path=path,
+                )
+
+                occurred_at = datetime.now(UTC)
+                await self.repository.insert_resource(
+                    conn,
+                    resource_id=resource_id,
+                    namespace_id=namespace_id,
+                    surface=surface,
+                    content_profile="text",
+                    path=path,
+                    occurred_at=occurred_at,
+                )
+                await self._hit("authority.after_resource")
+                await self.repository.insert_manifest(
+                    conn,
+                    payload_manifest_id=manifest_id,
+                    namespace_id=namespace_id,
+                    resource_id=resource_id,
+                    payload=prepared,
+                    occurred_at=occurred_at,
+                )
+                await self._hit("authority.after_manifest")
+                await self.repository.insert_revision(
+                    conn,
+                    revision_id=revision_id,
+                    namespace_id=namespace_id,
+                    resource_id=resource_id,
+                    parent_revision_id=None,
+                    action="create",
+                    path=path,
+                    path_from=None,
+                    path_to=path,
+                    payload_manifest_id=manifest_id,
+                    mutation_id=mutation_id,
+                    request_fingerprint=fingerprint,
+                    message=message,
+                    subject=subject,
+                    summary=summary,
+                    actor=actor,
+                    occurred_at=occurred_at,
+                    activity_event_id=activity_id,
+                    invalidation_intent_id=intent_id,
+                )
+                await self._hit("authority.after_revision")
+                await self.repository.set_head(
+                    conn,
+                    resource_id=resource_id,
+                    revision_id=revision_id,
+                    path=path,
+                    lifecycle="live",
+                    occurred_at=occurred_at,
+                )
+                await self._hit("authority.after_head")
+                await self._hit("authority.after_path")
+                if reused_alias is not None:
+                    await self.repository.retire_live_alias(
                         conn,
                         namespace_id=namespace_id,
                         surface=surface,
                         old_path=path,
-                    )
-
-                    occurred_at = datetime.now(UTC)
-                    await self.repository.insert_resource(
-                        conn,
-                        resource_id=resource_id,
-                        namespace_id=namespace_id,
-                        surface=surface,
-                        content_profile="text",
-                        path=path,
+                        retired_revision_id=revision_id,
                         occurred_at=occurred_at,
                     )
-                    await self._hit("authority.after_resource")
-                    await self.repository.insert_manifest(
-                        conn,
-                        payload_manifest_id=manifest_id,
-                        namespace_id=namespace_id,
-                        resource_id=resource_id,
-                        payload=prepared,
-                        occurred_at=occurred_at,
-                    )
-                    await self._hit("authority.after_manifest")
-                    await self.repository.insert_revision(
-                        conn,
-                        revision_id=revision_id,
-                        namespace_id=namespace_id,
-                        resource_id=resource_id,
-                        parent_revision_id=None,
-                        action="create",
-                        path=path,
-                        path_from=None,
-                        path_to=path,
-                        payload_manifest_id=manifest_id,
-                        mutation_id=mutation_id,
-                        request_fingerprint=fingerprint,
-                        message=message,
-                        subject=subject,
-                        summary=summary,
-                        actor=actor,
-                        occurred_at=occurred_at,
-                        activity_event_id=activity_id,
-                        invalidation_intent_id=intent_id,
-                    )
-                    await self._hit("authority.after_revision")
-                    await self.repository.set_head(
-                        conn,
-                        resource_id=resource_id,
-                        revision_id=revision_id,
-                        path=path,
-                        lifecycle="live",
-                        occurred_at=occurred_at,
-                    )
-                    await self._hit("authority.after_head")
-                    await self._hit("authority.after_path")
-                    if reused_alias is not None:
-                        await self.repository.retire_live_alias(
-                            conn,
-                            namespace_id=namespace_id,
-                            surface=surface,
-                            old_path=path,
-                            retired_revision_id=revision_id,
-                            occurred_at=occurred_at,
-                        )
-                    await self._hit("authority.after_alias")
-                    await self.repository.insert_activity(
-                        conn,
-                        activity_event_id=activity_id,
-                        namespace_id=namespace_id,
-                        resource_id=resource_id,
-                        revision_id=revision_id,
-                        action="create",
-                        actor=actor,
-                        subject=subject,
-                        summary=summary,
-                        path_from=None,
-                        path_to=path,
-                        occurred_at=occurred_at,
-                    )
-                    await self._hit("authority.after_activity")
-                    await self.repository.insert_invalidation_intent(
-                        conn,
-                        intent_id=intent_id,
-                        namespace_id=namespace_id,
-                        resource_id=resource_id,
-                        revision_id=revision_id,
-                        reason="create",
-                        occurred_at=occurred_at,
-                    )
-                    await self._hit("authority.after_invalidation")
-                    await self._hit("authority.before_commit")
+                await self._hit("authority.after_alias")
+                await self.repository.insert_activity(
+                    conn,
+                    activity_event_id=activity_id,
+                    namespace_id=namespace_id,
+                    resource_id=resource_id,
+                    revision_id=revision_id,
+                    action="create",
+                    actor=actor,
+                    subject=subject,
+                    summary=summary,
+                    path_from=None,
+                    path_to=path,
+                    occurred_at=occurred_at,
+                )
+                await self._hit("authority.after_activity")
+                await self.repository.insert_invalidation_intent(
+                    conn,
+                    intent_id=intent_id,
+                    namespace_id=namespace_id,
+                    resource_id=resource_id,
+                    revision_id=revision_id,
+                    reason="create",
+                    occurred_at=occurred_at,
+                )
+                await self._hit("authority.after_invalidation")
+                await self._hit("authority.before_commit")
         except asyncpg.UniqueViolationError as exc:
             if exc.constraint_name == "uq_native_resources_live_path":
                 raise ConflictError(f"Native Resource already exists at path: {path}") from exc
@@ -1165,7 +1279,7 @@ class NativeRevisionService:
         reference: str,
         revision_id: str,
     ) -> NativeRevisionSnapshot:
-        self._validate_expected_revision(revision_id)
+        self._validate_revision_selector(revision_id)
         resource = await self.repository.resolve_live_reference(
             namespace_id=namespace_id,
             surface=surface,

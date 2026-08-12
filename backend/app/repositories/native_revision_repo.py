@@ -9,6 +9,7 @@ from typing import Protocol
 import asyncpg
 
 from app.exceptions import ConflictError
+from app.util.errors import NATIVE_REVISION_SELECTOR_AMBIGUOUS
 
 
 class NativeRevisionIdCollisionError(ConflictError):
@@ -16,6 +17,22 @@ class NativeRevisionIdCollisionError(ConflictError):
 
     def __init__(self):
         super().__init__("Server-generated native Revision ID collision; retry the mutation")
+
+
+class NativeResourceReferenceAmbiguousError(ConflictError):
+    """A reference names more than one live native Resource."""
+
+    def __init__(self, reference: str):
+        super().__init__(f"Native Resource reference is ambiguous: {reference}")
+        self.code = "native_resource_reference_ambiguous"
+
+
+class NativeRevisionSelectorAmbiguousError(ConflictError):
+    """A revision selector names more than one Revision on one Resource."""
+
+    def __init__(self, selector: str):
+        super().__init__(f"Native Revision selector is ambiguous: {selector}")
+        self.code = NATIVE_REVISION_SELECTOR_AMBIGUOUS
 
 
 class PreparedPayload(Protocol):
@@ -138,7 +155,7 @@ class NativeRevisionRepository:
         reference: str,
         conn: asyncpg.Connection | None = None,
     ) -> dict | None:
-        """Resolve a live Resource identifier first, else a current path, else an alias.
+        """Resolve exactly one live Resource by id, path, or live alias.
 
         Mirrors ``document_repo.DocumentRepository._MATCH_WHERE``, which
         accepts either the public id or the path in a single ``OR``
@@ -161,10 +178,16 @@ class NativeRevisionRepository:
         legacy's single ``id OR path`` predicate exactly: try id, and if
         that does not name a live Resource, try path/alias.
 
-        Exact current ownership always wins over the alias fallback. The
-        alias points directly to a Resource (never another path), so a
-        chain cannot form after repeated moves and a deleted Resource
-        cannot be resurrected by an old alias.
+        A UUID-shaped reference is checked against both identity forms. The
+        normal path resolution gives an exact current path precedence over
+        an old alias. If that resolved path/alias owner differs from the
+        exact id owner, the reference is ambiguous and raises a conflict
+        rather than silently preferring the id. A genuine miss still
+        returns ``None``.
+
+        Both lookups run on one connection. This preserves the UUID-shaped
+        path fall-through required for native Files: a bare UUID can be a
+        legitimate logical path when it is not also an identity collision.
         """
         resource_id: uuid.UUID | None
         try:
@@ -172,29 +195,17 @@ class NativeRevisionRepository:
         except (AttributeError, TypeError, ValueError):
             resource_id = None
 
-        if resource_id is not None:
-            id_sql = """
-                SELECT rs.resource_id, rs.namespace_id, rs.surface,
-                       rs.content_profile, rs.current_path, rs.lifecycle,
-                       rs.head_revision_id, rs.created_at, rs.updated_at
-                  FROM native_resources rs
-                 WHERE rs.namespace_id = $1
-                   AND rs.surface = $2
-                   AND rs.resource_id = $3
-                   AND rs.lifecycle = 'live'
-            """
-            if conn is not None:
-                row = await conn.fetchrow(id_sql, namespace_id, surface, resource_id)
-            else:
-                async with self.pool.acquire() as acquired:
-                    row = await acquired.fetchrow(id_sql, namespace_id, surface, resource_id)
-            if row is not None:
-                return dict(row)
-            # Fall through to path/alias resolution — do NOT return None
-            # here. A UUID-shaped reference that does not name a live
-            # Resource by id may still name one by path (see docstring).
-
-        sql = """
+        id_sql = """
+            SELECT rs.resource_id, rs.namespace_id, rs.surface,
+                   rs.content_profile, rs.current_path, rs.lifecycle,
+                   rs.head_revision_id, rs.created_at, rs.updated_at
+              FROM native_resources rs
+             WHERE rs.namespace_id = $1
+               AND rs.surface = $2
+               AND rs.resource_id = $3
+               AND rs.lifecycle = 'live'
+        """
+        path_sql = """
             SELECT rs.resource_id, rs.namespace_id, rs.surface,
                    rs.content_profile, rs.current_path, rs.lifecycle,
                    rs.head_revision_id, rs.created_at, rs.updated_at
@@ -220,12 +231,29 @@ class NativeRevisionRepository:
              ORDER BY (rs.current_path = $3) DESC
              LIMIT 1
         """
+
+        async def _resolve(acquired: asyncpg.Connection) -> dict | None:
+            identity_candidate: dict | None = None
+            if resource_id is not None:
+                row = await acquired.fetchrow(id_sql, namespace_id, surface, resource_id)
+                if row is not None:
+                    identity_candidate = dict(row)
+
+            path_row = await acquired.fetchrow(path_sql, namespace_id, surface, reference)
+            path_candidate = dict(path_row) if path_row is not None else None
+
+            if (
+                identity_candidate is not None
+                and path_candidate is not None
+                and identity_candidate["resource_id"] != path_candidate["resource_id"]
+            ):
+                raise NativeResourceReferenceAmbiguousError(reference)
+            return identity_candidate or path_candidate
+
         if conn is not None:
-            row = await conn.fetchrow(sql, namespace_id, surface, reference)
-        else:
-            async with self.pool.acquire() as acquired:
-                row = await acquired.fetchrow(sql, namespace_id, surface, reference)
-        return dict(row) if row is not None else None
+            return await _resolve(conn)
+        async with self.pool.acquire() as acquired:
+            return await _resolve(acquired)
 
     @staticmethod
     async def lock_resource(
@@ -644,7 +672,13 @@ class NativeRevisionRepository:
         revision_id: str,
         conn: asyncpg.Connection | None = None,
     ) -> dict | None:
-        sql = """
+        if len(revision_id) == 40 and all(ch in "0123456789abcdef" for ch in revision_id):
+            selector_sql = "rv.revision_id = $2"
+        elif 7 <= len(revision_id) < 40 and all(ch in "0123456789abcdef" for ch in revision_id):
+            selector_sql = "rv.revision_id LIKE $2 || '%'"
+        else:
+            return None
+        sql = f"""
             SELECT rv.*, rs.surface, rs.content_profile,
                    rs.created_at AS resource_created_at,
                    rs.updated_at AS resource_updated_at,
@@ -655,14 +689,17 @@ class NativeRevisionRepository:
               JOIN native_resources rs ON rs.resource_id = rv.resource_id
               LEFT JOIN native_payload_manifests pm
                 ON pm.payload_manifest_id = rv.payload_manifest_id
-             WHERE rv.resource_id = $1 AND rv.revision_id = $2
+             WHERE rv.resource_id = $1 AND {selector_sql}
+             LIMIT 2
         """
         if conn is not None:
-            row = await conn.fetchrow(sql, resource_id, revision_id)
+            rows = await conn.fetch(sql, resource_id, revision_id)
         else:
             async with self.pool.acquire() as acquired:
-                row = await acquired.fetchrow(sql, resource_id, revision_id)
-        return dict(row) if row is not None else None
+                rows = await acquired.fetch(sql, resource_id, revision_id)
+        if len(rows) > 1:
+            raise NativeRevisionSelectorAmbiguousError(revision_id)
+        return dict(rows[0]) if rows else None
 
     async def list_history(
         self,
@@ -747,6 +784,43 @@ class NativeRevisionRepository:
                 limit,
             )
         return [dict(row) for row in rows]
+
+    async def get_activity_for_revision(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        surface: str,
+        resource_id: uuid.UUID,
+        revision_id: str,
+    ) -> dict | None:
+        """Read one persisted activity fact through its exact Resource selector."""
+
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT a.resource_id, a.revision_id, a.action, a.actor,
+                       a.subject, a.summary, a.changed_path_from,
+                       a.changed_path_to, a.occurred_at,
+                       r.path_at_revision
+                  FROM native_revision_activity a
+                  JOIN native_revisions r
+                    ON r.namespace_id = a.namespace_id
+                   AND r.resource_id = a.resource_id
+                   AND r.revision_id = a.revision_id
+                  JOIN native_resources rs
+                    ON rs.namespace_id = a.namespace_id
+                   AND rs.resource_id = a.resource_id
+                 WHERE a.namespace_id = $1
+                   AND rs.surface = $2
+                   AND a.resource_id = $3
+                   AND a.revision_id = $4
+                """,
+                namespace_id,
+                surface,
+                resource_id,
+                revision_id,
+            )
+        return dict(row) if row is not None else None
 
     async def list_recent_document_heads(
         self,

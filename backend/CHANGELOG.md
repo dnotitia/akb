@@ -53,14 +53,14 @@ lose its metadata owner.
 
 Document updates preserve pre-existing broken placeholders but reject newly
 introduced unavailable, expired, or cross-vault asset URLs. Public image
-requests require the page's already-counted, configurable view grant (10 minutes
-by default) and never increment publication views themselves, so a page
-containing multiple images consumes exactly one view-cap entry. The grant never
-replaces publication access: password-protected image requests must also carry
-the one-hour password token and continue to revalidate the exact published
-section before storage is touched. Lazy images can rotate an expired grant
-inside a fixed one-hour page session without spending another view; rotation
-preserves the original issue time and cannot extend that session indefinitely.
+requests require the page's configurable view grant (10 minutes by default) and
+never increment publication views per image. Concurrent image expiry recovery
+is coalesced into one newly counted fetch window, and every renewal re-applies
+the publication's view cap. The grant never replaces publication access:
+password-protected image requests must also carry the one-hour password token
+and continue to revalidate the exact published section before storage is
+touched. During rolling upgrades, fetch grants retain the legacy wire format
+while a separate bounded proof authorizes renewal.
 
 Text-only OKF imports preserve source-vault image references as fail-closed
 placeholders rather than omitting the containing document. Interactive and MCP
@@ -71,6 +71,48 @@ Pinned public-document image manifests cache only their bounded attachment UUID
 sets rather than retaining complete Markdown bodies. Existing imported
 protocol-relative image sources remain renderable with a no-referrer policy;
 clickable protocol-relative links remain blocked.
+
+### Added an explicit PostgreSQL Native document revision mode
+
+AKB now accepts the stable process-scoped revision selectors `bare_git` and
+`postgres_native`, while keeping Bare Git as the default and retaining the old
+measurement selectors as compatibility aliases. PostgreSQL Native can start
+only after an explicit command claims a never-initialized AKB database and
+mints tenant/database/image-bound pending authority; first startup atomically
+turns that record into an immutable durable marker. Existing or merely empty
+legacy databases are rejected, and no existing tenant is converted by config.
+Readiness reports the canonical selected backend.
+
+### Added immutable app release reconciliation and staged rollout
+
+Added a database-backed rollout request ledger with UUID idempotency, sealed
+snapshot membership, manifest v1 checksum validation, whole-snapshot preflight,
+canary-first then sequential ten-target batches, bounded backfill checkpoints,
+lease fencing, replay/resume, redacted status, and monotonic installation/
+observed-state convergence. Added admin and self-app request/status routes,
+worker lifecycle registration, migration 062, and the repository-owned
+`app-release-rollout` E2E fixture scenario.
+The fixture now gives each advertised app its own valid release transition and
+owned installation coordinates for generic multi-app isolation checks.
+
+### Fixed repository-owned E2E reset and restart lifecycle
+
+Reset now serializes with generic backend restart requests and the runtime
+supervisor ignores exits from processes replaced during reset, so the app and
+fixture return to ready state without a stale lifecycle task stopping the new
+backend.
+
+### Added PostgreSQL Native logical-revision and bounded history safeguards
+
+Public logical-revision reads now preserve the existing 7–40 character
+selector contract in PostgreSQL Native mode: short selectors resolve only
+when unique within the addressed Document, while unknown, cross-Document, and
+ambiguous selectors fail explicitly. Bare Git historical get, history, and
+diff also follow a Document across a move when addressed through its current
+URI, without changing the default backend or external-mirror history path.
+The manual-vault rename lookup streams only through the requested revision and
+fails explicitly at bounded entry, output, or time limits instead of
+materializing an unbounded Git history.
 
 ### Fixed scoped grep replacement completeness and recovery
 

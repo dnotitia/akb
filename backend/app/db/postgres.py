@@ -236,14 +236,17 @@ async def _apply_migrations() -> None:
         "057_native_revision_m1_payload_placement.py", # M1 placement-scoped payload deduplication
         "058_publication_document_identity.py",  # publications.document_id + composite FK (document_id, vault_id) → documents(id, vault_id) ON DELETE CASCADE; conservative backfill
         "059_native_file_searchable_derived.py",  # chunks.source_type admits 'native_file' so text Files reach the chunk/index/embedding pipeline on the Document's Resource/Revision basis
-        "060_document_image_assets.py",  # vault_files.kind separates hidden editor attachments from standalone Files
-        "061_document_image_asset_lifecycle.py",  # first-claim marker; 062 adds bounded live/revision reference lifecycle
-        "062_document_image_asset_references.py",  # live document refs + bounded Git-revision manifests for attachment ACL/GC
-        "063_document_image_asset_gc_index.py",  # retain_until-first index for bounded expired-manifest collection
-        "064_vault_file_upload_state.py",  # distinguish pending uploads from hashless legacy confirmed Files
-        "065_vault_file_lifecycle_indexes.py",  # indexed attachment health counts + stale pending File collection
-        "066_document_asset_revision_lock_order.py",  # remove redundant vault FK so manifest writes keep vault→asset lock order
-        "067_vault_files_s3_key_lookup.py",  # physical-key reachability + pending-delete barrier indexes
+        "060_native_revision_migration_bridge.py",  # additive C9 migration runs, observations, and retained legacy selector mappings
+        "061_native_revision_authority.py",       # explicit new-database Native authority claim/pending/marker records
+        "062_app_rollout.py",                    # durable app release rollout job/target/step ledger
+        "063_document_image_assets.py",  # vault_files.kind separates hidden editor attachments from standalone Files
+        "064_document_image_asset_lifecycle.py",  # first-claim marker; 065 adds bounded live/revision reference lifecycle
+        "065_document_image_asset_references.py",  # live document refs + bounded Git-revision manifests for attachment ACL/GC
+        "066_document_image_asset_gc_index.py",  # retain_until-first index for bounded expired-manifest collection
+        "067_vault_file_upload_state.py",  # distinguish pending uploads from hashless legacy confirmed Files
+        "068_vault_file_lifecycle_indexes.py",  # indexed attachment health counts + stale pending File collection
+        "069_document_asset_revision_lock_order.py",  # remove redundant vault FK so manifest writes keep vault→asset lock order
+        "070_vault_files_s3_key_lookup.py",  # physical-key reachability + pending-delete barrier indexes
     ):
         if filename in applied:
             continue

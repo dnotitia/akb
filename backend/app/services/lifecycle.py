@@ -6,12 +6,18 @@ import these so the start/stop order stays consistent across entrypoints.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from app.config import settings
 from app.db.postgres import close_pool, get_pool, init_db
-from app.services import asset_gc_worker, audit_log, delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, m1_file_transfer_reaper, metadata_worker, s3_delete_worker, sparse_encoder, tool_usage, vault_backfill, write_lane
+from app.services import asset_gc_worker, audit_log, app_rollout_worker, delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, m1_file_transfer_reaper, metadata_worker, s3_delete_worker, sparse_encoder, tool_usage, vault_backfill, write_lane
 from app.services.git_service import GitService
+from app.services.native_revision_authority import (
+    pre_migration_revision_authority_guard,
+    startup_revision_authority_preflight,
+)
+from app.services.revision_backend import canonical_document_revision_backend
 from app.services.role_sync import RoleSync, get_role_sync, set_role_sync
 from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
 from app.services.vector_store import get_vector_store
@@ -70,8 +76,15 @@ def _validate_required_settings() -> None:
 async def init_storage() -> None:
     """Initialize DB schema/migrations and eagerly construct vector-store driver."""
     _validate_required_settings()
+    await pre_migration_revision_authority_guard()
     await init_db()
     logger.info("Database initialized")
+    authority_status = await startup_revision_authority_preflight()
+    logger.info(
+        "Document revision authority ready: backend=%s status=%s",
+        canonical_document_revision_backend(settings.document_revision_backend),
+        authority_status,
+    )
     if settings.native_revision_m1_file_driver != "s3_current":
         # Text Files share the native ledger and PostgreSQL BodyStore with the
         # guarded M1 grep arm. Install only after 048 and 053-057 are durable; normal
@@ -84,12 +97,13 @@ async def init_storage() -> None:
     # Self-heal: clear stale git index.lock files left behind by a
     # crashed prior process. Without this, the affected vault's writes
     # fail silently until an operator removes the lock by hand.
-    try:
-        cleared = GitService().cleanup_stale_locks()
-        if cleared:
-            logger.info("Cleared %d stale git lock(s) at startup", cleared)
-    except Exception as e:  # noqa: BLE001 — never block startup on best-effort cleanup
-        logger.warning("Stale-lock self-heal failed (continuing): %s", e)
+    if settings.document_revision_backend != "postgres_native":
+        try:
+            cleared = GitService().cleanup_stale_locks()
+            if cleared:
+                logger.info("Cleared %d stale git lock(s) at startup", cleared)
+        except Exception as e:  # noqa: BLE001 — never block startup on best-effort cleanup
+            logger.warning("Stale-lock self-heal failed (continuing): %s", e)
     # Force-construct so a misconfigured vector-store URL/DSN fails at startup rather
     # than silently serving empty search results later.
     store = get_vector_store()
@@ -124,6 +138,16 @@ async def init_storage() -> None:
 def start_workers() -> None:
     embed_worker.start()
     delete_worker.start()
+    # ``start_workers`` is normally called from the FastAPI lifespan loop.
+    # Keep direct, loop-free lifecycle probes (and import-time diagnostics)
+    # side-effect free; the rollout runner owns asyncio tasks and cannot be
+    # started without a running loop.
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        logger.debug("app_rollout_worker deferred: no running event loop")
+    else:
+        app_rollout_worker.start()
     # external-git kill-switch: the mirror poller must not run when the feature is
     # off (no claim, no outbound). Gated so a disabled deployment
     # starts zero mirror I/O; the read paths refuse mirror reads and the marker
@@ -152,7 +176,7 @@ def start_workers() -> None:
     # Git mutations run here so blocked/slow commits can never crowd git
     # READS out of asyncio.to_thread's shared default executor.
     write_lane.start_commit_pool()
-    started = ["tokenizer_pool", "git_commit_pool", "embed_worker", "delete_worker", "bm25_stats_refresher", "vault_backfill"]
+    started = ["tokenizer_pool", "git_commit_pool", "embed_worker", "delete_worker", "app_rollout_worker", "bm25_stats_refresher", "vault_backfill"]
     if settings.external_git_enabled:
         started.append("external_git_poller")
     if m1_file_transfer_reaper.enabled():
@@ -239,6 +263,7 @@ async def stop_workers() -> None:
     # freshly-enqueued object waiting solely because the consumer exited first.
     await asset_gc_worker.stop()
     await s3_delete_worker.stop()
+    await app_rollout_worker.stop()
     await delete_worker.stop()
     await embed_worker.stop()
     await vault_backfill.stop()

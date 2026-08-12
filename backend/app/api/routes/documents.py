@@ -12,6 +12,7 @@ from app.services.access_service import (
 )
 from app.models.document import (
     DocumentDeleteResponse,
+    DocumentMoveRequest,
     DocumentPutRequest,
     DocumentPutResponse,
     DocumentResponse,
@@ -92,6 +93,29 @@ async def list_vaults(user: AuthenticatedUser = Depends(get_current_user)):
 async def put_document(req: DocumentPutRequest, user: AuthenticatedUser = Depends(get_current_user)):
     await check_vault_access(user.user_id, req.vault, required_role="writer")
     return await doc_service.put(req, agent_id=user.username)
+
+
+@router.post(
+    "/documents/{vault}/{doc_id:path}/move",
+    response_model=DocumentPutResponse,
+    summary="Move or rename a document",
+    operation_id="documentsMoveDocument",
+)
+async def move_document(
+    vault: str,
+    doc_id: str,
+    req: DocumentMoveRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    await check_vault_access(user.user_id, vault, required_role="writer")
+    return await doc_service.move(
+        vault,
+        doc_id,
+        collection=req.collection,
+        slug=req.slug,
+        message=req.message,
+        agent_id=user.username,
+    )
 
 
 @router.get(

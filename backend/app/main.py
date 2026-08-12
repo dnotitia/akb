@@ -19,6 +19,7 @@ from app.api.routes import (
     assets,
     app_inventory,
     app_installations,
+    app_rollouts,
     agent_sessions,
     app_identity,
     auth,
@@ -53,6 +54,7 @@ from app.services.auth_service import AuthenticatedUser
 from app.services.external_git_capability import check_external_git_capability
 from app.services.health import vault_health
 from app.services.lifecycle import init_storage, shutdown_storage, start_workers, stop_workers
+from app.services.revision_backend import selected_document_revision_backend
 from app.services.vector_store import get_vector_store
 from app.util.errors import CONFLICT, INTERNAL, INVALID_ARGUMENT, METHOD_NOT_ALLOWED, NOT_FOUND, PERMISSION_DENIED
 from mcp_server.http_app import mcp_app
@@ -268,6 +270,8 @@ async def _no_store_public_surfaces(request: Request, call_next):
             break
     if (
         path.startswith("/api/v1/app/installations/")
+        or path.startswith("/api/v1/app/rollouts")
+        or (path.startswith("/api/v1/apps/") and "/rollouts" in path)
         or (
             path.startswith("/api/v1/apps/")
             and "/installations/" in path
@@ -282,6 +286,7 @@ app.include_router(auth.router, prefix="/api/v1", tags=["auth"])
 app.include_router(app_identity.router, prefix="/api/v1", tags=["app-identity"])
 app.include_router(app_inventory.router, prefix="/api/v1", tags=["app-inventory"])
 app.include_router(app_installations.router, prefix="/api/v1", tags=["app-installations"])
+app.include_router(app_rollouts.router, prefix="/api/v1", tags=["app-rollouts"])
 app.include_router(access.router, prefix="/api/v1", tags=["access"])
 app.include_router(documents.router, prefix="/api/v1", tags=["documents"])
 app.include_router(search.router, prefix="/api/v1", tags=["search"])
@@ -334,7 +339,9 @@ async def _probe_ready() -> tuple[bool, dict]:
     on the configured driver would pull the pod from the Service and
     break login/auth/CRUD for ~30s.
     """
-    detail: dict = {}
+    detail: dict = {
+        "document_revision_backend": selected_document_revision_backend(),
+    }
     try:
         pool = await get_pool()
         await asyncio.wait_for(pool.fetchval("SELECT 1"), timeout=2.0)

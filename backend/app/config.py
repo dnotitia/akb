@@ -17,6 +17,8 @@ per deployment without re-rendering config files.
 """
 
 import ipaddress
+import re
+import uuid
 from pathlib import Path
 from typing import Literal
 
@@ -47,6 +49,20 @@ def parse_git_version(text: str) -> tuple[int, int, int] | None:
 
 
 NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME = "akb_revision_m1_measurement"
+
+_DNS1123_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+_NATIVE_RUNTIME_IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def is_dns1123_namespace(value: str) -> bool:
+    """Return whether ``value`` is a DNS-1123 subdomain."""
+    if not value or len(value) > 253:
+        return False
+    labels = value.split(".")
+    return all(
+        1 <= len(label) <= 63 and _DNS1123_LABEL_RE.fullmatch(label) is not None
+        for label in labels
+    )
 
 
 class AuditSettings(BaseModel):
@@ -243,9 +259,18 @@ class Settings(BaseModel):
     # Git storage root (bare repos live here)
     git_storage_path: str = "/data/vaults"
 
-    # Native ledger selection is a dedicated M1 measurement path. Normal
-    # deployments retain the legacy bare-Git revision behavior by default.
-    document_revision_backend: Literal["bare_git_current", "native_ledger_m1"] = "bare_git_current"
+    # Stable document revision selector. ``bare_git`` is the default. The two
+    # legacy values remain accepted for receipt compatibility; they are not
+    # rendered by new deployment surfaces.
+    document_revision_backend: Literal[
+        "bare_git", "postgres_native", "bare_git_current", "native_ledger_m1"
+    ] = "bare_git"
+    # Positive new-database Native authority bootstrap identity. These values
+    # are deliberately YAML-only and are required only by postgres_native.
+    document_revision_tenant_id: str = ""
+    document_revision_namespace: str = ""
+    document_revision_database_id: uuid.UUID | None = None
+    document_revision_runtime_image_digest: str = ""
     native_revision_m1_measurement_only: bool = False
     # W4's public File measurement is an opt-in, dedicated-database-only
     # comparison.  ``s3_current`` leaves the normal File service completely
@@ -370,6 +395,40 @@ class Settings(BaseModel):
                 "publication_view_grant_session_secs must be >= "
                 "publication_view_grant_ttl_secs"
             )
+        if self.document_revision_backend == "postgres_native":
+            if not self.document_revision_tenant_id.strip():
+                raise ValueError(
+                    "postgres_native requires document_revision_tenant_id"
+                )
+            self.document_revision_tenant_id = self.document_revision_tenant_id.strip()
+            if not is_dns1123_namespace(self.document_revision_namespace):
+                raise ValueError(
+                    "postgres_native requires document_revision_namespace in DNS-1123 form"
+                )
+            if self.document_revision_database_id is None:
+                raise ValueError(
+                    "postgres_native requires document_revision_database_id"
+                )
+            if not _NATIVE_RUNTIME_IMAGE_DIGEST_RE.fullmatch(
+                self.document_revision_runtime_image_digest
+            ):
+                raise ValueError(
+                    "postgres_native requires document_revision_runtime_image_digest "
+                    "in sha256:<64 lowercase hex> form"
+                )
+            if self.db_name == NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME:
+                raise ValueError(
+                    "postgres_native rejects the reserved native measurement database"
+                )
+            if self.native_revision_m1_measurement_only:
+                raise ValueError(
+                    "postgres_native rejects native_revision_m1_measurement_only"
+                )
+            if self.native_revision_m1_file_driver != "s3_current":
+                raise ValueError(
+                    "postgres_native rejects non-s3_current native_revision_m1_file_driver"
+                )
+
         if self.document_revision_backend == "native_ledger_m1":
             if not self.native_revision_m1_measurement_only:
                 raise ValueError(

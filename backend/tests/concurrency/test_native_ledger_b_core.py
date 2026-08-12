@@ -9,17 +9,20 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib.util
+import inspect
 import os
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import asyncpg
+import frontmatter
 import pytest
 
 from app.exceptions import ConflictError, NotFoundError, ValidationError
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.native_revision_repo import NativeRevisionRepository
+from app.services.document_service import VAULT_SKILL_SEED_TEMPLATE
 from app.services.m1_file_measurement import (
     NativeTextDeleteRequest,
     NativeTextPublishRequest,
@@ -31,7 +34,6 @@ from app.services.m1_pg_body_store import M1PgBodyStore, PgBodyIntegrityError
 from app.services.m1_reference_payload_store import M1ReferencePayloadStore
 from app.services.native_document_service import (
     NativeDocumentService,
-    NativeRevisionUnsupportedSurfaceError,
 )
 from app.services.native_derived_worker import NativeDerivedWorker
 from app.services.native_revision_backend import NativeRevisionBackend
@@ -161,6 +163,97 @@ async def _authority_counts(pool: asyncpg.Pool) -> dict[str, int]:
     )
     async with pool.acquire() as conn:
         return {table: await conn.fetchval(f"SELECT count(*) FROM {table}") for table in tables}
+
+
+async def _assert_native_vault_creation_rolled_back(pool: asyncpg.Pool, vault_name: str) -> None:
+    async with pool.acquire() as conn:
+        assert await conn.fetchval("SELECT COUNT(*) FROM vaults WHERE name = $1", vault_name) == 0
+        for table in (
+            "native_resources",
+            "native_revisions",
+            "native_payload_manifests",
+            "native_revision_activity",
+            "native_invalidation_intents",
+            "native_resource_path_aliases",
+            "m1_reference_payloads",
+            "documents",
+        ):
+            assert await conn.fetchval(f"SELECT COUNT(*) FROM {table}") == 0
+
+
+async def test_create_text_public_signature_does_not_expose_a_connection() -> None:
+    assert "conn" not in inspect.signature(NativeRevisionService.create_text).parameters
+
+
+async def test_create_text_in_conn_rejects_connection_outside_a_transaction() -> None:
+    async with _fresh_database() as (pool, vault_id):
+        service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
+        async with pool.acquire() as conn:
+            with pytest.raises(ValidationError, match="active transaction"):
+                await service.create_text_in_conn(conn, **_create_args(vault_id))
+
+        assert await _authority_counts(pool) == {
+            "native_resources": 0,
+            "native_revisions": 0,
+            "native_payload_manifests": 0,
+            "native_revision_activity": 0,
+            "native_invalidation_intents": 0,
+        }
+        async with pool.acquire() as conn:
+            assert await conn.fetchval("SELECT COUNT(*) FROM m1_reference_payloads") == 0
+
+
+async def test_create_text_in_conn_rejects_default_reference_payload_store() -> None:
+    async with _fresh_database() as (pool, vault_id):
+        service = NativeRevisionService(pool)
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                with pytest.raises(TypeError, match="transaction-aware payload store"):
+                    await service.create_text_in_conn(conn, **_create_args(vault_id))
+
+        assert await _authority_counts(pool) == {
+            "native_resources": 0,
+            "native_revisions": 0,
+            "native_payload_manifests": 0,
+            "native_revision_activity": 0,
+            "native_invalidation_intents": 0,
+        }
+        async with pool.acquire() as conn:
+            assert await conn.fetchval("SELECT COUNT(*) FROM m1_reference_payloads") == 0
+
+
+async def test_create_text_in_conn_does_not_report_caller_transaction_as_committed() -> None:
+    async with _fresh_database() as (pool, vault_id):
+        seen: list[str] = []
+
+        async def record(name: str) -> None:
+            seen.append(name)
+
+        service = NativeRevisionService(
+            pool,
+            payload_store=M1PgBodyStore(pool),
+            failpoint=record,
+        )
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await service.create_text_in_conn(conn, **_create_args(vault_id))
+                assert conn.is_in_transaction()
+                assert "authority.after_commit_before_response" not in seen
+
+        assert seen == [
+            "payload.before_prepare",
+            "payload.after_verified",
+            "payload.after_prepare_before_tx",
+            "authority.after_resource",
+            "authority.after_manifest",
+            "authority.after_revision",
+            "authority.after_head",
+            "authority.after_path",
+            "authority.after_alias",
+            "authority.after_activity",
+            "authority.after_invalidation",
+            "authority.before_commit",
+        ]
 
 
 async def test_create_get_replace_are_native_atomic_and_leave_legacy_projection_untouched():
@@ -604,6 +697,109 @@ async def test_native_vault_create_is_postgres_only_and_wires_owner_and_public_a
         assert list(tmp_path.iterdir()) == []
 
 
+async def test_native_vault_create_seeds_exact_canonical_skill_in_one_pg_slot(tmp_path, monkeypatch):
+    async with _fresh_database(pool_max_size=1) as (pool, _):
+        from app.config import settings
+        from app.services import native_document_service as native_documents
+
+        class _RoleSync:
+            async def on_vault_create_in_conn(self, conn, vault_id, owner_id) -> None:
+                pass
+
+            async def on_public_access_change_in_conn(self, conn, vault_id, access) -> None:
+                pass
+
+        monkeypatch.setattr(native_documents, "get_role_sync", lambda: _RoleSync())
+        monkeypatch.setattr(settings, "git_storage_path", str(tmp_path))
+        vault_name = f"native-seed-{uuid.uuid4().hex}"
+        owner_id = uuid.uuid4()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO users (id, username, email, password_hash) VALUES ($1, $2, $3, $4)",
+                owner_id,
+                f"owner-{owner_id.hex}",
+                f"{owner_id.hex}@example.test",
+                "test",
+            )
+        vault_id = uuid.UUID(
+            await NativeDocumentService(pool=pool).create_vault(
+                vault_name,
+                owner_id=str(owner_id),
+            )
+        )
+
+        expected_body = VAULT_SKILL_SEED_TEMPLATE.replace("{vault}", vault_name)
+        expected_path = "overview/vault-skill.md"
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT r.resource_id, r.current_path, r.lifecycle, r.head_revision_id,
+                       rv.parent_revision_id, rv.action, rv.path_at_revision,
+                       rv.path_from, rv.path_to, rv.actor, rv.subject, rv.summary,
+                       m.content_profile, m.digest, m.byte_size, m.encoding,
+                       m.selected_placement, m.verification_profile,
+                       p.canonical_bytes,
+                       a.action AS activity_action, a.actor AS activity_actor,
+                       a.subject AS activity_subject, a.summary AS activity_summary,
+                       a.changed_path_from, a.changed_path_to,
+                       i.reason AS invalidation_reason, i.selected_delivery,
+                       (SELECT COUNT(*) FROM documents d WHERE d.vault_id = r.namespace_id) AS legacy_documents
+                  FROM native_resources r
+                  JOIN native_revisions rv
+                    ON rv.resource_id = r.resource_id
+                   AND rv.revision_id = r.head_revision_id
+                  JOIN native_payload_manifests m
+                    ON m.payload_manifest_id = rv.payload_manifest_id
+                  JOIN m1_reference_payloads p
+                    ON p.payload_id = m.private_locator
+                  JOIN native_revision_activity a
+                    ON a.activity_event_id = rv.activity_event_id
+                  JOIN native_invalidation_intents i
+                    ON i.intent_id = rv.invalidation_intent_id
+                 WHERE r.namespace_id = $1
+                   AND r.surface = 'document'
+                """,
+                vault_id,
+            )
+
+        assert row is not None
+        assert row["current_path"] == row["path_at_revision"] == expected_path
+        assert row["lifecycle"] == "live"
+        assert row["parent_revision_id"] is None
+        assert row["action"] == "create"
+        assert row["path_from"] is None
+        assert row["path_to"] == expected_path
+        assert row["actor"] == row["activity_actor"] == str(owner_id)
+        assert row["subject"] == row["activity_subject"] == f"[put] {expected_path}"
+        assert row["summary"] == row["activity_summary"] == f"{vault_name} Guide"
+        assert row["activity_action"] == "create"
+        assert row["changed_path_from"] is None
+        assert row["changed_path_to"] == expected_path
+        assert row["invalidation_reason"] == "create"
+        assert row["selected_delivery"] is None
+        assert row["content_profile"] == "text"
+        assert row["encoding"] == "utf-8"
+        assert row["selected_placement"] == "pg-bodystore-v1"
+        assert row["verification_profile"] == "sha256-size-utf8-v1"
+
+        canonical = bytes(row["canonical_bytes"])
+        assert frontmatter.loads(canonical.decode("utf-8")).content == expected_body.strip()
+        metadata = frontmatter.loads(canonical.decode("utf-8")).metadata
+        assert metadata["title"] == f"{vault_name} Guide"
+        assert metadata["type"] == "skill"
+        assert metadata["status"] == "draft"
+        assert metadata["tags"] == ["akb:skill"]
+        assert metadata["created_by"] == str(owner_id)
+        assert metadata["summary"] == (
+            "> Edit this document to describe how agents should write into this vault."
+        )
+        assert metadata["created_at"] == metadata["updated_at"]
+        assert "id" not in metadata
+        assert row["byte_size"] == len(canonical)
+        assert row["legacy_documents"] == 0
+        assert list(tmp_path.iterdir()) == []
+
+
 async def test_native_vault_create_syncs_scoped_pat_inside_one_connection(monkeypatch):
     """A one-slot pool proves strict RoleSync never acquires a second slot."""
     async with _fresh_database(pool_max_size=1) as (pool, _):
@@ -744,7 +940,17 @@ async def test_native_vault_create_concurrent_same_name_returns_one_conflict(mon
         assert len([result for result in outcomes if isinstance(result, str)]) == 1
         assert len([result for result in outcomes if isinstance(result, ConflictError)]) == 1
         async with pool.acquire() as conn:
-            assert await conn.fetchval("SELECT COUNT(*) FROM vaults WHERE name = $1", vault_name) == 1
+            winner = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", vault_name)
+            assert winner is not None
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM native_resources WHERE namespace_id = $1", winner["id"]
+            ) == 1
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM native_revisions WHERE namespace_id = $1", winner["id"]
+            ) == 1
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM m1_reference_payloads WHERE namespace_id = $1", winner["id"]
+            ) == 1
 
 
 async def test_public_delete_removes_native_vault_authority_and_derived_state(
@@ -804,11 +1010,13 @@ async def test_public_delete_removes_native_vault_authority_and_derived_state(
             ),
             agent_id=str(owner_id),
         )
-        assert await NativeDerivedWorker(pool).process_once() == 1
+        worker = NativeDerivedWorker(pool)
+        assert await worker.process_once() == 1  # canonical vault-skill seed
+        assert await worker.process_once() == 1  # user document
         async with pool.acquire() as conn:
             assert await conn.fetchval(
                 "SELECT COUNT(*) FROM native_derived_heads WHERE namespace_id = $1", vault_id
-            ) == 1
+            ) == 2
             assert await conn.fetchval(
                 "SELECT COUNT(*) FROM native_derived_chunks WHERE namespace_id = $1", vault_id
             ) > 0
@@ -927,7 +1135,9 @@ async def test_public_delete_tombstones_native_text_file_derived_chunks(
                 "main.py",
                 f"{vault_name}/src/main.py",
             )
-        assert await NativeDerivedWorker(pool).process_once() == 1
+        worker = NativeDerivedWorker(pool)
+        assert await worker.process_once() == 1  # canonical vault-skill seed
+        assert await worker.process_once() == 1  # native file
 
         async with pool.acquire() as conn:
             native_file_chunk_ids = {
@@ -940,6 +1150,9 @@ async def test_public_delete_tombstones_native_text_file_derived_chunks(
             assert native_file_chunk_ids
             assert await conn.fetchval(
                 "SELECT COUNT(*) FROM native_derived_heads WHERE namespace_id = $1", vault_id
+            ) == 2
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM native_derived_heads WHERE resource_id = $1", created.resource_id
             ) == 1
             assert await conn.fetchval(
                 "SELECT COUNT(*) FROM vector_delete_outbox"
@@ -965,7 +1178,7 @@ async def test_public_delete_tombstones_native_text_file_derived_chunks(
                 "SELECT COUNT(*) FROM chunks WHERE vault_id = $1", vault_id
             ) == 0
             assert await conn.fetchval(
-                "SELECT COUNT(*) FROM vector_delete_outbox"
+                "SELECT COUNT(*) FROM vector_delete_outbox WHERE source_type = 'native_file'"
             ) == len(native_file_chunk_ids)
             for table, where in (
                 ("vaults", "id"),
@@ -994,8 +1207,7 @@ async def test_native_vault_create_rolls_back_catalog_row_when_role_sync_raises(
         with pytest.raises(RuntimeError, match="role sync unavailable"):
             await NativeDocumentService(pool=pool).create_vault(vault_name)
 
-        async with pool.acquire() as conn:
-            assert await conn.fetchval("SELECT COUNT(*) FROM vaults WHERE name = $1", vault_name) == 0
+        await _assert_native_vault_creation_rolled_back(pool, vault_name)
 
 
 async def test_native_vault_create_rolls_back_catalog_row_when_strict_role_sync_is_cancelled(
@@ -1019,8 +1231,61 @@ async def test_native_vault_create_rolls_back_catalog_row_when_strict_role_sync_
         with pytest.raises(asyncio.CancelledError):
             await create_task
 
-        async with pool.acquire() as conn:
-            assert await conn.fetchval("SELECT COUNT(*) FROM vaults WHERE name = $1", vault_name) == 0
+        await _assert_native_vault_creation_rolled_back(pool, vault_name)
+
+
+async def test_native_vault_create_seed_failure_rolls_back_every_fact_and_payload(monkeypatch):
+    async with _fresh_database() as (pool, _):
+        from app.services import native_document_service as native_documents
+
+        class _RoleSync:
+            async def on_vault_create_in_conn(self, conn, vault_id, owner_id) -> None:
+                pass
+
+            async def on_public_access_change_in_conn(self, conn, vault_id, access) -> None:
+                pass
+
+        async def failpoint(name: str) -> None:
+            if name == "authority.after_activity":
+                raise RuntimeError("seed publication failed")
+
+        monkeypatch.setattr(native_documents, "get_role_sync", lambda: _RoleSync())
+        vault_name = f"native-seed-failure-{uuid.uuid4().hex}"
+        with pytest.raises(RuntimeError, match="seed publication failed"):
+            await NativeDocumentService(pool=pool, failpoint=failpoint).create_vault(vault_name)
+
+        await _assert_native_vault_creation_rolled_back(pool, vault_name)
+
+
+async def test_native_vault_create_seed_cancellation_rolls_back_every_fact_and_payload(monkeypatch):
+    async with _fresh_database(pool_max_size=1) as (pool, _):
+        from app.services import native_document_service as native_documents
+
+        class _RoleSync:
+            async def on_vault_create_in_conn(self, conn, vault_id, owner_id) -> None:
+                pass
+
+            async def on_public_access_change_in_conn(self, conn, vault_id, access) -> None:
+                pass
+
+        started = asyncio.Event()
+
+        async def failpoint(name: str) -> None:
+            if name == "authority.after_activity":
+                started.set()
+                await asyncio.Event().wait()
+
+        monkeypatch.setattr(native_documents, "get_role_sync", lambda: _RoleSync())
+        vault_name = f"native-seed-cancel-{uuid.uuid4().hex}"
+        create_task = asyncio.create_task(
+            NativeDocumentService(pool=pool, failpoint=failpoint).create_vault(vault_name)
+        )
+        await started.wait()
+        create_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await create_task
+
+        await _assert_native_vault_creation_rolled_back(pool, vault_name)
 
 
 async def test_native_vault_create_cancellation_rolls_back_actual_role_sync_state(monkeypatch):
@@ -2913,8 +3178,99 @@ async def test_full_native_document_lifecycle_preserves_compatibility_without_gi
                 == 0
             )
 
-        with pytest.raises(NativeRevisionUnsupportedSurfaceError):
-            await document_service.browse(vault)
+        browsed = await document_service.browse(
+            vault,
+            collection="archive",
+            depth=0,
+            include_hashes=True,
+        )
+        assert browsed.path == "archive"
+        assert [(item.type, item.path) for item in browsed.items] == [
+            ("document", recreated.path),
+        ]
+        assert browsed.items[0].current_commit == recreated.commit_hash
+        assert browsed.items[0].content_hash
+
+
+async def test_native_browse_uses_native_heads_for_collection_root_and_depth():
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+            await conn.execute(
+                """
+                INSERT INTO collections (vault_id, path, name)
+                VALUES ($1, 'guides', 'guides'), ($1, 'guides/nested', 'nested')
+                """,
+                vault_id,
+            )
+
+        service = NativeDocumentService(pool=pool)
+        await service.put(
+            DocumentPutRequest(
+                vault=vault, collection="", slug="root", title="Root", content="root"
+            ),
+            agent_id="browse-writer",
+        )
+        await service.put(
+            DocumentPutRequest(
+                vault=vault, collection="guides", slug="direct", title="Direct", content="direct"
+            ),
+            agent_id="browse-writer",
+        )
+        await service.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="guides/nested",
+                slug="deep",
+                title="Deep",
+                content="deep",
+            ),
+            agent_id="browse-writer",
+        )
+        await service.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="guides/nested",
+                slug="archived",
+                title="Archived",
+                content="archived",
+                status="archived",
+            ),
+            agent_id="browse-writer",
+        )
+
+        root = await service.browse(vault, depth=0)
+        assert {item.path for item in root.items if item.type == "document"} == {"root.md"}
+        assert {item.path for item in root.items if item.type == "collection"} == {
+            "guides",
+            "guides/nested",
+        }
+
+        collection_root = await service.browse(vault, collection="guides", depth=0)
+        assert {item.path for item in collection_root.items if item.type == "document"} == {
+            "guides/direct.md",
+        }
+        assert {item.path for item in collection_root.items if item.type == "collection"} == {
+            "guides/nested",
+        }
+
+        subtree = await service.browse(vault, collection="guides", depth=-1)
+        assert {item.path for item in subtree.items if item.type == "document"} == {
+            "guides/direct.md",
+            "guides/nested/deep.md",
+        }
+
+        archived = await service.browse(
+            vault,
+            collection="guides",
+            depth=-1,
+            include_archived=True,
+        )
+        assert {item.path for item in archived.items if item.type == "document"} == {
+            "guides/direct.md",
+            "guides/nested/deep.md",
+            "guides/nested/archived.md",
+        }
 
 
 async def test_vault_activity_and_recent_changes_are_scoped_to_the_document_surface():

@@ -53,8 +53,14 @@ def active_document_source_type(
     database: str,
 ) -> str:
     """Select one Document authority; fail closed on a partial native guard."""
-    if backend == "bare_git_current":
+    if backend in {"bare_git", "bare_git_current"}:
         return LEGACY_DOCUMENT_SOURCE
+    if backend == "postgres_native":
+        if measurement_only:
+            raise RuntimeError("postgres_native rejects the measurement-only guard")
+        if database == NATIVE_MEASUREMENT_DATABASE:
+            raise RuntimeError("postgres_native rejects the reserved measurement database")
+        return NATIVE_DOCUMENT_SOURCE
     if backend != "native_ledger_m1":
         raise RuntimeError(f"unsupported document revision backend: {backend}")
     if not measurement_only:
@@ -1119,9 +1125,13 @@ class SearchService:
         limit = clamp_search_limit(limit)
 
         document_source = _configured_document_source_type()
-        if measurement_include_text_files and document_source != NATIVE_DOCUMENT_SOURCE:
+        if measurement_include_text_files and (
+            settings.document_revision_backend != "native_ledger_m1"
+            or document_source != NATIVE_DOCUMENT_SOURCE
+        ):
             raise ValidationError(
-                "measurement_include_text_files requires the guarded native measurement backend"
+                "measurement_include_text_files requires the guarded native measurement "
+                "backend (native_ledger_m1)"
             )
         if document_source == NATIVE_DOCUMENT_SOURCE:
             from app.services.m1_native_grep_service import M1NativeGrepService

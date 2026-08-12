@@ -23,6 +23,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -46,7 +47,7 @@ from fixture_control import create_app
 
 LOGGER = logging.getLogger("akb.e2e_runtime")
 SCHEMA_VERSION = 2
-Scenario = Literal["empty", "app-installation-lifecycle"]
+Scenario = Literal["empty", "app-installation-lifecycle", "app-release-rollout"]
 SCENARIO: Scenario = "empty"
 DEFAULT_USERNAME_ENV = "AKB_E2E_USERNAME"
 DEFAULT_PASSWORD_ENV = "AKB_E2E_PASSWORD"
@@ -217,6 +218,7 @@ class E2ERuntime:
         self._stop_event = asyncio.Event()
         self._reset_lock = asyncio.Lock()
         self._resetting = False
+        self._lifecycle_generation = 0
         self._cleaned = False
         self._prepared = False
         self._fixture_catalog: dict[str, object] = {
@@ -225,6 +227,7 @@ class E2ERuntime:
         }
         self._fixture_private_values: tuple[str, ...] = ()
         self._fixture_private_marker = ""
+        self._fixture_controls: dict[str, object] = {}
 
         self._compose_log = self.config.logs_dir / "compose.log"
 
@@ -245,30 +248,72 @@ class E2ERuntime:
         }
 
     def fixture_discovery(self) -> dict[str, object]:
-        """Return fixture coordinates and source-neutral validator entry points."""
+        """Return sanitized product coordinates and bounded fixture controls."""
 
-        catalog = json.loads(json.dumps(self._fixture_catalog))
+        def scrub(value: object) -> object:
+            if isinstance(value, dict):
+                return {str(key): scrub(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [scrub(item) for item in value]
+            if isinstance(value, str):
+                for private in sorted(
+                    (item for item in self._fixture_private_values if item),
+                    key=len,
+                    reverse=True,
+                ):
+                    value = value.replace(private, "[redacted]")
+            return value
+
+        catalog = scrub(json.loads(json.dumps(self._fixture_catalog)))
+        if not isinstance(catalog, dict):
+            catalog = {}
         catalog["access"] = {
             "login": {
                 "service": "app",
                 "method": "POST",
                 "path": "/api/v1/auth/login",
                 "fields": ["username", "password"],
-                "credential_source": "external_env_only",
-                "credential_env": {
-                    "username": self.config.credentials.username_env,
-                    "password": self.config.credentials.password_env,
-                },
             }
         }
-        catalog["tasks"] = {
+        catalog["observability"] = {
             "log_observation": {
                 "service": "fixture",
                 "method": "GET",
                 "path": "/log-observation",
-                "result": "sanitized",
             }
         }
+        if self.config.scenario == "app-release-rollout":
+            installations = catalog.get("installations", [])
+            targets: list[dict[str, str]] = []
+            if isinstance(installations, list):
+                for item in installations:
+                    if not isinstance(item, dict):
+                        continue
+                    fixture_id = item.get("fixture_id") or item.get("label") or item.get("id")
+                    installation_id = item.get("id")
+                    if isinstance(fixture_id, str) and isinstance(installation_id, str):
+                        targets.append({"fixture_id": fixture_id, "installation_id": installation_id})
+            catalog["controls"] = {
+                "fault_injection": {
+                    "service": "fixture",
+                    "method": "POST",
+                    "path": "/control",
+                    "body": {
+                        "action": "fault_injection",
+                        "kind": "missing_owned_table",
+                        "target": targets[0]["fixture_id"] if targets else None,
+                        "enabled": True,
+                    },
+                    "kinds": ["missing_owned_table"],
+                    "targets": targets,
+                },
+                "restart": {
+                    "service": "fixture",
+                    "method": "POST",
+                    "path": "/control",
+                    "body": {"action": "restart", "enabled": True},
+                },
+            }
         return catalog
 
     def fixture_log_observation(self) -> dict[str, object]:
@@ -292,6 +337,151 @@ class E2ERuntime:
             },
             "log_line_count": log_text.count("\n"),
         }
+
+    def _resolve_fault_target(self, target: str) -> dict[str, object]:
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("unsupported fault target")
+        value = target.strip()
+        installations = self._fixture_catalog.get("installations", [])
+        if isinstance(installations, list):
+            for item in installations:
+                if not isinstance(item, dict):
+                    continue
+                fixture_id = item.get("fixture_id") or item.get("label") or item.get("id")
+                if value == fixture_id or value == item.get("id"):
+                    return item
+        raise ValueError("unsupported fault target")
+
+    async def fixture_control(
+        self,
+        action: str,
+        target: str | None,
+        enabled: bool,
+        kind: str | None = None,
+    ) -> dict[str, object]:
+        """Apply a bounded fixture control and return only sanitized state."""
+        if action == "restart":
+            self._fixture_controls["restart_requested"] = bool(enabled)
+            if enabled:
+                asyncio.create_task(
+                    self._restart_backend(
+                        self._lifecycle_generation,
+                        requested_during_reset=self._resetting or self._reset_lock.locked(),
+                    ),
+                    name="backend-restart",
+                )
+        elif action == "fault_injection":
+            if self.config.scenario != "app-release-rollout":
+                return {
+                    "status": "rejected",
+                    "scenario": self.config.scenario,
+                    "action": action,
+                    "reason": "unsupported_scenario",
+                }
+            if target is not None and len(target) > 128:
+                raise ValueError("control target is too long")
+            if enabled:
+                try:
+                    fixture = self._resolve_fault_target(target or "")
+                except ValueError:
+                    return {
+                        "status": "rejected",
+                        "scenario": self.config.scenario,
+                        "action": action,
+                        "enabled": False,
+                        "reason": "unsupported_target",
+                    }
+                selected_kind = kind or "missing_owned_table"
+                if selected_kind != "missing_owned_table":
+                    return {
+                        "status": "rejected",
+                        "scenario": self.config.scenario,
+                        "action": action,
+                        "enabled": False,
+                        "reason": "unsupported_kind",
+                    }
+                if not await self._apply_fault(fixture, selected_kind):
+                    return {
+                        "status": "rejected",
+                        "scenario": self.config.scenario,
+                        "action": action,
+                        "enabled": False,
+                        "reason": "fault_unavailable",
+                    }
+                self._fixture_controls["fault"] = {
+                    "target": fixture.get("fixture_id") or fixture.get("label") or fixture.get("id"),
+                    "kind": selected_kind,
+                }
+            else:
+                self._fixture_controls["fault"] = None
+        else:
+            return {"status": "ignored", "scenario": self.config.scenario, "action": action}
+        return {
+            "status": "accepted",
+            "scenario": self.config.scenario,
+            "action": action,
+            "enabled": bool(enabled),
+            "observed": {
+                "fault_injection": self._fixture_controls.get("fault"),
+                "restart_requested": bool(self._fixture_controls.get("restart_requested", False)),
+            },
+        }
+
+    async def _apply_fault(self, fixture: dict[str, object], kind: str) -> bool:
+        """Seed one bounded schema fault for a fixture installation.
+
+        The target table is removed while ownership remains registered.  The
+        public rollout request therefore still passes its ownership preflight,
+        while the worker deterministically records ``step_failed`` before any
+        migration mutation.  The SQL identifier remains private to the fixture.
+        """
+        if kind != "missing_owned_table":
+            return False
+        try:
+            import asyncpg
+
+            vault_id = fixture.get("vault_id")
+            if not isinstance(vault_id, str):
+                return False
+            connection = await asyncpg.connect(
+                host="127.0.0.1", port=15432, user="akb", password="akb", database="akb"
+            )
+            try:
+                vault_name = await connection.fetchval("SELECT name FROM vaults WHERE id=$1", uuid.UUID(vault_id))
+                if not isinstance(vault_name, str):
+                    return False
+                safe_vault = re.sub(r"[^a-zA-Z0-9_]", "_", vault_name)
+                physical = f"vt_{safe_vault}__rollout_data"
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", physical):
+                    return False
+                await connection.execute(f"DROP TABLE IF EXISTS {physical}")
+                return True
+            finally:
+                await connection.close()
+        except Exception:
+            # Controls are best effort and must not leak database details.
+            return False
+
+    async def _restart_backend(
+        self,
+        requested_generation: int | None = None,
+        *,
+        requested_during_reset: bool = False,
+    ) -> None:
+        try:
+            async with self._reset_lock:
+                if requested_generation is None:
+                    requested_generation = self._lifecycle_generation
+                if (
+                    requested_during_reset
+                    or requested_generation != self._lifecycle_generation
+                    or self._resetting
+                ):
+                    return
+                await self._stop_named_process("backend")
+                await self._start_backend()
+        except Exception:
+            return
 
     def descriptor(self) -> dict[str, object]:
         return {
@@ -684,6 +874,328 @@ class E2ERuntime:
             hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
         )
         return release_id
+
+    async def _insert_rollout_release(
+        self,
+        connection: Any,
+        *,
+        app_id: uuid.UUID,
+        version: str,
+        valid: bool = True,
+    ) -> tuple[uuid.UUID, str, dict[str, object]]:
+        """Insert a v1 release and return its immutable manifest coordinates."""
+        def canonical(value: object) -> bytes:
+            return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+        if valid:
+            steps: list[dict[str, object]] = [
+                {
+                    "id": "expand_flag",
+                    "phase": "expand",
+                    "operation": "add_column",
+                    "payload": {
+                        "table": "rollout_data",
+                        "column": {"name": "flag", "type": "text"},
+                    },
+                },
+                {
+                    "id": "backfill_flag",
+                    "phase": "backfill",
+                    "operation": "backfill_column",
+                    "payload": {
+                        "table": "rollout_data",
+                        "column": "flag",
+                        "primary_key": "id",
+                        "where_null": True,
+                        "batch_size": 10,
+                        "value": "ready",
+                    },
+                },
+                {
+                    "id": "enforce_flag",
+                    "phase": "enforce",
+                    "operation": "set_not_null",
+                    "payload": {"table": "rollout_data", "column": "flag"},
+                },
+            ]
+            for step in steps:
+                step["checksum"] = hashlib.sha256(canonical(step)).hexdigest()
+            manifest: dict[str, object] = {"manifest_version": 1, "steps": steps}
+        else:
+            manifest = {
+                "manifest_version": 1,
+                "steps": [{"id": "contract", "phase": "contract", "operation": "drop_table", "payload": {"table": "rollout_data"}}],
+            }
+        manifest_steps = manifest["steps"]
+        assert isinstance(manifest_steps, list)
+        checksum_payload = {
+            "manifest_version": manifest["manifest_version"],
+            "steps": [
+                {key: value for key, value in step.items() if key != "checksum"}
+                for step in manifest_steps
+                if isinstance(step, dict)
+            ],
+        }
+        checksum = hashlib.sha256(canonical(checksum_payload)).hexdigest()
+        manifest["manifest_checksum"] = checksum
+        release_id = uuid.uuid4()
+        await connection.execute(
+            "INSERT INTO app_releases(id, app_id, version, manifest, manifest_checksum) VALUES($1,$2,$3,$4::jsonb,$5)",
+            release_id,
+            app_id,
+            version,
+            json.dumps(manifest, ensure_ascii=False, separators=(",", ":")),
+            checksum,
+        )
+        return release_id, checksum, manifest
+
+    async def _seed_app_release_rollout(
+        self,
+        connection: Any,
+        *,
+        password_hash: str,
+        system_admin_id: uuid.UUID,
+    ) -> None:
+        """Seed 12+ active installations with real tables and bounded rows."""
+        namespace = f"rollout-{uuid.uuid4().hex[:12]}"
+        owner_id = await self._insert_fixture_user(
+            connection,
+            username=f"{namespace}-owner",
+            password_hash=password_hash,
+            label=f"{namespace}-owner",
+        )
+        target_app_id = uuid.uuid4()
+        foreign_app_id = uuid.uuid4()
+        await connection.execute(
+            "INSERT INTO app_definitions(id,app_key,display_name) VALUES($1,$2,$3),($4,$5,$6)",
+            target_app_id,
+            f"{namespace}-target",
+            "Runtime Rollout Target",
+            foreign_app_id,
+            f"{namespace}-foreign",
+            "Runtime Rollout Foreign",
+        )
+        old_release, old_checksum, old_manifest = await self._insert_rollout_release(
+            connection, app_id=target_app_id, version="1.0.0", valid=True
+        )
+        next_release, next_checksum, next_manifest = await self._insert_rollout_release(
+            connection, app_id=target_app_id, version="2.0.0", valid=True
+        )
+        unsupported_release, unsupported_checksum, _unsupported_manifest = await self._insert_rollout_release(
+            connection, app_id=target_app_id, version="9.0.0", valid=False
+        )
+        foreign_current, foreign_current_checksum, _foreign_current_manifest = await self._insert_rollout_release(
+            connection, app_id=foreign_app_id, version="1.0.0", valid=True
+        )
+        foreign_next, foreign_checksum, _foreign_next_manifest = await self._insert_rollout_release(
+            connection, app_id=foreign_app_id, version="2.0.0", valid=True
+        )
+        target_grants = [(owner_id, "owner")]
+        installations: list[dict[str, object]] = []
+        tables: list[dict[str, object]] = []
+        for target_index in range(13):
+            vault_id, vault_name = await self._insert_fixture_vault(
+                connection,
+                namespace=namespace,
+                label=f"target-{target_index:02d}",
+                owner_id=owner_id,
+                grants=target_grants,
+                granted_by=system_admin_id,
+            )
+            table_name = "rollout_data"
+            table_id = uuid.uuid4()
+            physical = f"vt_{vault_name.replace('-', '_')}__{table_name}"
+            await connection.execute(
+                f"CREATE TABLE {physical} (id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), value TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+            )
+            await connection.execute(
+                "INSERT INTO vault_tables(id,vault_id,name,description,columns,unique_keys,indexes,created_by) VALUES($1,$2,$3,'',$4::jsonb,'[]'::jsonb,'[]'::jsonb,$5)",
+                table_id,
+                vault_id,
+                table_name,
+                json.dumps([{"name": "value", "type": "text"}], separators=(",", ":")),
+                str(owner_id),
+            )
+            await connection.executemany(
+                f"INSERT INTO {physical}(value) VALUES($1)", [(None,) for _ in range(25)]
+            )
+            row_ids = [
+                str(row["id"])
+                for row in await connection.fetch(f"SELECT id FROM {physical} ORDER BY id")
+            ]
+            installation_id = uuid.uuid4()
+            await connection.execute(
+                "INSERT INTO vault_app_installations(id,app_id,vault_id,desired_release_id,current_release_id,lifecycle) VALUES($1,$2,$3,$4,$5,'active')",
+                installation_id,
+                target_app_id,
+                vault_id,
+                old_release,
+                old_release,
+            )
+            await connection.execute(
+                "INSERT INTO installation_grants(installation_id,generation,capabilities,issuer,provenance) VALUES($1,1,$2,'runtime-fixture','{}'::jsonb)",
+                installation_id,
+                ["installation:read", "inventory:read", "rollout:read", "rollout:request"],
+            )
+            await connection.execute(
+                "INSERT INTO app_owned_resources(installation_id,vault_id,resource_kind,resource_key,status) VALUES($1,$2,'table',$3,'owned')",
+                installation_id,
+                vault_id,
+                table_name,
+            )
+            await connection.execute(
+                "INSERT INTO app_installation_observed_states(installation_id,app_id,vault_id,observed_generation,observed_at,observed_release_id,observed_release_version,observed_grant_generation,checkpoint) VALUES($1,$2,$3,1,NOW(),$4,'1.0.0',1,'{}'::jsonb)",
+                installation_id,
+                target_app_id,
+                vault_id,
+                old_release,
+            )
+            installations.append(
+                {
+                    "fixture_id": f"target-{target_index:02d}",
+                    "id": str(installation_id),
+                    "vault_id": str(vault_id),
+                    "vault_name": vault_name,
+                }
+            )
+            tables.append({"installation_id": str(installation_id), "vault_id": str(vault_id), "name": table_name, "row_count": 25, "rows": row_ids})
+
+        foreign_vault_id, foreign_vault_name = await self._insert_fixture_vault(
+            connection,
+            namespace=namespace,
+            label="foreign",
+            owner_id=owner_id,
+            grants=target_grants,
+            granted_by=system_admin_id,
+        )
+        foreign_table_name = "rollout_data"
+        foreign_table_id = uuid.uuid4()
+        foreign_physical_table = f"vt_{foreign_vault_name.replace('-', '_')}__{foreign_table_name}"
+        await connection.execute(
+            f"CREATE TABLE {foreign_physical_table} (id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), value TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+        )
+        await connection.execute(
+            "INSERT INTO vault_tables(id,vault_id,name,description,columns,unique_keys,indexes,created_by) VALUES($1,$2,$3,'',$4::jsonb,'[]'::jsonb,'[]'::jsonb,$5)",
+            foreign_table_id,
+            foreign_vault_id,
+            foreign_table_name,
+            json.dumps([{"name": "value", "type": "text"}], separators=(",", ":")),
+            str(owner_id),
+        )
+        await connection.executemany(
+            f"INSERT INTO {foreign_physical_table}(value) VALUES($1)", [(None,) for _ in range(25)]
+        )
+        foreign_installation_id = await self._insert_fixture_installation(
+            connection,
+            app_id=foreign_app_id,
+            vault_id=foreign_vault_id,
+            desired_release_id=foreign_current,
+            current_release_id=foreign_current,
+            lifecycle="active",
+            capabilities=["installation:read", "inventory:read", "rollout:read", "rollout:request"],
+            resources=[("table", foreign_table_name, "owned")],
+            observed_release_id=foreign_current,
+            observed_release_version="1.0.0",
+        )
+        def rollout_coordinates(
+            app_id: uuid.UUID,
+            release_id: uuid.UUID,
+            checksum: str,
+        ) -> dict[str, object]:
+            return {
+                "release_id": str(release_id),
+                "manifest_checksum": checksum,
+                "request": {
+                    "service": "app",
+                    "method": "POST",
+                    "path": f"/api/v1/apps/{app_id}/rollouts",
+                    "body": {
+                        "release_id": str(release_id),
+                        "manifest_checksum": checksum,
+                        "idempotency_key": "uuid-v4",
+                    },
+                    "headers": {"Idempotency-Key": "uuid-v4"},
+                },
+                "status": {
+                    "service": "app",
+                    "method": "GET",
+                    "path": f"/api/v1/apps/{app_id}/rollouts/{{rollout_id}}",
+                },
+            }
+        target_rollout_coordinates = rollout_coordinates(target_app_id, next_release, next_checksum)
+        foreign_rollout_coordinates = rollout_coordinates(foreign_app_id, foreign_next, foreign_checksum)
+        random_ids = {
+            "app_id": str(uuid.uuid4()),
+            "release_id": str(uuid.uuid4()),
+            "installation_id": str(uuid.uuid4()),
+            "vault_id": str(uuid.uuid4()),
+        }
+        self._fixture_catalog = {
+            "status": "ready",
+            "scenario": self.config.scenario,
+            "namespace": namespace,
+            "actors": {"system_admin": {"id": str(system_admin_id), "role": "system_admin"}, "target_owner": {"id": str(owner_id), "role": "owner"}},
+            "apps": {
+                "target": {"id": str(target_app_id), "rollout": target_rollout_coordinates},
+                "foreign": {"id": str(foreign_app_id), "rollout": foreign_rollout_coordinates},
+            },
+            "releases": {
+                "target_current": {"id": str(old_release), "version": "1.0.0", "manifest_checksum": old_checksum},
+                "target_next": {"id": str(next_release), "version": "2.0.0", "manifest_checksum": next_checksum},
+                "target_unsupported": {"id": str(unsupported_release), "version": "9.0.0", "manifest_checksum": unsupported_checksum},
+                "foreign_current": {"id": str(foreign_current), "version": "1.0.0", "manifest_checksum": foreign_current_checksum},
+                "foreign_next": {"id": str(foreign_next), "version": "2.0.0", "manifest_checksum": foreign_checksum},
+            },
+            "installations": installations,
+            "tables": tables,
+            "scope_cases": {
+                "other_app": {
+                    "app_id": str(foreign_app_id),
+                    "release_id": str(foreign_next),
+                    "manifest_checksum": foreign_checksum,
+                    "current_release_id": str(foreign_current),
+                    "installation_id": str(foreign_installation_id),
+                    "vault_id": str(foreign_vault_id),
+                },
+                "unallocated": random_ids,
+            },
+            "coordinates": {
+                "admin": {
+                    "credential": {"service": "app", "method": "POST", "path": f"/api/v1/apps/{target_app_id}/credentials", "body": {"deployment": "fixture"}},
+                    "exchange": {"service": "app", "method": "POST", "path": "/api/v1/auth/app-token", "body": {"credential": "<issued-value>"}},
+                    "request": target_rollout_coordinates["request"],
+                    "status": target_rollout_coordinates["status"],
+                    "apps": {
+                        "target": target_rollout_coordinates,
+                        "foreign": foreign_rollout_coordinates,
+                    },
+                },
+                "self_app": {
+                    "request": {"service": "app", "method": "POST", "path": "/api/v1/app/rollouts", "body": {"release_id": str(next_release), "manifest_checksum": next_checksum}, "headers": {"Idempotency-Key": "uuid-v4"}},
+                    "status": {"service": "app", "method": "GET", "path": "/api/v1/app/rollouts/{rollout_id}"},
+                },
+                "installation_status": {"service": "app", "method": "GET", "path": f"/api/v1/apps/{target_app_id}/installations/{{vault_id}}"},
+            },
+            "controls": {
+                "fault_injection": {
+                    "service": "fixture",
+                    "method": "POST",
+                    "path": "/control",
+                    "body": {"action": "fault_injection", "kind": "missing_owned_table", "target": "target-00", "enabled": True},
+                    "kinds": ["missing_owned_table"],
+                    "targets": [
+                        {"fixture_id": item["fixture_id"], "installation_id": item["id"]}
+                        for item in installations
+                    ],
+                },
+                "restart": {
+                    "service": "fixture",
+                    "method": "POST",
+                    "path": "/control",
+                    "body": {"action": "restart", "enabled": True},
+                },
+            },
+        }
 
     async def _insert_fixture_installation(
         self,
@@ -1213,6 +1725,12 @@ class E2ERuntime:
                         password_hash=password_hash,
                         system_admin_id=system_admin_id,
                     )
+                elif self.config.scenario == "app-release-rollout":
+                    await self._seed_app_release_rollout(
+                        connection,
+                        password_hash=password_hash,
+                        system_admin_id=system_admin_id,
+                    )
                 else:
                     self._fixture_catalog = {
                         "status": "ready",
@@ -1284,8 +1802,10 @@ class E2ERuntime:
         async with self._reset_lock:
             if not self._prepared:
                 raise ProvisioningFailure("fixture reset requested before runtime readiness")
+            self._lifecycle_generation += 1
             self._resetting = True
             try:
+                self._fixture_controls.clear()
                 await self._stop_named_process("backend")
                 await self._stop_named_process("embed")
                 await self._compose("down", "--volumes", "--remove-orphans", check=False)
@@ -1303,20 +1823,29 @@ class E2ERuntime:
         stop_task = asyncio.create_task(self._stop_event.wait(), name="serve-stop")
         try:
             while not self._stop_event.is_set():
-                child_tasks = [
-                    asyncio.create_task(child.process.wait(), name=f"serve-{name}")
-                    for name, child in self._children.items()
-                ]
+                observed_children = tuple(self._children.items())
+                child_tasks = {
+                    name: (
+                        child,
+                        asyncio.create_task(child.process.wait(), name=f"serve-{name}"),
+                    )
+                    for name, child in observed_children
+                }
                 if not child_tasks:
                     await asyncio.sleep(0.1)
                     continue
                 try:
+                    wait_tasks = [task for _child, task in child_tasks.values()]
                     done, _pending = await asyncio.wait(
-                        [stop_task, *child_tasks], return_when=asyncio.FIRST_COMPLETED
+                        [stop_task, *wait_tasks], return_when=asyncio.FIRST_COMPLETED
                     )
                     if stop_task in done or self._stop_event.is_set():
                         return 0
-                    if self._resetting:
+                    current_child_exited = any(
+                        task in done and self._children.get(name) is child
+                        for name, (child, task) in child_tasks.items()
+                    )
+                    if not current_child_exited or self._resetting:
                         continue
                     LOGGER.error(
                         "E2E runtime child exited unexpectedly; see %s",
@@ -1324,10 +1853,11 @@ class E2ERuntime:
                     )
                     return 1
                 finally:
-                    for task in child_tasks:
+                    tasks = [task for _child, task in child_tasks.values()]
+                    for task in tasks:
                         if not task.done():
                             task.cancel()
-                    for task in child_tasks:
+                    for task in tasks:
                         with contextlib.suppress(asyncio.CancelledError):
                             await task
         finally:
@@ -1473,7 +2003,7 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
     parser.add_argument("--password-env", default=DEFAULT_PASSWORD_ENV)
     parser.add_argument(
         "--scenario",
-        choices=("empty", "app-installation-lifecycle"),
+        choices=("empty", "app-installation-lifecycle", "app-release-rollout"),
         default=SCENARIO,
     )
     args = parser.parse_args(argv)

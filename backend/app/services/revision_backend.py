@@ -1,9 +1,9 @@
 """Process-scoped selection of the document revision implementation.
 
-The legacy bare-Git document service remains the default. M1's native ledger
-path is measurement-only and must be registered by its implementation work.
-Selection happens once here, at a composition root, never from request or
-vault data.
+The stable bare-Git document service remains the default. Native is an
+explicit process-scoped choice, while the historical M1 selector remains a
+guarded compatibility path. Selection happens once at a composition root,
+never from request or vault data.
 """
 
 from __future__ import annotations
@@ -167,6 +167,19 @@ _selected_backend: str | None = None
 _native_revision_backend_factory: RevisionBackendFactory | None = None
 
 
+def canonical_document_revision_backend(backend: str) -> str:
+    """Return the public canonical name for a configured selector."""
+    if backend in {"bare_git", "bare_git_current"}:
+        return "bare_git"
+    if backend == "postgres_native":
+        return "postgres_native"
+    if backend == "native_ledger_m1":
+        # Diagnostics expose only the stable implementation family.  The raw
+        # measurement selector remains visible in configuration and receipts.
+        return "postgres_native"
+    raise RuntimeError(f"unsupported document revision backend: {backend!r}")
+
+
 def register_native_revision_backend(factory: RevisionBackendFactory) -> None:
     """Register the native facade before the process selects a backend.
 
@@ -203,7 +216,7 @@ def get_revision_backend() -> RevisionBackend:
 
         backend = settings.document_revision_backend
         revision_backend: RevisionBackend
-        if backend == "bare_git_current":
+        if backend in {"bare_git", "bare_git_current"}:
             revision_backend = LegacyRevisionBackend()
         elif backend == "native_ledger_m1":
             _assert_native_measurement_safety()
@@ -224,11 +237,24 @@ def get_revision_backend() -> RevisionBackend:
             native_factory = _native_revision_backend_factory
             assert native_factory is not None
             revision_backend = native_factory()
+        elif backend == "postgres_native":
+            if _native_revision_backend_factory is None:
+                from app.services.native_revision_backend import (
+                    native_revision_backend_factory,
+                )
+
+                _native_revision_backend_factory = cast(
+                    RevisionBackendFactory,
+                    native_revision_backend_factory,
+                )
+            native_factory = _native_revision_backend_factory
+            assert native_factory is not None
+            revision_backend = native_factory()
         else:  # Settings validates this, but fail closed for in-process mutation.
             raise RuntimeError(f"unsupported document revision backend: {backend!r}")
 
         _revision_backend = revision_backend
-        _selected_backend = backend
+        _selected_backend = canonical_document_revision_backend(backend)
         return revision_backend
 
 

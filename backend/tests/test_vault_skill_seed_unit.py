@@ -1,13 +1,34 @@
 """Unit test: create_vault seeds overview/vault-skill.md with type=skill."""
 import pytest
 
-from app.services.document_service import VAULT_SKILL_SEED_TEMPLATE
+from app.services.document_service import (
+    VAULT_SKILL_SEED_TEMPLATE,
+    build_vault_skill_seed_request,
+)
 
 
 def test_seed_template_constant_exists():
     assert "Guide" in VAULT_SKILL_SEED_TEMPLATE
     assert "{vault}" in VAULT_SKILL_SEED_TEMPLATE  # substitutable
     assert "akb_put" not in VAULT_SKILL_SEED_TEMPLATE  # template is for owners to edit, not call-instructions
+
+
+def test_canonical_seed_request_preserves_legacy_fields_and_body():
+    vault = "parity-vault"
+    request = build_vault_skill_seed_request(vault)
+
+    assert request.model_dump(exclude_none=True) == {
+        "vault": vault,
+        "collection": "overview",
+        "title": "parity-vault Guide",
+        "type": "skill",
+        "slug": "vault-skill",
+        "tags": ["akb:skill"],
+        "content": VAULT_SKILL_SEED_TEMPLATE.replace("{vault}", vault),
+        "status": "draft",
+        "related_to": [],
+        "depends_on": [],
+    }
 
 
 def test_seed_template_secrets_placeholder_literal():

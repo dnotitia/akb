@@ -66,6 +66,12 @@ async def test_create_vault_uses_postgres_repository_and_rbac_without_git(monkey
     monkeypatch.setattr(native_documents, "VaultRepository", _VaultRepository, raising=False)
     monkeypatch.setattr(native_documents, "get_role_sync", lambda: _RoleSync(), raising=False)
 
+    async def _seed(_service, conn, *, vault_id, vault_name, owner_id) -> None:
+        assert conn is connection
+        calls.append(("seed", vault_id, vault_name, owner_id))
+
+    monkeypatch.setattr(NativeDocumentService, "_seed_native_vault_skill", _seed)
+
     result = await NativeDocumentService(pool=pool_marker).create_vault(
         "native-create",
         "native description",
@@ -88,6 +94,7 @@ async def test_create_vault_uses_postgres_repository_and_rbac_without_git(monkey
         ),
         ("on_vault_create", vault_id, owner_id),
         ("on_public_access_change", vault_id, "reader"),
+        ("seed", vault_id, "native-create", owner_id),
     ]
 
 

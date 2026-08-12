@@ -18,12 +18,15 @@ from app.db.postgres import get_pool
 from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError
 from app.models.document import (
     DOC_STATUSES,
+    BrowseItem,
     BrowseResponse,
     DocumentPutRequest,
     DocumentPutResponse,
     DocumentResponse,
     DocumentUpdateRequest,
 )
+from app.repositories import table_data_repo, table_registry_repo, vault_files_repo
+from app.repositories.document_repo import CollectionRepository
 from app.repositories.native_revision_repo import NativeRevisionRepository
 from app.repositories.vault_repo import VaultRepository
 from app.services.document_service import (
@@ -31,6 +34,7 @@ from app.services.document_service import (
     DocumentService,
     _body_content_hash,
     _build_frontmatter,
+    build_vault_skill_seed_request,
     _certified_content_hash,
     _compose_markdown,
     _parse_markdown,
@@ -45,15 +49,17 @@ from app.services.native_revision_service import (
 )
 from app.services.resource_hash import HASH_ALGORITHM
 from app.services.role_sync import get_role_sync
-from app.services.uri_service import doc_uri
+from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri
 from app.util.text import (
     doc_path,
+    like_escape,
     normalize_collection_path,
     slugify,
     split_doc_path,
     strip_own_suffix,
     to_nfc,
 )
+from app.utils import ensure_list
 
 
 class NativeRevisionUnsupportedSurfaceError(AKBError):
@@ -244,6 +250,7 @@ class NativeDocumentService(DocumentService):
         vault_id: uuid.UUID,
         current: NativeRevisionSnapshot,
         selected: NativeRevisionSnapshot | None = None,
+        public_selector: str | None = None,
     ) -> DocumentResponse:
         selected = selected or current
         current_fm, _ = _parse_markdown(current.text)
@@ -272,7 +279,9 @@ class NativeDocumentService(DocumentService):
             created_by_name=created_by_name,
             created_at=current_fm.get("created_at") or current.resource_created_at,
             updated_at=current.resource_updated_at,
-            current_commit=selected.revision_id,
+            current_commit=(
+                public_selector if public_selector is not None else selected.revision_id
+            ),
             content_hash=_body_content_hash(selected_body),
             hash_algorithm=HASH_ALGORITHM,
             tags=list(current_fm.get("tags") or []),
@@ -373,7 +382,10 @@ class NativeDocumentService(DocumentService):
         version: str,
     ) -> DocumentResponse:
         vault_id, current = await self._current(vault, doc_ref)
-        if len(version) != 40 or any(ch not in "0123456789abcdef" for ch in version):
+        # Public historical reads accept a full native Revision ID or a
+        # resource-scoped unique prefix. Write OCC pins remain exact-40 via
+        # NativeRevisionService._validate_expected_revision().
+        if not 7 <= len(version) <= 40 or any(ch not in "0123456789abcdef" for ch in version):
             raise NotFoundError("Document version", f"{current.path}@{version[:8]}")
         selected = await (await self._native()).get_revision(
             namespace_id=vault_id,
@@ -382,7 +394,11 @@ class NativeDocumentService(DocumentService):
             revision_id=version,
         )
         return await self._response(
-            vault=vault, vault_id=vault_id, current=current, selected=selected,
+            vault=vault,
+            vault_id=vault_id,
+            current=current,
+            selected=selected,
+            public_selector=version,
         )
 
     async def update(
@@ -718,12 +734,274 @@ class NativeDocumentService(DocumentService):
         ]
         return {"uri": doc_uri(vault, resource["current_path"]), "history": history}
 
+    async def _seed_native_vault_skill(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        vault_id: uuid.UUID,
+        vault_name: str,
+        owner_id: uuid.UUID | None,
+    ) -> None:
+        """Publish the canonical vault skill inside the vault-create TX."""
+        request = build_vault_skill_seed_request(vault_name)
+        now = datetime.now(UTC)
+        frontmatter = _build_frontmatter(request, now)
+        if owner_id is not None:
+            frontmatter["created_by"] = str(owner_id)
+        raw = _compose_markdown(frontmatter, request.content)
+        path = doc_path(
+            normalize_collection_path(request.collection),
+            slugify(request.slug or request.title),
+        )
+        actor = str(owner_id) if owner_id is not None else "unknown"
+        await (await self._native()).create_text_in_conn(
+            conn,
+            namespace_id=vault_id,
+            surface="document",
+            path=path,
+            payload=raw,
+            actor=actor,
+            mutation_id=uuid.uuid4(),
+            resource_id=uuid.uuid4(),
+            message=(
+                f"[put] {path}\n\nagent: {actor}\naction: create\n"
+                f"summary: {request.title}"
+            ),
+            subject=f"[put] {path}",
+            summary=request.title,
+        )
+
     @staticmethod
     def _unsupported(surface: str) -> NoReturn:
         raise NativeRevisionUnsupportedSurfaceError(surface)
 
-    async def browse(self, *args, **kwargs) -> BrowseResponse:
-        self._unsupported("document browse")
+    async def _browse_native_documents(
+        self,
+        vault: str,
+        vault_id: uuid.UUID,
+        *,
+        prefix: str,
+        max_depth: int,
+        include_hashes: bool,
+        include_archived: bool,
+    ) -> list[BrowseItem]:
+        """Read current Native document Heads for the public browse view.
+
+        The Native ledger owns document identity and body bytes.  Collections,
+        tables, and binary files intentionally remain catalog-backed legacy
+        surfaces during the selector rollout, but this query must never hydrate
+        the legacy ``documents`` projection or Git.
+        """
+        params: list[object] = [vault_id]
+        clauses = [
+            "rs.namespace_id = $1",
+            "rs.surface = 'document'",
+            "rs.lifecycle = 'live'",
+        ]
+        if prefix:
+            params.append(like_escape(prefix) + "/%")
+            clauses.append(f"rs.current_path LIKE ${len(params)} ESCAPE '\\'")
+            depth_offset = prefix.count("/") + 1
+        else:
+            depth_offset = 0
+        if max_depth >= 0:
+            params.append(max_depth + depth_offset)
+            clauses.append(
+                "(length(rs.current_path) - "
+                f"length(replace(rs.current_path, '/', ''))) <= ${len(params)}"
+            )
+
+        sql = """
+            SELECT rs.resource_id, rs.current_path AS path,
+                   rs.head_revision_id AS revision_id, rs.updated_at
+              FROM native_resources rs
+             WHERE """ + " AND ".join(clauses) + """
+             ORDER BY rs.updated_at DESC, rs.resource_id DESC
+        """
+        pool = await self._pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+
+        native = await self._native()
+        items: list[BrowseItem] = []
+        for row in rows:
+            snapshot = await native.get_resource_revision(
+                namespace_id=vault_id,
+                surface="document",
+                resource_id=row["resource_id"],
+                revision_id=row["revision_id"],
+            )
+            frontmatter, body = _parse_markdown(snapshot.text)
+            status = frontmatter.get("status") or "draft"
+            if not include_archived and status == "archived":
+                continue
+            tags = frontmatter.get("tags") or []
+            if isinstance(tags, str):
+                tags = [tags]
+            path = snapshot.path
+            items.append(
+                BrowseItem(
+                    name=frontmatter.get("title") or path.rsplit("/", 1)[-1],
+                    path=path,
+                    type="document",
+                    uri=doc_uri(vault, path),
+                    summary=frontmatter.get("summary"),
+                    doc_type=frontmatter.get("type") or "note",
+                    status=status,
+                    tags=list(tags),
+                    last_updated=snapshot.resource_updated_at,
+                    current_commit=snapshot.revision_id if include_hashes else None,
+                    content_hash=_body_content_hash(body) if include_hashes else None,
+                    hash_algorithm=HASH_ALGORITHM if include_hashes else None,
+                )
+            )
+        return items
+
+    async def _browse_legacy_tables(
+        self,
+        vault: str,
+        vault_id: uuid.UUID,
+        *,
+        prefix: str,
+        max_depth: int,
+    ) -> list[BrowseItem]:
+        pool = await self._pool()
+        items: list[BrowseItem] = []
+        async with pool.acquire() as conn:
+            vault_name = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+            rows = await table_registry_repo.list_for_vault(
+                conn, vault_id, max_depth=max_depth, prefix=prefix,
+            )
+            for row in rows:
+                pg_name = table_data_repo.pg_table_name(vault_name, row["name"])
+                try:
+                    row_count = await conn.fetchval(f"SELECT COUNT(*) FROM {pg_name}")
+                except Exception:
+                    row_count = 0
+                columns = ensure_list(row["columns"]) if isinstance(row["columns"], str) else row["columns"]
+                items.append(
+                    BrowseItem(
+                        name=row["name"],
+                        path=row["name"],
+                        type="table",
+                        uri=table_uri(vault, row["name"], collection=row.get("collection")),
+                        summary=row["description"],
+                        row_count=row_count,
+                        columns=columns,
+                        sql_name=table_data_repo.pg_short_name(row["name"]),
+                        collection=row.get("collection"),
+                        last_updated=row["created_at"],
+                    )
+                )
+        return items
+
+    async def _browse_legacy_files(
+        self,
+        vault: str,
+        vault_id: uuid.UUID,
+        *,
+        prefix: str,
+        max_depth: int,
+        include_hashes: bool,
+    ) -> list[BrowseItem]:
+        pool = await self._pool()
+        async with pool.acquire() as conn:
+            rows = await vault_files_repo.list_for_vault(
+                conn,
+                vault_id,
+                max_depth=max_depth,
+                prefix=prefix,
+                limit=10_000,
+            )
+        return [
+            BrowseItem(
+                name=row["name"],
+                path=(
+                    f"{row['collection']}/{row['name']}"
+                    if row.get("collection")
+                    else row["name"]
+                ),
+                type="file",
+                uri=file_uri(vault, str(row["id"]), collection=row.get("collection")),
+                mime_type=row["mime_type"],
+                size_bytes=row["size_bytes"],
+                summary=row["description"],
+                collection=row.get("collection"),
+                last_updated=row["created_at"],
+                content_hash=row.get("content_hash") if include_hashes else None,
+                hash_algorithm=row.get("hash_algorithm") if include_hashes else None,
+                etag=row.get("etag") if include_hashes else None,
+                storage_version=row.get("storage_version") if include_hashes else None,
+                version=(row.get("storage_version") or row.get("etag"))
+                if include_hashes
+                else None,
+            )
+            for row in rows
+        ]
+
+    async def browse(
+        self,
+        vault: str,
+        collection: str | None = None,
+        depth: int = 1,
+        content_type: str = "all",
+        include_hashes: bool = False,
+        include_archived: bool = False,
+    ) -> BrowseResponse:
+        """Return the legacy browse envelope with Native document Heads."""
+        prefix = normalize_collection_path(collection) if collection is not None else ""
+        vault_id = await self._vault_id(vault)
+        show_docs = content_type in ("all", "documents")
+        show_tables = content_type in ("all", "tables")
+        show_files = content_type in ("all", "files")
+
+        items: list[BrowseItem] = []
+        if show_docs:
+            pool = await self._pool()
+            for row in await CollectionRepository(pool).list_by_vault(vault_id):
+                if prefix and not row["path"].startswith(prefix + "/"):
+                    continue
+                items.append(
+                    BrowseItem(
+                        name=row["name"],
+                        path=row["path"],
+                        type="collection",
+                        uri=coll_uri(vault, row["path"]),
+                        summary=row["summary"],
+                        doc_count=row["doc_count"],
+                        last_updated=row["last_updated"],
+                    )
+                )
+            items.extend(
+                await self._browse_native_documents(
+                    vault,
+                    vault_id,
+                    prefix=prefix,
+                    max_depth=depth,
+                    include_hashes=include_hashes,
+                    include_archived=include_archived,
+                )
+            )
+        if show_tables:
+            items.extend(
+                await self._browse_legacy_tables(
+                    vault, vault_id, prefix=prefix, max_depth=depth,
+                )
+            )
+        if show_files:
+            items.extend(
+                await self._browse_legacy_files(
+                    vault,
+                    vault_id,
+                    prefix=prefix,
+                    max_depth=depth,
+                    include_hashes=include_hashes,
+                )
+            )
+
+        browse_path = prefix
+        hint = self._browse_hint(vault, prefix or None, items)
+        return BrowseResponse(vault=vault, path=browse_path, items=items, hint=hint)
 
     async def create_vault(
         self,
@@ -774,6 +1052,12 @@ class NativeDocumentService(DocumentService):
                     await role_sync.on_vault_create_in_conn(conn, vault_id, uid)
                     await role_sync.on_public_access_change_in_conn(
                         conn, vault_id, public_access,
+                    )
+                    await self._seed_native_vault_skill(
+                        conn,
+                        vault_id=vault_id,
+                        vault_name=name,
+                        owner_id=uid,
                     )
         except asyncpg.UniqueViolationError as exc:
             if exc.constraint_name == "vaults_name_key":
