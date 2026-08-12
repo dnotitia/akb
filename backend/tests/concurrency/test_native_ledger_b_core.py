@@ -31,7 +31,6 @@ from app.services.m1_pg_body_store import M1PgBodyStore, PgBodyIntegrityError
 from app.services.m1_reference_payload_store import M1ReferencePayloadStore
 from app.services.native_document_service import (
     NativeDocumentService,
-    NativeRevisionUnsupportedSurfaceError,
 )
 from app.services.native_derived_worker import NativeDerivedWorker
 from app.services.native_revision_backend import NativeRevisionBackend
@@ -2913,8 +2912,99 @@ async def test_full_native_document_lifecycle_preserves_compatibility_without_gi
                 == 0
             )
 
-        with pytest.raises(NativeRevisionUnsupportedSurfaceError):
-            await document_service.browse(vault)
+        browsed = await document_service.browse(
+            vault,
+            collection="archive",
+            depth=0,
+            include_hashes=True,
+        )
+        assert browsed.path == "archive"
+        assert [(item.type, item.path) for item in browsed.items] == [
+            ("document", recreated.path),
+        ]
+        assert browsed.items[0].current_commit == recreated.commit_hash
+        assert browsed.items[0].content_hash
+
+
+async def test_native_browse_uses_native_heads_for_collection_root_and_depth():
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+            await conn.execute(
+                """
+                INSERT INTO collections (vault_id, path, name)
+                VALUES ($1, 'guides', 'guides'), ($1, 'guides/nested', 'nested')
+                """,
+                vault_id,
+            )
+
+        service = NativeDocumentService(pool=pool)
+        await service.put(
+            DocumentPutRequest(
+                vault=vault, collection="", slug="root", title="Root", content="root"
+            ),
+            agent_id="browse-writer",
+        )
+        await service.put(
+            DocumentPutRequest(
+                vault=vault, collection="guides", slug="direct", title="Direct", content="direct"
+            ),
+            agent_id="browse-writer",
+        )
+        await service.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="guides/nested",
+                slug="deep",
+                title="Deep",
+                content="deep",
+            ),
+            agent_id="browse-writer",
+        )
+        await service.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="guides/nested",
+                slug="archived",
+                title="Archived",
+                content="archived",
+                status="archived",
+            ),
+            agent_id="browse-writer",
+        )
+
+        root = await service.browse(vault, depth=0)
+        assert {item.path for item in root.items if item.type == "document"} == {"root.md"}
+        assert {item.path for item in root.items if item.type == "collection"} == {
+            "guides",
+            "guides/nested",
+        }
+
+        collection_root = await service.browse(vault, collection="guides", depth=0)
+        assert {item.path for item in collection_root.items if item.type == "document"} == {
+            "guides/direct.md",
+        }
+        assert {item.path for item in collection_root.items if item.type == "collection"} == {
+            "guides/nested",
+        }
+
+        subtree = await service.browse(vault, collection="guides", depth=-1)
+        assert {item.path for item in subtree.items if item.type == "document"} == {
+            "guides/direct.md",
+            "guides/nested/deep.md",
+        }
+
+        archived = await service.browse(
+            vault,
+            collection="guides",
+            depth=-1,
+            include_archived=True,
+        )
+        assert {item.path for item in archived.items if item.type == "document"} == {
+            "guides/direct.md",
+            "guides/nested/deep.md",
+            "guides/nested/archived.md",
+        }
 
 
 async def test_vault_activity_and_recent_changes_are_scoped_to_the_document_surface():

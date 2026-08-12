@@ -7,6 +7,17 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Added an explicit PostgreSQL Native document revision mode
+
+AKB now accepts the stable process-scoped revision selectors `bare_git` and
+`postgres_native`, while keeping Bare Git as the default and retaining the old
+measurement selectors as compatibility aliases. PostgreSQL Native can start
+only after an explicit command claims a never-initialized AKB database and
+mints tenant/database/image-bound pending authority; first startup atomically
+turns that record into an immutable durable marker. Existing or merely empty
+legacy databases are rejected, and no existing tenant is converted by config.
+Readiness reports the canonical selected backend.
+
 ### Added immutable app release reconciliation and staged rollout
 
 Added a database-backed rollout request ledger with UUID idempotency, sealed
@@ -14,7 +25,7 @@ snapshot membership, manifest v1 checksum validation, whole-snapshot preflight,
 canary-first then sequential ten-target batches, bounded backfill checkpoints,
 lease fencing, replay/resume, redacted status, and monotonic installation/
 observed-state convergence. Added admin and self-app request/status routes,
-worker lifecycle registration, migration 061, and the repository-owned
+worker lifecycle registration, migration 062, and the repository-owned
 `app-release-rollout` E2E fixture scenario.
 
 ### Fixed repository-owned E2E reset and restart lifecycle

@@ -1,4 +1,4 @@
-"""Migration 061: durable app release rollout execution ledger.
+"""Migration 062: durable app release rollout execution ledger.
 
 The rollout tables are deliberately separate from the desired-state registry
 and the sealed inventory snapshot.  A worker may be restarted at any point;

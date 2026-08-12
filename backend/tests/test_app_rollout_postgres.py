@@ -24,7 +24,7 @@ _MIGRATIONS = [
     _BACKEND / "app" / "db" / "migrations" / "047_app_registry.py",
     _BACKEND / "app" / "db" / "migrations" / "051_app_credentials.py",
     _BACKEND / "app" / "db" / "migrations" / "052_app_inventory.py",
-    _BACKEND / "app" / "db" / "migrations" / "061_app_rollout.py",
+    _BACKEND / "app" / "db" / "migrations" / "062_app_rollout.py",
 ]
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
 
