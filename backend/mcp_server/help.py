@@ -29,6 +29,7 @@ All connected via a unified knowledge graph with AKB URI scheme.
 | `search` | search, browse, drill_down | Find and read documents |
 | `tables` | create_table, sql, alter_table, drop_table | Structured data (real PG tables + SQL) |
 | `files` | put_file, get_file, delete_file | Binary files (S3-backed) |
+| `images` | put_image, discard_image | Inline images for Markdown documents |
 | `access` | grant, revoke, vault_members, vault_info, ... | Permissions and vault management |
 | `history` | activity, diff, history | Vault activity + git-based change history |
 | `publishing` | publish, unpublish, publications, publication_snapshot | Public sharing for docs/tables/files |
@@ -122,6 +123,7 @@ Each document has: vault, collection (directory), title, content, type, tags, st
 | `akb_delete` | Removing a document |
 | `akb_browse` | Exploring what exists (tree view) |
 | `akb_drill_down` | Reading specific sections of a long document |
+| `akb_put_image` | Uploading a local image to embed in Markdown |
 | `akb_create_collection` | Creating an empty collection (folder) in a vault |
 | `akb_delete_collection` | Deleting a collection (with optional `recursive=true` cascade) |
 
@@ -712,6 +714,9 @@ akb_get(uri="akb://eng/doc/decisions/adopt-grpc.md")
     "akb_update": """# akb_update — Update a Document
 
 Only send fields you want to change. Unspecified fields remain unchanged.
+`content` is the exception: when present, it replaces the **entire Markdown
+body**. Never pass only a newly uploaded image or another partial fragment as
+`content`; use a targeted `akb_edit` for that.
 
 ## Parameters
 | Param | Required | Description |
@@ -725,6 +730,8 @@ Only send fields you want to change. Unspecified fields remain unchanged.
 | depends_on | | Update dependency list (akb:// URIs) |
 | related_to | | Update related list (akb:// URIs) |
 | message | | Git commit message |
+| expected_commit | | Reject if the document moved since it was read |
+| expected_content_hash | | Reject if the current body changed since it was read |
 
 ## Examples
 ```
@@ -752,6 +759,7 @@ Use akb_update for metadata changes (title, tags, status, etc.).
 | new_string | ✓ | Replacement text (can be empty to delete) |
 | replace_all | | If true, replaces every occurrence (default: false) |
 | message | | Git commit message |
+| base_commit | | Reject if the document moved since it was read |
 
 ## Uniqueness Rule
 By default, `old_string` must match **exactly one** place in the document body.
@@ -762,6 +770,10 @@ or set `replace_all=true` to replace every occurrence.
 1. `akb_get(uri)` → read current content
 2. Pick a distinctive piece of text you want to change
 3. `akb_edit(uri, old_string="...", new_string="...")` → apply
+
+For an inline image, upload it first with `akb_put_image`, then use the exact
+returned `markdown` as part of `new_string`. Pass the `current_commit` returned
+by `akb_get` as `base_commit` when concurrent writers are possible.
 
 ## Error Handling
 Errors return `error: "edit_failed"` with a message explaining:
@@ -1512,10 +1524,173 @@ akb_sql(vaults=["sales","external-projects"],
 
 Permissions: SELECT=reader, INSERT/UPDATE/DELETE=writer""",
 
+    "images": """# Inline Document Images
+
+Availability: `akb_put_image` and `akb_discard_image` are local-filesystem
+tools supplied by the `akb-mcp` stdio proxy version 2.2 or newer. Use this
+workflow only when those names are present in the client's tool list.
+
+Use `akb_put_image` when a local raster image should render inside an AKB
+Markdown document. This is different from `akb_put_file`: an inline image is a
+hidden, vault-owned document attachment and does not appear as a standalone
+resource in browse, search, or File publication surfaces.
+
+## Recommended workflow
+
+```
+image = akb_put_image(
+  parent="akb://eng/coll/specs",
+  file_path="/workspace/architecture.png",
+  alt_text="Request processing architecture")
+
+akb_put(
+  parent="akb://eng/coll/specs",
+  title="Request Processing",
+  content="# Architecture\n\n" + image.markdown)
+```
+
+For an existing document, first read the current body and commit, then make a
+targeted edit. Do not send an image fragment to `akb_update(content=...)`; that
+field replaces the complete document body.
+
+```
+doc = akb_get(uri="akb://eng/coll/specs/doc/request-processing.md")
+image = akb_put_image(
+  parent="akb://eng/coll/specs",
+  file_path="/workspace/architecture.png",
+  alt_text="Request processing architecture")
+
+akb_edit(
+  uri=doc.uri,
+  old_string="## Architecture",
+  new_string="## Architecture\n\n" + image.markdown,
+  base_commit=doc.current_commit)
+```
+
+The upload result contains:
+
+- `url`: stable `/api/assets/{uuid}` reference stored in Markdown
+- `markdown`: ready-to-paste `![alt](/api/assets/{uuid})` expression
+- decoded MIME type, dimensions, and size
+
+The backend accepts PNG, JPEG, GIF, and WebP up to 10 MiB and verifies the
+decoded content before storing it. A document write atomically claims every
+available same-vault image for Git revision history. A new unavailable,
+expired, or cross-vault asset URL is rejected by `akb_put`, `akb_update`, and
+`akb_edit`; upload it to the same vault first. Existing broken references from
+an imported or previously stored document remain as unavailable placeholders
+so unrelated edits are still possible. Always use the exact `markdown`
+returned by `akb_put_image` rather than constructing an asset URL.
+
+If the document write fails or is abandoned, clean up the uncommitted upload:
+
+```
+akb_discard_image(parent="akb://eng", url=image.url)
+```
+
+## Insert, replace, remove, and reuse
+
+- **Insert:** upload once, then insert `image.markdown` with `akb_put` or a
+  targeted `akb_edit`.
+- **Replace:** image bytes are immutable. Upload the replacement, replace the
+  old Markdown expression with the new one, and discard the new upload if the
+  edit fails.
+- **Remove:** delete the complete `![alt](/api/assets/{uuid})` expression with
+  `akb_edit`; do not call `akb_discard_image` for a committed image.
+- **Reuse:** the same returned Markdown may be referenced by multiple
+  documents in the same vault. A cross-vault document must upload its own
+  image.
+- **Publish:** no separate image publication is required. The image inherits
+  the exact document publication and section filter.
+
+## Lifecycle defaults
+
+| Event | Result |
+|-------|--------|
+| Upload abandoned before a document commit | Uploader-only preview; `akb_discard_image` can remove it, otherwise GC after 24 hours by default |
+| Markdown link removed or replaced | Current access ends unless another document references it; matching Git revisions retain it for 30 days by default |
+| Document or recursive collection deleted | Live references are revoked; unshared images follow the same bounded revision retention |
+| Vault deleted | Access is revoked immediately and object deletion is queued |
+
+Once any document commit claims an image, it cannot be discarded separately.
+Retention values are deployment settings, so old Git revisions are not a
+permanent image archive.
+
+💡 Details: `akb_help(topic="akb_put_image")`,
+`akb_help(topic="akb_discard_image")`""",
+
+    "akb_put_image": """# akb_put_image — Upload an Inline Document Image
+
+Availability: proxy-local in `akb-mcp` 2.2 or newer; it is not exposed by a
+direct connection to the backend MCP endpoint.
+
+Reads a local PNG, JPEG, GIF, or WebP through the akb-mcp stdio proxy and
+uploads it to AKB's authenticated document-image endpoint. The backend verifies
+the actual bytes and returns a stable Markdown reference; no S3 URL is stored
+in the document.
+
+## Parameters
+| Param | Required | Description |
+|-------|----------|-------------|
+| parent | one of parent/vault | `akb://{vault}` or `akb://{vault}/coll/{path}` |
+| vault | one of parent/vault | Vault name |
+| file_path | ✓ | Absolute path to a local PNG/JPEG/GIF/WebP, maximum 10 MiB |
+| alt_text | | Accessible alt text; defaults to the filename |
+| mime_type | | Optional allowlisted override for an extensionless file |
+
+## Create a document
+```
+image = akb_put_image(vault="eng", file_path="/workspace/flow.webp",
+  alt_text="Authentication flow")
+# image.markdown == "![Authentication flow](/api/assets/<uuid>)"
+
+akb_put(parent="akb://eng/coll/specs", title="Authentication",
+  content="# Authentication\n\n" + image.markdown)
+```
+
+## Insert into an existing document
+
+Read the document first so the edit can be pinned to the observed commit:
+
+```
+doc = akb_get(uri="akb://eng/coll/specs/doc/auth.md")
+akb_edit(uri=doc.uri,
+  old_string="## Architecture",
+  new_string="## Architecture\n\n" + image.markdown,
+  base_commit=doc.current_commit)
+```
+
+`akb_update(content=...)` replaces the complete body. Use it only when sending
+the complete fetched-and-merged content with an OCC pin. If the document write
+fails, pass `image.url` to `akb_discard_image`.""",
+
+    "akb_discard_image": """# akb_discard_image — Clean Up an Uncommitted Image
+
+Availability: proxy-local in `akb-mcp` 2.2 or newer; it is not exposed by a
+direct connection to the backend MCP endpoint.
+
+Deletes a caller-owned image upload only when no document commit has claimed
+it. This is a failure-recovery tool, not a way to remove historical document
+content. The result reports `discarded=true` only when an owned upload was
+removed; `false` is a non-disclosing no-op for a missing or non-owned URL.
+
+```
+akb_discard_image(vault="eng", url="/api/assets/<uuid>")
+```
+
+To remove a rendered image from a document, update the Markdown body and remove
+the `![alt](/api/assets/<uuid>)` expression. Claimed bytes are retained only
+for the configured revision window (30 days by default), then collected when
+no live document still references them. Uncommitted uploads are collected
+after 24 hours by default even if this cleanup call is missed.""",
+
     "files": """# File Storage (S3-backed)
 
 Binary files (images, PDFs, exports) stored in S3 with metadata in PostgreSQL.
 Files appear in `akb_browse` alongside documents and tables.
+
+For an image that should render *inside* Markdown, use `akb_put_image` instead.
+That path creates a hidden document attachment and returns the Markdown to embed.
 
 File tools (`akb_put_file`, `akb_get_file`, `akb_update_file`, `akb_delete_file`) work with local file paths —
 they are handled by the akb-mcp stdio proxy which streams files directly to/from S3.

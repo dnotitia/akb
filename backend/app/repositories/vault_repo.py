@@ -7,6 +7,21 @@ import uuid
 import asyncpg
 
 
+async def lock_vault_for_child_write(conn, vault_id: uuid.UUID) -> bool:
+    """Hold the parent vault before locking or writing child resources.
+
+    Vault deletion takes ``FOR UPDATE`` on this row before cascading through
+    documents and files. Every child-write transaction must therefore take the
+    compatible parent lock first; centralising the query keeps background
+    writers and request paths on the same lock order.
+    """
+    locked_id = await conn.fetchval(
+        "SELECT id FROM vaults WHERE id = $1 FOR KEY SHARE",
+        vault_id,
+    )
+    return locked_id is not None
+
+
 class VaultRepository:
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool

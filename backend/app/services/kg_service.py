@@ -21,6 +21,8 @@ from itertools import zip_longest
 from typing import Literal, get_args
 
 from app.db.postgres import get_pool
+from app.repositories.vault_files_repo import confirmed_file_predicate
+from app.services.asset_service import ASSET_URL_PREFIX
 from app.services.uri_service import parse_uri, doc_uri, table_uri, file_uri
 from app.util.errors import (
     err,
@@ -56,8 +58,10 @@ LinkRelationType = Literal[
 ]
 LINK_RELATION_TYPES: tuple[str, ...] = get_args(LinkRelationType)
 
-# Matches markdown links: [text](target)
-_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+# Matches markdown links and image destinations. Relative images can represent
+# document-to-document references in imported Markdown; generated editor asset
+# URLs are filtered below because their lifecycle is not a graph edge.
+_MD_LINK_RE = re.compile(r"!?\[([^\]]+)\]\(([^)]+)\)")
 # Matches Obsidian-style wikilinks: [[target]] or [[target|alias]]. Only the
 # target (before the first '|') is the link; the rest is display text. The
 # inner run cannot contain '[' or ']'.
@@ -88,6 +92,27 @@ def strip_code_spans(content: str) -> str:
 
 # ── Link extraction from markdown body ───────────────────────
 
+def normalize_document_link_ref(ref: str) -> str:
+    """Normalize Markdown's path prefixes to an AKB vault-relative ref.
+
+    Historical AKB documents use vault-relative paths even when authors spell
+    them with ``./``, one or more ``../`` segments, or a leading ``/``.  Remove
+    only those complete prefixes.  ``str.lstrip('./')`` is intentionally not
+    used: it treats its argument as a character set and corrupts legitimate
+    names such as ``.well-known.md``.
+    """
+    normalized = ref
+    while True:
+        if normalized.startswith("../"):
+            normalized = normalized[3:]
+        elif normalized.startswith("./"):
+            normalized = normalized[2:]
+        elif normalized.startswith("/"):
+            normalized = normalized[1:]
+        else:
+            return normalized
+
+
 def extract_markdown_links(content: str) -> list[str]:
     """Extract internal document references from markdown links.
 
@@ -100,19 +125,21 @@ def extract_markdown_links(content: str) -> list[str]:
 
     def _add(raw: str) -> None:
         """Normalize one link target and append it (deduped). Filters
-        external URLs / anchors; keeps akb:// URIs verbatim; strips a
-        leading './' and any '#fragment' from relative paths."""
+        external URLs / anchors; keeps akb:// URIs verbatim; normalizes
+        explicit vault-relative prefixes and strips any '#fragment'."""
         target = raw.strip()
-        if not target or target.startswith(("http://", "https://", "mailto:", "#")):
+        if not target or target.startswith(("http://", "https://", "mailto:", "//", "#")):
+            return
+        if target.lower().startswith(ASSET_URL_PREFIX):
             return
         if target.startswith("akb://"):
             if target not in seen:
                 targets.append(target)
                 seen.add(target)
             return
-        target = target.lstrip("./")
         if "#" in target:
             target = target.split("#")[0]
+        target = normalize_document_link_ref(target)
         if target and target not in seen:
             targets.append(target)
             seen.add(target)
@@ -608,7 +635,8 @@ async def _fetch_orphan_nodes(
     file_rows = await conn.fetch(
         "SELECT f.id::text AS id, f.name, c.path AS coll "
         "FROM vault_files f LEFT JOIN collections c ON f.collection_id = c.id "
-        "WHERE f.vault_id = $1 AND f.id::text != ALL($2::text[]) "
+        "WHERE f.vault_id = $1 AND " + confirmed_file_predicate("f") + " "
+        "AND f.id::text != ALL($2::text[]) "
         "ORDER BY f.created_at DESC LIMIT $3",
         vault_id, list(file_ids), per,
     )
@@ -1043,8 +1071,9 @@ async def _batch_resolve_names(
 
     if file_ids:
         rows = await conn.fetch(
-            "SELECT id::text, name FROM vault_files "
-            "WHERE id::text = ANY($1::text[]) AND vault_id = $2",
+            "SELECT id::text, name FROM vault_files f "
+            "WHERE id::text = ANY($1::text[]) AND vault_id = $2 "
+            "AND " + confirmed_file_predicate("f"),
             file_ids, vault_id,
         )
         for r in rows:
@@ -1072,7 +1101,10 @@ async def _resource_exists(conn, vault_id: uuid.UUID, rtype: str, identifier: st
         ))
     elif rtype == "file":
         return bool(await conn.fetchval(
-            "SELECT 1 FROM vault_files WHERE vault_id = $1 AND id::text = $2", vault_id, identifier,
+            "SELECT 1 FROM vault_files f WHERE vault_id = $1 AND "
+            + confirmed_file_predicate("f") + " AND id::text = $2",
+            vault_id,
+            identifier,
         ))
     return False
 
@@ -1188,6 +1220,8 @@ async def _resolve_doc_ref(conn, vault_id: uuid.UUID, ref: str) -> uuid.UUID | N
          several matches — but the suffix is anchored at `/`, so
          `api.md` cannot match `funapi.md`).
     """
+    ref = normalize_document_link_ref(ref)
+
     # UUID + exact-path arms share the same predicate as `find_by_ref`
     # / `drill_down` — keep the substring-match ban centralised.
     from app.repositories.document_repo import DocumentRepository
@@ -1320,4 +1354,3 @@ async def _bfs_collect(
 
 
 # ── URI builder helpers for callers ──────────────────────────
-

@@ -14,6 +14,7 @@ from app.exceptions import ConflictError, ForbiddenError, NotFoundError, Validat
 from app.models.vault_scope import VaultScope, current_token_uuid, current_vault_scope
 from app.repositories import vault_write_policy_repo as write_policy_repo
 from app.repositories.events_repo import emit_event
+from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import vault_uri
 from app.services.write_lane import run_compensation, run_git_write
@@ -688,7 +689,11 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
         _q("SELECT COUNT(*) FROM vault_access WHERE vault_id = $1", vid),
         _q("SELECT COUNT(*) FROM documents WHERE vault_id = $1", vid),
         _q("SELECT COUNT(*) FROM vault_tables WHERE vault_id = $1", vid),
-        _q("SELECT COUNT(*) FROM vault_files WHERE vault_id = $1", vid),
+        _q(
+            "SELECT COUNT(*) FROM vault_files vf WHERE vault_id = $1 AND "
+            + confirmed_file_predicate("vf"),
+            vid,
+        ),
         # Authoritative collection total — depth-safe, unlike a client-side
         # browse(depth=2) count which silently undercounts deeper nesting.
         _q("SELECT COUNT(*) FROM collections WHERE vault_id = $1", vid),
@@ -1519,55 +1524,52 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
     )
     pool = await get_pool()
     async with pool.acquire() as conn:
-        vault = await conn.fetchrow(
-            "SELECT id, git_path FROM vaults WHERE name = $1", vault_name,
-        )
-        if not vault:
-            return err(f"Vault not found: {vault_name}", code=NOT_FOUND)
-        vault_id = vault["id"]
-        is_native_ledger_vault = str(vault["git_path"]).startswith("native-ledger://")
-
-        # Delete S3 files BEFORE the DB cascade — this part cannot be
-        # transactional with PG (S3 is out-of-band), so we accept the
-        # narrow "S3 gone but DB rolled back" recovery window. Everything
-        # PG-side runs inside the transaction below so a mid-flight crash
-        # never leaves the vault with phantom vt_* tables or registry
-        # rows pointing at dropped physical tables.
-        file_rows = await conn.fetch("SELECT id, s3_key FROM vault_files WHERE vault_id = $1", vault_id)
-        if file_rows and settings.s3_endpoint_url:
-            from app.services.adapters import s3_adapter
-            failed = []
-            for fr in file_rows:
-                try:
-                    s3_adapter.delete(fr["s3_key"])
-                except Exception as e:  # noqa: BLE001
-                    failed.append(fr["s3_key"])
-                    logger.warning("Failed to delete S3 object %s: %s", fr["s3_key"], e)
-            if failed:
-                logger.error("Vault %s: %d/%d S3 files failed to delete", vault_name, len(failed), len(file_rows))
-
-        # Publication snapshot objects live under snapshots/<id>.json — OUTSIDE
-        # the vault's file prefix — so the vault_files sweep above misses them.
-        # Collect + delete them here before the DB cascade drops the publication
-        # rows, or they'd orphan in S3. Same out-of-band caveat as files above.
-        # (publish-hardening F7 — the per-publication path is delete_publication.)
-        # A snapshot created in the tiny window between this read and the cascade
-        # could still orphan, but the archive-then-delete lifecycle makes the
-        # vault read-only first, so no new publication lands here in practice.
-        snap_rows = await conn.fetch(
-            "SELECT snapshot_s3_key FROM publications"
-            " WHERE vault_id = $1 AND snapshot_s3_key IS NOT NULL",
-            vault_id,
-        )
-        if snap_rows and settings.s3_endpoint_url:
-            from app.services.adapters import s3_adapter
-            for sr in snap_rows:
-                try:
-                    s3_adapter.delete(sr["snapshot_s3_key"])
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("Failed to delete snapshot S3 object %s: %s", sr["snapshot_s3_key"], e)
-
         async with conn.transaction():
+            # Lock before enumerating object keys. Image uploads register a
+            # pending row before PUT and revalidate this lock at finalization,
+            # so the sweep includes every key that can become readable.
+            vault = await conn.fetchrow(
+                "SELECT id, git_path FROM vaults WHERE name = $1 FOR UPDATE",
+                vault_name,
+            )
+            if not vault:
+                return err(f"Vault not found: {vault_name}", code=NOT_FOUND)
+            vault_id = vault["id"]
+            is_native_ledger_vault = str(vault["git_path"]).startswith("native-ledger://")
+
+            # Capture every object key while the vault lock makes the set
+            # complete with respect to concurrent image uploads. Remote S3 I/O
+            # must not run while this transaction and row lock are held: it can
+            # be slow, cannot roll back, and used to lose failed deletes after
+            # the metadata cascade. Enqueue the immutable keys in the same PG
+            # transaction instead; the existing worker retries idempotent
+            # object deletion after the vault's access has been revoked.
+            file_rows = await conn.fetch(
+                "SELECT id, s3_key, upload_state FROM vault_files WHERE vault_id = $1",
+                vault_id,
+            )
+            if file_rows and settings.s3_endpoint_url:
+                from app.services.s3_delete_worker import (
+                    enqueue_delete,
+                    enqueue_pending_upload_delete,
+                )
+                for fr in file_rows:
+                    if fr["upload_state"] == "pending":
+                        await enqueue_pending_upload_delete(conn, fr["s3_key"])
+                    else:
+                        await enqueue_delete(conn, fr["s3_key"])
+
+            # Publication snapshots live outside the vault file prefix.
+            snap_rows = await conn.fetch(
+                "SELECT snapshot_s3_key FROM publications"
+                " WHERE vault_id = $1 AND snapshot_s3_key IS NOT NULL",
+                vault_id,
+            )
+            if snap_rows and settings.s3_endpoint_url:
+                from app.services.s3_delete_worker import enqueue_delete
+                for sr in snap_rows:
+                    await enqueue_delete(conn, sr["snapshot_s3_key"])
+
             from app.services.index_service import _drop_source_chunks_with_outbox
 
             # Enqueue file-chunk vector deletes BEFORE deleting vault_files.

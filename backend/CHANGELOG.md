@@ -7,6 +7,71 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Added inline document images with bounded revision retention
+
+The Markdown editor and MCP proxy can upload validated PNG, JPEG, GIF, and WebP
+images as hidden object-storage attachments and insert stable
+`/api/assets/{uuid}` references. Attachments do not appear in File browse,
+search, or standalone publication surfaces. Private reads require either the
+uploader's uncommitted upload, a current document reference, or an exact
+document-path/Git-commit manifest that has not expired. Public reads continue
+to inherit the exact published document commit and section slice.
+
+Document writes now replace their live image-reference set transactionally and
+record bounded revision manifests. Link, document, external-mirror, and
+recursive collection deletion therefore revoke live access immediately while
+preserving recent historical revisions. A background collector expires
+uncommitted uploads (24 hours by default) and objects with no live or retained
+revision reference (30 days by default), deleting metadata and enqueueing the
+S3 object removal in one transaction. Vault deletion immediately revokes access
+and transactionally queues associated object deletion. The retention windows
+and GC cadence are configurable.
+
+Image validation fully decodes bounded frames on a worker thread rather than
+the API event loop. Per-worker admission bounds compressed request bodies and
+decoder concurrency, including after request cancellation. Upload metadata and
+cleanup state are recorded before object transfer, and cancellation completes
+the transfer outcome before scheduling cleanup. Valid CommonMark image nodes,
+including titled and reference-style forms, share one parser-backed
+reachability path. Expired revision manifests
+are removed in indexed batches, and verified image bodies stream through the
+API after a bounded metadata check instead of being fully buffered per request.
+
+Upload registration and finalization use short coordinated row-lock phases; the
+remote S3 PUT runs between them without pinning a PostgreSQL connection. Vault
+deletion records immutable object keys in the existing retrying S3 outbox in the
+same transaction as the metadata cascade. Pending keys receive both an immediate
+delete and a delayed reconciliation delete after the presigned-upload window.
+Slow request bodies use a separately bounded admission pool and deadline instead
+of occupying image decode and object-storage slots. Regular File upload readiness
+now uses an explicit `upload_state`: pre-hash legacy Files remain confirmed and
+visible, while newly initiated transfers are pending and stale pending rows are
+collected after 24 hours by default. Re-adopting a content-addressed pending
+File refreshes its upload lease before collection, and user-initiated image
+discard is limited to finalized uploads so an active object transfer cannot
+lose its metadata owner.
+
+Document updates preserve pre-existing broken placeholders but reject newly
+introduced unavailable, expired, or cross-vault asset URLs. Public image
+requests require the page's configurable view grant (10 minutes by default) and
+never increment publication views per image. Concurrent image expiry recovery
+is coalesced into one newly counted fetch window, and every renewal re-applies
+the publication's view cap. The grant never replaces publication access:
+password-protected image requests must also carry the one-hour password token
+and continue to revalidate the exact published section before storage is
+touched. During rolling upgrades, fetch grants retain the legacy wire format
+while a separate bounded proof authorizes renewal.
+
+Text-only OKF imports preserve source-vault image references as fail-closed
+placeholders rather than omitting the containing document. Interactive and MCP
+creates remain strict. Integrity repair is restricted to already-confirmed
+standalone Files and cannot perform an upload state transition.
+
+Pinned public-document image manifests cache only their bounded attachment UUID
+sets rather than retaining complete Markdown bodies. Existing imported
+protocol-relative image sources remain renderable with a no-referrer policy;
+clickable protocol-relative links remain blocked.
+
 ### Added an explicit PostgreSQL Native document revision mode
 
 AKB now accepts the stable process-scoped revision selectors `bare_git` and

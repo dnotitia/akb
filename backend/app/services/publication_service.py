@@ -17,9 +17,12 @@ import math
 import re
 import secrets
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from threading import Lock
 from typing import Any
 
 import asyncpg
@@ -29,7 +32,9 @@ import frontmatter
 from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import AKBError, ConflictError, NotFoundError
-from app.services import file_service, table_service
+from app.repositories.vault_files_repo import confirmed_file_predicate
+from app.repositories.vault_repo import lock_vault_for_child_write
+from app.services import asset_service, file_service, table_service
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services.document_service import DocumentService
 from app.services.revision_backend import get_document_service
@@ -363,6 +368,12 @@ async def create_publication(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # Vault deletion locks the parent before cascading into documents,
+            # files, and publications. Creation takes the same parent-first
+            # order before locking its document/file resource, so neither side
+            # can hold one row while waiting for the other.
+            if not await lock_vault_for_child_write(conn, vault_id):
+                raise ValueError("Vault not found (deleted concurrently)")
             # Re-check resource existence INSIDE the publish TX. Closes the
             # publish/delete race: without this, `document_service.delete`
             # could cascade-clean publications (zero rows) before we
@@ -460,7 +471,8 @@ async def create_publication(
                     # Bind to vault_id (not id alone) so this can't be satisfied
                     # by a same-UUID file in another vault (cross-vault IDOR).
                     found = await conn.fetchval(
-                        "SELECT 1 FROM vault_files WHERE id = $1 AND vault_id = $2 FOR SHARE",
+                        "SELECT 1 FROM vault_files f WHERE id = $1 AND vault_id = $2 AND "
+                        + confirmed_file_predicate("f") + " FOR SHARE",
                         file_uuid_obj, vault_id,
                     )
                     if not found:
@@ -568,11 +580,12 @@ async def create_publication_for_vault(
         # collection_id — `file_uri` falls through to the root form.
         async with pool.acquire() as conn:
             file_coll_row = await conn.fetchrow(
-                """
+                f"""
                 SELECT c.path AS collection
                   FROM vault_files f
                   LEFT JOIN collections c ON c.id = f.collection_id
                  WHERE f.id = $1 AND f.vault_id = $2
+                   AND {confirmed_file_predicate("f")}
                 """,
                 uuid.UUID(file_id), vault_id,
             )
@@ -1136,40 +1149,189 @@ async def resolve_publication(
 # Document resolution
 # ============================================================
 
-async def resolve_document_publication(publication: dict) -> dict:
-    """Read document content for a document-type publication.
 
-    Returns a dict with the document body and display metadata. Never
-    includes the document UUID — the public viewer only knows the slug.
-    If the underlying Git file is missing, sets content_unavailable=true
-    and returns a placeholder body so consumers can display a clear notice.
+@dataclass(frozen=True)
+class _ResolvedDocumentBody:
+    content: str
+    content_unavailable: bool
+    section_not_found: bool
+    asset_ids: frozenset[uuid.UUID]
+
+
+class _UncacheableDocumentBody(Exception):
+    """Carries a transient unavailable response without caching the failure."""
+
+    def __init__(self, resolved: _ResolvedDocumentBody):
+        super().__init__("document content unavailable")
+        self.resolved = resolved
+
+
+def _read_document_body_uncached(
+    vault_name: str,
+    path: str,
+    commit_hash: str | None,
+    section_filter: str | None,
+) -> _ResolvedDocumentBody:
+    """Resolve one exact public representation on a worker thread."""
+    body = ""
+    content_unavailable = False
+    try:
+        raw = _get_doc_service().git.read_file(vault_name, path, commit_hash)
+        if raw:
+            body = frontmatter.loads(raw).content
+    except (FileNotFoundError, OSError) as exc:
+        logger.warning("Document content unavailable for publication: %s", exc)
+        content_unavailable = True
+        body = "*Document content is no longer available.*"
+
+    section_not_found = False
+    if section_filter and body:
+        filtered, found = _filter_section(body, section_filter)
+        if found:
+            body = filtered
+        else:
+            section_not_found = True
+            logger.info("section_filter %r did not match any heading", section_filter)
+
+    return _ResolvedDocumentBody(
+        content=body,
+        content_unavailable=content_unavailable,
+        section_not_found=section_not_found,
+        asset_ids=frozenset(asset_service.extract_asset_ids(body)),
+    )
+
+
+_ManifestKey = tuple[str, str, str, str | None]
+
+
+class _PinnedDocumentAssetCache:
+    """Small thread-safe LRU that retains UUID manifests, never document text."""
+
+    def __init__(self, maxsize: int):
+        self._maxsize = maxsize
+        self._entries: OrderedDict[_ManifestKey, frozenset[uuid.UUID]] = OrderedDict()
+        self._lock = Lock()
+
+    def get(self, key: _ManifestKey) -> frozenset[uuid.UUID] | None:
+        with self._lock:
+            value = self._entries.get(key)
+            if value is not None:
+                self._entries.move_to_end(key)
+            return value
+
+    def put(self, key: _ManifestKey, value: frozenset[uuid.UUID]) -> None:
+        with self._lock:
+            self._entries[key] = value
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._maxsize:
+                self._entries.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+_PINNED_DOCUMENT_ASSET_CACHE = _PinnedDocumentAssetCache(maxsize=64)
+
+
+def _read_pinned_document_asset_ids(
+    vault_name: str,
+    path: str,
+    commit_hash: str,
+    section_filter: str | None,
+) -> frozenset[uuid.UUID]:
+    """Cache only the manifest derived from an immutable Git representation."""
+    key = (vault_name, path, commit_hash, section_filter)
+    cached = _PINNED_DOCUMENT_ASSET_CACHE.get(key)
+    if cached is not None:
+        return cached
+    resolved = _read_document_body_uncached(
+        vault_name, path, commit_hash, section_filter,
+    )
+    if resolved.content_unavailable:
+        # Keep transient Git/filesystem failures retryable instead of pinning
+        # the placeholder for this process.
+        raise _UncacheableDocumentBody(resolved)
+    _PINNED_DOCUMENT_ASSET_CACHE.put(key, resolved.asset_ids)
+    return resolved.asset_ids
+
+
+async def _resolve_document_commit(doc_row) -> str | None:
+    """Return the immutable commit used for one document representation."""
+    commit_hash = doc_row["current_commit"]
+    if commit_hash is None:
+        # Legacy rows used floating HEAD. Resolve it once per request so both
+        # body and manifest helpers can address an immutable representation.
+        commit_hash = await asyncio.to_thread(
+            _get_doc_service().git.current_commit,
+            doc_row["vault_name"],
+        )
+    return commit_hash
+
+
+async def _resolve_document_body(
+    doc_row,
+    section_filter: str | None,
+) -> _ResolvedDocumentBody:
+    commit_hash = await _resolve_document_commit(doc_row)
+    resolved = await asyncio.to_thread(
+        _read_document_body_uncached,
+        doc_row["vault_name"],
+        doc_row["path"],
+        commit_hash,
+        section_filter,
+    )
+    if commit_hash is not None and not resolved.content_unavailable:
+        _PINNED_DOCUMENT_ASSET_CACHE.put(
+            (doc_row["vault_name"], doc_row["path"], commit_hash, section_filter),
+            resolved.asset_ids,
+        )
+    return resolved
+
+
+async def _resolve_document_asset_ids(
+    doc_row,
+    section_filter: str | None,
+) -> frozenset[uuid.UUID]:
+    commit_hash = await _resolve_document_commit(doc_row)
+    if commit_hash is None:
+        resolved = await asyncio.to_thread(
+            _read_document_body_uncached,
+            doc_row["vault_name"],
+            doc_row["path"],
+            None,
+            section_filter,
+        )
+        return resolved.asset_ids
+    try:
+        return await asyncio.to_thread(
+            _read_pinned_document_asset_ids,
+            doc_row["vault_name"],
+            doc_row["path"],
+            commit_hash,
+            section_filter,
+        )
+    except _UncacheableDocumentBody as exc:
+        return exc.resolved.asset_ids
+
+
+async def _find_published_document(publication: dict):
+    """Resolve the publication's vault-pinned document identity.
+
+    New rows bind by the composite ``(document_id, vault_id)`` foreign key.
+    The path branch exists only for legacy rows that migration 058 could not
+    bind; it also requires the URI's vault name, so a reused path in another
+    vault cannot satisfy the lookup.
     """
-    if publication["resource_type"] != ResourceType.DOCUMENT:
-        raise PublicationError("Not a document publication", status_code=400)
-
-    # **Which document this slug serves is decided by `document_id`.** Since
-    # migration 058 that column is the publication's binding to its document,
-    # under a composite FK (document_id, vault_id) → documents(id, vault_id),
-    # so a bound row names one document and that document is in the
-    # publication's own vault. Reading it here is the point of having it:
-    # `resource_uri` is a path, `documents` is UNIQUE(vault_id, path), and a
-    # path is reusable, so resolving by path asks "what lives there now?"
-    # rather than "what was published?". Those two questions had the same
-    # answer only for as long as one UPDATE — the move-time URI rewrite in
-    # `document_service.move` — was never missed. A constraint the read path
-    # does not read protects nothing.
     from app.services.uri_service import parse_uri
+
     uri = publication.get("resource_uri")
     raw_doc_id = publication.get("document_id")
     doc_uuid = to_uuid(raw_doc_id) if raw_doc_id else None
-
     parsed = parse_uri(uri) if uri else None
     doc_path = parsed.identifier if parsed and parsed.kind == "doc" else None
     uri_vault = parsed.vault if parsed and parsed.kind == "doc" else None
     if doc_uuid is None and doc_path is None:
-        # Only the legacy branch needs a readable URI. A bound row resolves
-        # without one, which also means a mirrored document whose path
-        # contains braces — a URI `parse_uri` refuses — is now servable.
         raise NotFoundError("Document", str(uri))
 
     pool = await get_pool()
@@ -1181,83 +1343,35 @@ async def resolve_document_publication(publication: dict) -> dict:
                    d.current_commit,
                    v.name AS vault_name,
                    COALESCE(u.display_name, u.username) AS created_by_name
-            FROM documents d
-            JOIN vaults v ON d.vault_id = v.id
-            -- created_by holds the actor's username on the normal write path
-            -- (older rows store a UUID); match either form, mirroring
-            -- user_directory.resolve_display_names.
-            LEFT JOIN users u
+              FROM documents d
+              JOIN vaults v ON d.vault_id = v.id
+              LEFT JOIN users u
                 ON u.id::text = d.created_by OR u.username = d.created_by
-            -- Bound to the publication's own vault_id in BOTH branches, so
-            -- neither can be satisfied by a same-path document in another
-            -- vault — the same binding `resolve_file_publication` puts on
-            -- vault_files.
-            --
-            -- $2 (document_id) is the lookup key when the row carries one.
-            -- No `v.name` cross-check on that branch, deliberately: the FK
-            -- already pins the document to this vault, so the URI's vault
-            -- name adds nothing — and requiring it to agree would re-break
-            -- exactly what keying on the id fixes, turning a publication
-            -- whose URI drifted into a 404 instead of resolving it to the
-            -- document its publisher chose.
-            --
-            -- The path branch is for rows the migration-058 backfill could
-            -- not bind (document_id IS NULL), where the URI is still the
-            -- only handle. There `v.name = $4` remains the cross-check, not
-            -- the lookup key: v is joined on the pinned vault_id, so a row
-            -- whose resource_uri disagrees with its vault_id matches nothing
-            -- and 404s. Fail closed — nothing identifies the intended
-            -- document on that branch, so serving whatever sits at the path
-            -- would be a silent partial success on a corrupt row.
-            WHERE d.vault_id = $1
-              AND ( d.id = $2::uuid
-                 OR ($2::uuid IS NULL AND d.path = $3 AND v.name = $4) )
+             WHERE d.vault_id = $1
+               AND ( d.id = $2::uuid
+                  OR ($2::uuid IS NULL AND d.path = $3 AND v.name = $4) )
             """,
             to_uuid(publication["vault_id"]), doc_uuid, doc_path, uri_vault,
         )
-        if doc_row is None:
-            raise NotFoundError("Document", str(uri))
+    if doc_row is None:
+        raise NotFoundError("Document", str(uri))
+    return doc_row
 
-    body = ""
-    content_unavailable = False
-    try:
-        # Git read is blocking filesystem I/O — offload it so a document page
-        # open / download never stalls the single event loop (503 risk class).
-        #
-        # **Read at the row's own commit, not the floating vault HEAD.** The
-        # query above establishes identity by `document_id`; reading HEAD at
-        # `d.path` would hand it straight back, because the connection is
-        # released first and a path is reusable. A move plus a new document
-        # onto the vacated path between the two would serve that document's
-        # BYTES under this publication's title, tags and author attribution —
-        # the same substitution the id lookup exists to prevent, re-entered
-        # one statement later. Pinning the commit makes the body and the
-        # metadata come from one document by construction.
-        #
-        # `DocumentService.get` pins the same way and for the same reason
-        # (recorded there as E03); the anonymous path is the one that had not.
-        # A NULL `current_commit` (legacy rows) falls back to HEAD inside
-        # `read_file`, which is the pre-existing behaviour for those rows.
-        raw = await asyncio.to_thread(
-            _get_doc_service().git.read_file,
-            doc_row["vault_name"], doc_row["path"], doc_row["current_commit"],
-        )
-        if raw:
-            body = frontmatter.loads(raw).content
-    except (FileNotFoundError, OSError) as e:
-        logger.warning("Document content unavailable for publication: %s", e)
-        content_unavailable = True
-        body = "*Document content is no longer available.*"
+
+async def resolve_document_publication(publication: dict) -> dict:
+    """Read document content for a document-type publication.
+
+    Returns a dict with the document body and display metadata. Never
+    includes the document UUID — the public viewer only knows the slug.
+    If the underlying Git file is missing, sets content_unavailable=true
+    and returns a placeholder body so consumers can display a clear notice.
+    """
+    if publication["resource_type"] != ResourceType.DOCUMENT:
+        raise PublicationError("Not a document publication", status_code=400)
 
     section_filter = publication.get("section_filter")
-    section_not_found = False
-    if section_filter and body:
-        filtered, found = _filter_section(body, section_filter)
-        if found:
-            body = filtered
-        else:
-            section_not_found = True
-            logger.info("section_filter %r did not match any heading", section_filter)
+    doc_row = await _find_published_document(publication)
+    resolved_body = await _resolve_document_body(doc_row, section_filter)
 
     return {
         "resource_type": ResourceType.DOCUMENT,
@@ -1276,11 +1390,22 @@ async def resolve_document_publication(publication: dict) -> dict:
         "created_by_name": doc_row["created_by_name"],
         "updated_at": doc_row["updated_at"].isoformat() if doc_row["updated_at"] else None,
         "tags": list(doc_row["tags"]) if doc_row["tags"] else [],
-        "content": body,
-        "content_unavailable": content_unavailable,
+        "content": resolved_body.content,
+        "content_unavailable": resolved_body.content_unavailable,
         "section_filter": section_filter,
-        "section_not_found": section_not_found,
+        "section_not_found": resolved_body.section_not_found,
     }
+
+
+async def resolve_document_publication_asset_ids(publication: dict) -> frozenset[uuid.UUID]:
+    """Return the exact section-scoped image manifest for a public document."""
+    if publication["resource_type"] != ResourceType.DOCUMENT:
+        raise PublicationError("Not a document publication", status_code=400)
+    doc_row = await _find_published_document(publication)
+    return await _resolve_document_asset_ids(
+        doc_row,
+        publication.get("section_filter"),
+    )
 
 
 _HEADING_RE = re.compile(r"^(#+)\s+(.*)$")
@@ -1358,12 +1483,13 @@ async def resolve_file_publication(publication: dict) -> dict:
     pool = await get_pool()
     async with pool.acquire() as conn:
         file_row = await conn.fetchrow(
-            """
+            f"""
             SELECT f.name, f.s3_key, f.mime_type, f.size_bytes,
                    c.path AS collection
               FROM vault_files f
               LEFT JOIN collections c ON c.id = f.collection_id
              WHERE f.id = $1 AND f.vault_id = $2
+               AND {confirmed_file_predicate("f")}
             """,
             to_uuid(file_uuid_str), to_uuid(publication["vault_id"]),
         )
@@ -1403,7 +1529,9 @@ async def get_file_storage_for_publication(publication: dict) -> dict:
     pool = await get_pool()
     async with pool.acquire() as conn:
         file_row = await conn.fetchrow(
-            "SELECT name, s3_key, mime_type, size_bytes FROM vault_files WHERE id = $1 AND vault_id = $2",
+            "SELECT name, s3_key, mime_type, size_bytes FROM vault_files f "
+            "WHERE id = $1 AND vault_id = $2 AND "
+            + confirmed_file_predicate("f"),
             to_uuid(file_uuid_str), to_uuid(publication["vault_id"]),
         )
     if file_row is None:

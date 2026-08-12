@@ -38,9 +38,11 @@ from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import ConfigDict
 
 from app.api.deps import get_current_user, get_optional_user
+from app.api.routes import assets
 from app.exceptions import ForbiddenError, NotFoundError
 from app.config import settings
 from app.db.postgres import get_pool
+from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.util.text import NFCModel
 from app.services import audit_log, file_service, publication_service
 from app.services import publication_rate_limit as pub_rl
@@ -68,6 +70,17 @@ logger = logging.getLogger("akb.publications.public")
 _TOKEN_TTL = 3600  # 1 hour
 
 
+def _matches_hmac_hexdigest(expected: str, supplied: str) -> bool:
+    """Compare an untrusted digest without ``compare_digest`` type errors."""
+    try:
+        supplied_bytes = supplied.encode("ascii")
+    except (AttributeError, UnicodeEncodeError):
+        return False
+    if len(supplied_bytes) != 64 or any(c not in b"0123456789abcdef" for c in supplied_bytes):
+        return False
+    return hmac.compare_digest(expected.encode("ascii"), supplied_bytes)
+
+
 def _make_token(slug: str) -> str:
     # Bound to the slug (not the password): publications are create-only, so a
     # password "change" is an unpublish + republish, which mints a NEW slug —
@@ -92,44 +105,129 @@ def _verify_token(slug: str, token: str) -> bool:
         return False
     msg = f"{slug}:{ts_str}".encode("utf-8")
     expected = hmac.new(settings.jwt_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, sig)
+    return _matches_hmac_hexdigest(expected, sig)
 
 
 # ============================================================
-# View-grant: proves a COUNTED page open, so the paired /raw and /download
-# re-serves of that same view don't re-count and stay usable at the last allowed
-# view. Distinct from the password token (different HMAC purpose prefix) so one
-# can't substitute for the other: a password token must NOT skip view-counting,
-# and a grant must NOT bypass the password gate. WITHOUT a grant, /raw and
-# /download each count as their own view and are capped — so max_views is a HARD
-# cap on every content-delivery path, not just the page GET. TTL is short: it
-# only has to outlive a single page session's preview→download, and a short
-# window bounds how long a leaked/shared grant URL can fetch without counting.
+# View-grant: proves a COUNTED page open, so subordinate requests for that view
+# do not re-count. It is deliberately distinct from the password token: a grant
+# never unlocks content, including document images. Password-protected image
+# requests must carry both capabilities while public images need only the grant.
 # ============================================================
 
-_VIEW_GRANT_TTL = 600  # 10 minutes
 
-
-def _make_view_grant(slug: str) -> str:
-    ts = str(int(time.time()))
-    msg = f"grant:{slug}:{ts}".encode("utf-8")
+def _make_bounded_view_grant(slug: str, *, issued_at: int | None = None) -> str:
+    now = int(time.time())
+    issued = now if issued_at is None else issued_at
+    expires = min(
+        now + settings.publication_view_grant_ttl_secs,
+        issued + settings.publication_view_grant_session_secs,
+    )
+    msg = f"grant:{slug}:{issued}:{expires}".encode("utf-8")
     sig = hmac.new(settings.jwt_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
-    return f"{ts}.{sig}"
+    return f"{issued}.{expires}.{sig}"
+
+
+def _make_view_grant(slug: str, *, issued_at: int | None = None) -> str:
+    if not settings.publication_view_grant_emit_legacy:
+        return _make_bounded_view_grant(slug, issued_at=issued_at)
+    issued = int(time.time()) if issued_at is None else issued_at
+    msg = f"grant:{slug}:{issued}".encode("utf-8")
+    sig = hmac.new(settings.jwt_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return f"{issued}.{sig}"
+
+
+def _parse_view_grant(slug: str, grant: str | None) -> tuple[int, int] | None:
+    """Validate current and pre-session view-grant wire formats.
+
+    The two-field form was issued before bounded grant rotation existed. It is
+    accepted only for its original TTL and is never promoted into a rotatable
+    session. Reading both forms lets an already-open page survive a rolling
+    deployment without gaining a longer lifetime.
+    """
+    if not grant:
+        return None
+    parts = grant.split(".")
+    if len(parts) == 2:
+        issued_str, sig = parts
+        try:
+            issued = int(issued_str)
+        except ValueError:
+            return None
+        expires = issued + settings.publication_view_grant_ttl_secs
+        msg = f"grant:{slug}:{issued_str}".encode("utf-8")
+    elif len(parts) == 3:
+        issued_str, expires_str, sig = parts
+        try:
+            issued = int(issued_str)
+            expires = int(expires_str)
+        except ValueError:
+            return None
+        msg = f"grant:{slug}:{issued_str}:{expires_str}".encode("utf-8")
+    else:
+        return None
+    if expires < issued:
+        return None
+    if expires > issued + settings.publication_view_grant_session_secs:
+        return None
+    expected = hmac.new(settings.jwt_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    if not _matches_hmac_hexdigest(expected, sig):
+        return None
+    return issued, expires
 
 
 def _verify_view_grant(slug: str, grant: str | None) -> bool:
-    if not grant:
+    parsed = _parse_view_grant(slug, grant)
+    if parsed is None:
         return False
-    try:
-        ts_str, sig = grant.split(".", 1)
-        ts = int(ts_str)
-    except (ValueError, AttributeError):
-        return False
-    if abs(time.time() - ts) > _VIEW_GRANT_TTL:
-        return False
-    msg = f"grant:{slug}:{ts_str}".encode("utf-8")
-    expected = hmac.new(settings.jwt_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, sig)
+    issued, expires = parsed
+    now = int(time.time())
+    return issued <= now + 30 and now <= expires
+
+
+def _validate_view_grant_renewal(
+    slug: str, grant: str | None,
+) -> tuple[int, int] | None:
+    """Validate the bounded proof used to request another counted window.
+
+    Two-field grants remain fetch-only rollout capabilities.  A three-field
+    grant can prove that the caller opened the page recently, but renewal still
+    goes through the normal publication view counter and cap.  The session
+    proof therefore extends eligibility to renew, not the counted view itself.
+    """
+    if not grant or len(grant.split(".")) != 3:
+        return None
+    parsed = _parse_view_grant(slug, grant)
+    if parsed is None:
+        return None
+    issued, _expires = parsed
+    now = int(time.time())
+    if issued > now + 30 or now >= issued + settings.publication_view_grant_session_secs:
+        return None
+    return parsed
+
+
+def _view_grant_remaining_seconds(slug: str, grant: str) -> int:
+    """Return the signed capability's actual remaining lifetime."""
+    parsed = _parse_view_grant(slug, grant)
+    if parsed is None:
+        return 0
+    _issued, expires = parsed
+    return max(0, expires - int(time.time()))
+
+
+def _view_grant_session_remaining_seconds(slug: str, grant: str) -> int:
+    """Return how long a bounded grant remains eligible for renewal."""
+    if len(grant.split(".")) != 3:
+        return 0
+    parsed = _parse_view_grant(slug, grant)
+    if parsed is None:
+        return 0
+    issued, _expires = parsed
+    return max(
+        0,
+        issued + settings.publication_view_grant_session_secs - int(time.time()),
+    )
 
 
 def _extract_view_grant(request: Request) -> str | None:
@@ -549,6 +647,42 @@ async def publication_auth(slug: str, req: PasswordAuthRequest, request: Request
     return {"authorized": True, "token": _make_token(slug), "expires_in": _TOKEN_TTL}
 
 
+@router.post("/public/{slug}/grant", summary="Rotate a document view grant")
+async def renew_publication_view_grant(slug: str, request: Request):
+    """Exchange a bounded page proof for one newly counted fetch window.
+
+    Publication access, expiry, password, and ``max_views`` are all rechecked.
+    While legacy emission is enabled the fetch grant remains two-field so both
+    old and new backend pods can serve image requests during a rolling update;
+    the three-field session proof is returned separately.
+    """
+    if _validate_view_grant_renewal(slug, _extract_view_grant(request)) is None:
+        raise HTTPException(status_code=404, detail="Publication grant not found")
+    try:
+        await _resolve_with_access(
+            slug,
+            request,
+            increment_view=True,
+            enforce_view_cap=True,
+        )
+    except PublicationError as exc:
+        raise _publication_error_to_http(exc)
+    grant = _make_view_grant(slug)
+    session_grant = (
+        grant
+        if len(grant.split(".")) == 3
+        else _make_bounded_view_grant(slug)
+    )
+    return {
+        "view_grant": grant,
+        "view_grant_session": session_grant,
+        "expires_in": _view_grant_remaining_seconds(slug, grant),
+        "session_expires_in": _view_grant_session_remaining_seconds(
+            slug, session_grant,
+        ),
+    }
+
+
 @router.get("/public/{slug}/meta", summary="Get publication metadata (no content)")
 async def publication_meta(slug: str, request: Request):
     """Return metadata about a publication without resolving full content.
@@ -586,7 +720,9 @@ async def publication_meta(slug: str, request: Request):
             pool = await get_pool()
             async with pool.acquire() as conn:
                 file_row = await conn.fetchrow(
-                    "SELECT name, mime_type, size_bytes FROM vault_files WHERE id = $1 AND vault_id = $2",
+                    "SELECT name, mime_type, size_bytes FROM vault_files f "
+                    "WHERE id = $1 AND vault_id = $2 AND "
+                    + confirmed_file_predicate("f"),
                     to_uuid(file_uuid_str), to_uuid(publication["vault_id"]),
                 )
             if file_row:
@@ -651,6 +787,53 @@ def _is_inert_raw_mime(mime: str) -> bool:
 
 
 @router.get(
+    "/public/{slug}/assets/{file_id}",
+    response_class=Response,
+    summary="Render an image inherited from a document publication",
+)
+async def publication_document_asset(slug: str, file_id: str, request: Request):
+    """Serve an attachment only when the exact public document slice embeds it.
+
+    Authorization is derived on every request from the publication's pinned
+    document identity/current commit and its section filter.  This avoids a
+    document-wide manifest accidentally exposing an image from a private
+    section, and removal/unpublish revokes access immediately.
+    """
+    # An image is a subordinate fetch of an already-counted page view. Require
+    # its short-lived grant so N images do not consume N view-cap entries.
+    if not _verify_view_grant(slug, _extract_view_grant(request)):
+        raise HTTPException(status_code=404, detail="Asset not found")
+    try:
+        # Re-run normal publication access without incrementing the view. A
+        # grant suppresses counting but never substitutes for a password token.
+        publication = await _resolve_with_access(
+            slug, request,
+            increment_view=False,
+            enforce_view_cap=False,
+        )
+        if publication["resource_type"] != ResourceType.DOCUMENT:
+            raise PublicationNotFound(slug)
+        asset_ids = await publication_service.resolve_document_publication_asset_ids(
+            publication,
+        )
+    except PublicationError as exc:
+        raise _publication_error_to_http(exc)
+
+    try:
+        requested_id = uuid.UUID(file_id)
+    except (ValueError, AttributeError) as exc:
+        raise HTTPException(status_code=404, detail="Asset not found") from exc
+    if requested_id not in asset_ids:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    try:
+        row = await assets.load_asset_row(file_id, to_uuid(publication["vault_id"]))
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Asset not found") from exc
+    return await assets.image_asset_response(row, public=True)
+
+
+@router.get(
     "/public/{slug}/raw",
     response_class=Response,
     responses={
@@ -700,7 +883,9 @@ async def publication_raw(slug: str, request: Request):
     pool = await get_pool()
     async with pool.acquire() as conn:
         file_row = await conn.fetchrow(
-            "SELECT s3_key, mime_type, size_bytes, name FROM vault_files WHERE id = $1 AND vault_id = $2",
+            "SELECT s3_key, mime_type, size_bytes, name FROM vault_files f "
+            "WHERE id = $1 AND vault_id = $2 AND "
+            + confirmed_file_predicate("f"),
             to_uuid(parsed.identifier), to_uuid(publication["vault_id"]),
         )
     if not file_row:
@@ -955,16 +1140,36 @@ async def get_public_publication(
 
     rt = publication["resource_type"]
 
-    # Hand back a short-lived grant so the paired /raw and /download re-serves of
+    # Hand back a bounded grant so the paired /raw and /download re-serves of
     # THIS view don't re-count (and a page at its last allowed view can still
     # fetch its bytes). Mint a FRESH grant only on a counted (grantless) open; on
-    # a grant-carried re-serve, ECHO the same grant so its ORIGINAL 600s TTL
+    # a grant-carried re-serve, ECHO the same grant so its ORIGINAL TTL
     # stands. Re-minting on every GET would let a viewer refresh before expiry to
     # roll the timestamp forward indefinitely — an unlimited renewable capability
     # from a single counted view, defeating the cap (Codex High). Only the JSON
     # page-open responses carry it — the CSV/HTML format branches are leaf
     # downloads, not the "open the page" call the viewer threads the grant from.
-    grant = incoming_grant if has_grant else _make_view_grant(slug)
+    if has_grant:
+        # Verification cannot succeed for None, but spelling out the narrowing
+        # keeps this response contract non-null for type checkers and callers.
+        assert incoming_grant is not None
+        grant = incoming_grant
+    else:
+        grant = _make_view_grant(slug)
+    # During the rolling-upgrade phase the fetch grant remains in the legacy
+    # two-field format so an older backend can still serve subordinate image
+    # requests. A separately minted bounded token proves the same counted page
+    # open to the refresh endpoint without promoting the legacy capability.
+    # Once legacy emission is disabled the two values are identical.
+    session_grant = None
+    if not has_grant:
+        session_grant = (
+            grant
+            if len(grant.split(".")) == 3
+            else _make_bounded_view_grant(slug)
+        )
+    elif incoming_grant and len(incoming_grant.split(".")) == 3:
+        session_grant = incoming_grant
 
     if rt == ResourceType.DOCUMENT:
         try:
@@ -972,6 +1177,8 @@ async def get_public_publication(
         except PublicationError as e:
             raise _publication_error_to_http(e)
         data["view_grant"] = grant
+        if session_grant:
+            data["view_grant_session"] = session_grant
         return data
 
     if rt == ResourceType.FILE:
@@ -984,6 +1191,8 @@ async def get_public_publication(
         # /public/{slug}/download (force-download). The legacy ?format=raw
         # alias was removed — it had no callers and no size cap.
         file_data["view_grant"] = grant
+        if session_grant:
+            file_data["view_grant_session"] = session_grant
         return file_data
 
     if rt == ResourceType.TABLE_QUERY:
@@ -1007,6 +1216,8 @@ async def get_public_publication(
         if fmt == "html":
             return await _to_html_table_response(data)
         data["view_grant"] = grant
+        if session_grant:
+            data["view_grant_session"] = session_grant
         return data
 
     raise HTTPException(status_code=400, detail=f"Unknown resource_type: {rt}")
@@ -1153,7 +1364,8 @@ async def oembed(url: str, format: str = "json"):
                 pool = await get_pool()
                 async with pool.acquire() as conn:
                     f_row = await conn.fetchrow(
-                        "SELECT name FROM vault_files WHERE id = $1 AND vault_id = $2",
+                        "SELECT name FROM vault_files f WHERE id = $1 AND vault_id = $2 AND "
+                        + confirmed_file_predicate("f"),
                         to_uuid(file_uuid_str), to_uuid(publication["vault_id"]),
                     )
                     if f_row:

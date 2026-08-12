@@ -16,6 +16,7 @@ from app.api.deps import get_current_user, get_optional_user
 from app.api.routes import (
     access,
     activity,
+    assets,
     app_inventory,
     app_installations,
     app_rollouts,
@@ -39,6 +40,7 @@ from app.exceptions import AKBError
 from app.logging_redaction import install_secret_redaction
 from app.openapi_contract import install_openapi_contract
 from app.services import (
+    asset_gc_worker,
     audit_log,
     embed_worker,
     events_publisher,
@@ -299,6 +301,8 @@ app.include_router(agent_sessions.router, prefix="/api/v1", tags=["agent-session
 app.include_router(tables.router, prefix="/api/v1", tags=["tables"])
 app.include_router(knowledge_io.router, prefix="/api/v1", tags=["export-import"])
 app.include_router(files.router, prefix="/api/v1", tags=["files"])
+app.include_router(assets.router, prefix="/api/v1", tags=["assets"])
+app.include_router(assets.stable_router, prefix="/api", tags=["assets"])
 app.include_router(public.router, prefix="/api/v1", tags=["public"])
 app.include_router(help_routes.router, prefix="/api/v1/help", tags=["help"])
 install_openapi_contract(app)
@@ -449,6 +453,7 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
         "status": "ok",
         "service": "akb",
         "external_git": await _safe(external_git_poller.pending_stats),
+        "asset_gc": await _safe(asset_gc_worker.pending_stats),
         "metadata_backfill": await _safe(metadata_worker.pending_stats),
         "events": await _safe(events_publisher.pending_stats),
         "vector_store": vs_info,

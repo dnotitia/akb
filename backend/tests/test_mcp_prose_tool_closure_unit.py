@@ -41,12 +41,17 @@ _MCP = Path(__file__).resolve().parents[1] / "mcp_server"
 _PLUGINS = Path(__file__).resolve().parents[2] / "plugins"
 
 # Tools the backend deliberately does NOT define: the Node stdio proxy owns
-# local filesystem access, so it synthesises these four itself and they never
+# local filesystem access, so it synthesises these tools itself and they never
 # appear in the backend `TOOLS` list (see packages/akb-mcp-client/lib/proxy.mjs
 # and the boundary rule in AGENTS.md). Prose is allowed to name them.
-_PROXY_ONLY_TOOLS = frozenset(
-    {"akb_put_file", "akb_get_file", "akb_update_file", "akb_delete_file"}
-)
+_PROXY_ONLY_TOOLS = frozenset({
+    "akb_put_file",
+    "akb_get_file",
+    "akb_update_file",
+    "akb_delete_file",
+    "akb_put_image",
+    "akb_discard_image",
+})
 
 # The trailing \b and the digit class matter: `\bakb_[a-z_]+` would match the
 # `akb_search` PREFIX of a ghost named `akb_search2` and wave it through as a
@@ -181,6 +186,32 @@ def test_prose_never_names_a_nonexistent_akb_tool() -> None:
         f"(or the proxy-only set {sorted(_PROXY_ONLY_TOOLS)}): "
         + "; ".join(f"{name} in {locs}" for name, locs in sorted(ghosts.items()))
     )
+
+
+def test_inline_image_guidance_is_safe_and_matches_bounded_lifecycle() -> None:
+    """Agent prose must not turn image insertion into a body-truncating update."""
+    topics = _help_topics()
+    images = topics["images"]
+    put_image = topics["akb_put_image"]
+    discard_image = topics["akb_discard_image"]
+    update = topics["akb_update"]
+    instructions = _instructions_text()
+
+    for body in (images, put_image, update, instructions):
+        normalized = re.sub(r"\s+", " ", body.replace("**", ""))
+        assert "replaces the entire" in normalized or "replaces the complete" in normalized
+        assert "akb_edit" in body
+
+    assert "30 days by default" in images
+    assert "24 hours by default" in images
+    assert "30 days by default" in discard_image
+    assert "same vault" in images
+    assert "cross-vault" in images
+    assert "is rejected" in images
+    assert "unavailable placeholders" in images
+
+    unsafe_example = 'akb_update(uri="akb://eng/coll/specs/doc/auth.md",\n  content="# Authentication'
+    assert unsafe_example not in put_image
 
 
 def test_help_root_table_topics_are_real_help_topics() -> None:

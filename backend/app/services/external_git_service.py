@@ -36,6 +36,7 @@ from app.db.postgres import get_pool
 from app.exceptions import AKBError, MirrorMarkerError
 from app.repositories.document_repo import CollectionRepository, DocumentRepository
 from app.repositories.events_repo import emit_event
+from app.repositories.vault_repo import lock_vault_for_child_write
 from app.repositories.vault_external_git_repo import VaultExternalGitRepository
 from app.services.git_service import GitService
 from app.services.index_service import (
@@ -44,6 +45,7 @@ from app.services.index_service import (
     delete_document_chunks,
     write_source_chunks,
 )
+from app.services import asset_service
 from app.services.resource_hash import HASH_ALGORITHM, compute_text_content_hash
 from app.services.uri_service import doc_uri
 from app.util.text import normalize_collection_path, to_nfc, to_nfc_any
@@ -467,6 +469,13 @@ class ExternalGitService:
         last_commit = await asyncio.to_thread(
             self.git.last_commit_for_path, vault_name, path, tip_sha
         )
+        if last_commit is None:
+            # The path was read from tip_sha, which is itself an exact commit
+            # containing the bytes. Some shallow or replacement-ref histories
+            # cannot identify the last path-touch commit; pinning the mirror tip
+            # preserves a non-null, addressable document revision without
+            # stalling the entire reconcile cursor.
+            last_commit = tip_sha
         created_by = _created_by_for(remote_url)
         now = datetime.now(timezone.utc)
 
@@ -489,6 +498,7 @@ class ExternalGitService:
             summary=summary, tags=tags, doc_type=doc_type,
         )
         chunks = chunk_markdown(body, metadata_header=meta_header)
+        referenced_asset_ids = await asset_service.extract_asset_ids_async(body)
 
         # One connection, one tx: collection get-or-create → doc upsert →
         # chunks replace. Halves the pool acquires per file (5658 ×).
@@ -497,6 +507,14 @@ class ExternalGitService:
         coll_repo = CollectionRepository(pool)
         async with pool.acquire() as conn:
             async with conn.transaction():
+                if not await lock_vault_for_child_write(conn, vault_id):
+                    raise AKBError(
+                        "Vault was deleted during external Git synchronization",
+                        status_code=409,
+                    )
+                previous_asset_state = await doc_repo.find_asset_sync_state_for_update(
+                    vault_id, path, conn=conn,
+                )
                 collection_id = (
                     await coll_repo.get_or_create(vault_id, coll_path, conn=conn)
                     if coll_path else None
@@ -532,6 +550,29 @@ class ExternalGitService:
                     vault_id=vault_id,
                     chunks=chunks,
                 )
+                # External Markdown may contain stale or foreign asset URLs;
+                # mirror fidelity wins over rejecting the entire sync.  Valid
+                # same-vault references are still claimed for Git-history
+                # retention, while invalid ones remain fail-closed at render.
+                if referenced_asset_ids or (
+                    previous_asset_state
+                    and previous_asset_state["has_asset_refs"]
+                ):
+                    asset_ids = await asset_service.claim_document_asset_ids(
+                        conn,
+                        vault_id=vault_id,
+                        asset_ids=referenced_asset_ids,
+                        strict=False,
+                    )
+                    await asset_service.sync_document_assets(
+                        conn,
+                        document_id=pg_doc_id,
+                        vault_id=vault_id,
+                        document_path=path,
+                        commit_hash=last_commit,
+                        asset_ids=asset_ids,
+                        previous_commit=(previous_asset_state or {}).get("current_commit"),
+                    )
                 # Subscribers (search reindex, audit) need to see external
                 # mirror writes the same as user PUTs. Emitted inside the
                 # same TX so rollback drops the event too.
@@ -592,6 +633,8 @@ class ExternalGitService:
         from app.services.kg_service import delete_document_relations
         async with pool.acquire() as conn:
             async with conn.transaction():
+                if not await lock_vault_for_child_write(conn, vault_id):
+                    return "already_absent"
                 row = await conn.fetchrow(
                     """
                     SELECT id, collection_id, created_by, external_blob

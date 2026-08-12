@@ -409,6 +409,8 @@ CREATE TABLE IF NOT EXISTS vault_files (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     vault_id UUID NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
     collection_id UUID REFERENCES collections(id) ON DELETE SET NULL,
+    kind TEXT NOT NULL DEFAULT 'file',
+    upload_state TEXT NOT NULL DEFAULT 'pending',
     name TEXT NOT NULL,
     s3_key TEXT NOT NULL,
     mime_type TEXT,
@@ -418,14 +420,17 @@ CREATE TABLE IF NOT EXISTS vault_files (
     etag TEXT,                         -- object-store ETag/checksum hint
     storage_version TEXT,              -- object-store version id when available
     hash_verified_at TIMESTAMPTZ,      -- when AKB last verified content_hash from storage bytes
+    attachment_claimed_at TIMESTAMPTZ, -- first document commit that referenced an editor attachment
     description TEXT,
     created_by TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(vault_id, s3_key)
+    UNIQUE(vault_id, s3_key),
+    CONSTRAINT vault_files_id_vault_id_key UNIQUE (id, vault_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_vault_files_vault ON vault_files(vault_id);
+CREATE INDEX IF NOT EXISTS idx_vault_files_s3_key ON vault_files(s3_key);
 -- Guarded: `vault_files.collection_id` arrives with migration 020; see the
 -- note at the publications document_id guard below.
 DO $$
@@ -437,6 +442,69 @@ BEGIN
            AND column_name = 'collection_id'
     ) THEN
         CREATE INDEX IF NOT EXISTS idx_vault_files_collection ON vault_files(collection_id);
+    END IF;
+END $$;
+
+-- Live document-image references are the private authorization set. They
+-- disappear with the document; a separate bounded manifest keeps recent Git
+-- revisions renderable without retaining unreferenced objects forever.
+-- init.sql runs before pending migrations on an upgraded database. A database
+-- that predates migration 058 does not yet have documents(id, vault_id) as a
+-- unique key, so creating the composite FK here would abort startup before 058
+-- can add it. Fresh/current databases take this fast path; older ones skip it
+-- and migration 062 creates the table after 058 has completed.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'documents_id_vault_id_key'
+           AND conrelid = 'documents'::regclass
+    ) AND EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'vault_files_id_vault_id_key'
+           AND conrelid = 'vault_files'::regclass
+    ) THEN
+        EXECUTE $ddl$
+            CREATE TABLE IF NOT EXISTS document_asset_refs (
+                document_id UUID NOT NULL,
+                vault_id UUID NOT NULL,
+                asset_id UUID NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (document_id, asset_id),
+                CONSTRAINT document_asset_refs_document_fk
+                    FOREIGN KEY (document_id, vault_id)
+                    REFERENCES documents(id, vault_id) ON DELETE CASCADE,
+                CONSTRAINT document_asset_refs_asset_fk
+                    FOREIGN KEY (asset_id, vault_id)
+                    REFERENCES vault_files(id, vault_id) ON DELETE CASCADE
+            )
+        $ddl$;
+        EXECUTE $ddl$
+            CREATE INDEX IF NOT EXISTS idx_document_asset_refs_asset
+                ON document_asset_refs(asset_id, vault_id)
+        $ddl$;
+        EXECUTE $ddl$
+            CREATE TABLE IF NOT EXISTS document_asset_revision_refs (
+                vault_id UUID NOT NULL,
+                document_path TEXT NOT NULL,
+                commit_hash TEXT NOT NULL,
+                asset_id UUID NOT NULL,
+                retain_until TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (vault_id, document_path, commit_hash, asset_id),
+                CONSTRAINT document_asset_revision_refs_asset_fk
+                    FOREIGN KEY (asset_id, vault_id)
+                    REFERENCES vault_files(id, vault_id) ON DELETE CASCADE
+            )
+        $ddl$;
+        EXECUTE $ddl$
+            CREATE INDEX IF NOT EXISTS idx_document_asset_revision_refs_asset_retention
+                ON document_asset_revision_refs(asset_id, retain_until)
+        $ddl$;
+        EXECUTE $ddl$
+            CREATE INDEX IF NOT EXISTS idx_document_asset_revision_refs_expiry
+                ON document_asset_revision_refs(retain_until)
+        $ddl$;
     END IF;
 END $$;
 

@@ -13,9 +13,10 @@ from pathlib import Path
 
 from app.config import NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME, settings
 from app.db.postgres import get_pool
-from app.exceptions import AKBError, NotFoundError, ValidationError
+from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError
 from app.repositories import vault_files_repo
 from app.repositories.document_repo import CollectionRepository
+from app.repositories.vault_repo import lock_vault_for_child_write
 from app.services.adapters import s3_adapter
 from app.services.m1_binary_store import BinaryStore, FilesystemCAS, PreparedBinary, S3CAS
 from app.services.m1_pg_body_store import M1_PG_TEXT_MAX_BYTES, M1PgBodyStore
@@ -223,6 +224,8 @@ class MeasurementFileService:
         pool = await get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
+                if not await lock_vault_for_child_write(conn, vault_id):
+                    raise ConflictError("Vault was deleted during file upload")
                 await self.reap_transfer_intents(conn)
                 collection_id = None
                 if collection_path:

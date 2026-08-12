@@ -26,6 +26,7 @@ from app.exceptions import AKBError, ConflictError, NotFoundError
 from app.repositories import vault_files_repo
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
+from app.repositories.vault_repo import lock_vault_for_child_write
 from app.services.adapters import s3_adapter
 from app.services.index_service import (
     build_file_chunk, delete_file_chunks, write_source_chunks,
@@ -103,12 +104,10 @@ def get_object_bytes(s3_key: str, max_bytes: int | None = None) -> bytes:
     if max_bytes is None:
         return s3_adapter.get_bytes(s3_key)
     buf = bytearray()
-    gen = s3_adapter.iter_chunks(s3_key)
+    gen = iter_object_chunks(s3_key, max_bytes=max_bytes)
     try:
         for chunk in gen:
             buf.extend(chunk)
-            if len(buf) > max_bytes:
-                raise StorageError(f"object {s3_key} exceeds {max_bytes} bytes")
     finally:
         # release the boto stream promptly on cap-abort or exhaustion; the
         # concrete iterator is a generator, but the annotation is Iterator[bytes]
@@ -127,9 +126,24 @@ def head_object(s3_key: str) -> dict:
 
 
 def iter_object_chunks(
-    s3_key: str, chunk_size: int = _S3_STREAM_CHUNK_SIZE
+    s3_key: str,
+    chunk_size: int = _S3_STREAM_CHUNK_SIZE,
+    *,
+    max_bytes: int | None = None,
 ) -> Iterator[bytes]:
-    return s3_adapter.iter_chunks(s3_key, chunk_size=chunk_size)
+    """Stream an object with an optional hard bound on transferred bytes."""
+    transferred = 0
+    gen = s3_adapter.iter_chunks(s3_key, chunk_size=chunk_size)
+    try:
+        for chunk in gen:
+            transferred += len(chunk)
+            if max_bytes is not None and transferred > max_bytes:
+                raise StorageError(f"object {s3_key} exceeds {max_bytes} bytes")
+            yield chunk
+    finally:
+        close = getattr(gen, "close", None)
+        if callable(close):
+            close()
 
 
 def put_object_bytes(
@@ -282,16 +296,12 @@ async def _delete_file_publications(conn, vault_id: uuid.UUID, file_id: str) -> 
     """Drop this file's publications on the CALLER's connection, before its
     `vault_files` row goes.
 
-    A file becomes publishable the moment `initiate_upload` writes its row —
-    `create_publication` only checks `SELECT 1 FROM vault_files WHERE id=$1
-    AND vault_id=$2`, with no confirmed/hash predicate. So a file can be
-    published while the upload is still outstanding, and the two
-    `confirm_upload` failure paths that clean up the row (S3 object missing,
-    declared-bytes mismatch) would otherwise leave the publication behind:
-    a live slug in the owner's list pointing at a resource that no longer
-    exists. A file URI carries a UUID, so this cannot be reoccupied the way
-    a document path can — the row is simply stale, not reachable as
-    something else.
+    Publication creation now requires a confirmed ``kind='file'`` row, but
+    this remains the shared deletion chokepoint for both confirm-time cleanup
+    and ordinary File deletion. Keeping the cascade here protects legacy rows
+    and avoids coupling correctness to the order in which callers discovered
+    the invalid or deleted object. A file URI carries a UUID, so any surviving
+    publication would be stale rather than re-bound to another resource.
 
     Takes `vault_id` because `confirm_upload` never resolves the vault NAME,
     which the shared helper needs to build the canonical URI.
@@ -363,23 +373,41 @@ class FileService:
 
         s3_adapter.ensure_bucket(self._bucket)
         collection_path = _normalize_collection_path(collection)
-        s3_key = _s3_key(
+        preferred_s3_key = _s3_key(
             vault_name, collection_path, filename, content_hash=content_hash,
         )
         file_id = uuid.uuid4()
 
-        presigned_url = s3_adapter.presign_put(
-            s3_key, content_type=mime_type, ttl=_PRESIGN_UPLOAD_TTL,
-        )
-
         pool = await get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
+                if not await lock_vault_for_child_write(conn, vault_id):
+                    raise ConflictError("Vault was deleted during file upload")
                 collection_id = None
                 if collection_path:
                     coll_repo = CollectionRepository(pool)
                     collection_id = await coll_repo.get_or_create(
                         vault_id, collection_path, conn=conn,
+                    )
+                # A delayed delete intent may still own the deterministic key
+                # after its original metadata row disappeared. Never wait for
+                # remote object-store I/O on the request path: reserve the
+                # preferred key with a non-blocking advisory lock, otherwise
+                # use a fresh random key whose upload cannot be removed by the
+                # older intent.
+                s3_key = preferred_s3_key
+                for _attempt in range(4):
+                    if await vault_files_repo.s3_key_available_for_registration(
+                        conn, vault_id=vault_id, s3_key=s3_key,
+                    ):
+                        break
+                    s3_key = _s3_key(
+                        vault_name, collection_path, filename, content_hash=None,
+                    )
+                else:
+                    raise AKBError(
+                        "Could not reserve an object storage key",
+                        status_code=503,
                     )
                 stored_id = await vault_files_repo.insert_or_adopt(
                     conn,
@@ -390,6 +418,10 @@ class FileService:
                     created_by=actor_id,
                     collection_id=collection_id,
                 )
+
+        presigned_url = s3_adapter.presign_put(
+            s3_key, content_type=mime_type, ttl=_PRESIGN_UPLOAD_TTL,
+        )
 
         deduplicated = stored_id != file_id
         file_id = stored_id
@@ -440,7 +472,7 @@ class FileService:
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await vault_files_repo.find_by_id(conn, vault_id, fid)
-        if not row:
+        if not row or row.get("kind") != "file":
             raise NotFoundError("File", file_id)
         _check_file_preconditions(
             row,
@@ -535,7 +567,7 @@ class FileService:
         # optimization and is not the concurrency boundary.
         async with pool.acquire() as conn:
             row = await vault_files_repo.find_by_id(conn, vault_id, fid)
-        if not row:
+        if not row or row.get("kind") != "file":
             await _discard_replacement_objects(staging_key)
             raise NotFoundError("File", file_id)
         try:
@@ -744,9 +776,12 @@ class FileService:
         fid = uuid.UUID(file_id)
         pool = await get_pool()
         async with pool.acquire() as conn:
-            row = await vault_files_repo.find_by_id(conn, vault_id, fid)
-            if not row:
-                raise NotFoundError("File", file_id)
+            async with conn.transaction():
+                row = await vault_files_repo.lease_file_upload_confirmation(
+                    conn, vault_id, fid,
+                )
+                if not row:
+                    raise NotFoundError("File", file_id)
 
         # Read object size. Treat NoSuchKey specially: that means the
         # client never finished its presigned upload; clean up the
@@ -800,14 +835,16 @@ class FileService:
 
         async with pool.acquire() as conn:
             async with conn.transaction():
-                await vault_files_repo.update_confirmed_metadata(
-                    conn, fid,
+                confirmed = await vault_files_repo.confirm_file_upload_metadata(
+                    conn, fid, vault_id,
                     size_bytes=size_bytes,
                     content_hash=server_content_hash,
                     hash_algorithm=HASH_ALGORITHM,
                     etag=etag,
                     storage_version=storage_version,
                 )
+                if not confirmed:
+                    raise NotFoundError("File", file_id)
                 vault_row = await conn.fetchrow(
                     "SELECT name FROM vaults WHERE id = $1", vault_id,
                 )
@@ -882,7 +919,11 @@ class FileService:
             row = await vault_files_repo.find_by_id(
                 conn, vault_id, uuid.UUID(file_id),
             )
-            if not row:
+            if (
+                not row
+                or row.get("kind") != "file"
+                or row.get("upload_state") != "confirmed"
+            ):
                 raise NotFoundError("File", file_id)
 
         # Override stored Content-Type with DB value so browsers inline

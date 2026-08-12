@@ -151,6 +151,81 @@ async def test_inv5_bm25_recompute_lock(pool, vault):
     assert len(skipped) == N - 1, f"expected {N-1} skipped, got {len(skipped)}"
 
 
+@pytest.mark.asyncio
+async def test_document_image_write_and_vault_lock_share_one_order(pool, vault):
+    """A manifest write finishes while a concurrent vault lifecycle lock waits.
+
+    The writer takes vault -> document -> asset, matching deletion. The retained
+    manifest has no second direct FK to vaults; its composite asset FK already
+    owns that lifecycle and avoids reacquiring the parent after child locks.
+    """
+    document_id = uuid.uuid4()
+    asset_id = uuid.uuid4()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO documents (id, vault_id, path, title, doc_type, status, "
+            "created_at, updated_at, current_commit, tags, metadata) VALUES "
+            "($1, $2, 'image-lock.md', 'image lock', 'note', 'draft', NOW(), NOW(), "
+            "'abcdef1', '{}'::text[], '{}'::jsonb)",
+            document_id, vault["id"],
+        )
+        await conn.execute(
+            "INSERT INTO vault_files (id, vault_id, kind, upload_state, name, s3_key, "
+            "mime_type, size_bytes, content_hash, hash_algorithm, hash_verified_at, "
+            "created_by, attachment_claimed_at) VALUES "
+            "($1, $2, 'attachment', 'confirmed', 'image.png', $3, 'image/png', 1, "
+            "$4, 'sha256', NOW(), 'tester', NOW())",
+            asset_id, vault["id"], f"{vault['name']}/.akb-assets/{asset_id}/image.png",
+            "0" * 64,
+        )
+
+        direct_parent_fks = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+              FROM pg_constraint
+             WHERE conrelid = 'document_asset_revision_refs'::regclass
+               AND confrelid = 'vaults'::regclass
+               AND contype = 'f'
+            """
+        )
+        assert direct_parent_fks == 0
+
+    async with pool.acquire() as writer, pool.acquire() as lifecycle:
+        writer_tx = writer.transaction()
+        await writer_tx.start()
+        await writer.fetchval(
+            "SELECT id FROM vaults WHERE id = $1 FOR KEY SHARE", vault["id"],
+        )
+        await writer.fetchval(
+            "SELECT id FROM documents WHERE id = $1 FOR UPDATE", document_id,
+        )
+        await writer.fetchval(
+            "SELECT id FROM vault_files WHERE id = $1 FOR UPDATE", asset_id,
+        )
+
+        async def lock_vault_then_children() -> None:
+            async with lifecycle.transaction():
+                await lifecycle.fetchval(
+                    "SELECT id FROM vaults WHERE id = $1 FOR UPDATE", vault["id"],
+                )
+                await lifecycle.fetchval(
+                    "SELECT id FROM vault_files WHERE id = $1 FOR UPDATE", asset_id,
+                )
+
+        lifecycle_task = asyncio.create_task(lock_vault_then_children())
+        await asyncio.sleep(0.05)
+        assert not lifecycle_task.done()
+
+        await writer.execute(
+            "INSERT INTO document_asset_revision_refs "
+            "(vault_id, document_path, commit_hash, asset_id, retain_until) "
+            "VALUES ($1, 'image-lock.md', 'abcdef1', $2, NOW() + INTERVAL '1 day')",
+            vault["id"], asset_id,
+        )
+        await writer_tx.commit()
+        await asyncio.wait_for(lifecycle_task, timeout=2)
+
+
 # ── INV-6: metadata_worker stale guard via expected_blob ───────────
 
 
@@ -324,14 +399,16 @@ async def test_inv7_delete_vault_no_orphan_chunks(pool, tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_inv7b_delete_vault_file_outbox_with_s3(pool, tmp_path, monkeypatch):
-    """When S3 is configured, delete_vault deletes vault_files early (to
-    issue S3 object deletes), so the file-chunk outbox enqueue must read
-    the file ids BEFORE that delete — otherwise file chunks CASCADE out
-    of PG with no vector_delete_outbox row and orphan in the vector store.
+    """When S3 is configured, delete_vault records both durable outboxes.
+
+    The file ids must reach the vector outbox before the metadata cascade, and
+    each immutable object key must reach the S3 outbox in the same transaction
+    so a transient store failure cannot orphan bytes after the vault row is
+    gone.
 
     The default-env inv7 test does not catch this because the audit stack
     has no S3 (the early `DELETE FROM vault_files` branch is skipped). Here
-    we force S3 on and stub the adapter so the early delete runs.
+    We force S3 on so the explicit metadata delete and object outbox path run.
     """
     from app.config import settings
     from app.services.role_sync import RoleSync, set_role_sync, get_role_sync
@@ -339,10 +416,6 @@ async def test_inv7b_delete_vault_file_outbox_with_s3(pool, tmp_path, monkeypatc
 
     monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
     monkeypatch.setattr(settings, "s3_endpoint_url", "http://stub-s3:9000")
-    # Stub the S3 adapter so the early per-file delete loop is a no-op.
-    from app.services.adapters import s3_adapter
-    monkeypatch.setattr(s3_adapter, "delete", lambda *_a, **_k: None)
-
     try:
         get_role_sync()
     except RuntimeError:
@@ -361,33 +434,82 @@ async def test_inv7b_delete_vault_file_outbox_with_s3(pool, tmp_path, monkeypatc
         name=name, description="inv7b", git_path=f"/tmp/{name}.git", owner_id=admin_id,
     )
 
-    file_id = uuid.uuid4()
+    pending_file_id = uuid.uuid4()
+    confirmed_file_id = uuid.uuid4()
+    pending_key = f"_inv7b_{pending_file_id}"
+    confirmed_key = f"_inv7b_{confirmed_file_id}"
     async with pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO vault_files (id, vault_id, name, s3_key, mime_type, size_bytes, created_at) VALUES "
-            "($1, $2, 'f.bin', $3, 'application/octet-stream', 0, NOW())",
-            file_id, vid, f"_inv7b_{file_id}",
+            "INSERT INTO vault_files "
+            "(id, vault_id, name, s3_key, mime_type, size_bytes, upload_state, created_at) VALUES "
+            "($1, $2, 'f.bin', $3, 'application/octet-stream', 0, 'pending', NOW())",
+            pending_file_id, vid, pending_key,
+        )
+        await conn.execute(
+            "INSERT INTO vault_files "
+            "(id, vault_id, name, s3_key, mime_type, size_bytes, upload_state, "
+            "hash_verified_at, created_at) VALUES "
+            "($1, $2, 'confirmed.bin', $3, 'application/octet-stream', 0, "
+            "'confirmed', NOW(), NOW())",
+            confirmed_file_id, vid, confirmed_key,
         )
         await conn.execute(
             "INSERT INTO chunks (id, source_type, source_id, vault_id, chunk_index, content) "
-            "VALUES (gen_random_uuid(), 'file', $1, $2, 0, 'f')",
-            file_id, vid,
+            "VALUES (gen_random_uuid(), 'file', $1, $3, 0, 'pending'), "
+            "       (gen_random_uuid(), 'file', $2, $3, 0, 'confirmed')",
+            pending_file_id, confirmed_file_id, vid,
         )
 
     await access_service.delete_vault(user_id=str(admin_id), vault_name=name)
 
     async with pool.acquire() as conn:
         post = await conn.fetchval(
-            "SELECT COUNT(*) FROM chunks WHERE source_id = $1", file_id,
+            "SELECT COUNT(*) FROM chunks WHERE source_id = ANY($1::uuid[])",
+            [pending_file_id, confirmed_file_id],
         )
         outbox = await conn.fetchval(
-            "SELECT COUNT(*) FROM vector_delete_outbox WHERE source_id = $1", file_id,
+            "SELECT COUNT(*) FROM vector_delete_outbox WHERE source_id = ANY($1::uuid[])",
+            [pending_file_id, confirmed_file_id],
+        )
+        pending_s3_outbox = await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE next_attempt_at <= NOW()) AS immediate,
+                   COUNT(*) FILTER (
+                       WHERE next_attempt_at > NOW() + INTERVAL '23 hours'
+                   ) AS reconciliation
+              FROM s3_delete_outbox
+             WHERE s3_key = $1
+            """,
+            pending_key,
+        )
+        confirmed_s3_outbox = await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE next_attempt_at <= NOW()) AS immediate,
+                   COUNT(*) FILTER (WHERE next_attempt_at > NOW()) AS delayed
+              FROM s3_delete_outbox
+             WHERE s3_key = $1
+            """,
+            confirmed_key,
         )
 
     assert post == 0, f"file chunk should be gone from PG, got {post}"
-    assert outbox == 1, (
-        "file chunk must be enqueued in vector_delete_outbox even when S3 is "
+    assert outbox == 2, (
+        "both file chunks must be enqueued in vector_delete_outbox when S3 is "
         f"configured (vault_files deleted early); got {outbox}"
+    )
+    assert dict(pending_s3_outbox) == {
+        "total": 2, "immediate": 1, "reconciliation": 1,
+    }, (
+        "a pending upload must enqueue one immediate delete and one delayed "
+        f"reconciliation after vault deletion; got {dict(pending_s3_outbox)}"
+    )
+    assert dict(confirmed_s3_outbox) == {
+        "total": 1, "immediate": 1, "delayed": 0,
+    }, (
+        "a confirmed file must enqueue exactly one immediate object delete; "
+        f"got {dict(confirmed_s3_outbox)}"
     )
 
 
@@ -1015,6 +1137,73 @@ async def _await_blocked(watch, *, count: int, contains: str | None = None,
                 + f", saw {len(qs)}. All waiters: {all_waiting}"
             )
         await asyncio.sleep(0.02)
+
+
+@pytest.mark.asyncio
+async def test_publication_waits_for_vault_before_locking_document(
+    pool, vault, monkeypatch,
+):
+    """Publication creation follows the vault -> document lifecycle order."""
+    from app.services import publication_service
+    from app.services.publication_service import create_publication
+
+    monkeypatch.setattr(
+        publication_service.settings, "public_base_url",
+        "https://race.test.local", raising=False,
+    )
+    vid, vname = vault["id"], vault["name"]
+    did = uuid.uuid4()
+    path = "reports/parent-lock.md"
+    uri = f"akb://{vname}/coll/reports/doc/parent-lock.md"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO documents (id, vault_id, path, title, doc_type, status, "
+            "created_at, updated_at, current_commit, tags, metadata) VALUES "
+            "($1, $2, $3, 'Parent lock', 'report', 'draft', NOW(), NOW(), "
+            "'cafef00d', '{}'::text[], '{}'::jsonb)",
+            did, vid, path,
+        )
+
+    doc_repo = DocumentRepository(pool)
+    watch = await asyncpg.connect(_DSN)
+    try:
+        async with pool.acquire() as lifecycle:
+            tx = lifecycle.transaction()
+            await tx.start()
+            await lifecycle.fetchval(
+                "SELECT id FROM vaults WHERE id = $1 FOR UPDATE", vid,
+            )
+
+            publisher = asyncio.create_task(create_publication(
+                vault_id=vid,
+                resource_type="document",
+                resource_uri=uri,
+                document_id=did,
+                title="Parent lock",
+            ))
+            await _await_blocked(
+                watch,
+                count=1,
+                contains="FROM vaults",
+                what="publication to wait on the parent vault",
+            )
+
+            # If the publisher had locked the document first, this call and
+            # the publisher's later vault FK lock would form the inverse-order
+            # cycle. It must complete while the publisher remains parked on
+            # the parent.
+            assert await doc_repo.delete_with_publications(
+                lifecycle, doc_id=did, vault_id=vid,
+            ) is True
+            await tx.commit()
+
+        with pytest.raises(ValueError) as exc:
+            await asyncio.wait_for(publisher, timeout=2)
+        assert str(exc.value) == (
+            "Document not found (resource was deleted concurrently): " + uri
+        )
+    finally:
+        await watch.close()
 
 
 @pytest.mark.asyncio

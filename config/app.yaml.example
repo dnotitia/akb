@@ -137,9 +137,23 @@ s3_public_url: ""          # external endpoint for presigned URLs (client → S3
 s3_bucket: akb-files
 s3_region: ""
 
+# Hidden document images follow live Markdown references. Removed/deleted
+# images remain available only to matching Git revisions for this window;
+# uploads that never reach a document commit expire separately.
+document_asset_revision_retention_days: 30
+document_asset_unclaimed_ttl_hours: 24
+file_pending_upload_ttl_hours: 24
+document_asset_gc_interval_secs: 300
+document_asset_upload_body_timeout_secs: 60
+
 # === Auth (jwt_secret is in secret.yaml) ===
 jwt_algorithm: HS256
 jwt_expire_hours: 24
+publication_view_grant_ttl_secs: 600
+# Rolling upgrades must keep this true until every backend instance can read
+# both the two-field and bounded three-field grant formats.
+publication_view_grant_emit_legacy: true
+publication_view_grant_session_secs: 3600
 
 # === App identity exchange ===
 # Short-lived app tokens never carry Vaults, installations, or capabilities;
