@@ -12,6 +12,32 @@ This is the Phase 0 architecture decision for
 The record fixes the authority and security boundaries that later phases must
 preserve without fixing their route layout, claim schema, or code structure.
 
+## Relationship to Workspace Account Governance
+
+This ADR partially supersedes
+[Workspace Account Governance](../2026-07-10-workspace-account-governance/README.md).
+The supersession is prospective and limited to these human-authentication
+contracts:
+
+- human-auth mode defaults now come from the single canonical
+  `auth_mode=local|sso` choice;
+- browser session authority and issuance are mode-specific, including the rule
+  that `sso` does not mint an AKB user session token;
+- local and OIDC human login are not a permanent hybrid runtime mode; and
+- HS256 compatibility for legacy AKB human sessions is migration-only, not a
+  permanent compatibility promise.
+
+The older ADR remains authoritative for durable `users.id` account projection,
+exact external identity binding, account status, PAT and service identities,
+Vault ownership and grants, PostgreSQL roles, and the shared AKB authorization
+boundary. Its account-governance schema, lifecycle, suspension, and
+administrative controls are likewise unchanged by this ADR except where they
+refer specifically to the superseded human-session behavior above.
+
+The older text remains the historical record of its applied rollout. Where the
+two records conflict within the four categories above, this ADR governs the
+target architecture; outside them, the older ADR continues to govern.
+
 ## Context
 
 Authentication settings that evolve independently can accidentally describe a
@@ -176,8 +202,9 @@ The following remain open until their owning implementation phase:
 - whether legacy hybrid installations require a bounded compatibility release
   or must select a canonical mode before upgrade;
 - the exact configuration migration and invalid-combination diagnostics;
-- OIDC admission, just-in-time provisioning, and explicit account-linking
-  policies within the common projection boundary;
+- whether a later versioned decision should change the existing OIDC admission,
+  just-in-time provisioning, or explicit account-linking policies; until then,
+  Workspace Account Governance remains authoritative;
 - browser-side session transport and server-side token custody, refresh,
   logout, and revocation mechanics;
 - product-admin bootstrap credentials, recovery ceremony, and exact control
