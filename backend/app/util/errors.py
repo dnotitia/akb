@@ -75,6 +75,7 @@ INVALID_PATH = "invalid_path"              # collection / file path failure
 UNKNOWN_ARGUMENT = "unknown_argument"      # arg key not in tool schema (0.5.4)
 UNKNOWN_TOOL = "unknown_tool"
 CONFLICT = "conflict"                      # version / expected-state mismatch
+NATIVE_REVISION_SELECTOR_AMBIGUOUS = "native_revision_selector_ambiguous"
 WRITE_BUSY = "write_busy"                  # write-lane admission timed out — retry after backoff
 UNIQUE_VIOLATION = "unique_violation"      # PG 23505 — INSERT/UPDATE breaks a unique key
 EDIT_FAILED = "edit_failed"                # akb_edit: old_string match / uniqueness failure
@@ -109,6 +110,14 @@ SELF_LINK = "self_link"
 # that explicitly want to surface a 5xx-class failure (e.g. upstream
 # storage write failure in akb_publication_snapshot).
 INTERNAL = "internal"
+
+# Manual-vault Git history resolution. These are deliberately catalogue
+# entries rather than values copied from an exception at dispatch time: the
+# MCP wire contract must remain statically auditable by the catalogue test.
+GIT_HISTORY_FAILED = "git_history_failed"
+GIT_HISTORY_TIMEOUT = "git_history_timeout"
+GIT_HISTORY_OUTPUT_CAPPED = "git_history_output_capped"
+GIT_HISTORY_ENTRY_CAPPED = "git_history_entry_capped"
 
 
 # ── Builder ───────────────────────────────────────────────────
@@ -158,6 +167,8 @@ def exception_envelope(e: Exception) -> dict:
     if isinstance(e, NotFoundError):
         return err(str(e), code=NOT_FOUND)
     if isinstance(e, ConflictError):
+        if e.code == NATIVE_REVISION_SELECTOR_AMBIGUOUS:
+            return err(str(e), code=NATIVE_REVISION_SELECTOR_AMBIGUOUS)
         return err(str(e), code=CONFLICT)
     if isinstance(e, InvalidColumnTypeError):
         return err(
@@ -172,6 +183,14 @@ def exception_envelope(e: Exception) -> dict:
             hint="The vault is under heavy write load. Wait a few seconds and retry; no partial write occurred.",
             retry_after_secs=e.retry_after_secs,
         )
+    if getattr(e, "code", None) == GIT_HISTORY_FAILED:
+        return err(str(e), code=GIT_HISTORY_FAILED)
+    if getattr(e, "code", None) == GIT_HISTORY_TIMEOUT:
+        return err(str(e), code=GIT_HISTORY_TIMEOUT)
+    if getattr(e, "code", None) == GIT_HISTORY_OUTPUT_CAPPED:
+        return err(str(e), code=GIT_HISTORY_OUTPUT_CAPPED)
+    if getattr(e, "code", None) == GIT_HISTORY_ENTRY_CAPPED:
+        return err(str(e), code=GIT_HISTORY_ENTRY_CAPPED)
     if isinstance(e, ValidationError):
         return err(str(e), code=INVALID_ARGUMENT)
     return err(str(e), code=INTERNAL)

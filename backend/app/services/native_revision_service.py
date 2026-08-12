@@ -241,6 +241,11 @@ class NativeRevisionService:
             raise ValidationError("Expected native Revision ID must be exactly 40 lowercase hex")
 
     @staticmethod
+    def _validate_revision_selector(revision_id: str) -> None:
+        if not 7 <= len(revision_id) <= 40 or any(ch not in "0123456789abcdef" for ch in revision_id):
+            raise ValidationError("Native Revision selector must be 7..40 lowercase hex")
+
+    @staticmethod
     def _from_row(row: dict, *, replay: bool) -> NativeMutationResult:
         return NativeMutationResult(
             resource_id=row["resource_id"],
@@ -1165,7 +1170,7 @@ class NativeRevisionService:
         reference: str,
         revision_id: str,
     ) -> NativeRevisionSnapshot:
-        self._validate_expected_revision(revision_id)
+        self._validate_revision_selector(revision_id)
         resource = await self.repository.resolve_live_reference(
             namespace_id=namespace_id,
             surface=surface,

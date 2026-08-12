@@ -28,13 +28,16 @@ from __future__ import annotations
 import logging
 import os
 import re
+import selectors
 import shutil
 import stat
+import subprocess
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from git import Blob, Repo
 from git.exc import BadName, BadObject, GitError
@@ -43,6 +46,12 @@ from app.config import settings
 from app.exceptions import AKBError, MirrorMarkerError
 from app.services.external_git_runner import ExternalGitRunner
 from app.services.external_git_validation import validate_branch
+from app.util.errors import (
+    GIT_HISTORY_ENTRY_CAPPED,
+    GIT_HISTORY_FAILED,
+    GIT_HISTORY_OUTPUT_CAPPED,
+    GIT_HISTORY_TIMEOUT,
+)
 
 logger = logging.getLogger("akb.git")
 
@@ -78,6 +87,18 @@ _OUTPUT_MARGIN_BYTES = 64 * 1024
 # The per-image size checks refuse genuinely oversized content up front; this
 # streaming cap stays the backstop for a pathological many-hunk patch.
 _DIFF_OUTPUT_FACTOR = 4
+
+# ``path_at_revision`` only needs the prefix of a path-following walk through
+# the requested target.  Keep the prefix itself bounded as a backstop for a
+# target that is not in the path's history, and stream the command so a large
+# suffix is never materialized.  The timeout reuses the existing configured Git
+# command bound (the same setting used by the write lane); the entry/output
+# limits are code-owned safety floors because this internal lookup has no user
+# supplied page size.
+_PATH_AT_REVISION_MAX_ENTRIES = 10_000
+_PATH_AT_REVISION_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+_PATH_AT_REVISION_READ_CHUNK_BYTES = 64 * 1024
+_PATH_AT_REVISION_DEFAULT_TIMEOUT_SECS = 30.0
 
 
 def _marker_state(marker: Path) -> str:
@@ -174,6 +195,45 @@ class ExternalGitOversizedError(AKBError):
 
 class FixedRefHistoryError(RuntimeError):
     """A manual-vault fixed-ref history read could not be completed."""
+
+
+class GitHistoryBoundError(AKBError, RuntimeError):
+    """A bounded manual-vault history lookup could not finish safely.
+
+    Unlike an unknown commit/path (which keeps the historical ``None`` result),
+    hitting a resource bound is explicit so callers cannot mistake a truncated
+    walk for a missing historical file.  The class is also a ``RuntimeError``
+    for legacy service callers that already classify Git history failures that
+    way, while ``AKBError`` gives public reads the normal error envelope.
+    """
+
+    def __init__(self, bound: str, limit: int | float):
+        if bound == "timeout":
+            message = f"git path history timed out after {limit:g}s"
+            status_code = 503
+            code = GIT_HISTORY_TIMEOUT
+        elif bound == "output":
+            message = f"git path history exceeded the {limit}-byte output cap"
+            status_code = 413
+            code = GIT_HISTORY_OUTPUT_CAPPED
+        else:
+            message = f"git path history exceeded the {limit}-entry cap"
+            status_code = 503
+            code = GIT_HISTORY_ENTRY_CAPPED
+        super().__init__(message, status_code=status_code, code=code)
+        self.bound = bound
+        self.limit = limit
+
+
+class GitHistoryCommandError(AKBError, RuntimeError):
+    """A streamed manual-vault history command exited unsuccessfully."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "git path history command failed",
+            status_code=503,
+            code=GIT_HISTORY_FAILED,
+        )
 
 
 class GitService:
@@ -1013,7 +1073,265 @@ class GitService:
             blob = ref.tree / file_path
             return blob.data_stream.read().decode("utf-8")
         except (KeyError, TypeError):
+            if commit is None:
+                return None
+            historical_path = self.path_at_revision(vault_name, file_path, commit)
+            if historical_path and historical_path != file_path:
+                try:
+                    blob = ref.tree / historical_path
+                    return blob.data_stream.read().decode("utf-8")
+                except (KeyError, TypeError):
+                    pass
             return None
+
+    @staticmethod
+    def _parse_follow_path_log(output: str) -> list[dict]:
+        """Parse ``git log --follow --name-status`` into revision/path pairs."""
+        history: list[dict] = []
+        active: dict | None = None
+
+        def flush() -> None:
+            if active is not None and active.get("path_at_revision"):
+                history.append(active.copy())
+
+        for line in str(output).splitlines():
+            if "\x00" in line:
+                flush()
+                oid, epoch, *_ = line.split("\x00")
+                if not re.fullmatch(r"[0-9a-f]{40}", oid):
+                    active = None
+                    continue
+                try:
+                    committed_at = datetime.fromtimestamp(int(epoch), tz=timezone.utc)
+                except (TypeError, ValueError, OverflowError):
+                    active = None
+                    continue
+                active = {
+                    "legacy_git_oid": oid,
+                    "committed_at": committed_at,
+                }
+                continue
+            if active is None or not line:
+                continue
+            fields = line.split("\t")
+            if len(fields) >= 2:
+                active["path_at_revision"] = fields[-1]
+        flush()
+        return history
+
+    def _follow_path_history(
+        self,
+        repo: Repo,
+        fixed_ref: str,
+        file_path: str,
+        *,
+        max_count: int | None = None,
+        since_epoch: int | None = None,
+    ) -> list[dict]:
+        """Return newest-first rename-following revisions for ``file_path``."""
+        log_args = ["log", "--follow", "-M", "--name-status"]
+        if max_count is not None:
+            log_args.append(f"--max-count={max_count}")
+        if since_epoch is not None:
+            log_args.append(f"--since=@{since_epoch}")
+        log_args.extend(["--format=%H%x00%ct", fixed_ref, "--", file_path])
+        return self._parse_follow_path_log(repo.git.log(*log_args[1:]))
+
+    @staticmethod
+    def _close_path_history_process(process, *, terminate: bool) -> None:
+        """Close a streamed GitPython process, killing it when still active."""
+        raw_process: Any = getattr(process, "proc", None) or process
+        if terminate:
+            try:
+                if raw_process.poll() is None:
+                    raw_process.kill()
+            except (AttributeError, OSError):
+                pass
+            try:
+                raw_process.wait(timeout=5)
+            except (AttributeError, OSError, subprocess.TimeoutExpired):
+                pass
+        for stream_name in ("stdin", "stdout", "stderr"):
+            stream = getattr(raw_process, stream_name, None)
+            try:
+                if stream is not None:
+                    stream.close()
+            except (OSError, ValueError):
+                pass
+
+    def _stream_path_at_revision(
+        self,
+        repo: Repo,
+        fixed_ref: str,
+        file_path: str,
+        target: str,
+    ) -> str | None:
+        """Stream a rename-following log until ``target`` or a safe bound.
+
+        ``GitPython`` normally buffers ``git log`` before returning.  The
+        revision selector only needs the target commit's one status record, so
+        this reader owns a process and consumes stdout incrementally.  It asks
+        Git for one entry past the allowed prefix: that distinguishes an
+        ordinary short history from a walk truncated by the entry cap without
+        ever allowing an unbounded command or result.
+        """
+        max_entries = max(1, int(_PATH_AT_REVISION_MAX_ENTRIES))
+        max_output_bytes = max(1, int(_PATH_AT_REVISION_MAX_OUTPUT_BYTES))
+        try:
+            timeout_secs = float(
+                getattr(settings, "git_write_timeout_secs", _PATH_AT_REVISION_DEFAULT_TIMEOUT_SECS)
+            )
+        except (TypeError, ValueError):
+            timeout_secs = _PATH_AT_REVISION_DEFAULT_TIMEOUT_SECS
+        timeout_secs = max(0.001, timeout_secs)
+
+        log_args = [
+            "--follow",
+            "-M",
+            "--name-status",
+            f"--max-count={max_entries + 1}",
+            "--format=%H%x00%ct",
+            fixed_ref,
+            "--",
+            file_path,
+        ]
+        try:
+            process = repo.git.execute(
+                [
+                    repo.git.GIT_PYTHON_GIT_EXECUTABLE,
+                    "-c",
+                    "core.quotePath=false",
+                    "log",
+                    *log_args,
+                ],
+                as_process=True,
+            )
+        except (GitError, OSError) as exc:
+            raise GitHistoryCommandError() from exc
+        raw_process: Any = getattr(process, "proc", None) or process
+        stdout = getattr(raw_process, "stdout", None)
+        stderr = getattr(raw_process, "stderr", None)
+        stdout_fd = stdout.fileno() if stdout is not None else -1
+        selector = selectors.DefaultSelector()
+        pending = bytearray()
+        output_bytes = 0
+        entry_count = 0
+        active_oid: str | None = None
+        finished = False
+        deadline = time.monotonic() + timeout_secs
+
+        def consume_line(line: bytes) -> str | None:
+            nonlocal active_oid, entry_count
+            text = line.decode("utf-8", "replace").rstrip("\r")
+            if "\x00" in text:
+                entry_count += 1
+                if entry_count > max_entries:
+                    raise GitHistoryBoundError("entry", max_entries)
+                oid = text.split("\x00", 1)[0]
+                active_oid = oid if re.fullmatch(r"[0-9a-f]{40}", oid) else None
+                return None
+            if active_oid is None or not text:
+                return None
+            fields = text.split("\t")
+            if len(fields) >= 2 and active_oid == target:
+                return fields[-1]
+            return None
+
+        try:
+            for stream in (stdout, stderr):
+                if stream is not None:
+                    selector.register(stream, selectors.EVENT_READ)
+
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise GitHistoryBoundError("timeout", timeout_secs)
+                events = selector.select(remaining)
+                if not events:
+                    continue
+                for key, _mask in events:
+                    try:
+                        if key.fd == stdout_fd:
+                            available = max_output_bytes - output_bytes - len(pending)
+                            if available < 0:
+                                raise GitHistoryBoundError("output", max_output_bytes)
+                            read_size = min(
+                                _PATH_AT_REVISION_READ_CHUNK_BYTES,
+                                max(1, available + 1),
+                            )
+                        else:
+                            read_size = _PATH_AT_REVISION_READ_CHUNK_BYTES
+                        chunk = os.read(key.fd, read_size)
+                    except (OSError, ValueError):
+                        selector.unregister(key.fileobj)
+                        continue
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    if key.fd != stdout_fd:
+                        continue
+
+                    pending.extend(chunk)
+                    while True:
+                        newline = pending.find(b"\n")
+                        if newline < 0:
+                            break
+                        line = bytes(pending[:newline])
+                        del pending[: newline + 1]
+                        output_bytes += newline + 1
+                        if output_bytes > max_output_bytes:
+                            raise GitHistoryBoundError("output", max_output_bytes)
+                        path = consume_line(line)
+                        if path is not None:
+                            return path
+                    if output_bytes + len(pending) > max_output_bytes:
+                        raise GitHistoryBoundError("output", max_output_bytes)
+
+            if pending:
+                output_bytes += len(pending)
+                if output_bytes > max_output_bytes:
+                    raise GitHistoryBoundError("output", max_output_bytes)
+                path = consume_line(bytes(pending))
+                if path is not None:
+                    return path
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise GitHistoryBoundError("timeout", timeout_secs)
+            try:
+                status = raw_process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                raise GitHistoryBoundError("timeout", timeout_secs) from None
+            finished = True
+            if status != 0:
+                raise GitHistoryCommandError()
+            return None
+        finally:
+            selector.close()
+            self._close_path_history_process(process, terminate=not finished)
+
+    def path_at_revision(
+        self, vault_name: str, file_path: str, commit: str
+    ) -> str | None:
+        """Return the path carried by ``commit`` while following renames.
+
+        ``file_path`` is the document's current path.  The walk starts at the
+        current local tip, not at ``commit`` itself, so a pre-move selector can
+        be mapped back to the old path.  Manual vaults use GitPython; mirror
+        vaults remain on :class:`ExternalGitRunner`'s hermetic local boundary.
+        """
+        # External mirrors retain their existing fixed-path semantics. Their
+        # separate source-corpus history contract is deliberately out of this
+        # manual-vault logical revision change.
+        if self._use_mirror_reader(vault_name):
+            return None
+        try:
+            repo = self._get_repo(vault_name)
+            target = repo.commit(commit).hexsha
+            fixed_ref = repo.head.commit.hexsha
+        except (BadName, BadObject, FileNotFoundError, ValueError):
+            return None
+        return self._stream_path_at_revision(repo, fixed_ref, file_path, target)
 
     def manual_fixed_ref_history(
         self,
@@ -1244,16 +1562,16 @@ class GitService:
         if not bare.exists():
             return []
         out: list[dict] = []
-        for e in self._ext_runner.log_for_path(bare, file_path, max_count):
-            if since_epoch is not None and e["committed_epoch"] < since_epoch:
+        for entry in self._ext_runner.log_for_path(bare, file_path, max_count):
+            if since_epoch is not None and entry["committed_epoch"] < since_epoch:
                 continue
             out.append(
                 {
-                    "hash": e["hash"][:12],
-                    "message": e["message"].strip(),
-                    "author": e["author"],
+                    "hash": entry["hash"][:12],
+                    "message": entry["message"].strip(),
+                    "author": entry["author"],
                     "date": datetime.fromtimestamp(
-                        e["committed_epoch"], tz=timezone.utc
+                        entry["committed_epoch"], tz=timezone.utc
                     ).isoformat(),
                 }
             )
@@ -1733,22 +2051,34 @@ class GitService:
             return self._file_log_mirror(vault_name, file_path, max_count, since_epoch)
         repo = self._get_repo(vault_name)
         try:
-            commits = list(repo.iter_commits(paths=file_path, max_count=max_count))
+            entries = self._follow_path_history(
+                repo,
+                repo.head.commit.hexsha,
+                file_path,
+                max_count=max_count,
+                since_epoch=since_epoch,
+            )
         except (ValueError, GitError):
             return []
 
-        if since_epoch is not None:
-            commits = [c for c in commits if c.committed_date >= since_epoch]
-
-        return [
-            {
-                "hash": c.hexsha[:12],
-                "message": c.message.strip(),
-                "author": str(c.author),
-                "date": datetime.fromtimestamp(c.committed_date, tz=timezone.utc).isoformat(),
-            }
-            for c in commits
-        ]
+        results: list[dict] = []
+        for entry in entries:
+            committed_at = entry["committed_at"]
+            if since_epoch is not None and int(committed_at.timestamp()) < since_epoch:
+                continue
+            try:
+                commit = repo.commit(entry["legacy_git_oid"])
+            except (BadName, BadObject, ValueError):
+                continue
+            results.append(
+                {
+                    "hash": commit.hexsha[:12],
+                    "message": commit.message.strip(),
+                    "author": str(commit.author),
+                    "date": committed_at.isoformat(),
+                }
+            )
+        return results
 
     @staticmethod
     def _legacy_commit_metadata(commit) -> dict[str, str]:
@@ -1857,6 +2187,8 @@ class GitService:
         if self._use_mirror_reader(vault_name):
             return self._file_diff_mirror(vault_name, file_path, commit_hash)
         from git.exc import BadName, BadObject
+        historical_path = self.path_at_revision(vault_name, file_path, commit_hash)
+        lookup_path = historical_path or file_path
         repo = self._get_repo(vault_name)
         try:
             commit = repo.commit(commit_hash)
@@ -1872,7 +2204,7 @@ class GitService:
         if not commit.parents:
             # Initial commit — show full content as addition
             try:
-                blob = commit.tree / file_path
+                blob = commit.tree / lookup_path
                 content = blob.data_stream.read().decode("utf-8")
                 return {
                     "file": file_path,
@@ -1884,7 +2216,7 @@ class GitService:
                 return {"file": file_path, "commit": commit_hash, "type": "unknown", "diff": ""}
 
         parent = commit.parents[0]
-        diffs = parent.diff(commit, paths=[file_path], create_patch=True)
+        diffs = parent.diff(commit, paths=[lookup_path], create_patch=True)
 
         for d in diffs:
             patch = d.diff
