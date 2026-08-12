@@ -14,8 +14,8 @@ snapshot membership, manifest v1 checksum validation, whole-snapshot preflight,
 canary-first then sequential ten-target batches, bounded backfill checkpoints,
 lease fencing, replay/resume, redacted status, and monotonic installation/
 observed-state convergence. Added admin and self-app request/status routes,
-worker lifecycle registration, migration 060, and the source-neutral
-`app-release-rollout` repository E2E fixture scenario.
+worker lifecycle registration, migration 061, and the repository-owned
+`app-release-rollout` E2E fixture scenario.
 
 ### Fixed scoped grep replacement completeness and recovery
 

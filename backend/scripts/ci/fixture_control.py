@@ -27,7 +27,7 @@ class FixtureRuntime(Protocol):
     async def reset_scenario(self) -> None: ...
 
     def fixture_control(
-        self, action: str, target: str | None, enabled: bool
+        self, action: str, target: str | None, enabled: bool, kind: str | None
     ) -> object | Awaitable[dict[str, object]]: ...
 
 
@@ -38,12 +38,13 @@ class ResetRequest(BaseModel):
 
 
 class ControlRequest(BaseModel):
-    """Outcome-oriented hooks needed only where ordinary HTTP cannot induce a condition."""
+    """Bounded fixture controls for conditions ordinary product APIs cannot induce."""
 
     model_config = ConfigDict(extra="forbid")
 
-    action: Literal["failure_injection", "worker_observation", "restart"]
+    action: Literal["fault_injection", "restart"]
     target: str | None = None
+    kind: str | None = None
     enabled: bool = True
 
 
@@ -85,7 +86,7 @@ def create_app(runtime: FixtureRuntime) -> FastAPI:
         handler = getattr(runtime, "fixture_control", None)
         if handler is None:
             raise HTTPException(status_code=404, detail="fixture control is unavailable")
-        result = handler(request.action, request.target, request.enabled)
+        result = handler(request.action, request.target, request.enabled, request.kind)
         if inspect.isawaitable(result):
             result = await result
         if not isinstance(result, dict):

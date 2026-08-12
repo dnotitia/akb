@@ -247,7 +247,7 @@ class E2ERuntime:
         }
 
     def fixture_discovery(self) -> dict[str, object]:
-        """Return fixture coordinates and source-neutral validator entry points."""
+        """Return sanitized product coordinates and bounded fixture controls."""
 
         def scrub(value: object) -> object:
             if isinstance(value, dict):
@@ -272,48 +272,47 @@ class E2ERuntime:
                 "method": "POST",
                 "path": "/api/v1/auth/login",
                 "fields": ["username", "password"],
-                "credential_source": "external_env_only",
-                "credential_env": {
-                    "username": self.config.credentials.username_env,
-                    "password": self.config.credentials.password_env,
-                },
             }
         }
-        catalog["tasks"] = {
+        catalog["observability"] = {
             "log_observation": {
                 "service": "fixture",
                 "method": "GET",
                 "path": "/log-observation",
-                "result": "sanitized",
             }
         }
         if self.config.scenario == "app-release-rollout":
-            controls = catalog.setdefault("controls", {})
-            if isinstance(controls, dict):
-                installations = catalog.get("installations", [])
-                ordinals = {
-                    item.get("ordinal")
-                    for item in installations
-                    if isinstance(item, dict) and isinstance(item.get("ordinal"), int)
-                } if isinstance(installations, list) else set()
-                failure_targets = []
-                if 0 in ordinals:
-                    failure_targets.append({"value": "canary", "ordinal": 0, "expected_outcome": "blocked"})
-                if 11 in ordinals:
-                    failure_targets.append({"value": "ordinal:11", "ordinal": 11, "expected_outcome": "blocked"})
-                controls["failure_injection"] = {
+            installations = catalog.get("installations", [])
+            targets: list[dict[str, str]] = []
+            if isinstance(installations, list):
+                for item in installations:
+                    if not isinstance(item, dict):
+                        continue
+                    fixture_id = item.get("fixture_id") or item.get("label") or item.get("id")
+                    installation_id = item.get("id")
+                    if isinstance(fixture_id, str) and isinstance(installation_id, str):
+                        targets.append({"fixture_id": fixture_id, "installation_id": installation_id})
+            catalog["controls"] = {
+                "fault_injection": {
                     "service": "fixture",
                     "method": "POST",
                     "path": "/control",
                     "body": {
-                        "action": "failure_injection",
-                        "target": failure_targets[0]["value"] if failure_targets else None,
+                        "action": "fault_injection",
+                        "kind": "missing_owned_table",
+                        "target": targets[0]["fixture_id"] if targets else None,
                         "enabled": True,
                     },
-                    "accepted_target_values": [item["value"] for item in failure_targets],
-                    "target_examples": failure_targets,
-                    "result": "outcome_only",
-                }
+                    "kinds": ["missing_owned_table"],
+                    "targets": targets,
+                },
+                "restart": {
+                    "service": "fixture",
+                    "method": "POST",
+                    "path": "/control",
+                    "body": {"action": "restart", "enabled": True},
+                },
+            }
         return catalog
 
     def fixture_log_observation(self) -> dict[str, object]:
@@ -338,44 +337,45 @@ class E2ERuntime:
             "log_line_count": log_text.count("\n"),
         }
 
-    def _resolve_failure_target_ordinal(self, target: str) -> int:
-        if not isinstance(target, str):
-            raise ValueError("unsupported failure target")
-        value = target.strip().lower()
-        if value in {"canary", "first", "0", "ordinal:0"}:
-            ordinal = 0
-        elif value in {"11", "ordinal:11"}:
-            ordinal = 11
-        else:
-            raise ValueError("unsupported failure target")
+    def _resolve_fault_target(self, target: str) -> dict[str, object]:
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("unsupported fault target")
+        value = target.strip()
         installations = self._fixture_catalog.get("installations", [])
-        if not isinstance(installations, list) or not any(
-            isinstance(item, dict) and item.get("ordinal") == ordinal for item in installations
-        ):
-            raise ValueError("unsupported failure target")
-        return ordinal
+        if isinstance(installations, list):
+            for item in installations:
+                if not isinstance(item, dict):
+                    continue
+                fixture_id = item.get("fixture_id") or item.get("label") or item.get("id")
+                if value == fixture_id or value == item.get("id"):
+                    return item
+        raise ValueError("unsupported fault target")
 
     async def fixture_control(
         self,
         action: str,
         target: str | None,
         enabled: bool,
+        kind: str | None = None,
     ) -> dict[str, object]:
-        """Apply a bounded, source-neutral test hook and return only outcome state."""
-        if self.config.scenario != "app-release-rollout":
-            return {"status": "ignored", "scenario": self.config.scenario, "action": action}
+        """Apply a bounded fixture control and return only sanitized state."""
         if action == "restart":
             self._fixture_controls["restart_requested"] = bool(enabled)
             if enabled:
-                asyncio.create_task(self._restart_backend_for_control(), name="rollout-backend-restart")
-        elif action == "worker_observation":
-            self._fixture_controls["worker_observation"] = bool(enabled)
-        elif action == "failure_injection":
+                asyncio.create_task(self._restart_backend(), name="backend-restart")
+        elif action == "fault_injection":
+            if self.config.scenario != "app-release-rollout":
+                return {
+                    "status": "rejected",
+                    "scenario": self.config.scenario,
+                    "action": action,
+                    "reason": "unsupported_scenario",
+                }
             if target is not None and len(target) > 128:
                 raise ValueError("control target is too long")
             if enabled:
                 try:
-                    ordinal = self._resolve_failure_target_ordinal(target or "")
+                    fixture = self._resolve_fault_target(target or "")
                 except ValueError:
                     return {
                         "status": "rejected",
@@ -384,18 +384,29 @@ class E2ERuntime:
                         "enabled": False,
                         "reason": "unsupported_target",
                     }
-                canonical_target = "canary" if ordinal == 0 else f"ordinal:{ordinal}"
-                if not await self._apply_failure_injection(canonical_target):
+                selected_kind = kind or "missing_owned_table"
+                if selected_kind != "missing_owned_table":
                     return {
                         "status": "rejected",
                         "scenario": self.config.scenario,
                         "action": action,
                         "enabled": False,
-                        "reason": "failure_control_unavailable",
+                        "reason": "unsupported_kind",
                     }
-                self._fixture_controls["failure_target"] = canonical_target
+                if not await self._apply_fault(fixture, selected_kind):
+                    return {
+                        "status": "rejected",
+                        "scenario": self.config.scenario,
+                        "action": action,
+                        "enabled": False,
+                        "reason": "fault_unavailable",
+                    }
+                self._fixture_controls["fault"] = {
+                    "target": fixture.get("fixture_id") or fixture.get("label") or fixture.get("id"),
+                    "kind": selected_kind,
+                }
             else:
-                self._fixture_controls["failure_target"] = None
+                self._fixture_controls["fault"] = None
         else:
             return {"status": "ignored", "scenario": self.config.scenario, "action": action}
         return {
@@ -404,39 +415,25 @@ class E2ERuntime:
             "action": action,
             "enabled": bool(enabled),
             "observed": {
-                "failure_injection": self._fixture_controls.get("failure_target") is not None,
-                "worker_observation": bool(self._fixture_controls.get("worker_observation", False)),
+                "fault_injection": self._fixture_controls.get("fault"),
                 "restart_requested": bool(self._fixture_controls.get("restart_requested", False)),
             },
         }
 
-    async def _apply_failure_injection(self, target: str) -> bool:
-        """Seed a bounded schema failure for one exact fixture target.
+    async def _apply_fault(self, fixture: dict[str, object], kind: str) -> bool:
+        """Seed one bounded schema fault for a fixture installation.
 
         The target table is removed while ownership remains registered.  The
         public rollout request therefore still passes its ownership preflight,
         while the worker deterministically records ``step_failed`` before any
-        migration mutation.  This control is only available in the randomized
-        runtime fixture and never exposes the SQL identifier to callers.
+        migration mutation.  The SQL identifier remains private to the fixture.
         """
+        if kind != "missing_owned_table":
+            return False
         try:
             import asyncpg
 
-            ordinal = self._resolve_failure_target_ordinal(target)
-            installations = self._fixture_catalog.get("installations", [])
-            if not isinstance(installations, list):
-                return False
-            installation = next(
-                (
-                    item
-                    for item in installations
-                    if isinstance(item, dict) and item.get("ordinal") == ordinal
-                ),
-                None,
-            )
-            if not isinstance(installation, dict):
-                return False
-            vault_id = installation.get("vault_id")
+            vault_id = fixture.get("vault_id")
             if not isinstance(vault_id, str):
                 return False
             connection = await asyncpg.connect(
@@ -455,11 +452,10 @@ class E2ERuntime:
             finally:
                 await connection.close()
         except Exception:
-            # Controls are best effort and must not leak database/fixture
-            # details into the control response or runtime logs.
+            # Controls are best effort and must not leak database details.
             return False
 
-    async def _restart_backend_for_control(self) -> None:
+    async def _restart_backend(self) -> None:
         try:
             await self._stop_named_process("backend")
             if not self._resetting:
@@ -974,11 +970,11 @@ class E2ERuntime:
         target_grants = [(owner_id, "owner")]
         installations: list[dict[str, object]] = []
         tables: list[dict[str, object]] = []
-        for ordinal in range(13):
+        for target_index in range(13):
             vault_id, vault_name = await self._insert_fixture_vault(
                 connection,
                 namespace=namespace,
-                label=f"target-{ordinal:02d}",
+                label=f"target-{target_index:02d}",
                 owner_id=owner_id,
                 grants=target_grants,
                 granted_by=system_admin_id,
@@ -1031,7 +1027,14 @@ class E2ERuntime:
                 vault_id,
                 old_release,
             )
-            installations.append({"ordinal": ordinal, "id": str(installation_id), "vault_id": str(vault_id), "vault_name": vault_name})
+            installations.append(
+                {
+                    "fixture_id": f"target-{target_index:02d}",
+                    "id": str(installation_id),
+                    "vault_id": str(vault_id),
+                    "vault_name": vault_name,
+                }
+            )
             tables.append({"installation_id": str(installation_id), "vault_id": str(vault_id), "name": table_name, "row_count": 25, "rows": row_ids})
 
         foreign_vault_id, foreign_vault_name = await self._insert_fixture_vault(
@@ -1074,11 +1077,19 @@ class E2ERuntime:
             },
             "installations": installations,
             "tables": tables,
-            "foreign_ids": {"real": {"app_id": str(foreign_app_id), "release_id": str(foreign_release), "installation_id": str(foreign_installation_id), "vault_id": str(foreign_vault_id)}, "random": random_ids},
+            "scope_cases": {
+                "other_app": {
+                    "app_id": str(foreign_app_id),
+                    "release_id": str(foreign_release),
+                    "installation_id": str(foreign_installation_id),
+                    "vault_id": str(foreign_vault_id),
+                },
+                "unallocated": random_ids,
+            },
             "coordinates": {
                 "admin": {
-                    "credential": {"service": "app", "method": "POST", "path": f"/api/v1/apps/{target_app_id}/credentials", "body": {"deployment": "validator"}, "result": "credential_value_is_request_scoped"},
-                    "exchange": {"service": "app", "method": "POST", "path": "/api/v1/auth/app-token", "body": {"credential": "value_from_previous_response"}},
+                    "credential": {"service": "app", "method": "POST", "path": f"/api/v1/apps/{target_app_id}/credentials", "body": {"deployment": "fixture"}},
+                    "exchange": {"service": "app", "method": "POST", "path": "/api/v1/auth/app-token", "body": {"credential": "<issued-value>"}},
                     "request": {"service": "app", "method": "POST", "path": f"/api/v1/apps/{target_app_id}/rollouts", "body": {"release_id": str(next_release), "manifest_checksum": next_checksum, "idempotency_key": "uuid-v4"}, "headers": {"Idempotency-Key": "uuid-v4"}},
                     "status": {"service": "app", "method": "GET", "path": f"/api/v1/apps/{target_app_id}/rollouts/{{rollout_id}}"},
                 },
@@ -1089,35 +1100,22 @@ class E2ERuntime:
                 "installation_status": {"service": "app", "method": "GET", "path": f"/api/v1/apps/{target_app_id}/installations/{{vault_id}}"},
             },
             "controls": {
-                "failure_injection": {
+                "fault_injection": {
                     "service": "fixture",
                     "method": "POST",
                     "path": "/control",
-                    "body": {"action": "failure_injection", "target": "canary", "enabled": True},
-                    "accepted_target_values": ["canary", "ordinal:11"],
-                    "target_examples": [
-                        {"value": "canary", "ordinal": 0, "expected_outcome": "blocked"},
-                        {"value": "ordinal:11", "ordinal": 11, "expected_outcome": "blocked"},
+                    "body": {"action": "fault_injection", "kind": "missing_owned_table", "target": "target-00", "enabled": True},
+                    "kinds": ["missing_owned_table"],
+                    "targets": [
+                        {"fixture_id": item["fixture_id"], "installation_id": item["id"]}
+                        for item in installations
                     ],
-                    "result": "outcome_only",
                 },
-                "worker_observation": {"service": "fixture", "method": "POST", "path": "/control", "body": {"action": "worker_observation", "enabled": True}, "result": "sanitized"},
-                "restart": {"service": "fixture", "method": "POST", "path": "/control", "body": {"action": "restart", "enabled": True}, "result": "outcome_only"},
-            },
-            "polling": {
-                "rollout_status": {
-                    "method": "GET",
-                    "path": f"/api/v1/apps/{target_app_id}/rollouts/{{rollout_id}}",
-                    "interval_seconds": 0.5,
-                    "timeout_seconds": 180,
-                    "terminal_statuses": ["applied", "blocked"],
-                },
-                "installation_status": {
-                    "method": "GET",
-                    "path": f"/api/v1/apps/{target_app_id}/installations/{{vault_id}}",
-                    "interval_seconds": 0.5,
-                    "timeout_seconds": 180,
-                    "terminal_lifecycle": ["active", "blocked"],
+                "restart": {
+                    "service": "fixture",
+                    "method": "POST",
+                    "path": "/control",
+                    "body": {"action": "restart", "enabled": True},
                 },
             },
         }

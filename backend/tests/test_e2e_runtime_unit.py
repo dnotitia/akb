@@ -123,7 +123,7 @@ def test_descriptor_is_schema_v2_and_never_contains_credential_values(tmp_path, 
     assert "external-password-value" not in serialized
 
 
-def test_fixture_discovery_declares_access_tasks_and_preserves_catalog_without_secrets(
+def test_fixture_discovery_declares_auth_and_observability_without_secrets(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("TEST_USERNAME_ENV", "external-user-value")
@@ -151,19 +151,13 @@ def test_fixture_discovery_declares_access_tasks_and_preserves_catalog_without_s
             "method": "POST",
             "path": "/api/v1/auth/login",
             "fields": ["username", "password"],
-            "credential_source": "external_env_only",
-            "credential_env": {
-                "username": "TEST_USERNAME_ENV",
-                "password": "TEST_PASSWORD_ENV",
-            },
         }
     }
-    assert discovery["tasks"] == {
+    assert discovery["observability"] == {
         "log_observation": {
             "service": "fixture",
             "method": "GET",
             "path": "/log-observation",
-            "result": "sanitized",
         }
     }
     serialized = json.dumps(discovery)
@@ -417,15 +411,13 @@ class FakeFixtureRuntime:
                     "method": "POST",
                     "path": "/api/v1/auth/login",
                     "fields": ["username", "password"],
-                    "credential_source": "external_env_only",
                 }
             },
-            "tasks": {
+            "observability": {
                 "log_observation": {
                     "service": "fixture",
                     "method": "GET",
                     "path": "/log-observation",
-                    "result": "sanitized",
                 }
             },
         }
@@ -438,12 +430,13 @@ class FakeFixtureRuntime:
             "redaction_scan": {"private_value_hits": 0, "raw_log_exposed": False},
         }
 
-    def fixture_control(self, action, target, enabled):
+    def fixture_control(self, action, target, enabled, kind=None):
         return {
             "status": "accepted",
             "scenario": self.scenario,
             "action": action,
             "enabled": enabled,
+            "kind": kind,
         }
 
     async def reset_scenario(self):
@@ -477,13 +470,11 @@ async def test_fixture_control_exposes_reset_discovery_and_sanitized_logs():
             "method": "POST",
             "path": "/api/v1/auth/login",
             "fields": ["username", "password"],
-            "credential_source": "external_env_only",
         }
-        assert discovery.json()["tasks"]["log_observation"] == {
+        assert discovery.json()["observability"]["log_observation"] == {
             "service": "fixture",
             "method": "GET",
             "path": "/log-observation",
-            "result": "sanitized",
         }
         log_observation = await client.get("/log-observation")
         assert log_observation.json()["redaction_scan"]["private_value_hits"] == 0
@@ -492,7 +483,7 @@ async def test_fixture_control_exposes_reset_discovery_and_sanitized_logs():
         assert runtime.reset_count == 1
         control = await client.post(
             "/control",
-            json={"action": "worker_observation", "enabled": True},
+            json={"action": "restart", "enabled": True},
         )
         assert control.status_code == 200
         assert control.json()["scenario"] == "empty"
@@ -514,7 +505,7 @@ async def test_fixture_control_exposes_reset_discovery_and_sanitized_logs():
         assert "/reset" in openapi.json()["paths"]
 
 
-def test_rollout_fixture_discovery_is_source_neutral_and_redacted(tmp_path):
+def test_rollout_fixture_discovery_is_generic_and_redacted(tmp_path):
     runtime = E2ERuntime(
         RuntimeConfig(
             checkout=REPO_ROOT,
@@ -535,27 +526,26 @@ def test_rollout_fixture_discovery_is_source_neutral_and_redacted(tmp_path):
         "scenario": "app-release-rollout",
         "namespace": "fixture-randomized",
         "apps": {"target": {"id": "target-app"}, "foreign": {"id": "foreign-app"}},
-        "installations": [{"ordinal": 0, "id": "target-installation"}],
+        "installations": [{"fixture_id": "target-00", "id": "target-installation"}],
         "coordinates": {
             "admin": {"request": {"method": "POST", "path": "/api/v1/apps/{app_id}/rollouts"}},
             "self_app": {"request": {"method": "POST", "path": "/api/v1/app/rollouts"}},
         },
-        "polling": {"rollout_status": {"terminal_statuses": ["applied", "blocked"]}},
-        "controls": {"failure_injection": {"method": "POST", "path": "/control"}},
+        "controls": {"fault_injection": {"method": "POST", "path": "/control"}},
         "secret": "private-marker-suffix",  # pragma: allowlist secret
     }
     discovery = runtime.fixture_discovery()
     assert discovery["scenario"] == "app-release-rollout"
     assert len(discovery["installations"]) >= 1
     assert "private-marker" not in json.dumps(discovery)
-    # Fixture discovery must never include runtime values, even if a caller
-    # accidentally placed one in its private catalog while testing.
+    # Fixture discovery must never include runtime values, even if test setup
+    # accidentally placed one in its private catalog.
     assert "private-credential" not in json.dumps(discovery)
     assert discovery["coordinates"]["admin"]["request"]["method"] == "POST"
-    assert discovery["polling"]["rollout_status"]["terminal_statuses"] == ["applied", "blocked"]
+    assert discovery["controls"]["fault_injection"]["body"]["kind"] == "missing_owned_table"
 
 
-def test_rollout_failure_control_discovery_has_exact_stable_targets(tmp_path):
+def test_rollout_fault_control_discovery_uses_fixture_ids_and_kinds(tmp_path):
     runtime = E2ERuntime(
         RuntimeConfig(
             checkout=REPO_ROOT,
@@ -570,29 +560,32 @@ def test_rollout_failure_control_discovery_has_exact_stable_targets(tmp_path):
         "status": "ready",
         "scenario": "app-release-rollout",
         "apps": {"target": {"id": "target-app"}},
-        "installations": [{"ordinal": ordinal, "id": f"installation-{ordinal}"} for ordinal in range(13)],
+        "installations": [
+            {"fixture_id": f"target-{index:02d}", "id": f"installation-{index}"}
+            for index in range(13)
+        ],
     }
 
     discovery = runtime.fixture_discovery()
-    failure = discovery["controls"]["failure_injection"]
-    assert failure["accepted_target_values"] == ["canary", "ordinal:11"]
-    assert failure["target_examples"] == [
-        {"value": "canary", "ordinal": 0, "expected_outcome": "blocked"},
-        {"value": "ordinal:11", "ordinal": 11, "expected_outcome": "blocked"},
-    ]
-    assert failure["body"]["target"] == "canary"
-
-    assert runtime._resolve_failure_target_ordinal("canary") == 0
-    assert runtime._resolve_failure_target_ordinal("ordinal:0") == 0
-    assert runtime._resolve_failure_target_ordinal("0") == 0
-    assert runtime._resolve_failure_target_ordinal("ordinal:11") == 11
-    assert runtime._resolve_failure_target_ordinal("11") == 11
+    fault = discovery["controls"]["fault_injection"]
+    assert fault["kinds"] == ["missing_owned_table"]
+    assert fault["body"] == {
+        "action": "fault_injection",
+        "kind": "missing_owned_table",
+        "target": "target-00",
+        "enabled": True,
+    }
+    assert {item["fixture_id"] for item in fault["targets"]} == {
+        f"target-{index:02d}" for index in range(13)
+    }
+    assert runtime._resolve_fault_target("target-00")["id"] == "installation-0"
+    assert runtime._resolve_fault_target("target-11")["id"] == "installation-11"
     with pytest.raises(ValueError):
-        runtime._resolve_failure_target_ordinal("ordinal:12")
+        runtime._resolve_fault_target("target-13")
 
 
 @pytest.mark.asyncio
-async def test_rollout_failure_control_applies_before_ack(tmp_path, monkeypatch):
+async def test_rollout_fault_control_applies_before_ack(tmp_path, monkeypatch):
     runtime = E2ERuntime(
         RuntimeConfig(
             checkout=REPO_ROOT,
@@ -606,20 +599,32 @@ async def test_rollout_failure_control_applies_before_ack(tmp_path, monkeypatch)
     runtime._fixture_catalog = {
         "status": "ready",
         "scenario": "app-release-rollout",
-        "installations": [{"ordinal": ordinal, "id": f"installation-{ordinal}"} for ordinal in range(13)],
+        "installations": [
+            {
+                "fixture_id": f"target-{index:02d}",
+                "id": f"installation-{index}",
+                "vault_id": f"vault-{index}",
+            }
+            for index in range(13)
+        ],
     }
-    applied: list[str] = []
+    applied: list[tuple[str, str]] = []
 
-    async def record_application(target: str) -> bool:
-        applied.append(target)
+    async def record_application(fixture: dict[str, object], kind: str) -> bool:
+        applied.append((str(fixture["fixture_id"]), kind))
         return True
 
-    monkeypatch.setattr(runtime, "_apply_failure_injection", record_application)
-    result = await runtime.fixture_control("failure_injection", "11", True)
+    monkeypatch.setattr(runtime, "_apply_fault", record_application)
+    result = await runtime.fixture_control(
+        "fault_injection", "target-11", True, "missing_owned_table"
+    )
 
     assert result["status"] == "accepted"
-    assert applied == ["ordinal:11"]
-    assert runtime._fixture_controls["failure_target"] == "ordinal:11"
+    assert applied == [("target-11", "missing_owned_table")]
+    assert runtime._fixture_controls["fault"] == {
+        "target": "target-11",
+        "kind": "missing_owned_table",
+    }
 
 
 def test_compose_and_hosted_workflow_preserve_the_live_topology():
