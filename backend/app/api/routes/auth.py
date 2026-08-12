@@ -2,13 +2,21 @@
 
 import logging
 import urllib.parse
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import RedirectResponse
+from pydantic import ConfigDict, Field, field_validator
 
 from app.api.deps import get_current_user
 from app.config import settings
-from app.exceptions import AKBError, NotFoundError
+from app.exceptions import (
+    AKBError,
+    AuthenticationError,
+    ForbiddenError,
+    NotFoundError,
+)
+from app.services.access_service import VALID_WRITE_ACTIONS, check_vault_access
 from app.services.auth_service import (
     AuthenticatedUser,
     register,
@@ -18,6 +26,7 @@ from app.services.auth_service import (
     list_pats,
     revoke_pat,
     revoke_all_sessions,
+    token_has_scope,
     update_profile,
 )
 from app.util.text import NFCModel
@@ -52,6 +61,59 @@ class CreatePATRequest(NFCModel):
     vault_scope: dict[str, list[str]] | None = None
 
 
+class AuthorityVaultScopeRequest(NFCModel):
+    """Exact PAT vault-scope shape accepted by authority verification."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prefixes: list[str]
+    extra_vaults: list[str]
+
+
+class WriterAuthorityRequest(NFCModel):
+    """One concrete writer action the authenticating PAT must possess."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    vault: str
+    action: str
+
+    @field_validator("action")
+    @classmethod
+    def validate_action(cls, value: str) -> str:
+        value = value.strip()
+        if value not in VALID_WRITE_ACTIONS:
+            raise ValueError("unknown write action")
+        return value
+
+
+class VerifyAuthorityRequest(NFCModel):
+    """Authority a caller expects the authenticating PAT to possess."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    vault_scope: AuthorityVaultScopeRequest
+    # Keep the non-mutating check bounded: every distinct item performs one
+    # database-backed effective-authority lookup.
+    writer_authorities: list[WriterAuthorityRequest] = Field(min_length=1, max_length=32)
+
+
+class VerifiedWriterAuthority(NFCModel):
+    model_config = ConfigDict(extra="forbid")
+
+    vault: str
+    role: str
+    action: str
+
+
+class VerifyAuthorityResponse(NFCModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token_id: uuid.UUID
+    vault_scope: AuthorityVaultScopeRequest
+    authorities: list[VerifiedWriterAuthority]
+
+
 class ChangePasswordRequest(NFCModel):
     current_password: str
     new_password: str
@@ -73,6 +135,7 @@ async def login_user(req: LoginRequest):
 
 
 # ── Public auth config (lets the SPA decide which login options to show) ──
+
 
 @router.get("/auth/config", summary="Public auth configuration")
 async def auth_config():
@@ -107,6 +170,7 @@ async def auth_config():
 #
 # Only mounted-effective when keycloak_enabled. Each handler 404s when
 # SSO is off so a disabled deployment exposes no live SSO surface.
+
 
 class KeycloakExchangeRequest(NFCModel):
     code: str
@@ -161,9 +225,7 @@ def _allowed_companion_origin(raw: str | None) -> str | None:
     origin = _normalize_origin(raw)
     if origin is None:
         return None
-    allowed = {
-        _normalize_origin(o) for o in settings.keycloak_post_login_allowed_origins
-    }
+    allowed = {_normalize_origin(o) for o in settings.keycloak_post_login_allowed_origins}
     return origin if origin in allowed else None
 
 
@@ -182,9 +244,7 @@ def _keycloak_client_id_for_redirect(raw: str | None) -> str:
         return settings.keycloak_client_id
     configured = {
         normalized: client_id.strip()
-        for configured_origin, client_id in (
-            settings.keycloak_companion_client_ids_by_origin or {}
-        ).items()
+        for configured_origin, client_id in (settings.keycloak_companion_client_ids_by_origin or {}).items()
         if (normalized := _normalize_origin(configured_origin)) is not None
         and isinstance(client_id, str)
         and client_id.strip()
@@ -199,8 +259,7 @@ def _with_query_param(url: str, key: str, value: str) -> str:
     query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
     query.append((key, value))
     return urllib.parse.urlunsplit(
-        (parts.scheme, parts.netloc, parts.path,
-         urllib.parse.urlencode(query), parts.fragment)
+        (parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(query), parts.fragment)
     )
 
 
@@ -254,17 +313,12 @@ def _post_login_error_target(redirect: str | None, reason: str) -> str:
 async def keycloak_login(redirect: str = "/"):
     _require_keycloak()
     from app.services.keycloak_oidc import get_keycloak_oidc
+
     # An allowlisted companion-app absolute URL rides through verbatim
     # (re-validated at callback time); everything else is reduced to a safe
     # same-site path before it ever enters the flow state.
-    dest = (
-        redirect
-        if _allowed_companion_origin(redirect) is not None
-        else _safe_redirect_path(redirect)
-    )
-    url = await get_keycloak_oidc().begin_login(
-        dest, client_id=_keycloak_client_id_for_redirect(redirect)
-    )
+    dest = redirect if _allowed_companion_origin(redirect) is not None else _safe_redirect_path(redirect)
+    url = await get_keycloak_oidc().begin_login(dest, client_id=_keycloak_client_id_for_redirect(redirect))
     return RedirectResponse(url, status_code=status.HTTP_302_FOUND)
 
 
@@ -295,9 +349,7 @@ async def keycloak_callback(request: Request):
 
     try:
         client_id = flow.get("client_id")
-        tokens = await svc.exchange_code_for_tokens(
-            code, flow.get("code_verifier"), client_id=client_id
-        )
+        tokens = await svc.exchange_code_for_tokens(code, flow.get("code_verifier"), client_id=client_id)
         id_token = tokens.get("id_token")
         if not id_token:
             return _sso_error_redirect("no_id_token", flow.get("redirect_path"))
@@ -333,10 +385,9 @@ async def keycloak_logout(id_token_hint: str | None = None):
     exchange time; without it, Keycloak may show a logout confirmation."""
     _require_keycloak()
     from app.services.keycloak_oidc import get_keycloak_oidc
+
     post_logout = settings.public_base_url.rstrip("/") + "/auth"
-    url = get_keycloak_oidc().logout_url(
-        id_token_hint=id_token_hint, post_logout_redirect=post_logout
-    )
+    url = get_keycloak_oidc().logout_url(id_token_hint=id_token_hint, post_logout_redirect=post_logout)
     return RedirectResponse(url, status_code=status.HTTP_302_FOUND)
 
 
@@ -344,11 +395,10 @@ async def keycloak_logout(id_token_hint: str | None = None):
 async def keycloak_exchange(req: KeycloakExchangeRequest):
     _require_keycloak()
     from app.services.keycloak_oidc import redeem_exchange_code
+
     result = await redeem_exchange_code(req.code)
     if result is None:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST, "Invalid or expired exchange code"
-        )
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired exchange code")
     # Same {token, user} shape as POST /auth/login.
     return result
 
@@ -387,7 +437,9 @@ async def update_my_profile(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     return await update_profile(
-        user.user_id, display_name=req.display_name, email=req.email,
+        user.user_id,
+        display_name=req.display_name,
+        email=req.email,
     )
 
 
@@ -416,6 +468,71 @@ async def list_tokens(user: AuthenticatedUser = Depends(get_current_user)):
     return {"tokens": await list_pats(user.user_id)}
 
 
+@router.post(
+    "/auth/authority/verify",
+    summary="Verify the current PAT's exact write authority",
+    response_model=VerifyAuthorityResponse,
+)
+async def verify_authority(
+    req: VerifyAuthorityRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+) -> VerifyAuthorityResponse:
+    """Verify the authenticating token without performing a write.
+
+    The caller supplies the exact scope it expects and the concrete Vaults on
+    which it requires writer authority.  The response deliberately contains
+    only the current token id, its canonical scope, and the verified roles;
+    it never exposes token material, ACLs, or write-policy provenance.
+    """
+    from app.models.vault_scope import VaultScope
+
+    if user.auth_method != "pat" or user.token_id is None:
+        raise AuthenticationError("Authority verification requires a PAT")
+    try:
+        uuid.UUID(user.token_id)
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise AuthenticationError("Authority verification requires a valid PAT") from exc
+    if not token_has_scope(user.token_scopes, "write"):
+        raise ForbiddenError("Authenticated token lacks the coarse write scope")
+
+    expected_scope = VaultScope.parse_input(req.vault_scope.model_dump())
+    requested_authorities = sorted({(item.vault, item.action) for item in req.writer_authorities})
+    writer_scope = VaultScope.parse_input(
+        {
+            "prefixes": [],
+            "extra_vaults": [vault for vault, _action in requested_authorities],
+        }
+    )
+    assert expected_scope is not None
+    assert writer_scope is not None
+    if user.vault_scope is None or user.vault_scope.to_db_json() != expected_scope.to_db_json():
+        raise ForbiddenError("Authenticated token Vault scope does not match")
+
+    writer_vaults = sorted(writer_scope.extra_vaults)
+    if any(not expected_scope.permits(vault) for vault in writer_vaults):
+        raise ForbiddenError("Requested writer authority exceeds the PAT Vault scope")
+
+    for vault, action in requested_authorities:
+        try:
+            await check_vault_access(
+                user.user_id,
+                vault,
+                required_role="writer",
+                write_action=action,
+            )
+        except (ForbiddenError, NotFoundError) as exc:
+            raise ForbiddenError("Authenticated token lacks required writer authority") from exc
+
+    return VerifyAuthorityResponse(
+        token_id=uuid.UUID(user.token_id),
+        vault_scope=AuthorityVaultScopeRequest(**expected_scope.to_db_json()),
+        authorities=[
+            VerifiedWriterAuthority(vault=vault, role="writer", action=action)
+            for vault, action in requested_authorities
+        ],
+    )
+
+
 @router.delete("/auth/tokens/{token_id}", summary="Revoke a PAT")
 async def delete_token(token_id: str, user: AuthenticatedUser = Depends(get_current_user)):
     success = await revoke_pat(user.user_id, token_id)
@@ -430,6 +547,7 @@ async def change_password_route(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     from app.services.auth_service import change_password, BadPasswordChange
+
     try:
         await change_password(user.user_id, req.current_password, req.new_password)
     except BadPasswordChange as exc:
