@@ -5,6 +5,16 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.14.2 — 2026-08-13  *(feat — exact PAT authority self-verification)*
+
+### Added PAT authority self-verification
+
+Managed clients can verify that the authenticating PAT has an exact expected
+Vault scope and effective writer authority without performing a synthetic
+write. The endpoint returns only the current token id, canonical scope, and
+verified Vault roles and write actions; it does not expose token material, ACLs, or write-policy
+details.
+
 ## 0.14.1 — 2026-08-12  *(fix — name the exception class behind a degraded hybrid search)*
 
 ### Fixed an undiagnosable degraded-search log line
