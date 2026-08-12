@@ -1,5 +1,9 @@
 FROM python:3.14-slim
 
+ARG AKB_SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.source="https://github.com/dnotitia/akb" \
+      org.opencontainers.image.revision="${AKB_SOURCE_REVISION}"
+
 # The hermetic external-git runner pins DNS resolution
 # via git's `http.curloptResolve`, documented since git 2.37 — a code-owned
 # security floor. Debian's packaged git is already well past 2.37, so we install

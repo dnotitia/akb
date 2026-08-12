@@ -86,6 +86,14 @@ class DocumentUpdateRequest(NFCModel):
     expected_content_hash: str | None = None
 
 
+class DocumentMoveRequest(NFCModel):
+    """Request body for moving or renaming a document."""
+
+    collection: str | None = None
+    slug: str | None = None
+    message: str | None = None
+
+
 class DocumentEditRequest(NFCModel):
     """Request body for akb_edit. Mirrors the MCP tool schema."""
 

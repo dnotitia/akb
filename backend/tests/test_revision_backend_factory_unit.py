@@ -50,7 +50,7 @@ def test_default_backend_is_legacy_document_service_once_per_process(monkeypatch
 
     assert isinstance(first, DocumentService)
     assert second is first
-    assert revision_backend.selected_document_revision_backend() == "bare_git_current"
+    assert revision_backend.selected_document_revision_backend() == "bare_git"
 
 
 def test_native_backend_requires_explicit_measurement_opt_in(tmp_path):
@@ -95,7 +95,7 @@ def test_native_backend_uses_registered_factory_once(monkeypatch, tmp_path):
     assert revision_backend.get_document_service() is native_service
     assert revision_backend.get_revision_backend() is native_backend
     assert factory_calls == 1
-    assert revision_backend.selected_document_revision_backend() == "native_ledger_m1"
+    assert revision_backend.selected_document_revision_backend() == "postgres_native"
 
 
 def test_native_backend_lazily_registers_real_facade_without_git(monkeypatch, tmp_path):

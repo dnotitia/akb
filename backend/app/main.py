@@ -51,6 +51,7 @@ from app.services.auth_service import AuthenticatedUser
 from app.services.external_git_capability import check_external_git_capability
 from app.services.health import vault_health
 from app.services.lifecycle import init_storage, shutdown_storage, start_workers, stop_workers
+from app.services.revision_backend import selected_document_revision_backend
 from app.services.vector_store import get_vector_store
 from app.util.errors import CONFLICT, INTERNAL, INVALID_ARGUMENT, METHOD_NOT_ALLOWED, NOT_FOUND, PERMISSION_DENIED
 from mcp_server.http_app import mcp_app
@@ -330,7 +331,9 @@ async def _probe_ready() -> tuple[bool, dict]:
     on the configured driver would pull the pod from the Service and
     break login/auth/CRUD for ~30s.
     """
-    detail: dict = {}
+    detail: dict = {
+        "document_revision_backend": selected_document_revision_backend(),
+    }
     try:
         pool = await get_pool()
         await asyncio.wait_for(pool.fetchval("SELECT 1"), timeout=2.0)

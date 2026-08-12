@@ -12,6 +12,11 @@ from app.config import settings
 from app.db.postgres import close_pool, get_pool, init_db
 from app.services import audit_log, delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, m1_file_transfer_reaper, metadata_worker, s3_delete_worker, sparse_encoder, tool_usage, vault_backfill, write_lane
 from app.services.git_service import GitService
+from app.services.native_revision_authority import (
+    pre_migration_revision_authority_guard,
+    startup_revision_authority_preflight,
+)
+from app.services.revision_backend import canonical_document_revision_backend
 from app.services.role_sync import RoleSync, get_role_sync, set_role_sync
 from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
 from app.services.vector_store import get_vector_store
@@ -70,8 +75,15 @@ def _validate_required_settings() -> None:
 async def init_storage() -> None:
     """Initialize DB schema/migrations and eagerly construct vector-store driver."""
     _validate_required_settings()
+    await pre_migration_revision_authority_guard()
     await init_db()
     logger.info("Database initialized")
+    authority_status = await startup_revision_authority_preflight()
+    logger.info(
+        "Document revision authority ready: backend=%s status=%s",
+        canonical_document_revision_backend(settings.document_revision_backend),
+        authority_status,
+    )
     if settings.native_revision_m1_file_driver != "s3_current":
         # Text Files share the native ledger and PostgreSQL BodyStore with the
         # guarded M1 grep arm. Install only after 048 and 053-057 are durable; normal
@@ -84,12 +96,13 @@ async def init_storage() -> None:
     # Self-heal: clear stale git index.lock files left behind by a
     # crashed prior process. Without this, the affected vault's writes
     # fail silently until an operator removes the lock by hand.
-    try:
-        cleared = GitService().cleanup_stale_locks()
-        if cleared:
-            logger.info("Cleared %d stale git lock(s) at startup", cleared)
-    except Exception as e:  # noqa: BLE001 — never block startup on best-effort cleanup
-        logger.warning("Stale-lock self-heal failed (continuing): %s", e)
+    if settings.document_revision_backend != "postgres_native":
+        try:
+            cleared = GitService().cleanup_stale_locks()
+            if cleared:
+                logger.info("Cleared %d stale git lock(s) at startup", cleared)
+        except Exception as e:  # noqa: BLE001 — never block startup on best-effort cleanup
+            logger.warning("Stale-lock self-heal failed (continuing): %s", e)
     # Force-construct so a misconfigured vector-store URL/DSN fails at startup rather
     # than silently serving empty search results later.
     store = get_vector_store()

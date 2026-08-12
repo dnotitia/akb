@@ -7,6 +7,17 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Added an explicit PostgreSQL Native document revision mode
+
+AKB now accepts the stable process-scoped revision selectors `bare_git` and
+`postgres_native`, while keeping Bare Git as the default and retaining the old
+measurement selectors as compatibility aliases. PostgreSQL Native can start
+only after an explicit command claims a never-initialized AKB database and
+mints tenant/database/image-bound pending authority; first startup atomically
+turns that record into an immutable durable marker. Existing or merely empty
+legacy databases are rejected, and no existing tenant is converted by config.
+Readiness reports the canonical selected backend.
+
 ### Fixed scoped grep replacement completeness and recovery
 
 `akb_grep(replace=...)` now treats `limit` only as a response-preview bound and

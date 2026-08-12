@@ -18,13 +18,21 @@ db_user: akb
 git_storage_path: /data/vaults
 
 # === Document revision backend ===
-# Default keeps the existing bare-Git implementation. native_ledger_m1 is
-# measurement-only: it requires native_revision_m1_measurement_only: true and
-# the exact dedicated database name below. Its native service must also be
-# registered before startup, so it cannot silently affect normal deployments.
-document_revision_backend: bare_git_current  # bare_git_current | native_ledger_m1
+# The stable choices are bare_git (default) and postgres_native. The Native
+# choice is only valid after an operator runs `python -m app.cli
+# initialize-postgres-native` against a never-used AKB database. It does not
+# convert an existing Bare Git tenant. The deployment must supply a stable
+# tenant/namespace identity, a provisioned database UUID, and this image's OCI
+# digest. `bare_git_current` remains an alias. `native_ledger_m1` remains a
+# deprecated, dedicated-database measurement alias for historical receipts.
+document_revision_backend: bare_git  # bare_git | postgres_native
+# document_revision_tenant_id: tenant-example
+# document_revision_namespace: tenant-example
+# document_revision_database_id: 11111111-1111-4111-8111-111111111111
+# document_revision_runtime_image_digest: sha256:<64 lowercase hex>
 native_revision_m1_measurement_only: false
-# Isolated M1 measurement runs must also set: db_name: akb_revision_m1_measurement
+# Historical M1 runs also set document_revision_backend: native_ledger_m1,
+# native_revision_m1_measurement_only: true, and db_name: akb_revision_m1_measurement.
 
 # === External-git mirror — network timeouts (seconds) ===
 external_git_lsremote_timeout: 30

@@ -13,6 +13,8 @@ Subcommands:
                                  Prints the temp password to stdout. Caller
                                  must share it with the user out-of-band.
     repair-resource-hashes      Backfill document/file content-hash projections.
+    initialize-postgres-native  Claim and initialize a never-used PostgreSQL
+                                database for the stable Native backend.
 """
 from __future__ import annotations
 
@@ -96,6 +98,27 @@ async def _repair_resource_hashes(args: list[str]) -> int:
     return 1 if report.get("errors") else 0
 
 
+async def _initialize_postgres_native(args: list[str]) -> int:
+    if args:
+        print("Usage: python -m app.cli initialize-postgres-native", file=sys.stderr)
+        return 2
+    from app.db.postgres import close_pool
+    from app.services.native_revision_authority import (
+        NativeAuthorityError,
+        bootstrap_postgres_native,
+    )
+
+    try:
+        report = await bootstrap_postgres_native()
+    except NativeAuthorityError as error:
+        print(f"{error.code}: {error}", file=sys.stderr)
+        return 1
+    finally:
+        await close_pool()
+    print(json.dumps(report, sort_keys=True))
+    return 0
+
+
 def _okf_validate(args: list[str]) -> int:
     """`okf-validate <bundle-dir>` — check a directory against OKF v0.1."""
     from pathlib import Path
@@ -172,7 +195,8 @@ def main(argv: list[str] | None = None) -> int:
         print("Usage: python -m app.cli <subcommand> [args]", file=sys.stderr)
         print(
             "Subcommands: reset-password <username>, repair-resource-hashes, "
-            "okf-validate <dir>, okf-export --from-git <worktree> --vault <name> --out <dir>",
+            "initialize-postgres-native, okf-validate <dir>, "
+            "okf-export --from-git <worktree> --vault <name> --out <dir>",
             file=sys.stderr,
         )
         return 2
@@ -184,6 +208,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_reset_password(argv[1]))
     if cmd == "repair-resource-hashes":
         return asyncio.run(_repair_resource_hashes(argv[1:]))
+    if cmd == "initialize-postgres-native":
+        return asyncio.run(_initialize_postgres_native(argv[1:]))
     if cmd == "okf-validate":
         return _okf_validate(argv[1:])
     if cmd == "okf-export":
