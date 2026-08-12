@@ -8,9 +8,14 @@ previously became dangling `links_to` edges (ghost graph nodes).
 """
 from __future__ import annotations
 
+import uuid
+
+import pytest
+
 from app.services.kg_service import (
     extract_markdown_links,
     normalize_document_link_ref,
+    store_document_relations,
     strip_code_spans,
 )
 
@@ -82,6 +87,62 @@ def test_document_link_prefix_matrix_is_explicit_and_preserves_dotfiles():
     assert normalize_document_link_ref("/root/spec.md") == "root/spec.md"
     assert normalize_document_link_ref(".well-known.md") == ".well-known.md"
     assert normalize_document_link_ref("...draft.md") == "...draft.md"
+
+
+@pytest.mark.asyncio
+async def test_parent_and_root_relative_edges_are_recreated_on_document_update():
+    """A document rewrite replaces, rather than loses, its implicit links."""
+    vault_id = uuid.uuid4()
+    target_ids = {
+        "shared/spec.md": uuid.uuid4(),
+        "root/overview.md": uuid.uuid4(),
+    }
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.deleted_sources: list[str] = []
+            self.inserted_targets: list[str] = []
+
+        async def execute(self, query: str, *args):
+            if query.startswith("DELETE FROM edges"):
+                self.deleted_sources.append(args[0])
+            elif "INSERT INTO edges" in query:
+                self.inserted_targets.append(args[3])
+            return "OK"
+
+        async def fetchrow(self, _query: str, _vault_id, ref: str):
+            target_id = target_ids.get(ref)
+            return {"id": target_id} if target_id else None
+
+        async def fetchval(self, query: str, target_id):
+            if query.startswith("SELECT path FROM documents"):
+                return next(
+                    path for path, document_id in target_ids.items()
+                    if document_id == target_id
+                )
+            return None
+
+    conn = FakeConnection()
+    body = "[shared](../shared/spec.md) and [root](/root/overview.md)"
+
+    for _ in range(2):
+        stored = await store_document_relations(
+            conn,
+            vault_id,
+            "weekly",
+            "notes/current.md",
+            [],
+            [],
+            [],
+            body,
+        )
+        assert stored == 2
+
+    assert len(conn.deleted_sources) == 2
+    assert conn.inserted_targets == [
+        "akb://weekly/coll/shared/doc/spec.md",
+        "akb://weekly/coll/root/doc/overview.md",
+    ] * 2
 
 
 def test_strip_code_spans_removes_code_keeps_prose():
