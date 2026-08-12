@@ -40,6 +40,27 @@ async def _run(conn):
             CREATE INDEX IF NOT EXISTS app_rollout_jobs_source_idx
                 ON app_rollout_jobs(source_rollout_id);
 
+            -- A resumed attempt deliberately reuses the immutable release
+            -- steps.  The original ledger keyed a step only by installation,
+            -- release, and step id, which made a new attempt collide with the
+            -- blocked source row.  Scope uniqueness to the attempt instead;
+            -- the job ledger remains the authority for replay and execution.
+            ALTER TABLE app_rollout_steps
+                DROP CONSTRAINT IF EXISTS app_rollout_steps_installation_id_release_id_step_id_key;
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                     WHERE conname = 'app_rollout_steps_job_installation_release_step_key'
+                       AND conrelid = 'app_rollout_steps'::regclass
+                ) THEN
+                    ALTER TABLE app_rollout_steps
+                        ADD CONSTRAINT app_rollout_steps_job_installation_release_step_key
+                        UNIQUE (job_id, installation_id, release_id, step_id);
+                END IF;
+            END
+            $$;
+
             CREATE TABLE IF NOT EXISTS app_rollout_resume_attempts (
                 id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
                 app_id UUID NOT NULL REFERENCES app_definitions(id) ON DELETE RESTRICT,

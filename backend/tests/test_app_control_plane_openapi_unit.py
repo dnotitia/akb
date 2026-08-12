@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import tempfile
+
+from app.config import settings
+
+settings.git_storage_path = tempfile.mkdtemp(prefix="akb-control-plane-openapi-")
 
 from app.main import app
 
