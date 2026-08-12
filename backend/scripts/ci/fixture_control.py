@@ -34,7 +34,12 @@ class FixtureRuntime(Protocol):
 class ResetRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    scenario: Literal["empty", "app-installation-lifecycle", "app-release-rollout"]
+    scenario: Literal[
+        "empty",
+        "app-installation-lifecycle",
+        "app-release-rollout",
+        "app-control-plane",
+    ]
 
 
 class ControlRequest(BaseModel):

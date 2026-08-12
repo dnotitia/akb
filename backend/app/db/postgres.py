@@ -239,6 +239,7 @@ async def _apply_migrations() -> None:
         "060_native_revision_migration_bridge.py",  # additive C9 migration runs, observations, and retained legacy selector mappings
         "061_native_revision_authority.py",       # explicit new-database Native authority claim/pending/marker records
         "062_app_rollout.py",                    # durable app release rollout job/target/step ledger
+        "063_app_rollout_resume.py",             # immutable-source new-attempt rollout resume ledger
     ):
         if filename in applied:
             continue

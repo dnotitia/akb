@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import uuid
-from typing import Literal
 
 from fastapi import APIRouter, Depends, Request, Response, status
-from pydantic import Field
+
+from app.api.control_plane_models import InstallationCommandRequest, InstallationProjection
 
 from app.api.deps import get_current_app, get_current_user, request_correlation_id
 from app.services.app_identity_service import AppPrincipal
@@ -17,15 +17,8 @@ from app.services.app_installation_service import (
     uninstall_installation,
 )
 from app.services.auth_service import AuthenticatedUser
-from app.util.text import NFCModel
 
 router = APIRouter()
-
-
-class InstallationCommandRequest(NFCModel):
-    release_id: uuid.UUID
-    capabilities: list[str] = Field(min_length=1, max_length=32)
-    mode: Literal["install", "restore", "fresh"] = "install"
 
 
 def _mark_no_store(response: Response) -> None:
@@ -35,6 +28,10 @@ def _mark_no_store(response: Response) -> None:
 
 @router.put(
     "/apps/{app_id}/installations/{vault_id}",
+    response_model=InstallationProjection,
+    operation_id="appsApplyInstallation",
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={200: {"model": InstallationProjection}},
     summary="Install, restore, or freshly install an app in a Vault",
 )
 async def put_installation(
@@ -63,6 +60,8 @@ async def put_installation(
 
 @router.get(
     "/apps/{app_id}/installations/{vault_id}",
+    response_model=InstallationProjection,
+    operation_id="appsGetInstallation",
     summary="Read an app installation as a system or Vault administrator",
 )
 async def get_installation(
@@ -84,6 +83,10 @@ async def get_installation(
 
 @router.delete(
     "/apps/{app_id}/installations/{vault_id}",
+    response_model=InstallationProjection,
+    operation_id="appsUninstallInstallation",
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={200: {"model": InstallationProjection}},
     summary="Uninstall an app from a Vault while retaining owned resources",
 )
 async def delete_installation(
@@ -108,6 +111,8 @@ async def delete_installation(
 
 @router.get(
     "/app/installations/{vault_id}",
+    response_model=InstallationProjection,
+    operation_id="appGetInstallation",
     summary="Read the calling app's installation in a Vault",
 )
 async def get_app_installation(

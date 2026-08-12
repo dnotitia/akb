@@ -7,6 +7,17 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Added generic app control-plane registry, typed SDK, and resume attempts
+
+Added system-admin app definition and immutable release registry routes, explicit
+control-plane OpenAPI request/response projections, and the
+`@akb/client/control-plane` admin/app facade with exchange-only deployment
+credentials. Blocked rollouts can now be resumed as new, idempotent attempts
+from an immutable source after live grant, observation, ownership, and schema
+preflight; converged targets are recorded as replayed without rerunning steps.
+The repository-owned runtime now exposes a source-neutral `app-control-plane`
+scenario descriptor and its contract checks.
+
 ### Added an explicit PostgreSQL Native document revision mode
 
 AKB now accepts the stable process-scoped revision selectors `bare_git` and

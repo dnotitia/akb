@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import stat
 import subprocess
@@ -173,8 +174,43 @@ def test_scenario_argument_supports_the_lifecycle_fixture():
     assert lifecycle.scenario == "app-installation-lifecycle"
     rollout = _parse_args(["serve", "--scenario", "app-release-rollout"])
     assert rollout.scenario == "app-release-rollout"
+    control_plane = _parse_args(["serve", "--scenario", "app-control-plane"])
+    assert control_plane.scenario == "app-control-plane"
     with pytest.raises(SystemExit):
         _parse_args(["serve", "--scenario", "project"])
+
+
+def test_app_control_plane_descriptor_keeps_schema_v2_discovery_contract(tmp_path):
+    runtime = E2ERuntime(
+        dataclasses.replace(make_config(tmp_path), scenario="app-control-plane")
+    )
+    runtime._fixture_catalog = {
+        "status": "ready",
+        "scenario": "app-control-plane",
+        "namespace": "fixture-randomized",
+        "installations": [{"fixture_id": "target-00", "id": "installation-randomized"}],
+        "coordinates": {
+            "admin": {
+                "registry": {"app_create": {"path": "/api/v1/apps"}},
+                "resume": {"method": "POST"},
+            },
+            "self_app": {
+                "resume": {"path": "/api/v1/app/rollouts/{rollout_id}/resume"},
+            },
+        },
+    }
+    descriptor = runtime.descriptor()
+    discovery = runtime.fixture_discovery()
+    assert descriptor["schema_version"] == 2
+    assert descriptor["scenario"] == "app-control-plane"
+    assert descriptor["services"]["fixture"]["reset"]["body"] == {
+        "scenario": "app-control-plane"
+    }
+    assert discovery["scenario"] == "app-control-plane"
+    assert discovery["controls"]["fault_injection"]["path"] == "/control"
+    assert discovery["coordinates"]["admin"]["registry"]["app_create"]["path"] == "/api/v1/apps"
+    assert discovery["coordinates"]["admin"]["resume"]["method"] == "POST"
+    assert discovery["coordinates"]["self_app"]["resume"]["path"] == "/api/v1/app/rollouts/{rollout_id}/resume"
 
 
 def test_suite_sql_uses_compose_psql_by_default_and_preserves_override(tmp_path, monkeypatch):

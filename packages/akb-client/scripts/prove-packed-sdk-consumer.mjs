@@ -30,6 +30,8 @@ try {
     "package/dist/index.d.ts",
     "package/dist/lite.js",
     "package/dist/lite.d.ts",
+    "package/dist/control-plane.js",
+    "package/dist/control-plane.d.ts",
     "package/scripts/sdk-surface-contract.json",
     "package/scripts/packed-sdk-runtime.mjs",
     "package/scripts/packed-sdk-types.ts",
@@ -57,6 +59,9 @@ try {
   );
   if (installedContract.operations.length !== 20) {
     throw new Error(`installed matrix has ${installedContract.operations.length} operations`);
+  }
+  if (installedContract.controlPlane?.length !== 31) {
+    throw new Error(`installed control-plane matrix has ${installedContract.controlPlane?.length ?? 0} operations`);
   }
   for (const item of installedContract.operations) {
     if (!item.packedProof) throw new Error(`${item.operationId}: missing packed proof mapping`);

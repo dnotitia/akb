@@ -19,6 +19,7 @@ from app.api.routes import (
     app_inventory,
     app_installations,
     app_rollouts,
+    app_registry,
     agent_sessions,
     app_identity,
     auth,
@@ -282,6 +283,7 @@ async def _no_store_public_surfaces(request: Request, call_next):
 
 app.include_router(auth.router, prefix="/api/v1", tags=["auth"])
 app.include_router(app_identity.router, prefix="/api/v1", tags=["app-identity"])
+app.include_router(app_registry.router, prefix="/api/v1", tags=["app-registry"])
 app.include_router(app_inventory.router, prefix="/api/v1", tags=["app-inventory"])
 app.include_router(app_installations.router, prefix="/api/v1", tags=["app-installations"])
 app.include_router(app_rollouts.router, prefix="/api/v1", tags=["app-rollouts"])

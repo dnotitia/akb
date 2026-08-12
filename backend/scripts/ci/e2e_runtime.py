@@ -47,7 +47,12 @@ from fixture_control import create_app
 
 LOGGER = logging.getLogger("akb.e2e_runtime")
 SCHEMA_VERSION = 2
-Scenario = Literal["empty", "app-installation-lifecycle", "app-release-rollout"]
+Scenario = Literal[
+    "empty",
+    "app-installation-lifecycle",
+    "app-release-rollout",
+    "app-control-plane",
+]
 SCENARIO: Scenario = "empty"
 DEFAULT_USERNAME_ENV = "AKB_E2E_USERNAME"
 DEFAULT_PASSWORD_ENV = "AKB_E2E_PASSWORD"
@@ -282,7 +287,7 @@ class E2ERuntime:
                 "path": "/log-observation",
             }
         }
-        if self.config.scenario == "app-release-rollout":
+        if self.config.scenario in {"app-release-rollout", "app-control-plane"}:
             installations = catalog.get("installations", [])
             targets: list[dict[str, str]] = []
             if isinstance(installations, list):
@@ -371,7 +376,7 @@ class E2ERuntime:
                     name="backend-restart",
                 )
         elif action == "fault_injection":
-            if self.config.scenario != "app-release-rollout":
+            if self.config.scenario not in {"app-release-rollout", "app-control-plane"}:
                 return {
                     "status": "rejected",
                     "scenario": self.config.scenario,
@@ -1124,6 +1129,25 @@ class E2ERuntime:
             }
         target_rollout_coordinates = rollout_coordinates(target_app_id, next_release, next_checksum)
         foreign_rollout_coordinates = rollout_coordinates(foreign_app_id, foreign_next, foreign_checksum)
+        target_resume_coordinates = {
+            "method": "POST",
+            "path": f"/api/v1/apps/{target_app_id}/rollouts/{{rollout_id}}/resume",
+            "body": {
+                "release_id": str(next_release),
+                "manifest_checksum": next_checksum,
+                "idempotency_key": "uuid-v4",
+            },
+            "headers": {"Idempotency-Key": "uuid-v4"},
+        }
+        self_app_resume_coordinates = {
+            "method": "POST",
+            "path": "/api/v1/app/rollouts/{rollout_id}/resume",
+            "body": {
+                "release_id": str(next_release),
+                "manifest_checksum": next_checksum,
+            },
+            "headers": {"Idempotency-Key": "uuid-v4"},
+        }
         random_ids = {
             "app_id": str(uuid.uuid4()),
             "release_id": str(uuid.uuid4()),
@@ -1165,6 +1189,21 @@ class E2ERuntime:
                     "exchange": {"service": "app", "method": "POST", "path": "/api/v1/auth/app-token", "body": {"credential": "<issued-value>"}},
                     "request": target_rollout_coordinates["request"],
                     "status": target_rollout_coordinates["status"],
+                    "resume": target_resume_coordinates,
+                    "registry": {
+                        "app_create": {
+                            "service": "app",
+                            "method": "POST",
+                            "path": "/api/v1/apps",
+                            "body_fields": ["app_key", "display_name", "description", "metadata"],
+                        },
+                        "release_create": {
+                            "service": "app",
+                            "method": "POST",
+                            "path": f"/api/v1/apps/{target_app_id}/releases",
+                            "body_fields": ["version", "manifest", "manifest_checksum"],
+                        },
+                    },
                     "apps": {
                         "target": target_rollout_coordinates,
                         "foreign": foreign_rollout_coordinates,
@@ -1173,6 +1212,7 @@ class E2ERuntime:
                 "self_app": {
                     "request": {"service": "app", "method": "POST", "path": "/api/v1/app/rollouts", "body": {"release_id": str(next_release), "manifest_checksum": next_checksum}, "headers": {"Idempotency-Key": "uuid-v4"}},
                     "status": {"service": "app", "method": "GET", "path": "/api/v1/app/rollouts/{rollout_id}"},
+                    "resume": self_app_resume_coordinates,
                 },
                 "installation_status": {"service": "app", "method": "GET", "path": f"/api/v1/apps/{target_app_id}/installations/{{vault_id}}"},
             },
@@ -1731,6 +1771,12 @@ class E2ERuntime:
                         password_hash=password_hash,
                         system_admin_id=system_admin_id,
                     )
+                elif self.config.scenario == "app-control-plane":
+                    await self._seed_app_release_rollout(
+                        connection,
+                        password_hash=password_hash,
+                        system_admin_id=system_admin_id,
+                    )
                 else:
                     self._fixture_catalog = {
                         "status": "ready",
@@ -2003,7 +2049,12 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
     parser.add_argument("--password-env", default=DEFAULT_PASSWORD_ENV)
     parser.add_argument(
         "--scenario",
-        choices=("empty", "app-installation-lifecycle", "app-release-rollout"),
+        choices=(
+            "empty",
+            "app-installation-lifecycle",
+            "app-release-rollout",
+            "app-control-plane",
+        ),
         default=SCENARIO,
     )
     args = parser.parse_args(argv)

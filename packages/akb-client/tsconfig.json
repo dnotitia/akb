@@ -4,6 +4,12 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+    "baseUrl": ".",
+    "paths": {
+      "@akb/client": ["./src/index.ts"],
+      "@akb/client/lite": ["./src/lite.ts"],
+      "@akb/client/control-plane": ["./src/control-plane.ts"]
+    },
     "strict": true,
     "skipLibCheck": true,
     "isolatedModules": true,

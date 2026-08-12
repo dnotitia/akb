@@ -3,6 +3,11 @@ import { readFile } from "node:fs/promises";
 
 import { AkbError, createClient } from "@akb/client";
 import { createClient as createLiteClient } from "@akb/client/lite";
+import {
+  createControlPlaneAdminClient,
+  createControlPlaneAppClient,
+  exchangeAppCredential,
+} from "@akb/client/control-plane";
 
 const contract = JSON.parse(
   await readFile(
@@ -50,6 +55,16 @@ const client = root.vault("packed vault").actingAs(claims);
 const lite = createLiteClient({
   baseUrl: "https://packed.invalid/api/v1",
   defaultVault: "packed vault",
+  fetch,
+});
+const admin = createControlPlaneAdminClient({
+  baseUrl: "https://packed.invalid/api/v1",
+  adminToken: () => "packed-admin-token",
+  fetch,
+});
+const app = createControlPlaneAppClient({
+  baseUrl: "https://packed.invalid/api/v1",
+  appToken: () => "packed-app-token",
   fetch,
 });
 assert.equal(typeof lite.graph.neighbors, "function");
@@ -102,6 +117,62 @@ assert.ok(calls.every((call) => call.headers.authorization === "Bearer packed-co
 assert.ok(calls.every((call) => call.headers["x-akb-claims"] === JSON.stringify(claims)));
 assert.equal(calls[18].headers["idempotency-key"], "packed-migration");
 
+const controlStart = calls.length;
+const controlApp = "app control";
+const controlVault = "vault control";
+const controlRelease = "release-control";
+const controlCredential = "credential-control";
+const controlSnapshot = "snapshot-control";
+const controlTarget = "target-control";
+const controlRollout = "rollout-control";
+const controlBody = {
+  release_id: controlRelease,
+  manifest_checksum: "a".repeat(64),
+};
+const controlResults = [
+  await app.authorize({ vault_id: controlVault, capability: "inventory:read" }),
+  await app.installations.get(controlVault),
+  await app.inventory.list({ limit: 5 }),
+  await app.inventory.reportObserved({ installation_id: "installation-control", observed_generation: 1 }),
+  await app.snapshots.create(),
+  await app.snapshots.get(controlSnapshot),
+  await app.snapshots.evaluate(controlSnapshot, controlTarget),
+  await app.rollouts.request(controlBody, "key-app-request"),
+  await app.rollouts.get(controlRollout),
+  await app.rollouts.resume(controlRollout, controlBody, "key-app-resume"),
+  await admin.apps.create({ app_key: "control-app" }),
+  await admin.apps.get(controlApp),
+  await admin.apps.update(controlApp, { display_name: "Control" }),
+  await admin.credentials.issue(controlApp, { deployment: "packed" }),
+  await admin.credentials.list(controlApp, { deployment: "packed" }),
+  await admin.credentials.revoke(controlApp, controlCredential),
+  await admin.credentials.rotate(controlApp, controlCredential),
+  await admin.installations.apply(controlApp, controlVault, { release_id: controlRelease, capabilities: ["inventory:read"] }),
+  await admin.installations.get(controlApp, controlVault),
+  await admin.installations.uninstall(controlApp, controlVault),
+  await admin.inventory.list(controlApp, { limit: 5 }),
+  await admin.inventory.reportObserved(controlApp, { installation_id: "installation-control", observed_generation: 1 }),
+  await admin.releases.create(controlApp, { version: "1.0.0", manifest: { steps: [] }, manifest_checksum: "a".repeat(64) }),
+  await admin.releases.get(controlApp, controlRelease),
+  await admin.snapshots.create(controlApp),
+  await admin.snapshots.get(controlApp, controlSnapshot),
+  await admin.snapshots.evaluate(controlApp, controlSnapshot, controlTarget),
+  await admin.rollouts.request(controlApp, controlBody, "key-admin-request"),
+  await admin.rollouts.get(controlApp, controlRollout),
+  await admin.rollouts.resume(controlApp, controlRollout, controlBody, "key-admin-resume"),
+  await exchangeAppCredential({ baseUrl: "https://packed.invalid/api/v1", credential: "packed-deployment-credential", fetch }),
+];
+assert.equal(controlResults.length, contract.controlPlane.length);
+for (const [index, item] of contract.controlPlane.entries()) {
+  assert.equal(calls[controlStart + index].method, item.method.toUpperCase(), `${item.operationId} method`);
+  assert.equal(calls[controlStart + index].url.pathname, controlPath(item), `${item.operationId} path`);
+}
+assert.equal(calls[controlStart].headers.authorization, "Bearer packed-app-token");
+assert.equal(calls[controlStart + 10].headers.authorization, "Bearer packed-admin-token");
+assert.equal(calls[controlStart + 7].headers["idempotency-key"], "key-app-request");
+assert.equal(calls[controlStart + 9].headers["idempotency-key"], "key-app-resume");
+assert.equal(calls[controlStart + 27].headers["idempotency-key"], "key-admin-request");
+
 const rawAt = calls.length;
 await client.graph.request("/raw");
 await client.activity.request("/raw");
@@ -137,7 +208,7 @@ assert.throws(() => unscoped.docs.createCollection({ path: "a" }), /Select a vau
 assert.throws(() => unscoped.tables.list(), /Select a vault/);
 assert.equal(missingVaultFetches, 0);
 
-console.log("Packed SDK runtime proof passed: 20 operations, main/lite, raw/error/preflight.");
+console.log(`Packed SDK runtime proof passed: ${contract.operations.length} data-plane + ${contract.controlPlane.length} control-plane operations.`);
 
 function payload(url, method, body) {
   if (url.pathname.endsWith("/graph")) return { kind: "graph_neighbors", nodes: [], edges: [] };
@@ -251,4 +322,17 @@ function contractPath(item) {
       ? value.split("/").map(encodeURIComponent).join("/")
       : encodeURIComponent(value);
   });
+}
+
+function controlPath(item) {
+  const parameters = {
+    app_id: controlApp,
+    vault_id: controlVault,
+    release_id: controlRelease,
+    credential_id: controlCredential,
+    snapshot_id: controlSnapshot,
+    target_id: controlTarget,
+    rollout_id: controlRollout,
+  };
+  return item.path.replace(/\{([^}]+)\}/g, (_, name) => encodeURIComponent(parameters[name]));
 }
