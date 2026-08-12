@@ -78,27 +78,31 @@ async def lifespan(app: FastAPI):
     # Idempotent — already-covered handlers are skipped.
     install_secret_redaction()
     await init_storage()
-    # Stamp the external-mirror marker on any mirror whose
-    # bare repo predates it, so its reads route through the hermetic runner
-    # (fail-closed) rather than GitPython. Runs AFTER the DB is up (authoritative
-    # mirror list) and BEFORE workers/requests. UNCONDITIONAL — it runs even when
-    # external_git is disabled, because the marker is the fail-closed safety net
-    # that makes the read paths correctly REFUSE a disabled mirror (503) rather
-    # than serve it via GitPython; the kill-switch lives on the poller-start gate
-    # and the read paths, not here. FAIL-FAST: if a marker cannot be written onto
-    # an existing mirror bare (disk/permission), or the mirror list can't be
-    # read, this raises and startup ABORTS rather than serving mirrors that would
-    # fall open. No serving has begun yet, so the fail-open window is zero.
-    marked = await external_git_service.backfill_mirror_markers()
-    if marked:
-        logger.info("Backfilled external-git mirror marker on %d vault(s)", marked)
-    # When the mirror feature is enabled, prove at boot (in a
-    # thread; it runs a git subprocess + loopback socket) that this git build
-    # actually enforces the network controls the hermetic runner depends on
-    # (http.curloptResolve DNS-pin, proxy-off, --config-env) and meets the git
-    # >= 2.37 floor. Fast-fails the boot BEFORE workers/serving start if not; a
-    # no-op when external_git is disabled. No real network (uses a *.invalid host).
-    await asyncio.to_thread(check_external_git_capability, settings)
+    bare_git_selected = selected_document_revision_backend() == "bare_git"
+    if bare_git_selected:
+        # Stamp the external-mirror marker on any mirror whose
+        # bare repo predates it, so its reads route through the hermetic runner
+        # (fail-closed) rather than GitPython. Runs AFTER the DB is up (authoritative
+        # mirror list) and BEFORE workers/requests. This remains unconditional
+        # within Bare-Git mode, even when external_git is disabled, because the
+        # marker is the fail-closed safety net that makes the read paths correctly
+        # REFUSE a disabled mirror (503) rather than serve it via GitPython. The
+        # backfill is not composed for PostgreSQL Native, whose vault storage is
+        # PostgreSQL-only and may have no Git write authority. FAIL-FAST: if a
+        # marker cannot be written onto an existing mirror bare (disk/permission),
+        # or the mirror list can't be read, this raises and startup ABORTS rather
+        # than serving mirrors that would fall open. No serving has begun yet, so
+        # the fail-open window is zero.
+        marked = await external_git_service.backfill_mirror_markers()
+        if marked:
+            logger.info("Backfilled external-git mirror marker on %d vault(s)", marked)
+        # When the mirror feature is enabled, prove at boot (in a
+        # thread; it runs a git subprocess + loopback socket) that this git build
+        # actually enforces the network controls the hermetic runner depends on
+        # (http.curloptResolve DNS-pin, proxy-off, --config-env) and meets the git
+        # >= 2.37 floor. Fast-fails the boot BEFORE workers/serving start if not; a
+        # no-op when external_git is disabled. No real network (uses a *.invalid host).
+        await asyncio.to_thread(check_external_git_capability, settings)
     start_workers()
     yield
     await stop_workers()
