@@ -9,6 +9,7 @@ from typing import Protocol
 import asyncpg
 
 from app.exceptions import ConflictError
+from app.util.errors import NATIVE_REVISION_SELECTOR_AMBIGUOUS
 
 
 class NativeRevisionIdCollisionError(ConflictError):
@@ -31,7 +32,7 @@ class NativeRevisionSelectorAmbiguousError(ConflictError):
 
     def __init__(self, selector: str):
         super().__init__(f"Native Revision selector is ambiguous: {selector}")
-        self.code = "native_revision_selector_ambiguous"
+        self.code = NATIVE_REVISION_SELECTOR_AMBIGUOUS
 
 
 class PreparedPayload(Protocol):
