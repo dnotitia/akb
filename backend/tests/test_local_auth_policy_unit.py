@@ -100,9 +100,7 @@ async def test_revoke_all_sessions_service_denies_before_database(monkeypatch):
     monkeypatch.setattr(auth_service, "get_pool", _must_not_touch_db)
 
     with pytest.raises(LocalAuthDisabledError):
-        await auth_service.revoke_all_sessions(
-            "00000000-0000-0000-0000-000000000001"
-        )
+        await auth_service.revoke_all_sessions("00000000-0000-0000-0000-000000000001")
 
 
 async def test_local_lifecycle_routes_deny_before_service_calls(monkeypatch):
@@ -129,16 +127,19 @@ async def test_local_lifecycle_routes_deny_before_service_calls(monkeypatch):
             auth.RegisterRequest(
                 username="member",
                 email="member@example.com",
-                password="known-password",
+                password="known-password",  # pragma: allowlist secret
             )
         ),
         lambda: auth.login_user(
-            auth.LoginRequest(username="member", password="known-password")
+            auth.LoginRequest(
+                username="member",
+                password="known-password",  # pragma: allowlist secret
+            )
         ),
         lambda: auth.change_password_route(
             auth.ChangePasswordRequest(
-                current_password="known-password",
-                new_password="new-known-password",
+                current_password="known-password",  # pragma: allowlist secret
+                new_password="new-known-password",  # pragma: allowlist secret
             ),
             actor,
         ),

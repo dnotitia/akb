@@ -13,11 +13,13 @@ adoption entry point. See ``docs/designs/keycloak-oidc/00-overview.md``.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
 import logging
 import secrets
+import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
@@ -41,9 +43,8 @@ logger = logging.getLogger("akb.keycloak")
 # routes never issue an authorization request.
 _SCOPE = "openid profile email"
 _TOKEN_SUPPLIED_KEY_HEADERS = frozenset({"jku", "x5u", "jwk", "x5c"})
-_SERVICE_ACCOUNT_CLAIMS = frozenset(
-    {"client_id", "clientId", "clientHost", "clientAddress"}
-)
+_SERVICE_ACCOUNT_CLAIMS = frozenset({"client_id", "clientId", "clientHost", "clientAddress"})
+_JWKS_REFRESH_COOLDOWN_SECONDS = 30.0
 
 
 # ── Transient store (oidc_transients table) ──────────────────────────
@@ -65,7 +66,10 @@ async def _store_issue(key: str, kind: str, payload: dict, ttl_secs: int) -> Non
             INSERT INTO oidc_transients (key, kind, payload, expires_at)
             VALUES ($1, $2, $3::jsonb, $4)
             """,
-            key, kind, json.dumps(payload), expires_at,
+            key,
+            kind,
+            json.dumps(payload),
+            expires_at,
         )
 
 
@@ -79,7 +83,8 @@ async def _store_consume(key: str, kind: str) -> dict | None:
              WHERE key = $1 AND kind = $2 AND expires_at > NOW()
             RETURNING payload
             """,
-            key, kind,
+            key,
+            kind,
         )
     if row is None:
         return None
@@ -92,8 +97,12 @@ class KeycloakOIDC:
     """Pinned verifier with dormant, PostgreSQL-backed browser helpers."""
 
     def __init__(self) -> None:
-        # JWKS cached in-process; refetched on key rotation (kid miss).
+        # JWKS is cached in-process. Unknown kids may request one bounded,
+        # single-flight refresh per cooldown window so attacker-controlled
+        # headers cannot amplify unauthenticated traffic to Keycloak.
         self._jwks: dict[str, Any] | None = None
+        self._jwks_refresh_lock = asyncio.Lock()
+        self._jwks_refresh_attempt_at: float | None = None
         self._http: httpx.AsyncClient | None = None
 
     # ── HTTP client (honors verify_ssl) ──────────────────────────────
@@ -127,15 +136,9 @@ class KeycloakOIDC:
     @staticmethod
     def _effective_client_id(client_id: str | None) -> str:
         """Resolve an optional server-selected client to the legacy default."""
-        return (
-            client_id.strip()
-            if client_id and client_id.strip()
-            else settings.keycloak_client_id
-        )
+        return client_id.strip() if client_id and client_id.strip() else settings.keycloak_client_id
 
-    async def begin_login(
-        self, redirect_path: str = "/", *, client_id: str | None = None
-    ) -> str:
+    async def begin_login(self, redirect_path: str = "/", *, client_id: str | None = None) -> str:
         """Build dormant Phase 4 authorization state and redirect URL.
 
         No Phase 1 production route calls this helper. Any future caller must
@@ -162,7 +165,9 @@ class KeycloakOIDC:
             params["code_challenge_method"] = "S256"
 
         await _store_issue(
-            state, "state", payload,
+            state,
+            "state",
+            payload,
             ttl_secs=600,  # 10 min to complete the Keycloak login screen
         )
         return f"{settings.keycloak_authorization_endpoint}?{urllib.parse.urlencode(params)}"
@@ -193,9 +198,7 @@ class KeycloakOIDC:
             data["client_secret"] = settings.keycloak_client_secret
 
         try:
-            resp = await self._client().post(
-                settings.keycloak_token_endpoint, data=data
-            )
+            resp = await self._client().post(settings.keycloak_token_endpoint, data=data)
         except httpx.HTTPError as e:
             logger.error("Keycloak token exchange network error: %s", e)
             raise AKBError("Keycloak unreachable during token exchange", status_code=502) from e
@@ -203,7 +206,8 @@ class KeycloakOIDC:
         if resp.status_code != 200:
             logger.warning(
                 "Keycloak token exchange failed: %s %s",
-                resp.status_code, resp.text[:500],
+                resp.status_code,
+                resp.text[:500],
             )
             # A bad/expired/replayed code is a client-side auth failure.
             raise AuthenticationError("Authorization code exchange failed")
@@ -213,16 +217,41 @@ class KeycloakOIDC:
     async def _fetch_jwks(self, *, force: bool = False) -> dict[str, Any]:
         if self._jwks is not None and not force:
             return self._jwks
-        try:
-            resp = await self._client().get(settings.keycloak_jwks_uri)
-        except httpx.HTTPError as e:
-            logger.error("Keycloak JWKS fetch network error: %s", e)
-            raise AKBError("Keycloak unreachable fetching JWKS", status_code=502) from e
-        if resp.status_code != 200:
-            logger.error("Keycloak JWKS fetch failed: %s", resp.status_code)
-            raise AKBError("Failed to fetch Keycloak public keys", status_code=502)
-        self._jwks = resp.json()
-        return self._jwks
+        async with self._jwks_refresh_lock:
+            if self._jwks is not None and not force:
+                return self._jwks
+
+            now = time.monotonic()
+            if (
+                self._jwks_refresh_attempt_at is not None
+                and now - self._jwks_refresh_attempt_at < _JWKS_REFRESH_COOLDOWN_SECONDS
+            ):
+                if self._jwks is not None:
+                    return self._jwks
+                raise AKBError(
+                    "Keycloak public keys are temporarily unavailable",
+                    status_code=502,
+                )
+
+            # Record attempts, not just successes. A Keycloak outage must not
+            # turn malformed bearer traffic into an upstream request storm.
+            self._jwks_refresh_attempt_at = now
+            try:
+                resp = await self._client().get(settings.keycloak_jwks_uri)
+            except httpx.HTTPError as e:
+                logger.error("Keycloak JWKS fetch network error: %s", e)
+                raise AKBError("Keycloak unreachable fetching JWKS", status_code=502) from e
+            if resp.status_code != 200:
+                logger.error("Keycloak JWKS fetch failed: %s", resp.status_code)
+                raise AKBError("Failed to fetch Keycloak public keys", status_code=502)
+            try:
+                candidate = resp.json()
+            except (TypeError, ValueError) as e:
+                raise AKBError("Keycloak returned invalid public keys", status_code=502) from e
+            if not isinstance(candidate, dict) or not isinstance(candidate.get("keys"), list):
+                raise AKBError("Keycloak returned invalid public keys", status_code=502)
+            self._jwks = candidate
+            return self._jwks
 
     @staticmethod
     def _find_key(jwks: dict[str, Any], kid: str) -> dict | None:
@@ -234,9 +263,7 @@ class KeycloakOIDC:
             None,
         )
 
-    async def verify_id_token(
-        self, id_token: str, *, client_id: str | None = None
-    ) -> dict[str, Any]:
+    async def verify_id_token(self, id_token: str, *, client_id: str | None = None) -> dict[str, Any]:
         """Verify a Keycloak ID token locally and return its claims.
 
         Validates signature (RS256), audience (client_id), issuer (realm),
@@ -266,11 +293,7 @@ class KeycloakOIDC:
             key = self._find_key(jwks, kid)
         if key is None:
             raise AuthenticationError("No matching Keycloak public key for token")
-        if (
-            key.get("kty") != "RSA"
-            or key.get("use") != "sig"
-            or key.get("alg") != "RS256"
-        ):
+        if key.get("kty") != "RSA" or key.get("use") != "sig" or key.get("alg") != "RS256":
             raise AuthenticationError("Keycloak ID-token signing key is not allowed")
 
         try:
@@ -330,11 +353,7 @@ class KeycloakOIDC:
             return None
         if key is None:
             return None
-        if (
-            key.get("kty") != "RSA"
-            or key.get("use") != "sig"
-            or key.get("alg") != "RS256"
-        ):
+        if key.get("kty") != "RSA" or key.get("use") != "sig" or key.get("alg") != "RS256":
             return None
 
         try:
@@ -365,17 +384,17 @@ class KeycloakOIDC:
             return None
 
         required_strings = ("iss", "sub", "jti", "typ", "azp", "sid", "scope")
-        if any(
-            not isinstance(claims.get(name), str) or not claims[name].strip()
-            for name in required_strings
-        ):
+        if any(not isinstance(claims.get(name), str) or not claims[name].strip() for name in required_strings):
             return None
         if claims["typ"] != "Bearer":
             return None
-        if (
-            route_profile == "api"
-            and claims["azp"] not in settings.keycloak_human_client_ids
-        ):
+        for optional_name in ("email", "name", "preferred_username"):
+            optional_value = claims.get(optional_name)
+            if optional_value is not None and not isinstance(optional_value, str):
+                return None
+        if "email_verified" in claims and type(claims["email_verified"]) is not bool:
+            return None
+        if route_profile == "api" and claims["azp"] not in settings.keycloak_human_client_ids:
             return None
         if type(claims.get("iat")) is not int or type(claims.get("exp")) is not int:
             return None
@@ -384,29 +403,19 @@ class KeycloakOIDC:
         raw_audience = claims.get("aud")
         if isinstance(raw_audience, str):
             audiences = {raw_audience}
-        elif isinstance(raw_audience, list) and all(
-            isinstance(item, str) and item for item in raw_audience
-        ):
+        elif isinstance(raw_audience, list) and all(isinstance(item, str) and item for item in raw_audience):
             audiences = set(raw_audience)
         else:
             return None
         other_route_audience = (
-            settings.mcp_oauth_audience_effective
-            if route_profile == "api"
-            else settings.api_oauth_audience_effective
+            settings.mcp_oauth_audience_effective if route_profile == "api" else settings.api_oauth_audience_effective
         )
-        if (
-            other_route_audience
-            and other_route_audience != audience
-            and other_route_audience in audiences
-        ):
+        if other_route_audience and other_route_audience != audience and other_route_audience in audiences:
             return None
         if _SERVICE_ACCOUNT_CLAIMS.intersection(claims):
             return None
         preferred_username = claims.get("preferred_username")
-        if isinstance(preferred_username, str) and preferred_username.startswith(
-            "service-account-"
-        ):
+        if isinstance(preferred_username, str) and preferred_username.startswith("service-account-"):
             return None
 
         return VerifiedPrincipal(

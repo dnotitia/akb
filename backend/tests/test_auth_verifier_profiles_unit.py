@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import uuid
@@ -241,7 +242,7 @@ async def test_rest_sso_mode_rejects_a_valid_local_session_jwt(monkeypatch):
     from app.services.auth_verifier_profiles import verify_local_session_legacy_v1
     from app.services.keycloak_oidc import KeycloakOIDC
 
-    secret = "required-compatibility-hmac-secret"
+    secret = "required-compatibility-hmac-secret"  # pragma: allowlist secret
     now = int(datetime.now(timezone.utc).timestamp())
     local_token = jwt.encode(
         {
@@ -282,10 +283,7 @@ async def test_rest_sso_mode_rejects_a_valid_local_session_jwt(monkeypatch):
     monkeypatch.setattr(auth_service, "verify_keycloak_access_v1", verify_keycloak)
     monkeypatch.setattr(auth_service, "project_verified_principal", forbidden_projection)
 
-    assert (
-        await auth_service.resolve_rest_user_authorization(f"Bearer {local_token}")
-        is None
-    )
+    assert await auth_service.resolve_rest_user_authorization(f"Bearer {local_token}") is None
 
 
 @pytest.mark.asyncio
@@ -377,7 +375,7 @@ async def test_mcp_never_accepts_local_session_jwt(monkeypatch):
 def test_local_session_legacy_v1_is_fixed_hs256_with_strict_current_claims(monkeypatch):
     from app.services.auth_verifier_profiles import verify_local_session_legacy_v1
 
-    secret = "local-session-test-secret-at-least-32-bytes"
+    secret = "local-session-test-secret-at-least-32-bytes"  # pragma: allowlist secret
     monkeypatch.setattr(settings, "jwt_secret", secret, raising=False)
     now = int(datetime.now(timezone.utc).timestamp())
     claims = {
@@ -554,6 +552,10 @@ async def test_keycloak_mcp_profile_does_not_apply_static_human_azp_allowlist(
         ("azp", ""),
         ("sid", ""),
         ("scope", ""),
+        ("email", ["alice@example.com"]),
+        ("email_verified", "true"),
+        ("name", {"display": "Alice"}),
+        ("preferred_username", ["alice"]),
     ],
 )
 async def test_keycloak_access_v1_rejects_wrong_or_incomplete_profile_claims(
@@ -695,6 +697,50 @@ async def test_keycloak_access_v1_unknown_kid_refreshes_same_pinned_jwks_once(
 
     assert await service.verify_access_token(token, api_audience, route_profile="api") is None
     assert calls == [False, True]
+    assert requested_urls == [settings.keycloak_jwks_uri]
+
+
+@pytest.mark.asyncio
+async def test_keycloak_access_v1_unknown_kid_refresh_is_single_flight_and_bounded(
+    monkeypatch,
+    rsa_keypair,
+):
+    from app.services.keycloak_oidc import KeycloakOIDC
+
+    issuer, api_audience, _ = _configure_keycloak(monkeypatch)
+    service = KeycloakOIDC()
+    service._jwks = {"keys": []}
+    requested_urls: list[str] = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"keys": []}
+
+    class Client:
+        async def get(self, url: str):
+            requested_urls.append(url)
+            await asyncio.sleep(0)
+            return Response()
+
+    service._client = lambda: Client()  # type: ignore[method-assign]
+    tokens = [
+        _mint_keycloak_token(
+            rsa_keypair,
+            issuer=issuer,
+            audience=api_audience,
+            header_overrides={"kid": f"attacker-key-{index}"},
+        )
+        for index in range(32)
+    ]
+
+    results = await asyncio.gather(
+        *(service.verify_access_token(token, api_audience, route_profile="api") for token in tokens)
+    )
+
+    assert results == [None] * len(tokens)
     assert requested_urls == [settings.keycloak_jwks_uri]
 
 

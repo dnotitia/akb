@@ -50,6 +50,36 @@ describe("getAuthConfig v1", () => {
     ["missing mode", { schema_version: 1 }],
     ["unknown mode", { schema_version: 1, auth_mode: "hybrid" }],
     [
+      "additional root property",
+      {
+        schema_version: 1,
+        auth_mode: "local",
+        local_auth: { enabled: true },
+        keycloak: {
+          enabled: false,
+          browser_session_ready: false,
+          login_url: null,
+        },
+        mcp_oauth: { enabled: false },
+        local_auth_override: true,
+      },
+    ],
+    [
+      "additional nested property",
+      {
+        schema_version: 1,
+        auth_mode: "sso",
+        local_auth: { enabled: false },
+        keycloak: {
+          enabled: true,
+          browser_session_ready: false,
+          login_url: null,
+          fallback_to_local: true,
+        },
+        mcp_oauth: { enabled: false },
+      },
+    ],
+    [
       "mode contradiction",
       {
         schema_version: 1,

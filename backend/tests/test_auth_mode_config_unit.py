@@ -78,7 +78,7 @@ def test_runtime_load_rejects_unknown_mode_without_echoing_secrets(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    secret = "must-not-appear-in-auth-mode-diagnostic"
+    secret = "must-not-appear-in-auth-mode-diagnostic"  # pragma: allowlist secret
 
     with pytest.raises(app_config.AuthModeConfigurationError) as exc_info:
         _load(
@@ -135,7 +135,7 @@ def test_runtime_load_rejects_mode_contradictions(
     values: dict[str, object],
     expected_detail: str,
 ) -> None:
-    secret = "must-not-appear-in-contradiction-diagnostic"
+    secret = "must-not-appear-in-contradiction-diagnostic"  # pragma: allowlist secret
     values["db_password"] = secret
 
     with pytest.raises(app_config.AuthModeConfigurationError) as exc_info:
@@ -250,8 +250,8 @@ def test_local_mcp_oauth_startup_does_not_require_human_oidc_client_config(
             "keycloak_enabled": True,
             "mcp_oauth_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
-            "jwt_secret": "test-jwt-secret",
-            "db_password": "test-db-password",
+            "jwt_secret": "test-jwt-secret",  # pragma: allowlist secret
+            "db_password": "test-db-password",  # pragma: allowlist secret
             "public_base_url": "https://akb.example.com",
         },
     )
@@ -260,7 +260,7 @@ def test_local_mcp_oauth_startup_does_not_require_human_oidc_client_config(
     lifecycle._validate_required_settings()
 
 
-def test_sso_startup_still_requires_human_oidc_client_config(
+def test_sso_startup_requires_active_human_api_verifier_config_only(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -273,8 +273,9 @@ def test_sso_startup_still_requires_human_oidc_client_config(
             "auth_mode": "sso",
             "keycloak_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
-            "jwt_secret": "test-jwt-secret",
-            "db_password": "test-db-password",
+            "keycloak_client_id": "",
+            "jwt_secret": "test-jwt-secret",  # pragma: allowlist secret
+            "db_password": "test-db-password",  # pragma: allowlist secret
             "public_base_url": "https://akb.example.com",
         },
     )
@@ -284,8 +285,35 @@ def test_sso_startup_still_requires_human_oidc_client_config(
         lifecycle._validate_required_settings()
 
     message = str(exc_info.value)
-    assert "keycloak_redirect_uri (auth_mode is sso" in message
-    assert "keycloak_client_secret (auth_mode is sso" in message
+    assert "human API client allowlist" in message
+    assert "keycloak_redirect_uri" not in message
+    assert "keycloak_client_secret" not in message
+
+
+def test_sso_startup_defers_browser_callback_inputs_until_browser_sessions_exist(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from app.services import lifecycle
+
+    loaded = _load(
+        monkeypatch,
+        tmp_path,
+        {
+            "auth_mode": "sso",
+            "keycloak_enabled": True,
+            "keycloak_server_url": "https://auth.example.com",
+            "keycloak_client_id": "akb-web",
+            "keycloak_redirect_uri": "",
+            "keycloak_client_secret": "",
+            "jwt_secret": "test-jwt-secret",  # pragma: allowlist secret
+            "db_password": "test-db-password",  # pragma: allowlist secret
+            "public_base_url": "https://akb.example.com",
+        },
+    )
+    monkeypatch.setattr(lifecycle, "settings", loaded)
+
+    lifecycle._validate_required_settings()
 
 
 def test_sso_startup_rejects_missing_compatibility_hmac_secret(
@@ -302,8 +330,8 @@ def test_sso_startup_rejects_missing_compatibility_hmac_secret(
             "keycloak_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
             "keycloak_redirect_uri": "https://akb.example.com/auth/keycloak/callback",
-            "keycloak_client_secret": "test-keycloak-client-secret",
-            "db_password": "test-db-password",
+            "keycloak_client_secret": "test-keycloak-client-secret",  # pragma: allowlist secret
+            "db_password": "test-db-password",  # pragma: allowlist secret
             "public_base_url": "https://akb.example.com",
         },
     )
@@ -329,10 +357,10 @@ def test_sso_startup_does_not_select_legacy_hs256_human_profile(
             "keycloak_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
             "keycloak_redirect_uri": "https://akb.example.com/auth/keycloak/callback",
-            "keycloak_client_secret": "test-keycloak-client-secret",
+            "keycloak_client_secret": "test-keycloak-client-secret",  # pragma: allowlist secret
             "jwt_algorithm": "RS256",
-            "jwt_secret": "compatibility-hmac-secret",
-            "db_password": "test-db-password",
+            "jwt_secret": "compatibility-hmac-secret",  # pragma: allowlist secret
+            "db_password": "test-db-password",  # pragma: allowlist secret
             "public_base_url": "https://akb.example.com",
         },
     )
@@ -352,8 +380,8 @@ def test_local_startup_requires_legacy_session_secret_independently_of_app_secre
         tmp_path,
         {
             "auth_mode": "local",
-            "app_token_secret": "independent-app-token-secret",
-            "db_password": "test-db-password",
+            "app_token_secret": "independent-app-token-secret",  # pragma: allowlist secret
+            "db_password": "test-db-password",  # pragma: allowlist secret
             "public_base_url": "https://akb.example.com",
         },
     )
@@ -392,8 +420,8 @@ def test_startup_rejects_equal_api_and_mcp_audiences(
             "keycloak_server_url": "https://auth.example.com",
             "api_oauth_audience": shared_audience,
             "mcp_oauth_audience": shared_audience,
-            "jwt_secret": "test-jwt-secret",
-            "db_password": "test-db-password",
+            "jwt_secret": "test-jwt-secret",  # pragma: allowlist secret
+            "db_password": "test-db-password",  # pragma: allowlist secret
             "public_base_url": "https://akb.example.com",
         },
     )
@@ -415,8 +443,8 @@ def test_startup_rejects_configurable_algorithm_for_fixed_legacy_profile(
         {
             "auth_mode": "local",
             "jwt_algorithm": "RS256",
-            "jwt_secret": "test-jwt-secret",
-            "db_password": "test-db-password",
+            "jwt_secret": "test-jwt-secret",  # pragma: allowlist secret
+            "db_password": "test-db-password",  # pragma: allowlist secret
             "public_base_url": "https://akb.example.com",
         },
     )

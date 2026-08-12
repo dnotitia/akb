@@ -85,6 +85,7 @@ class AuthenticatedUser:
 
 # ── Password hashing ────────────────────────────────────────
 
+
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
@@ -107,6 +108,7 @@ def verify_password(password: str, password_hash: str) -> bool:
 # timeouts → 503 / kubelet SIGKILL (2026-07-20 incident). Always await these
 # async wrappers from request paths; the sync forms remain the thread target.
 
+
 async def hash_password_async(password: str) -> str:
     return await asyncio.to_thread(hash_password, password)
 
@@ -116,6 +118,7 @@ async def verify_password_async(password: str, password_hash: str) -> bool:
 
 
 # ── JWT ──────────────────────────────────────────────────────
+
 
 def create_jwt(
     user_id: str,
@@ -154,6 +157,7 @@ def decode_jwt(token: str) -> dict | None:
 
 # ── PAT ──────────────────────────────────────────────────────
 
+
 def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
@@ -169,9 +173,7 @@ def generate_pat(key_class: str = "pat") -> tuple[str, str, str]:
 def _normalize_key_class(key_class: str | None) -> str:
     value = key_class or "pat"
     if value not in TOKEN_KEY_CLASSES:
-        raise ValidationError(
-            f"Invalid key_class {value!r}. Must be one of: {sorted(TOKEN_KEY_CLASSES)}"
-        )
+        raise ValidationError(f"Invalid key_class {value!r}. Must be one of: {sorted(TOKEN_KEY_CLASSES)}")
     return value
 
 
@@ -179,8 +181,7 @@ def _normalize_issuable_key_class(key_class: str | None) -> str:
     value = _normalize_key_class(key_class)
     if value not in ISSUABLE_TOKEN_KEY_CLASSES:
         raise ValidationError(
-            "key_class='publishable' is reserved for the future browser-direct "
-            "flow and cannot be issued yet."
+            "key_class='publishable' is reserved for the future browser-direct flow and cannot be issued yet."
         )
     return value
 
@@ -202,9 +203,7 @@ def normalize_token_scopes(scopes: list[str] | None) -> list[str]:
         if not isinstance(scope, str) or not scope:
             raise ValidationError("scopes must contain non-empty strings")
         if scope not in TOKEN_SCOPES:
-            raise ValidationError(
-                f"Invalid token scope {scope!r}. Must be one of: {sorted(TOKEN_SCOPES)}"
-            )
+            raise ValidationError(f"Invalid token scope {scope!r}. Must be one of: {sorted(TOKEN_SCOPES)}")
         if scope not in seen:
             normalized.append(scope)
             seen.add(scope)
@@ -231,6 +230,7 @@ def token_has_scope(granted: frozenset[str] | None, required: str) -> bool:
 
 # ── User operations ─────────────────────────────────────────
 
+
 async def register(username: str, email: str, password: str, display_name: str | None = None) -> dict:
     require_local_auth_enabled()
     pool = await get_pool()
@@ -241,7 +241,8 @@ async def register(username: str, email: str, password: str, display_name: str |
         # Check duplicates
         existing = await conn.fetchrow(
             "SELECT id FROM users WHERE username = $1 OR email = $2",
-            username, email,
+            username,
+            email,
         )
         if existing:
             raise ConflictError("Username or email already exists")
@@ -257,20 +258,24 @@ async def register(username: str, email: str, password: str, display_name: str |
             VALUES ($1, $2, $3, $4, $5, NOT EXISTS (SELECT 1 FROM users))
             RETURNING is_admin
             """,
-            user_id, username, email, pw_hash, display_name,
+            user_id,
+            username,
+            email,
+            pw_hash,
+            display_name,
         )
 
     if is_admin:
-        logging.getLogger("akb.auth").info(
-            "Bootstrap: first user %r registered — granted admin", username
-        )
+        logging.getLogger("akb.auth").info("Bootstrap: first user %r registered — granted admin", username)
 
     # PG-native RBAC: emit the per-user PG role so akb_sql works.
     # Best-effort — reconciler at next startup catches any failure here.
     await get_role_sync().on_user_create(user_id)
 
     return {
-        "user_id": str(user_id), "username": username, "email": email,
+        "user_id": str(user_id),
+        "username": username,
+        "email": email,
         "is_admin": is_admin,
     }
 
@@ -290,18 +295,12 @@ async def login(username: str, password: str) -> dict:
                 """,
                 username,
             )
-            if (
-                row
-                and row["account_status"] != "active"
-                and row["account_kind"] == "human"
-            ):
+            if row and row["account_status"] != "active" and row["account_kind"] == "human":
                 raise AccountSuspendedError()
             # SSO-provisioned accounts have no usable local password. Reject
             # the local-login path explicitly with the same generic message
             # so we don't leak which accounts are SSO-backed.
-            if row and (
-                row["auth_provider"] != "local" or row["account_kind"] != "human"
-            ):
+            if row and (row["auth_provider"] != "local" or row["account_kind"] != "human"):
                 raise AuthenticationError("Invalid credentials")
             if not row or not await verify_password_async(password, row["password_hash"]):
                 raise AuthenticationError("Invalid credentials")
@@ -312,7 +311,9 @@ async def login(username: str, password: str) -> dict:
             # CEIL(epoch) so the safe boundary is cutoff + 1s rounded up.
             not_before = row["tokens_revoked_before"] + timedelta(seconds=1)
             token = create_jwt(
-                str(row["id"]), row["username"], not_before=not_before,
+                str(row["id"]),
+                row["username"],
+                not_before=not_before,
             )
             return {
                 "token": token,
@@ -353,11 +354,22 @@ async def _unique_username(conn, base: str | None) -> str:
 
 
 def _external_identity_key(claims: dict) -> tuple[str, str]:
-    issuer = str(claims.get("iss") or "").strip()
-    subject = str(claims.get("sub") or "").strip()
+    raw_issuer = claims.get("iss")
+    raw_subject = claims.get("sub")
+    issuer = raw_issuer.strip() if isinstance(raw_issuer, str) else ""
+    subject = raw_subject.strip() if isinstance(raw_subject, str) else ""
     if not issuer or not subject:
         raise AuthenticationError("Identity provider token has no issuer or subject")
     return issuer, subject
+
+
+def _optional_external_string(claims: dict, name: str) -> str | None:
+    value = claims.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise AuthenticationError(f"Identity provider {name} claim is malformed")
+    return value
 
 
 def _assert_active_human(row) -> None:
@@ -374,11 +386,7 @@ def _resolved_external_user(row, *, newly_provisioned: bool) -> dict:
         "email": row["email"],
         "display_name": row["display_name"],
         "is_admin": row["is_admin"],
-        "not_before": (
-            None
-            if newly_provisioned
-            else row["tokens_revoked_before"] + timedelta(seconds=1)
-        ),
+        "not_before": (None if newly_provisioned else row["tokens_revoked_before"] + timedelta(seconds=1)),
         "newly_provisioned": newly_provisioned,
     }
 
@@ -401,16 +409,12 @@ async def _bound_external_user(conn, issuer: str, subject: str):
 
 async def _refresh_bound_external_user(conn, row, claims: dict):
     _assert_active_human(row)
-    claimed_email = (claims.get("email") or "").strip().lower() or None
-    email_is_trusted = (
-        claimed_email is not None
-        and (
-            claims.get("email_verified") is True
-            or not settings.keycloak_require_verified_email
-        )
+    claimed_email = (_optional_external_string(claims, "email") or "").strip().lower() or None
+    email_is_trusted = claimed_email is not None and (
+        claims.get("email_verified") is True or not settings.keycloak_require_verified_email
     )
     email_snapshot = claimed_email if email_is_trusted else None
-    display_name = claims.get("name") or claims.get("preferred_username")
+    display_name = _optional_external_string(claims, "name") or _optional_external_string(claims, "preferred_username")
     try:
         async with conn.transaction():
             await conn.execute(
@@ -459,8 +463,7 @@ async def _resolve_or_provision_keycloak_user(claims: dict) -> dict:
         # Keep the field readable for migration tooling, but make direct
         # Settings construction as fail-closed as the canonical YAML loader.
         raise AuthModeConfigurationError(
-            "keycloak_link_by_email=true is not a canonical runtime mode; "
-            "email-based account adoption is disabled"
+            "keycloak_link_by_email=true is not a canonical runtime mode; email-based account adoption is disabled"
         )
     issuer, subject = _external_identity_key(claims)
     if settings.keycloak_enrollment_mode == "disabled":
@@ -476,26 +479,19 @@ async def _resolve_or_provision_keycloak_user(claims: dict) -> dict:
         if settings.keycloak_enrollment_mode == "invite_only":
             raise MembershipRequiredError()
 
-        email = (claims.get("email") or "").strip().lower()
+        email = (_optional_external_string(claims, "email") or "").strip().lower()
         if not email:
             raise AuthenticationError("Identity provider account has no email claim")
-        if (
-            settings.keycloak_require_verified_email
-            and claims.get("email_verified") is not True
-        ):
-            raise AuthenticationError(
-                "Identity provider has not verified this email address"
-            )
+        if settings.keycloak_require_verified_email and claims.get("email_verified") is not True:
+            raise AuthenticationError("Identity provider has not verified this email address")
 
-        raw_preferred_username = claims.get("preferred_username")
+        raw_preferred_username = _optional_external_string(claims, "preferred_username")
         preferred_username = (
             raw_preferred_username.strip()
-            if isinstance(raw_preferred_username, str)
-            and raw_preferred_username.strip()
+            if isinstance(raw_preferred_username, str) and raw_preferred_username.strip()
             else email.split("@", 1)[0]
         )
-        raw_display_name = claims.get("name") or raw_preferred_username
-        display_name = raw_display_name if isinstance(raw_display_name, str) else None
+        display_name = _optional_external_string(claims, "name") or raw_preferred_username
         user_id = uuid.uuid4()
         try:
             async with conn.transaction():
@@ -571,9 +567,7 @@ async def _project_keycloak_principal(
             return None
         resolved = await _resolve_or_provision_keycloak_user(claims)
     except AKBError as e:
-        logging.getLogger("akb.auth").info(
-            "Keycloak access token: account projection rejected (%s)", e
-        )
+        logging.getLogger("akb.auth").info("Keycloak access token: account projection rejected (%s)", e)
         return None
 
     if resolved["newly_provisioned"]:
@@ -722,15 +716,11 @@ async def update_profile(
                 raise NotFoundError("User", user_id)
             if policy["account_status"] != "active":
                 raise AccountSuspendedError()
-            if (
-                policy["auth_provider"] != "local"
-                or policy["account_kind"] != "human"
-            ):
+            if policy["auth_provider"] != "local" or policy["account_kind"] != "human":
                 raise ExternalProfileReadOnlyError()
             try:
                 row = await conn.fetchrow(
-                    f"UPDATE users SET {', '.join(sets)} WHERE id = ${idx} "
-                    f"RETURNING username, display_name, email",
+                    f"UPDATE users SET {', '.join(sets)} WHERE id = ${idx} RETURNING username, display_name, email",
                     *params,
                 )
             except asyncpg.UniqueViolationError:
@@ -744,6 +734,7 @@ async def update_profile(
 
 
 # ── PAT operations ──────────────────────────────────────────
+
 
 async def create_pat(
     user_id: str,
@@ -774,7 +765,7 @@ async def create_pat(
     else:
         try:
             resolved_token_id = uuid.UUID(token_id)
-        except (AttributeError, TypeError, ValueError):
+        except AttributeError, TypeError, ValueError:
             raise ValidationError("token_id must be a UUID") from None
 
     expires_at = None
@@ -819,7 +810,9 @@ async def create_pat(
     # never falls back to the full akb_user_<uid>). Unscoped PATs need none.
     if vault_scope is not None:
         await get_role_sync().on_token_create(
-            resolved_token_id, uuid.UUID(user_id), vault_scope,
+            resolved_token_id,
+            uuid.UUID(user_id),
+            vault_scope,
         )
 
     return {
@@ -865,7 +858,8 @@ async def revoke_pat(user_id: str, token_id: str) -> bool:
     async with pool.acquire() as conn:
         result = await conn.execute(
             "DELETE FROM tokens WHERE id = $1 AND user_id = $2",
-            uuid.UUID(token_id), uuid.UUID(user_id),
+            uuid.UUID(token_id),
+            uuid.UUID(user_id),
         )
     deleted = "DELETE 1" in result
     if deleted:

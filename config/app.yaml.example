@@ -174,9 +174,10 @@ app_credential_overlap_seconds: 300
 # derived from auth_mode for fresh configs. Do not set them independently;
 # an explicit mismatch fails startup.
 #
-# Keycloak human login resolves an exact (issuer, subject) binding. The default
-# `open` enrollment mode preserves the verified-email JIT/link fallback once,
-# then persists that stable binding. Keycloak never drives AKB authorization.
+# Keycloak human access resolves an exact (issuer, subject) binding. The
+# default `open` enrollment mode may create a brand-new AKB account and exact
+# binding when email/username do not collide; it never adopts or links an
+# existing account by email. Keycloak never drives AKB authorization.
 # Full designs: docs/designs/keycloak-oidc/00-overview.md and
 # docs/design/accepted/2026-07-10-workspace-account-governance/README.md
 #
@@ -188,14 +189,15 @@ app_credential_overlap_seconds: 300
 # keycloak_client_id: "akb-web"
 # keycloak_public_client: false      # true → PKCE (no client_secret needed)
 # keycloak_verify_ssl: true          # false only for local self-signed Keycloak
-# keycloak_require_verified_email: true   # refuse unverified email for open-mode JIT/link.
+# keycloak_require_verified_email: true   # refuse unverified email for open-mode JIT.
 #                                         # Exact subject bindings need no email claim.
 #                                         # Set false ONLY for a trusted realm with
 #                                         # controlled emails.
-# keycloak_link_by_email: false           # link SSO to a pre-existing same-email account
-#                                         # (e.g. one the managed control plane provisioned).
-#                                         # Keeps the user_id/PATs; only links VERIFIED emails.
-#                                         # Default false = no silent merge (OSS-safe).
+# keycloak_link_by_email is a deprecated migration marker; omit it. Setting it
+# to true fails canonical startup. Exact pre-binding is the only account-link path.
+# The callback settings below are reserved for the future server-custodied
+# browser session release. Phase 1 validates access tokens only and returns a
+# staged-unavailable response from browser login/callback/logout/exchange routes.
 # keycloak_redirect_uri: "https://akb.example.com/api/v1/auth/keycloak/callback"
 # keycloak_post_login_path: "/auth/callback"
 # keycloak_post_login_allowed_origins: []   # companion-app origins allowed to receive the SSO

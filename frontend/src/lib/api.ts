@@ -251,6 +251,16 @@ function record(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+function hasExactKeys(
+  value: Record<string, unknown> | null,
+  expected: readonly string[],
+): value is Record<string, unknown> {
+  if (!value) return false;
+  const actual = Object.keys(value).sort();
+  const exact = [...expected].sort();
+  return actual.length === exact.length && actual.every((key, index) => key === exact[index]);
+}
+
 export function parseAuthConfig(value: unknown): AuthConfig {
   const root = record(value);
   const localAuth = record(root?.local_auth);
@@ -259,6 +269,10 @@ export function parseAuthConfig(value: unknown): AuthConfig {
   const mode = root?.auth_mode;
   const loginUrl = keycloak?.login_url;
   if (
+    !hasExactKeys(root, ["schema_version", "auth_mode", "local_auth", "keycloak", "mcp_oauth"]) ||
+    !hasExactKeys(localAuth, ["enabled"]) ||
+    !hasExactKeys(keycloak, ["enabled", "browser_session_ready", "login_url"]) ||
+    !hasExactKeys(mcpOauth, ["enabled"]) ||
     root?.schema_version !== 1 ||
     (mode !== "local" && mode !== "sso") ||
     typeof localAuth?.enabled !== "boolean" ||

@@ -17,10 +17,16 @@ export interface User {
 interface Props {
   user: User;
   localPasswordEnabled: boolean;
+  localProfileEditingEnabled: boolean;
   onUserUpdate: (patch: { display_name?: string; email?: string }) => void;
 }
 
-export function ProfileSection({ user, localPasswordEnabled, onUserUpdate }: Props) {
+export function ProfileSection({
+  user,
+  localPasswordEnabled,
+  localProfileEditingEnabled,
+  onUserUpdate,
+}: Props) {
   const [profileDisplayName, setProfileDisplayName] = useState("");
   const [profileEmail, setProfileEmail] = useState("");
   const [profileError, setProfileError] = useState("");
@@ -54,17 +60,18 @@ export function ProfileSection({ user, localPasswordEnabled, onUserUpdate }: Pro
   useEffect(() => {
     const dirty =
       (user.display_name ?? "") !== profileDisplayName || user.email !== profileEmail;
-    if (!dirty || profileBusy) return;
+    if (!localProfileEditingEnabled || !dirty || profileBusy) return;
     const onBeforeUnload = (e: BeforeUnloadEvent) => {
       e.preventDefault();
       e.returnValue = "";
     };
     window.addEventListener("beforeunload", onBeforeUnload);
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
-  }, [user, profileDisplayName, profileEmail, profileBusy]);
+  }, [user, profileDisplayName, profileEmail, profileBusy, localProfileEditingEnabled]);
 
   async function handleSaveProfile(e: React.FormEvent) {
     e.preventDefault();
+    if (!localProfileEditingEnabled) return;
     setProfileError("");
     setProfileNotice("");
     const patch: { display_name?: string; email?: string } = {};
@@ -138,6 +145,7 @@ export function ProfileSection({ user, localPasswordEnabled, onUserUpdate }: Pro
               value={profileDisplayName}
               onChange={(e) => setProfileDisplayName(e.target.value)}
               placeholder="—"
+              disabled={!localProfileEditingEnabled}
             />
           </div>
           <div>
@@ -148,29 +156,36 @@ export function ProfileSection({ user, localPasswordEnabled, onUserUpdate }: Pro
               value={profileEmail}
               onChange={(e) => setProfileEmail(e.target.value)}
               required
+              disabled={!localProfileEditingEnabled}
             />
           </div>
         </div>
-        <div className="flex items-center gap-3 px-6 pb-6 flex-wrap">
-          <Button type="submit" loading={profileBusy} disabled={!profileDirty}>
-            Save profile
-          </Button>
-          {profileFlash.message && (
-            <span role="status" aria-live="polite" className="text-sm text-success">
-              {profileFlash.message}
-            </span>
-          )}
-          {profileNotice && (
-            <span role="status" aria-live="polite" className="text-sm text-foreground-muted">
-              {profileNotice}
-            </span>
-          )}
-          {profileError && (
-            <span role="alert" className="text-sm text-destructive">
-              {profileError}
-            </span>
-          )}
-        </div>
+        {localProfileEditingEnabled ? (
+          <div className="flex items-center gap-3 px-6 pb-6 flex-wrap">
+            <Button type="submit" loading={profileBusy} disabled={!profileDirty}>
+              Save profile
+            </Button>
+            {profileFlash.message && (
+              <span role="status" aria-live="polite" className="text-sm text-success">
+                {profileFlash.message}
+              </span>
+            )}
+            {profileNotice && (
+              <span role="status" aria-live="polite" className="text-sm text-foreground-muted">
+                {profileNotice}
+              </span>
+            )}
+            {profileError && (
+              <span role="alert" className="text-sm text-destructive">
+                {profileError}
+              </span>
+            )}
+          </div>
+        ) : (
+          <p className="px-6 pb-6 text-sm text-foreground-muted">
+            Profile details are managed by your identity provider.
+          </p>
+        )}
       </form>
 
       {localPasswordEnabled && (

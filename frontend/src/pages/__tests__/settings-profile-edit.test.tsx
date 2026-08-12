@@ -101,6 +101,10 @@ describe("settings — profile edit", () => {
     await waitFor(() => expect(api.getAuthConfig as any).toHaveBeenCalledOnce());
     expect(screen.queryByText("Change password", { selector: "#change-pw-heading" })).toBeNull();
     expect(screen.queryByLabelText(/current password/i)).toBeNull();
+    expect(screen.getByLabelText(/display name/i)).toBeDisabled();
+    expect(screen.getByLabelText(/email/i)).toBeDisabled();
+    expect(screen.queryByRole("button", { name: /save profile/i })).toBeNull();
+    expect(screen.getByText(/managed by your identity provider/i)).toBeInTheDocument();
   });
 
   it("'Save profile' is disabled when nothing changed", async () => {

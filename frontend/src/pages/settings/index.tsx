@@ -189,6 +189,7 @@ export default function SettingsPage() {
           <ProfileSection
             user={user}
             localPasswordEnabled={localPasswordEnabled}
+            localProfileEditingEnabled={localPasswordEnabled}
             onUserUpdate={(patch) =>
               setUser((u) => (u ? { ...u, ...patch } : u))
             }
