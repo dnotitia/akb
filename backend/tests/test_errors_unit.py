@@ -22,7 +22,12 @@ from pathlib import Path
 
 from app.util import errors as errors_mod
 from app.util.errors import (
+    GIT_HISTORY_ENTRY_CAPPED,
+    GIT_HISTORY_FAILED,
+    GIT_HISTORY_OUTPUT_CAPPED,
+    GIT_HISTORY_TIMEOUT,
     err,
+    exception_envelope,
     NOT_FOUND,
     PERMISSION_DENIED,
     UNKNOWN_ARGUMENT,
@@ -76,6 +81,20 @@ def test_code_field_is_always_set():
     out = err("oops", code="something")
     assert "code" in out
     assert out["code"] == "something"
+
+
+def test_git_history_failures_keep_explicit_mcp_codes():
+    from app.services.git_service import GitHistoryBoundError, GitHistoryCommandError
+
+    cases = (
+        (GitHistoryBoundError("timeout", 0.5), GIT_HISTORY_TIMEOUT),
+        (GitHistoryBoundError("output", 1024), GIT_HISTORY_OUTPUT_CAPPED),
+        (GitHistoryBoundError("entry", 10), GIT_HISTORY_ENTRY_CAPPED),
+        (GitHistoryCommandError(), GIT_HISTORY_FAILED),
+    )
+
+    for error, code in cases:
+        assert exception_envelope(error) == {"error": str(error), "code": code}
 
 
 # ── Catalogue enforcement ─────────────────────────────────────

@@ -37,6 +37,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from git import Blob, Repo
 from git.exc import BadName, BadObject, GitError
@@ -45,6 +46,12 @@ from app.config import settings
 from app.exceptions import AKBError, MirrorMarkerError
 from app.services.external_git_runner import ExternalGitRunner
 from app.services.external_git_validation import validate_branch
+from app.util.errors import (
+    GIT_HISTORY_ENTRY_CAPPED,
+    GIT_HISTORY_FAILED,
+    GIT_HISTORY_OUTPUT_CAPPED,
+    GIT_HISTORY_TIMEOUT,
+)
 
 logger = logging.getLogger("akb.git")
 
@@ -204,18 +211,29 @@ class GitHistoryBoundError(AKBError, RuntimeError):
         if bound == "timeout":
             message = f"git path history timed out after {limit:g}s"
             status_code = 503
-            code = "git_history_timeout"
+            code = GIT_HISTORY_TIMEOUT
         elif bound == "output":
             message = f"git path history exceeded the {limit}-byte output cap"
             status_code = 413
-            code = "git_history_output_capped"
+            code = GIT_HISTORY_OUTPUT_CAPPED
         else:
             message = f"git path history exceeded the {limit}-entry cap"
             status_code = 503
-            code = "git_history_entry_capped"
+            code = GIT_HISTORY_ENTRY_CAPPED
         super().__init__(message, status_code=status_code, code=code)
         self.bound = bound
         self.limit = limit
+
+
+class GitHistoryCommandError(AKBError, RuntimeError):
+    """A streamed manual-vault history command exited unsuccessfully."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "git path history command failed",
+            status_code=503,
+            code=GIT_HISTORY_FAILED,
+        )
 
 
 class GitService:
@@ -1122,7 +1140,7 @@ class GitService:
     @staticmethod
     def _close_path_history_process(process, *, terminate: bool) -> None:
         """Close a streamed GitPython process, killing it when still active."""
-        raw_process = getattr(process, "proc", None) or process
+        raw_process: Any = getattr(process, "proc", None) or process
         if terminate:
             try:
                 if raw_process.poll() is None:
@@ -1177,8 +1195,11 @@ class GitService:
             "--",
             file_path,
         ]
-        process = repo.git.log(*log_args, as_process=True)
-        raw_process = getattr(process, "proc", None) or process
+        process = repo.git.execute(
+            ["git", "-c", "core.quotePath=false", "log", *log_args],
+            as_process=True,
+        )
+        raw_process: Any = getattr(process, "proc", None) or process
         stdout = getattr(raw_process, "stdout", None)
         stderr = getattr(raw_process, "stderr", None)
         stdout_fd = stdout.fileno() if stdout is not None else -1
@@ -1274,7 +1295,7 @@ class GitService:
                 raise GitHistoryBoundError("timeout", timeout_secs) from None
             finished = True
             if status != 0:
-                raise GitError("git path history command failed")
+                raise GitHistoryCommandError()
             return None
         finally:
             selector.close()
@@ -1299,9 +1320,9 @@ class GitService:
             repo = self._get_repo(vault_name)
             target = repo.commit(commit).hexsha
             fixed_ref = repo.head.commit.hexsha
-            return self._stream_path_at_revision(repo, fixed_ref, file_path, target)
-        except (BadName, BadObject, GitError, FileNotFoundError, ValueError):
+        except (BadName, BadObject, FileNotFoundError, ValueError):
             return None
+        return self._stream_path_at_revision(repo, fixed_ref, file_path, target)
 
     def manual_fixed_ref_history(
         self,
@@ -2158,8 +2179,7 @@ class GitService:
             return self._file_diff_mirror(vault_name, file_path, commit_hash)
         from git.exc import BadName, BadObject
         historical_path = self.path_at_revision(vault_name, file_path, commit_hash)
-        if historical_path:
-            file_path = historical_path
+        lookup_path = historical_path or file_path
         repo = self._get_repo(vault_name)
         try:
             commit = repo.commit(commit_hash)
@@ -2175,7 +2195,7 @@ class GitService:
         if not commit.parents:
             # Initial commit — show full content as addition
             try:
-                blob = commit.tree / file_path
+                blob = commit.tree / lookup_path
                 content = blob.data_stream.read().decode("utf-8")
                 return {
                     "file": file_path,
@@ -2187,7 +2207,7 @@ class GitService:
                 return {"file": file_path, "commit": commit_hash, "type": "unknown", "diff": ""}
 
         parent = commit.parents[0]
-        diffs = parent.diff(commit, paths=[file_path], create_patch=True)
+        diffs = parent.diff(commit, paths=[lookup_path], create_patch=True)
 
         for d in diffs:
             patch = d.diff

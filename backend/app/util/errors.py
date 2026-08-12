@@ -111,6 +111,14 @@ SELF_LINK = "self_link"
 # storage write failure in akb_publication_snapshot).
 INTERNAL = "internal"
 
+# Manual-vault Git history resolution. These are deliberately catalogue
+# entries rather than values copied from an exception at dispatch time: the
+# MCP wire contract must remain statically auditable by the catalogue test.
+GIT_HISTORY_FAILED = "git_history_failed"
+GIT_HISTORY_TIMEOUT = "git_history_timeout"
+GIT_HISTORY_OUTPUT_CAPPED = "git_history_output_capped"
+GIT_HISTORY_ENTRY_CAPPED = "git_history_entry_capped"
+
 
 # ── Builder ───────────────────────────────────────────────────
 
@@ -175,6 +183,14 @@ def exception_envelope(e: Exception) -> dict:
             hint="The vault is under heavy write load. Wait a few seconds and retry; no partial write occurred.",
             retry_after_secs=e.retry_after_secs,
         )
+    if getattr(e, "code", None) == GIT_HISTORY_FAILED:
+        return err(str(e), code=GIT_HISTORY_FAILED)
+    if getattr(e, "code", None) == GIT_HISTORY_TIMEOUT:
+        return err(str(e), code=GIT_HISTORY_TIMEOUT)
+    if getattr(e, "code", None) == GIT_HISTORY_OUTPUT_CAPPED:
+        return err(str(e), code=GIT_HISTORY_OUTPUT_CAPPED)
+    if getattr(e, "code", None) == GIT_HISTORY_ENTRY_CAPPED:
+        return err(str(e), code=GIT_HISTORY_ENTRY_CAPPED)
     if isinstance(e, ValidationError):
         return err(str(e), code=INVALID_ARGUMENT)
     return err(str(e), code=INTERNAL)

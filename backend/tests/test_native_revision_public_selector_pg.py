@@ -140,8 +140,10 @@ async def test_public_historical_selector_is_exact_or_resource_scoped_prefix(mon
         document_service = NativeDocumentService(pool=pool)
         rest_exact = await document_service.get_at_commit(vault_name, "one.md", first.revision_id)
         assert rest_exact.content == "first"
+        assert rest_exact.current_commit == first.revision_id
         rest_selected = await document_service.get_at_commit(vault_name, "one.md", first.revision_id[:8])
         assert rest_selected.content == "first"
+        assert rest_selected.current_commit == prefix
 
         NativeRevisionService._validate_expected_revision(first.revision_id)
         with pytest.raises(ValidationError):
