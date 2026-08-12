@@ -211,6 +211,12 @@ def _resolve_auth_mode_config(
             "mcp_oauth_enabled=true contradicts keycloak_enabled=false; the MCP OAuth "
             "resource server requires a configured Keycloak authority"
         )
+    if _auth_config_bool(values, "keycloak_link_by_email", default=False):
+        raise AuthModeConfigurationError(
+            "keycloak_link_by_email=true is no longer accepted by canonical runtime; "
+            "external identities must be prebound or created from an unclaimed "
+            "issuer/subject without adopting an account by email"
+        )
 
     resolved["auth_mode"] = mode
     resolved["local_auth_enabled"] = expected_local_auth
@@ -826,31 +832,19 @@ class Settings(BaseModel):
     keycloak_client_secret: str = ""       # secret.yaml — blank for public (PKCE) clients
     keycloak_public_client: bool = False   # true → PKCE (no client_secret); false → confidential
     keycloak_verify_ssl: bool = True       # set false only for local self-signed Keycloak
-    # Exact identity is issuer/subject and does not require email. During the
-    # open-mode JIT/link fallback we REQUIRE the id_token's `email_verified`
-    # claim to be true before provisioning / adopting an AKB user — otherwise
-    # an IdP that allows unverified or
-    # self-asserted emails (open self-registration, social federation)
-    # becomes an account-spoofing vector. Set false ONLY for a trusted
-    # realm where every account's email is controlled out-of-band.
+    # Exact identity is issuer/subject and does not require email. Open-mode
+    # JIT requires a verified email only when creating a brand-new AKB user;
+    # email is never an account lookup or adoption key. Set false ONLY for a
+    # trusted realm where every account's email is controlled out-of-band.
     keycloak_require_verified_email: bool = True
-    # OIDC account admission policy. `open` preserves historical verified-email
-    # JIT/link behavior. `invite_only` accepts only an exact pre-provisioned
-    # (issuer, subject) binding. `disabled` rejects external login entirely.
+    # OIDC account admission policy. `open` permits atomic creation of a fresh
+    # user plus exact binding. `invite_only` accepts only an exact prebound
+    # (issuer, subject) identity. `disabled` rejects external login entirely.
     keycloak_enrollment_mode: Literal["open", "invite_only", "disabled"] = "open"
-    # Link an SSO login to a pre-existing AKB account that has the SAME
-    # email but a different auth_provider (e.g. a local/password account).
-    #
-    # Default false → such a collision is rejected (no silent identity
-    # merge; the OSS-safe default). Set true for a MANAGED deployment where
-    # the control plane intentionally pre-provisions an AKB user (+ PAT) for
-    # a member and that same person then logs in via SSO — without linking,
-    # every pre-provisioned member is locked out of SSO. Linking keeps the
-    # existing user_id, so the member's PAT, vault ownership and grants all
-    # survive. SAFE ONLY with verified emails: a cross-provider link is
-    # refused unless the id_token's email_verified is true, regardless of
-    # keycloak_require_verified_email, so a relaxed realm can't be used to
-    # take over an existing account by asserting its email.
+    # Deprecated migration input retained so Phase 3 readiness tooling can
+    # identify legacy installations. Canonical config loading rejects true,
+    # and the projection service repeats that guard for directly constructed
+    # Settings. Runtime email adoption has no compatibility bypass.
     keycloak_link_by_email: bool = False
     # Absolute URL Keycloak redirects the browser back to after login.
     # Must point at the AKB backend callback route and be registered as a
@@ -1148,6 +1142,22 @@ class Settings(BaseModel):
     def keycloak_jwks_uri(self) -> str:
         # Server→Keycloak → backchannel issuer.
         return f"{self._keycloak_backchannel_issuer}/protocol/openid-connect/certs"
+
+    @property
+    def keycloak_human_client_ids(self) -> frozenset[str]:
+        """OIDC clients allowed to authorize human API access tokens.
+
+        MCP DCR clients are intentionally excluded: MCP has its own route
+        profile, audience, and scope contract rather than this static list.
+        """
+        return frozenset(
+            client_id.strip()
+            for client_id in (
+                self.keycloak_client_id,
+                *self.keycloak_companion_client_ids_by_origin.values(),
+            )
+            if client_id.strip()
+        )
 
     @property
     def keycloak_end_session_endpoint(self) -> str:

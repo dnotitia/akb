@@ -20,7 +20,7 @@ import asyncpg
 import bcrypt
 import jwt
 
-from app.config import settings
+from app.config import AuthModeConfigurationError, settings
 from app.db.postgres import get_pool
 from app.exceptions import (
     AKBError,
@@ -336,7 +336,12 @@ _SSO_SENTINEL_HASH = "!keycloak-sso:no-local-login!"
 
 
 async def _unique_username(conn, base: str | None) -> str:
-    """Derive a unique username from a Keycloak claim, suffixing on collision."""
+    """Allocate a username for explicit administrative provisioning.
+
+    Canonical SSO projection deliberately does not call this helper: a claimed
+    username collision must reject instead of silently selecting another AKB
+    account name. Account-governance services retain it for explicit creates.
+    """
     base = (base or "").strip() or "user"
     candidate = base
     for _ in range(8):
@@ -443,12 +448,20 @@ async def _refresh_bound_external_user(conn, row, claims: dict):
 
 
 async def _resolve_or_provision_keycloak_user(claims: dict) -> dict:
-    """Resolve verified OIDC claims by exact issuer/subject before open JIT.
+    """Resolve exact issuer/subject, or transactionally create a fresh account.
 
-    `open` preserves the historical verified-email adoption path once, then
-    persists the stable binding. `invite_only` never creates or adopts a user.
-    `disabled` rejects all external authentication.
+    Email and username are collision checks only. Canonical SSO never adopts
+    an existing account from mutable profile claims. ``invite_only`` therefore
+    accepts only an exact prebound identity, while ``open`` may create one new
+    AKB user and its exact external binding in the same transaction.
     """
+    if settings.keycloak_link_by_email:
+        # Keep the field readable for migration tooling, but make direct
+        # Settings construction as fail-closed as the canonical YAML loader.
+        raise AuthModeConfigurationError(
+            "keycloak_link_by_email=true is not a canonical runtime mode; "
+            "email-based account adoption is disabled"
+        )
     issuer, subject = _external_identity_key(claims)
     if settings.keycloak_enrollment_mode == "disabled":
         raise ExternalAuthDisabledError()
@@ -474,95 +487,55 @@ async def _resolve_or_provision_keycloak_user(claims: dict) -> dict:
                 "Identity provider has not verified this email address"
             )
 
-        display_name = claims.get("name") or claims.get("preferred_username")
-        preferred_username = claims.get("preferred_username") or email.split("@")[0]
+        raw_preferred_username = claims.get("preferred_username")
+        preferred_username = (
+            raw_preferred_username.strip()
+            if isinstance(raw_preferred_username, str)
+            and raw_preferred_username.strip()
+            else email.split("@", 1)[0]
+        )
+        raw_display_name = claims.get("name") or raw_preferred_username
+        display_name = raw_display_name if isinstance(raw_display_name, str) else None
         user_id = uuid.uuid4()
-        newly_provisioned = False
         try:
             async with conn.transaction():
-                row = await conn.fetchrow(
+                # Deliberately do not SELECT by email or username first. Their
+                # unique constraints are atomic collision guards, never
+                # identity resolution or account-linking inputs.
+                is_admin = await conn.fetchval(
                     """
-                    SELECT id, username, email, display_name, is_admin,
-                           tokens_revoked_before, auth_provider,
-                           account_status, account_kind
-                      FROM users WHERE email = $1
-                       FOR UPDATE
+                    INSERT INTO users (
+                        id, username, email, password_hash, display_name,
+                        auth_provider, is_admin, account_status, account_kind
+                    )
+                    VALUES ($1, $2, $3, $4, $5, 'keycloak',
+                            NOT EXISTS (SELECT 1 FROM users), 'active', 'human')
+                    RETURNING is_admin
                     """,
+                    user_id,
+                    preferred_username,
                     email,
+                    _SSO_SENTINEL_HASH,
+                    display_name,
                 )
-                if row is not None:
-                    _assert_active_human(row)
-                    # Another first-login may have persisted this exact binding
-                    # while we waited for the existing user row lock. Re-check
-                    # the stable key before treating any binding as a conflict.
-                    late_bound = await _bound_external_user(conn, issuer, subject)
-                    if late_bound is not None:
-                        refreshed = await _refresh_bound_external_user(
-                            conn,
-                            late_bound,
-                            claims,
-                        )
-                        return _resolved_external_user(
-                            refreshed,
-                            newly_provisioned=False,
-                        )
-                    already_bound = await conn.fetchval(
-                        "SELECT EXISTS (SELECT 1 FROM external_identities WHERE user_id = $1)",
-                        row["id"],
+                await emit_event(
+                    conn,
+                    "auth.user_provisioned",
+                    actor_id=str(user_id),
+                    payload={
+                        "auth_provider": "keycloak",
+                        "email": email,
+                        "issuer": issuer,
+                    },
+                )
+                if is_admin:
+                    # Phase 2 owns replacement of this legacy bootstrap rule.
+                    # Phase 1 keeps browser SSO staged unavailable, so this is
+                    # not a deployable first-user provisioning contract.
+                    logging.getLogger("akb.auth").info(
+                        "Bootstrap: first user %r (SSO) provisioned — granted admin",
+                        preferred_username,
                     )
-                    if already_bound:
-                        raise ExternalIdentityConflictError()
-                    if row["auth_provider"] != "keycloak":
-                        if not settings.keycloak_link_by_email:
-                            raise ExternalIdentityConflictError()
-                        if claims.get("email_verified") is not True:
-                            raise AuthenticationError(
-                                "Cannot link SSO to the existing account: email is not "
-                                "verified by the identity provider"
-                            )
-                        await conn.execute(
-                            """
-                            UPDATE users
-                               SET auth_provider = 'keycloak', updated_at = NOW()
-                             WHERE id = $1
-                            """,
-                            row["id"],
-                        )
-                    user_id = row["id"]
-                else:
-                    uname = await _unique_username(conn, preferred_username)
-                    is_admin = await conn.fetchval(
-                        """
-                        INSERT INTO users (
-                            id, username, email, password_hash, display_name,
-                            auth_provider, is_admin, account_status, account_kind
-                        )
-                        VALUES ($1, $2, $3, $4, $5, 'keycloak',
-                                NOT EXISTS (SELECT 1 FROM users), 'active', 'human')
-                        RETURNING is_admin
-                        """,
-                        user_id,
-                        uname,
-                        email,
-                        _SSO_SENTINEL_HASH,
-                        display_name,
-                    )
-                    await emit_event(
-                        conn,
-                        "auth.user_provisioned",
-                        actor_id=str(user_id),
-                        payload={
-                            "auth_provider": "keycloak",
-                            "email": email,
-                            "issuer": issuer,
-                        },
-                    )
-                    newly_provisioned = True
-                    if is_admin:
-                        logging.getLogger("akb.auth").info(
-                            "Bootstrap: first user %r (SSO) provisioned — granted admin",
-                            uname,
-                        )
 
                 await conn.execute(
                     """
@@ -594,7 +567,7 @@ async def _resolve_or_provision_keycloak_user(claims: dict) -> dict:
             user_id,
         )
         _assert_active_human(row)
-        return _resolved_external_user(row, newly_provisioned=newly_provisioned)
+        return _resolved_external_user(row, newly_provisioned=True)
 
 
 async def login_with_keycloak_claims(claims: dict) -> dict:

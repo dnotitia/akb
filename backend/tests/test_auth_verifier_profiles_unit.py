@@ -126,6 +126,13 @@ def _configure_keycloak(monkeypatch) -> tuple[str, str, str]:
     monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
     monkeypatch.setattr(settings, "keycloak_server_url", "https://identity.example.com", raising=False)
     monkeypatch.setattr(settings, "keycloak_realm", "akb", raising=False)
+    monkeypatch.setattr(settings, "keycloak_client_id", "browser-client", raising=False)
+    monkeypatch.setattr(
+        settings,
+        "keycloak_companion_client_ids_by_origin",
+        {"https://companion.example.com": "companion-client"},
+        raising=False,
+    )
     monkeypatch.setattr(settings, "api_oauth_audience", api_audience, raising=False)
     monkeypatch.setattr(settings, "mcp_oauth_enabled", True, raising=False)
     monkeypatch.setattr(settings, "mcp_oauth_audience", mcp_audience, raising=False)
@@ -403,6 +410,78 @@ async def test_keycloak_access_v1_accepts_realistic_multi_audience_user_token(
 
     assert principal is not None
     assert principal.audience == api_audience
+
+
+@pytest.mark.asyncio
+async def test_keycloak_api_profile_binds_azp_to_configured_human_clients(
+    monkeypatch,
+    rsa_keypair,
+):
+    from app.services import auth_service, keycloak_oidc
+
+    issuer, api_audience, _ = _configure_keycloak(monkeypatch)
+    service = keycloak_oidc.KeycloakOIDC()
+    service._jwks = {"keys": [rsa_keypair["jwk"]]}
+    monkeypatch.setattr(keycloak_oidc, "get_keycloak_oidc", lambda: service)
+
+    projected: list[str] = []
+
+    async def forbidden_projection(principal):
+        projected.append(principal.subject)
+        raise AssertionError("wrong API azp must be rejected before projection")
+
+    monkeypatch.setattr(auth_service, "project_verified_principal", forbidden_projection)
+    wrong_azp = _mint_keycloak_token(
+        rsa_keypair,
+        issuer=issuer,
+        audience=api_audience,
+        claim_overrides={"azp": "untrusted-client"},
+    )
+
+    assert await auth_service.resolve_rest_user_authorization(f"Bearer {wrong_azp}") is None
+    assert projected == []
+
+    companion_token = _mint_keycloak_token(
+        rsa_keypair,
+        issuer=issuer,
+        audience=api_audience,
+        claim_overrides={"azp": "companion-client"},
+    )
+    assert (
+        await service.verify_access_token(
+            companion_token,
+            api_audience,
+            route_profile="api",
+        )
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_keycloak_mcp_profile_does_not_apply_static_human_azp_allowlist(
+    monkeypatch,
+    rsa_keypair,
+):
+    from app.services.keycloak_oidc import KeycloakOIDC
+
+    issuer, _, mcp_audience = _configure_keycloak(monkeypatch)
+    service = KeycloakOIDC()
+    service._jwks = {"keys": [rsa_keypair["jwk"]]}
+    dcr_token = _mint_keycloak_token(
+        rsa_keypair,
+        issuer=issuer,
+        audience=mcp_audience,
+        claim_overrides={"azp": "dynamically-registered-mcp-client"},
+    )
+
+    assert (
+        await service.verify_access_token(
+            dcr_token,
+            mcp_audience,
+            route_profile="mcp",
+        )
+        is not None
+    )
 
 
 @pytest.mark.asyncio

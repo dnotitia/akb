@@ -217,6 +217,25 @@ def test_local_mode_keeps_keycloak_separate_for_mcp_oauth(
     assert loaded.mcp_oauth_enabled is True
 
 
+def test_canonical_runtime_rejects_deprecated_email_linking(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        app_config.AuthModeConfigurationError,
+        match="keycloak_link_by_email",
+    ):
+        _load(
+            monkeypatch,
+            tmp_path,
+            {
+                "auth_mode": "sso",
+                "keycloak_enabled": True,
+                "keycloak_link_by_email": True,
+            },
+        )
+
+
 def test_local_mcp_oauth_startup_does_not_require_human_oidc_client_config(
     monkeypatch,
     tmp_path: Path,

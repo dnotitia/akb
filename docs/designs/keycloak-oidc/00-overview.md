@@ -1,12 +1,19 @@
 # Keycloak OIDC login (optional external IdP) — Design
 
+> **2026-08-13 Phase 1 supersession:**
+> [Authentication Mode Boundary](../../design/accepted/2026-08-13-authentication-mode-boundary/README.md)
+> replaces the hybrid browser/session model described in this historical
+> implementation record. Canonical SSO resolves only an exact verified
+> `(issuer, subject)` binding. Open enrollment may atomically create a fresh
+> AKB user and exact binding, but an existing email or username is a conflict;
+> it is never adopted. `keycloak_link_by_email` is a deprecated migration
+> input and canonical runtime rejects `true`. The staged browser cutover is
+> documented below as Phase 1 work lands.
+>
 > **2026-07-10 account-resolution amendment:**
 > [Workspace Account Governance](../../design/accepted/2026-07-10-workspace-account-governance/README.md)
-> supersedes this document's email-keyed identity and unconditional JIT model.
-> Exact verified `(issuer, subject)` is now resolved first. The standalone
-> default `keycloak_enrollment_mode=open` preserves the verified-email JIT/link
-> flow described below only as a first-binding compatibility fallback;
-> `invite_only` disables that fallback.
+> introduced durable external identities and account governance. The newer
+> Phase 1 boundary above further removes its email-link compatibility path.
 
 **Status**: implemented + locally validated (real Keycloak 26 + browser e2e), awaiting review
 **Started**: 2026-06-07
@@ -161,6 +168,13 @@ only satisfy one origin per instance.
   does not accept an AKB local-session JWT there. The callback still mints the
   legacy token until the A4 browser-session cutover; A4 owns removing that
   issuance and completing the browser transport change.
+- `keycloak-access-v1` API tokens require the explicit API audience and an
+  `azp` equal to the configured AKB browser client or one of the configured
+  companion client IDs. The v1 API profile intentionally does not speculate
+  about a realm-specific API scope: audience, authorized party, human token
+  kind, issuer, and the complete versioned claim policy form this boundary.
+  MCP keeps its distinct audience and scope enforcement and permits DCR client
+  IDs instead of applying the static human-client `azp` allowlist.
 
 ## Backend changes (file by file, as built)
 
@@ -288,21 +302,11 @@ keycloak_client_secret: "<from Keycloak client credentials>"
   triggers it only for SSO-originated sessions via a localStorage marker,
   so local-auth logout is untouched). Still out of scope: Keycloak
   front-channel/back-channel single-logout that notifies *other* RPs.
-- Account linking: a same-email collision with a non-`keycloak` account is
-  rejected by default (`ConflictError`, no silent merge). Opt-in
-  `keycloak_link_by_email` (default false) links the SSO identity to the
-  existing account — keeping its `user_id`, PATs, vault ownership and
-  grants — and flips `auth_provider` to `keycloak`. A cross-provider link
-  requires the id_token's `email_verified` to be true (independent of
-  `keycloak_require_verified_email`) so a relaxed realm can't take over an
-  account by asserting its email. This is what the **managed akb-platform**
-  needs: its operator pre-provisions an AKB user (+PAT) per member via
-  `/auth/register` (local), and the same member then logs in via SSO —
-  without linking, every pre-provisioned member is locked out. (Platform
-  wiring: set `keycloak_link_by_email: true` + `keycloak_require_verified_email:
-  true` in the per-tenant AKB backend config. PAT *rotation* after a member
-  has SSO-linked still needs an admin mint API — separate follow-up, since
-  the operator currently mints by logging in with the now-retired password.)
+- Account linking by email is retired from canonical runtime. A same-email or
+  same-username collision rejects regardless of `auth_provider`; only an exact
+  prebound `(issuer, subject)` resolves an existing account. Phase 3 owns any
+  explicit prelink/readiness migration for installations that previously set
+  `keycloak_link_by_email=true`.
 
 ## Local test harness
 

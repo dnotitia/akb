@@ -389,6 +389,11 @@ class KeycloakOIDC:
             return None
         if claims["typ"] != "Bearer":
             return None
+        if (
+            route_profile == "api"
+            and claims["azp"] not in settings.keycloak_human_client_ids
+        ):
+            return None
         if type(claims.get("iat")) is not int or type(claims.get("exp")) is not int:
             return None
         if claims["exp"] <= claims["iat"]:

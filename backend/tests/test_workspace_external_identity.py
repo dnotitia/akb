@@ -10,6 +10,7 @@ import asyncpg
 import pytest
 
 from app.config import settings
+from app.config import AuthModeConfigurationError
 from app.exceptions import (
     AccountSuspendedError,
     ExternalIdentityConflictError,
@@ -161,7 +162,11 @@ async def test_exact_binding_does_not_require_email_claim(pool, monkeypatch):
     assert resolved["user_id"] == user_id
 
 
-async def test_open_mode_backfills_subject_for_existing_keycloak_user(pool):
+@pytest.mark.parametrize("auth_provider", ["local", "keycloak"])
+async def test_open_mode_never_adopts_existing_user_by_email(
+    pool,
+    auth_provider,
+):
     from app.services.auth_service import _resolve_or_provision_keycloak_user
 
     user_id = uuid.uuid4()
@@ -170,46 +175,53 @@ async def test_open_mode_backfills_subject_for_existing_keycloak_user(pool):
         await conn.execute(
             """
             INSERT INTO users (id, username, email, password_hash, auth_provider)
-            VALUES ($1, $2, $3, $4, 'keycloak')
+            VALUES ($1, $2, $3, $4, $5)
             """,
             user_id,
             f"wsg-{uuid.uuid4().hex[:12]}",
             email,
             "!keycloak-sso:no-local-login!",
+            auth_provider,
         )
 
-    resolved = await _resolve_or_provision_keycloak_user(
-        _claims("backfill-existing", email)
-    )
-    assert resolved["user_id"] == user_id
+    with pytest.raises(ExternalIdentityConflictError):
+        await _resolve_or_provision_keycloak_user(
+            _claims("backfill-existing", email)
+        )
+
     async with pool.acquire() as conn:
-        bound_user_id = await conn.fetchval(
-            "SELECT user_id FROM external_identities WHERE issuer = $1 AND subject = $2",
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM external_identities WHERE issuer = $1 AND subject = $2",
             _ISSUER,
             "backfill-existing",
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT auth_provider FROM users WHERE id = $1",
+            user_id,
+        ) == auth_provider
+
+
+async def test_deprecated_email_link_flag_cannot_bypass_exact_projection(
+    pool,
+    monkeypatch,
+):
+    from app.services.auth_service import _resolve_or_provision_keycloak_user
+
+    monkeypatch.setattr(settings, "keycloak_link_by_email", True, raising=False)
+
+    with pytest.raises(AuthModeConfigurationError, match="keycloak_link_by_email"):
+        await _resolve_or_provision_keycloak_user(
+            _claims("link-flag", f"wsg-link-{uuid.uuid4().hex[:8]}@example.com")
         )
-    assert bound_user_id == user_id
 
 
-async def test_concurrent_open_mode_backfill_of_same_subject_is_idempotent(
+async def test_concurrent_open_mode_creation_of_same_subject_is_idempotent(
     pool,
     monkeypatch,
 ):
     from app.services import auth_service
 
-    user_id = uuid.uuid4()
-    email = f"wsg-concurrent-backfill-{uuid.uuid4().hex[:8]}@example.com"
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO users (id, username, email, password_hash, auth_provider)
-            VALUES ($1, $2, $3, $4, 'keycloak')
-            """,
-            user_id,
-            f"wsg-{uuid.uuid4().hex[:12]}",
-            email,
-            "!keycloak-sso:no-local-login!",
-        )
+    email = f"wsg-concurrent-jit-{uuid.uuid4().hex[:8]}@example.com"
 
     original_lookup = auth_service._bound_external_user
     initial_lookups = 0
@@ -230,19 +242,24 @@ async def test_concurrent_open_mode_backfill_of_same_subject_is_idempotent(
         "_bound_external_user",
         synchronized_initial_lookup,
     )
-    claims = _claims("concurrent-backfill", email)
+    claims = _claims("concurrent-jit", email)
 
     results = await asyncio.gather(
         auth_service._resolve_or_provision_keycloak_user(claims),
         auth_service._resolve_or_provision_keycloak_user(claims),
     )
 
-    assert {result["user_id"] for result in results} == {user_id}
+    assert len({result["user_id"] for result in results}) == 1
+    assert sorted(result["newly_provisioned"] for result in results) == [False, True]
     async with pool.acquire() as conn:
         assert await conn.fetchval(
             "SELECT COUNT(*) FROM external_identities WHERE issuer = $1 AND subject = $2",
             _ISSUER,
-            "concurrent-backfill",
+            "concurrent-jit",
+        ) == 1
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE email = $1",
+            email,
         ) == 1
 
 
@@ -277,6 +294,27 @@ async def test_second_subject_cannot_jit_bind_to_an_already_bound_email(pool):
 
     with pytest.raises(ExternalIdentityConflictError):
         await _resolve_or_provision_keycloak_user(_claims("subject-two", email))
+
+
+async def test_open_mode_rejects_username_collision_instead_of_suffixing(pool):
+    from app.services.auth_service import _resolve_or_provision_keycloak_user
+
+    username = f"wsg-username-{uuid.uuid4().hex[:8]}"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (username, email, password_hash, auth_provider)
+            VALUES ($1, $2, $3, 'local')
+            """,
+            username,
+            f"{username}-existing@example.com",
+            "!existing!",
+        )
+
+    claims = _claims("username-collision", f"{username}-new@example.com")
+    claims["preferred_username"] = username
+    with pytest.raises(ExternalIdentityConflictError):
+        await _resolve_or_provision_keycloak_user(claims)
 
 
 async def test_suspended_bound_user_is_denied(pool, monkeypatch):
