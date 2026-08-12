@@ -4,11 +4,10 @@ Covers the pure-function and pydantic-mockable surfaces — no DB, no
 real Keycloak. Concretely:
 
 - ``settings.mcp_oauth_audience_effective`` derives from ``public_base_url``
-- ``KeycloakOIDC.verify_access_token`` accepts a freshly-signed RS256
+- ``KeycloakOIDC.verify_access_token`` returns a typed principal for RS256
   token, rejects wrong audience / wrong issuer / expired / wrong alg
-- ``resolve_token`` dispatches on JWT ``alg``: PAT → _resolve_pat,
-  HS256 → existing AKB JWT path, RS256 → Keycloak access-token path
-  (gated on ``mcp_oauth_enabled``)
+- the MCP capability selects PAT/service-by-prefix or keycloak-access-v1;
+  local session JWTs are not an MCP credential
 - ``_dispatch`` scope enforcement: ``oauth_scopes is None`` bypasses,
   missing scope returns ``insufficient_scope``, sufficient passes
 - ``/.well-known/oauth-protected-resource`` shape: 404 when disabled,
@@ -88,6 +87,10 @@ def _mint_access_token(
         "sub": sub,
         "iat": now,
         "exp": now + exp_delta,
+        "jti": "test-jti",
+        "typ": "Bearer",
+        "azp": "test-browser-client",
+        "sid": "test-human-session",
         "email": email,
         "email_verified": email_verified,
         "preferred_username": preferred_username,
@@ -95,7 +98,12 @@ def _mint_access_token(
     }
     if extra:
         payload.update(extra)
-    return jwt.encode(payload, private_pem, algorithm=alg, headers={"kid": kid})
+    return jwt.encode(
+        payload,
+        private_pem,
+        algorithm=alg,
+        headers={"kid": kid, "typ": "JWT"},
+    )
 
 
 # ── settings.mcp_oauth_audience_effective ──────────────────────────
@@ -142,10 +150,10 @@ async def test_verify_access_token_happy_path(monkeypatch, rsa_keypair):
         audience=audience,
         issuer=issuer,
     )
-    claims = await svc.verify_access_token(token, audience)
-    assert claims is not None
-    assert claims["email"] == "alice@example.com"
-    assert "akb:vault:read" in claims.get("scope", "")
+    principal = await svc.verify_access_token(token, audience, route_profile="mcp")
+    assert principal is not None
+    assert principal.claims["email"] == "alice@example.com"
+    assert "akb:vault:read" in principal.claims["scope"]
 
 
 @pytest.mark.asyncio
@@ -166,7 +174,14 @@ async def test_verify_access_token_wrong_audience(monkeypatch, rsa_keypair):
         audience="https://other.example.com/mcp",
         issuer=issuer,
     )
-    assert await svc.verify_access_token(token, "https://akb.example.com/mcp") is None
+    assert (
+        await svc.verify_access_token(
+            token,
+            "https://akb.example.com/mcp",
+            route_profile="mcp",
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -187,7 +202,7 @@ async def test_verify_access_token_wrong_issuer(monkeypatch, rsa_keypair):
         audience=audience,
         issuer="https://attacker.example.com/realms/akb",
     )
-    assert await svc.verify_access_token(token, audience) is None
+    assert await svc.verify_access_token(token, audience, route_profile="mcp") is None
 
 
 @pytest.mark.asyncio
@@ -209,7 +224,7 @@ async def test_verify_access_token_expired(monkeypatch, rsa_keypair):
         issuer=issuer,
         exp_delta=-60,  # already expired
     )
-    assert await svc.verify_access_token(token, audience) is None
+    assert await svc.verify_access_token(token, audience, route_profile="mcp") is None
 
 
 @pytest.mark.asyncio
@@ -228,20 +243,26 @@ async def test_verify_access_token_rejects_hs256(monkeypatch):
     now = int(datetime.now(timezone.utc).timestamp())
     token = jwt.encode(
         {"sub": "x", "aud": "y", "iss": "z", "iat": now, "exp": now + 60},
-        "shared-secret",
+        "shared-secret-at-least-32-bytes-long",
         algorithm="HS256",
     )
-    assert await svc.verify_access_token(token, "https://akb.example.com/mcp") is None
+    assert (
+        await svc.verify_access_token(
+            token,
+            "https://akb.example.com/mcp",
+            route_profile="mcp",
+        )
+        is None
+    )
 
 
-# ── resolve_token dispatch ─────────────────────────────────────────
+# ── MCP capability selection ──────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_resolve_token_routes_rs256_to_keycloak_path(monkeypatch, rsa_keypair):
-    """An RS256 JWT must route to ``resolve_keycloak_access_token``, not
-    fall through to the HS256 AKB JWT decoder."""
+async def test_resolve_mcp_selects_keycloak_profile_without_alg_dispatch(monkeypatch):
     from app.services import auth_service
+    from app.services.auth_verifier_profiles import VerifiedPrincipal
 
     monkeypatch.setattr(settings, "mcp_oauth_enabled", True, raising=False)
     monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
@@ -250,39 +271,47 @@ async def test_resolve_token_routes_rs256_to_keycloak_path(monkeypatch, rsa_keyp
     monkeypatch.setattr(settings, "public_base_url", "https://akb.example.com", raising=False)
     monkeypatch.setattr(settings, "mcp_oauth_audience", "", raising=False)
 
-    calls = []
-
-    async def _stub(token):
-        calls.append(token)
-        return auth_service.AuthenticatedUser(
-            user_id="00000000-0000-0000-0000-000000000001",
-            username="alice",
-            email="alice@example.com",
-            display_name="Alice",
-            is_admin=False,
-            auth_method="oauth",
-            oauth_scopes=["akb:vault:read"],
-        )
-
-    monkeypatch.setattr(auth_service, "resolve_keycloak_access_token", _stub)
-
-    token = _mint_access_token(
-        private_pem=rsa_keypair["private_pem"],
-        kid="test-key-1",
-        audience="https://akb.example.com/mcp",
-        issuer="https://kc.example.com/realms/akb",
+    calls: list[tuple[str, str]] = []
+    actor = auth_service.AuthenticatedUser(
+        user_id="00000000-0000-0000-0000-000000000001",
+        username="alice",
+        email="alice@example.com",
+        display_name="Alice",
+        is_admin=False,
+        auth_method="oauth",
+        oauth_scopes=["akb:vault:read"],
     )
-    result = await auth_service.resolve_token(f"Bearer {token}")
+    principal = VerifiedPrincipal(
+        profile_id="keycloak-access-v1",
+        issuer="https://kc.example.com/realms/akb",
+        subject="alice-subject",
+        credential_type="access_token",
+        claims={"scope": "akb:vault:read"},
+        audience="https://akb.example.com/mcp",
+    )
+
+    async def verify(token: str, route_profile: str):
+        calls.append((token, route_profile))
+        return principal
+
+    async def project(value):
+        assert value is principal
+        return actor
+
+    monkeypatch.setattr(auth_service, "verify_keycloak_access_v1", verify)
+    monkeypatch.setattr(auth_service, "project_verified_principal", project)
+    result = await auth_service.resolve_mcp_authorization("Bearer opaque.jwt")
     assert result is not None
     assert result.auth_method == "oauth"
     assert result.oauth_scopes == ["akb:vault:read"]
-    assert calls == [token]
+    assert calls == [("opaque.jwt", "mcp")]
 
 
 @pytest.mark.asyncio
 async def test_mcp_oauth_maps_suspended_external_account_to_auth_failure(monkeypatch):
     from app.exceptions import AccountSuspendedError
-    from app.services import auth_service, keycloak_oidc
+    from app.services import auth_service
+    from app.services.auth_verifier_profiles import VerifiedPrincipal
 
     monkeypatch.setattr(settings, "mcp_oauth_enabled", True, raising=False)
     monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
@@ -293,25 +322,33 @@ async def test_mcp_oauth_maps_suspended_external_account_to_auth_failure(monkeyp
         raising=False,
     )
 
-    class StubOIDC:
-        async def verify_access_token(self, _token, _audience):
-            return {
-                "iss": "https://kc.example.com/realms/akb",
-                "sub": "suspended-subject",
-            }
+    principal = VerifiedPrincipal(
+        profile_id="keycloak-access-v1",
+        issuer="https://kc.example.com/realms/akb",
+        subject="suspended-subject",
+        credential_type="access_token",
+        claims={
+            "iss": "https://kc.example.com/realms/akb",
+            "sub": "suspended-subject",
+            "scope": "akb:vault:read",
+        },
+        audience="https://akb.example.com/mcp",
+    )
+
+    async def verify(_token: str, _route_profile: str):
+        return principal
 
     async def _suspended(_claims):
         raise AccountSuspendedError()
 
-    monkeypatch.setattr(keycloak_oidc, "get_keycloak_oidc", lambda: StubOIDC())
+    monkeypatch.setattr(auth_service, "verify_keycloak_access_v1", verify)
     monkeypatch.setattr(auth_service, "_resolve_or_provision_keycloak_user", _suspended)
 
-    assert await auth_service.resolve_keycloak_access_token("signed-token") is None
+    assert await auth_service.resolve_mcp_authorization("Bearer signed-token") is None
 
 
 @pytest.mark.asyncio
-async def test_resolve_token_pat_unchanged(monkeypatch):
-    """The PAT prefix path must not be perturbed by the new RS256 branch."""
+async def test_resolve_mcp_pat_unchanged(monkeypatch):
     from app.services import auth_service
 
     seen = []
@@ -321,12 +358,12 @@ async def test_resolve_token_pat_unchanged(monkeypatch):
         return None  # we only care that the PAT path is taken
 
     monkeypatch.setattr(auth_service, "_resolve_pat", _stub)
-    await auth_service.resolve_token("Bearer akb_some_pat_value")
+    await auth_service.resolve_mcp_authorization("Bearer akb_some_pat_value")
     assert seen == ["akb_some_pat_value"]
 
 
 @pytest.mark.asyncio
-async def test_resolve_token_rs256_rejected_when_mcp_oauth_off(monkeypatch, rsa_keypair):
+async def test_resolve_mcp_rs256_rejected_when_mcp_oauth_off(monkeypatch, rsa_keypair):
     """Resource-server gating: with ``mcp_oauth_enabled = false`` an
     RS256 token is rejected to None, not silently honoured."""
     from app.services import auth_service
@@ -338,7 +375,7 @@ async def test_resolve_token_rs256_rejected_when_mcp_oauth_off(monkeypatch, rsa_
         audience="https://akb.example.com/mcp",
         issuer="https://kc.example.com/realms/akb",
     )
-    assert await auth_service.resolve_token(f"Bearer {token}") is None
+    assert await auth_service.resolve_mcp_authorization(f"Bearer {token}") is None
 
 
 # ── _dispatch scope enforcement ────────────────────────────────────
@@ -346,7 +383,7 @@ async def test_resolve_token_rs256_rejected_when_mcp_oauth_off(monkeypatch, rsa_
 
 @pytest.mark.asyncio
 async def test_dispatch_skips_scope_check_when_oauth_scopes_none():
-    """PAT and AKB JWT callers carry ``oauth_scopes is None`` and must
+    """PAT and service callers carry ``oauth_scopes is None`` and must
     NOT be gated by the OAuth scope check — only by PG-RBAC downstream."""
     from mcp_server.server import _dispatch, _MCPUser, _HANDLERS
 
@@ -780,7 +817,7 @@ async def test_verify_access_token_returns_none_on_jwks_unreachable(monkeypatch,
         audience=audience,
         issuer=issuer,
     )
-    assert await svc.verify_access_token(token, audience) is None
+    assert await svc.verify_access_token(token, audience, route_profile="mcp") is None
 
 
 # ── SPA-audience token must not be usable at /mcp ──────────────────
@@ -809,4 +846,11 @@ async def test_verify_rejects_spa_audience_token(monkeypatch, rsa_keypair):
         issuer=issuer,
     )
     # Validated against the MCP resource audience → rejected.
-    assert await svc.verify_access_token(spa_token, "https://akb.example.com/mcp") is None
+    assert (
+        await svc.verify_access_token(
+            spa_token,
+            "https://akb.example.com/mcp",
+            route_profile="mcp",
+        )
+        is None
+    )

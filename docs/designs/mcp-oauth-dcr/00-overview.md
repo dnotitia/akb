@@ -61,10 +61,10 @@ for the SSO login path. This design extends them to a second caller
 | AKB role in OAuth | Resource Server only | Keep AKB out of consent/registration/token-rotation security surface. |
 | AS provider | Any RFC 7591-capable OIDC IdP (reference: Keycloak) | Already integrated; swappable per deployment. No code dep on Keycloak specifically. |
 | DCR handling | Delegated to IdP entirely | AKB advertises the IdP's registration endpoint via `oauth-protected-resource` metadata; clients register there directly. |
-| Identity mapping | Reuse `keycloak_oidc.resolve_jwt()` + `find_or_provision_user(claims)` | Same JIT path the SSO callback already uses; one helper, two callers. |
+| Identity mapping | Reuse the verified-principal account projection used by SSO | Exact issuer/subject projection stays shared after the route-selected verifier succeeds. |
 | Default state | OAuth path disabled | When `oidc.enabled = false`, `/mcp` still accepts PAT only — current behavior preserved bit-for-bit. |
 | Scope model | `akb:vault:read`, `akb:vault:write` (vault-wide); finer grain deferred | Matches existing vault-level role grants. Per-collection scopes are not in OAuth — they stay in AKB's authorization layer. |
-| PAT compatibility | `/mcp` accepts BOTH `Bearer akb_<pat>` AND `Bearer <jwt>` | No breaking change for stdio/CLI users. Detected by token prefix. |
+| PAT compatibility | `/mcp` accepts namespaced PAT/service credentials and, when enabled, `keycloak-access-v1` | No breaking change for stdio/CLI users; local human-session JWTs are not MCP credentials. |
 | Consent UI | Hosted by IdP, not AKB | AKB does not render or own the consent screen. Scope names and i18n strings live in the IdP realm config. |
 | Audience claim | AKB validates `aud` includes its `resource` identifier | Prevents tokens issued for other RSes (or for the SPA itself) from being usable at `/mcp`. |
 
@@ -92,21 +92,19 @@ When `oidc.enabled = false`, this endpoint returns `404 Not Found`. No
 `authorization_servers` advertised means clients fall through to
 PAT-only behavior.
 
-### 2. MCP handler accepts both token types
+### 2. MCP handler accepts its declared credential classes
 
-`backend/mcp_server/http_app.py:69` is the sole change point. Pseudocode
-of the patch:
+The MCP HTTP boundary and tool-request context use the same explicit resolver.
+Pseudocode of the boundary:
 
 ```python
 auth_header = request.headers.get("authorization", "")
 token = auth_header.removeprefix("Bearer ").strip()
 
-if token.startswith("akb_"):
-    user = await resolve_token(auth_header)               # PAT path (existing)
-elif settings.oidc.enabled and token:
-    user = await resolve_oidc_jwt(token, audience=MCP_RESOURCE)   # new
-else:
-    user = None
+user = await resolve_mcp_authorization(auth_header)
+# The trusted MCP capability selects either token-store resolution for an
+# akb_ credential or keycloak-access-v1 for the MCP audience. It never selects
+# a verifier from an untrusted JOSE alg and never tries a local-session profile.
 
 if not user:
     return _unauthorized_with_resource_metadata_hint()
@@ -229,9 +227,9 @@ AKB never sees any of this. AKB code did not run.
              Authorization: Bearer <jwt>
              body: { "method": "tools/call", "params": { "name": "akb_search", ... } }
 
-[AKB /mcp]   token prefix ≠ "akb_" + oidc.enabled → resolve_oidc_jwt(jwt, aud=MCP_RESOURCE)
+[AKB /mcp]   MCP capability + oidc.enabled → keycloak-access-v1(jwt, aud=MCP_RESOURCE)
              verify_jwt: JWKS sig + iss + aud + exp + scope contains akb:vault:read
-             find_or_provision_user(claims.email) → users.id
+             project exact (claims.iss, claims.sub) → users.id
              SET LOCAL ROLE akb_user_<uid>          (existing PG-RBAC path)
              dispatch tool
              → 200
@@ -241,8 +239,9 @@ AKB never sees any of this. AKB code did not run.
 
 - **Does not implement an AS inside AKB.** No `/register`, `/authorize`,
   `/token`, consent UI, refresh rotation, or JWKS publication is added.
-- **Does not change PAT behavior.** All current stdio/CLI/Desktop flows
-  continue to work. PAT and JWT coexist on `/mcp`.
+- **Does not change PAT/service behavior.** Current stdio/CLI/Desktop token-store
+  flows continue to work. Those credentials coexist with the MCP-audience
+  Keycloak access-token profile on `/mcp`; AKB local-session JWTs do not.
 - **Does not change the SPA login.** Web UI continues to use the existing
   AKB-issued JWT via `/api/v1/auth/login` (or `/auth/keycloak/exchange`
   when SSO is on). The OAuth path here is exclusively for **third-party

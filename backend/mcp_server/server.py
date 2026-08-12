@@ -42,7 +42,7 @@ from app.services.access_service import (
     list_vault_members, list_accessible_vaults, get_vault_info, search_users,
     transfer_ownership, archive_vault,
 )
-from app.services.auth_service import resolve_token, token_has_scope
+from app.services.auth_service import resolve_mcp_authorization, token_has_scope
 from app.util.errors import (
     err,
     exception_envelope,
@@ -104,7 +104,7 @@ class _MCPUser:
         self.username = username
         self.is_admin = is_admin
         # OAuth scopes when the call came in via a Keycloak access token
-        # at /mcp; None for PAT / AKB JWT / fallback. The scope check in
+        # at /mcp; None for PAT / service / fallback. The scope check in
         # `_dispatch` is no-op when this is None — current behaviour for
         # everyone who has not opted into the MCP-OAuth Resource Server
         # path.
@@ -120,7 +120,7 @@ async def _get_user() -> _MCPUser:
 
     Uses the standard MCP SDK mechanism: server.request_context.request
     contains the original HTTP Request, from which we extract the
-    Authorization header and resolve the user via PAT.
+    Authorization header and apply the MCP credential capability.
     """
     try:
         ctx = server.request_context
@@ -128,7 +128,7 @@ async def _get_user() -> _MCPUser:
         if request:
             auth_header = request.headers.get("authorization", "")
             if auth_header:
-                user = await resolve_token(auth_header)
+                user = await resolve_mcp_authorization(auth_header)
                 if user:
                     return _MCPUser(
                         user.user_id,
@@ -178,9 +178,8 @@ _HANDLERS: dict[str, Any] = {}
 
 # OAuth scope required to invoke each tool — checked in _dispatch when
 # the caller authenticated via the MCP OAuth Resource Server path (a
-# Keycloak access token with a non-None `oauth_scopes`). PAT and AKB
-# JWT callers carry `oauth_scopes is None` and skip the check entirely,
-# preserving current behaviour for stdio / CLI clients.
+# Keycloak access token with a non-None `oauth_scopes`). PAT and service
+# credentials carry `oauth_scopes is None` and skip this OAuth-layer check.
 #
 # The vocabulary is deliberately coarse — read vs write at the vault
 # level. Finer-grained access (per-vault role, public visibility,
@@ -1585,7 +1584,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
 
     # OAuth scope enforcement — only when the caller's session is
     # authenticated via a Keycloak access token (oauth_scopes is a
-    # concrete list, possibly empty). PAT and AKB JWT keep
+    # concrete list, possibly empty). PAT and service credentials keep
     # `oauth_scopes is None` so this check is a no-op for them, which
     # preserves stdio/CLI behaviour bit-for-bit.
     #

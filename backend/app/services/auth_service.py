@@ -38,6 +38,14 @@ from app.exceptions import (
 from app.models.vault_scope import VaultScope
 from app.repositories.events_repo import emit_event
 from app.services.auth_policy import require_local_auth_enabled
+from app.services.auth_verifier_profiles import (
+    KEYCLOAK_ACCESS_V1,
+    LOCAL_SESSION_LEGACY_V1,
+    KeycloakRouteProfile,
+    VerifiedPrincipal,
+    verify_keycloak_access_v1,
+    verify_local_session_legacy_v1,
+)
 from app.services.role_sync import get_role_sync
 
 TOKEN_KEY_CLASSES = frozenset({"pat", "service", "publishable"})
@@ -60,11 +68,11 @@ class AuthenticatedUser:
     # The authenticating PAT's id (None for JWT logins). The PG-native akb_sql
     # executor switches to akb_token_<tid> when this PAT is ALSO scoped.
     token_id: str | None = None
-    # OAuth 2.1 scopes carried by a Keycloak access token at /mcp. None
-    # for any non-OAuth path (PAT, AKB JWT) — those are unscoped at the
-    # OAuth layer, and the MCP dispatcher skips its scope check when this
-    # is None. A list is meaningful even when empty: an OAuth caller that
-    # presented a valid token with zero scopes is rejected by the
+    # OAuth 2.1 scopes carried by a Keycloak access token at REST or /mcp.
+    # None for any non-OAuth path (PAT, service, local session) — those are
+    # unscoped at the OAuth layer, and the MCP dispatcher skips its scope
+    # check when this is None. A list is meaningful even when empty: an OAuth
+    # caller that presented a valid token with zero scopes is rejected by the
     # dispatcher's `vault:read|write` requirement.
     oauth_scopes: list[str] | None = None
     # Token-table class for PAT/service-key paths. None for JWT/OAuth.
@@ -120,7 +128,7 @@ def create_jwt(
     ``not_before`` lets a caller pin the ``iat`` claim past a known
     revocation cutoff so a token issued in the same second as a
     revoke is born already valid (otherwise the iat-second comparison
-    in :func:`resolve_token` would reject it for up to 1s).
+    during local-session account projection would reject it for up to 1s).
     """
     now = datetime.now(timezone.utc)
     iat = now if not_before is None or not_before <= now else not_before
@@ -130,14 +138,18 @@ def create_jwt(
         "exp": iat + timedelta(hours=settings.jwt_expire_hours),
         "iat": iat,
     }
-    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+    return jwt.encode(
+        payload,
+        settings.jwt_secret,
+        algorithm="HS256",
+        headers={"typ": "JWT"},
+    )
 
 
 def decode_jwt(token: str) -> dict | None:
-    try:
-        return jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
-    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
-        return None
+    """Compatibility read of the fixed local-session-legacy-v1 profile."""
+    principal = verify_local_session_legacy_v1(token)
+    return dict(principal.claims) if principal is not None else None
 
 
 # ── PAT ──────────────────────────────────────────────────────
@@ -296,7 +308,7 @@ async def login(username: str, password: str) -> dict:
 
             # Push iat past the revocation cutoff so a login in the same
             # whole second as a revoke (admin reset, change_password) still
-            # yields a usable token. resolve_token compares against
+            # yields a usable token. Local-session projection compares against
             # CEIL(epoch) so the safe boundary is cutoff + 1s rounded up.
             not_before = row["tokens_revoked_before"] + timedelta(seconds=1)
             token = create_jwt(
@@ -622,45 +634,27 @@ async def login_with_keycloak_claims(claims: dict) -> dict:
     }
 
 
-async def resolve_keycloak_access_token(token: str) -> AuthenticatedUser | None:
-    """Resolve a Keycloak-issued access token to an :class:`AuthenticatedUser`
-    for the MCP OAuth Resource Server path. Returns ``None`` on any failure
-    (gating disabled, signature/audience/issuer mismatch, claim refusal).
-
-    The OAuth scopes are surfaced on ``user.oauth_scopes``; the MCP
-    dispatcher uses them to enforce per-tool ``vault:read`` / ``vault:write``
-    requirements. ``oauth_scopes is None`` everywhere else (PAT, AKB JWT)
-    means "skip the scope check" — current behaviour for those paths.
-    """
-    if not settings.mcp_oauth_enabled or not settings.keycloak_enabled:
-        return None
-    audience = settings.mcp_oauth_audience_effective
-    if not audience:
-        return None
-
-    from app.services.keycloak_oidc import get_keycloak_oidc
-
-    claims = await get_keycloak_oidc().verify_access_token(token, audience)
-    if not claims:
-        return None
-
+async def _project_keycloak_principal(
+    principal: VerifiedPrincipal,
+) -> AuthenticatedUser | None:
+    """Project a completely verified OIDC identity onto the AKB account path."""
+    claims = dict(principal.claims)
     try:
+        issuer, subject = _external_identity_key(claims)
+        if (issuer, subject) != (principal.issuer, principal.subject):
+            return None
         resolved = await _resolve_or_provision_keycloak_user(claims)
     except AKBError as e:
-        # Refuse rather than crash — the caller maps this to 401.
         logging.getLogger("akb.auth").info(
-            "MCP access token: user resolution rejected (%s)", e
+            "Keycloak access token: account projection rejected (%s)", e
         )
         return None
 
     if resolved["newly_provisioned"]:
         await get_role_sync().on_user_create(resolved["user_id"])
 
-    # RFC 6749 §3.3 — scopes are a space-delimited list in the `scope`
-    # claim. Defensive split: any empty fragments are dropped.
-    scope_str = claims.get("scope", "") or ""
-    scopes = [s for s in scope_str.split(" ") if s]
-
+    scope_str = claims["scope"]
+    scopes = [scope for scope in scope_str.split(" ") if scope]
     return AuthenticatedUser(
         user_id=str(resolved["user_id"]),
         username=resolved["username"],
@@ -670,6 +664,29 @@ async def resolve_keycloak_access_token(token: str) -> AuthenticatedUser | None:
         auth_method="oauth",
         oauth_scopes=scopes,
     )
+
+
+async def project_verified_principal(
+    principal: VerifiedPrincipal,
+) -> AuthenticatedUser | None:
+    """Common verified-human boundary before existing AKB authorization."""
+    if principal.profile_id == LOCAL_SESSION_LEGACY_V1:
+        return await _project_local_session_principal(principal)
+    if principal.profile_id == KEYCLOAK_ACCESS_V1:
+        return await _project_keycloak_principal(principal)
+    return None
+
+
+async def resolve_keycloak_access_token(
+    token: str,
+    *,
+    route_profile: KeycloakRouteProfile = "mcp",
+) -> AuthenticatedUser | None:
+    """Compatibility wrapper around the selected keycloak-access-v1 profile."""
+    principal = await verify_keycloak_access_v1(token, route_profile)
+    if principal is None:
+        return None
+    return await project_verified_principal(principal)
 
 
 class BadPasswordChange(Exception):
@@ -990,8 +1007,9 @@ async def revoke_all_sessions(
     """Invalidate every JWT issued to ``user_id`` before the call.
 
     Returns the cutoff timestamp. Any JWT with ``iat`` strictly less than
-    this is rejected by :func:`resolve_token`. The caller's own JWT is
-    invalidated too — the response is the last action that token can take.
+    this is rejected during local-session account projection. The caller's
+    own JWT is invalidated too — the response is the last action that token
+    can take.
 
     PATs are intentionally NOT touched. Mixing them would surprise
     pipelines that store a PAT and never expect "I changed my password"
@@ -1008,62 +1026,11 @@ async def revoke_all_sessions(
             )
 
 
-# ── Token resolution (JWT or PAT) ───────────────────────────
-
-def _jwt_algorithm(token: str) -> str | None:
-    try:
-        header = jwt.get_unverified_header(token)
-    except Exception:
-        return None
-    alg = header.get("alg")
-    return alg if isinstance(alg, str) else None
+# ── Route-selected credential resolution ────────────────────
 
 
-def _jwt_type(token: str) -> str | None:
-    try:
-        header = jwt.get_unverified_header(token)
-    except Exception:
-        return None
-    token_type = header.get("typ")
-    return token_type if isinstance(token_type, str) else None
-
-
-async def resolve_akb_session_authorization(
-    authorization: str,
-) -> AuthenticatedUser | None:
-    """Resolve only an AKB-issued user-session JWT, without ContextVar writes.
-
-    Dual-principal endpoints call this after the primary service PAT has already
-    populated request ContextVars. Accepting PAT or Keycloak token shapes here
-    would either blur the human/session contract or overwrite the primary
-    authorization state, so both are rejected.
-    """
-    if not authorization or not authorization.startswith("Bearer "):
-        return None
-    token = authorization[7:]
-    if (
-        token.startswith("akb_")
-        or _jwt_type(token) == "AKB-APP"
-        or _jwt_algorithm(token) != "HS256"
-    ):
-        return None
-    return await _resolve_akb_session_jwt(token)
-
-async def resolve_token(authorization: str) -> AuthenticatedUser | None:
-    """Resolve an Authorization header to an authenticated user.
-
-    Supports three token shapes:
-    - ``Bearer akb_<pat>`` — Personal Access Token (always)
-    - ``Bearer <hs256-jwt>`` — AKB-issued session JWT (always)
-    - ``Bearer <rs256-jwt>`` — Keycloak-issued access token for the MCP
-      Resource Server path (only when ``mcp_oauth_enabled`` AND
-      ``keycloak_enabled``; rejected to ``None`` otherwise so deployments
-      that have not opted in cannot have an external token accidentally
-      accepted).
-    """
-    # Option B: reset the request-scoped vault scope + token id on every
-    # resolve. Only a PAT (set in _resolve_pat) carries non-None values; JWT
-    # logins and tokenless/worker paths stay unscoped + token-less.
+def _reset_request_credential_context() -> None:
+    """Clear token-store authority before a top-level route resolution."""
     from app.models.vault_scope import (
         current_key_class,
         current_request_jwt_claims,
@@ -1078,50 +1045,92 @@ async def resolve_token(authorization: str) -> AuthenticatedUser | None:
     current_token_scopes.set(None)
     current_request_jwt_claims.set(None)
 
+
+def _bearer_token(authorization: str) -> str | None:
     if not authorization or not authorization.startswith("Bearer "):
         return None
-
     token = authorization[7:]
+    return token if token else None
 
-    # PAT (starts with akb_)
+
+async def _resolve_pat_or_service(token: str) -> AuthenticatedUser | None:
+    """Resolve only currently issued token-store credential classes."""
+    user = await _resolve_pat(token)
+    if user is not None and user.key_class in ISSUABLE_TOKEN_KEY_CLASSES:
+        return user
+    if user is not None:
+        _reset_request_credential_context()
+    return None
+
+
+async def resolve_rest_user_authorization(
+    authorization: str,
+) -> AuthenticatedUser | None:
+    """Resolve the REST capability without token-directed verifier dispatch."""
+    _reset_request_credential_context()
+    token = _bearer_token(authorization)
+    if token is None:
+        return None
     if token.startswith("akb_"):
-        return await _resolve_pat(token)
+        return await _resolve_pat_or_service(token)
 
-    # App identity is a separate principal class. Reject its explicit type
-    # before any user lookup even under an unsafe operator configuration where
-    # the two signing secrets accidentally match.
-    if _jwt_type(token) == "AKB-APP":
+    if settings.require_auth_mode() == "local":
+        principal = verify_local_session_legacy_v1(token)
+    else:
+        principal = await verify_keycloak_access_v1(token, "api")
+    if principal is None:
         return None
+    return await project_verified_principal(principal)
 
-    # JWT — discriminate by `alg` header. AKB-issued JWTs are HS256;
-    # Keycloak access tokens are RS256. We pick the verifier from the
-    # token's own header so a single Bearer surface accepts both without
-    # an O(2) verify attempt per request.
-    alg = _jwt_algorithm(token)
 
-    if alg == "RS256":
-        # Keycloak access token. Gated on mcp_oauth_enabled inside.
-        return await resolve_keycloak_access_token(token)
-
-    if alg != "HS256":
-        # Neither AKB nor Keycloak — reject rather than fall through to
-        # decode_jwt, which would attempt HS256 verify against an RS256
-        # token and (correctly) refuse but only after burning CPU.
+async def resolve_mcp_authorization(authorization: str) -> AuthenticatedUser | None:
+    """Resolve only token-store credentials or the MCP access-token profile."""
+    _reset_request_credential_context()
+    token = _bearer_token(authorization)
+    if token is None:
         return None
+    if token.startswith("akb_"):
+        return await _resolve_pat_or_service(token)
 
-    return await _resolve_akb_session_jwt(token)
-
-
-async def _resolve_akb_session_jwt(token: str) -> AuthenticatedUser | None:
-    """Validate one AKB HS256 session token and return its active account."""
-    payload = decode_jwt(token)
-    if not payload:
+    principal = await verify_keycloak_access_v1(token, "mcp")
+    if principal is None:
         return None
-    iat = payload.get("iat")
-    if iat is None:
-        # Required for the revocation cutoff comparison below.
-        return None
+    return await project_verified_principal(principal)
 
+
+async def resolve_delegated_human_authorization(
+    authorization: str,
+) -> AuthenticatedUser | None:
+    """Resolve a mode-selected human without clearing the primary service key."""
+    token = _bearer_token(authorization)
+    if token is None or token.startswith("akb_"):
+        return None
+    if settings.require_auth_mode() == "local":
+        principal = verify_local_session_legacy_v1(token)
+    else:
+        principal = await verify_keycloak_access_v1(token, "api")
+    if principal is None:
+        return None
+    return await project_verified_principal(principal)
+
+
+async def resolve_akb_session_authorization(
+    authorization: str,
+) -> AuthenticatedUser | None:
+    """Deprecated compatibility name for delegated human authorization."""
+    return await resolve_delegated_human_authorization(authorization)
+
+
+async def resolve_token(authorization: str) -> AuthenticatedUser | None:
+    """Deprecated compatibility name for the REST authorization capability."""
+    return await resolve_rest_user_authorization(authorization)
+
+
+async def _project_local_session_principal(
+    principal: VerifiedPrincipal,
+) -> AuthenticatedUser | None:
+    """Project a verified local session onto its active AKB account."""
+    iat = principal.claims["iat"]
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -1134,7 +1143,7 @@ async def _resolve_akb_session_jwt(token: str) -> AuthenticatedUser | None:
                  WHERE id = $1 AND account_status = 'active'
                    FOR SHARE
                 """,
-                uuid.UUID(payload["sub"]),
+                uuid.UUID(principal.subject),
             )
             if not row:
                 return None
@@ -1164,6 +1173,14 @@ async def _resolve_akb_session_jwt(token: str) -> AuthenticatedUser | None:
                 is_admin=row["is_admin"],
                 auth_method="jwt",
             )
+
+
+async def _resolve_akb_session_jwt(token: str) -> AuthenticatedUser | None:
+    """Compatibility helper for callers that already extracted a local token."""
+    principal = verify_local_session_legacy_v1(token)
+    if principal is None:
+        return None
+    return await project_verified_principal(principal)
 
 
 async def _resolve_pat(raw_token: str) -> AuthenticatedUser | None:

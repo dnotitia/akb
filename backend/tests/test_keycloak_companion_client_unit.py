@@ -75,14 +75,22 @@ async def test_id_token_audience_uses_selected_client(monkeypatch):
     service = KeycloakOIDC()
 
     async def fake_jwks(*, force=False):
-        return {"keys": [{"kid": "key-1", "kty": "RSA"}]}
+        return {
+            "keys": [
+                {"kid": "key-1", "kty": "RSA", "use": "sig", "alg": "RS256"}
+            ]
+        }
 
     def fake_decode(token, key, **kwargs):
         decoded.update(token=token, key=key, **kwargs)
         return {"sub": "user-1"}
 
     monkeypatch.setattr(service, "_fetch_jwks", fake_jwks)
-    monkeypatch.setattr(keycloak_oidc.jwt, "get_unverified_header", lambda _: {"kid": "key-1"})
+    monkeypatch.setattr(
+        keycloak_oidc.jwt,
+        "get_unverified_header",
+        lambda _: {"kid": "key-1", "alg": "RS256", "typ": "JWT"},
+    )
     monkeypatch.setattr(keycloak_oidc.RSAAlgorithm, "from_jwk", lambda _: "public-key")
     monkeypatch.setattr(keycloak_oidc.jwt, "decode", fake_decode)
 

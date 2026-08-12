@@ -898,10 +898,16 @@ class Settings(BaseModel):
     # POST so the token never rides in a URL. Keep this small.
     keycloak_exchange_code_ttl_secs: int = 60
 
+    # Audience required on Keycloak access tokens presented to human REST or
+    # delegated-human routes in SSO mode. Its effective default follows the
+    # existing public-resource convention used by MCP, but stays distinct.
+    api_oauth_audience: str = ""
+
     # === MCP OAuth Resource Server (optional, separate from SSO) ===
     # When true, AKB's /mcp endpoint accepts Keycloak-issued access tokens
-    # (RS256) in addition to the existing PAT (`akb_*`) and AKB JWT (HS256)
-    # paths. Web-hosted LLM clients (claude.ai / ChatGPT Custom Connectors,
+    # (RS256) in addition to token-store PAT/service credentials (`akb_*`).
+    # Local human-session JWTs are never MCP credentials. Web-hosted LLM
+    # clients (claude.ai / ChatGPT Custom Connectors,
     # Claude Code's HTTP transport) discover the authorization server via
     # `/.well-known/oauth-protected-resource` (RFC 9728), register
     # themselves via DCR (RFC 7591) against Keycloak, and obtain an access
@@ -1147,6 +1153,13 @@ class Settings(BaseModel):
     def keycloak_end_session_endpoint(self) -> str:
         # Browser-facing → public issuer.
         return f"{self.keycloak_issuer}/protocol/openid-connect/logout"
+
+    @property
+    def api_oauth_audience_effective(self) -> str:
+        """Audience required on SSO human access tokens at API routes."""
+        if self.api_oauth_audience:
+            return self.api_oauth_audience
+        return f"{self.public_base_url.rstrip('/')}/api"
 
     @property
     def mcp_oauth_audience_effective(self) -> str:

@@ -43,6 +43,11 @@ from jwt.algorithms import RSAAlgorithm
 from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import AKBError, AuthenticationError
+from app.services.auth_verifier_profiles import (
+    KEYCLOAK_ACCESS_V1,
+    KeycloakRouteProfile,
+    VerifiedPrincipal,
+)
 
 logger = logging.getLogger("akb.keycloak")
 
@@ -50,6 +55,10 @@ logger = logging.getLogger("akb.keycloak")
 # mandatory for an ID token; `profile`+`email` populate name/email claims
 # we map onto the AKB user.
 _SCOPE = "openid profile email"
+_TOKEN_SUPPLIED_KEY_HEADERS = frozenset({"jku", "x5u", "jwk", "x5c"})
+_SERVICE_ACCOUNT_CLAIMS = frozenset(
+    {"client_id", "clientId", "clientHost", "clientAddress"}
+)
 
 
 # ── Transient store (oidc_transients table) ──────────────────────────
@@ -234,8 +243,12 @@ class KeycloakOIDC:
 
     @staticmethod
     def _find_key(jwks: dict[str, Any], kid: str) -> dict | None:
+        keys = jwks.get("keys")
+        if not isinstance(keys, list):
+            return None
         return next(
-            (k for k in jwks.get("keys", []) if k.get("kid") == kid), None
+            (key for key in keys if isinstance(key, dict) and key.get("kid") == kid),
+            None,
         )
 
     async def verify_id_token(
@@ -253,8 +266,13 @@ class KeycloakOIDC:
         except jwt.InvalidTokenError as e:
             raise AuthenticationError(f"Malformed ID token: {e}") from e
 
+        if header.get("alg") != "RS256" or header.get("typ") != "JWT":
+            raise AuthenticationError("ID token does not match the RS256 JWT profile")
+        if _TOKEN_SUPPLIED_KEY_HEADERS.intersection(header):
+            raise AuthenticationError("ID token contains an untrusted key-source header")
+
         kid = header.get("kid")
-        if not kid:
+        if not isinstance(kid, str) or not kid:
             raise AuthenticationError("ID token missing kid header")
 
         jwks = await self._fetch_jwks()
@@ -265,6 +283,12 @@ class KeycloakOIDC:
             key = self._find_key(jwks, kid)
         if key is None:
             raise AuthenticationError("No matching Keycloak public key for token")
+        if (
+            key.get("kty") != "RSA"
+            or key.get("use") != "sig"
+            or key.get("alg") != "RS256"
+        ):
+            raise AuthenticationError("Keycloak ID-token signing key is not allowed")
 
         try:
             public_key = RSAAlgorithm.from_jwk(json.dumps(key))
@@ -282,47 +306,36 @@ class KeycloakOIDC:
 
         return claims
 
-    # ── Access-token verification (MCP OAuth Resource Server) ────────
+    # ── Route-selected access-token verification ────────────────────
     async def verify_access_token(
-        self, token: str, audience: str
-    ) -> dict[str, Any] | None:
-        """Verify a Keycloak-issued access token for the MCP Resource
-        Server path. Returns the claim set on success, ``None`` on any
-        verification failure.
+        self,
+        token: str,
+        audience: str,
+        *,
+        route_profile: KeycloakRouteProfile,
+    ) -> VerifiedPrincipal | None:
+        """Verify one route-selected keycloak-access-v1 credential.
 
-        Distinct from :meth:`verify_id_token` in three ways:
-        - The expected ``aud`` is the *resource* (``<host>/mcp``), not the
-          OIDC client id, because Keycloak emits the audience via the
-          scope-level hardcoded-audience mapper set up by the realm
-          bootstrap script.
-        - Returns ``None`` rather than raising on failure: the caller is
-          an MCP request handler that distinguishes "no auth" from "bad
-          auth" via response codes, not exceptions.
-        - Stricter required-claims set: ``exp``, ``iat``, ``iss``, ``aud``,
-          ``sub`` (a Keycloak access token may carry no ``scope`` claim
-          when no scopes were requested — the scope check is enforced
-          downstream in the MCP dispatcher, not here).
+        The caller supplies the already-selected API or MCP audience. Token
+        headers may only confirm this fixed RS256/JWKS profile; they never
+        select an algorithm, issuer, key source, or fallback verifier.
         """
         try:
             header = jwt.get_unverified_header(token)
         except jwt.InvalidTokenError as e:
-            logger.debug("MCP access token: malformed header (%s)", e)
+            logger.debug("Keycloak access token: malformed header (%s)", e)
             return None
 
-        # AKB-issued JWTs are HS256; only RS256 (Keycloak) reaches this
-        # path. The caller already discriminated by alg, but defend in
-        # depth so a config flip doesn't silently downgrade trust.
-        if header.get("alg") != "RS256":
+        if route_profile not in ("api", "mcp"):
+            return None
+        if header.get("alg") != "RS256" or header.get("typ") != "JWT":
+            return None
+        if _TOKEN_SUPPLIED_KEY_HEADERS.intersection(header):
             return None
         kid = header.get("kid")
-        if not kid:
+        if not isinstance(kid, str) or not kid:
             return None
 
-        # `_fetch_jwks` raises `AKBError` on IdP unreachability — catch
-        # it here so a transient JWKS blip surfaces as a clean 401
-        # (with the RFC 9728 `WWW-Authenticate` header the MCP handler
-        # adds) rather than a bare 502. The 401 lets a spec-compliant
-        # client re-run discovery; a 502 has no such affordance.
         try:
             jwks = await self._fetch_jwks()
             key = self._find_key(jwks, kid)
@@ -330,9 +343,15 @@ class KeycloakOIDC:
                 jwks = await self._fetch_jwks(force=True)
                 key = self._find_key(jwks, kid)
         except AKBError as e:
-            logger.warning("MCP access token: JWKS unavailable (%s)", e)
+            logger.warning("Keycloak access token: JWKS unavailable (%s)", e)
             return None
         if key is None:
+            return None
+        if (
+            key.get("kty") != "RSA"
+            or key.get("use") != "sig"
+            or key.get("alg") != "RS256"
+        ):
             return None
 
         try:
@@ -343,13 +362,73 @@ class KeycloakOIDC:
                 algorithms=["RS256"],
                 audience=audience,
                 issuer=settings.keycloak_issuer,
-                options={"require": ["exp", "iat", "aud", "iss", "sub"]},
+                options={
+                    "require": [
+                        "exp",
+                        "iat",
+                        "jti",
+                        "aud",
+                        "iss",
+                        "sub",
+                        "typ",
+                        "azp",
+                        "sid",
+                        "scope",
+                    ]
+                },
             )
-        except jwt.InvalidTokenError as e:
-            logger.debug("MCP access token verification failed: %s", e)
+        except (jwt.InvalidTokenError, TypeError, ValueError) as e:
+            logger.debug("Keycloak access token verification failed: %s", e)
             return None
 
-        return claims
+        required_strings = ("iss", "sub", "jti", "typ", "azp", "sid", "scope")
+        if any(
+            not isinstance(claims.get(name), str) or not claims[name].strip()
+            for name in required_strings
+        ):
+            return None
+        if claims["typ"] != "Bearer":
+            return None
+        if type(claims.get("iat")) is not int or type(claims.get("exp")) is not int:
+            return None
+        if claims["exp"] <= claims["iat"]:
+            return None
+        raw_audience = claims.get("aud")
+        if isinstance(raw_audience, str):
+            audiences = {raw_audience}
+        elif isinstance(raw_audience, list) and all(
+            isinstance(item, str) and item for item in raw_audience
+        ):
+            audiences = set(raw_audience)
+        else:
+            return None
+        other_route_audience = (
+            settings.mcp_oauth_audience_effective
+            if route_profile == "api"
+            else settings.api_oauth_audience_effective
+        )
+        if (
+            other_route_audience
+            and other_route_audience != audience
+            and other_route_audience in audiences
+        ):
+            return None
+        if _SERVICE_ACCOUNT_CLAIMS.intersection(claims):
+            return None
+        preferred_username = claims.get("preferred_username")
+        if isinstance(preferred_username, str) and preferred_username.startswith(
+            "service-account-"
+        ):
+            return None
+
+        return VerifiedPrincipal(
+            profile_id=KEYCLOAK_ACCESS_V1,
+            issuer=claims["iss"],
+            subject=claims["sub"],
+            credential_type="access_token",
+            claims=claims,
+            audience=audience,
+        )
 
     # ── Logout URL ───────────────────────────────────────────────────
     def logout_url(self, id_token_hint: str | None, post_logout_redirect: str | None) -> str:

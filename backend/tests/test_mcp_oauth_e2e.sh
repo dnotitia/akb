@@ -3,10 +3,10 @@
 # AKB MCP OAuth Resource Server — E2E
 #
 # Exercises the new /mcp OAuth path against the local-dev Keycloak overlay
-# WITHOUT needing a browser DCR roundtrip: the test realm ships an
-# `akb-mcp-test` service-account client (client_credentials grant) whose
-# default scopes are `akb:vault:read|write`, so we can mint a real
-# Keycloak access token from a shell script and present it at /mcp.
+# WITHOUT needing a browser DCR roundtrip: the test realm's human fixture uses
+# the direct-access grant on the existing `akb-web` client. This keeps the
+# verifier fixture human-shaped while still minting a real Keycloak access
+# token from a shell script.
 #
 # What this script proves (in order):
 #   1. `/.well-known/oauth-protected-resource` returns the expected shape
@@ -14,9 +14,9 @@
 #      `resource_metadata=` parameter (RFC 9728 §5 client tip-off)
 #   3. `/mcp` rejects a syntactically-valid but wrong-audience token
 #      with 401
-#   4. `/mcp` accepts a service-account access token with both scopes
+#   4. `/mcp` accepts a human access token with both scopes
 #      and dispatches a read-grade tool (akb_list_vaults)
-#   5. PAT path still works unchanged (regression guard)
+#   5. `/mcp` rejects a local session JWT and accepts a real `akb_` PAT
 #   6. A token with only `akb:vault:read` is refused at a write-grade
 #      tool with `insufficient_scope`
 #
@@ -35,15 +35,19 @@
 #   AKB_URL=http://localhost:8000
 #   KC_URL=http://localhost:8080
 #   KC_REALM=akb
-#   KC_TEST_CLIENT_ID=akb-mcp-test
-#   KC_TEST_CLIENT_SECRET=local-akb-mcp-test-secret
+#   KC_TEST_CLIENT_ID=akb-web
+#   KC_TEST_CLIENT_SECRET=local-akb-dev-secret
+#   KC_TEST_USERNAME=alice
+#   KC_TEST_PASSWORD=alice-password
 set -uo pipefail
 
 AKB_URL="${AKB_URL:-http://localhost:8000}"
 KC_URL="${KC_URL:-http://localhost:8080}"
 KC_REALM="${KC_REALM:-akb}"
-KC_TEST_CLIENT_ID="${KC_TEST_CLIENT_ID:-akb-mcp-test}"
-KC_TEST_CLIENT_SECRET="${KC_TEST_CLIENT_SECRET:-local-akb-mcp-test-secret}"
+KC_TEST_CLIENT_ID="${KC_TEST_CLIENT_ID:-akb-web}"
+KC_TEST_CLIENT_SECRET="${KC_TEST_CLIENT_SECRET:-local-akb-dev-secret}"
+KC_TEST_USERNAME="${KC_TEST_USERNAME:-alice}"
+KC_TEST_PASSWORD="${KC_TEST_PASSWORD:-alice-password}"
 
 PASS=0
 FAIL=0
@@ -59,7 +63,7 @@ section() { echo; echo "── $1 ──"; }
 mint_token() {
   # $1 = scope (space-delimited). Empty → realm-default scopes only.
   local scope="$1"
-  local data="grant_type=client_credentials&client_id=${KC_TEST_CLIENT_ID}&client_secret=${KC_TEST_CLIENT_SECRET}"
+  local data="grant_type=password&client_id=${KC_TEST_CLIENT_ID}&client_secret=${KC_TEST_CLIENT_SECRET}&username=${KC_TEST_USERNAME}&password=${KC_TEST_PASSWORD}"
   if [ -n "$scope" ]; then data="${data}&scope=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$scope")"; fi
   curl -s -X POST "${KC_URL}/realms/${KC_REALM}/protocol/openid-connect/token" \
        -H "Content-Type: application/x-www-form-urlencoded" \
@@ -133,7 +137,7 @@ if [ -z "$bad_token" ]; then fail "mint unscoped token" "Keycloak returned no ac
   if [ "$status" = "401" ]; then pass "wrong-aud → 401"; else fail "wrong-aud → 401" "got $status"; fi
 fi
 
-# ── 4. Service-account token with both scopes → 200 + tool list ─
+# ── 4. Human access token with both scopes → 200 + tool list ─
 
 section "Read+write token → /mcp accepts, tools/list returns AKB tools"
 good_token=$(mint_token "akb:vault:read akb:vault:write")
@@ -147,23 +151,49 @@ if [ -z "$good_token" ]; then fail "mint scoped token" "Keycloak returned no acc
                             *) fail "tools/list includes akb_list_vaults" "got '${list_resp:0:200}'" ;; esac
 fi
 
-# ── 5. PAT path still works (regression) ───────────────────────
+# ── 5. Local session rejected; actual PAT works ─────────────────
 
-section "Regression — PAT path unchanged"
-# Register a throwaway local user + PAT.
+section "Regression — local session rejected, actual PAT accepted"
+# Register a throwaway local user, log in, then mint an actual namespaced PAT.
 ts=$(date +%s)
 user="mcp-oauth-e2e-${ts}"
 email="${user}@example.com"
-pat=$(curl -s -X POST "${AKB_URL}/api/v1/auth/register" \
-        -H "Content-Type: application/json" \
-        -d "{\"username\":\"${user}\",\"email\":\"${email}\",\"password\":\"test-password-1\"}" \
-      | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))")
-if [ -z "$pat" ]; then fail "register local user" "no token returned"; else
-  # Use the AKB JWT as Bearer at /mcp — PAT prefix not strictly required,
-  # AKB JWT works at /mcp too.
+curl -s -X POST "${AKB_URL}/api/v1/auth/register" \
+  -H "Content-Type: application/json" \
+  -d "{\"username\":\"${user}\",\"email\":\"${email}\",\"password\":\"test-password-1\"}" \
+  >/dev/null
+session_jwt=$(curl -s -X POST "${AKB_URL}/api/v1/auth/login" \
+  -H "Content-Type: application/json" \
+  -d "{\"username\":\"${user}\",\"password\":\"test-password-1\"}" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))")
+if [ -z "$session_jwt" ]; then
+  fail "local login" "no session JWT returned"
+else
+  status=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${AKB_URL}/mcp/" \
+    -H "Authorization: Bearer ${session_jwt}" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0"}}}')
+  if [ "$status" = "401" ]; then pass "local session JWT rejected at /mcp"; else fail "local session JWT rejected at /mcp" "got $status"; fi
+fi
+
+pat=$(curl -s -X POST "${AKB_URL}/api/v1/auth/tokens" \
+  -H "Authorization: Bearer ${session_jwt}" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"mcp-oauth-e2e-pat","scopes":["read","write"]}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))")
+case "$pat" in
+  akb_*)
+    pass "actual namespaced PAT minted"
+    ;;
+  *)
+    fail "actual namespaced PAT minted" "token is empty or lacks akb_ prefix"
+    ;;
+esac
+if [ -n "$pat" ]; then
   init_resp=$(mcp_initialize_call "$pat")
-  case "$init_resp" in *'"jsonrpc"'*) pass "PAT/JWT initialize still works" ;;
-                            *) fail "PAT/JWT initialize still works" "got '${init_resp:0:200}'" ;; esac
+  case "$init_resp" in *'"jsonrpc"'*) pass "PAT initialize works" ;;
+                            *) fail "PAT initialize works" "got '${init_resp:0:200}'" ;; esac
 fi
 
 # ── 6. Read-only token → write tool returns insufficient_scope ──

@@ -156,10 +156,11 @@ only satisfy one origin per instance.
   and decode with pyjwt `algorithms=["RS256"], audience=keycloak_client_id,
   issuer=keycloak_issuer, options={"require": ["exp","iat","aud","iss","sub"]}`.
   On a `kid` miss the JWKS is refetched once (key rotation) before failing.
-- This validation applies **only to the Keycloak `id_token` during
-  callback**. It is not on the per-request hot path — once AKB issues its
-  own JWT, `resolve_token()` handles every subsequent request exactly as
-  today (HS256 AKB JWT or `akb_` PAT).
+- Callback validation still applies to the Keycloak `id_token`. Phase 1 A2
+  separately verifies `keycloak-access-v1` on the per-request SSO path and
+  does not accept an AKB local-session JWT there. The callback still mints the
+  legacy token until the A4 browser-session cutover; A4 owns removing that
+  issuance and completing the browser transport change.
 
 ## Backend changes (file by file, as built)
 

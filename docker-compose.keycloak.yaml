@@ -34,12 +34,11 @@
 # with the same Keycloak authority + `mcp_oauth_enabled: true`; no human OIDC
 # redirect/client settings are required for that resource-server-only mode.
 #
-# For E2E / CI (`backend/tests/test_mcp_oauth_e2e.sh`) the realm ships
-# `akb-mcp-test` — a confidential service-account client (secret
-# "local-akb-mcp-test-secret") with `akb:vault:read|write` as default
-# scopes. It mints access tokens via the client_credentials grant so
-# the test exercises the Resource Server path headlessly, without a
-# browser DCR roundtrip.
+# For local E2E (`backend/tests/test_mcp_oauth_e2e.sh`), the `alice` fixture
+# uses the `akb-web` direct-access grant to mint a human access token without
+# a browser roundtrip. The realm's `akb-mcp-test` service-account client stays
+# available for legacy/manual experiments but is intentionally not accepted by
+# the human verifier profile.
 #
 # Real Claude Code / claude.ai validation: the local Keycloak overlay
 # works for headless E2E but Claude Code's OAuth discovery requires

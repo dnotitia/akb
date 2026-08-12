@@ -115,17 +115,16 @@ class VaultScope:
         return scope
 
 
-# Request-scoped carrier for the authenticated token's vault scope. Set once
-# per request in ``auth_service.resolve_token`` (the single chokepoint BOTH the
-# REST ``get_current_user`` dependency AND the MCP server's auth go through),
-# read in ``access_service.check_vault_access``. Default ``None`` (unscoped) —
-# tokenless internal/worker paths never set it.
+# Request-scoped carrier for the authenticated token's vault scope. Set by the
+# explicit REST or MCP authorization capability when it resolves a token-store
+# credential, then read in ``access_service.check_vault_access``. Default
+# ``None`` (unscoped) — tokenless internal/worker paths never set it.
 current_vault_scope: ContextVar[VaultScope | None] = ContextVar(
     "current_vault_scope", default=None
 )
 
-# Request-scoped carrier for the authenticated PAT's id, set alongside
-# ``current_vault_scope`` in ``auth_service.resolve_token``. The PG-native
+# Request-scoped carrier for the authenticated PAT/service id, set alongside
+# ``current_vault_scope`` during token-store resolution. The PG-native
 # ``akb_sql`` executor (``user_sql_executor.execute``) reads it to
 # ``SET LOCAL ROLE akb_token_<tid>`` when a scope is present — the narrow role
 # whose membership is the owner-ACL ∩ scope (surface 2 of the backstop). The
@@ -157,8 +156,8 @@ def current_token_uuid() -> uuid.UUID | None:
         return None
 
 
-# Request-scoped token metadata, set by ``auth_service.resolve_token`` for
-# rows from the tokens table. JWT / OAuth / internal paths leave these as
+# Request-scoped token metadata, set by explicit route authorization for rows
+# from the tokens table. Local-session / OAuth / internal paths leave these as
 # None; PAT and service-key paths set both so entrypoints can enforce coarse
 # read/write scopes and AKB-038 can gate trusted claim injection on
 # ``current_key_class == "service"``.

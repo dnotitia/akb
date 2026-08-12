@@ -209,6 +209,10 @@ app_credential_overlap_seconds: 300
 #                                             # {"https://naut.example.com": "naut-web"}.
 #                                             # Empty preserves the global akb-web client.
 # keycloak_exchange_code_ttl_secs: 60
+# api_oauth_audience: ""               # default: <public_base_url>/api
+# mcp_oauth_enabled: false
+# mcp_oauth_audience: ""               # default: <public_base_url>/mcp
+# API and MCP audiences must remain distinct.
 # keycloak_client_secret lives in secret.yaml (never commit it)
 
 # === Server ===

@@ -267,3 +267,66 @@ def test_sso_startup_still_requires_human_oidc_client_config(
     message = str(exc_info.value)
     assert "keycloak_redirect_uri (auth_mode is sso" in message
     assert "keycloak_client_secret (auth_mode is sso" in message
+
+
+def test_api_audience_has_distinct_public_resource_default() -> None:
+    loaded = app_config.Settings(
+        auth_mode="sso",
+        keycloak_enabled=True,
+        public_base_url="https://akb.example.com",
+        mcp_oauth_enabled=True,
+    )
+
+    assert loaded.api_oauth_audience_effective == "https://akb.example.com/api"
+    assert loaded.mcp_oauth_audience_effective == "https://akb.example.com/mcp"
+
+
+def test_startup_rejects_equal_api_and_mcp_audiences(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from app.services import lifecycle
+
+    shared_audience = "https://akb.example.com/resource"
+    loaded = _load(
+        monkeypatch,
+        tmp_path,
+        {
+            "auth_mode": "local",
+            "keycloak_enabled": True,
+            "mcp_oauth_enabled": True,
+            "keycloak_server_url": "https://auth.example.com",
+            "api_oauth_audience": shared_audience,
+            "mcp_oauth_audience": shared_audience,
+            "jwt_secret": "test-jwt-secret",
+            "db_password": "test-db-password",
+            "public_base_url": "https://akb.example.com",
+        },
+    )
+    monkeypatch.setattr(lifecycle, "settings", loaded)
+
+    with pytest.raises(RuntimeError, match="audiences must be distinct"):
+        lifecycle._validate_required_settings()
+
+
+def test_startup_rejects_configurable_algorithm_for_fixed_legacy_profile(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from app.services import lifecycle
+
+    loaded = _load(
+        monkeypatch,
+        tmp_path,
+        {
+            "auth_mode": "local",
+            "jwt_algorithm": "RS256",
+            "jwt_secret": "test-jwt-secret",
+            "db_password": "test-db-password",
+            "public_base_url": "https://akb.example.com",
+        },
+    )
+    monkeypatch.setattr(lifecycle, "settings", loaded)
+
+    with pytest.raises(RuntimeError, match="local-session-legacy-v1"):
+        lifecycle._validate_required_settings()

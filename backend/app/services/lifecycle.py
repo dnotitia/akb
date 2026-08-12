@@ -32,6 +32,18 @@ def _validate_required_settings() -> None:
     """Fail fast on missing required config so misconfigured deploys don't
     silently serve unsigned tokens or produce confusing downstream errors."""
     settings.require_auth_mode()
+    if settings.jwt_algorithm != "HS256":
+        raise RuntimeError(
+            "jwt_algorithm must be HS256 while local-session-legacy-v1 is active"
+        )
+    if (
+        settings.mcp_oauth_enabled
+        and settings.api_oauth_audience_effective
+        == settings.mcp_oauth_audience_effective
+    ):
+        raise RuntimeError(
+            "API and MCP OAuth audiences must be distinct resource identifiers"
+        )
     missing: list[str] = []
     if not settings.jwt_secret:
         missing.append("AKB_JWT_SECRET (signs auth tokens — use a strong random string)")
