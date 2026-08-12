@@ -94,7 +94,10 @@ def test_bearer_auth_scheme_is_registered():
     assert schema["components"]["securitySchemes"]["bearerAuth"] == {
         "type": "http",
         "scheme": "bearer",
-        "description": "JWT or AKB personal access token supplied as a Bearer token.",
+        "description": (
+            "Route-selected human credential or namespaced AKB PAT/service "
+            "credential supplied as a Bearer token."
+        ),
     }
 
 
@@ -112,6 +115,15 @@ def test_api_operations_have_codegen_safe_ids_tags_and_success_schema():
 
         responses = operation.get("responses", {})
         success = next((responses.get(code) for code in SUCCESS_STATUSES if code in responses), None)
+        if (method, path) in {
+            ("get", "/api/v1/auth/keycloak/login"),
+            ("get", "/api/v1/auth/keycloak/callback"),
+            ("get", "/api/v1/auth/keycloak/logout"),
+            ("post", "/api/v1/auth/keycloak/exchange"),
+        }:
+            assert success is None
+            assert not any(str(code).startswith("3") for code in responses)
+            continue
         if success is None and any(str(code).startswith("3") for code in responses):
             assert "200" not in responses
             continue
@@ -939,17 +951,23 @@ def test_unhandled_exception_runtime_shape_matches_akb_error_schema():
     }
 
 
-def test_redirect_operations_do_not_advertise_json_success():
+def test_staged_browser_sso_operations_advertise_no_redirect_or_success():
     schema = app.openapi()
-    for path in (
-        "/api/v1/auth/keycloak/login",
-        "/api/v1/auth/keycloak/callback",
-        "/api/v1/auth/keycloak/logout",
-    ):
-        responses = schema["paths"][path]["get"]["responses"]
-        assert "302" in responses
+    operations = (
+        ("/api/v1/auth/keycloak/login", "get"),
+        ("/api/v1/auth/keycloak/callback", "get"),
+        ("/api/v1/auth/keycloak/logout", "get"),
+        ("/api/v1/auth/keycloak/exchange", "post"),
+    )
+    for path, method in operations:
+        responses = schema["paths"][path][method]["responses"]
+        assert "503" in responses
         assert "200" not in responses
-        assert "application/json" not in responses["302"].get("content", {})
+        assert "302" not in responses
+
+    exchange = schema["paths"]["/api/v1/auth/keycloak/exchange"]["post"]
+    assert exchange["summary"] == "Legacy SSO exchange (staged unavailable)"
+    assert "JWT" not in exchange["summary"]
 
 
 def test_non_json_success_operations_keep_their_media_types():

@@ -1,8 +1,8 @@
 # MCP OAuth + DCR — Resource Server, delegated AS
 
-**Status**: design draft (no code yet)
+**Status**: resource-server boundary implemented; browser SSO remains staged
 **Started**: 2026-06-25
-**Related**: [`keycloak-oidc/00-overview.md`](../keycloak-oidc/00-overview.md) — existing optional Keycloak login path that this design reuses
+**Related**: [`keycloak-oidc/00-overview.md`](../keycloak-oidc/00-overview.md) — current route-selected verifier and browser-session boundary
 
 ## Statement
 
@@ -49,10 +49,10 @@ By contrast, the Resource Server role is small and well-bounded:
 2. Map the JWT subject to an internal AKB `users.id`.
 3. Enforce the existing PG-native RBAC.
 
-Steps 1 and 2 already exist in
+Steps 1 and 2 are implemented in
 [`backend/app/services/keycloak_oidc.py`](../../backend/app/services/keycloak_oidc.py)
-for the SSO login path. This design extends them to a second caller
-(the MCP HTTP handler) without changing their semantics.
+and the common verified-principal projector. REST and MCP select distinct
+profiles before parsing any untrusted JOSE metadata.
 
 ## Decisions (locked)
 
@@ -114,31 +114,25 @@ The `WWW-Authenticate` response header on 401 includes a
 `resource_metadata=` parameter (RFC 9728 §5) pointing clients at the
 `.well-known` URL above so they can complete discovery.
 
-### 3. `resolve_oidc_jwt` helper
+### 3. Explicit MCP authorization resolver
 
-Added to `backend/app/services/auth_service.py` (or co-located in
-`keycloak_oidc.py`). Wraps the existing JWT verifier plus the existing
-user lookup:
+`resolve_mcp_authorization` selects token-store resolution for namespaced
+`akb_` credentials or, only when MCP OAuth is enabled, the pinned
+`keycloak-access-v1` MCP profile:
 
 ```python
-async def resolve_oidc_jwt(token: str, audience: str) -> User | None:
-    claims = await keycloak_oidc.verify_jwt(token, audience=audience)
-    if not claims:
-        return None
-    return await find_or_provision_user(claims)            # extracted from
-                                                            # current SSO callback
+user = await resolve_mcp_authorization(authorization_header)
 ```
 
-The extraction of `find_or_provision_user` from the SSO callback into a
-standalone helper is the only meaningful refactor — both call sites
-(SSO browser flow + MCP machine-to-machine flow) then share one path.
+Only a completely verified principal reaches the common exact
+`(issuer, subject)` account projector. There is no algorithm dispatch,
+verifier fallback, or local-session JWT acceptance on MCP.
 
 ### 4. Audience constant
 
 `MCP_RESOURCE = f"{settings.public_url}/mcp"` exposed from config so the
-JWKS verifier can enforce `aud` matches. Tokens minted for the SPA login
-flow (audience = `"akb-web"`) MUST NOT be usable at `/mcp`, and vice
-versa.
+JWKS verifier can enforce `aud` matches. Tokens issued for the human API
+resource MUST NOT be usable at `/mcp`, and vice versa.
 
 ### 5. Scope enforcement (optional in v1)
 
@@ -227,8 +221,8 @@ AKB never sees any of this. AKB code did not run.
              Authorization: Bearer <jwt>
              body: { "method": "tools/call", "params": { "name": "akb_search", ... } }
 
-[AKB /mcp]   MCP capability + oidc.enabled → keycloak-access-v1(jwt, aud=MCP_RESOURCE)
-             verify_jwt: JWKS sig + iss + aud + exp + scope contains akb:vault:read
+[AKB /mcp]   MCP capability + mcp_oauth.enabled → keycloak-access-v1(access token, aud=MCP_RESOURCE)
+             fixed verifier: JWKS sig + iss + aud + exp + scope contains akb:vault:read
              project exact (claims.iss, claims.sub) → users.id
              SET LOCAL ROLE akb_user_<uid>          (existing PG-RBAC path)
              dispatch tool
@@ -242,10 +236,10 @@ AKB never sees any of this. AKB code did not run.
 - **Does not change PAT/service behavior.** Current stdio/CLI/Desktop token-store
   flows continue to work. Those credentials coexist with the MCP-audience
   Keycloak access-token profile on `/mcp`; AKB local-session JWTs do not.
-- **Does not change the SPA login.** Web UI continues to use the existing
-  AKB-issued JWT via `/api/v1/auth/login` (or `/auth/keycloak/exchange`
-  when SSO is on). The OAuth path here is exclusively for **third-party
-  MCP clients**.
+- **Does not provide a browser SSO transport.** Local mode retains the legacy
+  local-session login. In SSO mode, browser routes are fail-closed until Phase
+  4 supplies server-side token custody; MCP OAuth remains exclusively the
+  third-party MCP-client path.
 - **Does not add per-collection scopes.** OAuth scope vocabulary stays
   coarse (`vault:read` / `vault:write`); fine-grained access continues
   to live in AKB's PG-RBAC + `vault_access` table.

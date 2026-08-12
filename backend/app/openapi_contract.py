@@ -135,6 +135,12 @@ OPERATION_TAG_OVERRIDES = {
     ("get", "/api/v1/history/{vault}/{doc_id}"): ["documents"],
     ("get", "/api/v1/diff/{vault}/{doc_id}"): ["documents"],
 }
+NO_SUCCESS_RESPONSE_OPERATIONS = {
+    ("get", "/api/v1/auth/keycloak/login"),
+    ("get", "/api/v1/auth/keycloak/callback"),
+    ("get", "/api/v1/auth/keycloak/logout"),
+    ("post", "/api/v1/auth/keycloak/exchange"),
+}
 
 
 def install_openapi_contract(app: FastAPI) -> None:
@@ -190,7 +196,10 @@ def _install_components(schema: dict[str, Any]) -> None:
     security["bearerAuth"] = {
         "type": "http",
         "scheme": "bearer",
-        "description": "JWT or AKB personal access token supplied as a Bearer token.",
+        "description": (
+            "Route-selected human credential or namespaced AKB PAT/service "
+            "credential supplied as a Bearer token."
+        ),
     }
 
 
@@ -212,6 +221,11 @@ def _normalize_api_operations(schema: dict[str, Any]) -> None:
 
 def _ensure_success_response(path: str, method: str, operation: dict[str, Any]) -> None:
     responses = operation.setdefault("responses", {})
+    if (method, path) in NO_SUCCESS_RESPONSE_OPERATIONS:
+        for status in tuple(responses):
+            if str(status).startswith("2") or str(status).startswith("3"):
+                responses.pop(status)
+        return
     status = next((code for code in SUCCESS_STATUSES if code in responses), None)
     if status is None:
         if any(str(code).startswith("3") for code in responses):

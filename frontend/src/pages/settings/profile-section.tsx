@@ -16,10 +16,11 @@ export interface User {
 
 interface Props {
   user: User;
+  localPasswordEnabled: boolean;
   onUserUpdate: (patch: { display_name?: string; email?: string }) => void;
 }
 
-export function ProfileSection({ user, onUserUpdate }: Props) {
+export function ProfileSection({ user, localPasswordEnabled, onUserUpdate }: Props) {
   const [profileDisplayName, setProfileDisplayName] = useState("");
   const [profileEmail, setProfileEmail] = useState("");
   const [profileError, setProfileError] = useState("");
@@ -172,79 +173,80 @@ export function ProfileSection({ user, onUserUpdate }: Props) {
         </div>
       </form>
 
-      {/* Change password card */}
-      <section
-        className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden"
-        aria-labelledby="change-pw-heading"
-      >
-        <header className="border-b border-border px-6 py-3">
-          <span id="change-pw-heading" className="coord-ink">Change password</span>
-        </header>
-        <form onSubmit={handleChangePassword} className="space-y-3 p-6 max-w-md">
-          <div>
-            <Label htmlFor="pw-current">Current password</Label>
-            <Input
-              id="pw-current"
-              type="password"
-              autoComplete="current-password"
-              value={pwCurrent}
-              onChange={(e) => setPwCurrent(e.target.value)}
-              required
-            />
-          </div>
-          <div>
-            <Label htmlFor="pw-new">New password</Label>
-            <Input
-              id="pw-new"
-              type="password"
-              autoComplete="new-password"
-              value={pwNew}
-              onChange={(e) => setPwNew(e.target.value)}
-              onBlur={() => setPwTouched((t) => ({ ...t, new: true }))}
-              aria-invalid={pwTooShort || undefined}
-              aria-describedby={pwTooShort ? "pw-new-help" : undefined}
-              required
-            />
-            {pwTooShort && (
-              <p id="pw-new-help" className="text-destructive text-xs mt-1">
-                Use at least 8 characters.
+      {localPasswordEnabled && (
+        <section
+          className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden"
+          aria-labelledby="change-pw-heading"
+        >
+          <header className="border-b border-border px-6 py-3">
+            <span id="change-pw-heading" className="coord-ink">Change password</span>
+          </header>
+          <form onSubmit={handleChangePassword} className="space-y-3 p-6 max-w-md">
+            <div>
+              <Label htmlFor="pw-current">Current password</Label>
+              <Input
+                id="pw-current"
+                type="password"
+                autoComplete="current-password"
+                value={pwCurrent}
+                onChange={(e) => setPwCurrent(e.target.value)}
+                required
+              />
+            </div>
+            <div>
+              <Label htmlFor="pw-new">New password</Label>
+              <Input
+                id="pw-new"
+                type="password"
+                autoComplete="new-password"
+                value={pwNew}
+                onChange={(e) => setPwNew(e.target.value)}
+                onBlur={() => setPwTouched((t) => ({ ...t, new: true }))}
+                aria-invalid={pwTooShort || undefined}
+                aria-describedby={pwTooShort ? "pw-new-help" : undefined}
+                required
+              />
+              {pwTooShort && (
+                <p id="pw-new-help" className="text-destructive text-xs mt-1">
+                  Use at least 8 characters.
+                </p>
+              )}
+            </div>
+            <div>
+              <Label htmlFor="pw-confirm">Confirm new password</Label>
+              <Input
+                id="pw-confirm"
+                type="password"
+                autoComplete="new-password"
+                value={pwConfirm}
+                onChange={(e) => setPwConfirm(e.target.value)}
+                onBlur={() => setPwTouched((t) => ({ ...t, confirm: true }))}
+                aria-invalid={pwMismatch || undefined}
+                aria-describedby={pwMismatch ? "pw-confirm-help" : undefined}
+                required
+              />
+              {pwMismatch && (
+                <p id="pw-confirm-help" className="text-destructive text-xs mt-1">
+                  Doesn&apos;t match new password.
+                </p>
+              )}
+            </div>
+            {pwError && (
+              <p role="alert" className="text-destructive text-xs">
+                {pwError}
               </p>
             )}
-          </div>
-          <div>
-            <Label htmlFor="pw-confirm">Confirm new password</Label>
-            <Input
-              id="pw-confirm"
-              type="password"
-              autoComplete="new-password"
-              value={pwConfirm}
-              onChange={(e) => setPwConfirm(e.target.value)}
-              onBlur={() => setPwTouched((t) => ({ ...t, confirm: true }))}
-              aria-invalid={pwMismatch || undefined}
-              aria-describedby={pwMismatch ? "pw-confirm-help" : undefined}
-              required
-            />
-            {pwMismatch && (
-              <p id="pw-confirm-help" className="text-destructive text-xs mt-1">
-                Doesn&apos;t match new password.
+            {passwordFlash.message && (
+              <p role="status" aria-live="polite" className="text-success text-xs">
+                {passwordFlash.message}
               </p>
             )}
-          </div>
-          {pwError && (
-            <p role="alert" className="text-destructive text-xs">
-              {pwError}
-            </p>
-          )}
-          {passwordFlash.message && (
-            <p role="status" aria-live="polite" className="text-success text-xs">
-              {passwordFlash.message}
-            </p>
-          )}
-          <Button type="submit" loading={pwBusy} disabled={pwSubmitDisabled} aria-disabled={pwSubmitDisabled}>
-            Change password
-          </Button>
-        </form>
-      </section>
+            <Button type="submit" loading={pwBusy} disabled={pwSubmitDisabled} aria-disabled={pwSubmitDisabled}>
+              Change password
+            </Button>
+          </form>
+        </section>
+      )}
     </>
   );
 }

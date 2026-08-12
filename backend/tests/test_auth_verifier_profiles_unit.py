@@ -236,6 +236,59 @@ async def test_rest_sso_mode_selects_only_api_access_profile_without_fallback(mo
 
 
 @pytest.mark.asyncio
+async def test_rest_sso_mode_rejects_a_valid_local_session_jwt(monkeypatch):
+    from app.services import auth_service
+    from app.services.auth_verifier_profiles import verify_local_session_legacy_v1
+    from app.services.keycloak_oidc import KeycloakOIDC
+
+    secret = "required-compatibility-hmac-secret"
+    now = int(datetime.now(timezone.utc).timestamp())
+    local_token = jwt.encode(
+        {
+            "sub": str(uuid.uuid4()),
+            "username": "local-alice",
+            "iat": now,
+            "exp": now + 300,
+        },
+        secret,
+        algorithm="HS256",
+        headers={"typ": "JWT"},
+    )
+    monkeypatch.setattr(settings, "jwt_secret", secret, raising=False)
+    assert verify_local_session_legacy_v1(local_token) is not None
+
+    _, api_audience, _ = _configure_keycloak(monkeypatch)
+    service = KeycloakOIDC()
+
+    async def forbidden_fetch(*, force: bool = False):
+        raise AssertionError(f"HS256 local token must fail before JWKS fetch: {force}")
+
+    async def verify_keycloak(token: str, route_profile: str):
+        assert route_profile == "api"
+        return await service.verify_access_token(
+            token,
+            api_audience,
+            route_profile="api",
+        )
+
+    def forbidden_local(_token: str):
+        raise AssertionError("SSO REST must never invoke the local-session verifier")
+
+    async def forbidden_projection(_principal):
+        raise AssertionError("a local session must be rejected before projection")
+
+    service._fetch_jwks = forbidden_fetch  # type: ignore[method-assign]
+    monkeypatch.setattr(auth_service, "verify_local_session_legacy_v1", forbidden_local)
+    monkeypatch.setattr(auth_service, "verify_keycloak_access_v1", verify_keycloak)
+    monkeypatch.setattr(auth_service, "project_verified_principal", forbidden_projection)
+
+    assert (
+        await auth_service.resolve_rest_user_authorization(f"Bearer {local_token}")
+        is None
+    )
+
+
+@pytest.mark.asyncio
 async def test_delegated_human_resolver_is_mode_selected_and_preserves_primary_context(
     monkeypatch,
 ):

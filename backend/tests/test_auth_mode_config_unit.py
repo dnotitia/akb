@@ -288,6 +288,81 @@ def test_sso_startup_still_requires_human_oidc_client_config(
     assert "keycloak_client_secret (auth_mode is sso" in message
 
 
+def test_sso_startup_rejects_missing_compatibility_hmac_secret(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from app.services import lifecycle
+
+    loaded = _load(
+        monkeypatch,
+        tmp_path,
+        {
+            "auth_mode": "sso",
+            "keycloak_enabled": True,
+            "keycloak_server_url": "https://auth.example.com",
+            "keycloak_redirect_uri": "https://akb.example.com/auth/keycloak/callback",
+            "keycloak_client_secret": "test-keycloak-client-secret",
+            "db_password": "test-db-password",
+            "public_base_url": "https://akb.example.com",
+        },
+    )
+    monkeypatch.setattr(lifecycle, "settings", loaded)
+
+    assert loaded.jwt_secret == ""
+    assert loaded.app_token_secret == ""
+    with pytest.raises(RuntimeError, match="AKB_JWT_SECRET"):
+        lifecycle._validate_required_settings()
+
+
+def test_sso_startup_does_not_select_legacy_hs256_human_profile(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from app.services import lifecycle
+
+    loaded = _load(
+        monkeypatch,
+        tmp_path,
+        {
+            "auth_mode": "sso",
+            "keycloak_enabled": True,
+            "keycloak_server_url": "https://auth.example.com",
+            "keycloak_redirect_uri": "https://akb.example.com/auth/keycloak/callback",
+            "keycloak_client_secret": "test-keycloak-client-secret",
+            "jwt_algorithm": "RS256",
+            "jwt_secret": "compatibility-hmac-secret",
+            "db_password": "test-db-password",
+            "public_base_url": "https://akb.example.com",
+        },
+    )
+    monkeypatch.setattr(lifecycle, "settings", loaded)
+
+    lifecycle._validate_required_settings()
+
+
+def test_local_startup_requires_legacy_session_secret_independently_of_app_secret(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from app.services import lifecycle
+
+    loaded = _load(
+        monkeypatch,
+        tmp_path,
+        {
+            "auth_mode": "local",
+            "app_token_secret": "independent-app-token-secret",
+            "db_password": "test-db-password",
+            "public_base_url": "https://akb.example.com",
+        },
+    )
+    monkeypatch.setattr(lifecycle, "settings", loaded)
+
+    with pytest.raises(RuntimeError, match="AKB_JWT_SECRET"):
+        lifecycle._validate_required_settings()
+
+
 def test_api_audience_has_distinct_public_resource_default() -> None:
     loaded = app_config.Settings(
         auth_mode="sso",

@@ -560,43 +560,6 @@ async def _resolve_or_provision_keycloak_user(claims: dict) -> dict:
         return _resolved_external_user(row, newly_provisioned=True)
 
 
-async def login_with_keycloak_claims(claims: dict) -> dict:
-    """Map a verified Keycloak ID token to an AKB session.
-
-    Exact issuer/subject bindings reuse the AKB user. In `open` mode only,
-    a first login may JIT-provision by verified email and persist the binding.
-    New users receive their per-user PG role. Returns the same
-    ``{token, user}`` shape as :func:`login` so the SSO callback path is
-    indistinguishable downstream.
-
-    Keycloak is authentication only — ``realm_access.roles`` are NOT
-    mapped to AKB ``is_admin`` or vault grants here (see the design doc).
-    """
-    resolved = await _resolve_or_provision_keycloak_user(claims)
-
-    # PG-native RBAC: create the per-user role outside the resolve helper's
-    # connection scope, mirroring register(). Best-effort — the reconciler
-    # at next startup rebuilds any role this misses.
-    if resolved["newly_provisioned"]:
-        await get_role_sync().on_user_create(resolved["user_id"])
-
-    token = create_jwt(
-        str(resolved["user_id"]),
-        resolved["username"],
-        not_before=resolved["not_before"],
-    )
-    return {
-        "token": token,
-        "user": {
-            "id": str(resolved["user_id"]),
-            "username": resolved["username"],
-            "email": resolved["email"],
-            "display_name": resolved["display_name"],
-            "is_admin": resolved["is_admin"],
-        },
-    }
-
-
 async def _project_keycloak_principal(
     principal: VerifiedPrincipal,
 ) -> AuthenticatedUser | None:
@@ -978,6 +941,7 @@ async def revoke_all_sessions(
     pipelines that store a PAT and never expect "I changed my password"
     to break the integration.
     """
+    require_local_auth_enabled()
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():

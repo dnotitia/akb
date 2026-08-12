@@ -1,28 +1,14 @@
-"""Keycloak OIDC client — the OPTIONAL external-IdP login path.
+"""Pinned Keycloak verification plus dormant browser OIDC primitives.
 
-This module is *only* exercised when ``settings.keycloak_enabled`` is
-true. With it off, nothing here runs and AKB authenticates exactly as
-before (local username/password + PAT).
+Phase 1 request authorization uses :meth:`verify_access_token` only. The
+route-selected ``keycloak-access-v1`` profile pins RS256, issuer, JWKS, route
+audience, token kind, and required claims before exact ``(issuer, subject)``
+projection. It never treats an ID token as an API access token.
 
-Design (see docs/designs/keycloak-oidc/00-overview.md):
-
-- Keycloak authenticates the person at the front door using the OIDC
-  **authorization-code** flow (+ PKCE S256 for public clients).
-- The ID token is verified **locally** against Keycloak's JWKS (RS256,
-  cached, refetched once on key rotation) — no remote introspection on
-  the hot path.
-- Keycloak is **authentication only**. The caller maps the verified
-  identity (by email) to an internal AKB user and mints a normal AKB
-  JWT; the internal user model, PG-native RBAC, and PATs are untouched.
-
-Implemented on the dependencies AKB already ships — ``httpx`` for the
-token/JWKS HTTP calls and ``pyjwt`` for RS256 verification. No new
-third-party packages.
-
-Transient flow state (CSRF ``state`` + PKCE verifier, and the one-time
-exchange codes) is persisted in the ``oidc_transients`` table so the
-redirect round-trip works across multiple backend replicas. Each entry
-is single-use and TTL-bounded.
+Authorization-code, ID-token, and logout helpers remain internal candidates
+for the Phase 4 server-side browser-session design. No Phase 1 production
+route calls them, and this module has no AKB human-session issuance or account
+adoption entry point. See ``docs/designs/keycloak-oidc/00-overview.md``.
 """
 
 from __future__ import annotations
@@ -51,9 +37,8 @@ from app.services.auth_verifier_profiles import (
 
 logger = logging.getLogger("akb.keycloak")
 
-# OIDC scopes requested at the authorization endpoint. `openid` is
-# mandatory for an ID token; `profile`+`email` populate name/email claims
-# we map onto the AKB user.
+# Reserved Phase 4 authorization-code scopes. The staged Phase 1 browser
+# routes never issue an authorization request.
 _SCOPE = "openid profile email"
 _TOKEN_SUPPLIED_KEY_HEADERS = frozenset({"jku", "x5u", "jwk", "x5c"})
 _SERVICE_ACCOUNT_CLAIMS = frozenset(
@@ -63,9 +48,9 @@ _SERVICE_ACCOUNT_CLAIMS = frozenset(
 
 # ── Transient store (oidc_transients table) ──────────────────────────
 #
-# Two single-use, TTL-bounded record kinds backing the redirect flow.
-# Consume is an atomic DELETE … RETURNING so a code can never be redeemed
-# twice even under concurrent callbacks.
+# Legacy single-use, TTL-bounded transient storage retained for schema
+# compatibility and possible Phase 4 reuse. Staged Phase 1 browser routes do
+# not issue or consume these records. Consume remains atomic DELETE … RETURNING.
 
 
 async def _store_issue(key: str, kind: str, payload: dict, ttl_secs: int) -> None:
@@ -104,7 +89,7 @@ async def _store_consume(key: str, kind: str) -> dict | None:
 
 
 class KeycloakOIDC:
-    """Stateless-per-process OIDC client. All flow state lives in PG."""
+    """Pinned verifier with dormant, PostgreSQL-backed browser helpers."""
 
     def __init__(self) -> None:
         # JWKS cached in-process; refetched on key rotation (kid miss).
@@ -151,14 +136,12 @@ class KeycloakOIDC:
     async def begin_login(
         self, redirect_path: str = "/", *, client_id: str | None = None
     ) -> str:
-        """Create CSRF state (+PKCE for public clients) and return the
-        Keycloak authorization URL to redirect the browser to.
+        """Build dormant Phase 4 authorization state and redirect URL.
 
-        ``redirect_path`` is the caller-vetted post-login destination carried
-        opaquely through flow state. It is normally a same-site path, but may
-        be an allowlisted companion-app absolute URL (cross-origin SSO); the
-        callback (`_post_login_target`) re-validates it before delivering the
-        one-time code, so this layer just stores it verbatim."""
+        No Phase 1 production route calls this helper. Any future caller must
+        validate ``redirect_path`` against the server-side browser-session
+        design before enabling it.
+        """
         selected_client_id = self._effective_client_id(client_id)
         state = secrets.token_urlsafe(32)
         payload: dict[str, str] = {
@@ -188,7 +171,7 @@ class KeycloakOIDC:
         """Verify+consume the CSRF state. Returns {redirect_path, code_verifier?}."""
         return await _store_consume(state, "state")
 
-    # ── Token exchange ───────────────────────────────────────────────
+    # ── Dormant authorization-code exchange (Phase 4 candidate) ─────
     async def exchange_code_for_tokens(
         self,
         code: str,
@@ -226,7 +209,7 @@ class KeycloakOIDC:
             raise AuthenticationError("Authorization code exchange failed")
         return resp.json()
 
-    # ── JWKS + ID-token verification ─────────────────────────────────
+    # ── Dormant ID-token verification (Phase 4 candidate) ────────────
     async def _fetch_jwks(self, *, force: bool = False) -> dict[str, Any]:
         if self._jwks is not None and not force:
             return self._jwks
@@ -435,7 +418,7 @@ class KeycloakOIDC:
             audience=audience,
         )
 
-    # ── Logout URL ───────────────────────────────────────────────────
+    # ── Dormant logout URL construction (Phase 4 candidate) ─────────
     def logout_url(self, id_token_hint: str | None, post_logout_redirect: str | None) -> str:
         params: dict[str, str] = {}
         if post_logout_redirect:
@@ -456,23 +439,3 @@ def get_keycloak_oidc() -> KeycloakOIDC:
     if _service is None:
         _service = KeycloakOIDC()
     return _service
-
-
-# ── One-time exchange code (callback → SPA) ──────────────────────────
-
-
-async def issue_exchange_code(login_response: dict) -> str:
-    """Store the freshly minted AKB JWT + user payload under a one-time
-    opaque code and return the code. The SPA trades it via /exchange so
-    the token is delivered in a POST body, never in a redirect URL."""
-    code = secrets.token_urlsafe(32)
-    await _store_issue(
-        code, "exchange", login_response,
-        ttl_secs=settings.keycloak_exchange_code_ttl_secs,
-    )
-    return code
-
-
-async def redeem_exchange_code(code: str) -> dict | None:
-    """Atomically redeem a one-time exchange code → {token, user} or None."""
-    return await _store_consume(code, "exchange")

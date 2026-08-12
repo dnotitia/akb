@@ -134,6 +134,17 @@ class ExternalAuthDisabledError(AKBError):
         )
 
 
+class BrowserSessionNotReadyError(AKBError):
+    """Human SSO is selected, but Phase 4 browser custody is not active."""
+
+    def __init__(self):
+        super().__init__(
+            "SSO browser sessions are not available in this release",
+            status_code=503,
+            code="browser_session_not_ready",
+        )
+
+
 class CredentialCleanupIncompleteError(AKBError):
     """Credential denial landed, but strict derived-role cleanup is pending."""
 

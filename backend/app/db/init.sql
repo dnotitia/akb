@@ -41,10 +41,9 @@ CREATE TABLE IF NOT EXISTS users (
     -- and automatically inside change_password.
     tokens_revoked_before TIMESTAMPTZ NOT NULL DEFAULT TIMESTAMPTZ '1970-01-01 00:00:00+00',
     -- How the account authenticates. 'local' = bcrypt password (the
-    -- baseline). 'keycloak' = JIT-provisioned on first OIDC login; its
-    -- password_hash is an unusable sentinel. Advisory only — Keycloak
-    -- itself is gated by keycloak_enabled in config; when SSO is off this
-    -- column is never read. See migration 033.
+    -- baseline). 'keycloak' = projected from a fully verified external
+    -- principal; its password_hash is an unusable sentinel. Advisory only;
+    -- route capabilities are selected by auth_mode. See migration 033.
     auth_provider TEXT NOT NULL DEFAULT 'local',
     -- Account-state and principal-kind guards are additive. Compatibility
     -- defaults preserve every pre-governance user as an active human.
@@ -109,15 +108,13 @@ CREATE INDEX IF NOT EXISTS idx_tokens_hash ON tokens(token_hash);
 CREATE INDEX IF NOT EXISTS idx_tokens_user ON tokens(user_id);
 
 -- ============================================================
--- OIDC transients — short-lived state for the OPTIONAL Keycloak login
--- flow (CSRF state + PKCE verifier, and one-time exchange codes mapping
--- to a freshly minted AKB JWT). HA-safe (shared across replicas),
--- single-use, TTL-bounded. Stays empty when Keycloak is disabled.
--- See migration 034.
+-- OIDC transients — legacy additive schema retained for compatibility and
+-- possible Phase 4 server-side browser-session reuse. Phase 1 browser routes
+-- are staged unavailable and leave it empty. See migration 034.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS oidc_transients (
     key         TEXT PRIMARY KEY,
-    kind        TEXT NOT NULL,          -- 'state' | 'exchange'
+    kind        TEXT NOT NULL,          -- reserved legacy transient kind
     payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
     expires_at  TIMESTAMPTZ NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()

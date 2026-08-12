@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import SettingsPage from "../settings";
+import * as api from "@/lib/api";
 
 vi.mock("@/lib/api", () => ({
   getMe: vi.fn().mockResolvedValue({ user_id: "u1", username: "admin", email: "a@x", is_admin: true }),
@@ -22,6 +23,7 @@ vi.mock("@/lib/api", () => ({
   adminDeleteUser: vi.fn(),
   changePassword: vi.fn(),
   updateProfile: vi.fn(),
+  getAuthConfig: vi.fn(),
 }));
 
 vi.mock("@/hooks/use-theme", () => ({
@@ -39,7 +41,21 @@ function wrap() {
   );
 }
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.mocked(api.getAuthConfig).mockResolvedValue({
+    available: true,
+    schema_version: 1,
+    auth_mode: "local",
+    local_auth: { enabled: true },
+    keycloak: {
+      enabled: false,
+      browser_session_ready: false,
+      login_url: null,
+    },
+    mcp_oauth: { enabled: false },
+  });
+});
 
 describe("Admin tab search + sort", () => {
   it("filters users by name", async () => {
@@ -64,5 +80,26 @@ describe("Admin tab search + sort", () => {
       el.querySelector("[data-testid='admin-user-name']")?.textContent
     );
     expect(usernames).toEqual(["alice", "carol", "bob"]); // 3, 1, 0
+  });
+
+  it("hides admin password reset controls in SSO mode", async () => {
+    vi.mocked(api.getAuthConfig).mockResolvedValue({
+      available: true,
+      schema_version: 1,
+      auth_mode: "sso",
+      local_auth: { enabled: false },
+      keycloak: {
+        enabled: true,
+        browser_session_ready: false,
+        login_url: null,
+      },
+      mcp_oauth: { enabled: true },
+    });
+
+    render(wrap());
+
+    await screen.findByText("bob");
+    expect(screen.queryByRole("button", { name: /reset password/i })).toBeNull();
+    expect(screen.getByRole("button", { name: /delete user bob/i })).toBeInTheDocument();
   });
 });

@@ -1,15 +1,30 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { ArrowLeft } from "lucide-react";
-import { getToken } from "@/lib/api";
+import { getAuthConfig, getToken, type AuthConfig } from "@/lib/api";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Logo } from "@/components/logo";
 
 export default function AuthForgotPage() {
   const navigate = useNavigate();
+  const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
+  const localPasswordHelp =
+    authConfig?.available === true &&
+    authConfig.auth_mode === "local" &&
+    authConfig.local_auth.enabled;
   // This route sits outside the Layout auth gate — bounce signed-in users home.
   useEffect(() => {
-    if (getToken()) navigate("/", { replace: true });
+    if (getToken()) {
+      navigate("/", { replace: true });
+      return;
+    }
+    let cancelled = false;
+    void getAuthConfig().then((config) => {
+      if (!cancelled) setAuthConfig(config);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [navigate]);
 
   return (
@@ -24,16 +39,33 @@ export default function AuthForgotPage() {
         </div>
 
         <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-lg p-7 sm:p-8">
-          <h1 className="font-display text-2xl tracking-tight text-foreground mb-4">
-            Forgot your password?
-          </h1>
-          <p className="text-sm text-foreground-muted leading-relaxed mb-3">
-            Contact your administrator to reset your password. They will provide
-            you with a temporary password you can use to log in.
-          </p>
-          <p className="text-sm text-foreground-muted leading-relaxed mb-6">
-            Once logged in, change it from <strong>Settings → Profile</strong>.
-          </p>
+          {authConfig === null ? (
+            <div className="py-6 text-center coord" role="status" aria-live="polite">
+              Loading authentication options…
+            </div>
+          ) : localPasswordHelp ? (
+            <>
+              <h1 className="font-display text-2xl tracking-tight text-foreground mb-4">
+                Forgot your password?
+              </h1>
+              <p className="text-sm text-foreground-muted leading-relaxed mb-3">
+                Contact your administrator to reset your password. They will provide
+                you with a temporary password you can use to log in.
+              </p>
+              <p className="text-sm text-foreground-muted leading-relaxed mb-6">
+                Once logged in, change it from <strong>Settings → Profile</strong>.
+              </p>
+            </>
+          ) : (
+            <>
+              <h1 className="font-display text-2xl tracking-tight text-foreground mb-4">
+                Password recovery unavailable
+              </h1>
+              <p className="text-sm text-foreground-muted leading-relaxed mb-6">
+                Local password recovery is not available for this authentication mode.
+              </p>
+            </>
+          )}
           <Link
             to="/auth"
             className="inline-flex items-center gap-1.5 text-sm text-link hover:text-link-hover transition-token"

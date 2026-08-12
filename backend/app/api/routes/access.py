@@ -9,6 +9,7 @@ from app.services.auth_service import (
     REVOKE_REASON_ADMIN,
     revoke_all_sessions,
 )
+from app.services.auth_policy import require_local_auth_enabled
 from app.services.account_service import (
     activate_user,
     adopt_current_admin_as_service,
@@ -572,6 +573,7 @@ async def admin_revoke_user_sessions(
     rotating the global ``jwt_secret`` (which would log out everyone).
     Does not touch PATs — those have their own revoke flow.
     """
+    require_local_auth_enabled()
     _require_admin(user)
     revoked_at = await revoke_all_sessions(
         user_id, actor_id=user.user_id, reason=REVOKE_REASON_ADMIN,
@@ -587,6 +589,7 @@ async def admin_reset_user_password(
     user_id: str,
     user: AuthenticatedUser = Depends(get_current_user),
 ):
+    require_local_auth_enabled()
     if not user.is_admin:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Admin only")
 

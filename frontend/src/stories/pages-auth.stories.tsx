@@ -1,15 +1,10 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, within } from "storybook/test";
-import { delay, http, HttpResponse } from "msw";
+import { http, HttpResponse } from "msw";
 import {
   API,
-  defaultVaultInfoHandler,
-  hybridSsoAuthConfig,
   localAuthConfig,
-  recentChanges,
-  vaultHealth,
-  vaultShellHandlers,
-  vaultSkillDoc,
+  stagedSsoAuthConfig,
 } from "./page-story-fixtures";
 import { AkbRouteTree } from "./page-route-shell";
 
@@ -90,20 +85,20 @@ export const RegisterForm: Story = {
   },
 };
 
-export const HybridSsoAvailable: Story = {
-  name: "SSO / hybrid available",
+export const StagedSsoUnavailable: Story = {
+  name: "SSO / browser session staged",
   parameters: {
     router: { initialEntries: ["/auth"] },
     msw: {
       handlers: [
-        http.get(`${API}/auth/config`, () => HttpResponse.json(hybridSsoAuthConfig)),
+        http.get(`${API}/auth/config`, () => HttpResponse.json(stagedSsoAuthConfig)),
       ],
     },
   },
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByRole("button", { name: "Sign in with SSO" })).toBeInTheDocument();
+    await expect(await canvas.findByText(/SSO browser sign-in is not available yet/i)).toBeInTheDocument();
     await expect(canvas.queryByRole("navigation", { name: "Primary" })).not.toBeInTheDocument();
   },
 };
@@ -112,6 +107,11 @@ export const ForgotPasswordGuidance: Story = {
   name: "Forgot password / admin reset guidance",
   parameters: {
     router: { initialEntries: ["/auth/forgot"] },
+    msw: {
+      handlers: [
+        http.get(`${API}/auth/config`, () => HttpResponse.json(localAuthConfig)),
+      ],
+    },
   },
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
@@ -121,88 +121,15 @@ export const ForgotPasswordGuidance: Story = {
   },
 };
 
-export const CallbackCompleting: Story = {
-  name: "SSO callback / completing",
+export const CallbackFailClosed: Story = {
+  name: "SSO callback / fail closed",
   parameters: {
     router: { initialEntries: ["/auth/callback?code=story-code&redirect=/"] },
-    msw: {
-      handlers: [
-        http.post(`${API}/auth/keycloak/exchange`, async () => {
-          await delay("infinite");
-          return HttpResponse.json({});
-        }),
-      ],
-    },
   },
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("Completing sign-in…")).toBeInTheDocument();
+    await expect(await canvas.findByRole("heading", { name: "SSO sign-in unavailable" })).toBeInTheDocument();
     await expect(canvas.queryByRole("navigation", { name: "Primary" })).not.toBeInTheDocument();
-  },
-};
-
-export const CallbackMissingCode: Story = {
-  name: "SSO callback / missing code",
-  parameters: {
-    router: { initialEntries: ["/auth/callback"] },
-    msw: {
-      handlers: [
-        http.get(`${API}/auth/config`, () => HttpResponse.json(localAuthConfig)),
-      ],
-    },
-  },
-  render: () => <AkbRouteTree />,
-  play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    await expect(await canvas.findByLabelText("Username")).toBeInTheDocument();
-    await expect(canvas.queryByRole("navigation", { name: "Primary" })).not.toBeInTheDocument();
-  },
-};
-
-export const CallbackExchangeError: Story = {
-  name: "SSO callback / exchange error",
-  parameters: {
-    router: { initialEntries: ["/auth/callback?code=bad-code"] },
-    msw: {
-      handlers: [
-        http.get(`${API}/auth/config`, () => HttpResponse.json(localAuthConfig)),
-        http.post(`${API}/auth/keycloak/exchange`, () =>
-          HttpResponse.json({ error: "exchange failed" }, { status: 400 }),
-        ),
-      ],
-    },
-  },
-  render: () => <AkbRouteTree />,
-  play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    await expect(await canvas.findByLabelText("Username")).toBeInTheDocument();
-    await expect(canvas.queryByRole("navigation", { name: "Primary" })).not.toBeInTheDocument();
-  },
-};
-
-export const CallbackSuccessRedirect: Story = {
-  name: "SSO callback / success redirect",
-  parameters: {
-    router: { initialEntries: ["/auth/callback?code=story-code&redirect=/vault/akb"] },
-    msw: {
-      handlers: [
-        http.post(`${API}/auth/keycloak/exchange`, () =>
-          HttpResponse.json({ token: "mock", kc_id_token: "kid" }),
-        ),
-        ...vaultShellHandlers,
-        defaultVaultInfoHandler,
-        http.get(`${API}/documents/akb/overview%2Fvault-skill.md`, () => HttpResponse.json(vaultSkillDoc)),
-        http.get("/health/vault/akb", () => HttpResponse.json(vaultHealth)),
-        http.get(`${API}/recent`, () => HttpResponse.json(recentChanges)),
-      ],
-    },
-  },
-  render: () => <AkbRouteTree />,
-  play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    await expect(await canvas.findByRole("heading", { name: "akb" })).toBeInTheDocument();
-    await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
-    await expect(await canvas.findByRole("navigation", { name: "Vaults" })).toBeInTheDocument();
   },
 };

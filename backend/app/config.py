@@ -777,7 +777,11 @@ class Settings(BaseModel):
     document_asset_gc_interval_secs: int = Field(default=300, ge=10, le=86400)
     document_asset_upload_body_timeout_secs: float = Field(default=60.0, ge=1.0, le=900.0)
 
-    # Auth — jwt_secret must be set (validated at startup in lifecycle.init_storage)
+    # Compatibility HMAC material currently shared by local human sessions,
+    # publication/view grants, and an inventory-cursor fallback. Startup
+    # requires it in every mode so those internal capabilities never use an
+    # empty key. Only local mode selects it as a human credential authority;
+    # Phase 2 will decouple the non-session consumers from future session keys.
     jwt_secret: str = ""
     jwt_algorithm: str = "HS256"
     jwt_expire_hours: int = 24
@@ -846,50 +850,19 @@ class Settings(BaseModel):
     # and the projection service repeats that guard for directly constructed
     # Settings. Runtime email adoption has no compatibility bypass.
     keycloak_link_by_email: bool = False
-    # Absolute URL Keycloak redirects the browser back to after login.
-    # Must point at the AKB backend callback route and be registered as a
-    # valid redirect URI on the Keycloak client, e.g.
-    #   http://localhost:3000/api/v1/auth/keycloak/callback
+    # Reserved Phase 4 browser-session inputs. Phase 1 browser routes are
+    # fail-closed and do not issue state, exchange codes, or session tokens.
     keycloak_redirect_uri: str = ""
-    # SPA path the callback bounces the browser to with a one-time code.
-    # Relative → resolves against the request origin (same host the user
-    # is already on), so it works for both :3000 dev proxy and prod ingress.
+    # Deprecated callback-delivery compatibility input; inactive in Phase 1.
     keycloak_post_login_path: str = "/auth/callback"
-    # Companion-app post-login origins for cross-origin SSO delegation.
-    #
-    # Empty (default) → the post-login one-time code is ALWAYS delivered to
-    # the same-site keycloak_post_login_path (AKB's own SPA). Behaviour is
-    # then 100% identical to before this option existed; no other origin can
-    # ever receive the code.
-    #
-    # When set, a first-party companion app served on a listed origin (e.g.
-    # reef at https://reef-<slug>.<domain>) can ride THIS akb's Keycloak
-    # client without owning its own client/realm/secret. It starts SSO via
-    #   GET /auth/keycloak/login?redirect=<absolute-callback-URL-on-that-origin>
-    # and akb delivers the one-time code to that URL (which the companion
-    # then exchanges server-side via POST /auth/keycloak/exchange). This is
-    # what makes a single per-instance keycloak_post_login_path stop being a
-    # bottleneck: akb's own SPA and the companion can both complete SSO,
-    # selected per request by the redirect target rather than one global path.
-    #
-    # Open-redirect protection is preserved: a redirect whose origin is NOT
-    # in this list collapses to the safe same-site path. Each entry must be a
-    # full origin matched as scheme://host[:port], e.g.
-    #   ["https://reef-acme.example.com"]
+    # Deprecated callback-origin compatibility input; inactive in Phase 1.
     keycloak_post_login_allowed_origins: list[str] = Field(default_factory=list)
-    # Optional per-companion OIDC client selection. Keys are companion origins
-    # (normalized as scheme://host[:port]); values are Keycloak client ids.
-    # The mapping is consulted only after the origin passes the allowlist above,
-    # so adding a mapping can never grant a new redirect destination. The AKB
-    # backend remains the sole OIDC client and uses its backend-only secret for
-    # the selected confidential client. Empty preserves the historical single
-    # `keycloak_client_id` flow.
+    # Companion client IDs remain active as accepted `azp` values for the
+    # human API profile. Origin-keyed browser routing is inactive until Phase 4.
     keycloak_companion_client_ids_by_origin: dict[str, str] = Field(
         default_factory=dict
     )
-    # One-time exchange-code TTL (seconds). The callback hands the SPA a
-    # short-lived opaque code; the SPA trades it for the AKB JWT over a
-    # POST so the token never rides in a URL. Keep this small.
+    # Deprecated legacy exchange-code input; no Phase 1 route issues/redeems it.
     keycloak_exchange_code_ttl_secs: int = 60
 
     # Audience required on Keycloak access tokens presented to human REST or
