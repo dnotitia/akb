@@ -236,8 +236,8 @@ async def _apply_migrations() -> None:
         "057_native_revision_m1_payload_placement.py", # M1 placement-scoped payload deduplication
         "058_publication_document_identity.py",  # publications.document_id + composite FK (document_id, vault_id) → documents(id, vault_id) ON DELETE CASCADE; conservative backfill
         "059_native_file_searchable_derived.py",  # chunks.source_type admits 'native_file' so text Files reach the chunk/index/embedding pipeline on the Document's Resource/Revision basis
-        "060_app_rollout.py",                    # durable app release rollout job/target/step ledger
         "060_native_revision_migration_bridge.py",  # additive C9 migration runs, observations, and retained legacy selector mappings
+        "061_app_rollout.py",                    # durable app release rollout job/target/step ledger
     ):
         if filename in applied:
             continue
