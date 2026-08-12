@@ -97,6 +97,11 @@ async def test_bootstrap_consume_restart_and_immutable_marker(tmp_path, monkeypa
             identity = NativeAuthorityIdentity.from_settings(configured)
             assert await consume_or_validate_native_authority(conn, identity=identity) == "initialized"
 
+            rerun = await bootstrap_postgres_native(configured)
+            assert rerun["status"] == "initialized"
+            assert rerun["claim_id"] == report["claim_id"]
+            assert rerun["authority_id"] == report["authority_id"]
+
             counts = await conn.fetchrow(
                 """
                 SELECT

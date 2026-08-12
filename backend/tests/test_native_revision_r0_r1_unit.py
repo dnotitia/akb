@@ -89,6 +89,7 @@ def test_native_selector_constructs_the_native_facade_without_git(monkeypatch, t
     selected = revision_backend.get_revision_backend()
 
     assert isinstance(selected.document_service, NativeDocumentService)
+    assert selected.document_service.move.__func__ is NativeDocumentService.move
     assert revision_backend.selected_document_revision_backend() == "postgres_native"
 
 
@@ -113,6 +114,7 @@ def test_legacy_default_alias_still_builds_the_bare_git_service(monkeypatch, tmp
     selected = revision_backend.get_revision_backend()
 
     assert isinstance(selected.document_service, DocumentService)
+    assert selected.document_service.move.__func__ is DocumentService.move
     assert revision_backend.selected_document_revision_backend() == "bare_git"
 
 

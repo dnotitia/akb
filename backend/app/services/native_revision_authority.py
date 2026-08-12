@@ -494,8 +494,28 @@ async def bootstrap_postgres_native(configured: Settings = settings) -> dict[str
             claim_id=claim_id,
             git_storage_path=configured.git_storage_path,
         )
+        marker = await conn.fetchrow(
+            "SELECT * FROM document_revision_authority_marker WHERE marker_id = TRUE"
+        )
+        status = "pending"
+        if marker is not None:
+            if not _binding_matches(marker, identity) or marker["backend"] != AUTHORITY_BACKEND:
+                raise NativeAuthorityError(
+                    "native_authority_marker_mismatch",
+                    "Native authority marker does not match configured deployment identity",
+                )
+            pending = await conn.fetchrow(
+                "SELECT status FROM document_revision_authority_pending WHERE authority_id = $1",
+                marker["authority_id"],
+            )
+            if pending is None or pending["status"] != "consumed":
+                raise NativeAuthorityError(
+                    "native_authority_marker_incomplete",
+                    "Native authority marker has no consumed pending record",
+                )
+            status = "initialized"
         return {
-            "status": "pending",
+            "status": status,
             "backend": AUTHORITY_BACKEND,
             "claim_id": str(claim_id),
             "authority_id": str(authority_id),
