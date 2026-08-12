@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 import pytest
 from git import Repo
+from git.exc import GitCommandNotFound
 
 from app.services.git_service import (
     GitHistoryBoundError,
@@ -275,6 +276,38 @@ def test_path_at_revision_nonzero_exit_is_not_a_missing_path(
             moved_document.updated[:7],
         )
     assert exc_info.value.status_code == 503
+    assert exc_info.value.code == "git_history_failed"
+
+
+def test_path_at_revision_uses_configured_git_and_maps_launch_failure(
+    moved_document: _MovedDocument,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = Repo(str(moved_document.git._bare_path(moved_document.vault)))
+    configured_git = "/configured/bin/git"
+    captured: dict[str, object] = {}
+    fixed_ref = repo.head.commit.hexsha
+    target = repo.commit(moved_document.updated[:7]).hexsha
+
+    def fail_execute(self, command, *args, **kwargs):
+        captured["command"] = command
+        raise GitCommandNotFound(command, "unavailable")
+
+    git_type = type(repo.git)
+    monkeypatch.setattr(git_type, "GIT_PYTHON_GIT_EXECUTABLE", configured_git)
+    monkeypatch.setattr(git_type, "execute", fail_execute)
+
+    with pytest.raises(GitHistoryCommandError) as exc_info:
+        moved_document.git._stream_path_at_revision(
+            repo,
+            fixed_ref,
+            moved_document.new_path,
+            target,
+        )
+
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert command[0] == configured_git
     assert exc_info.value.code == "git_history_failed"
 
 

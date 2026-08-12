@@ -1195,10 +1195,19 @@ class GitService:
             "--",
             file_path,
         ]
-        process = repo.git.execute(
-            ["git", "-c", "core.quotePath=false", "log", *log_args],
-            as_process=True,
-        )
+        try:
+            process = repo.git.execute(
+                [
+                    repo.git.GIT_PYTHON_GIT_EXECUTABLE,
+                    "-c",
+                    "core.quotePath=false",
+                    "log",
+                    *log_args,
+                ],
+                as_process=True,
+            )
+        except (GitError, OSError) as exc:
+            raise GitHistoryCommandError() from exc
         raw_process: Any = getattr(process, "proc", None) or process
         stdout = getattr(raw_process, "stdout", None)
         stderr = getattr(raw_process, "stderr", None)
