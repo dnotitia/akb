@@ -17,7 +17,10 @@ from app.services.native_revision_authority import (
     pre_migration_revision_authority_guard,
     startup_revision_authority_preflight,
 )
-from app.services.revision_backend import canonical_document_revision_backend
+from app.services.revision_backend import (
+    canonical_document_revision_backend,
+    selected_document_revision_backend,
+)
 from app.services.role_sync import RoleSync, get_role_sync, set_role_sync
 from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
 from app.services.vector_store import get_vector_store
@@ -97,7 +100,7 @@ async def init_storage() -> None:
     # Self-heal: clear stale git index.lock files left behind by a
     # crashed prior process. Without this, the affected vault's writes
     # fail silently until an operator removes the lock by hand.
-    if settings.document_revision_backend != "postgres_native":
+    if selected_document_revision_backend() == "bare_git":
         try:
             cleared = GitService().cleanup_stale_locks()
             if cleared:
@@ -148,11 +151,11 @@ def start_workers() -> None:
         logger.debug("app_rollout_worker deferred: no running event loop")
     else:
         app_rollout_worker.start()
-    # external-git kill-switch: the mirror poller must not run when the feature is
-    # off (no claim, no outbound). Gated so a disabled deployment
-    # starts zero mirror I/O; the read paths refuse mirror reads and the marker
-    # backfill (fail-closed safety net) still runs unconditionally at startup.
-    if settings.external_git_enabled:
+    # External-Git mirrors are a Bare-Git subsystem. The feature kill-switch
+    # still gates it within that mode, while PostgreSQL Native composes no
+    # mirror poller because its vault storage has no Git write authority.
+    bare_git_selected = selected_document_revision_backend() == "bare_git"
+    if bare_git_selected and settings.external_git_enabled:
         external_git_poller.start()
     # Auto-backfill vault_id onto pre-upgrade pgvector points (issue #189
     # Phase 2). Non-blocking; search self-activates the vault path once it
@@ -177,7 +180,7 @@ def start_workers() -> None:
     # READS out of asyncio.to_thread's shared default executor.
     write_lane.start_commit_pool()
     started = ["tokenizer_pool", "git_commit_pool", "embed_worker", "delete_worker", "app_rollout_worker", "bm25_stats_refresher", "vault_backfill"]
-    if settings.external_git_enabled:
+    if bare_git_selected and settings.external_git_enabled:
         started.append("external_git_poller")
     if m1_file_transfer_reaper.enabled():
         m1_file_transfer_reaper.start()
@@ -196,7 +199,11 @@ def start_workers() -> None:
     # can produce work and it must issue zero LLM outbound. It is also the only
     # LLM consumer in the request-independent path, so it still stays off when
     # LLM isn't configured (no retry/abandon noise for OSS users without a key).
-    if not settings.external_git_enabled:
+    if not bare_git_selected:
+        logger.info(
+            "metadata_worker disabled (document revision backend is not Bare Git)"
+        )
+    elif not settings.external_git_enabled:
         logger.info(
             "metadata_worker disabled (external_git_enabled=false; it only "
             "fills metadata on external_git mirror imports)"

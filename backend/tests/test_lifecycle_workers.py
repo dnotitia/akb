@@ -32,6 +32,16 @@ def _import_lifecycle(monkeypatch, tmp_path):
 def _stub_workers(monkeypatch, lifecycle, started: list[str]) -> None:
     """Replace every worker start hook `start_workers` touches with a recorder."""
 
+    # The production lifecycle receives the process-selected revision backend
+    # from the composition root. Keep these direct lifecycle tests on the
+    # legacy path unless a test explicitly overrides it.
+    monkeypatch.setattr(
+        lifecycle,
+        "selected_document_revision_backend",
+        lambda: "bare_git",
+        raising=False,
+    )
+
     def rec(label: str):
         return lambda *a, **k: started.append(label)
 
@@ -126,6 +136,24 @@ def test_start_workers_skips_metadata_worker_when_external_git_disabled(monkeypa
     assert "metadata_worker" not in started
     # … the poller is off too, while the always-on set still starts.
     assert "external_git_poller" not in started
+    assert "embed_worker" in started
+
+
+def test_start_workers_skips_git_only_workers_for_postgres_native(monkeypatch, tmp_path):
+    lifecycle = _import_lifecycle(monkeypatch, tmp_path)
+    started: list[str] = []
+    _stub_workers(monkeypatch, lifecycle, started)
+    monkeypatch.setattr(lifecycle, "selected_document_revision_backend", lambda: "postgres_native")
+    monkeypatch.setattr(
+        lifecycle,
+        "settings",
+        _settings(external_git_enabled=True, llm_configured=True),
+    )
+
+    lifecycle.start_workers()
+
+    assert "external_git_poller" not in started
+    assert "metadata_worker" not in started
     assert "embed_worker" in started
 
 
