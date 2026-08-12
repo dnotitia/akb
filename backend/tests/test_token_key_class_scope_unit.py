@@ -70,7 +70,7 @@ def test_rest_dependency_allows_read_scope_on_get(monkeypatch):
             token_scopes=frozenset({"read"}),
         )
 
-    monkeypatch.setattr(deps, "resolve_token", fake_resolve)
+    monkeypatch.setattr(deps, "resolve_rest_user_authorization", fake_resolve)
 
     app = FastAPI()
 
@@ -96,7 +96,7 @@ def test_rest_dependency_rejects_read_scope_on_post(monkeypatch):
             token_scopes=frozenset({"read"}),
         )
 
-    monkeypatch.setattr(deps, "resolve_token", fake_resolve)
+    monkeypatch.setattr(deps, "resolve_rest_user_authorization", fake_resolve)
 
     app = FastAPI()
 

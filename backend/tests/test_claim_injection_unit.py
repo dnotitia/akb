@@ -55,7 +55,7 @@ def test_claim_header_requires_service_key(monkeypatch):
     async def fake_resolve(_authorization: str) -> AuthenticatedUser:
         return _auth_user(key_class="pat")
 
-    monkeypatch.setattr(deps, "resolve_token", fake_resolve)
+    monkeypatch.setattr(deps, "resolve_rest_user_authorization", fake_resolve)
 
     response = TestClient(_claims_app()).get(
         "/claims",
@@ -73,7 +73,7 @@ def test_service_key_accepts_valid_claim_header(monkeypatch):
     async def fake_resolve(_authorization: str) -> AuthenticatedUser:
         return _auth_user(key_class="service")
 
-    monkeypatch.setattr(deps, "resolve_token", fake_resolve)
+    monkeypatch.setattr(deps, "resolve_rest_user_authorization", fake_resolve)
 
     response = TestClient(_claims_app()).get(
         "/claims",
@@ -96,7 +96,7 @@ def test_service_key_rejects_invalid_claim_shape(monkeypatch):
     async def fake_resolve(_authorization: str) -> AuthenticatedUser:
         return _auth_user(key_class="service")
 
-    monkeypatch.setattr(deps, "resolve_token", fake_resolve)
+    monkeypatch.setattr(deps, "resolve_rest_user_authorization", fake_resolve)
 
     response = TestClient(_claims_app()).get(
         "/claims",
@@ -114,7 +114,7 @@ def test_no_claim_header_leaves_request_claims_empty(monkeypatch):
     async def fake_resolve(_authorization: str) -> AuthenticatedUser:
         return _auth_user(key_class="service")
 
-    monkeypatch.setattr(deps, "resolve_token", fake_resolve)
+    monkeypatch.setattr(deps, "resolve_rest_user_authorization", fake_resolve)
 
     response = TestClient(_claims_app()).get(
         "/claims",
