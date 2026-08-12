@@ -249,6 +249,7 @@ class NativeDocumentService(DocumentService):
         vault_id: uuid.UUID,
         current: NativeRevisionSnapshot,
         selected: NativeRevisionSnapshot | None = None,
+        public_selector: str | None = None,
     ) -> DocumentResponse:
         selected = selected or current
         current_fm, _ = _parse_markdown(current.text)
@@ -277,7 +278,9 @@ class NativeDocumentService(DocumentService):
             created_by_name=created_by_name,
             created_at=current_fm.get("created_at") or current.resource_created_at,
             updated_at=current.resource_updated_at,
-            current_commit=selected.revision_id,
+            current_commit=(
+                public_selector if public_selector is not None else selected.revision_id
+            ),
             content_hash=_body_content_hash(selected_body),
             hash_algorithm=HASH_ALGORITHM,
             tags=list(current_fm.get("tags") or []),
@@ -372,7 +375,10 @@ class NativeDocumentService(DocumentService):
         version: str,
     ) -> DocumentResponse:
         vault_id, current = await self._current(vault, doc_ref)
-        if len(version) != 40 or any(ch not in "0123456789abcdef" for ch in version):
+        # Public historical reads accept a full native Revision ID or a
+        # resource-scoped unique prefix. Write OCC pins remain exact-40 via
+        # NativeRevisionService._validate_expected_revision().
+        if not 7 <= len(version) <= 40 or any(ch not in "0123456789abcdef" for ch in version):
             raise NotFoundError("Document version", f"{current.path}@{version[:8]}")
         selected = await (await self._native()).get_revision(
             namespace_id=vault_id,
@@ -381,7 +387,11 @@ class NativeDocumentService(DocumentService):
             revision_id=version,
         )
         return await self._response(
-            vault=vault, vault_id=vault_id, current=current, selected=selected,
+            vault=vault,
+            vault_id=vault_id,
+            current=current,
+            selected=selected,
+            public_selector=version,
         )
 
     async def update(

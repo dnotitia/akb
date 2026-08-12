@@ -37,6 +37,18 @@ supervisor ignores exits from processes replaced during reset, so the app and
 fixture return to ready state without a stale lifecycle task stopping the new
 backend.
 
+### Added PostgreSQL Native logical-revision and bounded history safeguards
+
+Public logical-revision reads now preserve the existing 7–40 character
+selector contract in PostgreSQL Native mode: short selectors resolve only
+when unique within the addressed Document, while unknown, cross-Document, and
+ambiguous selectors fail explicitly. Bare Git historical get, history, and
+diff also follow a Document across a move when addressed through its current
+URI, without changing the default backend or external-mirror history path.
+The manual-vault rename lookup streams only through the requested revision and
+fails explicitly at bounded entry, output, or time limits instead of
+materializing an unbounded Git history.
+
 ### Fixed scoped grep replacement completeness and recovery
 
 `akb_grep(replace=...)` now treats `limit` only as a response-preview bound and
