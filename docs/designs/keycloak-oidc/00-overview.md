@@ -216,6 +216,7 @@ independently.
 
 ```yaml
 # config/app.yaml  (non-secret)
+auth_mode: local                       # required; choose sso for human OIDC login
 keycloak_enabled: false                # default — local auth only
 keycloak_server_url: https://auth.example.com   # browser-facing → issuer
 keycloak_internal_url: ""              # optional backchannel (server→KC); blank → server_url

@@ -8,6 +8,7 @@
 # === SSO path === enable in config/app.yaml (matches the imported realm
 # `deploy/keycloak-dev/akb-realm.json` and the split localhost/container URLs):
 #
+#   auth_mode: sso
 #   keycloak_enabled: true
 #   keycloak_server_url: "http://localhost:8080"      # browser-facing → issuer
 #   keycloak_internal_url: "http://keycloak:8080"     # backend → keycloak container
@@ -28,6 +29,10 @@
 #   mcp_oauth_audience: ""    # default → "http://localhost:8000/mcp"
 #                             # MUST match the audience baked into the
 #                             # akb:vault:* scope mappers in akb-realm.json
+#
+# To test MCP OAuth while keeping human login local, use `auth_mode: local`
+# with the same Keycloak authority + `mcp_oauth_enabled: true`; no human OIDC
+# redirect/client settings are required for that resource-server-only mode.
 #
 # For E2E / CI (`backend/tests/test_mcp_oauth_e2e.sh`) the realm ships
 # `akb-mcp-test` — a confidential service-account client (secret

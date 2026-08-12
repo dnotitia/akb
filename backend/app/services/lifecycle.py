@@ -31,6 +31,7 @@ logger = logging.getLogger("akb.lifecycle")
 def _validate_required_settings() -> None:
     """Fail fast on missing required config so misconfigured deploys don't
     silently serve unsigned tokens or produce confusing downstream errors."""
+    settings.require_auth_mode()
     missing: list[str] = []
     if not settings.jwt_secret:
         missing.append("AKB_JWT_SECRET (signs auth tokens — use a strong random string)")
@@ -42,22 +43,27 @@ def _validate_required_settings() -> None:
             "publication response carries an absolute share_url; e.g. "
             "https://akb.example.com)"
         )
-    # Keycloak is OPTIONAL — only validate its config when it's turned on.
-    # When enabled, an incomplete config would 500 mid-login instead of
-    # failing the deploy, so fail fast here.
+    # A configured Keycloak authority always needs its issuer base. Human OIDC
+    # client settings are required only in canonical SSO mode: local mode may
+    # configure Keycloak solely as the MCP OAuth resource-server authority.
     if settings.keycloak_enabled:
         if not settings.keycloak_server_url:
             missing.append("keycloak_server_url (keycloak_enabled is true)")
-        if not settings.keycloak_redirect_uri:
-            missing.append(
-                "keycloak_redirect_uri (keycloak_enabled is true — the "
-                "backend callback URL registered on the Keycloak client)"
-            )
-        if not settings.keycloak_public_client and not settings.keycloak_client_secret:
-            missing.append(
-                "keycloak_client_secret (confidential client — set it in "
-                "secret.yaml, or set keycloak_public_client: true for PKCE)"
-            )
+        if settings.sso_human_auth_enabled:
+            if not settings.keycloak_redirect_uri:
+                missing.append(
+                    "keycloak_redirect_uri (auth_mode is sso — the backend "
+                    "callback URL registered on the Keycloak client)"
+                )
+            if (
+                not settings.keycloak_public_client
+                and not settings.keycloak_client_secret
+            ):
+                missing.append(
+                    "keycloak_client_secret (auth_mode is sso with a "
+                    "confidential client — set it in secret.yaml, or set "
+                    "keycloak_public_client: true for PKCE)"
+                )
     # MCP-OAuth (the Resource Server path) reuses the Keycloak JWKS,
     # issuer, and audience-mapped scopes — so it's only meaningful when
     # `keycloak_enabled` is also true. A deployment with mcp_oauth on +

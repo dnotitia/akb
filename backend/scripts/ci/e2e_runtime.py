@@ -544,6 +544,7 @@ class E2ERuntime:
         import yaml
 
         app_config = {
+            "auth_mode": "local",
             "db_host": "127.0.0.1",
             "db_port": 15432,
             "db_name": "akb",

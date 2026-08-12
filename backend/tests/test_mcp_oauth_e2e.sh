@@ -23,6 +23,7 @@
 # Stack required:
 #   docker compose -f docker-compose.yaml -f docker-compose.keycloak.yaml up -d
 #   # config/app.yaml must have:
+#   #   auth_mode: local
 #   #   keycloak_enabled: true
 #   #   mcp_oauth_enabled: true
 #   #   public_base_url: http://localhost:8000

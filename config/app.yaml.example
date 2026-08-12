@@ -147,6 +147,9 @@ document_asset_gc_interval_secs: 300
 document_asset_upload_body_timeout_secs: 60
 
 # === Auth (jwt_secret is in secret.yaml) ===
+# REQUIRED canonical human-login mode. Fresh runtime config never infers this
+# from legacy booleans. Choose exactly one: local | sso.
+auth_mode: local
 jwt_algorithm: HS256
 jwt_expire_hours: 24
 publication_view_grant_ttl_secs: 600
@@ -163,16 +166,17 @@ app_token_ttl_seconds: 300
 app_credential_overlap_seconds: 300
 
 # === Auth — Keycloak OIDC (OPTIONAL external IdP; OFF by default) ===
-# Local username/password lifecycle remains enabled by default. Managed SSO-only
-# deployments set this false; keycloak_sso_only alone only changes the login UI.
-# local_auth_enabled: true
+# Human login is selected only by auth_mode. For SSO, set auth_mode: sso and
+# keycloak_enabled: true. Local mode may configure Keycloak only when
+# mcp_oauth_enabled: true needs it as an OAuth resource-server authority.
 #
-# Leave keycloak_enabled false and AKB uses local username/password + PAT
-# exactly as before — none of the keys below are read and the SSO routes
-# return 404. Turn it on to add an SSO login button; on success AKB resolves
-# an exact (issuer, subject) binding. The default `open` mode preserves the
-# verified-email JIT/link fallback once, then persists that stable binding.
-# Keycloak is authentication only — it never drives AKB authorization.
+# Legacy compatibility inputs local_auth_enabled and keycloak_sso_only are
+# derived from auth_mode for fresh configs. Do not set them independently;
+# an explicit mismatch fails startup.
+#
+# Keycloak human login resolves an exact (issuer, subject) binding. The default
+# `open` enrollment mode preserves the verified-email JIT/link fallback once,
+# then persists that stable binding. Keycloak never drives AKB authorization.
 # Full designs: docs/designs/keycloak-oidc/00-overview.md and
 # docs/design/accepted/2026-07-10-workspace-account-governance/README.md
 #

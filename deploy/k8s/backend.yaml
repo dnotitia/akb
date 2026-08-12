@@ -36,6 +36,9 @@ data:
     s3_endpoint_url: ""
     s3_bucket: akb-files
 
+    # Required canonical human-login mode. This base deployment is local.
+    auth_mode: local
+
     # Vector store — default driver is pgvector inside the main PG pod
     # (`pgvector/pgvector:pg16` ships with the extension). Override
     # via overlay (deploy/k8s/internal/) to use Qdrant instead.
