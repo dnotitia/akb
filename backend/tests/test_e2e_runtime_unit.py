@@ -19,6 +19,7 @@ sys.path.insert(0, str(CI_DIR))
 from e2e_runtime import (  # noqa: E402
     CredentialNames,
     E2ERuntime,
+    ManagedProcess,
     RuntimeConfig,
     _parse_args,
     terminate_process,
@@ -503,6 +504,61 @@ async def test_fixture_control_exposes_reset_discovery_and_sanitized_logs():
         openapi = await client.get("/openapi.json")
         assert openapi.status_code == 200
         assert "/reset" in openapi.json()["paths"]
+
+
+class _LifecycleProcess:
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.returncode: int | None = None
+
+    async def wait(self) -> int:
+        await self.release.wait()
+        self.returncode = 0
+        return 0
+
+
+@pytest.mark.asyncio
+async def test_serve_ignores_process_exit_after_reset_replaces_the_process(tmp_path):
+    runtime = E2ERuntime(make_config(tmp_path))
+    old_process = _LifecycleProcess()
+    new_process = _LifecycleProcess()
+    runtime._children["backend"] = ManagedProcess(old_process)  # type: ignore[arg-type]
+
+    serve_task = asyncio.create_task(runtime._serve_foreground())
+    await asyncio.sleep(0)
+
+    runtime._resetting = True
+    old_process.release.set()
+    runtime._children["backend"] = ManagedProcess(new_process)  # type: ignore[arg-type]
+    runtime._resetting = False
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert not serve_task.done()
+    runtime.request_stop()
+    assert await asyncio.wait_for(serve_task, timeout=1) == 0
+    assert runtime._children["backend"].process is new_process
+
+
+@pytest.mark.asyncio
+async def test_restart_requested_during_reset_does_not_restart_after_reset(tmp_path):
+    runtime = E2ERuntime(make_config(tmp_path))
+    runtime._lifecycle_generation = 4
+    runtime._resetting = True
+    calls: list[str] = []
+
+    async def record_stop(_name: str) -> None:
+        calls.append("stop")
+
+    async def record_start() -> None:
+        calls.append("start")
+
+    runtime._stop_named_process = record_stop  # type: ignore[method-assign]
+    runtime._start_backend = record_start  # type: ignore[method-assign]
+
+    await runtime._restart_backend(4, requested_during_reset=True)
+
+    assert calls == []
 
 
 def test_rollout_fixture_discovery_is_generic_and_redacted(tmp_path):

@@ -218,6 +218,7 @@ class E2ERuntime:
         self._stop_event = asyncio.Event()
         self._reset_lock = asyncio.Lock()
         self._resetting = False
+        self._lifecycle_generation = 0
         self._cleaned = False
         self._prepared = False
         self._fixture_catalog: dict[str, object] = {
@@ -362,7 +363,13 @@ class E2ERuntime:
         if action == "restart":
             self._fixture_controls["restart_requested"] = bool(enabled)
             if enabled:
-                asyncio.create_task(self._restart_backend(), name="backend-restart")
+                asyncio.create_task(
+                    self._restart_backend(
+                        self._lifecycle_generation,
+                        requested_during_reset=self._resetting or self._reset_lock.locked(),
+                    ),
+                    name="backend-restart",
+                )
         elif action == "fault_injection":
             if self.config.scenario != "app-release-rollout":
                 return {
@@ -455,10 +462,23 @@ class E2ERuntime:
             # Controls are best effort and must not leak database details.
             return False
 
-    async def _restart_backend(self) -> None:
+    async def _restart_backend(
+        self,
+        requested_generation: int | None = None,
+        *,
+        requested_during_reset: bool = False,
+    ) -> None:
         try:
-            await self._stop_named_process("backend")
-            if not self._resetting:
+            async with self._reset_lock:
+                if requested_generation is None:
+                    requested_generation = self._lifecycle_generation
+                if (
+                    requested_during_reset
+                    or requested_generation != self._lifecycle_generation
+                    or self._resetting
+                ):
+                    return
+                await self._stop_named_process("backend")
                 await self._start_backend()
         except Exception:
             return
@@ -1725,6 +1745,7 @@ class E2ERuntime:
         async with self._reset_lock:
             if not self._prepared:
                 raise ProvisioningFailure("fixture reset requested before runtime readiness")
+            self._lifecycle_generation += 1
             self._resetting = True
             try:
                 self._fixture_controls.clear()
@@ -1745,20 +1766,29 @@ class E2ERuntime:
         stop_task = asyncio.create_task(self._stop_event.wait(), name="serve-stop")
         try:
             while not self._stop_event.is_set():
-                child_tasks = [
-                    asyncio.create_task(child.process.wait(), name=f"serve-{name}")
-                    for name, child in self._children.items()
-                ]
+                observed_children = tuple(self._children.items())
+                child_tasks = {
+                    name: (
+                        child,
+                        asyncio.create_task(child.process.wait(), name=f"serve-{name}"),
+                    )
+                    for name, child in observed_children
+                }
                 if not child_tasks:
                     await asyncio.sleep(0.1)
                     continue
                 try:
+                    wait_tasks = [task for _child, task in child_tasks.values()]
                     done, _pending = await asyncio.wait(
-                        [stop_task, *child_tasks], return_when=asyncio.FIRST_COMPLETED
+                        [stop_task, *wait_tasks], return_when=asyncio.FIRST_COMPLETED
                     )
                     if stop_task in done or self._stop_event.is_set():
                         return 0
-                    if self._resetting:
+                    current_child_exited = any(
+                        task in done and self._children.get(name) is child
+                        for name, (child, task) in child_tasks.items()
+                    )
+                    if not current_child_exited or self._resetting:
                         continue
                     LOGGER.error(
                         "E2E runtime child exited unexpectedly; see %s",
@@ -1766,10 +1796,11 @@ class E2ERuntime:
                     )
                     return 1
                 finally:
-                    for task in child_tasks:
+                    tasks = [task for _child, task in child_tasks.values()]
+                    for task in tasks:
                         if not task.done():
                             task.cancel()
-                    for task in child_tasks:
+                    for task in tasks:
                         with contextlib.suppress(asyncio.CancelledError):
                             await task
         finally:

@@ -17,6 +17,13 @@ observed-state convergence. Added admin and self-app request/status routes,
 worker lifecycle registration, migration 061, and the repository-owned
 `app-release-rollout` E2E fixture scenario.
 
+### Fixed repository-owned E2E reset and restart lifecycle
+
+Reset now serializes with generic backend restart requests and the runtime
+supervisor ignores exits from processes replaced during reset, so the app and
+fixture return to ready state without a stale lifecycle task stopping the new
+backend.
+
 ### Fixed scoped grep replacement completeness and recovery
 
 `akb_grep(replace=...)` now treats `limit` only as a response-preview bound and
