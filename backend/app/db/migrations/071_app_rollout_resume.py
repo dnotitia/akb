@@ -1,4 +1,4 @@
-"""Migration 063: immutable-source rollout resume attempts."""
+"""Migration 071: immutable-source rollout resume attempts."""
 
 from __future__ import annotations
 

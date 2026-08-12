@@ -1,4 +1,5 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { ArrowLeft, ArrowRight, Check, ChevronRight, FolderPlus } from "lucide-react";
 import { ApiError, putDocument } from "@/lib/api";
@@ -57,9 +58,12 @@ export default function DocumentNewPage() {
   const [summary, setSummary] = useState("");
   const [tags, setTags] = useState<string[]>([]);
   const [body, setBody] = useState("");
+  const [bodyAssetIds, setBodyAssetIds] = useState<readonly string[]>([]);
   const [error, setError] = useState("");
   const [invalidField, setInvalidField] = useState<"title" | "collection" | "body" | null>(null);
   const [creating, setCreating] = useState(false);
+  const [uploadingImage, setUploadingImage] = useState(false);
+  const [claimedAssetIds, setClaimedAssetIds] = useState<readonly string[] | null>(null);
   const [discardOpen, setDiscardOpen] = useState(false);
   const titleRef = useRef<HTMLInputElement>(null);
   const collectionRef = useRef<HTMLInputElement>(null);
@@ -84,6 +88,7 @@ export default function DocumentNewPage() {
     summary.trim() !== "" ||
     tags.length > 0 ||
     body.trim() !== "";
+  const hasUnsavedWork = isDirty || uploadingImage;
 
   function doCancel() {
     if (typeof window !== "undefined" && window.history.length > 1) {
@@ -94,7 +99,7 @@ export default function DocumentNewPage() {
   }
   function handleCancel() {
     // Guard a dirty draft behind a ConfirmDialog (design system bans window.confirm).
-    if (isDirty && !creating) setDiscardOpen(true);
+    if (hasUnsavedWork && !creating) setDiscardOpen(true);
     else doCancel();
   }
 
@@ -107,17 +112,17 @@ export default function DocumentNewPage() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [creating, discardOpen, isDirty]);
+  }, [creating, discardOpen, hasUnsavedWork]);
 
   useEffect(() => {
-    if (!isDirty || creating) return;
+    if (!hasUnsavedWork || creating) return;
     const onBeforeUnload = (e: BeforeUnloadEvent) => {
       e.preventDefault();
       e.returnValue = "";
     };
     window.addEventListener("beforeunload", onBeforeUnload);
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
-  }, [isDirty, creating]);
+  }, [hasUnsavedWork, creating]);
 
   // Fail a field: surface the message, mark the field invalid (aria + red
   // border), and move focus to it so a keyboard/AT user lands on the problem.
@@ -130,7 +135,7 @@ export default function DocumentNewPage() {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!name) return;
+    if (!name || uploadingImage) return;
     setError("");
     setInvalidField(null);
     const t = title.trim();
@@ -151,6 +156,7 @@ export default function DocumentNewPage() {
     }
     if (!body.trim()) return fail("body", "Body cannot be empty.");
     if (body.length > 1_000_000) return fail("body", "Body is too large (1 MB max).");
+    const assetIdsToClaim = bodyAssetIds;
     setCreating(true);
     try {
       const result = await putDocument({
@@ -167,6 +173,13 @@ export default function DocumentNewPage() {
       // manual reload (the explorer/home stay mounted across this navigation).
       refetchTree();
       refetchVaults();
+      // The response means document refs now own every valid image. Commit the
+      // state before navigation so editor cleanup may discard only uploads the
+      // saved body did not claim.
+      flushSync(() => {
+        setCreating(false);
+        setClaimedAssetIds(assetIdsToClaim);
+      });
       const path = result?.path;
       if (path) {
         navigate(`/vault/${name}/doc/${encodeURIComponent(path)}`);
@@ -189,7 +202,11 @@ export default function DocumentNewPage() {
     }
   }
 
-  const canSubmit = title.trim() !== "" && collection.trim() !== "" && body.trim() !== "";
+  const canSubmit =
+    title.trim() !== "" &&
+    collection.trim() !== "" &&
+    body.trim() !== "" &&
+    !uploadingImage;
 
   return (
     <div className="max-w-3xl mx-auto fade-up">
@@ -370,13 +387,22 @@ export default function DocumentNewPage() {
           <Suspense fallback={<MarkdownEditorFallback />}>
             <MarkdownEditor
               value=""
-              onChange={(md) => {
+              onChange={(md, assetIds) => {
                 setBody(md);
+                setBodyAssetIds(assetIds);
                 if (invalidField === "body") setInvalidField(null);
               }}
               placeholder="Write the document body in markdown."
               ariaLabelledby="doc-body-label"
               required
+              readOnly={creating}
+              vault={name!}
+              onUploadingChange={(uploading) => {
+                setUploadingImage(uploading);
+                if (uploading) setClaimedAssetIds(null);
+              }}
+              preserveUploadsOnUnmount={creating}
+              claimedAssetIds={claimedAssetIds}
             />
           </Suspense>
         </div>
@@ -405,7 +431,11 @@ export default function DocumentNewPage() {
         open={discardOpen}
         onOpenChange={setDiscardOpen}
         title="Discard this draft?"
-        description="Your unsaved document will be lost."
+        description={
+          uploadingImage
+            ? "The image upload will be cancelled and your unsaved document will be lost."
+            : "Your unsaved document will be lost."
+        }
         confirmLabel="Discard"
         variant="destructive"
         onConfirm={doCancel}

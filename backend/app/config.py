@@ -390,6 +390,11 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def validate_model_api_governance(self) -> "Settings":
+        if self.publication_view_grant_session_secs < self.publication_view_grant_ttl_secs:
+            raise ValueError(
+                "publication_view_grant_session_secs must be >= "
+                "publication_view_grant_ttl_secs"
+            )
         if self.document_revision_backend == "postgres_native":
             if not self.document_revision_tenant_id.strip():
                 raise ValueError(
@@ -579,6 +584,17 @@ class Settings(BaseModel):
     s3_read_timeout_secs: float = 10.0
     s3_max_attempts: int = 2
 
+    # Document images use live document refs for authorization and a bounded
+    # manifest for recent Git revisions. Uncommitted uploads are collected
+    # separately so abandoned uploads remain eligible for bounded cleanup.
+    document_asset_revision_retention_days: int = Field(default=30, ge=1, le=3650)
+    document_asset_unclaimed_ttl_hours: int = Field(default=24, ge=1, le=8760)
+    # Direct File uploads use a one-hour presigned PUT. Give clients a much
+    # larger completion window before stale, still-private metadata is reaped.
+    file_pending_upload_ttl_hours: int = Field(default=24, ge=2, le=8760)
+    document_asset_gc_interval_secs: int = Field(default=300, ge=10, le=86400)
+    document_asset_upload_body_timeout_secs: float = Field(default=60.0, ge=1.0, le=900.0)
+
     # Auth — jwt_secret must be set (validated at startup in lifecycle.init_storage)
     jwt_secret: str = ""
     jwt_algorithm: str = "HS256"
@@ -751,6 +767,19 @@ class Settings(BaseModel):
     # ``lifecycle._validate_required_settings`` fails the app launch if
     # this is empty.
     public_base_url: str = ""
+    # A counted publication page may lazy-load subordinate images after first
+    # paint. Keep this capability short-lived: it is carried by subordinate
+    # URLs and suppresses repeat view counting for the same page open.
+    publication_view_grant_ttl_secs: int = Field(default=600, ge=60, le=3600)
+    # Expand/contract rollout gate. Keep legacy emission enabled while any
+    # running server accepts only the original two-field grant. New servers
+    # read both forms; after the fleet is fully upgraded this can be disabled
+    # to emit bounded, rotatable three-field grants.
+    publication_view_grant_emit_legacy: bool = True
+    # A bounded proof may request another view-counted fetch window only inside
+    # this page-session interval. The publication max_views check still runs on
+    # every renewal; this interval limits how long renewal remains available.
+    publication_view_grant_session_secs: int = Field(default=3600, ge=600, le=3600)
 
     # Vector store (hybrid dense + BM25). Driver-pluggable.
     #

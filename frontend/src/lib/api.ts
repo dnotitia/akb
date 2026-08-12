@@ -2,10 +2,78 @@ const API_BASE = "/api/v1";
 
 let _token: string | null = null;
 
+const PRIVATE_ASSET_CACHE_MAX_ENTRIES = 32;
+const PRIVATE_ASSET_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+const privateAssetCache = new Map<string, Blob>();
+let privateAssetCacheBytes = 0;
+type AssetFlight = {
+  controller: AbortController;
+  promise: Promise<Blob>;
+  subscribers: number;
+  settled: boolean;
+};
+const privateAssetFlights = new Map<string, AssetFlight>();
+
+export function clearPrivateAssetCache() {
+  privateAssetCache.clear();
+  privateAssetCacheBytes = 0;
+  for (const flight of privateAssetFlights.values()) flight.controller.abort();
+  privateAssetFlights.clear();
+}
+
 export function setToken(t: string | null) {
+  if (_token !== t) clearPrivateAssetCache();
   _token = t;
   if (t) localStorage.setItem("akb_token", t);
   else localStorage.removeItem("akb_token");
+}
+
+function privateAssetCacheKey(
+  token: string,
+  fileId: string,
+  vault: string,
+  source?: { document: string; commit: string },
+) {
+  return [token, vault, source?.document ?? "live", source?.commit ?? "live", fileId].join("\u0000");
+}
+
+function readPrivateAssetCache(key: string): Blob | null {
+  const blob = privateAssetCache.get(key);
+  if (!blob) return null;
+  // Map insertion order is the LRU order.
+  privateAssetCache.delete(key);
+  privateAssetCache.set(key, blob);
+  return blob;
+}
+
+function writePrivateAssetCache(key: string, blob: Blob) {
+  if (blob.size > PRIVATE_ASSET_CACHE_MAX_BYTES) return;
+  const previous = privateAssetCache.get(key);
+  if (previous) privateAssetCacheBytes -= previous.size;
+  privateAssetCache.delete(key);
+  privateAssetCache.set(key, blob);
+  privateAssetCacheBytes += blob.size;
+  while (
+    privateAssetCache.size > PRIVATE_ASSET_CACHE_MAX_ENTRIES ||
+    privateAssetCacheBytes > PRIVATE_ASSET_CACHE_MAX_BYTES
+  ) {
+    const oldest = privateAssetCache.entries().next().value as [string, Blob] | undefined;
+    if (!oldest) break;
+    privateAssetCache.delete(oldest[0]);
+    privateAssetCacheBytes -= oldest[1].size;
+  }
+}
+
+function waitForAssetFlight(flight: AssetFlight, signal?: AbortSignal): Promise<Blob> {
+  if (!signal) return flight.promise;
+  if (signal.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(new DOMException("Aborted", "AbortError"));
+    signal.addEventListener("abort", abort, { once: true });
+    flight.promise.then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", abort);
+    });
+  });
 }
 
 export function getToken(): string | null {
@@ -60,48 +128,74 @@ export class ApiError<T = unknown> extends Error {
   }
 }
 
-async function api<T>(path: string, opts?: RequestInit): Promise<T> {
+function withBearerToken(headers?: HeadersInit): HeadersInit {
   const token = getToken();
+  if (headers instanceof Headers || Array.isArray(headers)) {
+    const merged = new Headers(headers);
+    if (token) merged.set("Authorization", `Bearer ${token}`);
+    return merged;
+  }
+  return {
+    ...(headers || {}),
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+}
+
+function expireUnauthorizedSession(redirect: boolean) {
+  setToken(null);
+  if (redirect && !location.pathname.startsWith("/auth")) {
+    location.href =
+      "/auth?next=" + encodeURIComponent(location.pathname + location.search);
+  }
+}
+
+async function authenticatedFetch(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+  { unauthorized = "expire-and-redirect" }: {
+    unauthorized?: "expire-and-redirect" | "preserve-session";
+  } = {},
+): Promise<Response> {
+  const res = await fetch(input, {
+    ...init,
+    headers: withBearerToken(init?.headers),
+  });
+  if (res.status === 401) {
+    if (unauthorized === "expire-and-redirect") {
+      expireUnauthorizedSession(true);
+    }
+    throw new Error("Unauthorized");
+  }
+  return res;
+}
+
+async function throwJsonApiError(res: Response): Promise<never> {
+  const body = await res.json().catch(() => ({}));
+  if (body && typeof body.detail === "object" && body.detail !== null) {
+    const detail = body.detail as { message?: string };
+    throw new ApiError(
+      detail.message || `${res.status} ${res.statusText}`,
+      res.status,
+      body.detail,
+    );
+  }
+  throw new Error(body.error || body.detail || `${res.status} ${res.statusText}`);
+}
+
+async function api<T>(path: string, opts?: RequestInit): Promise<T> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...((opts?.headers as Record<string, string>) || {}),
   };
-  if (token) headers["Authorization"] = `Bearer ${token}`;
-  const res = await fetch(`${API_BASE}${path}`, { ...opts, headers });
-  if (res.status === 401) {
-    setToken(null);
-    if (!location.pathname.startsWith("/auth")) location.href = "/auth?next=" + encodeURIComponent(location.pathname + location.search);
-    throw new Error("Unauthorized");
-  }
+  const res = await authenticatedFetch(`${API_BASE}${path}`, { ...opts, headers });
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    if (body && typeof body.detail === "object" && body.detail !== null) {
-      // FastAPI returns {detail: {...}} for HTTPException(detail=dict).
-      // Preserve the structured payload so callers can render its fields.
-      const detail = body.detail as { message?: string };
-      throw new ApiError(
-        detail.message || `${res.status} ${res.statusText}`,
-        res.status,
-        body.detail,
-      );
-    }
-    throw new Error(body.error || body.detail || `${res.status} ${res.statusText}`);
+    await throwJsonApiError(res);
   }
   return res.json();
 }
 
 async function apiText(path: string, opts?: RequestInit): Promise<string> {
-  const token = getToken();
-  const headers: Record<string, string> = {
-    ...((opts?.headers as Record<string, string>) || {}),
-  };
-  if (token) headers["Authorization"] = `Bearer ${token}`;
-  const res = await fetch(`${API_BASE}${path}`, { ...opts, headers });
-  if (res.status === 401) {
-    setToken(null);
-    if (!location.pathname.startsWith("/auth")) location.href = "/auth?next=" + encodeURIComponent(location.pathname + location.search);
-    throw new Error("Unauthorized");
-  }
+  const res = await authenticatedFetch(`${API_BASE}${path}`, opts);
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(body || `${res.status} ${res.statusText}`);
@@ -308,6 +402,104 @@ export const updateDocument = (vault: string, id: string, data: any) =>
   api<any>(`/documents/${vault}/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(data) });
 export const deleteDocument = (vault: string, id: string) =>
   api<any>(`/documents/${vault}/${encodeURIComponent(id)}`, { method: "DELETE" });
+
+// ── Editor image assets ──
+export interface AssetUploadResponse {
+  id: string;
+  url: string;
+  name: string;
+  mime_type: string;
+  size_bytes: number;
+}
+
+/**
+ * Upload an editor image as a raw request body. This deliberately does not use
+ * `api()`: that helper always injects `Content-Type: application/json`, while
+ * the asset endpoint validates the image MIME from this header.
+ */
+export async function uploadAsset(
+  vault: string,
+  file: File,
+  signal?: AbortSignal,
+): Promise<AssetUploadResponse> {
+  const params = new URLSearchParams({ filename: file.name });
+  const headers: Record<string, string> = { "Content-Type": file.type };
+
+  const res = await authenticatedFetch(
+    `${API_BASE}/assets/${encodeURIComponent(vault)}?${params}`,
+    { method: "POST", headers, body: file, signal },
+  );
+  if (!res.ok) {
+    await throwJsonApiError(res);
+  }
+  return res.json();
+}
+
+/** Fetch a private asset with the app's Bearer credential for blob rendering. */
+export async function getAssetBlob(
+  fileId: string,
+  vault: string,
+  signal?: AbortSignal,
+  source?: { document: string; commit: string },
+): Promise<Blob> {
+  const token = getToken();
+  const cacheKey = privateAssetCacheKey(token ?? "anonymous", fileId, vault, source);
+  const cached = readPrivateAssetCache(cacheKey);
+  if (cached) return cached;
+
+  let flight = privateAssetFlights.get(cacheKey);
+  if (!flight) {
+    const controller = new AbortController();
+    const entry: AssetFlight = {
+      controller,
+      subscribers: 0,
+      settled: false,
+      promise: Promise.resolve(new Blob()),
+    };
+    entry.promise = (async () => {
+      const params = new URLSearchParams({ vault });
+      if (source) {
+        params.set("document", source.document);
+        params.set("commit", source.commit);
+      }
+      const res = await authenticatedFetch(
+        `/api/assets/${encodeURIComponent(fileId)}?${params}`,
+        { signal: controller.signal },
+      );
+      if (!res.ok) throw new Error(`Image unavailable (${res.status})`);
+      const blob = await res.blob();
+      writePrivateAssetCache(cacheKey, blob);
+      return blob;
+    })().finally(() => {
+      entry.settled = true;
+      if (privateAssetFlights.get(cacheKey) === entry) {
+        privateAssetFlights.delete(cacheKey);
+      }
+    });
+    flight = entry;
+    privateAssetFlights.set(cacheKey, flight);
+  }
+  flight.subscribers += 1;
+  try {
+    return await waitForAssetFlight(flight, signal);
+  } finally {
+    flight.subscribers -= 1;
+    if (!flight.settled && flight.subscribers === 0) flight.controller.abort();
+  }
+}
+
+/** Best-effort cleanup for an upload that never reached a document commit. */
+export async function discardAsset(vault: string, fileId: string): Promise<void> {
+  const res = await authenticatedFetch(
+    `${API_BASE}/assets/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}`,
+    { method: "DELETE", keepalive: true },
+    // Cleanup is best effort and may race with logout.  Its 401 must not
+    // invalidate an otherwise live session or abort unrelated image reads.
+    { unauthorized: "preserve-session" },
+  );
+  if (res.ok) return;
+  await throwJsonApiError(res);
+}
 
 // ── Browse ──
 export const browseVault = (vault: string, collection?: string, depth = 1) => {
@@ -607,6 +799,8 @@ export interface PublicationResponse {
   // Short-lived grant minted by this page open; carried by /raw, /download and
   // CSV so they re-serve this same view without re-counting it.
   view_grant?: string;
+  // Bounded proof for rotating a legacy fetch grant during a rolling upgrade.
+  view_grant_session?: string;
 }
 
 export interface PublicationError {
@@ -641,6 +835,10 @@ function publicationGrantKey(slug: string) {
   return `akb_publication_grant_${slug}`;
 }
 
+function publicationSessionGrantKey(slug: string) {
+  return `akb_publication_grant_session_${slug}`;
+}
+
 export function getViewGrant(slug: string): string | null {
   return sessionStorage.getItem(publicationGrantKey(slug));
 }
@@ -649,7 +847,20 @@ export function setViewGrant(slug: string, grant: string) {
   sessionStorage.setItem(publicationGrantKey(slug), grant);
 }
 
-async function fetchPublic(slug: string, path: string = "", params?: Record<string, string>): Promise<Response> {
+function getViewGrantSession(slug: string): string | null {
+  return sessionStorage.getItem(publicationSessionGrantKey(slug));
+}
+
+function setViewGrantSession(slug: string, grant: string) {
+  sessionStorage.setItem(publicationSessionGrantKey(slug), grant);
+}
+
+async function fetchPublic(
+  slug: string,
+  path: string = "",
+  params?: Record<string, string>,
+  init?: RequestInit,
+): Promise<Response> {
   const token = getPublicationToken(slug);
   const grant = getViewGrant(slug);
   const search = new URLSearchParams(params || {});
@@ -659,7 +870,7 @@ async function fetchPublic(slug: string, path: string = "", params?: Record<stri
   if (grant) search.set("grant", grant);
   const qs = search.toString();
   const suffix = qs ? `?${qs}` : "";
-  return fetch(`${API_BASE}/public/${slug}${path}${suffix}`);
+  return fetch(`${API_BASE}/public/${slug}${path}${suffix}`, init);
 }
 
 export async function getPublication(
@@ -682,6 +893,9 @@ export async function getPublication(
   // This page open spent one view and returned a grant; keep it so the paired
   // /raw + /download re-serves of this view aren't counted again.
   if (body.view_grant) setViewGrant(slug, body.view_grant);
+  if (body.view_grant_session) {
+    setViewGrantSession(slug, body.view_grant_session);
+  }
   return body;
 }
 
@@ -692,6 +906,48 @@ export async function getPublicationMeta(slug: string): Promise<any> {
     throw { message: body.detail || body.error || res.statusText, status: res.status, password_required: body.password_required } as PublicationError;
   }
   return res.json();
+}
+
+const publicationGrantRefreshes = new Map<string, Promise<string>>();
+
+/** Acquire one newly counted subordinate-fetch window for a publication. */
+export function refreshPublicationViewGrant(slug: string): Promise<string> {
+  const existing = publicationGrantRefreshes.get(slug);
+  if (existing) return existing;
+
+  const refresh = (async () => {
+    const search = new URLSearchParams();
+    const token = getPublicationToken(slug);
+    const renewalGrant = getViewGrantSession(slug) ?? getViewGrant(slug);
+    if (token) search.set("token", token);
+    if (renewalGrant) search.set("grant", renewalGrant);
+    const qs = search.toString();
+    const res = await fetch(
+      `${API_BASE}/public/${encodeURIComponent(slug)}/grant${qs ? `?${qs}` : ""}`,
+      { method: "POST" },
+    );
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || !body.view_grant) {
+      throw new Error(body.detail || body.error || "Publication grant expired");
+    }
+    setViewGrant(slug, body.view_grant);
+    if (body.view_grant_session) {
+      setViewGrantSession(slug, body.view_grant_session);
+    } else if (body.view_grant.split(".").length === 3) {
+      // Compatibility with a bounded-grant backend that predates the separate
+      // session field.  Never promote a two-field fetch grant here.
+      setViewGrantSession(slug, body.view_grant);
+    }
+    return body.view_grant;
+  })();
+
+  const tracked = refresh.finally(() => {
+    if (publicationGrantRefreshes.get(slug) === tracked) {
+      publicationGrantRefreshes.delete(slug);
+    }
+  });
+  publicationGrantRefreshes.set(slug, tracked);
+  return tracked;
 }
 
 export interface PublicationCapabilities {
@@ -749,6 +1005,22 @@ export function publicationRawUrl(slug: string): string {
   if (grant) search.set("grant", grant);
   const qs = search.toString();
   return `${API_BASE}/public/${slug}/raw${qs ? `?${qs}` : ""}`;
+}
+
+/**
+ * Asset-scoped URL for an image embedded by a counted document view.
+ *
+ * The grant suppresses N+1 view counting. Password-protected publications also
+ * require their short-lived password token; a grant never unlocks content.
+ */
+export function publicationAssetUrl(slug: string, fileId: string): string {
+  const token = getPublicationToken(slug);
+  const grant = getViewGrant(slug);
+  const search = new URLSearchParams();
+  if (token) search.set("token", token);
+  if (grant) search.set("grant", grant);
+  const qs = search.toString();
+  return `${API_BASE}/public/${encodeURIComponent(slug)}/assets/${encodeURIComponent(fileId)}${qs ? `?${qs}` : ""}`;
 }
 
 export function publicationCsvUrl(slug: string, params?: Record<string, string>): string {

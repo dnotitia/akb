@@ -13,19 +13,41 @@ vi.mock("@/lib/api", () => ({
   deleteDocument: vi.fn(),
   publishDoc: vi.fn(),
   unpublishDoc: vi.fn(),
+  updateDocument: vi.fn(),
+}));
+
+vi.mock("@/components/markdown-editor", () => ({
+  default: ({
+    value,
+    onChange,
+    ariaLabel,
+  }: {
+    value: string;
+    onChange?: (value: string) => void;
+    ariaLabel?: string;
+  }) => (
+    <textarea
+      aria-label={ariaLabel}
+      defaultValue={value}
+      onChange={(event) => onChange?.(event.currentTarget.value)}
+    />
+  ),
 }));
 
 import {
   getDocument,
   getVaultInfo,
   getRelations,
+  updateDocument,
 } from "@/lib/api";
 
 const getDocumentMock = getDocument as unknown as ReturnType<typeof vi.fn>;
 const getVaultInfoMock = getVaultInfo as unknown as ReturnType<typeof vi.fn>;
 const getRelationsMock = getRelations as unknown as ReturnType<typeof vi.fn>;
+const updateDocumentMock = updateDocument as unknown as ReturnType<typeof vi.fn>;
 
 const SAMPLE_CONTENT = "# BodyHeading\n\nworld";
+const UPDATED_COMMIT = "fedcba987654321"; // pragma: allowlist secret — synthetic Git commit
 
 function makeDoc(overrides: Record<string, unknown> = {}) {
   // NB: the real GET /documents response exposes NO internal `id` — `uri`/
@@ -73,10 +95,15 @@ beforeEach(() => {
   getDocumentMock.mockReset();
   getVaultInfoMock.mockReset();
   getRelationsMock.mockReset();
+  updateDocumentMock.mockReset();
 
   getDocumentMock.mockResolvedValue(makeDoc());
   getVaultInfoMock.mockResolvedValue({ role: "reader" });
   getRelationsMock.mockResolvedValue({ relations: [] });
+  updateDocumentMock.mockResolvedValue({
+    current_commit: UPDATED_COMMIT,
+    commit_hash: UPDATED_COMMIT,
+  });
 
   // /activity is fetched directly via fetch() — stub it to a no-op.
   vi.stubGlobal(
@@ -98,9 +125,11 @@ describe("DocumentPage view toggle", () => {
     renderAt("/vault/v/doc/notes%2Fhello.md");
     // Body markdown headings are demoted one level (the page title is the sole
     // <h1>), so the body `# BodyHeading` renders as an <h2>.
-    expect(
-      await screen.findByRole("heading", { level: 2, name: "BodyHeading" }),
-    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("heading", { level: 2, name: "BodyHeading" }),
+      ).toBeInTheDocument(),
+    );
     // The raw <pre> should NOT be present.
     expect(screen.queryByTestId("doc-raw")).not.toBeInTheDocument();
   });
@@ -181,5 +210,57 @@ describe("DocumentPage view toggle", () => {
       expect(copy).toHaveTextContent("Copied");
     });
     expect(copy).toHaveAccessibleName(/markdown copied/i);
+  });
+
+  it("returns an edited HEAD-pinned URL to the live document cache", async () => {
+    const user = userEvent.setup();
+    let saved = false;
+    getVaultInfoMock.mockResolvedValue({ role: "owner" });
+    updateDocumentMock.mockImplementation(async () => {
+      saved = true;
+      return {
+        current_commit: UPDATED_COMMIT,
+        commit_hash: UPDATED_COMMIT,
+      };
+    });
+    getDocumentMock.mockImplementation(async () =>
+      makeDoc(
+        saved
+          ? {
+              content: "Updated from pinned HEAD",
+              current_commit: UPDATED_COMMIT,
+            }
+          : {},
+      ),
+    );
+    renderAt(
+      "/vault/v/doc/notes%2Fhello.md?commit=abcdef1234567&view=edit",
+    );
+
+    const editor = await screen.findByRole("textbox", {
+      name: "Document body (markdown)",
+    });
+    await user.clear(editor);
+    await user.type(editor, "Updated from pinned HEAD");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(updateDocumentMock).toHaveBeenCalledWith(
+        "v",
+        "notes/hello.md",
+        { content: "Updated from pinned HEAD" },
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("location-search")).toHaveTextContent(""),
+    );
+    // The optimistic document and the live-query document replace each other
+    // during the URL transition. Re-query the current DOM on each attempt so
+    // the assertion cannot retain a node detached by that handoff.
+    await waitFor(
+      () =>
+        expect(screen.getByText("Updated from pinned HEAD")).toBeInTheDocument(),
+      { timeout: 5_000 },
+    );
   });
 });

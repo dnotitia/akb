@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import threading
 import uuid
 from pathlib import Path
 
@@ -29,7 +30,8 @@ import pytest
 import pytest_asyncio
 from starlette.requests import Request
 
-from app.exceptions import AKBError
+from app.api import file_write_context
+from app.exceptions import AKBError, ConflictError
 from app.repositories import vault_files_repo
 from app.repositories.vault_repo import VaultRepository
 from app.services.file_service import (
@@ -263,7 +265,12 @@ async def pool():
     # `events` (migration 015) and `s3_delete_outbox` (019) are not in
     # init.sql but are part of the confirm/cleanup contract. Idempotent.
     import importlib.util
-    for mig_name in ("015_events_outbox.py", "019_s3_delete_outbox.py"):
+    for mig_name in (
+        "015_events_outbox.py",
+        "019_s3_delete_outbox.py",
+        "067_vault_file_upload_state.py",
+        "068_vault_file_lifecycle_indexes.py",
+    ):
         mig_path = backend_dir / "app" / "db" / "migrations" / mig_name
         spec = importlib.util.spec_from_file_location(mig_name, str(mig_path))
         module = importlib.util.module_from_spec(spec)
@@ -310,6 +317,114 @@ async def _row_count(conn, vault_id) -> int:
     )
 
 
+async def test_file_initiation_losing_a_vault_delete_returns_conflict(
+    pool, vault_id, monkeypatch,
+):
+    """A stale authorized vault id must not surface an FK violation as a 500."""
+    from app.services import file_service as fs
+
+    async with pool.acquire() as conn:
+        vault_name = await conn.fetchval(
+            "SELECT name FROM vaults WHERE id = $1", vault_id,
+        )
+        await conn.execute("DELETE FROM vaults WHERE id = $1", vault_id)
+
+    async def fake_get_pool():
+        return pool
+
+    monkeypatch.setattr(fs, "get_pool", fake_get_pool)
+    monkeypatch.setattr(fs, "measurement_enabled", lambda: False)
+    monkeypatch.setattr(fs.s3_adapter, "ensure_bucket", lambda _bucket: None)
+
+    with pytest.raises(ConflictError):
+        await fs.FileService().initiate_upload(
+            vault_name=vault_name,
+            vault_id=vault_id,
+            collection="",
+            filename="race.bin",
+            actor_id="tester",
+        )
+
+
+async def test_file_initiation_serializes_with_a_concurrent_vault_delete(
+    pool, vault_id, monkeypatch,
+):
+    """The parent lock keeps a winning child transaction free of FK races."""
+    from app.repositories.vault_repo import lock_vault_for_child_write as real_lock
+    from app.services import file_service as fs
+
+    async with pool.acquire() as conn:
+        vault_name = await conn.fetchval(
+            "SELECT name FROM vaults WHERE id = $1", vault_id,
+        )
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated_lock(conn, locked_vault_id):
+        locked = await real_lock(conn, locked_vault_id)
+        entered.set()
+        await release.wait()
+        return locked
+
+    async def fake_get_pool():
+        return pool
+
+    monkeypatch.setattr(fs, "get_pool", fake_get_pool)
+    monkeypatch.setattr(fs, "measurement_enabled", lambda: False)
+    monkeypatch.setattr(fs, "lock_vault_for_child_write", gated_lock)
+    monkeypatch.setattr(fs.s3_adapter, "ensure_bucket", lambda _bucket: None)
+    monkeypatch.setattr(
+        fs.s3_adapter,
+        "presign_put",
+        lambda key, **_kwargs: f"https://storage.invalid/{key}",
+    )
+
+    upload = asyncio.create_task(fs.FileService().initiate_upload(
+        vault_name=vault_name,
+        vault_id=vault_id,
+        collection="",
+        filename="serialized.bin",
+        actor_id="tester",
+    ))
+    await asyncio.wait_for(entered.wait(), 2)
+
+    delete_started = asyncio.Event()
+
+    async def delete_vault():
+        async with pool.acquire() as conn:
+            delete_started.set()
+            return await conn.execute("DELETE FROM vaults WHERE id = $1", vault_id)
+
+    deletion = asyncio.create_task(delete_vault())
+    await asyncio.wait_for(delete_started.wait(), 2)
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 2
+    blocked = False
+    while loop.time() < deadline and not deletion.done():
+        async with pool.acquire() as watch:
+            blocked = bool(await watch.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_stat_activity
+                     WHERE datname = current_database()
+                       AND wait_event_type = 'Lock'
+                       AND query LIKE 'DELETE FROM vaults WHERE id = $1%'
+                )
+                """,
+            ))
+        if blocked:
+            break
+        await asyncio.sleep(0.01)
+
+    assert blocked, "vault deletion did not wait for the child-write parent lock"
+    release.set()
+    result = await asyncio.wait_for(upload, 2)
+    assert result["kind"] == "file"
+    assert await asyncio.wait_for(deletion, 2) == "DELETE 1"
+
+
 async def test_same_bytes_same_name_twice_is_one_row(pool, vault_id):
     key = _s3_key("v", "IS", "page.html", content_hash=_HASH_A)
     async with pool.acquire() as conn:
@@ -318,6 +433,298 @@ async def test_same_bytes_same_name_twice_is_one_row(pool, vault_id):
 
         assert second == first, "the second upload must adopt the first row"
         assert await _row_count(conn, vault_id) == 1
+
+
+async def test_re_adopting_stale_pending_file_wins_gc_race(pool, vault_id):
+    """An adopted upload refreshes its lease before stale-file GC can delete it."""
+    key = _s3_key("v", "IS", "restarted.bin", content_hash=_HASH_A)
+    async with pool.acquire() as conn:
+        original_id = await _put(conn, vault_id, key)
+        await conn.execute(
+            "UPDATE vault_files SET updated_at = NOW() - INTERVAL '2 days' WHERE id = $1",
+            original_id,
+        )
+
+    adopted = asyncio.Event()
+    release = asyncio.Event()
+
+    async def adopter() -> uuid.UUID:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                adopted_id = await _put(conn, vault_id, key)
+                adopted.set()
+                await release.wait()
+                return adopted_id
+
+    async def collector():
+        await adopted.wait()
+        async with pool.acquire() as conn:
+            return await conn.fetchval(
+                """
+                DELETE FROM vault_files
+                 WHERE id = $1
+                   AND upload_state = 'pending'
+                   AND updated_at < NOW() - INTERVAL '24 hours'
+                RETURNING id
+                """,
+                original_id,
+            )
+
+    adopt_task = asyncio.create_task(adopter())
+    collect_task = asyncio.create_task(collector())
+    await adopted.wait()
+    await asyncio.sleep(0.05)
+    assert not collect_task.done()
+    release.set()
+
+    assert await adopt_task == original_id
+    assert await collect_task is None
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM vault_files WHERE id = $1",
+            original_id,
+        ) == 1
+
+
+async def test_stale_delete_intent_skips_a_reused_live_key(
+    pool, vault_id, monkeypatch,
+):
+    """A delayed intent cannot remove bytes after a vault-name/key reuse."""
+    from app.services import s3_delete_worker
+
+    replacement_name = f"_test_recreated_vault_{uuid.uuid4().hex[:8]}"
+    key = _s3_key(
+        replacement_name, "IS", "reused.bin", content_hash=_HASH_A,
+    )
+    replacement_vault_id = await VaultRepository(pool).create(
+        name=replacement_name,
+        description="replacement vault",
+        git_path=f"/tmp/{replacement_name}.git",
+        owner_id=None,
+    )
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM s3_delete_outbox")
+        # A recreated vault has a different UUID but can derive the same key
+        # from its reused name and identical File metadata.
+        await _put(conn, replacement_vault_id, key)
+        await conn.execute(
+            "INSERT INTO s3_delete_outbox (s3_key, next_attempt_at) VALUES ($1, NOW())",
+            key,
+        )
+
+    async def fake_get_pool():
+        return pool
+
+    def unexpected_delete(_key):
+        raise AssertionError("a live metadata reference must cancel stale deletion")
+
+    monkeypatch.setattr(s3_delete_worker, "get_pool", fake_get_pool)
+    monkeypatch.setattr(s3_delete_worker.s3_adapter, "delete", unexpected_delete)
+
+    assert await s3_delete_worker._process_deletes_once() == 1
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM vault_files WHERE vault_id = $1 AND s3_key = $2",
+            replacement_vault_id, key,
+        ) == 1
+        assert await conn.fetchval(
+            "SELECT processed_at IS NOT NULL FROM s3_delete_outbox WHERE s3_key = $1",
+            key,
+        ) is True
+        await conn.execute(
+            "DELETE FROM vaults WHERE id = $1", replacement_vault_id,
+        )
+
+
+async def test_delete_and_key_registration_are_serialized(
+    pool, vault_id, monkeypatch,
+):
+    """A registration that loses the key lock runs only after deletion."""
+    from app.services import s3_delete_worker
+
+    key = _s3_key("v", "IS", "serialized.bin", content_hash=_HASH_A)
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM s3_delete_outbox")
+        await conn.execute(
+            "INSERT INTO s3_delete_outbox (s3_key, next_attempt_at) VALUES ($1, NOW())",
+            key,
+        )
+
+    delete_started = threading.Event()
+    release_delete = threading.Event()
+
+    async def fake_get_pool():
+        return pool
+
+    def controlled_delete(observed_key):
+        assert observed_key == key
+        delete_started.set()
+        assert release_delete.wait(timeout=2)
+
+    async def register_again():
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                return await _put(conn, vault_id, key)
+
+    monkeypatch.setattr(s3_delete_worker, "get_pool", fake_get_pool)
+    monkeypatch.setattr(s3_delete_worker.s3_adapter, "delete", controlled_delete)
+
+    worker_task = asyncio.create_task(s3_delete_worker._process_deletes_once())
+    assert await asyncio.to_thread(delete_started.wait, 2)
+    registration_task = asyncio.create_task(register_again())
+    await asyncio.sleep(0.05)
+    assert not registration_task.done()
+
+    release_delete.set()
+    assert await worker_task == 1
+    registered_id = await registration_task
+
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT id FROM vault_files WHERE vault_id = $1 AND s3_key = $2",
+            vault_id, key,
+        ) == registered_id
+
+
+async def test_file_initiation_does_not_wait_for_same_key_cleanup(
+    pool, vault_id, monkeypatch,
+):
+    """A request chooses a fresh key while cleanup owns the preferred key."""
+    from app.services import file_service as fs
+
+    async with pool.acquire() as conn:
+        vault_name = await conn.fetchval(
+            "SELECT name FROM vaults WHERE id = $1", vault_id,
+        )
+    preferred_key = _s3_key(
+        vault_name, "IS", "nonblocking.bin", content_hash=_HASH_A,
+    )
+
+    async def fake_get_pool():
+        return pool
+
+    monkeypatch.setattr(fs, "get_pool", fake_get_pool)
+    monkeypatch.setattr(fs, "measurement_enabled", lambda: False)
+    monkeypatch.setattr(fs.s3_adapter, "ensure_bucket", lambda _bucket: None)
+    monkeypatch.setattr(
+        fs.s3_adapter,
+        "presign_put",
+        lambda key, **_kwargs: f"https://storage.invalid/{key}",
+    )
+
+    async with pool.acquire() as cleanup_conn:
+        assert await vault_files_repo.try_lock_s3_key_for_cleanup(
+            cleanup_conn, preferred_key,
+        )
+        try:
+            result = await asyncio.wait_for(
+                fs.FileService().initiate_upload(
+                    vault_name=vault_name,
+                    vault_id=vault_id,
+                    collection="IS",
+                    filename="nonblocking.bin",
+                    actor_id="tester",
+                    content_hash=_HASH_A,
+                ),
+                timeout=1,
+            )
+        finally:
+            await vault_files_repo.unlock_s3_key_after_cleanup(
+                cleanup_conn, preferred_key,
+            )
+
+    assert result["s3_key"] != preferred_key
+    assert result["s3_key"].endswith("_nonblocking.bin")
+
+
+async def test_unprocessed_delete_intent_is_a_durable_key_barrier(
+    pool, vault_id,
+):
+    """A lost cleanup connection cannot make its old key reusable too soon."""
+    key = _s3_key("v", "IS", "barrier.bin", content_hash=_HASH_A)
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM s3_delete_outbox")
+        outbox_id = await conn.fetchval(
+            """
+            INSERT INTO s3_delete_outbox (s3_key, next_attempt_at)
+            VALUES ($1, NOW())
+            RETURNING id
+            """,
+            key,
+        )
+
+        async with conn.transaction():
+            assert not await vault_files_repo.s3_key_available_for_registration(
+                conn, vault_id=vault_id, s3_key=key,
+            )
+
+        await conn.execute(
+            "UPDATE s3_delete_outbox SET processed_at = NOW() WHERE id = $1",
+            outbox_id,
+        )
+        async with conn.transaction():
+            assert await vault_files_repo.s3_key_available_for_registration(
+                conn, vault_id=vault_id, s3_key=key,
+            )
+
+
+async def test_s3_key_probes_have_dedicated_indexes(pool):
+    backend_dir = Path(__file__).resolve().parents[1]
+    migration_path = (
+        backend_dir
+        / "app"
+        / "db"
+        / "migrations"
+        / "070_vault_files_s3_key_lookup.py"
+    )
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("migration_067", migration_path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    async with pool.acquire() as conn:
+        await migration.migrate(conn)
+        index_defs = await conn.fetch(
+            """
+            SELECT indexname, indexdef
+              FROM pg_indexes
+             WHERE schemaname = current_schema()
+               AND indexname = ANY($1::text[])
+            """,
+            ["idx_vault_files_s3_key", "idx_s3_delete_pending_key"],
+        )
+
+    by_name = {row["indexname"]: row["indexdef"] for row in index_defs}
+    assert "(s3_key)" in by_name["idx_vault_files_s3_key"]
+    assert "(s3_key)" in by_name["idx_s3_delete_pending_key"]
+    assert "processed_at IS NULL" in by_name["idx_s3_delete_pending_key"]
+
+
+async def test_legacy_confirm_write_advances_pending_upload_state(pool, vault_id):
+    """An older pod only sets hash_verified_at; the migration trigger keeps a
+    rolling deployment from leaving that successfully uploaded File hidden."""
+    file_id = uuid.uuid4()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO vault_files (id, vault_id, name, s3_key)
+            VALUES ($1, $2, 'legacy.txt', $3)
+            """,
+            file_id,
+            vault_id,
+            f"legacy/{file_id}",
+        )
+        assert await conn.fetchval(
+            "SELECT upload_state FROM vault_files WHERE id = $1", file_id,
+        ) == "pending"
+
+        # This is the confirmation statement issued by pre-064 code.
+        await conn.execute(
+            "UPDATE vault_files SET hash_verified_at = NOW() WHERE id = $1",
+            file_id,
+        )
+        assert await conn.fetchval(
+            "SELECT upload_state FROM vault_files WHERE id = $1", file_id,
+        ) == "confirmed"
 
 
 async def test_different_bytes_same_name_is_two_rows(pool, vault_id):
@@ -447,12 +854,18 @@ async def test_confirm_certifies_bytes_that_match_the_key_they_are_under(
     key = _s3_key("v", "IS", "page.html", content_hash=_HASH_A)
     async with pool.acquire() as conn:
         file_id = await _put(conn, vault_id, key)
+        assert await conn.fetchval(
+            "SELECT upload_state FROM vault_files WHERE id = $1", file_id,
+        ) == "pending"
 
     result = await confirmable(vault_id, file_id, key, _BYTES_A)
 
     assert result["content_hash"] == _HASH_A
     async with pool.acquire() as conn:
         assert await _row_count(conn, vault_id) == 1
+        assert await conn.fetchval(
+            "SELECT upload_state FROM vault_files WHERE id = $1", file_id,
+        ) == "confirmed"
 
 
 async def test_confirm_rejects_bytes_stored_under_another_content_key(
@@ -489,6 +902,77 @@ async def test_confirm_on_a_legacy_key_is_unchanged(pool, vault_id, confirmable)
     assert result["content_hash"] == _HASH_B
 
 
+async def test_confirmation_lease_refreshes_pending_file_gc_deadline(pool, vault_id):
+    key = _s3_key("v", "IS", "leased.bin")
+    async with pool.acquire() as conn:
+        file_id = await _put(conn, vault_id, key)
+        await conn.execute(
+            "UPDATE vault_files SET updated_at = NOW() - INTERVAL '2 days' WHERE id = $1",
+            file_id,
+        )
+        before = await conn.fetchval(
+            "SELECT updated_at FROM vault_files WHERE id = $1", file_id,
+        )
+        row = await vault_files_repo.lease_file_upload_confirmation(
+            conn, vault_id, file_id,
+        )
+
+    assert row is not None
+    assert row["upload_state"] == "pending"
+    assert row["updated_at"] > before
+
+
+async def test_confirmation_lease_wins_stale_gc_race(pool, vault_id):
+    key = _s3_key("v", "IS", "racing.bin")
+    async with pool.acquire() as conn:
+        file_id = await _put(conn, vault_id, key)
+        await conn.execute(
+            "UPDATE vault_files SET updated_at = NOW() - INTERVAL '2 days' WHERE id = $1",
+            file_id,
+        )
+
+    leased = asyncio.Event()
+    release = asyncio.Event()
+
+    async def confirmer():
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                row = await vault_files_repo.lease_file_upload_confirmation(
+                    conn, vault_id, file_id,
+                )
+                assert row is not None
+                leased.set()
+                await release.wait()
+
+    async def collector():
+        await leased.wait()
+        async with pool.acquire() as conn:
+            return await conn.fetchval(
+                """
+                DELETE FROM vault_files
+                 WHERE id = $1
+                   AND upload_state = 'pending'
+                   AND updated_at < NOW() - INTERVAL '24 hours'
+                RETURNING id
+                """,
+                file_id,
+            )
+
+    confirm_task = asyncio.create_task(confirmer())
+    collect_task = asyncio.create_task(collector())
+    await leased.wait()
+    await asyncio.sleep(0.05)
+    assert not collect_task.done()
+    release.set()
+
+    await confirm_task
+    assert await collect_task is None
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT upload_state FROM vault_files WHERE id = $1", file_id,
+        ) == "pending"
+
+
 async def test_confirm_still_rejects_a_mismatched_client_hash(
     pool, vault_id, confirmable,
 ):
@@ -520,7 +1004,7 @@ async def test_upload_route_forwards_content_hash_and_defaults_it_off(monkeypatc
         seen.append(kwargs)
         return {"uri": "akb://team/file/f-1"}
 
-    monkeypatch.setattr(files, "check_vault_access", _access)
+    monkeypatch.setattr(file_write_context, "check_vault_access", _access)
     monkeypatch.setattr(files.file_service, "initiate_upload", _initiate)
 
     async def _call(**overrides):

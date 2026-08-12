@@ -7,7 +7,7 @@ import uuid
 
 import pytest
 
-from app.exceptions import ConflictError
+from app.exceptions import ConflictError, NotFoundError
 from app.services import file_service as fs
 
 
@@ -52,12 +52,19 @@ class _Pool:
         return _Context(self.conn)
 
 
-def _row(*, content_hash=_OLD_HASH, etag="etag-old", s3_key="team/original.bin"):
+def _row(
+    *,
+    content_hash=_OLD_HASH,
+    etag="etag-old",
+    s3_key="team/original.bin",
+    kind="file",
+):
     return {
         "id": uuid.UUID("11111111-2222-3333-4444-555555555555"),
         "vault_id": uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
         "collection_id": None,
         "collection": "proof",
+        "kind": kind,
         "name": "original.bin",
         "s3_key": s3_key,
         "mime_type": "application/octet-stream",
@@ -104,6 +111,50 @@ async def test_initiate_replace_rejects_stale_hash_before_issuing_upload(monkeyp
             expected_content_hash="0" * 64,
         )
     assert exc.value.status_code == 409
+
+
+async def test_replace_routes_do_not_treat_document_images_as_files(monkeypatch):
+    service, _pool = await _service(monkeypatch)
+
+    async def _find(*_args):
+        return _row(kind="attachment")
+
+    async def _discard(*_args):
+        return None
+
+    monkeypatch.setattr(fs.vault_files_repo, "find_by_id", _find)
+    monkeypatch.setattr(fs, "_discard_replacement_objects", _discard)
+    monkeypatch.setattr(
+        fs.s3_adapter,
+        "presign_put",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a document image must not receive a File replacement URL"
+        ),
+    )
+    monkeypatch.setattr(
+        fs.s3_adapter,
+        "copy",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a document image must not reach object replacement"
+        ),
+    )
+
+    with pytest.raises(NotFoundError):
+        await service.initiate_replace(
+            "team",
+            _row()["vault_id"],
+            str(_row()["id"]),
+            content_hash=_NEW_HASH,
+        )
+    with pytest.raises(NotFoundError):
+        await service.confirm_replace(
+            "team",
+            _row()["vault_id"],
+            str(_row()["id"]),
+            str(uuid.uuid4()),
+            actor_id="tester",
+            content_hash=_NEW_HASH,
+        )
 
 
 async def test_initiate_replace_rejects_stale_version(monkeypatch):

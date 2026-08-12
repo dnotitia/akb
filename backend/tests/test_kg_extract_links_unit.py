@@ -8,7 +8,16 @@ previously became dangling `links_to` edges (ghost graph nodes).
 """
 from __future__ import annotations
 
-from app.services.kg_service import extract_markdown_links, strip_code_spans
+import uuid
+
+import pytest
+
+from app.services.kg_service import (
+    extract_markdown_links,
+    normalize_document_link_ref,
+    store_document_relations,
+    strip_code_spans,
+)
 
 
 def test_inline_code_uri_is_not_extracted():
@@ -39,6 +48,101 @@ def test_real_prose_links_are_still_extracted():
     out = extract_markdown_links(content)
     assert "specs/api.md" in out
     assert "akb://v/coll/notes/doc/intro.md" in out
+
+
+def test_generated_image_asset_is_not_a_document_relation():
+    content = (
+        "![diagram](/api/assets/6d04dc8a-0302-4a85-a314-e7485ff5a610)\n\n"
+        "[design notes](./design.md)"
+    )
+    assert extract_markdown_links(content) == ["design.md"]
+
+
+def test_generated_image_asset_case_variants_are_not_document_relations():
+    asset_id = "6D04DC8A-0302-4A85-A314-E7485FF5A610"
+    content = (
+        f"![diagram](/API/ASSETS/{asset_id})\n\n"
+        "[design notes](./design.md)"
+    )
+
+    assert extract_markdown_links(content) == ["design.md"]
+
+
+def test_relative_image_target_remains_a_document_relation():
+    assert extract_markdown_links("![diagram](./design/architecture.md)") == [
+        "design/architecture.md"
+    ]
+
+
+def test_parent_relative_link_is_normalized_to_a_vault_relative_ref():
+    assert extract_markdown_links("[shared](../shared/spec.md)") == [
+        "shared/spec.md"
+    ]
+
+
+def test_document_link_prefix_matrix_is_explicit_and_preserves_dotfiles():
+    assert normalize_document_link_ref("./design/spec.md") == "design/spec.md"
+    assert normalize_document_link_ref("../shared/spec.md") == "shared/spec.md"
+    assert normalize_document_link_ref("../../shared/spec.md") == "shared/spec.md"
+    assert normalize_document_link_ref("/root/spec.md") == "root/spec.md"
+    assert normalize_document_link_ref(".well-known.md") == ".well-known.md"
+    assert normalize_document_link_ref("...draft.md") == "...draft.md"
+
+
+@pytest.mark.asyncio
+async def test_parent_and_root_relative_edges_are_recreated_on_document_update():
+    """A document rewrite replaces, rather than loses, its implicit links."""
+    vault_id = uuid.uuid4()
+    target_ids = {
+        "shared/spec.md": uuid.uuid4(),
+        "root/overview.md": uuid.uuid4(),
+    }
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.deleted_sources: list[str] = []
+            self.inserted_targets: list[str] = []
+
+        async def execute(self, query: str, *args):
+            if query.startswith("DELETE FROM edges"):
+                self.deleted_sources.append(args[0])
+            elif "INSERT INTO edges" in query:
+                self.inserted_targets.append(args[3])
+            return "OK"
+
+        async def fetchrow(self, _query: str, _vault_id, ref: str):
+            target_id = target_ids.get(ref)
+            return {"id": target_id} if target_id else None
+
+        async def fetchval(self, query: str, target_id):
+            if query.startswith("SELECT path FROM documents"):
+                return next(
+                    path for path, document_id in target_ids.items()
+                    if document_id == target_id
+                )
+            return None
+
+    conn = FakeConnection()
+    body = "[shared](../shared/spec.md) and [root](/root/overview.md)"
+
+    for _ in range(2):
+        stored = await store_document_relations(
+            conn,
+            vault_id,
+            "weekly",
+            "notes/current.md",
+            [],
+            [],
+            [],
+            body,
+        )
+        assert stored == 2
+
+    assert len(conn.deleted_sources) == 2
+    assert conn.inserted_targets == [
+        "akb://weekly/coll/shared/doc/spec.md",
+        "akb://weekly/coll/root/doc/overview.md",
+    ] * 2
 
 
 def test_strip_code_spans_removes_code_keeps_prose():

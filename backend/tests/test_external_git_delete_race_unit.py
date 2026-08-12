@@ -35,6 +35,7 @@ class _FakeState:
         # (resource_uri, vault_id) per publication DELETE, recorded only when
         # it ran on THIS connection inside the transaction — see _FakeConn.fetch.
         self.publication_deletes: list[tuple] = []
+        self.lock_order: list[str] = []
 
 
 class _FakeConn:
@@ -63,12 +64,17 @@ class _FakeConn:
         if "FOR UPDATE" in s:
             # The lock/read MUST happen inside the transaction, not before it.
             assert self._in_tx[0], "FOR UPDATE lookup ran OUTSIDE the transaction"
+            self.state.lock_order.append("document")
             self.state.select_sqls.append(s)
             return dict(self.state.row) if self.state.row else None
         raise AssertionError(f"unexpected fetchrow SQL: {s}")
 
     async def fetchval(self, sql, *args):
         s = " ".join(sql.split())
+        if s == "SELECT id FROM vaults WHERE id = $1 FOR KEY SHARE":
+            assert self._in_tx[0], "vault lifecycle lock ran OUTSIDE the transaction"
+            self.state.lock_order.append("vault")
+            return args[0]
         if s.startswith("DELETE FROM documents") and "RETURNING" in s:
             assert self._in_tx[0]
             row_id = args[0]
@@ -196,6 +202,7 @@ async def test_delete_external_path_normal_single_delete(monkeypatch):
     assert state.relation_deletes == [("v", "a.md")]
     assert state.decrements == [row["collection_id"]]
     assert state.events == ["document.delete"]
+    assert state.lock_order[:2] == ["vault", "document"]
     assert state.select_sqls and all("FOR UPDATE" in s for s in state.select_sqls)
     # The publication cascade is app-level since migration 022 dropped
     # `publications.document_id`: without it the mirrored path's slug outlives

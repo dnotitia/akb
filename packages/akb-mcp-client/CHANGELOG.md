@@ -1,11 +1,42 @@
 # Changelog
 
-## 2.2.0 — conflict-safe in-place file replacement
+## 2.2.0 — inline document images and conflict-safe file replacement
 
-Adds the proxy-only `akb_update_file` tool. It preserves the existing file URI
-while replacing its bytes and accepts optional `expected_content_hash` and
-`expected_version` optimistic-concurrency pins. A stale pin returns HTTP 409,
-matching the document update contract.
+Adds two proxy-local tools for agent-authored document images:
+
+- **`akb_put_image`** reads a local PNG, JPEG, GIF, or WebP (maximum
+  10 MiB), uploads it through AKB's authenticated image endpoint, and returns
+  both the stable `/api/assets/{uuid}` URL and a ready-to-paste Markdown image
+  expression. Agents place that expression at the intended position with
+  `akb_put`, `akb_update`, or a targeted `akb_edit`.
+- **`akb_discard_image`** removes an upload that never reached a document
+  commit. Repeating a completed cleanup is idempotent; an active or already
+  claimed image reports that no deletion occurred, while the backend retains
+  claimed bytes under the document lifecycle. AKB derives access from current
+  document references and retains removed or deleted references for a bounded
+  Git-revision window before GC.
+
+Document images are deliberately separate from `akb_put_file`: they stay out
+of File browse/search/publication surfaces, inherit the document/vault access
+model, and are decoded and validated by the backend before becoming usable.
+The proxy still has zero runtime dependencies and never receives object-store
+credentials or a presigned URL for this path.
+
+The proxy-local MCP `initialize` response advertises the inline-image workflow.
+Backend guidance is capability-conditional, so direct MCP connections and
+older proxies are not instructed to call tools absent from their tool list.
+
+`akb_put_image` requires the corresponding backend image endpoint. During a
+split backend/proxy rollout, deploy and verify the backend first, then publish
+or install `akb-mcp` 2.2.0. Publishing the proxy first would expose the local
+tool while an older backend can only reject its upload request. Existing MCP
+processes must be restarted (or otherwise re-resolved) to load the new npm
+version and tool list.
+
+This release also adds the proxy-only `akb_update_file` tool. It preserves the
+existing file URI while replacing its bytes and accepts optional
+`expected_content_hash` and `expected_version` optimistic-concurrency pins. A
+stale pin returns HTTP 409, matching the document update contract.
 
 Replacement bytes upload to an isolated staging object. Confirmation copies
 them to a fresh, non-presigned object and rechecks both pins while holding the

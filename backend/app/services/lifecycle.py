@@ -11,13 +11,16 @@ import logging
 
 from app.config import settings
 from app.db.postgres import close_pool, get_pool, init_db
-from app.services import audit_log, app_rollout_worker, delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, m1_file_transfer_reaper, metadata_worker, s3_delete_worker, sparse_encoder, tool_usage, vault_backfill, write_lane
+from app.services import asset_gc_worker, audit_log, app_rollout_worker, delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, m1_file_transfer_reaper, metadata_worker, s3_delete_worker, sparse_encoder, tool_usage, vault_backfill, write_lane
 from app.services.git_service import GitService
 from app.services.native_revision_authority import (
     pre_migration_revision_authority_guard,
     startup_revision_authority_preflight,
 )
-from app.services.revision_backend import canonical_document_revision_backend
+from app.services.revision_backend import (
+    canonical_document_revision_backend,
+    selected_document_revision_backend,
+)
 from app.services.role_sync import RoleSync, get_role_sync, set_role_sync
 from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
 from app.services.vector_store import get_vector_store
@@ -97,7 +100,7 @@ async def init_storage() -> None:
     # Self-heal: clear stale git index.lock files left behind by a
     # crashed prior process. Without this, the affected vault's writes
     # fail silently until an operator removes the lock by hand.
-    if settings.document_revision_backend != "postgres_native":
+    if selected_document_revision_backend() == "bare_git":
         try:
             cleared = GitService().cleanup_stale_locks()
             if cleared:
@@ -148,11 +151,11 @@ def start_workers() -> None:
         logger.debug("app_rollout_worker deferred: no running event loop")
     else:
         app_rollout_worker.start()
-    # external-git kill-switch: the mirror poller must not run when the feature is
-    # off (no claim, no outbound). Gated so a disabled deployment
-    # starts zero mirror I/O; the read paths refuse mirror reads and the marker
-    # backfill (fail-closed safety net) still runs unconditionally at startup.
-    if settings.external_git_enabled:
+    # External-Git mirrors are a Bare-Git subsystem. The feature kill-switch
+    # still gates it within that mode, while PostgreSQL Native composes no
+    # mirror poller because its vault storage has no Git write authority.
+    bare_git_selected = selected_document_revision_backend() == "bare_git"
+    if bare_git_selected and settings.external_git_enabled:
         external_git_poller.start()
     # Auto-backfill vault_id onto pre-upgrade pgvector points (issue #189
     # Phase 2). Non-blocking; search self-activates the vault path once it
@@ -177,7 +180,7 @@ def start_workers() -> None:
     # READS out of asyncio.to_thread's shared default executor.
     write_lane.start_commit_pool()
     started = ["tokenizer_pool", "git_commit_pool", "embed_worker", "delete_worker", "app_rollout_worker", "bm25_stats_refresher", "vault_backfill"]
-    if settings.external_git_enabled:
+    if bare_git_selected and settings.external_git_enabled:
         started.append("external_git_poller")
     if m1_file_transfer_reaper.enabled():
         m1_file_transfer_reaper.start()
@@ -186,7 +189,9 @@ def start_workers() -> None:
     # makes sense when S3 is configured; otherwise file uploads are
     # disabled altogether and the outbox stays empty forever.
     if settings.s3_endpoint_url:
+        asset_gc_worker.start()
         s3_delete_worker.start()
+        started.append("asset_gc_worker")
         started.append("s3_delete_worker")
     else:
         logger.info("s3_delete_worker disabled (S3 not configured)")
@@ -196,7 +201,11 @@ def start_workers() -> None:
     # can produce work and it must issue zero LLM outbound. It is also the only
     # LLM consumer in the request-independent path, so it still stays off when
     # LLM isn't configured (no retry/abandon noise for OSS users without a key).
-    if not settings.external_git_enabled:
+    if not bare_git_selected:
+        logger.info(
+            "metadata_worker disabled (document revision backend is not Bare Git)"
+        )
+    elif not settings.external_git_enabled:
         logger.info(
             "metadata_worker disabled (external_git_enabled=false; it only "
             "fills metadata on external_git mirror imports)"
@@ -257,6 +266,9 @@ async def stop_workers() -> None:
     await events_publisher.stop()
     await metadata_worker.stop()
     await external_git_poller.stop()
+    # Stop producers before the S3 outbox consumer so shutdown cannot leave a
+    # freshly-enqueued object waiting solely because the consumer exited first.
+    await asset_gc_worker.stop()
     await s3_delete_worker.stop()
     await app_rollout_worker.stop()
     await delete_worker.stop()

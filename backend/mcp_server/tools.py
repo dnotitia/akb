@@ -183,7 +183,12 @@ TOOLS = [
     ),
     Tool(
         name="akb_update",
-        description="Update an existing document. Only provide fields you want to change.",
+        description=(
+            "Update an existing document. Only provide fields you want to change. "
+            "The `content` field replaces the complete Markdown body; never pass a "
+            "partial fragment such as a newly uploaded image. Use a targeted "
+            "akb_edit for inline insertion or replacement."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -214,7 +219,9 @@ TOOLS = [
             "Edit a single document by replacing exact text. Scope is one document. "
             "old_string must be unique within the document (or use replace_all). "
             "If old_string is not found or appears multiple times, the call fails with a clear error. "
-            "For find-and-replace across many documents, use akb_grep with replace instead."
+            "Use this for inserting, replacing, or removing an inline image without "
+            "resending the complete document body. For find-and-replace across many "
+            "documents, use akb_grep with replace instead."
         ),
         inputSchema={
             "type": "object",

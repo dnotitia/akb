@@ -299,3 +299,20 @@ def test_chokepoint_locks_before_it_cleans_up():
         "order must be FOR UPDATE → publication cleanup → DELETE FROM documents "
         f"(got lock@{lock}, cleanup@{cleanup}, delete@{row_delete})"
     )
+
+
+def test_chokepoint_retains_current_images_from_the_locked_row():
+    """Collection deletion may hold a stale pre-move document snapshot.
+
+    Image revision retention therefore belongs after the chokepoint's row lock,
+    beside publication cleanup, and before the live-ref FK cascade caused by
+    deleting the document.
+    """
+    body = _chokepoint_body()
+    lock = body.find("FOR UPDATE")
+    retain = body.find("retain_document_assets_for_delete(")
+    row_delete = body.find("DELETE FROM documents")
+    assert lock < retain < row_delete, (
+        "order must be FOR UPDATE → image retention → DELETE FROM documents "
+        f"(got lock@{lock}, retain@{retain}, delete@{row_delete})"
+    )

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import zipfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -64,3 +65,41 @@ class TestFormatRegistry:
 
     def test_okf_supported(self):
         assert knowledge_io._require_format("okf") == "okf"
+
+
+@pytest.mark.asyncio
+async def test_import_preserves_source_vault_image_urls_as_placeholders(monkeypatch):
+    asset_id = "6d04dc8a-0302-4a85-a314-e7485ff5a610"
+    monkeypatch.setattr(
+        knowledge_io.okf,
+        "parse_okf_bundle",
+        lambda _files: [{
+            "collection": "notes",
+            "slug": "weekly",
+            "title": "Weekly",
+            "content": f"![source image](/api/assets/{asset_id})",
+            "type": "note",
+            "status": "active",
+            "tags": [],
+            "summary": None,
+            "domain": None,
+            "path": "notes/weekly.md",
+        }],
+    )
+
+    class _Documents:
+        async def put(self, request, agent_id=None, **kwargs):
+            assert request.vault == "target"
+            assert agent_id == "importer"
+            assert kwargs == {"allow_unavailable_asset_refs": True}
+            return SimpleNamespace(uri="akb://target/doc/notes/weekly.md")
+
+    result = await knowledge_io.import_bundle(
+        "target",
+        {"notes/weekly.md": "ignored by parser fake"},
+        actor_id="importer",
+        doc_service=_Documents(),
+    )
+
+    assert result["created"] == 1
+    assert result["failed"] == 0

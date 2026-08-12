@@ -239,7 +239,15 @@ async def _apply_migrations() -> None:
         "060_native_revision_migration_bridge.py",  # additive C9 migration runs, observations, and retained legacy selector mappings
         "061_native_revision_authority.py",       # explicit new-database Native authority claim/pending/marker records
         "062_app_rollout.py",                    # durable app release rollout job/target/step ledger
-        "063_app_rollout_resume.py",             # immutable-source new-attempt rollout resume ledger
+        "063_document_image_assets.py",  # vault_files.kind separates hidden editor attachments from standalone Files
+        "064_document_image_asset_lifecycle.py",  # first-claim marker; 065 adds bounded live/revision reference lifecycle
+        "065_document_image_asset_references.py",  # live document refs + bounded Git-revision manifests for attachment ACL/GC
+        "066_document_image_asset_gc_index.py",  # retain_until-first index for bounded expired-manifest collection
+        "067_vault_file_upload_state.py",  # distinguish pending uploads from hashless legacy confirmed Files
+        "068_vault_file_lifecycle_indexes.py",  # indexed attachment health counts + stale pending File collection
+        "069_document_asset_revision_lock_order.py",  # remove redundant vault FK so manifest writes keep vault→asset lock order
+        "070_vault_files_s3_key_lookup.py",  # physical-key reachability + pending-delete barrier indexes
+        "071_app_rollout_resume.py",  # immutable-source new-attempt rollout resume ledger
     ):
         if filename in applied:
             continue
