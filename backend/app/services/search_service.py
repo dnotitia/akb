@@ -1126,7 +1126,8 @@ class SearchService:
             or document_source != NATIVE_DOCUMENT_SOURCE
         ):
             raise ValidationError(
-                "measurement_include_text_files requires the legacy native measurement selector"
+                "measurement_include_text_files requires the guarded native measurement "
+                "backend (native_ledger_m1)"
             )
         if document_source == NATIVE_DOCUMENT_SOURCE:
             from app.services.m1_native_grep_service import M1NativeGrepService
