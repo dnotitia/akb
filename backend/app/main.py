@@ -18,6 +18,7 @@ from app.api.routes import (
     activity,
     app_inventory,
     app_installations,
+    app_rollouts,
     agent_sessions,
     app_identity,
     auth,
@@ -267,6 +268,8 @@ async def _no_store_public_surfaces(request: Request, call_next):
             break
     if (
         path.startswith("/api/v1/app/installations/")
+        or path.startswith("/api/v1/app/rollouts")
+        or (path.startswith("/api/v1/apps/") and "/rollouts" in path)
         or (
             path.startswith("/api/v1/apps/")
             and "/installations/" in path
@@ -281,6 +284,7 @@ app.include_router(auth.router, prefix="/api/v1", tags=["auth"])
 app.include_router(app_identity.router, prefix="/api/v1", tags=["app-identity"])
 app.include_router(app_inventory.router, prefix="/api/v1", tags=["app-inventory"])
 app.include_router(app_installations.router, prefix="/api/v1", tags=["app-installations"])
+app.include_router(app_rollouts.router, prefix="/api/v1", tags=["app-rollouts"])
 app.include_router(access.router, prefix="/api/v1", tags=["access"])
 app.include_router(documents.router, prefix="/api/v1", tags=["documents"])
 app.include_router(search.router, prefix="/api/v1", tags=["search"])

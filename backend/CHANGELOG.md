@@ -18,6 +18,27 @@ turns that record into an immutable durable marker. Existing or merely empty
 legacy databases are rejected, and no existing tenant is converted by config.
 Readiness reports the canonical selected backend.
 
+### Added immutable app release reconciliation and staged rollout
+
+Added a database-backed rollout request ledger with UUID idempotency, sealed
+snapshot membership, manifest v1 checksum validation, whole-snapshot preflight,
+canary-first then sequential ten-target batches, bounded backfill checkpoints,
+lease fencing, replay/resume, redacted status, and monotonic installation/
+observed-state convergence. Added admin and self-app request/status routes,
+worker lifecycle registration, migration 062, and the repository-owned
+`app-release-rollout` E2E fixture scenario.
+The fixture now gives each advertised app its own valid release transition and
+owned installation coordinates for generic multi-app isolation checks.
+
+### Fixed repository-owned E2E reset and restart lifecycle
+
+Reset now serializes with generic backend restart requests and the runtime
+supervisor ignores exits from processes replaced during reset, so the app and
+fixture return to ready state without a stale lifecycle task stopping the new
+backend.
+
+### Added PostgreSQL Native logical-revision and bounded history safeguards
+
 Public logical-revision reads now preserve the existing 7–40 character
 selector contract in PostgreSQL Native mode: short selectors resolve only
 when unique within the addressed Document, while unknown, cross-Document, and
