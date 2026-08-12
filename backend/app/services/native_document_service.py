@@ -34,6 +34,7 @@ from app.services.document_service import (
     DocumentService,
     _body_content_hash,
     _build_frontmatter,
+    build_vault_skill_seed_request,
     _certified_content_hash,
     _compose_markdown,
     _parse_markdown,
@@ -727,6 +728,43 @@ class NativeDocumentService(DocumentService):
         ]
         return {"uri": doc_uri(vault, resource["current_path"]), "history": history}
 
+    async def _seed_native_vault_skill(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        vault_id: uuid.UUID,
+        vault_name: str,
+        owner_id: uuid.UUID | None,
+    ) -> None:
+        """Publish the canonical vault skill inside the vault-create TX."""
+        request = build_vault_skill_seed_request(vault_name)
+        now = datetime.now(UTC)
+        frontmatter = _build_frontmatter(request, now)
+        if owner_id is not None:
+            frontmatter["created_by"] = str(owner_id)
+        raw = _compose_markdown(frontmatter, request.content)
+        path = doc_path(
+            normalize_collection_path(request.collection),
+            slugify(request.slug or request.title),
+        )
+        actor = str(owner_id) if owner_id is not None else "unknown"
+        await (await self._native()).create_text_in_conn(
+            conn,
+            namespace_id=vault_id,
+            surface="document",
+            path=path,
+            payload=raw,
+            actor=actor,
+            mutation_id=uuid.uuid4(),
+            resource_id=uuid.uuid4(),
+            message=(
+                f"[put] {path}\n\nagent: {actor}\naction: create\n"
+                f"summary: {request.title}"
+            ),
+            subject=f"[put] {path}",
+            summary=request.title,
+        )
+
     @staticmethod
     def _unsupported(surface: str) -> NoReturn:
         raise NativeRevisionUnsupportedSurfaceError(surface)
@@ -1008,6 +1046,12 @@ class NativeDocumentService(DocumentService):
                     await role_sync.on_vault_create_in_conn(conn, vault_id, uid)
                     await role_sync.on_public_access_change_in_conn(
                         conn, vault_id, public_access,
+                    )
+                    await self._seed_native_vault_skill(
+                        conn,
+                        vault_id=vault_id,
+                        vault_name=name,
+                        owner_id=uid,
                     )
         except asyncpg.UniqueViolationError as exc:
             if exc.constraint_name == "vaults_name_key":
