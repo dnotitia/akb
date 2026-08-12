@@ -18,6 +18,13 @@ turns that record into an immutable durable marker. Existing or merely empty
 legacy databases are rejected, and no existing tenant is converted by config.
 Readiness reports the canonical selected backend.
 
+Public logical-revision reads now preserve the existing 7–40 character
+selector contract in PostgreSQL Native mode: short selectors resolve only
+when unique within the addressed Document, while unknown, cross-Document, and
+ambiguous selectors fail explicitly. Bare Git historical get, history, and
+diff also follow a Document across a move when addressed through its current
+URI, without changing the default backend or external-mirror history path.
+
 ### Fixed scoped grep replacement completeness and recovery
 
 `akb_grep(replace=...)` now treats `limit` only as a response-preview bound and

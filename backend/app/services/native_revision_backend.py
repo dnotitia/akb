@@ -259,7 +259,7 @@ class NativeRevisionBackend:
         version: str,
     ) -> tuple[dict[str, Any], str] | None:
         current = await self.document_service.get(vault, doc_ref)
-        if len(version) != 40 or any(ch not in "0123456789abcdef" for ch in version):
+        if not 7 <= len(version) <= 40 or any(ch not in "0123456789abcdef" for ch in version):
             return None
         try:
             vault_id = await self._vault_id(vault)

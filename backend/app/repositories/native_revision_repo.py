@@ -26,6 +26,14 @@ class NativeResourceReferenceAmbiguousError(ConflictError):
         self.code = "native_resource_reference_ambiguous"
 
 
+class NativeRevisionSelectorAmbiguousError(ConflictError):
+    """A revision selector names more than one Revision on one Resource."""
+
+    def __init__(self, selector: str):
+        super().__init__(f"Native Revision selector is ambiguous: {selector}")
+        self.code = "native_revision_selector_ambiguous"
+
+
 class PreparedPayload(Protocol):
     @property
     def payload_id(self) -> uuid.UUID: ...
@@ -663,7 +671,13 @@ class NativeRevisionRepository:
         revision_id: str,
         conn: asyncpg.Connection | None = None,
     ) -> dict | None:
-        sql = """
+        if len(revision_id) == 40 and all(ch in "0123456789abcdef" for ch in revision_id):
+            selector_sql = "rv.revision_id = $2"
+        elif 7 <= len(revision_id) < 40 and all(ch in "0123456789abcdef" for ch in revision_id):
+            selector_sql = "rv.revision_id LIKE $2 || '%'"
+        else:
+            return None
+        sql = f"""
             SELECT rv.*, rs.surface, rs.content_profile,
                    rs.created_at AS resource_created_at,
                    rs.updated_at AS resource_updated_at,
@@ -674,14 +688,17 @@ class NativeRevisionRepository:
               JOIN native_resources rs ON rs.resource_id = rv.resource_id
               LEFT JOIN native_payload_manifests pm
                 ON pm.payload_manifest_id = rv.payload_manifest_id
-             WHERE rv.resource_id = $1 AND rv.revision_id = $2
+             WHERE rv.resource_id = $1 AND {selector_sql}
+             LIMIT 2
         """
         if conn is not None:
-            row = await conn.fetchrow(sql, resource_id, revision_id)
+            rows = await conn.fetch(sql, resource_id, revision_id)
         else:
             async with self.pool.acquire() as acquired:
-                row = await acquired.fetchrow(sql, resource_id, revision_id)
-        return dict(row) if row is not None else None
+                rows = await acquired.fetch(sql, resource_id, revision_id)
+        if len(rows) > 1:
+            raise NativeRevisionSelectorAmbiguousError(revision_id)
+        return dict(rows[0]) if rows else None
 
     async def list_history(
         self,

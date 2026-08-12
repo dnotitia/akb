@@ -1013,7 +1013,97 @@ class GitService:
             blob = ref.tree / file_path
             return blob.data_stream.read().decode("utf-8")
         except (KeyError, TypeError):
+            if commit is None:
+                return None
+            historical_path = self.path_at_revision(vault_name, file_path, commit)
+            if historical_path and historical_path != file_path:
+                try:
+                    blob = ref.tree / historical_path
+                    return blob.data_stream.read().decode("utf-8")
+                except (KeyError, TypeError):
+                    pass
             return None
+
+    @staticmethod
+    def _parse_follow_path_log(output: str) -> list[dict]:
+        """Parse ``git log --follow --name-status`` into revision/path pairs."""
+        history: list[dict] = []
+        active: dict | None = None
+
+        def flush() -> None:
+            if active is not None and active.get("path_at_revision"):
+                history.append(active.copy())
+
+        for line in str(output).splitlines():
+            if "\x00" in line:
+                flush()
+                oid, epoch, *_ = line.split("\x00")
+                if not re.fullmatch(r"[0-9a-f]{40}", oid):
+                    active = None
+                    continue
+                try:
+                    committed_at = datetime.fromtimestamp(int(epoch), tz=timezone.utc)
+                except (TypeError, ValueError, OverflowError):
+                    active = None
+                    continue
+                active = {
+                    "legacy_git_oid": oid,
+                    "committed_at": committed_at,
+                }
+                continue
+            if active is None or not line:
+                continue
+            fields = line.split("\t")
+            if len(fields) >= 2:
+                active["path_at_revision"] = fields[-1]
+        flush()
+        return history
+
+    def _follow_path_history(
+        self,
+        repo: Repo,
+        fixed_ref: str,
+        file_path: str,
+        *,
+        max_count: int | None = None,
+        since_epoch: int | None = None,
+    ) -> list[dict]:
+        """Return newest-first rename-following revisions for ``file_path``."""
+        log_args = ["log", "--follow", "-M", "--name-status"]
+        if max_count is not None:
+            log_args.append(f"--max-count={max_count}")
+        if since_epoch is not None:
+            log_args.append(f"--since=@{since_epoch}")
+        log_args.extend(["--format=%H%x00%ct", fixed_ref, "--", file_path])
+        return self._parse_follow_path_log(repo.git.log(*log_args[1:]))
+
+    def path_at_revision(
+        self, vault_name: str, file_path: str, commit: str
+    ) -> str | None:
+        """Return the path carried by ``commit`` while following renames.
+
+        ``file_path`` is the document's current path.  The walk starts at the
+        current local tip, not at ``commit`` itself, so a pre-move selector can
+        be mapped back to the old path.  Manual vaults use GitPython; mirror
+        vaults remain on :class:`ExternalGitRunner`'s hermetic local boundary.
+        """
+        # External mirrors retain their existing fixed-path semantics. Their
+        # separate source-corpus history contract is deliberately out of this
+        # manual-vault logical revision change.
+        if self._use_mirror_reader(vault_name):
+            return None
+        try:
+            repo = self._get_repo(vault_name)
+            target = repo.commit(commit).hexsha
+            fixed_ref = repo.head.commit.hexsha
+            history = self._follow_path_history(repo, fixed_ref, file_path)
+        except (BadName, BadObject, GitError, FileNotFoundError, ValueError):
+            return None
+
+        for entry in history:
+            if entry["legacy_git_oid"] == target:
+                return entry["path_at_revision"]
+        return None
 
     def manual_fixed_ref_history(
         self,
@@ -1244,16 +1334,16 @@ class GitService:
         if not bare.exists():
             return []
         out: list[dict] = []
-        for e in self._ext_runner.log_for_path(bare, file_path, max_count):
-            if since_epoch is not None and e["committed_epoch"] < since_epoch:
+        for entry in self._ext_runner.log_for_path(bare, file_path, max_count):
+            if since_epoch is not None and entry["committed_epoch"] < since_epoch:
                 continue
             out.append(
                 {
-                    "hash": e["hash"][:12],
-                    "message": e["message"].strip(),
-                    "author": e["author"],
+                    "hash": entry["hash"][:12],
+                    "message": entry["message"].strip(),
+                    "author": entry["author"],
                     "date": datetime.fromtimestamp(
-                        e["committed_epoch"], tz=timezone.utc
+                        entry["committed_epoch"], tz=timezone.utc
                     ).isoformat(),
                 }
             )
@@ -1733,22 +1823,34 @@ class GitService:
             return self._file_log_mirror(vault_name, file_path, max_count, since_epoch)
         repo = self._get_repo(vault_name)
         try:
-            commits = list(repo.iter_commits(paths=file_path, max_count=max_count))
+            entries = self._follow_path_history(
+                repo,
+                repo.head.commit.hexsha,
+                file_path,
+                max_count=max_count,
+                since_epoch=since_epoch,
+            )
         except (ValueError, GitError):
             return []
 
-        if since_epoch is not None:
-            commits = [c for c in commits if c.committed_date >= since_epoch]
-
-        return [
-            {
-                "hash": c.hexsha[:12],
-                "message": c.message.strip(),
-                "author": str(c.author),
-                "date": datetime.fromtimestamp(c.committed_date, tz=timezone.utc).isoformat(),
-            }
-            for c in commits
-        ]
+        results: list[dict] = []
+        for entry in entries:
+            committed_at = entry["committed_at"]
+            if since_epoch is not None and int(committed_at.timestamp()) < since_epoch:
+                continue
+            try:
+                commit = repo.commit(entry["legacy_git_oid"])
+            except (BadName, BadObject, ValueError):
+                continue
+            results.append(
+                {
+                    "hash": commit.hexsha[:12],
+                    "message": commit.message.strip(),
+                    "author": str(commit.author),
+                    "date": committed_at.isoformat(),
+                }
+            )
+        return results
 
     @staticmethod
     def _legacy_commit_metadata(commit) -> dict[str, str]:
@@ -1857,6 +1959,9 @@ class GitService:
         if self._use_mirror_reader(vault_name):
             return self._file_diff_mirror(vault_name, file_path, commit_hash)
         from git.exc import BadName, BadObject
+        historical_path = self.path_at_revision(vault_name, file_path, commit_hash)
+        if historical_path:
+            file_path = historical_path
         repo = self._get_repo(vault_name)
         try:
             commit = repo.commit(commit_hash)
