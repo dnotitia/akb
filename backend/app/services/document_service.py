@@ -165,6 +165,19 @@ def _create_lock(name: str) -> asyncio.Lock:
     return lock
 
 
+def build_vault_skill_seed_request(vault: str) -> DocumentPutRequest:
+    """Build the canonical seed request shared by every document backend."""
+    return DocumentPutRequest(
+        vault=vault,
+        collection="overview",
+        title=f"{vault} Guide",
+        slug="vault-skill",
+        content=VAULT_SKILL_SEED_TEMPLATE.replace("{vault}", vault),
+        type="skill",
+        tags=["akb:skill"],
+    )
+
+
 class EditError(AKBError):
     """Raised when an edit operation cannot be performed."""
 
@@ -1946,21 +1959,12 @@ class DocumentService:
             # the vault-skill seed writes BOTH git AND a documents row so akb_get /
             # akb_browse / akb_search can find it.
             if not external_git:  # mirror vaults are read-only
-                skill_body = VAULT_SKILL_SEED_TEMPLATE.replace("{vault}", name)
                 # Route through the canonical put() so chunks/BM25 indexing,
                 # frontmatter composition, collection-count increment, and the
                 # document.put event all run — fixing I1–I4.
                 # put() calls coll_repo.get_or_create internally, so no
                 # separate create_empty is needed.
-                seed_req = DocumentPutRequest(
-                    vault=name,
-                    collection="overview",
-                    title=f"{name} Guide",
-                    slug="vault-skill",
-                    content=skill_body,
-                    type="skill",
-                    tags=["akb:skill"],
-                )
+                seed_req = build_vault_skill_seed_request(name)
                 await self.put(seed_req, agent_id=str(owner_id) if owner_id else None)
         except BaseException:
             # run_compensation: the whole rollback runs to COMPLETION even
