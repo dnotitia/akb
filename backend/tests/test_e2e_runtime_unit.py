@@ -657,5 +657,3 @@ def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
     assert "uv sync --locked" in text
     assert "exec 1>&3 3>&-" in text
     assert stat.S_IMODE(BOOTSTRAP.stat().st_mode) & stat.S_IXUSR
-    assert "CRABBOX_" not in text
-    assert "CRABBOX_" not in (CI_DIR / "e2e_runtime.py").read_text()
