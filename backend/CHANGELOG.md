@@ -5,7 +5,7 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
-## Unreleased
+## 0.14.0 — 2026-08-12  *(feat — inline document images; PostgreSQL Native revision mode; app release rollout)*
 
 ### Added inline document images with bounded revision retention
 
