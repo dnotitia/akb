@@ -5,6 +5,18 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.14.1 — 2026-08-12  *(fix — name the exception class behind a degraded hybrid search)*
+
+### Fixed an undiagnosable degraded-search log line
+
+When `hybrid_search` fails for a reason the pgvector driver does not convert
+into `VectorStoreUnavailable`, search degrades to an empty result and logs the
+cause. That log rendered only `str(e)`, so the exception classes that actually
+reach it in production — ones carrying an empty message — produced
+`vector hybrid_search failed ()` and named nothing. A search that silently
+returned zero rows was therefore not diagnosable from the logs. The line now
+records the exception class and the raising frame.
+
 ## 0.14.0 — 2026-08-12  *(feat — inline document images; PostgreSQL Native revision mode; app release rollout)*
 
 ### Added inline document images with bounded revision retention
