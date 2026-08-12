@@ -8,7 +8,9 @@
 > AKB user and exact binding, but an existing email or username is a conflict;
 > it is never adopted. `keycloak_link_by_email` is a deprecated migration
 > input and canonical runtime rejects `true`. The staged browser cutover is
-> documented below as Phase 1 work lands.
+> documented below as Phase 1 work lands. External JIT users are always
+> non-admin, including the first account in an empty database; Phase 2 owns
+> explicit product-admin seeding for an exact identity.
 >
 > **2026-07-10 account-resolution amendment:**
 > [Workspace Account Governance](../../design/accepted/2026-07-10-workspace-account-governance/README.md)

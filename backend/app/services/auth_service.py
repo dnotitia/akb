@@ -502,15 +502,14 @@ async def _resolve_or_provision_keycloak_user(claims: dict) -> dict:
                 # Deliberately do not SELECT by email or username first. Their
                 # unique constraints are atomic collision guards, never
                 # identity resolution or account-linking inputs.
-                is_admin = await conn.fetchval(
+                await conn.execute(
                     """
                     INSERT INTO users (
                         id, username, email, password_hash, display_name,
                         auth_provider, is_admin, account_status, account_kind
                     )
                     VALUES ($1, $2, $3, $4, $5, 'keycloak',
-                            NOT EXISTS (SELECT 1 FROM users), 'active', 'human')
-                    RETURNING is_admin
+                            false, 'active', 'human')
                     """,
                     user_id,
                     preferred_username,
@@ -528,15 +527,6 @@ async def _resolve_or_provision_keycloak_user(claims: dict) -> dict:
                         "issuer": issuer,
                     },
                 )
-                if is_admin:
-                    # Phase 2 owns replacement of this legacy bootstrap rule.
-                    # Phase 1 keeps browser SSO staged unavailable, so this is
-                    # not a deployable first-user provisioning contract.
-                    logging.getLogger("akb.auth").info(
-                        "Bootstrap: first user %r (SSO) provisioned — granted admin",
-                        preferred_username,
-                    )
-
                 await conn.execute(
                     """
                     INSERT INTO external_identities (

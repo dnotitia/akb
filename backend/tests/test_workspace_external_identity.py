@@ -286,6 +286,124 @@ async def test_open_mode_jit_creates_user_and_subject_binding(pool):
     assert row["subject"] == "jit-new"
 
 
+async def test_first_keycloak_api_principal_is_never_bootstrap_admin(
+    monkeypatch,
+):
+    """OIDC roles and empty-database order never grant AKB authority."""
+    try:
+        admin = await asyncpg.connect(_DSN)
+    except Exception:
+        pytest.skip("Postgres unreachable at AKB_TEST_DSN")
+
+    schema = "external_jit_" + uuid.uuid4().hex
+    await admin.execute(f'CREATE SCHEMA "{schema}"')
+    isolated_pool = None
+    try:
+        isolated_pool = await asyncpg.create_pool(
+            _DSN,
+            min_size=1,
+            max_size=2,
+            server_settings={"search_path": schema},
+        )
+        async with isolated_pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE users (
+                    id UUID PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE,
+                    email TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    display_name TEXT,
+                    is_admin BOOLEAN NOT NULL DEFAULT false,
+                    tokens_revoked_before TIMESTAMPTZ NOT NULL DEFAULT
+                        TIMESTAMPTZ '1970-01-01 00:00:00+00',
+                    auth_provider TEXT NOT NULL DEFAULT 'local',
+                    account_status TEXT NOT NULL DEFAULT 'active',
+                    account_kind TEXT NOT NULL DEFAULT 'human',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE TABLE external_identities (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    issuer TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    email_snapshot TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (issuer, subject)
+                );
+                CREATE TABLE events (
+                    id BIGSERIAL PRIMARY KEY,
+                    vault_id UUID,
+                    kind TEXT NOT NULL,
+                    resource_uri TEXT,
+                    actor_id TEXT,
+                    payload JSONB NOT NULL
+                );
+                """
+            )
+
+        from app.services import auth_service
+        from app.services.auth_verifier_profiles import (
+            KEYCLOAK_ACCESS_V1,
+            VerifiedPrincipal,
+        )
+
+        async def _get_pool():
+            return isolated_pool
+
+        class RoleSync:
+            async def on_user_create(self, _user_id):
+                return None
+
+        claims = {
+            **_claims("first-api-user", "wsg-first-api-user@example.com"),
+            "scope": "openid profile email akb:vault:read",
+            "realm_access": {"roles": ["admin", "realm-admin"]},
+            "resource_access": {"akb-web": {"roles": ["admin"]}},
+        }
+        principal = VerifiedPrincipal(
+            profile_id=KEYCLOAK_ACCESS_V1,
+            issuer=_ISSUER,
+            subject="first-api-user",
+            credential_type="access_token",
+            claims=claims,
+            audience="https://akb.example.com/api",
+        )
+
+        async def _verify_api(_token, route_profile):
+            assert route_profile == "api"
+            return principal
+
+        monkeypatch.setattr(auth_service, "get_pool", _get_pool)
+        monkeypatch.setattr(auth_service, "get_role_sync", RoleSync)
+        monkeypatch.setattr(auth_service, "verify_keycloak_access_v1", _verify_api)
+        monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+        monkeypatch.setattr(settings, "keycloak_enrollment_mode", "open", raising=False)
+        monkeypatch.setattr(settings, "keycloak_require_verified_email", True, raising=False)
+        monkeypatch.setattr(settings, "keycloak_link_by_email", False, raising=False)
+
+        actor = await auth_service.resolve_rest_user_authorization(
+            "Bearer verified-keycloak-api-token"
+        )
+
+        assert actor is not None
+        assert actor.auth_method == "oauth"
+        assert actor.is_admin is False
+        async with isolated_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT is_admin FROM users WHERE username = $1",
+                "wsg-first-api-user",
+            )
+        assert row["is_admin"] is False
+    finally:
+        if isolated_pool is not None:
+            await isolated_pool.close()
+        await admin.execute(f'DROP SCHEMA "{schema}" CASCADE')
+        await admin.close()
+
+
 async def test_second_subject_cannot_jit_bind_to_an_already_bound_email(pool):
     from app.services.auth_service import _resolve_or_provision_keycloak_user
 
