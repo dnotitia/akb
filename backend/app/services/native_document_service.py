@@ -372,7 +372,10 @@ class NativeDocumentService(DocumentService):
         version: str,
     ) -> DocumentResponse:
         vault_id, current = await self._current(vault, doc_ref)
-        if len(version) != 40 or any(ch not in "0123456789abcdef" for ch in version):
+        # Public historical reads accept a full native Revision ID or a
+        # resource-scoped unique prefix. Write OCC pins remain exact-40 via
+        # NativeRevisionService._validate_expected_revision().
+        if not 7 <= len(version) <= 40 or any(ch not in "0123456789abcdef" for ch in version):
             raise NotFoundError("Document version", f"{current.path}@{version[:8]}")
         selected = await (await self._native()).get_revision(
             namespace_id=vault_id,

@@ -11,8 +11,9 @@ from pathlib import Path
 import asyncpg
 import pytest
 
-from app.exceptions import ConflictError
+from app.exceptions import ConflictError, NotFoundError, ValidationError
 from app.services.native_revision_backend import NativeRevisionBackend
+from app.services.native_document_service import NativeDocumentService
 from app.services.native_revision_service import NativeRevisionService
 
 
@@ -136,8 +137,23 @@ async def test_public_historical_selector_is_exact_or_resource_scoped_prefix(mon
         assert selected is not None
         assert selected[1] == "first\n"
 
+        document_service = NativeDocumentService(pool=pool)
+        rest_exact = await document_service.get_at_commit(vault_name, "one.md", first.revision_id)
+        assert rest_exact.content == "first"
+        rest_selected = await document_service.get_at_commit(vault_name, "one.md", first.revision_id[:8])
+        assert rest_selected.content == "first"
+
+        NativeRevisionService._validate_expected_revision(first.revision_id)
+        with pytest.raises(ValidationError):
+            NativeRevisionService._validate_expected_revision(first.revision_id[:8])
+
         assert await backend.document_version(vault_name, "one.md", "deadbee") is None
         assert await backend.document_version(vault_name, "two.md", prefix) is None
+
+        with pytest.raises(NotFoundError):
+            await document_service.get_at_commit(vault_name, "one.md", "deadbee")
+        with pytest.raises(NotFoundError):
+            await document_service.get_at_commit(vault_name, "two.md", prefix)
 
         diff = await backend.document_diff(vault_name, "one.md", prefix)
         assert diff is not None
@@ -150,4 +166,8 @@ async def test_public_historical_selector_is_exact_or_resource_scoped_prefix(mon
 
         with pytest.raises(ConflictError) as caught:
             await backend.document_diff(vault_name, "one.md", first.revision_id[:7])
+        assert caught.value.code == "native_revision_selector_ambiguous"
+
+        with pytest.raises(ConflictError) as caught:
+            await document_service.get_at_commit(vault_name, "one.md", first.revision_id[:7])
         assert caught.value.code == "native_revision_selector_ambiguous"

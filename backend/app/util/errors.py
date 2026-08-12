@@ -158,7 +158,7 @@ def exception_envelope(e: Exception) -> dict:
     if isinstance(e, NotFoundError):
         return err(str(e), code=NOT_FOUND)
     if isinstance(e, ConflictError):
-        return err(str(e), code=CONFLICT)
+        return err(str(e), code=e.code or CONFLICT)
     if isinstance(e, InvalidColumnTypeError):
         return err(
             str(e),

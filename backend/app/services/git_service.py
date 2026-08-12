@@ -28,8 +28,10 @@ from __future__ import annotations
 import logging
 import os
 import re
+import selectors
 import shutil
 import stat
+import subprocess
 import threading
 import time
 import uuid
@@ -78,6 +80,18 @@ _OUTPUT_MARGIN_BYTES = 64 * 1024
 # The per-image size checks refuse genuinely oversized content up front; this
 # streaming cap stays the backstop for a pathological many-hunk patch.
 _DIFF_OUTPUT_FACTOR = 4
+
+# ``path_at_revision`` only needs the prefix of a path-following walk through
+# the requested target.  Keep the prefix itself bounded as a backstop for a
+# target that is not in the path's history, and stream the command so a large
+# suffix is never materialized.  The timeout reuses the existing configured Git
+# command bound (the same setting used by the write lane); the entry/output
+# limits are code-owned safety floors because this internal lookup has no user
+# supplied page size.
+_PATH_AT_REVISION_MAX_ENTRIES = 10_000
+_PATH_AT_REVISION_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+_PATH_AT_REVISION_READ_CHUNK_BYTES = 64 * 1024
+_PATH_AT_REVISION_DEFAULT_TIMEOUT_SECS = 30.0
 
 
 def _marker_state(marker: Path) -> str:
@@ -174,6 +188,34 @@ class ExternalGitOversizedError(AKBError):
 
 class FixedRefHistoryError(RuntimeError):
     """A manual-vault fixed-ref history read could not be completed."""
+
+
+class GitHistoryBoundError(AKBError, RuntimeError):
+    """A bounded manual-vault history lookup could not finish safely.
+
+    Unlike an unknown commit/path (which keeps the historical ``None`` result),
+    hitting a resource bound is explicit so callers cannot mistake a truncated
+    walk for a missing historical file.  The class is also a ``RuntimeError``
+    for legacy service callers that already classify Git history failures that
+    way, while ``AKBError`` gives public reads the normal error envelope.
+    """
+
+    def __init__(self, bound: str, limit: int | float):
+        if bound == "timeout":
+            message = f"git path history timed out after {limit:g}s"
+            status_code = 503
+            code = "git_history_timeout"
+        elif bound == "output":
+            message = f"git path history exceeded the {limit}-byte output cap"
+            status_code = 413
+            code = "git_history_output_capped"
+        else:
+            message = f"git path history exceeded the {limit}-entry cap"
+            status_code = 503
+            code = "git_history_entry_capped"
+        super().__init__(message, status_code=status_code, code=code)
+        self.bound = bound
+        self.limit = limit
 
 
 class GitService:
@@ -1077,6 +1119,167 @@ class GitService:
         log_args.extend(["--format=%H%x00%ct", fixed_ref, "--", file_path])
         return self._parse_follow_path_log(repo.git.log(*log_args[1:]))
 
+    @staticmethod
+    def _close_path_history_process(process, *, terminate: bool) -> None:
+        """Close a streamed GitPython process, killing it when still active."""
+        raw_process = getattr(process, "proc", None) or process
+        if terminate:
+            try:
+                if raw_process.poll() is None:
+                    raw_process.kill()
+            except (AttributeError, OSError):
+                pass
+            try:
+                raw_process.wait(timeout=5)
+            except (AttributeError, OSError, subprocess.TimeoutExpired):
+                pass
+        for stream_name in ("stdin", "stdout", "stderr"):
+            stream = getattr(raw_process, stream_name, None)
+            try:
+                if stream is not None:
+                    stream.close()
+            except (OSError, ValueError):
+                pass
+
+    def _stream_path_at_revision(
+        self,
+        repo: Repo,
+        fixed_ref: str,
+        file_path: str,
+        target: str,
+    ) -> str | None:
+        """Stream a rename-following log until ``target`` or a safe bound.
+
+        ``GitPython`` normally buffers ``git log`` before returning.  The
+        revision selector only needs the target commit's one status record, so
+        this reader owns a process and consumes stdout incrementally.  It asks
+        Git for one entry past the allowed prefix: that distinguishes an
+        ordinary short history from a walk truncated by the entry cap without
+        ever allowing an unbounded command or result.
+        """
+        max_entries = max(1, int(_PATH_AT_REVISION_MAX_ENTRIES))
+        max_output_bytes = max(1, int(_PATH_AT_REVISION_MAX_OUTPUT_BYTES))
+        try:
+            timeout_secs = float(
+                getattr(settings, "git_write_timeout_secs", _PATH_AT_REVISION_DEFAULT_TIMEOUT_SECS)
+            )
+        except (TypeError, ValueError):
+            timeout_secs = _PATH_AT_REVISION_DEFAULT_TIMEOUT_SECS
+        timeout_secs = max(0.001, timeout_secs)
+
+        log_args = [
+            "--follow",
+            "-M",
+            "--name-status",
+            f"--max-count={max_entries + 1}",
+            "--format=%H%x00%ct",
+            fixed_ref,
+            "--",
+            file_path,
+        ]
+        process = repo.git.log(*log_args, as_process=True)
+        raw_process = getattr(process, "proc", None) or process
+        stdout = getattr(raw_process, "stdout", None)
+        stderr = getattr(raw_process, "stderr", None)
+        stdout_fd = stdout.fileno() if stdout is not None else -1
+        selector = selectors.DefaultSelector()
+        pending = bytearray()
+        output_bytes = 0
+        entry_count = 0
+        active_oid: str | None = None
+        finished = False
+        deadline = time.monotonic() + timeout_secs
+
+        def consume_line(line: bytes) -> str | None:
+            nonlocal active_oid, entry_count
+            text = line.decode("utf-8", "replace").rstrip("\r")
+            if "\x00" in text:
+                entry_count += 1
+                if entry_count > max_entries:
+                    raise GitHistoryBoundError("entry", max_entries)
+                oid = text.split("\x00", 1)[0]
+                active_oid = oid if re.fullmatch(r"[0-9a-f]{40}", oid) else None
+                return None
+            if active_oid is None or not text:
+                return None
+            fields = text.split("\t")
+            if len(fields) >= 2 and active_oid == target:
+                return fields[-1]
+            return None
+
+        try:
+            for stream in (stdout, stderr):
+                if stream is not None:
+                    selector.register(stream, selectors.EVENT_READ)
+
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise GitHistoryBoundError("timeout", timeout_secs)
+                events = selector.select(remaining)
+                if not events:
+                    continue
+                for key, _mask in events:
+                    try:
+                        if key.fd == stdout_fd:
+                            available = max_output_bytes - output_bytes - len(pending)
+                            if available < 0:
+                                raise GitHistoryBoundError("output", max_output_bytes)
+                            read_size = min(
+                                _PATH_AT_REVISION_READ_CHUNK_BYTES,
+                                max(1, available + 1),
+                            )
+                        else:
+                            read_size = _PATH_AT_REVISION_READ_CHUNK_BYTES
+                        chunk = os.read(key.fd, read_size)
+                    except (OSError, ValueError):
+                        selector.unregister(key.fileobj)
+                        continue
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    if key.fd != stdout_fd:
+                        continue
+
+                    pending.extend(chunk)
+                    while True:
+                        newline = pending.find(b"\n")
+                        if newline < 0:
+                            break
+                        line = bytes(pending[:newline])
+                        del pending[: newline + 1]
+                        output_bytes += newline + 1
+                        if output_bytes > max_output_bytes:
+                            raise GitHistoryBoundError("output", max_output_bytes)
+                        path = consume_line(line)
+                        if path is not None:
+                            return path
+                    if output_bytes + len(pending) > max_output_bytes:
+                        raise GitHistoryBoundError("output", max_output_bytes)
+
+            if pending:
+                output_bytes += len(pending)
+                if output_bytes > max_output_bytes:
+                    raise GitHistoryBoundError("output", max_output_bytes)
+                path = consume_line(bytes(pending))
+                if path is not None:
+                    return path
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise GitHistoryBoundError("timeout", timeout_secs)
+            try:
+                status = raw_process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                raise GitHistoryBoundError("timeout", timeout_secs) from None
+            finished = True
+            if status != 0:
+                raise GitError("git path history command failed")
+            return None
+        finally:
+            selector.close()
+            self._close_path_history_process(process, terminate=not finished)
+
     def path_at_revision(
         self, vault_name: str, file_path: str, commit: str
     ) -> str | None:
@@ -1096,14 +1299,9 @@ class GitService:
             repo = self._get_repo(vault_name)
             target = repo.commit(commit).hexsha
             fixed_ref = repo.head.commit.hexsha
-            history = self._follow_path_history(repo, fixed_ref, file_path)
+            return self._stream_path_at_revision(repo, fixed_ref, file_path, target)
         except (BadName, BadObject, GitError, FileNotFoundError, ValueError):
             return None
-
-        for entry in history:
-            if entry["legacy_git_oid"] == target:
-                return entry["path_at_revision"]
-        return None
 
     def manual_fixed_ref_history(
         self,
