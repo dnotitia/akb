@@ -149,6 +149,8 @@ document_asset_upload_body_timeout_secs: 60
 # === Auth (jwt_secret is in secret.yaml) ===
 # REQUIRED canonical human-login mode. Fresh runtime config never infers this
 # from legacy booleans. Choose exactly one: local | sso.
+# Provision the designated administrator explicitly with
+# `python -m app.cli provision-recovery-admin`; ordinary registration is never admin.
 auth_mode: local
 jwt_algorithm: HS256
 jwt_expire_hours: 24

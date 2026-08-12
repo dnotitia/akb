@@ -280,13 +280,46 @@ $EDITOR config/secret.yaml   # set embed_api_key (and jwt_secret for any non-loc
 # 2. Run
 docker compose up -d
 
-# 3. Open
+# 3. Provision the designated recovery administrator (local mode)
+#    The password is read from stdin and is never printed by AKB.
+docker compose exec -T backend python -m app.cli provision-recovery-admin local \
+  --username recovery-admin --email recovery-admin@example.com \
+  --password-file - < /secure/operator/recovery-admin.password
+
+# 4. Open
 open http://localhost:3000
 ```
 
 `config/app.yaml` and `config/secret.yaml` are the **single source of runtime
 configuration** — no environment variables are read by the backend. Mount the
 `config/` directory at `/etc/akb/` in any deployment.
+
+Ordinary registration always creates a non-admin account, including on an
+empty database. Administrator bootstrap is available only through the
+operator CLI; there is no unauthenticated HTTP bootstrap endpoint. The CLI
+profile must match `auth_mode`:
+
+```bash
+# Local: have AKB generate the password only when an operator-owned output
+# file is explicitly requested. A new file is created with mode 0600 and the
+# password is not written to stdout, stderr, logs, or application config.
+python -m app.cli provision-recovery-admin local \
+  --username recovery-admin --email recovery-admin@example.com \
+  --generate-password-file /secure/operator/recovery-admin.password
+
+# SSO: pre-bind the product administrator to the exact external identity.
+# Username and email are snapshots; issuer + subject are the identity key.
+python -m app.cli provision-recovery-admin sso \
+  --username recovery-admin --email recovery-admin@example.com \
+  --issuer https://issuer.example.com/realms/akb \
+  --subject exact-provider-subject
+```
+
+The same exact identity is idempotent. A different designation, an existing
+username/email, or an already-bound external identity fails closed. The SSO
+command stores no usable local password and does not contact the identity
+provider. Generated output files are create-only and never overwritten; for a
+retry after the file exists, pass that file back with `--password-file`.
 
 ### Vector store (driver-pluggable)
 

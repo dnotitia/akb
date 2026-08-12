@@ -247,6 +247,7 @@ async def _apply_migrations() -> None:
         "068_vault_file_lifecycle_indexes.py",  # indexed attachment health counts + stale pending File collection
         "069_document_asset_revision_lock_order.py",  # remove redundant vault FK so manifest writes keep vault→asset lock order
         "070_vault_files_s3_key_lookup.py",  # physical-key reachability + pending-delete barrier indexes
+        "071_recovery_admin.py",  # explicit singleton recovery administrator + external username snapshot
     ):
         if filename in applied:
             continue

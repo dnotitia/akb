@@ -13,6 +13,7 @@ from app.exceptions import (
     CredentialCleanupIncompleteError,
     ExternalIdentityConflictError,
     NotFoundError,
+    RecoveryAdminProtectedError,
     ServiceIdentityAdoptionError,
     ValidationError,
 )
@@ -672,7 +673,7 @@ async def set_user_admin(user_id: str, *, is_admin: bool, actor_id: str) -> dict
         async with conn.transaction():
             current = await conn.fetchrow(
                 """
-                SELECT account_status, account_kind
+                SELECT account_status, account_kind, is_recovery_admin
                   FROM users WHERE id = $1
                    FOR UPDATE
                 """,
@@ -680,6 +681,8 @@ async def set_user_admin(user_id: str, *, is_admin: bool, actor_id: str) -> dict
             )
             if current is None or current["account_kind"] != "human":
                 raise NotFoundError("Human user", user_id)
+            if not is_admin and current["is_recovery_admin"]:
+                raise RecoveryAdminProtectedError()
             if is_admin and current["account_status"] != "active":
                 raise AccountSuspendedError()
             row = await conn.fetchrow(

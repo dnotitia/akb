@@ -247,15 +247,10 @@ async def register(username: str, email: str, password: str, display_name: str |
         if existing:
             raise ConflictError("Username or email already exists")
 
-        # Bootstrap: the very first account in a fresh deployment becomes
-        # admin, so a brand-new instance has an operator without a manual
-        # DB edit. `NOT EXISTS (… users)` is evaluated against the table
-        # state before this row, so only a truly empty users table grants
-        # it — existing deployments never retroactively promote anyone.
         is_admin = await conn.fetchval(
             """
             INSERT INTO users (id, username, email, password_hash, display_name, is_admin)
-            VALUES ($1, $2, $3, $4, $5, NOT EXISTS (SELECT 1 FROM users))
+            VALUES ($1, $2, $3, $4, $5, false)
             RETURNING is_admin
             """,
             user_id,
@@ -264,9 +259,6 @@ async def register(username: str, email: str, password: str, display_name: str |
             pw_hash,
             display_name,
         )
-
-    if is_admin:
-        logging.getLogger("akb.auth").info("Bootstrap: first user %r registered — granted admin", username)
 
     # PG-native RBAC: emit the per-user PG role so akb_sql works.
     # Best-effort — reconciler at next startup catches any failure here.

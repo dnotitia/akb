@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     display_name TEXT,
     is_admin BOOLEAN NOT NULL DEFAULT false,
+    is_recovery_admin BOOLEAN NOT NULL DEFAULT false,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     -- JWT revocation cutoff. A JWT is rejected if its `iat` claim is
@@ -52,8 +53,14 @@ CREATE TABLE IF NOT EXISTS users (
         CHECK (account_status IN ('active', 'suspended')),
     account_kind TEXT NOT NULL DEFAULT 'human'
         CONSTRAINT users_account_kind_check
-        CHECK (account_kind IN ('human', 'service'))
+        CHECK (account_kind IN ('human', 'service')),
+    CONSTRAINT users_recovery_admin_requires_admin
+        CHECK (NOT is_recovery_admin OR is_admin)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS users_one_recovery_admin
+    ON users ((is_recovery_admin))
+    WHERE is_recovery_admin;
 
 -- Stable external identity binding. Email is a mutable snapshot; verified
 -- OIDC issuer + subject is the permanent key.
@@ -62,6 +69,7 @@ CREATE TABLE IF NOT EXISTS external_identities (
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     issuer TEXT NOT NULL,
     subject TEXT NOT NULL,
+    username_snapshot TEXT,
     email_snapshot TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

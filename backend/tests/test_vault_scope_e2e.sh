@@ -5,9 +5,8 @@
 # Proves the token-scoping backstop end-to-end against a live backend:
 # a PAT minted with a vault_scope can only MUTATE vaults inside that
 # scope, even when its user OWNS the target vault. Reads are unaffected.
-# The user is the first-registered account (admin on a fresh DB), so the
-# out-of-scope-write denial ALSO demonstrates that a scoped admin token
-# does not bypass the scope.
+# The user owns both test vaults, so the out-of-scope-write denial also
+# demonstrates that ownership does not bypass the token scope.
 #
 set -uo pipefail
 

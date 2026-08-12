@@ -42,10 +42,14 @@ async def services(monkeypatch):
     from app.db.postgres import _load_migration
     from app.services import account_service, auth_service, password_service
 
-    migration = _load_migration("043_workspace_account_governance.py")
-    assert migration is not None
     async with pool.acquire() as conn:
-        await migration.migrate(conn=conn)
+        for filename in (
+            "043_workspace_account_governance.py",
+            "071_recovery_admin.py",
+        ):
+            migration = _load_migration(filename)
+            assert migration is not None
+            await migration.migrate(conn=conn)
 
     role_sync = RecordingRoleSync()
 
