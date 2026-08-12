@@ -778,7 +778,7 @@ class Settings(BaseModel):
     publication_view_grant_emit_legacy: bool = True
     # A bounded proof may request another view-counted fetch window only inside
     # this page-session interval. The publication max_views check still runs on
-    # every renewal; this interval limits replay, it does not bypass the cap.
+    # every renewal; this interval limits how long renewal remains available.
     publication_view_grant_session_secs: int = Field(default=3600, ge=600, le=3600)
 
     # Vector store (hybrid dense + BM25). Driver-pluggable.

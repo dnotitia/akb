@@ -192,8 +192,8 @@ def _validate_view_grant_renewal(
 
     Two-field grants remain fetch-only rollout capabilities.  A three-field
     grant can prove that the caller opened the page recently, but renewal still
-    goes through the normal publication view counter and cap.  This keeps the
-    session proof from turning one counted view into an hour-long bypass.
+    goes through the normal publication view counter and cap.  The session
+    proof therefore extends eligibility to renew, not the counted view itself.
     """
     if not grant or len(grant.split(".")) != 3:
         return None
