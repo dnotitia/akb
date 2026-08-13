@@ -392,7 +392,11 @@ class KeycloakStandaloneSSOControl:
         return readback
 
     @staticmethod
-    def _api_client(spec: StandaloneSSOBootstrapSpec) -> dict[str, Any]:
+    def _api_client(
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        backchannel_logout_uri: str | None = None,
+    ) -> dict[str, Any]:
         return {
             "clientId": spec.api_client_id,
             "name": "AKB browser and API",
@@ -418,7 +422,9 @@ class KeycloakStandaloneSSOControl:
                 "pkce.code.challenge.method": "S256",
                 "post.logout.redirect.uris": f"{spec.akb_public_url.rstrip('/')}/*",
                 "backchannel.logout.url": (
-                    f"{spec.akb_public_url.rstrip('/')}/api/v1/auth/keycloak/backchannel-logout"
+                    backchannel_logout_uri
+                    if backchannel_logout_uri is not None
+                    else spec.backchannel_logout_uri_effective
                 ),
                 "backchannel.logout.session.required": "true",
             },
@@ -1273,6 +1279,7 @@ class KeycloakStandaloneSSOControl:
         *,
         management_token: str,
         require_identity_provider_mapper: bool,
+        legacy_backchannel_logout: bool,
     ) -> StandaloneSSOReadback:
         realm = await self._realm(spec, token=management_token)
         if realm is None or not self._realm_matches(spec, realm):
@@ -1280,7 +1287,13 @@ class KeycloakStandaloneSSOControl:
         realm_id = _required_string(realm, "id", "keycloak_realm_readback_failed")
 
         expected_clients = (
-            (self._api_client(spec), "api"),
+            (
+                self._api_client(
+                    spec,
+                    backchannel_logout_uri=(spec.legacy_backchannel_logout_uri if legacy_backchannel_logout else None),
+                ),
+                "api",
+            ),
             (self._admin_client(spec), "admin"),
             (self._management_client(spec), "management"),
         )
@@ -1293,8 +1306,21 @@ class KeycloakStandaloneSSOControl:
                 client_id,
                 token=management_token,
             )
-            if actual is None or not self._selected_client_matches(actual, expected):
+            matches = actual is not None and self._selected_client_matches(
+                actual,
+                expected,
+            )
+            if not matches and actual is not None and role == "api" and legacy_backchannel_logout:
+                # A crash after the one-time authority updated the client but
+                # before receipt persistence must converge on retry. Accept
+                # only the exact source or exact target representation.
+                matches = self._selected_client_matches(
+                    actual,
+                    self._api_client(spec),
+                )
+            if not matches:
                 raise _fail("keycloak_client_readback_failed")
+            assert actual is not None
             clients[role] = actual
         api_uuid = _required_string(clients["api"], "id", "keycloak_client_readback_failed")
         admin_uuid = _required_string(
@@ -1425,6 +1451,7 @@ class KeycloakStandaloneSSOControl:
             spec,
             management_token=management_token,
             require_identity_provider_mapper=True,
+            legacy_backchannel_logout=False,
         )
 
     async def readback_legacy_v1(
@@ -1437,24 +1464,53 @@ class KeycloakStandaloneSSOControl:
             spec,
             management_token=management_token,
             require_identity_provider_mapper=False,
+            legacy_backchannel_logout=True,
         )
 
-    async def upgrade_v1_to_v2(
+    async def readback_legacy_v2(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        management_token: str,
+    ) -> StandaloneSSOReadback:
+        return await self._readback(
+            spec,
+            management_token=management_token,
+            require_identity_provider_mapper=True,
+            legacy_backchannel_logout=True,
+        )
+
+    async def upgrade_legacy_to_current(
         self,
         spec: StandaloneSSOBootstrapSpec,
         *,
         upgrade_token: str,
     ) -> StandaloneSSOReadback:
-        expected_api = self._api_client(spec)
+        expected_api = self._api_client(
+            spec,
+            backchannel_logout_uri=spec.legacy_backchannel_logout_uri,
+        )
         api = await self._exact_client(
             spec,
             spec.realm,
             spec.api_client_id,
             token=upgrade_token,
         )
-        if api is None or not self._selected_client_matches(api, expected_api):
+        if api is None or not (
+            self._selected_client_matches(api, expected_api)
+            or self._selected_client_matches(api, self._api_client(spec))
+        ):
             raise _fail("keycloak_client_readback_failed")
-        api_uuid = _required_string(api, "id", "keycloak_client_readback_failed")
+        reconciled = await self._reconcile_client(
+            spec,
+            self._api_client(spec),
+            token=upgrade_token,
+        )
+        api_uuid = _required_string(
+            reconciled,
+            "id",
+            "keycloak_client_readback_failed",
+        )
         await self._reconcile_mapper(
             spec,
             api_uuid,

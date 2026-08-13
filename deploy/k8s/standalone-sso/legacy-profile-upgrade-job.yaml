@@ -1,17 +1,17 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: akb-keycloak-v1-to-v2-authority
+  name: akb-keycloak-profile-upgrade-authority
   namespace: akb
   labels:
-    app.kubernetes.io/name: akb-keycloak-v1-to-v2-authority
+    app.kubernetes.io/name: akb-keycloak-profile-upgrade-authority
     app.kubernetes.io/part-of: akb
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: akb-keycloak-v1-to-v2-authority
+        app.kubernetes.io/name: akb-keycloak-profile-upgrade-authority
     spec:
       restartPolicy: Never
       securityContext:
@@ -25,6 +25,8 @@ spec:
           args:
             - bootstrap-admin
             - service
+            # Kept stable so an interrupted v1-to-v2 migration receipt and a
+            # v2-to-v3 migration use one exact, already documented identity.
             - --client-id
             - akb-bootstrap-upgrade-v2
             - --client-secret:env=AKB_KEYCLOAK_UPGRADE_SECRET

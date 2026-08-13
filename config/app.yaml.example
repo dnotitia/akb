@@ -200,6 +200,8 @@ app_credential_overlap_seconds: 300
 # keycloak_enrollment_mode: open           # open | invite_only | disabled
 # keycloak_server_url: "https://auth.example.com"   # no /realms suffix; HTTPS outside loopback
 # keycloak_internal_url: ""          # optional backchannel URL (server→Keycloak); blank → use server_url
+# keycloak_backchannel_logout_uri: "" # Keycloak→AKB callback; blank → public_base_url callback.
+#                                       # In Kubernetes, use the exact backend Service URL.
 # keycloak_realm: "akb"
 # keycloak_client_id: "akb-web"
 # keycloak_public_client: false      # true → no client_secret; both profiles require PKCE

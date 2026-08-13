@@ -140,9 +140,14 @@ class _Control:
         self.events.append("readback-keycloak-v1")
         return self._readback
 
-    async def upgrade_v1_to_v2(self, _spec, *, upgrade_token: str):
+    async def readback_legacy_v2(self, _spec, *, management_token: str):
+        assert management_token == "manager-token"
+        self.events.append("readback-keycloak-v2")
+        return self._readback
+
+    async def upgrade_legacy_to_current(self, _spec, *, upgrade_token: str):
         assert upgrade_token == "upgrade-token"
-        self.events.append("upgrade-keycloak-v1-to-v2")
+        self.events.append("upgrade-keycloak-to-current")
         return self._readback
 
     async def retire_bootstrap(self, _spec, *, bootstrap_token: str):
@@ -321,7 +326,7 @@ async def test_legacy_v1_receipt_uses_one_time_upgrade_authority_then_retires_it
         "acquire-upgrade",
         "readback-keycloak-v1",
         "provision-akb-admin",
-        "upgrade-keycloak-v1-to-v2",
+        "upgrade-keycloak-to-current",
         "acquire-management",
         "readback-keycloak",
         "retire-upgrade",
@@ -332,10 +337,138 @@ async def test_legacy_v1_receipt_uses_one_time_upgrade_authority_then_retires_it
     assert receipts.receipt == _receipt(
         retired_client_id=_spec().upgrade_client_id,
     )
-    assert report["mode"] == "upgrade-v1-to-v2"
+    assert report["mode"] == "upgrade-v1-to-v3"
     assert report["keycloak_mutated"] is True
-    assert report["receipt_profile"] == "bundled-keycloak-v2"
+    assert report["receipt_profile"] == "bundled-keycloak-v3"
     assert control.upgrade_available is False
+
+
+async def test_legacy_v2_public_callback_promotes_receipt_without_mutation_authority():
+    from app.services.standalone_sso_bootstrap import (
+        STANDALONE_SSO_RECEIPT_PROFILE_V2,
+        bootstrap_standalone_sso,
+    )
+
+    control = _Control(manager_available=True, bootstrap_available=False)
+    receipts = _ReceiptStore(
+        control.events,
+        _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V2),
+    )
+
+    async def _provision(**_kwargs):
+        control.events.append("provision-akb-admin")
+        return {
+            "user_id": "11111111-1111-4111-8111-111111111111",
+            "created": False,
+            "is_admin": True,
+            "is_recovery_admin": True,
+        }
+
+    report = await bootstrap_standalone_sso(
+        replace(_spec(), bootstrap_client_secret="", product_admin_password=""),
+        control=control,
+        provision_admin=_provision,
+        load_retirement_receipt=receipts.load,
+        record_retirement_receipt=receipts.record,
+    )
+
+    assert control.events == [
+        "load-retirement-receipt",
+        "acquire-management",
+        "acquire-bootstrap",
+        "readback-keycloak-v2",
+        "provision-akb-admin",
+        "acquire-management",
+        "readback-keycloak",
+        "record-retirement-receipt",
+        "load-retirement-receipt",
+    ]
+    assert receipts.receipt == _receipt()
+    assert report["mode"] == "upgrade-v2-to-v3-readback"
+    assert report["keycloak_mutated"] is False
+    assert report["receipt_profile"] == "bundled-keycloak-v3"
+
+
+async def test_legacy_v2_internal_callback_uses_bounded_upgrade_authority():
+    from app.services.standalone_sso_bootstrap import (
+        STANDALONE_SSO_RECEIPT_PROFILE_V2,
+        bootstrap_standalone_sso,
+    )
+
+    control = _Control(
+        manager_available=True,
+        bootstrap_available=False,
+        upgrade_available=True,
+    )
+    receipts = _ReceiptStore(
+        control.events,
+        _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V2),
+    )
+
+    async def _provision(**_kwargs):
+        control.events.append("provision-akb-admin")
+        return {
+            "user_id": "11111111-1111-4111-8111-111111111111",
+            "created": False,
+            "is_admin": True,
+            "is_recovery_admin": True,
+        }
+
+    report = await bootstrap_standalone_sso(
+        replace(
+            _spec(),
+            bootstrap_client_secret="",
+            product_admin_password="",
+            backchannel_logout_uri=("http://backend:8000/api/v1/auth/keycloak/backchannel-logout"),
+            upgrade_client_secret=_UPGRADE_SECRET,
+        ),
+        control=control,
+        provision_admin=_provision,
+        load_retirement_receipt=receipts.load,
+        record_retirement_receipt=receipts.record,
+    )
+
+    assert "readback-keycloak-v2" in control.events
+    assert "upgrade-keycloak-to-current" in control.events
+    assert "retire-upgrade" in control.events
+    assert report["mode"] == "upgrade-v2-to-v3"
+    assert report["keycloak_mutated"] is True
+    assert report["receipt_profile"] == "bundled-keycloak-v3"
+
+
+async def test_legacy_v2_internal_callback_without_authority_fails_before_projection():
+    from app.services.standalone_sso_bootstrap import (
+        STANDALONE_SSO_RECEIPT_PROFILE_V2,
+        StandaloneSSOBootstrapError,
+        bootstrap_standalone_sso,
+    )
+
+    control = _Control(manager_available=True, bootstrap_available=False)
+    receipts = _ReceiptStore(
+        control.events,
+        _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V2),
+    )
+
+    async def _should_not_run(**_kwargs):
+        raise AssertionError("metadata migration requires its bounded authority")
+
+    with pytest.raises(StandaloneSSOBootstrapError) as captured:
+        await bootstrap_standalone_sso(
+            replace(
+                _spec(),
+                bootstrap_client_secret="",
+                product_admin_password="",
+                backchannel_logout_uri=("http://backend:8000/api/v1/auth/keycloak/backchannel-logout"),
+            ),
+            control=control,
+            provision_admin=_should_not_run,
+            load_retirement_receipt=receipts.load,
+            record_retirement_receipt=receipts.record,
+        )
+
+    assert captured.value.code == "keycloak_upgrade_credential_required"
+    assert "provision-akb-admin" not in control.events
+    assert "upgrade-keycloak-to-current" not in control.events
 
 
 async def test_legacy_v1_receipt_without_upgrade_authority_fails_before_mutation():
@@ -369,7 +502,7 @@ async def test_legacy_v1_receipt_without_upgrade_authority_fails_before_mutation
         )
 
     assert captured.value.code == "keycloak_upgrade_credential_required"
-    assert "upgrade-keycloak-v1-to-v2" not in control.events
+    assert "upgrade-keycloak-to-current" not in control.events
     assert "provision-akb-admin" not in control.events
 
 
@@ -397,9 +530,7 @@ async def test_partial_bootstrap_uses_remaining_temp_admin_then_retires_it():
     )
 
     assert "reconcile-keycloak" in control.events
-    assert control.events.index("retire-bootstrap") > control.events.index(
-        "provision-akb-admin"
-    )
+    assert control.events.index("retire-bootstrap") > control.events.index("provision-akb-admin")
     assert report["mode"] == "recovery"
 
 
@@ -497,6 +628,31 @@ async def test_invalid_bootstrap_client_id_stops_before_external_calls():
         )
 
     assert captured.value.code == "keycloak_bootstrap_client_id_invalid"
+    assert control.events == []
+
+
+async def test_invalid_backchannel_logout_uri_stops_before_external_calls():
+    from app.services.standalone_sso_bootstrap import (
+        StandaloneSSOBootstrapError,
+        bootstrap_standalone_sso,
+    )
+
+    control = _Control(manager_available=False, bootstrap_available=True)
+    receipts = _ReceiptStore(control.events)
+
+    async def _should_not_run(**_kwargs):
+        raise AssertionError("invalid callback must fail before reconciliation")
+
+    with pytest.raises(StandaloneSSOBootstrapError) as captured:
+        await bootstrap_standalone_sso(
+            replace(_spec(), backchannel_logout_uri="http://backend:8000/wrong"),
+            control=control,
+            provision_admin=_should_not_run,
+            load_retirement_receipt=receipts.load,
+            record_retirement_receipt=receipts.record,
+        )
+
+    assert captured.value.code == "keycloak_backchannel_logout_uri_invalid"
     assert control.events == []
 
 

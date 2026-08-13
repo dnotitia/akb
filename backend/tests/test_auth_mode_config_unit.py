@@ -349,18 +349,63 @@ def test_sso_admin_client_is_dedicated_and_callback_is_deployment_bound(
             "system_hmac_secret": "test-system-hmac-secret",  # pragma: allowlist secret
             "db_password": "test-db-password",  # pragma: allowlist secret
             "public_base_url": "https://akb.example.com",
+            "keycloak_backchannel_logout_uri": ("http://backend:8000/api/v1/auth/keycloak/backchannel-logout"),
         },
     )
     monkeypatch.setattr(lifecycle, "settings", loaded)
 
     lifecycle._validate_required_settings()
-    assert loaded.keycloak_admin_redirect_uri == (
-        "https://akb.example.com/api/v1/admin/auth/keycloak/callback"
-    )
-    assert loaded.keycloak_admin_post_logout_redirect_uri == (
-        "https://akb.example.com/admin"
+    assert loaded.keycloak_admin_redirect_uri == ("https://akb.example.com/api/v1/admin/auth/keycloak/callback")
+    assert loaded.keycloak_admin_post_logout_redirect_uri == ("https://akb.example.com/admin")
+    assert loaded.keycloak_backchannel_logout_uri_effective == (
+        "http://backend:8000/api/v1/auth/keycloak/backchannel-logout"
     )
     assert "akb-admin" not in loaded.keycloak_human_client_ids
+
+
+def test_sso_backchannel_logout_uri_defaults_public_and_rejects_non_callback_targets(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from app.services import lifecycle
+
+    common = {
+        "auth_mode": "sso",
+        "keycloak_enabled": True,
+        "keycloak_server_url": "https://auth.example.com",
+        "keycloak_client_id": "akb-web",
+        "keycloak_admin_client_id": "akb-admin",
+        "keycloak_admin_client_secret": "admin-client-secret",  # pragma: allowlist secret
+        "system_hmac_secret": "test-system-hmac-secret",  # pragma: allowlist secret
+        "db_password": "test-db-password",  # pragma: allowlist secret
+        "public_base_url": "https://akb.example.com",
+    }
+    defaulted = _load(monkeypatch, tmp_path, common)
+    monkeypatch.setattr(lifecycle, "settings", defaulted)
+    lifecycle._validate_required_settings()
+    assert defaulted.keycloak_backchannel_logout_uri_effective == (
+        "https://akb.example.com/api/v1/auth/keycloak/backchannel-logout"
+    )
+
+    for invalid in (
+        "\nhttp://backend:8000/api/v1/auth/keycloak/backchannel-logout",
+        "http://back end:8000/api/v1/auth/keycloak/backchannel-logout",
+        "http://backend:/api/v1/auth/keycloak/backchannel-logout",
+        "http://backend:8000/api/v1/auth/keycloak/backchannel-logout?",
+        "http://backend:8000/api/v1/auth/keycloak/backchannel-logout#",
+        "http://backend:8000/wrong",
+        "http://backend:8000/api/v1/auth/keycloak/backchannel-logout?redirect=unsafe",
+        "file:///api/v1/auth/keycloak/backchannel-logout",
+        "http://user@backend:8000/api/v1/auth/keycloak/backchannel-logout",
+    ):
+        configured = _load(
+            monkeypatch,
+            tmp_path,
+            {**common, "keycloak_backchannel_logout_uri": invalid},
+        )
+        monkeypatch.setattr(lifecycle, "settings", configured)
+        with pytest.raises(RuntimeError, match="back-channel logout URI"):
+            lifecycle._validate_required_settings()
 
 
 def test_sso_startup_rejects_admin_client_reuse_and_non_tls_public_origin(

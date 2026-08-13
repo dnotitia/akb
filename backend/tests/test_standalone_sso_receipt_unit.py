@@ -108,23 +108,23 @@ async def test_receipt_round_trip_is_exact_idempotent_and_conflict_safe(monkeypa
     await service.record_standalone_sso_retirement_receipt(expected)
 
     with pytest.raises(StandaloneSSOBootstrapError) as captured:
-        await service.record_standalone_sso_retirement_receipt(
-            replace(expected, realm_id="other-realm-id")
-        )
+        await service.record_standalone_sso_retirement_receipt(replace(expected, realm_id="other-realm-id"))
 
     assert captured.value.code == "keycloak_bootstrap_retirement_receipt_mismatch"
     assert await service.load_standalone_sso_retirement_receipt() == expected
     assert conn.writes == 1
 
 
-async def test_loader_reads_legacy_v1_until_current_v2_receipt_exists(monkeypatch):
+async def test_loader_prefers_current_v3_then_v2_then_v1(monkeypatch):
     from app.services import standalone_sso_receipt as service
     from app.services.standalone_sso_bootstrap import (
         STANDALONE_SSO_RECEIPT_PROFILE_V1,
+        STANDALONE_SSO_RECEIPT_PROFILE_V2,
     )
 
     conn = _Connection()
     legacy = _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V1)
+    v2 = _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V2)
     current = _receipt()
 
     def _row(receipt):
@@ -140,7 +140,7 @@ async def test_loader_reads_legacy_v1_until_current_v2_receipt_exists(monkeypatc
             "akb_user_id": receipt.akb_user_id,
         }
 
-    for receipt in (legacy, current):
+    for receipt in (legacy, v2, current):
         conn.rows[receipt.profile] = _row(receipt)
 
     async def _get_pool():
@@ -148,6 +148,9 @@ async def test_loader_reads_legacy_v1_until_current_v2_receipt_exists(monkeypatc
 
     monkeypatch.setattr(service, "get_pool", _get_pool)
     del conn.rows[current.profile]
+    assert await service.load_standalone_sso_retirement_receipt() == v2
+
+    del conn.rows[v2.profile]
     assert await service.load_standalone_sso_retirement_receipt() == legacy
 
     conn.rows[current.profile] = _row(current)

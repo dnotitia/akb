@@ -38,6 +38,7 @@ from app.services.revision_backend import (
     canonical_document_revision_backend,
     selected_document_revision_backend,
 )
+from app.services.sso_callback_urls import is_backchannel_logout_uri
 from app.services.role_sync import RoleSync, get_role_sync, set_role_sync
 from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
 from app.services.vector_store import get_vector_store
@@ -157,6 +158,12 @@ def _validate_required_settings() -> None:
         if not _is_secure_browser_url(settings.keycloak_server_url):
             raise RuntimeError(
                 "auth_mode=sso requires an HTTPS public Keycloak URL; plain HTTP is allowed only on loopback"
+            )
+        if not is_backchannel_logout_uri(
+            settings.keycloak_backchannel_logout_uri_effective
+        ):
+            raise RuntimeError(
+                "auth_mode=sso requires an exact HTTP(S) AKB back-channel logout URI"
             )
     if auth_mode == "local":
         from app.services.local_session_keys import get_local_session_keyset

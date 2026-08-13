@@ -43,6 +43,9 @@ def _patch_sso_settings(monkeypatch) -> None:
         "keycloak_enabled": True,
         "keycloak_server_url": "https://auth.akb.example.com",
         "keycloak_internal_url": "http://keycloak:8080",
+        "keycloak_backchannel_logout_uri": (
+            "http://backend:8000/api/v1/auth/keycloak/backchannel-logout"
+        ),
         "keycloak_realm": "akb",
         "keycloak_client_id": "akb-web",
         "keycloak_client_secret": _API_SECRET,
@@ -157,6 +160,9 @@ async def test_bootstrap_cli_reads_only_secret_files_and_emits_allowlisted_repor
     assert spec.management_client_secret == _MANAGEMENT_SECRET
     assert spec.api_client_secret == _API_SECRET
     assert spec.admin_client_secret == _ADMIN_SECRET
+    assert spec.backchannel_logout_uri == (
+        "http://backend:8000/api/v1/auth/keycloak/backchannel-logout"
+    )
     assert observed["verify_ssl"] is True
     assert observed["closed"] is True
     assert callable(observed["load_retirement_receipt"])
