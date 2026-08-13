@@ -1,6 +1,6 @@
 ---
 status: accepted
-stage: design
+stage: implementation
 created: 2026-08-13
 updated: 2026-08-13
 ---
@@ -8,7 +8,9 @@ updated: 2026-08-13
 # Authentication Mode Boundary
 
 This is the Phase 0 architecture decision for
-[#357](https://github.com/dnotitia/akb/issues/357). Implementation is pending.
+[#357](https://github.com/dnotitia/akb/issues/357). The Phase 1 mode and
+verifier boundary and the Phase 2 local-session/admin-provisioning subset are
+implemented; browser SSO and provider control remain staged.
 The record fixes the authority and security boundaries that later phases must
 preserve without fixing their route layout, claim schema, or code structure.
 Public revision and review summaries are recorded in
@@ -233,15 +235,31 @@ claim field names.
 
 ## Open Decisions
 
+The Phase 2 implementation fixed these previously open choices:
+
+- `local-session-rs256-v2` uses RS256 with an installation-owned RSA-3072
+  private key, an RFC 7638-thumbprinted `kid`, exact issuer and API audience,
+  a dedicated JOSE type, `jti`, profile, token-use, and numeric lifetime
+  claims;
+- key generation is an explicit, non-overwriting operator action; the private
+  PEM and bounded public JWKS are persistent deployment secrets, while only
+  the public JWKS is exposed by the local-mode API;
+- rotation activates a new private key and may retain up to three explicitly
+  supplied prior public keys for verification; rollback restores the prior
+  immutable private/JWKS pair;
+- the HS256 cutover uses immediate reauthentication. No legacy human-session
+  verifier remains and the old `jwt_secret` is accepted for one release only
+  as migration input for non-session HMAC capabilities; and
+- the recovery administrator is provisioned explicitly through a non-HTTP,
+  single-designation command. Local provisioning creates a password-backed
+  admin; SSO provisioning pre-binds an exact issuer and subject with no usable
+  local password. Ordinary registration never creates an administrator.
+
 The following remain open until their owning implementation phase:
 
-- the first asymmetric local profile's algorithm, key parameters, claims,
-  storage, publication, and rotation details;
 - the concrete OIDC issuer and AKB audience/resource identifiers, accepted
   credential type, and provider-specific representation selected by the first
   versioned OIDC profile;
-- immediate reauthentication versus a bounded legacy symmetric-session window,
-  including the window's exact duration;
 - whether legacy hybrid installations require a bounded compatibility release
   or must select a canonical mode before upgrade;
 - the exact configuration migration and invalid-combination diagnostics;
@@ -250,8 +268,7 @@ The following remain open until their owning implementation phase:
   Workspace Account Governance remains authoritative;
 - browser-side session transport and server-side token custody, refresh,
   logout, and revocation mechanics;
-- product-admin bootstrap credentials, recovery ceremony, and exact control
-  endpoints; and
+- product-admin browser-session transport and exact control endpoints; and
 - versioned public login-options and admin-control API shapes.
 
 No implementation should infer one of these choices from this ADR. The owning

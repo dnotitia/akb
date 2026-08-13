@@ -36,8 +36,12 @@ s3_region: us-east-1
 
 # === Auth ===
 auth_mode: local
-jwt_algorithm: HS256
+jwt_algorithm: RS256
 jwt_expire_hours: 24
+local_session_private_key_path: /var/lib/akb/local-session/private.pem
+local_session_jwks_path: /var/lib/akb/local-session/jwks.json
+local_session_issuer: ""
+local_session_audience: ""
 
 # === Server ===
 host: 0.0.0.0

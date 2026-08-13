@@ -48,13 +48,25 @@ def _validate_required_settings() -> None:
     """Fail fast on missing required config so misconfigured deploys don't
     silently serve unsigned tokens or produce confusing downstream errors."""
     auth_mode = settings.require_auth_mode()
-    if auth_mode == "local" and settings.jwt_algorithm != "HS256":
-        raise RuntimeError("jwt_algorithm must be HS256 while local-session-legacy-v1 is active")
+    if auth_mode == "local" and settings.jwt_algorithm != "RS256":
+        raise RuntimeError(
+            "jwt_algorithm must be RS256 for the local-session-rs256-v2 profile; "
+            "HS256 sessions require forced re-login during upgrade"
+        )
     if settings.mcp_oauth_enabled and settings.api_oauth_audience_effective == settings.mcp_oauth_audience_effective:
         raise RuntimeError("API and MCP OAuth audiences must be distinct resource identifiers")
     missing: list[str] = []
-    if not settings.jwt_secret:
-        missing.append("AKB_JWT_SECRET (compatibility HMAC material — use a strong random string)")
+    if not settings.system_hmac_secret_effective:
+        missing.append("system_hmac_secret (internal non-session HMAC material — use a strong random string)")
+    if auth_mode == "local":
+        if not settings.local_session_private_key_path.strip():
+            missing.append("local_session_private_key_path (auth_mode is local)")
+        if not settings.local_session_jwks_path.strip():
+            missing.append("local_session_jwks_path (auth_mode is local)")
+        if not settings.local_session_issuer_effective:
+            missing.append("local_session_issuer or public_base_url (auth_mode is local)")
+        if not settings.local_session_audience_effective:
+            missing.append("local_session_audience or public_base_url (auth_mode is local)")
     if not settings.db_password:
         missing.append("AKB_DB_PASSWORD")
     if not settings.public_base_url:
@@ -93,6 +105,10 @@ def _validate_required_settings() -> None:
         )
     if missing:
         raise RuntimeError("Required configuration missing:\n  - " + "\n  - ".join(missing))
+    if auth_mode == "local":
+        from app.services.local_session_keys import get_local_session_keyset
+
+        get_local_session_keyset()
 
 
 async def init_storage() -> None:

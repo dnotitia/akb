@@ -165,6 +165,19 @@ async def auth_config():
     }
 
 
+@router.get("/auth/jwks", summary="Local-session public verification keys")
+async def local_session_jwks():
+    """Publish only the bounded public keyset for local-session-rs256-v2."""
+    if settings.require_auth_mode() != "local":
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "Local human authentication is not enabled",
+        )
+    from app.services.local_session_keys import get_local_session_keyset
+
+    return get_local_session_keyset().public_jwks
+
+
 # ── Staged Keycloak browser surface ───────────────────────────────────
 #
 # Each handler 404s outside SSO mode and returns the stable staging error in

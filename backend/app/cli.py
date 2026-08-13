@@ -9,6 +9,9 @@ The backend container is pip-installed (no uv inside). Use plain `python`
 in all in-container invocations.
 
 Subcommands:
+    generate-local-session-keyset
+                               Create a non-overwriting RSA-3072 private key
+                               and public JWKS for local-session-rs256-v2.
     provision-recovery-admin   Explicitly provision the designated local or
                                SSO recovery administrator. Password material
                                is accepted only by file/stdin and is never
@@ -44,6 +47,11 @@ PROVISION_RECOVERY_ADMIN_USAGE = (
     "  sso:   --issuer ISSUER --subject SUBJECT"
 )
 
+GENERATE_LOCAL_SESSION_KEYSET_USAGE = (
+    "Usage: python -m app.cli generate-local-session-keyset "
+    "--output-dir DIR [--retain-jwks PATH ...]"
+)
+
 
 class _CLIUsageError(Exception):
     pass
@@ -51,6 +59,33 @@ class _CLIUsageError(Exception):
 
 class _ProvisioningInputError(Exception):
     pass
+
+
+def _generate_local_session_keyset(args: list[str]) -> int:
+    parser = _SafeArgumentParser(add_help=False)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--retain-jwks", action="append", default=[])
+    try:
+        parsed = parser.parse_args(args)
+    except _CLIUsageError:
+        print(GENERATE_LOCAL_SESSION_KEYSET_USAGE, file=sys.stderr)
+        return 2
+
+    from app.services.local_session_keys import (
+        LocalSessionKeyConfigurationError,
+        generate_local_session_keyset,
+    )
+
+    try:
+        report = generate_local_session_keyset(
+            parsed.output_dir,
+            retain_jwks_paths=parsed.retain_jwks,
+        )
+    except LocalSessionKeyConfigurationError as exc:
+        print(f"local_session_keyset_failed: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(report, sort_keys=True))
+    return 0
 
 
 class _SafeArgumentParser(argparse.ArgumentParser):
@@ -394,7 +429,8 @@ def main(argv: list[str] | None = None) -> int:
     if not argv:
         print("Usage: python -m app.cli <subcommand> [args]", file=sys.stderr)
         print(
-            "Subcommands: provision-recovery-admin {local|sso}, "
+            "Subcommands: generate-local-session-keyset, "
+            "provision-recovery-admin {local|sso}, "
             "reset-password <username>, repair-resource-hashes, "
             "initialize-postgres-native, okf-validate <dir>, "
             "okf-export --from-git <worktree> --vault <name> --out <dir>",
@@ -402,6 +438,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     cmd = argv[0]
+    if cmd == "generate-local-session-keyset":
+        return _generate_local_session_keyset(argv[1:])
     if cmd == "provision-recovery-admin":
         return asyncio.run(_provision_recovery_admin(argv[1:]))
     if cmd == "reset-password":

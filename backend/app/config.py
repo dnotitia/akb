@@ -777,14 +777,26 @@ class Settings(BaseModel):
     document_asset_gc_interval_secs: int = Field(default=300, ge=10, le=86400)
     document_asset_upload_body_timeout_secs: float = Field(default=60.0, ge=1.0, le=900.0)
 
-    # Compatibility HMAC material currently shared by local human sessions,
-    # publication/view grants, and an inventory-cursor fallback. Startup
-    # requires it in every mode so those internal capabilities never use an
-    # empty key. Only local mode selects it as a human credential authority;
-    # Phase 2 will decouple the non-session consumers from future session keys.
+    # Deprecated Phase-1 compatibility input. It is never a human-session
+    # signing authority after the local-session-rs256-v2 cutover. Canonical
+    # runtime config rejects it when supplied; `system_hmac_secret` owns the
+    # remaining publication/cursor HMAC capabilities.
     jwt_secret: str = ""
-    jwt_algorithm: str = "HS256"
+    jwt_algorithm: str = "RS256"
     jwt_expire_hours: int = 24
+
+    # Internal non-session HMAC material. This must be independent of the
+    # local-session private key and of app-token signing material.
+    system_hmac_secret: str = ""
+
+    # Local human-session v2. The keyset is generated explicitly by the
+    # operator, persisted outside the image, and loaded read-only at runtime.
+    # A public JWKS may retain old v2 verification keys for bounded rotation;
+    # the private PEM always identifies the single active signer.
+    local_session_private_key_path: str = ""
+    local_session_jwks_path: str = ""
+    local_session_issuer: str = ""
+    local_session_audience: str = ""
 
     # Canonical install-time discriminator for human authentication. None is
     # allowed only so unrelated tests can construct Settings directly; the real
@@ -1083,6 +1095,28 @@ class Settings(BaseModel):
     def sso_human_auth_enabled(self) -> bool:
         """Derived SSO-human capability for later route/verifier slices."""
         return self.require_auth_mode() == "sso"
+
+    @property
+    def local_session_issuer_effective(self) -> str:
+        """Deployment-bound issuer for local application sessions."""
+        return (self.local_session_issuer or self.public_base_url).rstrip("/")
+
+    @property
+    def local_session_audience_effective(self) -> str:
+        """REST resource audience for local application sessions."""
+        if self.local_session_audience:
+            return self.local_session_audience
+        return f"{self.public_base_url.rstrip('/')}/api"
+
+    @property
+    def system_hmac_secret_effective(self) -> str:
+        """Non-session HMAC authority with one-release legacy input support.
+
+        `jwt_secret` is accepted only as migration input for capabilities that
+        were already HMAC-backed.  It is never consulted by a human-session
+        issuer or verifier after the RS256 v2 cutover.
+        """
+        return self.system_hmac_secret or self.jwt_secret
 
     # ── Keycloak OIDC derived endpoints ───────────────────────────
     # All computed off the realm issuer so only server_url + realm are

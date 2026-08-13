@@ -64,7 +64,7 @@ After the script finishes:
 
 ```bash
 kubectl edit configmap akb-app-config -n akb   # set embed_*, llm_*, s3_*, public_base_url
-kubectl edit secret    akb-secret-config -n akb # set jwt_secret, embed_api_key, …
+kubectl edit secret    akb-secret-config -n akb # set system_hmac_secret, embed_api_key, …
 ```
 
 The placeholder ConfigMap in `backend.yaml` matches `config/app.yaml.example`
@@ -96,19 +96,31 @@ Secrets) goes here too.
 
 ## Secrets
 
-Two Secrets are NOT created by `deploy.sh` — manage them out-of-band so
+Three Secrets are NOT created by `deploy.sh` — manage them out-of-band so
 re-runs don't clobber real credentials with placeholders:
 
 - `akb-secret-config` — `secret.yaml` mounted at `/etc/akb/secret.yaml`
-  in the backend pod. Required keys: `db_password`, `jwt_secret`,
+  in the backend pod. Required keys: `db_password`, `system_hmac_secret`,
   `embed_api_key` (and optionally `llm_api_key`, `rerank_api_key`,
   `s3_*_key`, `vector_api_key`, `redis_password`).
+- `akb-local-session-keys` — the persistent RSA-3072 private key and public
+  JWKS for `local-session-rs256-v2`. Generate them explicitly once and back
+  them up with the installation. Replacing both files without retaining the
+  old public JWK intentionally forces every local user to sign in again.
 - `redis-credentials` — single key `password`, referenced by the Redis
   CR. Skip if you disable the event stream (`redis_url: ""`).
 
 ```bash
 kubectl create secret generic akb-secret-config -n akb \
   --from-file=secret.yaml=./secret.yaml
+
+cd backend
+uv run python -m app.cli generate-local-session-keyset \
+  --output-dir ../local-session-keys
+cd ..
+kubectl create secret generic akb-local-session-keys -n akb \
+  --from-file=private.pem=./local-session-keys/private.pem \
+  --from-file=jwks.json=./local-session-keys/jwks.json
 
 PW=$(openssl rand -base64 32)
 kubectl create secret generic redis-credentials -n akb \

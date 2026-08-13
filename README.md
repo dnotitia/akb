@@ -275,7 +275,14 @@ store* below.
 # 1. Configure
 cp config/app.yaml.example   config/app.yaml
 cp config/secret.yaml.example config/secret.yaml
-$EDITOR config/secret.yaml   # set embed_api_key (and jwt_secret for any non-local deploy)
+$EDITOR config/secret.yaml   # set embed_api_key and replace system_hmac_secret
+
+# Generate the installation's persistent RSA-3072 local-session keyset.
+# This directory is gitignored; back it up with the other installation secrets.
+cd backend
+uv run python -m app.cli generate-local-session-keyset \
+  --output-dir ../config/local-session
+cd ..
 
 # 2. Run
 docker compose up -d
@@ -320,6 +327,33 @@ username/email, or an already-bound external identity fails closed. The SSO
 command stores no usable local password and does not contact the identity
 provider. Generated output files are create-only and never overwritten; for a
 retry after the file exists, pass that file back with `--password-file`.
+
+Local login issues only the versioned `local-session-rs256-v2` profile:
+RS256 with an installation-owned RSA-3072 key, an RFC 7638 `kid`, exact
+deployment issuer/audience, `jti`, and a public-only JWKS at
+`GET /api/v1/auth/jwks`. AKB never chooses a verifier from an untrusted token
+`alg` header. Upgrading from an HS256 release is an intentional forced-login
+boundary: generate and persist the v2 keyset before rollout, set
+`jwt_algorithm: RS256`, and restart all backends together. Existing HS256 user
+sessions then receive 401 and must sign in again; PATs and service keys are not
+revoked. The old `jwt_secret` may be retained for one release only as migration
+input for short-lived internal HMAC capabilities, or renamed unchanged to
+`system_hmac_secret`; it is never accepted as human-session signing material.
+
+For routine v2 key rotation, generate a new directory while retaining the
+current public JWKS, publish the new immutable Secret/config revision, and
+roll every backend to that exact pair:
+
+```bash
+cd backend
+uv run python -m app.cli generate-local-session-keyset \
+  --output-dir /secure/akb/local-session-next \
+  --retain-jwks /secure/akb/local-session-current/jwks.json
+```
+
+Keep a retained public key for at least `jwt_expire_hours` plus rollout skew,
+then remove it in a later coordinated keyset revision. Restoring the previous
+private/JWKS pair is the rollback; never overwrite key files in place.
 
 ### Vector store (driver-pluggable)
 

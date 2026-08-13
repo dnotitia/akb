@@ -38,6 +38,9 @@ data:
 
     # Required canonical human-login mode. This base deployment is local.
     auth_mode: local
+    jwt_algorithm: RS256
+    local_session_private_key_path: /etc/akb/local-session/private.pem
+    local_session_jwks_path: /etc/akb/local-session/jwks.json
 
     # Vector store — default driver is pgvector inside the main PG pod
     # (`pgvector/pgvector:pg16` ships with the extension). Override
@@ -65,7 +68,7 @@ data:
 #   stringData:
 #     secret.yaml: |
 #       db_password: <postgres password>
-#       jwt_secret:  <openssl rand -hex 32>
+#       system_hmac_secret: <openssl rand -hex 32>
 #       embed_api_key: <provider key>
 #       llm_api_key: <provider key>
 #       rerank_api_key: <cohere key>
@@ -109,6 +112,9 @@ spec:
             - name: secret-config
               mountPath: /etc/akb/secret.yaml
               subPath: secret.yaml
+              readOnly: true
+            - name: local-session-keys
+              mountPath: /etc/akb/local-session
               readOnly: true
             - name: vaultdata
               mountPath: /data/vaults
@@ -161,6 +167,10 @@ spec:
         - name: secret-config
           secret:
             secretName: akb-secret-config
+        - name: local-session-keys
+          secret:
+            secretName: akb-local-session-keys
+            defaultMode: 0400
         - name: vaultdata
           persistentVolumeClaim:
             claimName: akb-vaultdata

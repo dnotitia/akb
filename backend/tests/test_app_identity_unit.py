@@ -16,8 +16,8 @@ from app.services import app_identity_service, auth_service
 def _configure_secrets(monkeypatch) -> None:
     monkeypatch.setattr(
         settings,
-        "jwt_secret",
-        "user-session-signing-material-long-enough",
+        "system_hmac_secret",
+        "system-capability-hmac-material-long-enough",
         raising=False,
     )
     monkeypatch.setattr(
@@ -68,8 +68,9 @@ def test_app_token_contains_identity_not_registry_authority(monkeypatch):
     }.isdisjoint(claims)
 
 
-def test_matching_user_and_app_signing_secrets_fail_closed(monkeypatch):
-    monkeypatch.setattr(settings, "jwt_secret", "same-signing-material", raising=False)
+def test_matching_system_hmac_and_app_signing_secrets_fail_closed(monkeypatch):
+    monkeypatch.setattr(settings, "system_hmac_secret", "same-signing-material", raising=False)
+    monkeypatch.setattr(settings, "jwt_secret", "irrelevant-migration-input", raising=False)
     monkeypatch.setattr(settings, "app_token_secret", "same-signing-material", raising=False)
 
     with pytest.raises(AKBError) as exc:
@@ -91,7 +92,7 @@ async def test_explicit_app_token_type_never_reaches_user_lookup(monkeypatch):
             "iat": now,
             "exp": now + timedelta(minutes=5),
         },
-        settings.jwt_secret,
+        settings.system_hmac_secret_effective,
         algorithm="HS256",
         headers={"typ": app_identity_service.APP_TOKEN_TYPE},
     )
@@ -102,9 +103,7 @@ async def test_explicit_app_token_type_never_reaches_user_lookup(monkeypatch):
     monkeypatch.setattr(auth_service, "get_pool", forbidden_pool)
 
     assert await auth_service.resolve_token(f"Bearer {app_shaped}") is None
-    assert await auth_service.resolve_akb_session_authorization(
-        f"Bearer {app_shaped}"
-    ) is None
+    assert await auth_service.resolve_akb_session_authorization(f"Bearer {app_shaped}") is None
 
 
 def test_supported_capabilities_are_control_plane_only():

@@ -1,7 +1,7 @@
 # Keycloak OIDC boundary
 
-**Status:** Phase 1 verifier and projection boundary active; browser session
-cutover staged unavailable
+**Status:** Phase 2 local verifier/admin provisioning active; ordinary SSO
+browser session cutover staged unavailable
 
 The accepted
 [Authentication Mode Boundary](../../design/accepted/2026-08-13-authentication-mode-boundary/README.md)
@@ -14,7 +14,7 @@ are authoritative. This document records the current implementation shape.
 Human REST and delegated-human routes select exactly one verifier from the
 canonical `auth_mode`:
 
-- `local` selects `local-session-legacy-v1` only;
+- `local` selects `local-session-rs256-v2` only;
 - `sso` selects `keycloak-access-v1` only.
 
 `keycloak-access-v1` is a Keycloak 26-compatible RS256 access-token profile.
@@ -35,6 +35,15 @@ session JWTs are never MCP credentials.
 No token header selects an algorithm, issuer, key source, or fallback
 verifier. Token-supplied key URLs/material are rejected. An unknown `kid` may
 cause one refresh from the same pinned JWKS endpoint and then fails.
+
+`local-session-rs256-v2` is RS256 over an installation-owned RSA-3072 key.
+The active private key and bounded public JWKS are explicit persistent
+operator inputs; startup never creates ephemeral signing material. Tokens bind
+an RFC 7638 `kid`, exact deployment issuer and API audience, JOSE type,
+profile/token-use claims, `jti`, and numeric lifetime claims. The public-only
+keyset is available from `/api/v1/auth/jwks` in local mode. The Phase 2 cutover
+uses immediate reauthentication: the legacy HS256 verifier and issuance path
+are absent, so an old session fails rather than trying another profile.
 
 ## Exact AKB account projection
 
