@@ -1279,7 +1279,8 @@ class KeycloakStandaloneSSOControl:
         *,
         management_token: str,
         require_identity_provider_mapper: bool,
-        legacy_backchannel_logout: bool,
+        source_backchannel_logout_uri: str | None,
+        allow_current_backchannel_logout: bool,
     ) -> StandaloneSSOReadback:
         realm = await self._realm(spec, token=management_token)
         if realm is None or not self._realm_matches(spec, realm):
@@ -1290,7 +1291,7 @@ class KeycloakStandaloneSSOControl:
             (
                 self._api_client(
                     spec,
-                    backchannel_logout_uri=(spec.legacy_backchannel_logout_uri if legacy_backchannel_logout else None),
+                    backchannel_logout_uri=source_backchannel_logout_uri,
                 ),
                 "api",
             ),
@@ -1310,7 +1311,7 @@ class KeycloakStandaloneSSOControl:
                 actual,
                 expected,
             )
-            if not matches and actual is not None and role == "api" and legacy_backchannel_logout:
+            if not matches and actual is not None and role == "api" and allow_current_backchannel_logout:
                 # A crash after the one-time authority updated the client but
                 # before receipt persistence must converge on retry. Accept
                 # only the exact source or exact target representation.
@@ -1451,7 +1452,8 @@ class KeycloakStandaloneSSOControl:
             spec,
             management_token=management_token,
             require_identity_provider_mapper=True,
-            legacy_backchannel_logout=False,
+            source_backchannel_logout_uri=None,
+            allow_current_backchannel_logout=False,
         )
 
     async def readback_legacy_v1(
@@ -1464,7 +1466,8 @@ class KeycloakStandaloneSSOControl:
             spec,
             management_token=management_token,
             require_identity_provider_mapper=False,
-            legacy_backchannel_logout=True,
+            source_backchannel_logout_uri=spec.legacy_backchannel_logout_uri,
+            allow_current_backchannel_logout=True,
         )
 
     async def readback_legacy_v2(
@@ -1477,7 +1480,23 @@ class KeycloakStandaloneSSOControl:
             spec,
             management_token=management_token,
             require_identity_provider_mapper=True,
-            legacy_backchannel_logout=True,
+            source_backchannel_logout_uri=spec.legacy_backchannel_logout_uri,
+            allow_current_backchannel_logout=True,
+        )
+
+    async def readback_callback_migration(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        source_backchannel_logout_uri: str,
+        management_token: str,
+    ) -> StandaloneSSOReadback:
+        return await self._readback(
+            spec,
+            management_token=management_token,
+            require_identity_provider_mapper=True,
+            source_backchannel_logout_uri=source_backchannel_logout_uri,
+            allow_current_backchannel_logout=True,
         )
 
     async def upgrade_legacy_to_current(
@@ -1515,6 +1534,38 @@ class KeycloakStandaloneSSOControl:
             spec,
             api_uuid,
             self._api_identity_provider_mapper(),
+            token=upgrade_token,
+        )
+        return await self.readback(
+            spec,
+            management_token=upgrade_token,
+        )
+
+    async def upgrade_callback_to_current(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        source_backchannel_logout_uri: str,
+        upgrade_token: str,
+    ) -> StandaloneSSOReadback:
+        expected_source = self._api_client(
+            spec,
+            backchannel_logout_uri=source_backchannel_logout_uri,
+        )
+        api = await self._exact_client(
+            spec,
+            spec.realm,
+            spec.api_client_id,
+            token=upgrade_token,
+        )
+        if api is None or not (
+            self._selected_client_matches(api, expected_source)
+            or self._selected_client_matches(api, self._api_client(spec))
+        ):
+            raise _fail("keycloak_client_readback_failed")
+        await self._reconcile_client(
+            spec,
+            self._api_client(spec),
             token=upgrade_token,
         )
         return await self.readback(

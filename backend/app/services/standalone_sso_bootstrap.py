@@ -120,6 +120,7 @@ class StandaloneSSORetirementReceipt:
     api_client_uuid: str
     product_admin_subject: str
     akb_user_id: str
+    backchannel_logout_uri: str | None = None
 
 
 class StandaloneSSOControl(Protocol):
@@ -166,10 +167,26 @@ class StandaloneSSOControl(Protocol):
         management_token: str,
     ) -> StandaloneSSOReadback: ...
 
+    async def readback_callback_migration(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        source_backchannel_logout_uri: str,
+        management_token: str,
+    ) -> StandaloneSSOReadback: ...
+
     async def upgrade_legacy_to_current(
         self,
         spec: StandaloneSSOBootstrapSpec,
         *,
+        upgrade_token: str,
+    ) -> StandaloneSSOReadback: ...
+
+    async def upgrade_callback_to_current(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        source_backchannel_logout_uri: str,
         upgrade_token: str,
     ) -> StandaloneSSOReadback: ...
 
@@ -204,7 +221,15 @@ class StandaloneSSOControl(Protocol):
 
 ProvisionAdmin = Callable[..., Awaitable[Mapping[str, object]]]
 LoadRetirementReceipt = Callable[[], Awaitable[StandaloneSSORetirementReceipt | None]]
-RecordRetirementReceipt = Callable[[StandaloneSSORetirementReceipt], Awaitable[None]]
+
+
+class RecordRetirementReceipt(Protocol):
+    def __call__(
+        self,
+        receipt: StandaloneSSORetirementReceipt,
+        *,
+        previous_receipt: StandaloneSSORetirementReceipt | None = None,
+    ) -> Awaitable[None]: ...
 
 
 def _validate_readback(readback: StandaloneSSOReadback) -> None:
@@ -251,6 +276,7 @@ def _expected_retirement_receipt(
     akb_user_id: str,
     profile: str = STANDALONE_SSO_RECEIPT_PROFILE,
     retired_client_id: str | None = None,
+    backchannel_logout_uri: str | None = None,
 ) -> StandaloneSSORetirementReceipt:
     return StandaloneSSORetirementReceipt(
         profile=profile,
@@ -262,6 +288,11 @@ def _expected_retirement_receipt(
         api_client_uuid=readback.api_client_uuid,
         product_admin_subject=readback.product_admin_subject,
         akb_user_id=akb_user_id,
+        backchannel_logout_uri=(
+            backchannel_logout_uri
+            if backchannel_logout_uri is not None
+            else (spec.backchannel_logout_uri_effective if profile == STANDALONE_SSO_RECEIPT_PROFILE else None)
+        ),
     )
 
 
@@ -271,17 +302,32 @@ def _validate_receipt_static_binding(
 ) -> None:
     if receipt.profile == STANDALONE_SSO_RECEIPT_PROFILE_V1:
         expected_client_ids = {spec.bootstrap_client_id}
-    elif receipt.profile in {
-        STANDALONE_SSO_RECEIPT_PROFILE_V2,
-        STANDALONE_SSO_RECEIPT_PROFILE,
-    }:
+    elif receipt.profile == STANDALONE_SSO_RECEIPT_PROFILE_V2:
         expected_client_ids = {
             spec.bootstrap_client_id,
             spec.upgrade_client_id,
         }
+    elif receipt.profile == STANDALONE_SSO_RECEIPT_PROFILE:
+        expected_client_ids = {
+            spec.bootstrap_client_id,
+            spec.upgrade_client_id,
+        }
+        if receipt.backchannel_logout_uri is None or not is_backchannel_logout_uri(receipt.backchannel_logout_uri):
+            raise StandaloneSSOBootstrapError("keycloak_bootstrap_retirement_receipt_mismatch")
     else:
         expected_client_ids = set()
-    if receipt.issuer != spec.issuer or receipt.bootstrap_client_id not in expected_client_ids:
+    if (
+        receipt.issuer != spec.issuer
+        or receipt.bootstrap_client_id not in expected_client_ids
+        or (
+            receipt.profile
+            in {
+                STANDALONE_SSO_RECEIPT_PROFILE_V1,
+                STANDALONE_SSO_RECEIPT_PROFILE_V2,
+            }
+            and receipt.backchannel_logout_uri is not None
+        )
+    ):
         raise StandaloneSSOBootstrapError("keycloak_bootstrap_retirement_receipt_mismatch")
 
 
@@ -316,14 +362,23 @@ async def bootstrap_standalone_sso(
     legacy_v1 = source_profile == STANDALONE_SSO_RECEIPT_PROFILE_V1
     legacy_v2 = source_profile == STANDALONE_SSO_RECEIPT_PROFILE_V2
     legacy_profile = legacy_v1 or legacy_v2
-    metadata_upgrade_required = legacy_v1 or (
+    legacy_mutation_required = legacy_v1 or (
         legacy_v2 and spec.backchannel_logout_uri_effective != spec.legacy_backchannel_logout_uri
     )
+    source_callback_uri: str | None = None
+    if source_profile == STANDALONE_SSO_RECEIPT_PROFILE:
+        assert retirement_receipt is not None
+        assert retirement_receipt.backchannel_logout_uri is not None
+        source_callback_uri = retirement_receipt.backchannel_logout_uri
+    callback_migration_required = (
+        source_callback_uri is not None and source_callback_uri != spec.backchannel_logout_uri_effective
+    )
+    mutation_upgrade_required = legacy_mutation_required or callback_migration_required
 
     management_token = await control.acquire_management(spec)
     bootstrap_token = await control.acquire_bootstrap(spec)
     upgrade_token = (
-        await control.acquire_upgrade(spec) if metadata_upgrade_required or spec.upgrade_client_secret else None
+        await control.acquire_upgrade(spec) if mutation_upgrade_required or spec.upgrade_client_secret else None
     )
     if management_token is None and bootstrap_token is None and upgrade_token is None:
         raise StandaloneSSOBootstrapError("keycloak_install_credential_unavailable")
@@ -355,14 +410,14 @@ async def bootstrap_standalone_sso(
             raise StandaloneSSOBootstrapError("keycloak_bootstrap_client_reactivated")
         if management_token is None:
             raise StandaloneSSOBootstrapError("keycloak_management_credential_unavailable")
-        if metadata_upgrade_required and upgrade_token is None:
+        if legacy_mutation_required and upgrade_token is None:
             raise StandaloneSSOBootstrapError("keycloak_upgrade_credential_required")
-        if not metadata_upgrade_required and upgrade_token is not None:
+        if not legacy_mutation_required and upgrade_token is not None:
             raise StandaloneSSOBootstrapError("keycloak_upgrade_client_unexpected")
         mode = (
             "upgrade-v1-to-v3"
             if legacy_v1
-            else ("upgrade-v2-to-v3" if metadata_upgrade_required else "upgrade-v2-to-v3-readback")
+            else ("upgrade-v2-to-v3" if legacy_mutation_required else "upgrade-v2-to-v3-readback")
         )
         keycloak_mutated = False
         readback = await (
@@ -375,6 +430,21 @@ async def bootstrap_standalone_sso(
                 spec,
                 management_token=management_token,
             )
+        )
+    elif callback_migration_required:
+        if bootstrap_token is not None:
+            raise StandaloneSSOBootstrapError("keycloak_bootstrap_client_reactivated")
+        if management_token is None:
+            raise StandaloneSSOBootstrapError("keycloak_management_credential_unavailable")
+        if upgrade_token is None:
+            raise StandaloneSSOBootstrapError("keycloak_upgrade_credential_required")
+        assert source_callback_uri is not None
+        mode = "upgrade-v3-callback"
+        keycloak_mutated = False
+        readback = await control.readback_callback_migration(
+            spec,
+            source_backchannel_logout_uri=source_callback_uri,
+            management_token=management_token,
         )
     else:
         if bootstrap_token is not None:
@@ -399,21 +469,35 @@ async def bootstrap_standalone_sso(
     )
     user_id = _validate_projection(projection)
 
-    if legacy_profile:
+    if legacy_profile or callback_migration_required:
         assert retirement_receipt is not None
-        expected_legacy_receipt = _expected_retirement_receipt(
+        expected_source_receipt = _expected_retirement_receipt(
             spec,
             readback,
             akb_user_id=user_id,
             profile=retirement_receipt.profile,
             retired_client_id=retirement_receipt.bootstrap_client_id,
+            backchannel_logout_uri=retirement_receipt.backchannel_logout_uri,
         )
-        if retirement_receipt != expected_legacy_receipt:
+        if retirement_receipt != expected_source_receipt:
             raise StandaloneSSOBootstrapError("keycloak_bootstrap_retirement_receipt_mismatch")
-        if metadata_upgrade_required:
+        if legacy_mutation_required:
             assert upgrade_token is not None
             upgraded_readback = await control.upgrade_legacy_to_current(
                 spec,
+                upgrade_token=upgrade_token,
+            )
+            _validate_readback(upgraded_readback)
+            if upgraded_readback != readback:
+                raise StandaloneSSOBootstrapError("keycloak_upgrade_readback_changed")
+            readback = upgraded_readback
+            keycloak_mutated = True
+        elif callback_migration_required:
+            assert upgrade_token is not None
+            assert source_callback_uri is not None
+            upgraded_readback = await control.upgrade_callback_to_current(
+                spec,
+                source_backchannel_logout_uri=source_callback_uri,
                 upgrade_token=upgrade_token,
             )
             _validate_readback(upgraded_readback)
@@ -441,7 +525,7 @@ async def bootstrap_standalone_sso(
         akb_user_id=user_id,
         retired_client_id=(
             spec.upgrade_client_id
-            if metadata_upgrade_required
+            if mutation_upgrade_required
             else (
                 retirement_receipt.bootstrap_client_id if retirement_receipt is not None else spec.bootstrap_client_id
             )
@@ -461,7 +545,7 @@ async def bootstrap_standalone_sso(
         await record_retirement_receipt(expected_receipt)
         if await load_retirement_receipt() != expected_receipt:
             raise StandaloneSSOBootstrapError("keycloak_bootstrap_retirement_receipt_write_failed")
-    elif legacy_profile and metadata_upgrade_required:
+    elif mutation_upgrade_required:
         assert upgrade_token is not None
         await control.retire_upgrade(
             spec,
@@ -471,7 +555,10 @@ async def bootstrap_standalone_sso(
             spec,
             upgrade_token=upgrade_token,
         )
-        await record_retirement_receipt(expected_receipt)
+        await record_retirement_receipt(
+            expected_receipt,
+            previous_receipt=(retirement_receipt if callback_migration_required else None),
+        )
         if await load_retirement_receipt() != expected_receipt:
             raise StandaloneSSOBootstrapError("keycloak_upgrade_retirement_receipt_write_failed")
     elif legacy_profile:

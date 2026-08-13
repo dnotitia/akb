@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 
 BACKCHANNEL_LOGOUT_PATH = "/api/v1/auth/keycloak/backchannel-logout"
 _DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$")
+_LEGACY_IPV4_COMPONENT_RE = re.compile(r"^(?:0x[0-9a-f]+|[0-9]+)$")
 
 
 def _is_callback_host(value: str) -> bool:
@@ -19,9 +20,12 @@ def _is_callback_host(value: str) -> bool:
         return False
     # Refuse IPv4-looking alternatives that different URL consumers may
     # normalize differently (for example, dotted octal or a short address).
-    if value.replace(".", "").isdigit():
+    labels = value.split(".")
+    if value.replace(".", "").isdigit() or (
+        1 <= len(labels) <= 4 and all(_LEGACY_IPV4_COMPONENT_RE.fullmatch(label) for label in labels)
+    ):
         return False
-    return all(_DNS_LABEL_RE.fullmatch(label) for label in value.split("."))
+    return all(_DNS_LABEL_RE.fullmatch(label) for label in labels)
 
 
 def _has_canonical_authority(value: str, hostname: str) -> bool:

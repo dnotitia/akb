@@ -397,6 +397,9 @@ def test_sso_backchannel_logout_uri_defaults_public_and_rejects_non_callback_tar
         "http://backend:8000/api/v1/auth/keycloak/backchannel-logout?redirect=unsafe",
         "file:///api/v1/auth/keycloak/backchannel-logout",
         "http://user@backend:8000/api/v1/auth/keycloak/backchannel-logout",
+        "http://0x7f000001/api/v1/auth/keycloak/backchannel-logout",
+        "http://0x7f.0x0.0x0.0x1/api/v1/auth/keycloak/backchannel-logout",
+        "http://0x7f.0.0.1/api/v1/auth/keycloak/backchannel-logout",
     ):
         configured = _load(
             monkeypatch,
@@ -406,6 +409,17 @@ def test_sso_backchannel_logout_uri_defaults_public_and_rejects_non_callback_tar
         monkeypatch.setattr(lifecycle, "settings", configured)
         with pytest.raises(RuntimeError, match="back-channel logout URI"):
             lifecycle._validate_required_settings()
+
+    dns_host = _load(
+        monkeypatch,
+        tmp_path,
+        {
+            **common,
+            "keycloak_backchannel_logout_uri": ("http://0x7f.example.com:8000/api/v1/auth/keycloak/backchannel-logout"),
+        },
+    )
+    monkeypatch.setattr(lifecycle, "settings", dns_host)
+    lifecycle._validate_required_settings()
 
 
 def test_sso_startup_rejects_admin_client_reuse_and_non_tls_public_origin(

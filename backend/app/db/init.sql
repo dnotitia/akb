@@ -211,6 +211,11 @@ CREATE TABLE IF NOT EXISTS standalone_sso_bootstrap_retirements (
     product_admin_subject TEXT NOT NULL
         CHECK (char_length(product_admin_subject) BETWEEN 1 AND 1024),
     akb_user_id UUID NOT NULL,
+    backchannel_logout_uri TEXT
+        CHECK (
+            backchannel_logout_uri IS NULL OR
+            char_length(backchannel_logout_uri) BETWEEN 1 AND 2048
+        ),
     retired_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

@@ -84,9 +84,10 @@ def _receipt(
         StandaloneSSORetirementReceipt,
     )
 
+    selected_profile = profile or STANDALONE_SSO_RECEIPT_PROFILE
     readback = _readback()
     return StandaloneSSORetirementReceipt(
-        profile=profile or STANDALONE_SSO_RECEIPT_PROFILE,
+        profile=selected_profile,
         issuer=_spec().issuer,
         realm_id=readback.realm_id,
         bootstrap_client_id=retired_client_id or _spec().bootstrap_client_id,
@@ -95,6 +96,9 @@ def _receipt(
         api_client_uuid=readback.api_client_uuid,
         product_admin_subject=readback.product_admin_subject,
         akb_user_id=user_id,
+        backchannel_logout_uri=(
+            _spec().backchannel_logout_uri_effective if selected_profile == STANDALONE_SSO_RECEIPT_PROFILE else None
+        ),
     )
 
 
@@ -105,10 +109,13 @@ class _Control:
         manager_available: bool,
         bootstrap_available: bool,
         upgrade_available: bool = False,
+        callback_uri: str | None = None,
     ):
         self.manager_available = manager_available
         self.bootstrap_available = bootstrap_available
         self.upgrade_available = upgrade_available
+        self.callback_uri = callback_uri or _spec().backchannel_logout_uri_effective
+        self.crash_after_callback_update = False
         self.events: list[str] = []
         self._readback = _readback()
 
@@ -124,30 +131,75 @@ class _Control:
         self.events.append("acquire-upgrade")
         return "upgrade-token" if self.upgrade_available else None
 
-    async def reconcile(self, _spec, *, bootstrap_token: str):
+    async def reconcile(self, spec, *, bootstrap_token: str):
         assert bootstrap_token == "bootstrap-token"
         self.events.append("reconcile-keycloak")
         self.manager_available = True
+        self.callback_uri = spec.backchannel_logout_uri_effective
         return self._readback
 
-    async def readback(self, _spec, *, management_token: str):
+    async def readback(self, spec, *, management_token: str):
         assert management_token == "manager-token"
+        assert self.callback_uri == spec.backchannel_logout_uri_effective
         self.events.append("readback-keycloak")
         return self._readback
 
-    async def readback_legacy_v1(self, _spec, *, management_token: str):
+    async def readback_legacy_v1(self, spec, *, management_token: str):
         assert management_token == "manager-token"
+        assert self.callback_uri in {
+            spec.legacy_backchannel_logout_uri,
+            spec.backchannel_logout_uri_effective,
+        }
         self.events.append("readback-keycloak-v1")
         return self._readback
 
-    async def readback_legacy_v2(self, _spec, *, management_token: str):
+    async def readback_legacy_v2(self, spec, *, management_token: str):
         assert management_token == "manager-token"
+        assert self.callback_uri in {
+            spec.legacy_backchannel_logout_uri,
+            spec.backchannel_logout_uri_effective,
+        }
         self.events.append("readback-keycloak-v2")
         return self._readback
 
-    async def upgrade_legacy_to_current(self, _spec, *, upgrade_token: str):
+    async def readback_callback_migration(
+        self,
+        spec,
+        *,
+        source_backchannel_logout_uri: str,
+        management_token: str,
+    ):
+        assert management_token == "manager-token"
+        assert self.callback_uri in {
+            source_backchannel_logout_uri,
+            spec.backchannel_logout_uri_effective,
+        }
+        self.events.append("readback-keycloak-callback-migration")
+        return self._readback
+
+    async def upgrade_legacy_to_current(self, spec, *, upgrade_token: str):
         assert upgrade_token == "upgrade-token"
         self.events.append("upgrade-keycloak-to-current")
+        self.callback_uri = spec.backchannel_logout_uri_effective
+        return self._readback
+
+    async def upgrade_callback_to_current(
+        self,
+        spec,
+        *,
+        source_backchannel_logout_uri: str,
+        upgrade_token: str,
+    ):
+        assert upgrade_token == "upgrade-token"
+        assert self.callback_uri in {
+            source_backchannel_logout_uri,
+            spec.backchannel_logout_uri_effective,
+        }
+        self.events.append("upgrade-keycloak-callback-to-current")
+        self.callback_uri = spec.backchannel_logout_uri_effective
+        if self.crash_after_callback_update:
+            self.crash_after_callback_update = False
+            raise RuntimeError("simulated crash after callback update")
         return self._readback
 
     async def retire_bootstrap(self, _spec, *, bootstrap_token: str):
@@ -180,8 +232,10 @@ class _ReceiptStore:
         self.events.append("load-retirement-receipt")
         return self.receipt
 
-    async def record(self, receipt):
+    async def record(self, receipt, *, previous_receipt=None):
         self.events.append("record-retirement-receipt")
+        if previous_receipt is not None:
+            assert self.receipt == previous_receipt
         self.receipt = receipt
 
 
@@ -387,6 +441,119 @@ async def test_legacy_v2_public_callback_promotes_receipt_without_mutation_autho
     assert report["mode"] == "upgrade-v2-to-v3-readback"
     assert report["keycloak_mutated"] is False
     assert report["receipt_profile"] == "bundled-keycloak-v3"
+
+
+async def test_v2_readback_promotion_preserves_later_exact_callback_migration_retry():
+    from app.services.standalone_sso_bootstrap import (
+        STANDALONE_SSO_RECEIPT_PROFILE_V2,
+        bootstrap_standalone_sso,
+    )
+
+    public_uri = _spec().backchannel_logout_uri_effective
+    internal_uri = "http://backend:8000/api/v1/auth/keycloak/backchannel-logout"
+    control = _Control(manager_available=True, bootstrap_available=False)
+    receipts = _ReceiptStore(
+        control.events,
+        _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V2),
+    )
+
+    async def _provision(**_kwargs):
+        control.events.append("provision-akb-admin")
+        return {
+            "user_id": "11111111-1111-4111-8111-111111111111",
+            "created": False,
+            "is_admin": True,
+            "is_recovery_admin": True,
+        }
+
+    promoted = await bootstrap_standalone_sso(
+        replace(_spec(), bootstrap_client_secret="", product_admin_password=""),
+        control=control,
+        provision_admin=_provision,
+        load_retirement_receipt=receipts.load,
+        record_retirement_receipt=receipts.record,
+    )
+
+    assert promoted["mode"] == "upgrade-v2-to-v3-readback"
+    assert receipts.receipt.backchannel_logout_uri == public_uri
+
+    migration_spec = replace(
+        _spec(),
+        bootstrap_client_secret="",
+        product_admin_password="",
+        backchannel_logout_uri=internal_uri,
+        upgrade_client_secret=_UPGRADE_SECRET,
+    )
+    control.upgrade_available = True
+    control.crash_after_callback_update = True
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await bootstrap_standalone_sso(
+            migration_spec,
+            control=control,
+            provision_admin=_provision,
+            load_retirement_receipt=receipts.load,
+            record_retirement_receipt=receipts.record,
+        )
+
+    assert control.callback_uri == internal_uri
+    assert control.upgrade_available is True
+    assert receipts.receipt.backchannel_logout_uri == public_uri
+
+    report = await bootstrap_standalone_sso(
+        migration_spec,
+        control=control,
+        provision_admin=_provision,
+        load_retirement_receipt=receipts.load,
+        record_retirement_receipt=receipts.record,
+    )
+
+    assert report["mode"] == "upgrade-v3-callback"
+    assert report["keycloak_mutated"] is True
+    assert control.upgrade_available is False
+    assert receipts.receipt.backchannel_logout_uri == internal_uri
+    assert receipts.receipt.bootstrap_client_id == migration_spec.upgrade_client_id
+    assert control.events.count("upgrade-keycloak-callback-to-current") == 2
+
+    settled = await bootstrap_standalone_sso(
+        migration_spec,
+        control=control,
+        provision_admin=_provision,
+        load_retirement_receipt=receipts.load,
+        record_retirement_receipt=receipts.record,
+    )
+    assert settled["mode"] == "readback"
+    assert settled["keycloak_mutated"] is False
+
+
+async def test_v3_callback_migration_without_one_time_authority_fails_closed():
+    from app.services.standalone_sso_bootstrap import (
+        StandaloneSSOBootstrapError,
+        bootstrap_standalone_sso,
+    )
+
+    control = _Control(manager_available=True, bootstrap_available=False)
+    receipts = _ReceiptStore(control.events, _receipt())
+
+    async def _should_not_run(**_kwargs):
+        raise AssertionError("callback migration requires bounded authority")
+
+    with pytest.raises(StandaloneSSOBootstrapError) as captured:
+        await bootstrap_standalone_sso(
+            replace(
+                _spec(),
+                bootstrap_client_secret="",
+                product_admin_password="",
+                backchannel_logout_uri=("http://backend:8000/api/v1/auth/keycloak/backchannel-logout"),
+            ),
+            control=control,
+            provision_admin=_should_not_run,
+            load_retirement_receipt=receipts.load,
+            record_retirement_receipt=receipts.record,
+        )
+
+    assert captured.value.code == "keycloak_upgrade_credential_required"
+    assert "readback-keycloak-callback-migration" not in control.events
 
 
 async def test_legacy_v2_internal_callback_uses_bounded_upgrade_authority():

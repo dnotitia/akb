@@ -110,7 +110,7 @@ pod's `bootstrap-standalone-sso` init container and main container to complete,
 then inspect the init log. Its JSON report contains only IDs, key metadata, and
 the exact role names; it never contains credential values.
 
-## Upgrade an existing v1 or v2 receipt
+## Upgrade an existing receipt
 
 An installation that already recorded `bundled-keycloak-v1` retired its
 original master-realm bootstrap client before the signed broker-provenance
@@ -122,10 +122,13 @@ change either client resource cannot widen the manager's standing authority.
 If a v2 installation keeps the same public callback (the effective setting is
 still `https://<public-akb>/api/v1/auth/keycloak/backchannel-logout`), the init
 container proves the exact v2 and v3 read-backs and promotes the durable receipt
-without mutation or an upgrade credential. It reports
-`mode=upgrade-v2-to-v3-readback`. A v1 receipt always needs the one-time
+without mutation or an upgrade credential. The v3 receipt retains that effective
+callback, so a later callback change remains an exact, supported migration. It
+reports `mode=upgrade-v2-to-v3-readback`. A v1 receipt always needs the one-time
 authority to add the mapper. A v2 receipt needs it only when moving to a
-different callback, including this overlay's in-cluster backend URL.
+different callback, including this overlay's in-cluster backend URL. A v3
+receipt needs the same bounded authority when its recorded callback differs
+from the newly configured callback.
 
 Before rolling this version onto such an installation, create exactly one
 temporary upgrade service account named `akb-bootstrap-upgrade-v2`. Keycloak's
@@ -154,16 +157,18 @@ kubectl -n akb rollout status statefulset/keycloak --timeout=300s
 ```
 
 Then deploy the new AKB overlay. Its init container must report
-`mode=upgrade-v1-to-v3` or `mode=upgrade-v2-to-v3` and
+`mode=upgrade-v1-to-v3`, `mode=upgrade-v2-to-v3`, or
+`mode=upgrade-v3-callback` and
 `receipt_profile=bundled-keycloak-v3`. The lifecycle first validates the exact
-legacy read-back using the permanent manager, reconciles only the `akb-web`
-client metadata and signed broker-provenance mapper, revalidates the complete
+receipt-bound source read-back using the permanent manager, reconciles only the
+`akb-web` client metadata and, when required, signed broker-provenance mapper,
+revalidates the complete
 v3 profile through the permanent manager, deletes the temporary upgrade client,
 proves both its old and newly requested tokens are rejected, and only then
-writes the v3 receipt. Retrying after a partial client update accepts only the
-exact old or exact target metadata, so the process is convergent without
-accepting arbitrary drift. It does not require or reset the existing
-product-admin password.
+writes or compare-and-swaps the v3 receipt. Retrying after a partial client
+update accepts only the exact receipt source or exact target metadata, so the
+process is convergent without accepting arbitrary drift. It does not require
+or reset the existing product-admin password.
 
 Delete `akb-keycloak-upgrade` only after that report and a subsequent
 `mode=readback` restart succeed. If the init container reports
