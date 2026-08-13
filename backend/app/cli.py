@@ -425,6 +425,9 @@ async def _bootstrap_standalone_sso(args: list[str]) -> int:
             product_admin_username=parsed.product_admin_username,
             product_admin_email=parsed.product_admin_email,
             product_admin_password=product_admin_password,
+            backchannel_logout_uri=(
+                settings.keycloak_backchannel_logout_uri_effective
+            ),
             upgrade_client_id=parsed.upgrade_client_id,
             upgrade_client_secret=upgrade_secret,
         )

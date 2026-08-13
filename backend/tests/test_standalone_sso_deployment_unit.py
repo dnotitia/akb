@@ -23,8 +23,7 @@ def _one(name: str, *, kind: str, resource_name: str | None) -> dict:
     matches = [
         item
         for item in _documents(name)
-        if item.get("kind") == kind
-        and item.get("metadata", {}).get("name") == resource_name
+        if item.get("kind") == kind and item.get("metadata", {}).get("name") == resource_name
     ]
     assert len(matches) == 1
     return matches[0]
@@ -54,26 +53,15 @@ def test_overlay_owns_dedicated_keycloak_and_database_without_committed_secrets(
         kind="StatefulSet",
         resource_name="keycloak-postgres",
     )
-    assert keycloak["spec"]["template"]["spec"]["containers"][0]["image"].count(
-        "@sha256:"
-    ) == 1
-    assert keycloak_postgres["spec"]["template"]["spec"]["containers"][0][
-        "image"
-    ].count("@sha256:") == 1
+    assert keycloak["spec"]["template"]["spec"]["containers"][0]["image"].count("@sha256:") == 1
+    assert keycloak_postgres["spec"]["template"]["spec"]["containers"][0]["image"].count("@sha256:") == 1
 
 
 def test_keycloak_bootstrap_secret_is_required_for_first_boot_and_not_a_human_admin():
     keycloak = _one("keycloak.yaml", kind="StatefulSet", resource_name="keycloak")
-    env = {
-        item["name"]: item
-        for item in keycloak["spec"]["template"]["spec"]["containers"][0]["env"]
-    }
-    assert env["KC_BOOTSTRAP_ADMIN_CLIENT_ID"]["value"] == (
-        "akb-bootstrap-temporary"
-    )
-    reference = env["KC_BOOTSTRAP_ADMIN_CLIENT_SECRET"]["valueFrom"][
-        "secretKeyRef"
-    ]
+    env = {item["name"]: item for item in keycloak["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert env["KC_BOOTSTRAP_ADMIN_CLIENT_ID"]["value"] == ("akb-bootstrap-temporary")
+    reference = env["KC_BOOTSTRAP_ADMIN_CLIENT_SECRET"]["valueFrom"]["secretKeyRef"]
     assert reference == {
         "name": "akb-keycloak-bootstrap",
         "key": "client-secret",
@@ -116,18 +104,18 @@ def test_backend_patch_removes_local_key_authority_and_mounts_one_time_inputs_on
     assert "--upgrade-client-secret-file" in init["args"]
 
 
-def test_legacy_v1_upgrade_job_is_explicit_opt_in_and_uses_temporary_service_admin():
+def test_legacy_profile_upgrade_job_is_explicit_opt_in_and_uses_temporary_service_admin():
     kustomization = _one(
         "kustomization.yaml",
         kind="Kustomization",
         resource_name=None,
     )
-    assert "legacy-v1-upgrade-job.yaml" not in kustomization["resources"]
+    assert "legacy-profile-upgrade-job.yaml" not in kustomization["resources"]
 
     job = _one(
-        "legacy-v1-upgrade-job.yaml",
+        "legacy-profile-upgrade-job.yaml",
         kind="Job",
-        resource_name="akb-keycloak-v1-to-v2-authority",
+        resource_name="akb-keycloak-profile-upgrade-authority",
     )
     container = job["spec"]["template"]["spec"]["containers"][0]
     assert container["image"].count("@sha256:") == 1
@@ -136,9 +124,7 @@ def test_legacy_v1_upgrade_job_is_explicit_opt_in_and_uses_temporary_service_adm
     assert "akb-bootstrap-upgrade-v2" in container["args"]
     assert "--client-secret:env=AKB_KEYCLOAK_UPGRADE_SECRET" in container["args"]
     secret_refs = [
-        item["valueFrom"]["secretKeyRef"]
-        for item in container["env"]
-        if "secretKeyRef" in item.get("valueFrom", {})
+        item["valueFrom"]["secretKeyRef"] for item in container["env"] if "secretKeyRef" in item.get("valueFrom", {})
     ]
     assert {
         "name": "akb-keycloak-upgrade",
@@ -166,6 +152,7 @@ def test_sso_runtime_config_has_one_mode_and_three_distinct_confidential_clients
     }
     assert clients == {"akb-web", "akb-admin", "akb-sso-manager"}
     assert config["keycloak_internal_url"] == "http://keycloak:8080"
+    assert config["keycloak_backchannel_logout_uri"] == ("http://backend:8000/api/v1/auth/keycloak/backchannel-logout")
     assert config["keycloak_server_url"].startswith("https://")
 
 

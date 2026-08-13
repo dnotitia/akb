@@ -775,6 +775,11 @@ class Settings(BaseModel):
     # browser-facing authorization/logout endpoints always use
     # keycloak_server_url, so the `iss` claim stays the public URL.
     keycloak_internal_url: str = ""
+    # Exact AKB endpoint Keycloak calls for OIDC back-channel logout. This is
+    # an AKB callback, not a Keycloak endpoint: split-horizon deployments may
+    # need an in-cluster Service URL even though browser redirects use
+    # public_base_url. Blank preserves the public-origin default.
+    keycloak_backchannel_logout_uri: str = ""
     keycloak_realm: str = "akb"
     keycloak_client_id: str = "akb-web"
     keycloak_client_secret: str = ""  # secret.yaml — blank for public (PKCE) clients
@@ -1138,6 +1143,13 @@ class Settings(BaseModel):
     def keycloak_backchannel_logout_endpoint(self) -> str:
         """Server-to-Keycloak refresh-token revocation endpoint."""
         return f"{self._keycloak_backchannel_issuer}/protocol/openid-connect/logout"
+
+    @property
+    def keycloak_backchannel_logout_uri_effective(self) -> str:
+        """Exact AKB callback registered on the Keycloak browser client."""
+        if self.keycloak_backchannel_logout_uri:
+            return self.keycloak_backchannel_logout_uri
+        return f"{self.public_base_url.rstrip('/')}/api/v1/auth/keycloak/backchannel-logout"
 
     @property
     def keycloak_browser_redirect_uri(self) -> str:

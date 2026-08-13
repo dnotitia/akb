@@ -107,9 +107,13 @@ async def test_upgrade_authority_authenticates_only_against_master_realm():
         await control.aclose()
 
 
-async def test_v1_upgrade_mutates_only_the_signed_provider_mapper(monkeypatch):
+async def test_legacy_upgrade_updates_api_client_and_signed_provider_mapper(monkeypatch):
     control = KeycloakStandaloneSSOControl()
-    spec = replace(_spec(), upgrade_client_secret=_SECRETS[5])
+    spec = replace(
+        _spec(),
+        backchannel_logout_uri=("http://backend:8000/api/v1/auth/keycloak/backchannel-logout"),
+        upgrade_client_secret=_SECRETS[5],
+    )
     events: list[tuple[str, object]] = []
     expected_readback = object()
 
@@ -121,15 +125,20 @@ async def test_v1_upgrade_mutates_only_the_signed_provider_mapper(monkeypatch):
         events.append(("reconcile-mapper", (client_uuid, desired, token)))
         return desired
 
+    async def _reconcile_client(_spec, desired, *, token):
+        events.append(("reconcile-client", (desired, token)))
+        return {**desired, "id": "api-client-uuid"}
+
     async def _readback(_spec, *, management_token):
         events.append(("readback", management_token))
         return expected_readback
 
     monkeypatch.setattr(control, "_exact_client", _exact_client)
+    monkeypatch.setattr(control, "_reconcile_client", _reconcile_client)
     monkeypatch.setattr(control, "_reconcile_mapper", _reconcile_mapper)
     monkeypatch.setattr(control, "readback", _readback)
 
-    result = await control.upgrade_v1_to_v2(
+    result = await control.upgrade_legacy_to_current(
         spec,
         upgrade_token="opaque-upgrade-token",  # pragma: allowlist secret
     )
@@ -137,13 +146,108 @@ async def test_v1_upgrade_mutates_only_the_signed_provider_mapper(monkeypatch):
     assert result is expected_readback
     assert [name for name, _value in events] == [
         "exact-client",
+        "reconcile-client",
         "reconcile-mapper",
         "readback",
     ]
-    client_uuid, desired, token = events[1][1]
+    desired_client, client_token = events[1][1]
+    assert desired_client["attributes"]["backchannel.logout.url"] == (
+        "http://backend:8000/api/v1/auth/keycloak/backchannel-logout"
+    )
+    assert client_token == "opaque-upgrade-token"  # pragma: allowlist secret
+    client_uuid, desired, token = events[2][1]
     assert client_uuid == "api-client-uuid"
     assert desired == control._api_identity_provider_mapper()  # noqa: SLF001
     assert token == "opaque-upgrade-token"  # pragma: allowlist secret
+
+
+@pytest.mark.parametrize(
+    "actual_callback",
+    [
+        "https://akb.example.com/api/v1/auth/keycloak/backchannel-logout",
+        "http://backend:8000/api/v1/auth/keycloak/backchannel-logout",
+    ],
+)
+async def test_callback_upgrade_accepts_only_exact_receipt_source_or_target(
+    monkeypatch,
+    actual_callback: str,
+):
+    control = KeycloakStandaloneSSOControl()
+    source_callback = "https://akb.example.com/api/v1/auth/keycloak/backchannel-logout"
+    spec = replace(
+        _spec(),
+        backchannel_logout_uri=("http://backend:8000/api/v1/auth/keycloak/backchannel-logout"),
+        upgrade_client_secret=_SECRETS[5],
+    )
+    reconciled: list[dict[str, object]] = []
+    expected_readback = object()
+
+    async def _exact_client(_spec, _realm, _client_id, *, token):
+        assert token == "opaque-upgrade-token"  # pragma: allowlist secret
+        return {
+            **control._api_client(  # noqa: SLF001
+                spec,
+                backchannel_logout_uri=actual_callback,
+            ),
+            "id": "api-client-uuid",
+        }
+
+    async def _reconcile_client(_spec, desired, *, token):
+        assert token == "opaque-upgrade-token"  # pragma: allowlist secret
+        reconciled.append(desired)
+        return {**desired, "id": "api-client-uuid"}
+
+    async def _readback(_spec, *, management_token):
+        assert management_token == "opaque-upgrade-token"  # pragma: allowlist secret
+        return expected_readback
+
+    monkeypatch.setattr(control, "_exact_client", _exact_client)
+    monkeypatch.setattr(control, "_reconcile_client", _reconcile_client)
+    monkeypatch.setattr(control, "readback", _readback)
+
+    result = await control.upgrade_callback_to_current(
+        spec,
+        source_backchannel_logout_uri=source_callback,
+        upgrade_token="opaque-upgrade-token",  # pragma: allowlist secret
+    )
+
+    assert result is expected_readback
+    assert len(reconciled) == 1
+    assert reconciled[0]["attributes"]["backchannel.logout.url"] == (spec.backchannel_logout_uri_effective)
+
+
+async def test_callback_upgrade_rejects_callback_outside_receipt_transition(monkeypatch):
+    control = KeycloakStandaloneSSOControl()
+    spec = replace(
+        _spec(),
+        backchannel_logout_uri=("http://backend:8000/api/v1/auth/keycloak/backchannel-logout"),
+        upgrade_client_secret=_SECRETS[5],
+    )
+
+    async def _exact_client(_spec, _realm, _client_id, *, token):
+        assert token == "opaque-upgrade-token"  # pragma: allowlist secret
+        return {
+            **control._api_client(  # noqa: SLF001
+                spec,
+                backchannel_logout_uri=("https://other.example.com/api/v1/auth/keycloak/backchannel-logout"),
+            ),
+            "id": "api-client-uuid",
+        }
+
+    async def _should_not_reconcile(*_args, **_kwargs):
+        raise AssertionError("callback drift must not be reconciled")
+
+    monkeypatch.setattr(control, "_exact_client", _exact_client)
+    monkeypatch.setattr(control, "_reconcile_client", _should_not_reconcile)
+
+    with pytest.raises(StandaloneSSOBootstrapError) as captured:
+        await control.upgrade_callback_to_current(
+            spec,
+            source_backchannel_logout_uri=("https://akb.example.com/api/v1/auth/keycloak/backchannel-logout"),
+            upgrade_token="opaque-upgrade-token",  # pragma: allowlist secret
+        )
+
+    assert captured.value.code == "keycloak_client_readback_failed"
 
 
 async def test_keycloak_internal_base_path_is_preserved():
@@ -623,7 +727,10 @@ async def test_realm_sets_a_lean_product_admin_password_policy_from_creation():
 
 
 async def test_client_profiles_separate_user_admin_and_management_authorities():
-    spec = _spec()
+    spec = replace(
+        _spec(),
+        backchannel_logout_uri=("http://backend:8000/api/v1/auth/keycloak/backchannel-logout"),
+    )
     api = KeycloakStandaloneSSOControl._api_client(spec)  # noqa: SLF001
     admin = KeycloakStandaloneSSOControl._admin_client(spec)  # noqa: SLF001
     management = KeycloakStandaloneSSOControl._management_client(spec)  # noqa: SLF001
@@ -638,7 +745,7 @@ async def test_client_profiles_separate_user_admin_and_management_authorities():
     assert api["attributes"]["pkce.code.challenge.method"] == "S256"
     assert api["frontchannelLogout"] is False
     assert api["attributes"]["backchannel.logout.url"] == (
-        "https://akb.example.com/api/v1/auth/keycloak/backchannel-logout"
+        "http://backend:8000/api/v1/auth/keycloak/backchannel-logout"
     )
     assert api["attributes"]["backchannel.logout.session.required"] == "true"
     assert admin["attributes"]["pkce.code.challenge.method"] == "S256"
@@ -648,6 +755,14 @@ async def test_client_profiles_separate_user_admin_and_management_authorities():
     assert management["serviceAccountsEnabled"] is True
     assert management["defaultClientScopes"] == ["service_account"]
     assert management["redirectUris"] == []
+
+
+async def test_api_client_defaults_backchannel_logout_to_the_public_origin():
+    api = KeycloakStandaloneSSOControl._api_client(_spec())  # noqa: SLF001
+
+    assert api["attributes"]["backchannel.logout.url"] == (
+        "https://akb.example.com/api/v1/auth/keycloak/backchannel-logout"
+    )
 
 
 async def test_api_client_maps_signed_broker_provenance_into_both_token_profiles():

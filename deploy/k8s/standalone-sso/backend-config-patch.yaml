@@ -25,6 +25,7 @@ data:
     keycloak_enabled: true
     keycloak_server_url: https://auth.akb.example.com
     keycloak_internal_url: http://keycloak:8080
+    keycloak_backchannel_logout_uri: http://backend:8000/api/v1/auth/keycloak/backchannel-logout
     keycloak_realm: akb
     keycloak_client_id: akb-web
     keycloak_public_client: false

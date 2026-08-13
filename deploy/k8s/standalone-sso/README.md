@@ -16,7 +16,7 @@ The bundle implements the product-administrator bootstrap and recovery slice:
    projection.
 3. It proves the permanent management credential, deletes the temporary
    bootstrap client, verifies that credential is rejected, and records a
-   non-secret `bundled-keycloak-v2` retirement receipt in the AKB database.
+   non-secret `bundled-keycloak-v3` retirement receipt in the AKB database.
 4. A subsequent init-container run is read-only and succeeds without either
    original one-time value only when its current Keycloak and AKB identities
    exactly match that durable receipt.
@@ -31,6 +31,15 @@ It becomes ready only after the browser-session encryption key is supplied and
 an upstream provider is enabled. `/admin` uses the dedicated confidential
 client and requires a fresh native Keycloak password ceremony; a brokered
 upstream identity is not accepted as the recovery administrator.
+
+The browser-facing AKB origin and Keycloak-to-AKB back-channel are separate
+deployment concerns. `keycloak_backchannel_logout_uri` is registered on the
+`akb-web` client and defaults to the public AKB callback for simple installs.
+This Kubernetes overlay sets it to the exact in-cluster backend Service URL so
+Keycloak never tries to deliver a signed logout token to its own loopback
+interface. Changing this client metadata on an existing standalone v2 install
+requires a bounded client-update authority; the permanent provider manager is
+intentionally unable to mutate clients.
 
 ## Required operator inputs
 
@@ -54,7 +63,7 @@ commit their values.
 | `akb-keycloak-db-credentials` | `POSTGRES_DB=keycloak`, `POSTGRES_USER=keycloak`, `POSTGRES_PASSWORD` | durable |
 | `akb-secret-config` | `secret.yaml` | durable |
 | `akb-keycloak-bootstrap` | `client-secret` | one-time |
-| `akb-keycloak-upgrade` | `client-secret` | optional; one-time v1-to-v2 upgrade only |
+| `akb-keycloak-upgrade` | `client-secret` | optional; one-time legacy-profile upgrade only |
 | `akb-product-admin-bootstrap` | `password` | one-time |
 
 The mounted `secret.yaml` must include the AKB database password, an
@@ -101,21 +110,35 @@ pod's `bootstrap-standalone-sso` init container and main container to complete,
 then inspect the init log. Its JSON report contains only IDs, key metadata, and
 the exact role names; it never contains credential values.
 
-## Upgrade an existing v1 receipt
+## Upgrade an existing receipt
 
 An installation that already recorded `bundled-keycloak-v1` retired its
 original master-realm bootstrap client before the signed broker-provenance
-mapper existed. The permanent `akb-sso-manager` deliberately lacks
-`manage-clients`, so a normal rollout cannot add that mapper and must not widen
-the manager's standing authority.
+mapper existed. A `bundled-keycloak-v2` installation has that mapper but records
+the original public-origin back-channel callback. The permanent
+`akb-sso-manager` deliberately lacks `manage-clients`, so a rollout that must
+change either client resource cannot widen the manager's standing authority.
+
+If a v2 installation keeps the same public callback (the effective setting is
+still `https://<public-akb>/api/v1/auth/keycloak/backchannel-logout`), the init
+container proves the exact v2 and v3 read-backs and promotes the durable receipt
+without mutation or an upgrade credential. The v3 receipt retains that effective
+callback, so a later callback change remains an exact, supported migration. It
+reports `mode=upgrade-v2-to-v3-readback`. A v1 receipt always needs the one-time
+authority to add the mapper. A v2 receipt needs it only when moving to a
+different callback, including this overlay's in-cluster backend URL. A v3
+receipt needs the same bounded authority when its recorded callback differs
+from the newly configured callback.
 
 Before rolling this version onto such an installation, create exactly one
 temporary upgrade service account named `akb-bootstrap-upgrade-v2`. Keycloak's
 supported recovery command requires every Keycloak node to be stopped. Follow
 the upstream [temporary admin service account procedure](https://www.keycloak.org/server/bootstrap-admin-recovery)
 and use the same database settings as the server. The opt-in
-`legacy-v1-upgrade-job.yaml` captures those settings but is intentionally not a
-Kustomize resource, so a fresh install never creates this authority.
+`legacy-profile-upgrade-job.yaml` captures those settings but is intentionally
+not a Kustomize resource, so a fresh install never creates this authority. The
+historical client ID `akb-bootstrap-upgrade-v2` remains stable so an interrupted
+older migration can be recovered without creating a second identity.
 
 For the default `akb` namespace, the bounded sequence is:
 
@@ -125,28 +148,34 @@ openssl rand -base64 48 | tr -d '\n' | kubectl -n akb create secret generic \
   --from-file=client-secret=/dev/stdin
 kubectl -n akb scale statefulset/keycloak --replicas=0
 kubectl -n akb wait --for=delete pod -l app=akb-keycloak --timeout=180s
-kubectl apply -f deploy/k8s/standalone-sso/legacy-v1-upgrade-job.yaml
+kubectl apply -f deploy/k8s/standalone-sso/legacy-profile-upgrade-job.yaml
 kubectl -n akb wait --for=condition=complete \
-  job/akb-keycloak-v1-to-v2-authority --timeout=180s
-kubectl -n akb delete job akb-keycloak-v1-to-v2-authority
+  job/akb-keycloak-profile-upgrade-authority --timeout=180s
+kubectl -n akb delete job akb-keycloak-profile-upgrade-authority
 kubectl -n akb scale statefulset/keycloak --replicas=1
 kubectl -n akb rollout status statefulset/keycloak --timeout=300s
 ```
 
 Then deploy the new AKB overlay. Its init container must report
-`mode=upgrade-v1-to-v2` and `receipt_profile=bundled-keycloak-v2`. The lifecycle
-first validates every v1 read-back using the permanent manager, changes only
-the `akb-browser-identity-provider` mapper, revalidates the complete v2 profile
-through the permanent manager, deletes the temporary upgrade client, proves
-both its old and newly requested tokens are rejected, and only then writes the
-v2 receipt. It does not require or reset the existing product-admin password.
+`mode=upgrade-v1-to-v3`, `mode=upgrade-v2-to-v3`, or
+`mode=upgrade-v3-callback` and
+`receipt_profile=bundled-keycloak-v3`. The lifecycle first validates the exact
+receipt-bound source read-back using the permanent manager, reconciles only the
+`akb-web` client metadata and, when required, signed broker-provenance mapper,
+revalidates the complete
+v3 profile through the permanent manager, deletes the temporary upgrade client,
+proves both its old and newly requested tokens are rejected, and only then
+writes or compare-and-swaps the v3 receipt. Retrying after a partial client
+update accepts only the exact receipt source or exact target metadata, so the
+process is convergent without accepting arbitrary drift. It does not require
+or reset the existing product-admin password.
 
 Delete `akb-keycloak-upgrade` only after that report and a subsequent
 `mode=readback` restart succeed. If the init container reports
 `keycloak_upgrade_credential_required`, do not grant `manage-clients` to
 `akb-sso-manager`; complete this one-time procedure instead. A failed migration
 deliberately leaves the temporary authority available for repair. If deletion
-succeeds but the v2 receipt write does not, use the same official recovery
+succeeds but the v3 receipt write does not, use the same official recovery
 procedure to create the exact upgrade client again before retrying.
 
 ## Retire one-time material
