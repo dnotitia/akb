@@ -14,6 +14,7 @@ import pytest
 pytestmark = pytest.mark.asyncio
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
 _ISSUER = "https://id.example.com/realms/akb"
+_SSO_SESSION_EPOCH = uuid.UUID("8dbce581-ea57-47ca-ae8f-3c3ddb05e787")
 
 
 class RecordingRoleSync:
@@ -47,10 +48,32 @@ async def services(monkeypatch):
             "043_workspace_account_governance.py",
             "071_recovery_admin.py",
             "072_admin_browser_sessions.py",
+            "074_sso_browser_sessions.py",
+            "076_sso_session_epoch.py",
         ):
             migration = _load_migration(filename)
             assert migration is not None
             await migration.migrate(conn=conn)
+        await conn.execute(
+            """
+            INSERT INTO auth_runtime_state (
+                singleton, runtime_generation, auth_mode, sso_session_epoch
+            ) VALUES (TRUE, 1, 'sso', $1)
+            ON CONFLICT (singleton) DO UPDATE
+               SET runtime_generation = EXCLUDED.runtime_generation,
+                   auth_mode = EXCLUDED.auth_mode,
+                   sso_session_epoch = EXCLUDED.sso_session_epoch,
+                   updated_at = NOW()
+            """,
+            _SSO_SESSION_EPOCH,
+        )
+        await conn.execute(
+            """
+            UPDATE auth_runtime_epoch_upgrade
+               SET state = 'enforced'
+             WHERE singleton = TRUE
+            """
+        )
 
     role_sync = RecordingRoleSync()
 
@@ -732,10 +755,11 @@ async def test_role_projection_preserves_user_id(services):
         await conn.execute(
             """
             INSERT INTO admin_browser_sessions (
-                token_hash, csrf_token_hash, user_id, external_identity_id,
+                session_epoch, token_hash, csrf_token_hash, user_id, external_identity_id,
                 identity_issuer, identity_subject, keycloak_sid, expires_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() + INTERVAL '5 minutes')
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW() + INTERVAL '5 minutes')
             """,
+            _SSO_SESSION_EPOCH,
             uuid.uuid4().hex * 2,
             uuid.uuid4().hex * 2,
             uuid.UUID(ensured["user_id"]),

@@ -157,7 +157,11 @@ async def _run_one_migration(pool, filename: str, module, *, retries: int = 10, 
                     filename,
                 )
             return
-        except (asyncpg.LockNotAvailableError, asyncpg.QueryCanceledError) as e:
+        except (
+            asyncpg.DeadlockDetectedError,
+            asyncpg.LockNotAvailableError,
+            asyncpg.QueryCanceledError,
+        ) as e:
             if attempt < retries - 1:
                 log.warning(
                     "Migration %s blocked on a lock (attempt %d/%d): %s — retrying in %.0fs",
@@ -258,6 +262,7 @@ async def _apply_migrations() -> None:
         "073_sso_bootstrap_receipt.py",  # durable proof that the temporary bundled-Keycloak client was retired
         "074_sso_browser_sessions.py",  # encrypted ordinary-user SSO browser-session custody
         "075_sso_callback_receipt.py",  # bind current SSO receipts to the effective back-channel callback
+        "076_sso_session_epoch.py",  # monotonic auth boundary + rollback-compatible epoch bridge/legacy-write guard
     ):
         if filename in applied:
             continue

@@ -65,8 +65,11 @@ openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 1 \
 chmod 600 "$cert_dir/tls.key"
 
 mkdir -p "$fixture_run_dir/config"
-cat >"$fixture_run_dir/config/app.yaml" <<'YAML'
+sso_session_epoch="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+cat >"$fixture_run_dir/config/app.yaml" <<YAML
 auth_mode: sso
+auth_runtime_generation: 1
+sso_session_epoch: "$sso_session_epoch"
 keycloak_enabled: true
 keycloak_server_url: https://broker.localhost:19443
 keycloak_realm: akb

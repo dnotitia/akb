@@ -14,6 +14,72 @@ Product administration remains separate at `/admin`. A product administrator
 can configure an upstream provider while it is disabled, inspect the exact
 redirect URI, and then enable or disable it without redeploying AKB.
 
+Every installation owns a positive `auth_runtime_generation`; SSO mode also
+requires the non-secret UUID `sso_session_epoch`. Keep the exact
+generation/mode/epoch tuple stable for normal restarts. Increase the generation
+for every mode change or epoch rotation. PostgreSQL accepts only an exact
+restart or a greater generation, so stale and same-generation conflicting
+replicas cannot reverse `sso → local → sso` or restore an older epoch. Every
+accepted transition transactionally purges ordinary and product-admin browser
+sessions plus back-channel logout fences. Audit and startup output contain
+transition booleans and row counts, never epoch or generation values.
+
+## Pre-epoch upgrade and rollback
+
+The first upgrade from a build without session epochs is deliberately
+stop-the-world; it is not a rolling mixed-writer upgrade. The schema bridge
+keeps `session_epoch` nullable so the old image remains usable after a prepared
+rollback, while current code always writes and resolves an exact non-null
+epoch. A database trigger rejects legacy NULL writes as soon as the current
+authority is activated.
+
+Upgrade in this exact order:
+
+1. Stop every backend and other database client.
+2. Configure `auth_runtime_generation: 1`, the installation epoch, and the
+   temporary `sso_session_epoch_upgrade: stop-the-world-v1` acknowledgement.
+3. From the new image's `backend/` directory, run
+   `uv run python scripts/sso_session_epoch_preflight.py prepare-upgrade`.
+   It fails while another client is connected, applies the bridge, purges all
+   pre-epoch sessions/fences, and enables the legacy-write guard atomically.
+   Ordinary application startup cannot activate a required bridge, even when
+   the acknowledgement is present.
+4. Remove the temporary acknowledgement and start only the new image with the
+   exact prepared generation/mode/epoch tuple.
+
+Rollback in this exact order:
+
+1. Stop every current backend and other database client.
+2. Using the current image and config, run
+   `uv run python scripts/sso_session_epoch_preflight.py prepare-rollback`.
+   It fails while another client is connected, purges all current SSO browser
+   authority, preserves the monotonic generation floor, and reopens legacy
+   NULL writes.
+3. Remove `auth_runtime_generation`, `sso_session_epoch_upgrade`, and
+   `sso_session_epoch` from the old image's configuration, then start the old
+   image. No SSO browser session survives the rollback.
+
+A later re-upgrade must use a generation greater than the last current-image
+generation; the retained floor rejects replay. `status` prints only the
+contract state and whether legacy rows exist, never authority values.
+
+## SSO session epoch migration bridge retirement gate
+
+This is a migration-only compatibility bridge, not a permanent feature.
+Retire it only after all three conditions are evidenced:
+
+1. All supported AKB rollback artifacts are epoch-capable, and pre-epoch image
+   rollback support is formally ended.
+2. Deployment and fleet inventory shows no pre-epoch artifact.
+3. Upgrade and rollback rehearsal receipts exist for every supported
+   deployment profile.
+
+Then remove the bridge in one atomic schema/runtime change: remove the
+`sso_session_epoch_upgrade` acknowledgement and the `prepare-rollback`
+command/path; remove `rollback_ready` and the legacy NULL trigger and state;
+make every `session_epoch` column NOT NULL; and remove or replace the legacy
+bridge tests.
+
 ## Provider lifecycle
 
 ```text

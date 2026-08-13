@@ -30,6 +30,10 @@ from app.services.sso_browser_session_crypto import (
     BrowserSessionKeyError,
     BrowserSessionPayloadError,
 )
+from app.services.sso_session_epoch import (
+    current_sso_session_authority,
+    lock_active_sso_session_epoch,
+)
 from app.sso.providers.keycloak_oidc import ProviderDefinitionError, validate_alias
 
 
@@ -247,6 +251,8 @@ async def create_sso_browser_session(
         absolute_expiry=absolute_expiry,
     )
     scope = _scope(principal.claims)
+    authority = current_sso_session_authority()
+    session_epoch = authority.session_epoch
 
     try:
         user_id = uuid.UUID(user.user_id)
@@ -268,16 +274,17 @@ async def create_sso_browser_session(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await lock_active_sso_session_epoch(conn, authority)
             await conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                f"sso-browser-session:{user_id}",
+                f"sso-browser-session:{session_epoch}:{user_id}",
             )
             # Session creation and back-channel logout share this exact lock.
             # The durable fence below then rejects a callback that resumes
             # after a verified logout event has already committed.
             await conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                f"sso-browser-sid:{issuer}:{sid}",
+                f"sso-browser-sid:{session_epoch}:{issuer}:{sid}",
             )
             await conn.execute("DELETE FROM sso_browser_logout_fences WHERE expires_at <= NOW()")
             fenced = await conn.fetchval(
@@ -285,13 +292,15 @@ async def create_sso_browser_session(
                 SELECT EXISTS (
                     SELECT 1
                       FROM sso_browser_logout_fences
-                     WHERE identity_issuer = $1
-                       AND keycloak_sid = $2
-                       AND (identity_subject IS NULL OR identity_subject = $3)
-                       AND logout_issued_at >= $4
+                     WHERE session_epoch = $1
+                       AND identity_issuer = $2
+                       AND keycloak_sid = $3
+                       AND (identity_subject IS NULL OR identity_subject = $4)
+                       AND logout_issued_at >= $5
                        AND expires_at > NOW()
                 )
                 """,
+                session_epoch,
                 issuer,
                 sid,
                 subject,
@@ -336,24 +345,27 @@ async def create_sso_browser_session(
                     SELECT id
                       FROM sso_browser_sessions
                      WHERE user_id = $1
+                       AND session_epoch = $2
                      ORDER BY created_at DESC, id DESC
                     OFFSET 7
                  )
                 """,
                 user_id,
+                session_epoch,
             )
             await conn.execute(
                 """
                 INSERT INTO sso_browser_sessions (
-                    id, token_hash, csrf_token_hash, user_id,
+                    id, session_epoch, token_hash, csrf_token_hash, user_id,
                     external_identity_id, identity_issuer, identity_subject,
                     keycloak_sid, token_envelope, access_expires_at,
                     refresh_expires_at, idle_expires_at, absolute_expires_at
                 ) VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
                 )
                 """,
                 session_id,
+                session_epoch,
                 _hash_credential(token),
                 _hash_credential(csrf_token),
                 user_id,
@@ -428,6 +440,7 @@ async def resolve_sso_browser_session(
 
 async def _sso_browser_session_needs_refresh(token_hash: str) -> bool:
     """Probe expiry without waiting on a concurrent refresh row lock."""
+    session_epoch = current_sso_session_authority().session_epoch
     pool = await get_pool()
     async with pool.acquire() as conn:
         access_expires_at = await conn.fetchval(
@@ -435,8 +448,10 @@ async def _sso_browser_session_needs_refresh(token_hash: str) -> bool:
             SELECT access_expires_at
               FROM sso_browser_sessions
              WHERE token_hash = $1
+               AND session_epoch = $2
             """,
             token_hash,
+            session_epoch,
         )
     if not isinstance(access_expires_at, datetime):
         return False
@@ -452,6 +467,8 @@ async def _resolve_sso_browser_session_pass(
     allow_refresh: bool,
 ) -> tuple[AuthenticatedUser | None, bool]:
     """Run one locked resolution pass, optionally performing remote refresh."""
+    authority = current_sso_session_authority()
+    session_epoch = authority.session_epoch
     invalid = False
     result: AuthenticatedUser | None = None
     needs_refresh = False
@@ -459,6 +476,7 @@ async def _resolve_sso_browser_session_pass(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await lock_active_sso_session_epoch(conn, authority)
             row = await conn.fetchrow(
                 """
                 SELECT s.*, e.issuer AS current_issuer,
@@ -470,9 +488,11 @@ async def _resolve_sso_browser_session_pass(
                   JOIN external_identities e
                     ON e.id = s.external_identity_id AND e.user_id = s.user_id
                  WHERE s.token_hash = $1
+                   AND s.session_epoch = $2
                  FOR UPDATE OF s
                 """,
                 token_hash,
+                session_epoch,
             )
             now = datetime.now(timezone.utc)
             if row is None:
@@ -720,6 +740,8 @@ async def revoke_sso_browser_session(
     csrf_header: str,
 ) -> RevokedSsoBrowserSession:
     """Delete one local handle and return its encrypted revocation material."""
+    authority = current_sso_session_authority()
+    session_epoch = authority.session_epoch
     token = _bounded_credential(raw_token)
     cookie = _bounded_credential(csrf_cookie)
     header = _bounded_credential(csrf_header)
@@ -731,14 +753,17 @@ async def revoke_sso_browser_session(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await lock_active_sso_session_epoch(conn, authority)
             row = await conn.fetchrow(
                 """
                 SELECT id, user_id, csrf_token_hash, token_envelope
                   FROM sso_browser_sessions
                  WHERE token_hash = $1
+                   AND session_epoch = $2
                  FOR UPDATE
                 """,
                 token_hash,
+                session_epoch,
             )
             if (
                 row is None
@@ -799,23 +824,27 @@ async def revoke_sso_browser_sessions_from_logout_token(
     if event_expires_at <= event_issued_at or event_expires_at <= now:
         raise AuthenticationError("Invalid back-channel logout token")
     fence_expires_at = max(event_expires_at, now + _LOGOUT_FENCE_TTL)
+    authority = current_sso_session_authority()
+    session_epoch = authority.session_epoch
 
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await lock_active_sso_session_epoch(conn, authority)
             await conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                f"sso-browser-sid:{issuer}:{sid}",
+                f"sso-browser-sid:{session_epoch}:{issuer}:{sid}",
             )
             await conn.execute("DELETE FROM sso_browser_logout_fences WHERE expires_at <= NOW()")
             await conn.execute(
                 """
                 INSERT INTO sso_browser_logout_fences (
-                    identity_issuer, keycloak_sid, identity_subject,
+                    session_epoch, identity_issuer, keycloak_sid, identity_subject,
                     logout_issued_at, expires_at
-                ) VALUES ($1, $2, $3, $4, $5)
+                ) VALUES ($1, $2, $3, $4, $5, $6)
                 ON CONFLICT (identity_issuer, keycloak_sid) DO UPDATE
-                   SET identity_subject = CASE
+                   SET session_epoch = EXCLUDED.session_epoch,
+                       identity_subject = CASE
                            WHEN EXCLUDED.logout_issued_at >=
                                 sso_browser_logout_fences.logout_issued_at
                            THEN EXCLUDED.identity_subject
@@ -831,6 +860,7 @@ async def revoke_sso_browser_sessions_from_logout_token(
                        ),
                        received_at = NOW()
                 """,
+                session_epoch,
                 issuer,
                 sid,
                 subject,
@@ -840,10 +870,12 @@ async def revoke_sso_browser_sessions_from_logout_token(
             result = await conn.execute(
                 """
                 DELETE FROM sso_browser_sessions
-                 WHERE identity_issuer = $1
-                   AND keycloak_sid = $2
-                   AND ($3::TEXT IS NULL OR identity_subject = $3)
+                 WHERE session_epoch = $1
+                   AND identity_issuer = $2
+                   AND keycloak_sid = $3
+                   AND ($4::TEXT IS NULL OR identity_subject = $4)
                 """,
+                session_epoch,
                 issuer,
                 sid,
                 subject,

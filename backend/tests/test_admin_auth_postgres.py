@@ -27,6 +27,7 @@ _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret
 )
+_SSO_SESSION_EPOCH = uuid.UUID("80af20c6-6f9e-452e-9693-98b6ae0ea213")
 
 
 def _dsn_for_database(dsn: str, database: str) -> str:
@@ -51,7 +52,7 @@ async def _admin_schema_shape(conn) -> dict[str, tuple[tuple[object, ...], ...]]
           FROM information_schema.columns
          WHERE table_schema = 'public'
            AND table_name = 'admin_browser_sessions'
-         ORDER BY ordinal_position
+         ORDER BY column_name
         """
     )
     constraints = await conn.fetch(
@@ -107,11 +108,34 @@ async def _fresh_database():
             assert admin_session_migration is not None
             await admin_session_migration.migrate(conn=conn)
             await admin_session_migration.migrate(conn=conn)
+            ordinary_session_migration = _load_migration("074_sso_browser_sessions.py")
+            assert ordinary_session_migration is not None
+            await ordinary_session_migration.migrate(conn=conn)
+            epoch_migration = _load_migration("076_sso_session_epoch.py")
+            assert epoch_migration is not None
+            await epoch_migration.migrate(conn=conn)
+            await epoch_migration.migrate(conn=conn)
             assert await _admin_schema_shape(conn) == fresh_admin_shape
 
             events_migration = _load_migration("015_events_outbox.py")
             assert events_migration is not None
             await events_migration.migrate(conn=conn)
+            await conn.execute(
+                """
+                INSERT INTO auth_runtime_state (
+                    singleton, runtime_generation, auth_mode,
+                    sso_session_epoch
+                ) VALUES (TRUE, 1, 'sso', $1)
+                """,
+                _SSO_SESSION_EPOCH,
+            )
+            await conn.execute(
+                """
+                UPDATE auth_runtime_epoch_upgrade
+                   SET state = 'enforced'
+                 WHERE singleton = TRUE
+                """
+            )
         finally:
             await conn.close()
         pool = await asyncpg.create_pool(target_dsn, min_size=1, max_size=4)
@@ -142,6 +166,7 @@ async def test_sso_admin_is_exact_prebound_opaque_and_live_rechecked(
         monkeypatch.setattr(admin_auth_service, "get_pool", get_test_pool)
         monkeypatch.setattr(keycloak_oidc, "get_pool", get_test_pool)
         monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+        monkeypatch.setattr(settings, "auth_runtime_generation", 1, raising=False)
         monkeypatch.setattr(
             settings,
             "keycloak_server_url",
@@ -152,6 +177,7 @@ async def test_sso_admin_is_exact_prebound_opaque_and_live_rechecked(
         monkeypatch.setattr(settings, "keycloak_admin_client_id", "akb-admin", raising=False)
         monkeypatch.setattr(settings, "public_base_url", "https://akb.example", raising=False)
         monkeypatch.setattr(settings, "admin_browser_session_ttl_secs", 300, raising=False)
+        monkeypatch.setattr(settings, "sso_session_epoch", _SSO_SESSION_EPOCH, raising=False)
 
         oidc = keycloak_oidc.KeycloakOIDC()
         rejected_request = await oidc.begin_admin_login()
@@ -246,14 +272,15 @@ async def test_sso_admin_is_exact_prebound_opaque_and_live_rechecked(
                 await conn.execute(
                     """
                     INSERT INTO admin_browser_sessions (
-                        token_hash, csrf_token_hash, user_id,
+                        session_epoch, token_hash, csrf_token_hash, user_id,
                         external_identity_id, identity_issuer, identity_subject,
                         keycloak_sid, expires_at
                     ) VALUES (
-                        $1, $2, $3, $4, $5, $6,
+                        $1, $2, $3, $4, $5, $6, $7,
                         'sid', NOW() + INTERVAL '5 minutes'
                     )
                     """,
+                    _SSO_SESSION_EPOCH,
                     "a" * 64,
                     "b" * 64,
                     admin_user_id,

@@ -28,6 +28,10 @@ from app.services.auth_service import (
     login,
     resolve_delegated_human_authorization,
 )
+from app.services.sso_session_epoch import (
+    current_sso_session_authority,
+    lock_active_sso_session_epoch,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,9 +174,12 @@ async def create_sso_admin_browser_session(
     csrf_token = secrets.token_urlsafe(32)
     token_hash = _hash_credential(token)
     csrf_hash = _hash_credential(csrf_token)
+    authority = current_sso_session_authority()
+    session_epoch = authority.session_epoch
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await lock_active_sso_session_epoch(conn, authority)
             await conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                 f"admin-browser-session:{identity.user_id}",
@@ -210,20 +217,23 @@ async def create_sso_admin_browser_session(
                     SELECT id
                       FROM admin_browser_sessions
                      WHERE user_id = $1
+                       AND session_epoch = $2
                      ORDER BY created_at DESC, id DESC
                     OFFSET 7
                  )
                 """,
                 identity.user_id,
+                session_epoch,
             )
             await conn.execute(
                 """
                 INSERT INTO admin_browser_sessions (
-                    token_hash, csrf_token_hash, user_id,
+                    session_epoch, token_hash, csrf_token_hash, user_id,
                     external_identity_id, identity_issuer, identity_subject,
                     keycloak_sid, expires_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 """,
+                session_epoch,
                 token_hash,
                 csrf_hash,
                 identity.user_id,
@@ -249,6 +259,8 @@ async def create_sso_admin_browser_session(
 async def resolve_sso_admin_browser_session(
     raw_token: str,
 ) -> ProductAdminIdentity:
+    authority = current_sso_session_authority()
+    session_epoch = authority.session_epoch
     token = _bounded_credential(raw_token)
     if token is None:
         raise AuthenticationError()
@@ -256,6 +268,7 @@ async def resolve_sso_admin_browser_session(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await lock_active_sso_session_epoch(conn, authority)
             row = await conn.fetchrow(
                 """
                 SELECT s.id AS session_id, s.user_id, s.external_identity_id,
@@ -265,8 +278,9 @@ async def resolve_sso_admin_browser_session(
                   JOIN external_identities e
                     ON e.id = s.external_identity_id AND e.user_id = s.user_id
                  WHERE s.token_hash = $1
+                   AND s.session_epoch = $2
                    AND s.expires_at > NOW()
-                   AND s.identity_issuer = $2
+                   AND s.identity_issuer = $3
                    AND e.issuer = s.identity_issuer
                    AND e.subject = s.identity_subject
                    AND u.is_admin
@@ -276,6 +290,7 @@ async def resolve_sso_admin_browser_session(
                  FOR UPDATE OF s
                 """,
                 token_hash,
+                session_epoch,
                 settings.keycloak_issuer,
             )
             if row is None:
@@ -317,11 +332,14 @@ async def validate_sso_admin_browser_session_csrf(
     ):
         raise AuthenticationError("Invalid admin CSRF token")
 
+    authority = current_sso_session_authority()
+    session_epoch = authority.session_epoch
     token_hash = _hash_credential(token)
     csrf_hash = _hash_credential(cookie)
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await lock_active_sso_session_epoch(conn, authority)
             row = await conn.fetchrow(
                 """
                 SELECT s.id AS session_id, s.csrf_token_hash,
@@ -332,8 +350,9 @@ async def validate_sso_admin_browser_session_csrf(
                   JOIN external_identities e
                     ON e.id = s.external_identity_id AND e.user_id = s.user_id
                  WHERE s.token_hash = $1
+                   AND s.session_epoch = $2
                    AND s.expires_at > NOW()
-                   AND s.identity_issuer = $2
+                   AND s.identity_issuer = $3
                    AND e.issuer = s.identity_issuer
                    AND e.subject = s.identity_subject
                    AND u.is_admin
@@ -343,6 +362,7 @@ async def validate_sso_admin_browser_session_csrf(
                  FOR UPDATE OF s
                 """,
                 token_hash,
+                session_epoch,
                 settings.keycloak_issuer,
             )
             if (
@@ -369,11 +389,14 @@ async def revoke_sso_admin_browser_session(
     if token is None or cookie is None or header is None or not secrets.compare_digest(cookie, header):
         raise AuthenticationError("Invalid admin CSRF token")
 
+    authority = current_sso_session_authority()
+    session_epoch = authority.session_epoch
     token_hash = _hash_credential(token)
     csrf_hash = _hash_credential(cookie)
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await lock_active_sso_session_epoch(conn, authority)
             row = await conn.fetchrow(
                 """
                 SELECT s.id AS session_id, s.csrf_token_hash,
@@ -381,10 +404,13 @@ async def revoke_sso_admin_browser_session(
                        u.username, u.email, u.display_name
                   FROM admin_browser_sessions s
                   JOIN users u ON u.id = s.user_id
-                 WHERE s.token_hash = $1 AND s.expires_at > NOW()
+                 WHERE s.token_hash = $1
+                   AND s.session_epoch = $2
+                   AND s.expires_at > NOW()
                  FOR UPDATE OF s
                 """,
                 token_hash,
+                session_epoch,
             )
             if row is None or not secrets.compare_digest(row["csrf_token_hash"], csrf_hash):
                 raise AuthenticationError("Invalid admin CSRF token")

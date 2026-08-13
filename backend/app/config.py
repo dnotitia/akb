@@ -734,6 +734,14 @@ class Settings(BaseModel):
     # allowed only so unrelated tests can construct Settings directly; the real
     # YAML loader rejects a missing mode before the runtime can start.
     auth_mode: AuthMode | None = None
+    # Monotonic installation-owned generation for auth runtime transitions.
+    # Keep it stable for an exact restart and increase it for every mode or SSO
+    # epoch change. PostgreSQL rejects stale or conflicting generations.
+    auth_runtime_generation: int = Field(default=1, ge=1)
+    # One-release acknowledgement for the pre-epoch schema bridge. Existing
+    # installations must stop every old backend before setting this value and
+    # running the executable preflight. Fresh databases do not require it.
+    sso_session_epoch_upgrade: Literal["stop-the-world-v1"] | None = None
 
     # App principals use a separate exchange-only carrier. Keeping a distinct
     # signing secret makes an app token cryptographically unusable as a user
@@ -798,6 +806,13 @@ class Settings(BaseModel):
     keycloak_management_client_id: str = "akb-sso-manager"
     keycloak_management_client_secret: str = ""
     admin_browser_session_ttl_secs: int = Field(default=900, ge=60, le=3600)
+    # Installation-owned SSO authority epoch. Every ordinary and admin
+    # browser session, plus each back-channel logout fence, is bound to this
+    # UUID. It remains stable across normal SSO restarts and must change when
+    # an operator deliberately starts a new SSO authority epoch. AKB also
+    # binds it to auth_runtime_generation in PostgreSQL, so sso -> local -> sso
+    # cannot revive old handles even if an operator reuses the same UUID.
+    sso_session_epoch: uuid.UUID | None = None
     # Ordinary SSO browsers receive only an opaque AKB handle. The Keycloak
     # refresh/ID token set is encrypted at rest with this independent,
     # installation-owned AES-256-GCM key. Blank keeps the capability

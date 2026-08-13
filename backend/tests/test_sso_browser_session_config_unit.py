@@ -13,6 +13,9 @@ from app.services import auth_policy, lifecycle, sso_browser_session_service
 from app.services.auth_service import AuthenticatedUser
 
 
+_SSO_SESSION_EPOCH = uuid.UUID("3ddfa3a1-d577-4cb4-9596-c4688fa42b17")
+
+
 def _encoded_key(byte: int = 7) -> str:
     return base64.urlsafe_b64encode(bytes([byte]) * 32).decode("ascii").rstrip("=")
 
@@ -26,6 +29,7 @@ def _sso_settings(**changes: object) -> Settings:
         "keycloak_client_secret": "browser-client-secret",  # pragma: allowlist secret
         "keycloak_admin_client_id": "akb-admin",
         "keycloak_admin_client_secret": "admin-client-secret",  # pragma: allowlist secret
+        "sso_session_epoch": _SSO_SESSION_EPOCH,
         "system_hmac_secret": "system-hmac-secret",  # pragma: allowlist secret
         "db_password": "database-secret",  # pragma: allowlist secret
         "public_base_url": "https://akb.example.com",
@@ -37,6 +41,13 @@ def _sso_settings(**changes: object) -> Settings:
 def test_browser_session_capability_requires_complete_server_custody(monkeypatch):
     missing_key = _sso_settings()
     monkeypatch.setattr(auth_policy, "settings", missing_key)
+    assert auth_policy.sso_browser_session_ready() is False
+
+    missing_epoch = _sso_settings(
+        sso_session_epoch=None,
+        sso_browser_session_encryption_key=_encoded_key(),
+    )
+    monkeypatch.setattr(auth_policy, "settings", missing_epoch)
     assert auth_policy.sso_browser_session_ready() is False
 
     ready = _sso_settings(sso_browser_session_encryption_key=_encoded_key())
@@ -79,6 +90,16 @@ def test_missing_key_keeps_expand_contract_deployment_staged(monkeypatch):
     monkeypatch.setattr(lifecycle, "settings", configured)
 
     lifecycle._validate_required_settings()
+
+
+def test_sso_session_epoch_is_required_even_while_browser_custody_is_staged(
+    monkeypatch,
+):
+    configured = _sso_settings(sso_session_epoch=None)
+    monkeypatch.setattr(lifecycle, "settings", configured)
+
+    with pytest.raises(RuntimeError, match="sso_session_epoch"):
+        lifecycle._validate_required_settings()
 
 
 def test_session_lifetime_must_fit_inside_absolute_lifetime():
