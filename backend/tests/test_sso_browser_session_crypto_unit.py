@@ -17,6 +17,21 @@ def _key(byte: int) -> str:
     return base64.urlsafe_b64encode(bytes([byte]) * 32).decode("ascii").rstrip("=")
 
 
+def _noncanonical_base64url_alias(value: str) -> str:
+    """Change only unused pad bits while preserving the decoded bytes."""
+    # RFC 4648 URL-safe alphabet, not credential material.
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"  # pragma: allowlist secret
+    remainder = len(value) % 4
+    assert remainder in {2, 3}
+    unused_bits = 4 if remainder == 2 else 2
+    index = alphabet.index(value[-1])
+    assert index & ((1 << unused_bits) - 1) == 0
+    alias = f"{value[:-1]}{alphabet[index | 0b01]}"
+    padding = "=" * ((4 - len(value) % 4) % 4)
+    assert base64.urlsafe_b64decode(value + padding) == base64.urlsafe_b64decode(alias + padding)
+    return alias
+
+
 def test_v1_cipher_round_trips_without_putting_plaintext_in_the_envelope():
     cipher = BrowserSessionCipher.from_encoded_key(_key(7))
     payload = {
@@ -80,8 +95,15 @@ def test_cipher_rejects_wrong_key_tampering_and_noncanonical_payloads_without_ec
         context="session:one:user-1",
     )
     tampered = f"{envelope[:-1]}{'A' if envelope[-1] != 'A' else 'B'}"
+    version, nonce, ciphertext = envelope.split(".")
+    noncanonical = f"{version}.{nonce}.{_noncanonical_base64url_alias(ciphertext)}"
 
-    for candidate, cipher in ((envelope, second), (tampered, first), ("v2.abc", first)):
+    for candidate, cipher in (
+        (envelope, second),
+        (tampered, first),
+        (noncanonical, first),
+        ("v2.abc", first),
+    ):
         with pytest.raises(BrowserSessionPayloadError) as captured:
             cipher.open(candidate, context="session:one:user-1")
         assert "never-echo-this" not in str(captured.value)

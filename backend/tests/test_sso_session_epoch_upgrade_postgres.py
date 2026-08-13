@@ -22,7 +22,8 @@ _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
 _EXACT_BASE_INIT_SQL = (
     _BACKEND / "tests" / "fixtures" / "sso_session_epoch" / "exact_base_0860a0e_init.sql"
 ).read_text()
-_EXACT_BASE_INIT_SHA256 = "410c67e62b63f254004430cd3bb2ab72ff0fc9e4af3415ac8218fec6137696b1"
+# Public fixture integrity digest, not credential material.
+_EXACT_BASE_INIT_SHA256 = "410c67e62b63f254004430cd3bb2ab72ff0fc9e4af3415ac8218fec6137696b1"  # pragma: allowlist secret
 _MIGRATION_REGISTRY = (_BACKEND / "app" / "db" / "postgres.py").read_text().split("for filename in (", 1)[1]
 _MIGRATION_REGISTRY = _MIGRATION_REGISTRY.split("    ):", 1)[0]
 _CURRENT_MIGRATIONS = re.findall(r'"([0-9]{3}_[^"]+\.py)"', _MIGRATION_REGISTRY)

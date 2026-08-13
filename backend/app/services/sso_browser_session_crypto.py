@@ -41,13 +41,19 @@ def _decode_base64url(value: str, *, error: type[ValueError]) -> bytes:
     if not isinstance(value, str) or not value or not value.isascii():
         raise error("Invalid browser-session cryptographic material")
     try:
-        return base64.b64decode(
+        decoded = base64.b64decode(
             value + "=" * ((4 - len(value) % 4) % 4),
             altchars=b"-_",
             validate=True,
         )
     except ValueError, binascii.Error:
         raise error("Invalid browser-session cryptographic material") from None
+    # Base64 decoders may accept aliases whose unused pad bits are non-zero.
+    # Reject every representation except our exact unpadded Base64URL profile so
+    # one encrypted envelope has one wire representation on every Python version.
+    if _encode_base64url(decoded) != value:
+        raise error("Invalid browser-session cryptographic material")
+    return decoded
 
 
 def _encode_base64url(value: bytes) -> str:
