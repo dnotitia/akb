@@ -6,6 +6,7 @@ import asyncio
 import os
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -523,3 +524,55 @@ async def test_migration_upgrades_old_schema_and_is_idempotent(services):
     assert snapshot_column is True
     assert constraint == 1
     assert unique_index == 1
+
+
+async def test_sso_bootstrap_retirement_receipt_migrates_and_is_monotonic(
+    services,
+    monkeypatch,
+):
+    pool, _, _, _, _, _ = services
+    from app.db.postgres import _load_migration
+    from app.services import standalone_sso_receipt as receipt_service
+    from app.services.standalone_sso_bootstrap import (
+        STANDALONE_SSO_RECEIPT_PROFILE,
+        StandaloneSSOBootstrapError,
+        StandaloneSSORetirementReceipt,
+    )
+
+    async with pool.acquire() as conn:
+        await conn.execute("DROP TABLE standalone_sso_bootstrap_retirements")
+        migration = _load_migration("073_sso_bootstrap_receipt.py")
+        assert migration is not None
+        await migration.migrate(conn)
+        await migration.migrate(conn)
+
+    async def _get_pool():
+        return pool
+
+    monkeypatch.setattr(receipt_service, "get_pool", _get_pool)
+    expected = StandaloneSSORetirementReceipt(
+        profile=STANDALONE_SSO_RECEIPT_PROFILE,
+        issuer="https://auth.akb.example.com/realms/akb",
+        realm_id="akb-realm-id",
+        bootstrap_client_id="akb-bootstrap-temporary",
+        management_client_uuid="management-client-uuid",
+        admin_client_uuid="admin-client-uuid",
+        api_client_uuid="api-client-uuid",
+        product_admin_subject="00000000-0000-4000-8000-000000000001",
+        akb_user_id="11111111-1111-4111-8111-111111111111",
+    )
+
+    assert await receipt_service.load_standalone_sso_retirement_receipt() is None
+    await receipt_service.record_standalone_sso_retirement_receipt(expected)
+    await receipt_service.record_standalone_sso_retirement_receipt(expected)
+    assert await receipt_service.load_standalone_sso_retirement_receipt() == expected
+
+    with pytest.raises(StandaloneSSOBootstrapError):
+        await receipt_service.record_standalone_sso_retirement_receipt(
+            replace(expected, issuer="https://other.example.com/realms/akb")
+        )
+
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM standalone_sso_bootstrap_retirements"
+        ) == 1

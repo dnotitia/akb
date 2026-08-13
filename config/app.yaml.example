@@ -205,6 +205,8 @@ app_credential_overlap_seconds: 300
 # keycloak_public_client: false      # true → PKCE (no client_secret needed)
 # keycloak_admin_client_id: "akb-admin"  # dedicated confidential /admin client;
 #                                         # must differ from every ordinary human client
+# keycloak_management_client_id: "akb-sso-manager" # standalone bundle only:
+#                                         # permanent least-privilege IdP control client
 # admin_browser_session_ttl_secs: 900     # also capped by the verified ID-token expiry
 # keycloak_verify_ssl: true          # false only for local self-signed Keycloak
 # keycloak_require_verified_email: true   # refuse unverified email for open-mode JIT.
@@ -236,8 +238,9 @@ app_credential_overlap_seconds: 300
 # mcp_oauth_enabled: false
 # mcp_oauth_audience: ""               # default: <public_base_url>/mcp
 # API and MCP audiences must remain distinct.
-# keycloak_client_secret and keycloak_admin_client_secret live in secret.yaml
-# (never commit either value)
+# keycloak_client_secret, keycloak_admin_client_secret, and the optional
+# standalone keycloak_management_client_secret live in secret.yaml (never
+# commit any value)
 
 # === Server ===
 host: 0.0.0.0

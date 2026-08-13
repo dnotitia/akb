@@ -249,6 +249,7 @@ async def _apply_migrations() -> None:
         "070_vault_files_s3_key_lookup.py",  # physical-key reachability + pending-delete barrier indexes
         "071_recovery_admin.py",  # explicit singleton recovery administrator + external username snapshot
         "072_admin_browser_sessions.py",  # short-lived opaque sessions for the dedicated SSO admin client
+        "073_sso_bootstrap_receipt.py",  # durable proof that the temporary bundled-Keycloak client was retired
     ):
         if filename in applied:
             continue

@@ -63,9 +63,10 @@ async def test_admin_authorization_request_uses_dedicated_client_pkce_and_nonce(
     assert query["response_type"] == ["code"]
     assert query["scope"] == ["openid profile email"]
     assert query["code_challenge_method"] == ["S256"]
+    assert query["prompt"] == ["login"]
+    assert query["max_age"] == ["0"]
     assert "code_challenge" in query
     assert "nonce" in query
-    assert "prompt" not in query
     assert issued == [
         (
             query["state"][0],
@@ -195,6 +196,7 @@ async def test_admin_id_token_requires_exact_client_nonce_and_human_session(
             "sub": str(uuid.uuid4()),
             "sid": str(uuid.uuid4()),
             "nonce": expected_nonce,
+            "amr": ["pwd"],
             "iat": now,
             "exp": now + 300,
         }
@@ -221,6 +223,10 @@ async def test_admin_id_token_requires_exact_client_nonce_and_human_session(
         mint(nonce="관리자-nonce"),
         mint(aud="akb-web"),
         mint(azp="akb-web"),
+        mint(amr=[]),
+        mint(amr=["pwd", "otp"]),
+        mint(amr=["broker"]),
+        mint(amr="pwd"),
         mint(sid=""),
         mint(iat=str(now)),
         mint(exp=str(now + 300)),

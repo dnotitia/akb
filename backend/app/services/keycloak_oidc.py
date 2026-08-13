@@ -241,6 +241,11 @@ class KeycloakOIDC:
             "nonce": nonce,
             "code_challenge": self._make_code_challenge(verifier),
             "code_challenge_method": "S256",
+            # Product administration is a recovery surface.  Never satisfy it
+            # from a pre-existing realm/broker SSO cookie; force a fresh native
+            # credential ceremony whose exact AMR is verified below.
+            "prompt": "login",
+            "max_age": "0",
         }
         return AdminAuthorizationRequest(
             location=(
@@ -485,6 +490,8 @@ class KeycloakOIDC:
         ):
             raise AuthenticationError("Invalid admin identity token")
         if _SERVICE_ACCOUNT_CLAIMS.intersection(claims):
+            raise AuthenticationError("Invalid admin identity token")
+        if claims.get("amr") != ["pwd"]:
             raise AuthenticationError("Invalid admin identity token")
         preferred_username = claims.get("preferred_username")
         if preferred_username is not None and (
