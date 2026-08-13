@@ -10,6 +10,7 @@ import pytest
 pytestmark = pytest.mark.asyncio
 
 _BOOTSTRAP_SECRET = "bootstrap-secret-never-print"  # pragma: allowlist secret
+_UPGRADE_SECRET = "upgrade-secret-never-print"  # pragma: allowlist secret
 _PRODUCT_PASSWORD = "product-password-never-print"  # pragma: allowlist secret
 _MANAGEMENT_SECRET = "management-secret-never-print"  # pragma: allowlist secret
 _API_SECRET = "api-secret-never-print"  # pragma: allowlist secret
@@ -84,8 +85,10 @@ async def test_bootstrap_cli_reads_only_secret_files_and_emits_allowlisted_repor
     _patch_database(monkeypatch)
     _patch_sso_settings(monkeypatch)
     bootstrap_file = tmp_path / "bootstrap-client-secret"
+    upgrade_file = tmp_path / "upgrade-client-secret"
     product_password_file = tmp_path / "product-admin-password"
     bootstrap_file.write_text(f"{_BOOTSTRAP_SECRET}\n")
+    upgrade_file.write_text(f"{_UPGRADE_SECRET}\n")
     product_password_file.write_text(f"{_PRODUCT_PASSWORD}\n")
     observed: dict[str, object] = {}
 
@@ -135,13 +138,21 @@ async def test_bootstrap_cli_reads_only_secret_files_and_emits_allowlisted_repor
     )
 
     exit_code = await cli._bootstrap_standalone_sso(
-        _arguments(str(bootstrap_file), str(product_password_file))
+        [
+            *_arguments(str(bootstrap_file), str(product_password_file)),
+            "--upgrade-client-id",
+            "akb-bootstrap-upgrade-v2",
+            "--upgrade-client-secret-file",
+            str(upgrade_file),
+        ]
     )
 
     captured = capsys.readouterr()
     assert exit_code == 0
     spec = observed["spec"]
     assert spec.bootstrap_client_secret == _BOOTSTRAP_SECRET
+    assert spec.upgrade_client_id == "akb-bootstrap-upgrade-v2"
+    assert spec.upgrade_client_secret == _UPGRADE_SECRET
     assert spec.product_admin_password == _PRODUCT_PASSWORD
     assert spec.management_client_secret == _MANAGEMENT_SECRET
     assert spec.api_client_secret == _API_SECRET
@@ -294,6 +305,7 @@ async def test_bootstrap_cli_rejects_reused_credentials_before_mutation(
 def _all_secrets() -> tuple[str, ...]:
     return (
         _BOOTSTRAP_SECRET,
+        _UPGRADE_SECRET,
         _PRODUCT_PASSWORD,
         _MANAGEMENT_SECRET,
         _API_SECRET,

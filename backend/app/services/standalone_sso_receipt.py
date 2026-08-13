@@ -7,6 +7,7 @@ import uuid
 from app.db.postgres import get_pool
 from app.services.standalone_sso_bootstrap import (
     STANDALONE_SSO_RECEIPT_PROFILE,
+    STANDALONE_SSO_RECEIPT_PROFILES,
     StandaloneSSOBootstrapError,
     StandaloneSSORetirementReceipt,
 )
@@ -69,11 +70,14 @@ async def load_standalone_sso_retirement_receipt(
 ) -> StandaloneSSORetirementReceipt | None:
     pool = await get_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            _SELECT_RECEIPT,
-            STANDALONE_SSO_RECEIPT_PROFILE,
-        )
-    return None if row is None else _from_row(row)
+        for profile in STANDALONE_SSO_RECEIPT_PROFILES:
+            row = await conn.fetchrow(
+                _SELECT_RECEIPT,
+                profile,
+            )
+            if row is not None:
+                return _from_row(row)
+    return None
 
 
 async def record_standalone_sso_retirement_receipt(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 import re
 from typing import Any
 from urllib.parse import quote
@@ -158,6 +158,14 @@ class KeycloakStandaloneSSOControl:
             realm="master",
             client_id=spec.bootstrap_client_id,
             client_secret=spec.bootstrap_client_secret,
+        )
+
+    async def acquire_upgrade(self, spec: StandaloneSSOBootstrapSpec) -> str | None:
+        return await self._token(
+            spec,
+            realm="master",
+            client_id=spec.upgrade_client_id,
+            client_secret=spec.upgrade_client_secret,
         )
 
     async def _request(
@@ -1259,11 +1267,12 @@ class KeycloakStandaloneSSOControl:
         await self._reconcile_product_admin(spec, token=bootstrap_token)
         return await self.readback(spec, management_token=bootstrap_token)
 
-    async def readback(
+    async def _readback(
         self,
         spec: StandaloneSSOBootstrapSpec,
         *,
         management_token: str,
+        require_identity_provider_mapper: bool,
     ) -> StandaloneSSOReadback:
         realm = await self._realm(spec, token=management_token)
         if realm is None or not self._realm_matches(spec, realm):
@@ -1325,9 +1334,12 @@ class KeycloakStandaloneSSOControl:
             _API_IDENTITY_PROVIDER_MAPPER_NAME,
             "keycloak_mapper_duplicate",
         )
-        if identity_provider_mapper is None or not self._mapper_matches(
-            identity_provider_mapper,
-            self._api_identity_provider_mapper(),
+        if require_identity_provider_mapper and (
+            identity_provider_mapper is None
+            or not self._mapper_matches(
+                identity_provider_mapper,
+                self._api_identity_provider_mapper(),
+            )
         ):
             raise _fail("keycloak_api_identity_provider_mapper_readback_failed")
         admin_mapper = _exact(
@@ -1403,34 +1415,130 @@ class KeycloakStandaloneSSOControl:
             product_admin_federated_identities=federation_count,
         )
 
+    async def readback(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        management_token: str,
+    ) -> StandaloneSSOReadback:
+        return await self._readback(
+            spec,
+            management_token=management_token,
+            require_identity_provider_mapper=True,
+        )
+
+    async def readback_legacy_v1(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        management_token: str,
+    ) -> StandaloneSSOReadback:
+        return await self._readback(
+            spec,
+            management_token=management_token,
+            require_identity_provider_mapper=False,
+        )
+
+    async def upgrade_v1_to_v2(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        upgrade_token: str,
+    ) -> StandaloneSSOReadback:
+        expected_api = self._api_client(spec)
+        api = await self._exact_client(
+            spec,
+            spec.realm,
+            spec.api_client_id,
+            token=upgrade_token,
+        )
+        if api is None or not self._selected_client_matches(api, expected_api):
+            raise _fail("keycloak_client_readback_failed")
+        api_uuid = _required_string(api, "id", "keycloak_client_readback_failed")
+        await self._reconcile_mapper(
+            spec,
+            api_uuid,
+            self._api_identity_provider_mapper(),
+            token=upgrade_token,
+        )
+        return await self.readback(
+            spec,
+            management_token=upgrade_token,
+        )
+
+    async def _retire_one_time_client(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        client_id: str,
+        token: str,
+        missing_code: str,
+        invalid_code: str,
+        retire_code: str,
+    ) -> None:
+        if _CLIENT_ID_RE.fullmatch(client_id) is None:
+            raise _fail(invalid_code)
+        client = await self._exact_client(
+            spec,
+            "master",
+            client_id,
+            token=token,
+        )
+        if client is None:
+            raise _fail(missing_code)
+        client_uuid = _required_string(
+            client,
+            "id",
+            invalid_code,
+        )
+        await self._request(
+            spec,
+            "DELETE",
+            f"/admin/realms/master/clients/{_path(client_uuid)}",
+            token=token,
+            expected=frozenset({204}),
+            code=retire_code,
+        )
+
+    async def _assert_one_time_client_retired(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        token: str,
+        acquire_token: Callable[[], Awaitable[str | None]],
+        check_code: str,
+        still_active_code: str,
+    ) -> None:
+        for attempt in range(5):
+            prior = await self._request(
+                spec,
+                "GET",
+                "/admin/realms/master",
+                token=token,
+                expected=frozenset({200, 401, 403}),
+                code=check_code,
+            )
+            prior_token_denied = prior.status_code in {401, 403}
+            new_token_denied = await acquire_token() is None
+            if prior_token_denied and new_token_denied:
+                return
+            if attempt < 4:
+                await asyncio.sleep(0.5)
+        raise _fail(still_active_code)
+
     async def retire_bootstrap(
         self,
         spec: StandaloneSSOBootstrapSpec,
         *,
         bootstrap_token: str,
     ) -> None:
-        if _CLIENT_ID_RE.fullmatch(spec.bootstrap_client_id) is None:
-            raise _fail("keycloak_bootstrap_client_id_invalid")
-        client = await self._exact_client(
+        await self._retire_one_time_client(
             spec,
-            "master",
-            spec.bootstrap_client_id,
+            client_id=spec.bootstrap_client_id,
             token=bootstrap_token,
-        )
-        if client is None:
-            raise _fail("keycloak_bootstrap_client_missing")
-        client_uuid = _required_string(
-            client,
-            "id",
-            "keycloak_bootstrap_client_invalid",
-        )
-        await self._request(
-            spec,
-            "DELETE",
-            f"/admin/realms/master/clients/{_path(client_uuid)}",
-            token=bootstrap_token,
-            expected=frozenset({204}),
-            code="keycloak_bootstrap_client_retire_failed",
+            missing_code="keycloak_bootstrap_client_missing",
+            invalid_code="keycloak_bootstrap_client_invalid",
+            retire_code="keycloak_bootstrap_client_retire_failed",
         )
 
     async def assert_bootstrap_retired(
@@ -1439,19 +1547,39 @@ class KeycloakStandaloneSSOControl:
         *,
         bootstrap_token: str,
     ) -> None:
-        for attempt in range(5):
-            prior = await self._request(
-                spec,
-                "GET",
-                "/admin/realms/master",
-                token=bootstrap_token,
-                expected=frozenset({200, 401, 403}),
-                code="keycloak_bootstrap_retirement_check_failed",
-            )
-            prior_token_denied = prior.status_code in {401, 403}
-            new_token_denied = await self.acquire_bootstrap(spec) is None
-            if prior_token_denied and new_token_denied:
-                return
-            if attempt < 4:
-                await asyncio.sleep(0.5)
-        raise _fail("keycloak_bootstrap_client_still_active")
+        await self._assert_one_time_client_retired(
+            spec,
+            token=bootstrap_token,
+            acquire_token=lambda: self.acquire_bootstrap(spec),
+            check_code="keycloak_bootstrap_retirement_check_failed",
+            still_active_code="keycloak_bootstrap_client_still_active",
+        )
+
+    async def retire_upgrade(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        upgrade_token: str,
+    ) -> None:
+        await self._retire_one_time_client(
+            spec,
+            client_id=spec.upgrade_client_id,
+            token=upgrade_token,
+            missing_code="keycloak_upgrade_client_missing",
+            invalid_code="keycloak_upgrade_client_invalid",
+            retire_code="keycloak_upgrade_client_retire_failed",
+        )
+
+    async def assert_upgrade_retired(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        upgrade_token: str,
+    ) -> None:
+        await self._assert_one_time_client_retired(
+            spec,
+            token=upgrade_token,
+            acquire_token=lambda: self.acquire_upgrade(spec),
+            check_code="keycloak_upgrade_retirement_check_failed",
+            still_active_code="keycloak_upgrade_client_still_active",
+        )

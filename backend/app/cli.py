@@ -59,6 +59,7 @@ GENERATE_LOCAL_SESSION_KEYSET_USAGE = (
 STANDALONE_SSO_BOOTSTRAP_USAGE = (
     "Usage: python -m app.cli bootstrap-standalone-sso "
     "--bootstrap-client-id ID --bootstrap-client-secret-file PATH "
+    "[--upgrade-client-id ID --upgrade-client-secret-file PATH] "
     "--product-admin-username USER --product-admin-email EMAIL "
     "--product-admin-password-file PATH"
 )
@@ -306,6 +307,11 @@ def _standalone_sso_parser() -> argparse.ArgumentParser:
     parser = _SafeArgumentParser(add_help=False)
     parser.add_argument("--bootstrap-client-id", required=True)
     parser.add_argument("--bootstrap-client-secret-file", required=True)
+    parser.add_argument(
+        "--upgrade-client-id",
+        default="akb-bootstrap-upgrade-v2",
+    )
+    parser.add_argument("--upgrade-client-secret-file")
     parser.add_argument("--product-admin-username", required=True)
     parser.add_argument("--product-admin-email", required=True)
     parser.add_argument("--product-admin-password-file", required=True)
@@ -339,6 +345,11 @@ async def _bootstrap_standalone_sso(args: list[str]) -> int:
     try:
         bootstrap_secret = _read_optional_bootstrap_secret_file(
             parsed.bootstrap_client_secret_file
+        )
+        upgrade_secret = (
+            _read_optional_bootstrap_secret_file(parsed.upgrade_client_secret_file)
+            if parsed.upgrade_client_secret_file is not None
+            else ""
         )
         product_admin_password = _read_optional_bootstrap_secret_file(
             parsed.product_admin_password_file
@@ -377,6 +388,7 @@ async def _bootstrap_standalone_sso(args: list[str]) -> int:
             settings.keycloak_admin_client_secret,
             settings.keycloak_management_client_secret,
             bootstrap_secret,
+            upgrade_secret,
             product_admin_password,
         ]
         configured_credentials = [value for value in credentials if value]
@@ -388,10 +400,11 @@ async def _bootstrap_standalone_sso(args: list[str]) -> int:
             settings.keycloak_client_id,
             settings.keycloak_admin_client_id,
             settings.keycloak_management_client_id,
+            parsed.upgrade_client_id,
         }
-        if len(client_ids) != 3:
+        if len(client_ids) != 4:
             raise _ProvisioningInputError(
-                "Standalone SSO API, admin, and management clients must be distinct"
+                "Standalone SSO API, admin, management, and upgrade clients must be distinct"
             )
 
         spec = StandaloneSSOBootstrapSpec(
@@ -412,6 +425,8 @@ async def _bootstrap_standalone_sso(args: list[str]) -> int:
             product_admin_username=parsed.product_admin_username,
             product_admin_email=parsed.product_admin_email,
             product_admin_password=product_admin_password,
+            upgrade_client_id=parsed.upgrade_client_id,
+            upgrade_client_secret=upgrade_secret,
         )
         await _initialize_operator_database()
         control = KeycloakStandaloneSSOControl(

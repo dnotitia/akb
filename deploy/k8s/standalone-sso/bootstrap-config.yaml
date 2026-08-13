@@ -5,5 +5,6 @@ metadata:
   namespace: akb
 data:
   bootstrap-client-id: akb-bootstrap-temporary
+  upgrade-client-id: akb-bootstrap-upgrade-v2
   product-admin-username: admin
   product-admin-email: admin@example.com
