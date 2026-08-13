@@ -70,12 +70,12 @@ async def test_secondary_resolver_accepts_only_mode_selected_human_without_mutat
     observed: list[str] = []
     monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
     principal = VerifiedPrincipal(
-        profile_id="local-session-legacy-v1",
-        issuer="akb-local",
+        profile_id="local-session-rs256-v2",
+        issuer=settings.local_session_issuer_effective,
         subject=delegated.user_id,
         credential_type="session",
         claims={"iat": 1},
-        audience=None,
+        audience=settings.local_session_audience_effective,
     )
 
     def _verify_session(raw: str):
@@ -86,7 +86,7 @@ async def test_secondary_resolver_accepts_only_mode_selected_human_without_mutat
         assert value is principal
         return delegated
 
-    monkeypatch.setattr(auth_service, "verify_local_session_legacy_v1", _verify_session)
+    monkeypatch.setattr(auth_service, "verify_local_session_rs256_v2", _verify_session)
     monkeypatch.setattr(auth_service, "project_verified_principal", _project)
     raw = "delegated-human.jwt"
     token_marker = current_token_id.set("primary-service-token-id")

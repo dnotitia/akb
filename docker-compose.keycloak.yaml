@@ -1,7 +1,7 @@
 # OPTIONAL local Keycloak overlay — for developing/testing the route-selected
-# Keycloak access-token verifier and the MCP OAuth Resource Server path.
-# Browser login/callback/logout/exchange routes are intentionally unavailable
-# in the current phase. This overlay is NOT part of the default stack.
+# Keycloak verifier, the dedicated product-admin browser login, and the MCP
+# OAuth Resource Server path. Ordinary-user browser login remains staged.
+# This overlay is NOT part of the default stack.
 #
 # Usage:
 #   docker compose -f docker-compose.yaml -f docker-compose.keycloak.yaml up
@@ -15,13 +15,26 @@
 #   keycloak_internal_url: "http://keycloak:8080"     # backend → keycloak container
 #   keycloak_realm: "akb"
 #   keycloak_client_id: "akb-web"
+#   keycloak_admin_client_id: "akb-admin"
 #   keycloak_verify_ssl: false
 #   api_oauth_audience: "http://localhost:8000/api"
+#   public_base_url: "http://localhost:3000"          # same-origin SPA + /api proxy
 #
-# Test user (in the imported realm): alice / alice-password (alice@example.com).
-# The imported confidential client's fixed dev secret may be used by a test
-# client to obtain a token; AKB itself does not consume a browser callback
-# secret in this phase.
+# In config/secret.yaml:
+#   keycloak_admin_client_secret: "local-akb-admin-dev-secret"
+#
+# Pre-bind the imported product-admin fixture before opening
+# http://localhost:3000/admin (password: product-admin-password):
+#
+#   docker compose exec backend python -m app.cli provision-recovery-admin sso \
+#     --username product-admin --email product-admin@example.com \
+#     --issuer http://localhost:8080/realms/akb \
+#     --subject 00000000-0000-4000-8000-000000000001
+#
+# Ordinary test user: alice / alice-password (alice@example.com).
+# The `akb-web` fixed dev secret may be used by a headless test client to
+# obtain an ordinary API token. AKB consumes only the separate `akb-admin`
+# secret for its active product-admin callback in this phase.
 #
 # === MCP OAuth path === additionally:
 #
@@ -49,7 +62,7 @@
 # walkthrough.
 #
 # The realm import ships FIXED dev client secrets ("local-akb-dev-secret",
-# "local-akb-mcp-test-secret"). Throwaway local values (same spirit as
+# "local-akb-mcp-test-secret", "local-akb-admin-dev-secret"). Throwaway local values (same spirit as
 # the hard-coded `akb` Postgres password in docker-compose.yaml) — never
 # reuse them anywhere real.
 

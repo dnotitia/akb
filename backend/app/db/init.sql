@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     display_name TEXT,
     is_admin BOOLEAN NOT NULL DEFAULT false,
+    is_recovery_admin BOOLEAN NOT NULL DEFAULT false,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     -- JWT revocation cutoff. A JWT is rejected if its `iat` claim is
@@ -52,8 +53,14 @@ CREATE TABLE IF NOT EXISTS users (
         CHECK (account_status IN ('active', 'suspended')),
     account_kind TEXT NOT NULL DEFAULT 'human'
         CONSTRAINT users_account_kind_check
-        CHECK (account_kind IN ('human', 'service'))
+        CHECK (account_kind IN ('human', 'service')),
+    CONSTRAINT users_recovery_admin_requires_admin
+        CHECK (NOT is_recovery_admin OR is_admin)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS users_one_recovery_admin
+    ON users ((is_recovery_admin))
+    WHERE is_recovery_admin;
 
 -- Stable external identity binding. Email is a mutable snapshot; verified
 -- OIDC issuer + subject is the permanent key.
@@ -62,6 +69,7 @@ CREATE TABLE IF NOT EXISTS external_identities (
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     issuer TEXT NOT NULL,
     subject TEXT NOT NULL,
+    username_snapshot TEXT,
     email_snapshot TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -70,6 +78,41 @@ CREATE TABLE IF NOT EXISTS external_identities (
 
 CREATE INDEX IF NOT EXISTS idx_external_identities_user
     ON external_identities(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS external_identities_id_user_key
+    ON external_identities(id, user_id);
+
+-- Dedicated product-admin browser sessions. These rows contain only hashes
+-- of opaque AKB session/CSRF values, an exact external-identity FK, and the
+-- issuer/subject snapshot used to invalidate a changed binding. No Keycloak
+-- access, refresh, or ID token is stored here.
+CREATE TABLE IF NOT EXISTS admin_browser_sessions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    token_hash TEXT NOT NULL UNIQUE
+        CHECK (token_hash ~ '^[0-9a-f]{64}$'),
+    csrf_token_hash TEXT NOT NULL
+        CHECK (csrf_token_hash ~ '^[0-9a-f]{64}$'),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    external_identity_id UUID NOT NULL,
+    identity_issuer TEXT NOT NULL
+        CHECK (char_length(identity_issuer) BETWEEN 1 AND 2048),
+    identity_subject TEXT NOT NULL
+        CHECK (char_length(identity_subject) BETWEEN 1 AND 1024),
+    keycloak_sid TEXT NOT NULL
+        CHECK (char_length(keycloak_sid) BETWEEN 1 AND 255),
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT admin_browser_session_external_user_fk
+        FOREIGN KEY (external_identity_id, user_id)
+        REFERENCES external_identities(id, user_id) ON DELETE CASCADE,
+    CONSTRAINT admin_browser_session_positive_lifetime
+        CHECK (expires_at > created_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_browser_sessions_expiry
+    ON admin_browser_sessions(expires_at);
+CREATE INDEX IF NOT EXISTS idx_admin_browser_sessions_user
+    ON admin_browser_sessions(user_id);
 
 -- Durable post-commit cleanup ledger. Token rows are deleted in the same
 -- transaction that suspends an account; PG token roles are DDL and are
@@ -108,9 +151,9 @@ CREATE INDEX IF NOT EXISTS idx_tokens_hash ON tokens(token_hash);
 CREATE INDEX IF NOT EXISTS idx_tokens_user ON tokens(user_id);
 
 -- ============================================================
--- OIDC transients — legacy additive schema retained for compatibility and
--- possible Phase 4 server-side browser-session reuse. Phase 1 browser routes
--- are staged unavailable and leave it empty. See migration 034.
+-- OIDC transients — single-use, TTL-bounded state. The dedicated Phase 2
+-- product-admin client uses kind=admin-state-v1; ordinary SSO browser login
+-- remains staged for Phase 4. See migration 034.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS oidc_transients (
     key         TEXT PRIMARY KEY,

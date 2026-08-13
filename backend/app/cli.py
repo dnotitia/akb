@@ -9,6 +9,13 @@ The backend container is pip-installed (no uv inside). Use plain `python`
 in all in-container invocations.
 
 Subcommands:
+    generate-local-session-keyset
+                               Create a non-overwriting RSA-3072 private key
+                               and public JWKS for local-session-rs256-v2.
+    provision-recovery-admin   Explicitly provision the designated local or
+                               SSO recovery administrator. Password material
+                               is accepted only by file/stdin and is never
+                               printed.
     reset-password <username>   Generate a temp password for the given user.
                                  Prints the temp password to stdout. Caller
                                  must share it with the user out-of-band.
@@ -18,15 +25,243 @@ Subcommands:
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
+import os
+import secrets
 import sys
+from pathlib import Path
+from typing import NoReturn
 
 
 REPAIR_RESOURCE_HASHES_USAGE = (
     "Usage: python -m app.cli repair-resource-hashes "
     "[--vault NAME] [--documents-only|--files-only] [--limit N]"
 )
+
+PROVISION_RECOVERY_ADMIN_USAGE = (
+    "Usage: python -m app.cli provision-recovery-admin "
+    "{local|sso} --username USER --email EMAIL [profile options]\n"
+    "  local: (--password-file PATH|- | --generate-password-file PATH)\n"
+    "  sso:   --issuer ISSUER --subject SUBJECT"
+)
+
+GENERATE_LOCAL_SESSION_KEYSET_USAGE = (
+    "Usage: python -m app.cli generate-local-session-keyset "
+    "--output-dir DIR [--retain-jwks PATH ...]"
+)
+
+
+class _CLIUsageError(Exception):
+    pass
+
+
+class _ProvisioningInputError(Exception):
+    pass
+
+
+def _generate_local_session_keyset(args: list[str]) -> int:
+    parser = _SafeArgumentParser(add_help=False)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--retain-jwks", action="append", default=[])
+    try:
+        parsed = parser.parse_args(args)
+    except _CLIUsageError:
+        print(GENERATE_LOCAL_SESSION_KEYSET_USAGE, file=sys.stderr)
+        return 2
+
+    from app.services.local_session_keys import (
+        LocalSessionKeyConfigurationError,
+        generate_local_session_keyset,
+    )
+
+    try:
+        report = generate_local_session_keyset(
+            parsed.output_dir,
+            retain_jwks_paths=parsed.retain_jwks,
+        )
+    except LocalSessionKeyConfigurationError as exc:
+        print(f"local_session_keyset_failed: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(report, sort_keys=True))
+    return 0
+
+
+class _SafeArgumentParser(argparse.ArgumentParser):
+    """Raise a value-free error so an accidental secret argument is not echoed."""
+
+    def error(self, _message: str) -> NoReturn:
+        raise _CLIUsageError()
+
+
+def _recovery_admin_parser() -> argparse.ArgumentParser:
+    parser = _SafeArgumentParser(add_help=False)
+    profiles = parser.add_subparsers(dest="profile", required=True)
+
+    local = profiles.add_parser("local", add_help=False)
+    local.add_argument("--username", required=True)
+    local.add_argument("--email", required=True)
+    password_source = local.add_mutually_exclusive_group(required=True)
+    password_source.add_argument("--password-file")
+    password_source.add_argument("--generate-password-file")
+
+    sso = profiles.add_parser("sso", add_help=False)
+    sso.add_argument("--username", required=True)
+    sso.add_argument("--email", required=True)
+    sso.add_argument("--issuer", required=True)
+    sso.add_argument("--subject", required=True)
+    return parser
+
+
+def _read_password_source(source: str) -> str:
+    try:
+        text = (
+            sys.stdin.read()
+            if source == "-"
+            else Path(source).read_text(encoding="utf-8")
+        )
+    except OSError:
+        raise _ProvisioningInputError("Unable to read the password source") from None
+    password = text.rstrip("\r\n")
+    if not password:
+        raise _ProvisioningInputError("The password source is empty")
+    if "\r" in password or "\n" in password:
+        raise _ProvisioningInputError("The password source must contain one line")
+    return password
+
+
+def _write_generated_password(target: str, password: str) -> Path:
+    if target == "-":
+        raise _ProvisioningInputError("Generated passwords require an explicit file")
+    path = Path(target)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    created = False
+    fd: int | None = None
+    try:
+        fd = os.open(path, flags, 0o600)
+        created = True
+        os.fchmod(fd, 0o600)
+        output = os.fdopen(fd, "w", encoding="utf-8")
+        fd = None  # ownership transferred to the file object
+        with output:
+            output.write(password)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+    except (OSError, ValueError):
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if created:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise _ProvisioningInputError("Unable to create the generated-password file") from None
+    return path
+
+
+def _remove_generated_password(path: Path) -> bool:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return False
+    return True
+
+
+async def _provision_recovery_admin(args: list[str]) -> int:
+    try:
+        parsed = _recovery_admin_parser().parse_args(args)
+    except _CLIUsageError:
+        print(PROVISION_RECOVERY_ADMIN_USAGE, file=sys.stderr)
+        return 2
+
+    from app.config import AuthModeConfigurationError
+    from app.db.postgres import close_pool, init_db
+    from app.exceptions import AKBError
+    from app.services.recovery_admin_service import (
+        provision_local_recovery_admin,
+        provision_sso_recovery_admin,
+    )
+
+    generated_path: Path | None = None
+    keep_generated = False
+    report: dict | None = None
+    error: tuple[str, str] | None = None
+    try:
+        await init_db()
+        if parsed.profile == "local":
+            if parsed.generate_password_file is not None:
+                password = secrets.token_urlsafe(32)
+                generated_path = _write_generated_password(
+                    parsed.generate_password_file,
+                    password,
+                )
+            else:
+                password = _read_password_source(parsed.password_file)
+            report = await provision_local_recovery_admin(
+                username=parsed.username,
+                email=parsed.email,
+                password=password,
+            )
+        else:
+            report = await provision_sso_recovery_admin(
+                username=parsed.username,
+                email=parsed.email,
+                issuer=parsed.issuer,
+                subject=parsed.subject,
+            )
+        keep_generated = generated_path is not None and bool(report["created"])
+    except AKBError as exc:
+        error = (exc.code or "recovery_admin_provisioning_failed", exc.message)
+    except AuthModeConfigurationError as exc:
+        error = ("recovery_admin_mode_configuration", str(exc))
+    except _ProvisioningInputError as exc:
+        error = ("recovery_admin_secret_source", str(exc))
+    except Exception:
+        # Never render an unexpected exception: driver/library text can include
+        # arguments, and this command handles one-time credential material.
+        error = (
+            "recovery_admin_provisioning_failed",
+            "Recovery administrator provisioning failed",
+        )
+    finally:
+        if generated_path is not None and not keep_generated:
+            if not _remove_generated_password(generated_path):
+                error = (
+                    "recovery_admin_secret_cleanup_failed",
+                    "Generated-password file cleanup failed",
+                )
+        try:
+            await close_pool()
+        except Exception:
+            if error is None:
+                error = (
+                    "recovery_admin_database_cleanup_failed",
+                    "Database connection cleanup failed",
+                )
+
+    if error is not None:
+        print(f"{error[0]}: {error[1]}", file=sys.stderr)
+        return 1
+    assert report is not None
+    public_report = {
+        "user_id": report["user_id"],
+        "username": report["username"],
+        "email": report["email"],
+        "auth_mode": report["auth_mode"],
+        "created": report["created"],
+        "is_admin": report["is_admin"],
+        "is_recovery_admin": report["is_recovery_admin"],
+        "password_file_written": keep_generated,
+    }
+    print(json.dumps(public_report, sort_keys=True))
+    return 0
 
 
 async def _reset_password(username: str) -> int:
@@ -194,13 +429,19 @@ def main(argv: list[str] | None = None) -> int:
     if not argv:
         print("Usage: python -m app.cli <subcommand> [args]", file=sys.stderr)
         print(
-            "Subcommands: reset-password <username>, repair-resource-hashes, "
+            "Subcommands: generate-local-session-keyset, "
+            "provision-recovery-admin {local|sso}, "
+            "reset-password <username>, repair-resource-hashes, "
             "initialize-postgres-native, okf-validate <dir>, "
             "okf-export --from-git <worktree> --vault <name> --out <dir>",
             file=sys.stderr,
         )
         return 2
     cmd = argv[0]
+    if cmd == "generate-local-session-keyset":
+        return _generate_local_session_keyset(argv[1:])
+    if cmd == "provision-recovery-admin":
+        return asyncio.run(_provision_recovery_admin(argv[1:]))
     if cmd == "reset-password":
         if len(argv) != 2:
             print("Usage: python -m app.cli reset-password <username>", file=sys.stderr)

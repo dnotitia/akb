@@ -40,11 +40,11 @@ from app.repositories.events_repo import emit_event
 from app.services.auth_policy import require_local_auth_enabled
 from app.services.auth_verifier_profiles import (
     KEYCLOAK_ACCESS_V1,
-    LOCAL_SESSION_LEGACY_V1,
+    LOCAL_SESSION_RS256_V2,
     KeycloakRouteProfile,
     VerifiedPrincipal,
     verify_keycloak_access_v1,
-    verify_local_session_legacy_v1,
+    verify_local_session_rs256_v2,
 )
 from app.services.role_sync import get_role_sync
 
@@ -135,23 +135,35 @@ def create_jwt(
     """
     now = datetime.now(timezone.utc)
     iat = now if not_before is None or not_before <= now else not_before
+    from app.services.local_session_keys import (
+        LOCAL_SESSION_JOSE_TYPE,
+        get_local_session_keyset,
+    )
+
+    keyset = get_local_session_keyset()
     payload = {
+        "iss": settings.local_session_issuer_effective,
+        "aud": settings.local_session_audience_effective,
         "sub": user_id,
         "username": username,
         "exp": iat + timedelta(hours=settings.jwt_expire_hours),
         "iat": iat,
+        "nbf": iat,
+        "jti": str(uuid.uuid4()),
+        "profile": LOCAL_SESSION_RS256_V2,
+        "token_use": "session",
     }
     return jwt.encode(
         payload,
-        settings.jwt_secret,
-        algorithm="HS256",
-        headers={"typ": "JWT"},
+        keyset.private_key,
+        algorithm="RS256",
+        headers={"typ": LOCAL_SESSION_JOSE_TYPE, "kid": keyset.active_kid},
     )
 
 
 def decode_jwt(token: str) -> dict | None:
-    """Compatibility read of the fixed local-session-legacy-v1 profile."""
-    principal = verify_local_session_legacy_v1(token)
+    """Compatibility helper backed only by local-session-rs256-v2."""
+    principal = verify_local_session_rs256_v2(token)
     return dict(principal.claims) if principal is not None else None
 
 
@@ -247,15 +259,10 @@ async def register(username: str, email: str, password: str, display_name: str |
         if existing:
             raise ConflictError("Username or email already exists")
 
-        # Bootstrap: the very first account in a fresh deployment becomes
-        # admin, so a brand-new instance has an operator without a manual
-        # DB edit. `NOT EXISTS (… users)` is evaluated against the table
-        # state before this row, so only a truly empty users table grants
-        # it — existing deployments never retroactively promote anyone.
         is_admin = await conn.fetchval(
             """
             INSERT INTO users (id, username, email, password_hash, display_name, is_admin)
-            VALUES ($1, $2, $3, $4, $5, NOT EXISTS (SELECT 1 FROM users))
+            VALUES ($1, $2, $3, $4, $5, false)
             RETURNING is_admin
             """,
             user_id,
@@ -264,9 +271,6 @@ async def register(username: str, email: str, password: str, display_name: str |
             pw_hash,
             display_name,
         )
-
-    if is_admin:
-        logging.getLogger("akb.auth").info("Bootstrap: first user %r registered — granted admin", username)
 
     # PG-native RBAC: emit the per-user PG role so akb_sql works.
     # Best-effort — reconciler at next startup catches any failure here.
@@ -590,7 +594,7 @@ async def project_verified_principal(
     principal: VerifiedPrincipal,
 ) -> AuthenticatedUser | None:
     """Common verified-human boundary before existing AKB authorization."""
-    if principal.profile_id == LOCAL_SESSION_LEGACY_V1:
+    if principal.profile_id == LOCAL_SESSION_RS256_V2:
         return await _project_local_session_principal(principal)
     if principal.profile_id == KEYCLOAK_ACCESS_V1:
         return await _project_keycloak_principal(principal)
@@ -996,7 +1000,7 @@ async def resolve_rest_user_authorization(
         return await _resolve_pat_or_service(token)
 
     if settings.require_auth_mode() == "local":
-        principal = verify_local_session_legacy_v1(token)
+        principal = verify_local_session_rs256_v2(token)
     else:
         principal = await verify_keycloak_access_v1(token, "api")
     if principal is None:
@@ -1027,7 +1031,7 @@ async def resolve_delegated_human_authorization(
     if token is None or token.startswith("akb_"):
         return None
     if settings.require_auth_mode() == "local":
-        principal = verify_local_session_legacy_v1(token)
+        principal = verify_local_session_rs256_v2(token)
     else:
         principal = await verify_keycloak_access_v1(token, "api")
     if principal is None:
@@ -1073,9 +1077,10 @@ async def _project_local_session_principal(
             # they have by setting tokens_revoked_before = NOW(); any JWT
             # whose iat predates that cutoff fails here even though the
             # signature is valid and exp has not passed. This is the only
-            # mechanism to invalidate a leaked or stale JWT short of
-            # rotating the global jwt_secret (which would log every user
-            # out, not just one).
+            # mechanism to invalidate one leaked or stale session. Replacing
+            # the local-session verification keyset is the installation-wide
+            # forced-reauth mechanism, but is intentionally not a per-user
+            # revocation tool.
             #
             # JWT iat is whole-second (RFC 7519). tokens_revoked_before is
             # sub-second TIMESTAMPTZ. To make same-second writes safe we
@@ -1098,7 +1103,7 @@ async def _project_local_session_principal(
 
 async def _resolve_akb_session_jwt(token: str) -> AuthenticatedUser | None:
     """Compatibility helper for callers that already extracted a local token."""
-    principal = verify_local_session_legacy_v1(token)
+    principal = verify_local_session_rs256_v2(token)
     if principal is None:
         return None
     return await project_verified_principal(principal)

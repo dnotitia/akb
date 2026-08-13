@@ -17,7 +17,7 @@ mkdir -p /var/lib/akb
 if [ ! -f "${SECRET_STATE}" ]; then
   cat > "${SECRET_STATE}" <<EOF
 DB_PASSWORD=$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')
-JWT_SECRET=$(python3 -c 'import secrets;print(secrets.token_hex(32))')
+SYSTEM_HMAC_SECRET=$(python3 -c 'import secrets;print(secrets.token_hex(32))')
 S3_ACCESS_KEY=akb-allinone
 S3_SECRET_KEY=$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')
 DEMO_USERNAME=demo
@@ -31,6 +31,18 @@ fi
 # shellcheck disable=SC1090
 . "${SECRET_STATE}"
 
+# One-release compatibility for an existing all-in-one data volume.  The old
+# JWT secret becomes internal HMAC material only; it is never used to accept or
+# issue a human session after this image starts.
+if [ -z "${SYSTEM_HMAC_SECRET:-}" ]; then
+  if [ -n "${JWT_SECRET:-}" ]; then
+    SYSTEM_HMAC_SECRET="${JWT_SECRET}"
+  else
+    SYSTEM_HMAC_SECRET="$(python3 -c 'import secrets;print(secrets.token_hex(32))')"
+    printf '\nSYSTEM_HMAC_SECRET=%s\n' "${SYSTEM_HMAC_SECRET}" >> "${SECRET_STATE}"
+  fi
+fi
+
 # Caller-supplied API keys override (still optional — Glama introspection
 # works without them).
 EMBED_API_KEY="${EMBED_API_KEY:-}"
@@ -43,7 +55,7 @@ LLM_MODEL="${LLM_MODEL:-}"
 RERANK_API_KEY="${RERANK_API_KEY:-}"
 
 export POSTGRES_DB=akb POSTGRES_USER=akb POSTGRES_PASSWORD="${DB_PASSWORD}"
-export DB_PASSWORD JWT_SECRET S3_ACCESS_KEY S3_SECRET_KEY \
+export DB_PASSWORD SYSTEM_HMAC_SECRET S3_ACCESS_KEY S3_SECRET_KEY \
        EMBED_API_KEY LLM_API_KEY RERANK_API_KEY \
        DEMO_USERNAME DEMO_EMAIL DEMO_PASSWORD DEMO_VAULT DEMO_PAT
 
@@ -68,12 +80,21 @@ python3 - <<'PY'
 import os, pathlib
 tpl = pathlib.Path("/etc/akb/secret.yaml.template").read_text()
 out = tpl
-for key in ("DB_PASSWORD", "JWT_SECRET", "EMBED_API_KEY", "LLM_API_KEY",
+for key in ("DB_PASSWORD", "SYSTEM_HMAC_SECRET", "EMBED_API_KEY", "LLM_API_KEY",
             "RERANK_API_KEY", "S3_ACCESS_KEY", "S3_SECRET_KEY"):
     out = out.replace("${" + key + "}", os.environ.get(key, ""))
 pathlib.Path("/etc/akb/secret.yaml").write_text(out)
 os.chmod("/etc/akb/secret.yaml", 0o600)
 PY
+
+# Generate the local-session signer exactly once on persistent storage.  The
+# CLI is non-overwriting, so a partial or conflicting keyset fails the boot
+# instead of silently replacing the installation identity.
+LOCAL_SESSION_KEY_DIR=/var/lib/akb/local-session
+if [ ! -d "${LOCAL_SESSION_KEY_DIR}" ]; then
+  python3 -m app.cli generate-local-session-keyset \
+    --output-dir "${LOCAL_SESSION_KEY_DIR}"
+fi
 
 # Override app.yaml fields the user supplied via ENV.
 python3 - <<'PY'
@@ -132,6 +153,21 @@ if [ "$(bootstrap_sql "SELECT 1 FROM pg_roles WHERE rolname='akb'")" != "1" ]; t
 fi
 gosu postgres "${PG_BIN}/psql" -h /tmp -U postgres -d akb \
     -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null
+
+# The installer, not ordinary registration, owns the first administrator.
+# Re-running converges on the exact designated identity and never prints the
+# password material.
+ADMIN_PASSWORD_FILE="$(mktemp)"
+printf '%s\n' "${DEMO_PASSWORD}" > "${ADMIN_PASSWORD_FILE}"
+chmod 600 "${ADMIN_PASSWORD_FILE}"
+if ! python3 -m app.cli provision-recovery-admin local \
+  --username "${DEMO_USERNAME}" \
+  --email "${DEMO_EMAIL}" \
+  --password-file "${ADMIN_PASSWORD_FILE}"; then
+  rm -f "${ADMIN_PASSWORD_FILE}"
+  exit 1
+fi
+rm -f "${ADMIN_PASSWORD_FILE}"
 
 gosu postgres "${PG_BIN}/pg_ctl" -D "${PGDATA}" -w stop
 

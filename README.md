@@ -275,18 +275,106 @@ store* below.
 # 1. Configure
 cp config/app.yaml.example   config/app.yaml
 cp config/secret.yaml.example config/secret.yaml
-$EDITOR config/secret.yaml   # set embed_api_key (and jwt_secret for any non-local deploy)
+$EDITOR config/secret.yaml   # set embed_api_key and replace system_hmac_secret
+
+# Generate the installation's persistent RSA-3072 local-session keyset.
+# This directory is gitignored; back it up with the other installation secrets.
+cd backend
+uv run python -m app.cli generate-local-session-keyset \
+  --output-dir ../config/local-session
+cd ..
 
 # 2. Run
 docker compose up -d
 
-# 3. Open
+# 3. Provision the designated recovery administrator (local mode)
+#    The password is read from stdin and is never printed by AKB.
+docker compose exec -T backend python -m app.cli provision-recovery-admin local \
+  --username recovery-admin --email recovery-admin@example.com \
+  --password-file - < /secure/operator/recovery-admin.password
+
+# 4. Open
 open http://localhost:3000
 ```
 
 `config/app.yaml` and `config/secret.yaml` are the **single source of runtime
 configuration** — no environment variables are read by the backend. Mount the
 `config/` directory at `/etc/akb/` in any deployment.
+
+Ordinary registration always creates a non-admin account, including on an
+empty database. Administrator bootstrap is available only through the
+operator CLI; there is no unauthenticated HTTP bootstrap endpoint. The CLI
+profile must match `auth_mode`:
+
+```bash
+# Local: have AKB generate the password only when an operator-owned output
+# file is explicitly requested. A new file is created with mode 0600 and the
+# password is not written to stdout, stderr, logs, or application config.
+python -m app.cli provision-recovery-admin local \
+  --username recovery-admin --email recovery-admin@example.com \
+  --generate-password-file /secure/operator/recovery-admin.password
+
+# SSO: pre-bind the product administrator to the exact external identity.
+# Username and email are snapshots; issuer + subject are the identity key.
+python -m app.cli provision-recovery-admin sso \
+  --username recovery-admin --email recovery-admin@example.com \
+  --issuer https://issuer.example.com/realms/akb \
+  --subject exact-provider-subject
+```
+
+The same exact identity is idempotent. A different designation, an existing
+username/email, or an already-bound external identity fails closed. The SSO
+command stores no usable local password and does not contact the identity
+provider. Generated output files are create-only and never overwritten; for a
+retry after the file exists, pass that file back with `--password-file`.
+
+Open `/admin` for the separate product-administration surface. In `local`
+mode it accepts the provisioned local administrator and returns the same
+`local-session-rs256-v2` profile used by local human authentication, but it
+refuses non-admin accounts. In `sso` mode local credentials are absent:
+`/admin` uses a dedicated confidential `akb-admin` Keycloak client with PKCE
+and nonce, then accepts only the exact pre-bound `(issuer, subject)` whose AKB
+account is still active and `is_admin=true`.
+
+The SSO callback stores no Keycloak access, refresh, or ID token. It creates a
+short-lived opaque HttpOnly admin cookie plus a CSRF token; PostgreSQL stores
+only their hashes plus the exact identity snapshot, and rechecks the account,
+unchanged external binding, and admin flag on every request. The one-time OIDC
+state is also bound to a short-lived
+HttpOnly cookie so a callback copied into another browser fails before token
+exchange. Configure `keycloak_admin_client_secret`, register
+`<public_base_url>/api/v1/admin/auth/keycloak/callback` and
+`<public_base_url>/admin` in the dedicated client, and keep the admin client ID
+out of every API/MCP resource-client path. Browser-facing AKB and Keycloak URLs
+must use HTTPS outside the explicit loopback development exception. Ordinary SSO browser
+login remains staged until its Phase 4 server-side token-custody work lands.
+
+Local login issues only the versioned `local-session-rs256-v2` profile:
+RS256 with an installation-owned RSA-3072 key, an RFC 7638 `kid`, exact
+deployment issuer/audience, `jti`, and a public-only JWKS at
+`GET /api/v1/auth/jwks`. AKB never chooses a verifier from an untrusted token
+`alg` header. Upgrading from an HS256 release is an intentional forced-login
+boundary: generate and persist the v2 keyset before rollout, set
+`jwt_algorithm: RS256`, and restart all backends together. Existing HS256 user
+sessions then receive 401 and must sign in again; PATs and service keys are not
+revoked. The old `jwt_secret` may be retained for one release only as migration
+input for short-lived internal HMAC capabilities, or renamed unchanged to
+`system_hmac_secret`; it is never accepted as human-session signing material.
+
+For routine v2 key rotation, generate a new directory while retaining the
+current public JWKS, publish the new immutable Secret/config revision, and
+roll every backend to that exact pair:
+
+```bash
+cd backend
+uv run python -m app.cli generate-local-session-keyset \
+  --output-dir /secure/akb/local-session-next \
+  --retain-jwks /secure/akb/local-session-current/jwks.json
+```
+
+Keep a retained public key for at least `jwt_expire_hours` plus rollout skew,
+then remove it in a later coordinated keyset revision. Restoring the previous
+private/JWKS pair is the rollback; never overwrite key files in place.
 
 ### Vector store (driver-pluggable)
 

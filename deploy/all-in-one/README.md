@@ -70,15 +70,17 @@ boot and persisted in `/var/lib/akb/state.env`.
 | postgres   | 5432      | supervisord |
 | redis      | 6379      | supervisord |
 | minio      | 9000/9001 | supervisord |
-| seed (one-shot — demo user + vault + PAT) | – | supervisord |
+| seed (one-shot — admin-owned demo vault + PAT) | – | supervisord |
 
 `entrypoint.sh` runs idempotent bootstrap on every boot:
 
-1. Generates and persists random `DB_PASSWORD`, `JWT_SECRET`,
+1. Generates and persists random `DB_PASSWORD`, `SYSTEM_HMAC_SECRET`,
    `S3_SECRET_KEY`, `DEMO_PASSWORD`, `DEMO_PAT` under
    `/var/lib/akb/state.env` on first run.
-2. Renders `/etc/akb/secret.yaml` from `secret.yaml.template`.
-3. `initdb`s the PG cluster, creates the `akb` role + database, and
+2. Generates and persists the RSA-3072 `local-session-rs256-v2` keyset under
+   `/var/lib/akb/local-session` and renders `/etc/akb/secret.yaml`.
+3. `initdb`s the PG cluster, creates the `akb` role + database, explicitly
+   provisions the demo identity as the designated product/recovery admin, and
    installs the `vector` extension.
 4. Creates the MinIO `akb-files` bucket once MinIO is up (background).
 5. Hands off to supervisord — which starts everything and runs `seed.py`

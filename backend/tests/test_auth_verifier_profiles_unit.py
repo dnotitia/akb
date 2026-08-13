@@ -172,7 +172,7 @@ async def test_rest_local_mode_selects_only_local_profile_without_fallback(monke
     from app.services import auth_service
 
     monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
-    principal = _principal("local-session-legacy-v1")
+    principal = _principal("local-session-rs256-v2")
     actor = _actor()
     calls: list[str] = []
 
@@ -187,7 +187,7 @@ async def test_rest_local_mode_selects_only_local_profile_without_fallback(monke
         assert value is principal
         return actor
 
-    monkeypatch.setattr(auth_service, "verify_local_session_legacy_v1", verify_local)
+    monkeypatch.setattr(auth_service, "verify_local_session_rs256_v2", verify_local)
     monkeypatch.setattr(auth_service, "verify_keycloak_access_v1", forbidden_keycloak)
     monkeypatch.setattr(auth_service, "project_verified_principal", project)
 
@@ -196,7 +196,7 @@ async def test_rest_local_mode_selects_only_local_profile_without_fallback(monke
     assert resolved is actor
     assert calls == ["local:opaque.jwt"]
 
-    monkeypatch.setattr(auth_service, "verify_local_session_legacy_v1", lambda _token: None)
+    monkeypatch.setattr(auth_service, "verify_local_session_rs256_v2", lambda _token: None)
     assert await auth_service.resolve_rest_user_authorization("Bearer rejected.jwt") is None
 
 
@@ -220,7 +220,7 @@ async def test_rest_sso_mode_selects_only_api_access_profile_without_fallback(mo
         assert value is principal
         return actor
 
-    monkeypatch.setattr(auth_service, "verify_local_session_legacy_v1", forbidden_local)
+    monkeypatch.setattr(auth_service, "verify_local_session_rs256_v2", forbidden_local)
     monkeypatch.setattr(auth_service, "verify_keycloak_access_v1", verify_keycloak)
     monkeypatch.setattr(auth_service, "project_verified_principal", project)
 
@@ -239,30 +239,20 @@ async def test_rest_sso_mode_selects_only_api_access_profile_without_fallback(mo
 @pytest.mark.asyncio
 async def test_rest_sso_mode_rejects_a_valid_local_session_jwt(monkeypatch):
     from app.services import auth_service
-    from app.services.auth_verifier_profiles import verify_local_session_legacy_v1
+    from app.services.auth_service import create_jwt
+    from app.services.auth_verifier_profiles import verify_local_session_rs256_v2
     from app.services.keycloak_oidc import KeycloakOIDC
 
-    secret = "required-compatibility-hmac-secret"  # pragma: allowlist secret
-    now = int(datetime.now(timezone.utc).timestamp())
-    local_token = jwt.encode(
-        {
-            "sub": str(uuid.uuid4()),
-            "username": "local-alice",
-            "iat": now,
-            "exp": now + 300,
-        },
-        secret,
-        algorithm="HS256",
-        headers={"typ": "JWT"},
-    )
-    monkeypatch.setattr(settings, "jwt_secret", secret, raising=False)
-    assert verify_local_session_legacy_v1(local_token) is not None
+    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+    monkeypatch.setattr(settings, "public_base_url", "https://akb.example.com", raising=False)
+    local_token = create_jwt(str(uuid.uuid4()), "local-alice")
+    assert verify_local_session_rs256_v2(local_token) is not None
 
     _, api_audience, _ = _configure_keycloak(monkeypatch)
     service = KeycloakOIDC()
 
     async def forbidden_fetch(*, force: bool = False):
-        raise AssertionError(f"HS256 local token must fail before JWKS fetch: {force}")
+        raise AssertionError(f"local-session token must fail before JWKS fetch: {force}")
 
     async def verify_keycloak(token: str, route_profile: str):
         assert route_profile == "api"
@@ -279,7 +269,7 @@ async def test_rest_sso_mode_rejects_a_valid_local_session_jwt(monkeypatch):
         raise AssertionError("a local session must be rejected before projection")
 
     service._fetch_jwks = forbidden_fetch  # type: ignore[method-assign]
-    monkeypatch.setattr(auth_service, "verify_local_session_legacy_v1", forbidden_local)
+    monkeypatch.setattr(auth_service, "verify_local_session_rs256_v2", forbidden_local)
     monkeypatch.setattr(auth_service, "verify_keycloak_access_v1", verify_keycloak)
     monkeypatch.setattr(auth_service, "project_verified_principal", forbidden_projection)
 
@@ -294,9 +284,9 @@ async def test_delegated_human_resolver_is_mode_selected_and_preserves_primary_c
     from app.services import auth_service
 
     monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
-    principal = _principal("local-session-legacy-v1")
+    principal = _principal("local-session-rs256-v2")
     actor = _actor()
-    monkeypatch.setattr(auth_service, "verify_local_session_legacy_v1", lambda _token: principal)
+    monkeypatch.setattr(auth_service, "verify_local_session_rs256_v2", lambda _token: principal)
 
     async def project(_principal):
         return actor
@@ -368,46 +358,8 @@ async def test_mcp_never_accepts_local_session_jwt(monkeypatch):
     def forbidden_local(_token: str):
         raise AssertionError("MCP must not invoke the local-session verifier")
 
-    monkeypatch.setattr(auth_service, "verify_local_session_legacy_v1", forbidden_local)
+    monkeypatch.setattr(auth_service, "verify_local_session_rs256_v2", forbidden_local)
     assert await auth_service.resolve_mcp_authorization("Bearer local.session.jwt") is None
-
-
-def test_local_session_legacy_v1_is_fixed_hs256_with_strict_current_claims(monkeypatch):
-    from app.services.auth_verifier_profiles import verify_local_session_legacy_v1
-
-    secret = "local-session-test-secret-at-least-32-bytes"  # pragma: allowlist secret
-    monkeypatch.setattr(settings, "jwt_secret", secret, raising=False)
-    now = int(datetime.now(timezone.utc).timestamp())
-    claims = {
-        "sub": str(uuid.uuid4()),
-        "username": "alice",
-        "iat": now,
-        "exp": now + 300,
-    }
-    token = jwt.encode(claims, secret, algorithm="HS256", headers={"typ": "JWT"})
-
-    principal = verify_local_session_legacy_v1(token)
-
-    assert principal is not None
-    assert principal.profile_id == "local-session-legacy-v1"
-    assert principal.subject == claims["sub"]
-    assert principal.claims["username"] == "alice"
-
-    unsigned = jwt.encode(claims, key="", algorithm="none", headers={"typ": "JWT"})
-    assert verify_local_session_legacy_v1(unsigned) is None
-    assert verify_local_session_legacy_v1(_replace_header(token, alg="RS256")) is None
-    assert verify_local_session_legacy_v1(_replace_header(token, typ="AKB-APP")) is None
-
-    for required in ("sub", "username", "iat", "exp"):
-        incomplete = dict(claims)
-        incomplete.pop(required)
-        encoded = jwt.encode(
-            incomplete,
-            secret,
-            algorithm="HS256",
-            headers={"typ": "JWT"},
-        )
-        assert verify_local_session_legacy_v1(encoded) is None
 
 
 @pytest.mark.asyncio
@@ -532,6 +484,49 @@ async def test_keycloak_mcp_profile_does_not_apply_static_human_azp_allowlist(
             route_profile="mcp",
         )
         is not None
+    )
+
+    admin_client_token = _mint_keycloak_token(
+        rsa_keypair,
+        issuer=issuer,
+        audience=mcp_audience,
+        claim_overrides={"azp": settings.keycloak_admin_client_id},
+    )
+    assert (
+        await service.verify_access_token(
+            admin_client_token,
+            mcp_audience,
+            route_profile="mcp",
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_keycloak_access_v1_rejects_malformed_trusted_rsa_jwk(
+    monkeypatch,
+    rsa_keypair,
+):
+    from app.services.keycloak_oidc import KeycloakOIDC
+
+    issuer, api_audience, _ = _configure_keycloak(monkeypatch)
+    malformed = {**rsa_keypair["jwk"]}
+    malformed.pop("n")
+    service = KeycloakOIDC()
+    service._jwks = {"keys": [malformed]}
+    token = _mint_keycloak_token(
+        rsa_keypair,
+        issuer=issuer,
+        audience=api_audience,
+    )
+
+    assert (
+        await service.verify_access_token(
+            token,
+            api_audience,
+            route_profile="api",
+        )
+        is None
     )
 
 

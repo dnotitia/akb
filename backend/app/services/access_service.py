@@ -10,7 +10,13 @@ import logging
 import uuid
 
 from app.db.postgres import get_pool
-from app.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationError
+from app.exceptions import (
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    RecoveryAdminProtectedError,
+    ValidationError,
+)
 from app.models.vault_scope import VaultScope, current_token_uuid, current_vault_scope
 from app.repositories import vault_write_policy_repo as write_policy_repo
 from app.repositories.events_repo import emit_event
@@ -1677,6 +1683,11 @@ async def delete_user_account(user_id: str) -> dict:
     pool = await get_pool()
 
     async with pool.acquire() as conn:
+        if await conn.fetchval(
+            "SELECT is_recovery_admin FROM users WHERE id = $1",
+            uid,
+        ):
+            raise RecoveryAdminProtectedError()
         owned_vault_names = [
             r["name"] for r in await conn.fetch(
                 "SELECT name FROM vaults WHERE owner_id = $1", uid

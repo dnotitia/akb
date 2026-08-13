@@ -45,7 +45,9 @@ _SAFE_ISO = re.compile(
 
 
 def _cursor_secret() -> bytes:
-    configured = (settings.app_token_secret or settings.jwt_secret or "").encode()
+    configured = (
+        settings.app_token_secret or settings.system_hmac_secret_effective or ""
+    ).encode()
     # Unit-only configurations may intentionally leave auth secrets blank.  A
     # deterministic fallback keeps cursors opaque and, more importantly,
     # still binds them to their signed payload rather than exposing JSON.

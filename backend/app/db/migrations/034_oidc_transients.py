@@ -1,9 +1,9 @@
 """Migration 034: retain the legacy ``oidc_transients`` schema.
 
-The table originally stored authorization-code flow transients. Phase 1
-browser routes are now staged unavailable and issue or redeem no records;
-keeping the additive schema is harmless and avoids a destructive migration.
-Phase 4 may reuse it only as part of the server-side browser-session design.
+The dedicated Phase 2 product-admin client uses a namespaced, single-use
+``admin-state-v1`` record whose payload also binds the initiating browser by
+an opaque-cookie hash. Ordinary SSO browser routes remain staged and may reuse
+a different kind only as part of the Phase 4 browser-session design.
 
 Idempotent: ``CREATE TABLE IF NOT EXISTS``.
 """

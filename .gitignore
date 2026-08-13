@@ -38,6 +38,7 @@ htmlcov/
 /config/*.yaml
 /config/*.bak
 !/config/*.yaml.example
+/config/local-session/
 # Test-bootstrap copy of app.yaml — materialised by backend/tests/conftest.py
 # so `app.config` can import when pytest runs from `backend/` (CWD-relative
 # config search misses the repo-root /config without it).

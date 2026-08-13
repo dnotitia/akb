@@ -1,6 +1,6 @@
 import { matchRoutes, type RouteObject } from "react-router-dom";
 
-export type AppRouteBoundary = "auth" | "public" | "app-layout" | "vault-shell";
+export type AppRouteBoundary = "admin" | "auth" | "public" | "app-layout" | "vault-shell";
 
 export interface AppRouteDefinition {
   path: string;
@@ -16,6 +16,7 @@ export interface AppRouteDefinition {
  * intentionally a review gate for route, page, and shell-owner changes.
  */
 export const appRouteContract = [
+  { path: "/admin", component: "AdminPage", boundary: "admin" },
   { path: "/auth", component: "AuthPage", boundary: "auth" },
   { path: "/auth/forgot", component: "AuthForgotPage", boundary: "auth" },
   { path: "/auth/callback", component: "AuthCallbackPage", boundary: "auth" },

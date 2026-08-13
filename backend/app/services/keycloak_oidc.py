@@ -1,14 +1,15 @@
-"""Pinned Keycloak verification plus dormant browser OIDC primitives.
+"""Pinned Keycloak verification plus separated browser OIDC primitives.
 
 Phase 1 request authorization uses :meth:`verify_access_token` only. The
 route-selected ``keycloak-access-v1`` profile pins RS256, issuer, JWKS, route
 audience, token kind, and required claims before exact ``(issuer, subject)``
 projection. It never treats an ID token as an API access token.
 
-Authorization-code, ID-token, and logout helpers remain internal candidates
-for the Phase 4 server-side browser-session design. No Phase 1 production
-route calls them, and this module has no AKB human-session issuance or account
-adoption entry point. See ``docs/designs/keycloak-oidc/00-overview.md``.
+The dedicated Phase 2 product-admin client uses its own authorization-code,
+PKCE, nonce, ID-token, and logout profile. Ordinary-user browser helpers remain
+dormant candidates for Phase 4. This module has no AKB human-session issuance
+or account-adoption entry point. See
+``docs/designs/keycloak-oidc/00-overview.md``.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import logging
 import secrets
 import time
 import urllib.parse
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
@@ -39,12 +41,18 @@ from app.services.auth_verifier_profiles import (
 
 logger = logging.getLogger("akb.keycloak")
 
-# Reserved Phase 4 authorization-code scopes. The staged Phase 1 browser
-# routes never issue an authorization request.
+# OIDC browser scopes. The admin client uses them now; ordinary-user browser
+# routes remain staged for Phase 4.
 _SCOPE = "openid profile email"
 _TOKEN_SUPPLIED_KEY_HEADERS = frozenset({"jku", "x5u", "jwk", "x5c"})
 _SERVICE_ACCOUNT_CLAIMS = frozenset({"client_id", "clientId", "clientHost", "clientAddress"})
 _JWKS_REFRESH_COOLDOWN_SECONDS = 30.0
+
+
+@dataclass(frozen=True, slots=True)
+class AdminAuthorizationRequest:
+    location: str
+    browser_binding: str
 
 
 # ── Transient store (oidc_transients table) ──────────────────────────
@@ -93,8 +101,33 @@ async def _store_consume(key: str, kind: str) -> dict | None:
     return json.loads(payload) if isinstance(payload, str) else payload
 
 
+async def _store_consume_admin_bound(
+    key: str,
+    browser_binding_hash: str,
+) -> dict | None:
+    """Atomically consume admin state only when its browser binding matches."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            DELETE FROM oidc_transients
+             WHERE key = $1
+               AND kind = 'admin-state-v1'
+               AND expires_at > NOW()
+               AND payload->>'browser_binding_hash' = $2
+            RETURNING payload
+            """,
+            key,
+            browser_binding_hash,
+        )
+    if row is None:
+        return None
+    payload = row["payload"]
+    return json.loads(payload) if isinstance(payload, str) else payload
+
+
 class KeycloakOIDC:
-    """Pinned verifier with dormant, PostgreSQL-backed browser helpers."""
+    """Pinned verifier with isolated admin and ordinary browser profiles."""
 
     def __init__(self) -> None:
         # JWKS is cached in-process. Unknown kids may request one bounded,
@@ -176,6 +209,67 @@ class KeycloakOIDC:
         """Verify+consume the CSRF state. Returns {redirect_path, code_verifier?}."""
         return await _store_consume(state, "state")
 
+    async def begin_admin_login(self) -> AdminAuthorizationRequest:
+        """Build the dedicated product-admin authorization request.
+
+        The admin client always uses PKCE in addition to its confidential
+        client authentication. Its state/nonce namespace cannot be consumed by
+        the ordinary browser-flow helpers.
+        """
+        state = secrets.token_urlsafe(32)
+        nonce = secrets.token_urlsafe(32)
+        verifier = self._make_code_verifier()
+        browser_binding = secrets.token_urlsafe(32)
+        await _store_issue(
+            state,
+            "admin-state-v1",
+            {
+                "code_verifier": verifier,
+                "nonce": nonce,
+                "browser_binding_hash": hashlib.sha256(
+                    browser_binding.encode("ascii")
+                ).hexdigest(),
+            },
+            ttl_secs=600,
+        )
+        params = {
+            "client_id": settings.keycloak_admin_client_id,
+            "redirect_uri": settings.keycloak_admin_redirect_uri,
+            "response_type": "code",
+            "scope": _SCOPE,
+            "state": state,
+            "nonce": nonce,
+            "code_challenge": self._make_code_challenge(verifier),
+            "code_challenge_method": "S256",
+        }
+        return AdminAuthorizationRequest(
+            location=(
+                f"{settings.keycloak_authorization_endpoint}?"
+                f"{urllib.parse.urlencode(params)}"
+            ),
+            browser_binding=browser_binding,
+        )
+
+    async def consume_admin_state(
+        self,
+        state: str,
+        browser_binding: str,
+    ) -> dict | None:
+        """Consume state only in the browser that initiated the login."""
+        if not 20 <= len(browser_binding) <= 512:
+            return None
+        actual_hash = hashlib.sha256(browser_binding.encode("utf-8")).hexdigest()
+        payload = await _store_consume_admin_bound(state, actual_hash)
+        if not isinstance(payload, dict):
+            return None
+        expected_hash = payload.pop("browser_binding_hash", None)
+        if not isinstance(expected_hash, str) or not secrets.compare_digest(
+            expected_hash,
+            actual_hash,
+        ):
+            return None
+        return payload
+
     # ── Dormant authorization-code exchange (Phase 4 candidate) ─────
     async def exchange_code_for_tokens(
         self,
@@ -213,7 +307,44 @@ class KeycloakOIDC:
             raise AuthenticationError("Authorization code exchange failed")
         return resp.json()
 
-    # ── Dormant ID-token verification (Phase 4 candidate) ────────────
+    async def exchange_admin_code(self, code: str, code_verifier: str) -> dict[str, Any]:
+        """Exchange one admin-client code without logging token material."""
+        if not code or not code_verifier:
+            raise AuthenticationError("Authorization code exchange failed")
+        data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": settings.keycloak_admin_redirect_uri,
+            "client_id": settings.keycloak_admin_client_id,
+            "client_secret": settings.keycloak_admin_client_secret,
+            "code_verifier": code_verifier,
+        }
+        try:
+            response = await self._client().post(
+                settings.keycloak_token_endpoint,
+                data=data,
+            )
+        except httpx.HTTPError as exc:
+            logger.error("Keycloak admin token exchange network error")
+            raise AKBError(
+                "Keycloak unreachable during token exchange",
+                status_code=502,
+            ) from exc
+        if response.status_code != 200:
+            logger.warning(
+                "Keycloak admin token exchange failed with status %s",
+                response.status_code,
+            )
+            raise AuthenticationError("Authorization code exchange failed")
+        try:
+            payload = response.json()
+        except TypeError, ValueError:
+            raise AuthenticationError("Authorization code exchange failed") from None
+        if not isinstance(payload, dict):
+            raise AuthenticationError("Authorization code exchange failed")
+        return payload
+
+    # ── ID-token verification (admin active; ordinary Phase 4 candidate) ──
     async def _fetch_jwks(self, *, force: bool = False) -> dict[str, Any]:
         if self._jwks is not None and not force:
             return self._jwks
@@ -306,10 +437,60 @@ class KeycloakOIDC:
                 issuer=settings.keycloak_issuer,
                 options={"require": ["exp", "iat", "aud", "iss", "sub"]},
             )
-        except jwt.InvalidTokenError as e:
+        except (jwt.PyJWTError, TypeError, ValueError) as e:
             logger.warning("Keycloak ID token verification failed: %s", e)
             raise AuthenticationError(f"Invalid ID token: {e}") from e
 
+        return claims
+
+    async def verify_admin_id_token(
+        self,
+        id_token: str,
+        *,
+        expected_nonce: str,
+    ) -> dict[str, Any]:
+        """Verify the exact Keycloak ID-token profile for `/admin`."""
+        claims = await self.verify_id_token(
+            id_token,
+            client_id=settings.keycloak_admin_client_id,
+        )
+        required_string_limits = {
+            "iss": 2048,
+            "sub": 1024,
+            "azp": 255,
+            "sid": 255,
+            "nonce": 512,
+        }
+        if any(
+            not isinstance(claims.get(name), str)
+            or not claims[name].strip()
+            or len(claims[name]) > limit
+            for name, limit in required_string_limits.items()
+        ):
+            raise AuthenticationError("Invalid admin identity token")
+        if (
+            not isinstance(expected_nonce, str)
+            or not 20 <= len(expected_nonce) <= 512
+            or not expected_nonce.isascii()
+            or not claims["nonce"].isascii()
+            or not secrets.compare_digest(claims["nonce"], expected_nonce)
+        ):
+            raise AuthenticationError("Invalid admin identity token")
+        if claims["azp"] != settings.keycloak_admin_client_id:
+            raise AuthenticationError("Invalid admin identity token")
+        if (
+            type(claims.get("iat")) is not int
+            or type(claims.get("exp")) is not int
+            or claims["exp"] <= claims["iat"]
+        ):
+            raise AuthenticationError("Invalid admin identity token")
+        if _SERVICE_ACCOUNT_CLAIMS.intersection(claims):
+            raise AuthenticationError("Invalid admin identity token")
+        preferred_username = claims.get("preferred_username")
+        if preferred_username is not None and (
+            not isinstance(preferred_username, str) or preferred_username.startswith("service-account-")
+        ):
+            raise AuthenticationError("Invalid admin identity token")
         return claims
 
     # ── Route-selected access-token verification ────────────────────
@@ -379,7 +560,7 @@ class KeycloakOIDC:
                     ]
                 },
             )
-        except (jwt.InvalidTokenError, TypeError, ValueError) as e:
+        except (jwt.PyJWTError, TypeError, ValueError) as e:
             logger.debug("Keycloak access token verification failed: %s", e)
             return None
 
@@ -393,6 +574,11 @@ class KeycloakOIDC:
             if optional_value is not None and not isinstance(optional_value, str):
                 return None
         if "email_verified" in claims and type(claims["email_verified"]) is not bool:
+            return None
+        # The dedicated browser-admin client is an authentication proof only.
+        # Its access token must never become an API or MCP resource credential,
+        # even on the MCP profile where dynamic client IDs are otherwise valid.
+        if claims["azp"] == settings.keycloak_admin_client_id:
             return None
         if route_profile == "api" and claims["azp"] not in settings.keycloak_human_client_ids:
             return None
@@ -427,7 +613,7 @@ class KeycloakOIDC:
             audience=audience,
         )
 
-    # ── Dormant logout URL construction (Phase 4 candidate) ─────────
+    # ── Logout URL construction ──────────────────────────────────────
     def logout_url(self, id_token_hint: str | None, post_logout_redirect: str | None) -> str:
         params: dict[str, str] = {}
         if post_logout_redirect:
@@ -436,6 +622,13 @@ class KeycloakOIDC:
             params["id_token_hint"] = id_token_hint
         else:
             params["client_id"] = settings.keycloak_client_id
+        return f"{settings.keycloak_end_session_endpoint}?{urllib.parse.urlencode(params)}"
+
+    def admin_logout_url(self) -> str:
+        params = {
+            "client_id": settings.keycloak_admin_client_id,
+            "post_logout_redirect_uri": settings.keycloak_admin_post_logout_redirect_uri,
+        }
         return f"{settings.keycloak_end_session_endpoint}?{urllib.parse.urlencode(params)}"
 
 

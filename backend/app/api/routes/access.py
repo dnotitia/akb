@@ -570,7 +570,7 @@ async def admin_revoke_user_sessions(
 
     Useful for incident response (account compromise, employee
     offboarding) without needing the user's password and without
-    rotating the global ``jwt_secret`` (which would log out everyone).
+    replacing the local-session verification keyset (which logs out everyone).
     Does not touch PATs — those have their own revoke flow.
     """
     require_local_auth_enabled()

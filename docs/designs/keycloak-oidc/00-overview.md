@@ -1,7 +1,7 @@
 # Keycloak OIDC boundary
 
-**Status:** Phase 1 verifier and projection boundary active; browser session
-cutover staged unavailable
+**Status:** Phase 2 local verifier, admin provisioning, and dedicated admin
+browser session active; ordinary SSO browser session cutover staged unavailable
 
 The accepted
 [Authentication Mode Boundary](../../design/accepted/2026-08-13-authentication-mode-boundary/README.md)
@@ -14,7 +14,7 @@ are authoritative. This document records the current implementation shape.
 Human REST and delegated-human routes select exactly one verifier from the
 canonical `auth_mode`:
 
-- `local` selects `local-session-legacy-v1` only;
+- `local` selects `local-session-rs256-v2` only;
 - `sso` selects `keycloak-access-v1` only.
 
 `keycloak-access-v1` is a Keycloak 26-compatible RS256 access-token profile.
@@ -36,6 +36,15 @@ No token header selects an algorithm, issuer, key source, or fallback
 verifier. Token-supplied key URLs/material are rejected. An unknown `kid` may
 cause one refresh from the same pinned JWKS endpoint and then fails.
 
+`local-session-rs256-v2` is RS256 over an installation-owned RSA-3072 key.
+The active private key and bounded public JWKS are explicit persistent
+operator inputs; startup never creates ephemeral signing material. Tokens bind
+an RFC 7638 `kid`, exact deployment issuer and API audience, JOSE type,
+profile/token-use claims, `jti`, and numeric lifetime claims. The public-only
+keyset is available from `/api/v1/auth/jwks` in local mode. The Phase 2 cutover
+uses immediate reauthentication: the legacy HS256 verifier and issuance path
+are absent, so an old session fails rather than trying another profile.
+
 ## Exact AKB account projection
 
 Only a completely verified `VerifiedPrincipal` reaches account projection.
@@ -55,7 +64,37 @@ grants. Phase 2 owns explicit product-admin seeding for an exact identity.
 `keycloak_link_by_email` remains readable only as a deprecated Phase 3
 migration/readiness input; canonical runtime rejects `true`.
 
-## Browser routes are staged unavailable
+## Dedicated product-admin browser boundary
+
+`/admin` is a separate route and policy surface in both modes:
+
+| Mode | Product-admin authentication |
+| --- | --- |
+| `local` | Dedicated admin login endpoint authenticates local credentials, requires the live AKB `is_admin` decision, and returns `local-session-rs256-v2`. |
+| `sso` | Dedicated confidential `akb-admin` client uses authorization code + PKCE + nonce. Only an exact, pre-bound `(issuer, subject)` active human with live AKB admin status is admitted. |
+
+The admin client is excluded from `keycloak_human_client_ids`, and its `azp`
+is explicitly refused by both API and MCP access-token profiles, so its token
+cannot become a resource credential. The callback verifies the
+fixed RS256 issuer/client/nonce/session profile and does not JIT-provision or
+email-adopt an account. Its single-use state is bound to the initiating browser
+through the hash of a short-lived HttpOnly cookie, preventing a callback copied
+into another browser from creating an admin session. It discards all Keycloak
+token material after proof,
+then creates a short-lived AKB-owned opaque HttpOnly session and separate CSRF
+cookie. PostgreSQL stores only SHA-256 hashes, the exact external-identity FK,
+the bound issuer/subject snapshot, the Keycloak session ID, and expiry. Every
+admin request rechecks the account, unchanged exact binding, status, kind,
+provider, and `is_admin`; demotion or binding mutation/removal invalidates the
+next request. The session lifetime is capped by both
+`admin_browser_session_ttl_secs` and the verified ID-token expiry.
+
+This intentionally does not implement refresh-token custody, ordinary-user
+BFF sessions, back-channel logout, or long-lived provider sessions. Those
+remain Phase 4 work; the short admin session bounds IdP-side revocation lag in
+this MVP.
+
+## Ordinary browser routes are staged unavailable
 
 Phase 1 does not expose a browser token transport:
 

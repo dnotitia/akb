@@ -146,12 +146,27 @@ file_pending_upload_ttl_hours: 24
 document_asset_gc_interval_secs: 300
 document_asset_upload_body_timeout_secs: 60
 
-# === Auth (jwt_secret is in secret.yaml) ===
+# === Auth (system_hmac_secret is in secret.yaml) ===
 # REQUIRED canonical human-login mode. Fresh runtime config never infers this
 # from legacy booleans. Choose exactly one: local | sso.
+# Provision the designated administrator explicitly with
+# `python -m app.cli provision-recovery-admin`; ordinary registration is never admin.
 auth_mode: local
-jwt_algorithm: HS256
+jwt_algorithm: RS256
 jwt_expire_hours: 24
+# Generate once before the first local-mode start:
+#   cd backend
+#   uv run python -m app.cli generate-local-session-keyset \
+#     --output-dir ../config/local-session
+# The private PEM and public JWKS must survive restarts and stay outside the
+# image. Replacing them without retaining the prior public JWK forces every
+# local user to sign in again.
+local_session_private_key_path: /etc/akb/local-session/private.pem
+local_session_jwks_path: /etc/akb/local-session/jwks.json
+# Blank binds both claims to public_base_url. Override only when a deployment
+# needs a stable issuer/audience across an intentional public URL migration.
+local_session_issuer: ""
+local_session_audience: ""
 publication_view_grant_ttl_secs: 600
 # Rolling upgrades must keep this true until every backend instance can read
 # both the two-field and bounded three-field grant formats.
@@ -161,7 +176,7 @@ publication_view_grant_session_secs: 3600
 # === App identity exchange ===
 # Short-lived app tokens never carry Vaults, installations, or capabilities;
 # every app request rechecks the live registry. The signing secret lives in
-# secret.yaml and must differ from jwt_secret.
+# secret.yaml and must differ from system_hmac_secret.
 app_token_ttl_seconds: 300
 app_credential_overlap_seconds: 300
 
@@ -183,11 +198,14 @@ app_credential_overlap_seconds: 300
 #
 # keycloak_enabled: false
 # keycloak_enrollment_mode: open           # open | invite_only | disabled
-# keycloak_server_url: "https://auth.example.com"   # no /realms suffix (browser-facing; sets the issuer)
+# keycloak_server_url: "https://auth.example.com"   # no /realms suffix; HTTPS outside loopback
 # keycloak_internal_url: ""          # optional backchannel URL (server→Keycloak); blank → use server_url
 # keycloak_realm: "akb"
 # keycloak_client_id: "akb-web"
 # keycloak_public_client: false      # true → PKCE (no client_secret needed)
+# keycloak_admin_client_id: "akb-admin"  # dedicated confidential /admin client;
+#                                         # must differ from every ordinary human client
+# admin_browser_session_ttl_secs: 900     # also capped by the verified ID-token expiry
 # keycloak_verify_ssl: true          # false only for local self-signed Keycloak
 # keycloak_require_verified_email: true   # refuse unverified email for open-mode JIT.
 #                                         # Exact subject bindings need no email claim.
@@ -195,9 +213,12 @@ app_credential_overlap_seconds: 300
 #                                         # controlled emails.
 # keycloak_link_by_email is a deprecated migration marker; omit it. Setting it
 # to true fails canonical startup. Exact pre-binding is the only account-link path.
-# The callback settings below are reserved for the future server-custodied
-# browser session release. Phase 1 validates access tokens only and returns a
-# staged-unavailable response from browser login/callback/logout/exchange routes.
+# The ordinary-user callback settings below are reserved for the future
+# server-custodied browser session release. Ordinary browser
+# login/callback/logout/exchange routes remain staged unavailable. `/admin`
+# is active in SSO mode through the separate akb-admin client; register its
+# exact callback as `<public_base_url>/api/v1/admin/auth/keycloak/callback`
+# and its post-logout redirect as `<public_base_url>/admin`.
 # keycloak_redirect_uri: "https://akb.example.com/api/v1/auth/keycloak/callback"
 # keycloak_post_login_path: "/auth/callback"
 # keycloak_post_login_allowed_origins: []   # companion-app origins allowed to receive the SSO
@@ -215,7 +236,8 @@ app_credential_overlap_seconds: 300
 # mcp_oauth_enabled: false
 # mcp_oauth_audience: ""               # default: <public_base_url>/mcp
 # API and MCP audiences must remain distinct.
-# keycloak_client_secret lives in secret.yaml (never commit it)
+# keycloak_client_secret and keycloak_admin_client_secret live in secret.yaml
+# (never commit either value)
 
 # === Server ===
 host: 0.0.0.0
