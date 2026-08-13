@@ -15,7 +15,25 @@ from app.services.auth_service import AuthenticatedUser
 from app.util.text import to_nfc_any
 
 
+def _json_object(value: Any) -> dict[str, Any]:
+    """Decode asyncpg's text representation of a JSONB object."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
 def _canonical(value: Any) -> str:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
     return json.dumps(
         to_nfc_any(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False
     )
@@ -59,7 +77,7 @@ def _app_projection(row: Any, *, replayed: bool | None = None) -> dict[str, Any]
         "app_key": row["app_key"],
         "display_name": row["display_name"],
         "description": row["description"],
-        "metadata": row["metadata"] or {},
+        "metadata": _json_object(row["metadata"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -73,7 +91,7 @@ def _release_projection(row: Any, *, replayed: bool | None = None) -> dict[str, 
         "id": str(row["id"]),
         "app_id": str(row["app_id"]),
         "version": row["version"],
-        "manifest": row["manifest"] or {},
+        "manifest": _json_object(row["manifest"]),
         "manifest_checksum": row["manifest_checksum"],
         "registered_at": row["registered_at"],
     }

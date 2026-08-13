@@ -310,22 +310,22 @@ def classify_drift(row: Any) -> dict[str, Any]:
         if desired_release_id is None:
             release_status = "unknown"
         elif observed_release_id is not None:
-            release_status = "match" if observed_release_id == desired_release_id else "mismatch"
+            release_status = "in_sync" if observed_release_id == desired_release_id else "mismatch"
         elif observed_version is not None and desired_version is not None:
-            release_status = "match" if observed_version == desired_version else "mismatch"
+            release_status = "in_sync" if observed_version == desired_version else "mismatch"
         else:
             release_status = "unknown"
 
         if expected_schema is None or observed_schema is None:
             schema_status = "unknown"
         else:
-            schema_status = "match" if expected_schema == observed_schema else "mismatch"
+            schema_status = "in_sync" if expected_schema == observed_schema else "mismatch"
 
         if observed_grant_generation is None or desired_grant_generation is None:
             grant_status = "unknown"
         else:
             grant_status = (
-                "match"
+                "in_sync"
                 if observed_grant_generation == desired_grant_generation
                 else "mismatch"
             )

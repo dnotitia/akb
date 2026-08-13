@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app.api.control_plane_models import AppDefinitionProjection, AppReleaseProjection
 from app.api.deps import get_current_app, get_current_user
 from app.api.routes import app_registry, app_rollouts
 from app.services.app_identity_service import AppPrincipal
+from app.services.app_registry_service import (
+    _app_projection as project_registry_app,
+    _canonical,
+    _release_projection as project_registry_release,
+)
 from app.services.auth_service import AuthenticatedUser
 
 
@@ -101,6 +108,42 @@ def test_registry_create_uses_explicit_projection_and_no_store(monkeypatch):
     assert response.headers["cache-control"] == "no-store"
     assert calls[0]["app_key"] == "generic-app"
     assert response.json()["id"] == str(app_id)
+
+
+def test_registry_projections_decode_asyncpg_jsonb_strings():
+    app_id = uuid.uuid4()
+    release_id = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    metadata = {"owner": "validator", "flags": ["safe"]}
+    manifest = {"steps": [], "name": "release"}
+
+    app_projection = project_registry_app(
+        {
+            "id": app_id,
+            "app_key": "generic-app",
+            "display_name": "Generic App",
+            "description": None,
+            "metadata": '{"owner":"validator","flags":["safe"]}',
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    release_projection = project_registry_release(
+        {
+            "id": release_id,
+            "app_id": app_id,
+            "version": "1.0.0",
+            "manifest": '{"steps":[],"name":"release"}',
+            "manifest_checksum": "a" * 64,
+            "registered_at": now,
+        }
+    )
+
+    assert _canonical('{"owner":"validator","flags":["safe"]}') == _canonical(metadata)
+    assert app_projection["metadata"] == metadata
+    assert release_projection["manifest"] == manifest
+    AppDefinitionProjection.model_validate(app_projection)
+    AppReleaseProjection.model_validate(release_projection)
 
 
 def test_admin_resume_creates_new_attempt_ack(monkeypatch):
