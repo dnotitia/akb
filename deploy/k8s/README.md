@@ -20,6 +20,8 @@ deploy/k8s/
 ├── backend.yaml           # Deployment + ConfigMap (vector_store_driver: pgvector)
 ├── frontend.yaml          # Deployment + Service
 ├── ingress.yaml           # placeholder host (akb.example.com)
+├── standalone-sso/        # AKB + owned Keycloak 26.7 + dedicated Keycloak DB;
+│                          # temporary bootstrap service-account retirement
 └── internal/              # gitignored — operator-private overlays
     ├── deploy-internal.sh
     ├── cluster-issuer.yaml
@@ -42,6 +44,11 @@ inside the Postgres pod. Other options:
 
 The `internal/` overlay shows the Qdrant pattern for the production
 cluster.
+
+For a standalone installation whose canonical human-auth mode is `sso`, use
+[`standalone-sso/README.md`](standalone-sso/README.md). That overlay owns its
+Keycloak lifecycle and dedicated database. Do not apply it to a managed tenant
+that reuses a platform-owned/shared Keycloak realm.
 
 ## Quickstart (generic)
 

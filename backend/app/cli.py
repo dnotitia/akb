@@ -16,6 +16,10 @@ Subcommands:
                                SSO recovery administrator. Password material
                                is accepted only by file/stdin and is never
                                printed.
+    bootstrap-standalone-sso   Converge the bundled Keycloak realm, clients,
+                               signing profile, and exact AKB recovery-admin
+                               projection; then retire the temporary bootstrap
+                               service account.
     reset-password <username>   Generate a temp password for the given user.
                                  Prints the temp password to stdout. Caller
                                  must share it with the user out-of-band.
@@ -52,6 +56,13 @@ GENERATE_LOCAL_SESSION_KEYSET_USAGE = (
     "--output-dir DIR [--retain-jwks PATH ...]"
 )
 
+STANDALONE_SSO_BOOTSTRAP_USAGE = (
+    "Usage: python -m app.cli bootstrap-standalone-sso "
+    "--bootstrap-client-id ID --bootstrap-client-secret-file PATH "
+    "--product-admin-username USER --product-admin-email EMAIL "
+    "--product-admin-password-file PATH"
+)
+
 
 class _CLIUsageError(Exception):
     pass
@@ -59,6 +70,15 @@ class _CLIUsageError(Exception):
 
 class _ProvisioningInputError(Exception):
     pass
+
+
+async def _initialize_operator_database() -> None:
+    """Initialize schema and the user-role projection needed by admin CLIs."""
+    from app.db.postgres import get_pool, init_db
+    from app.services.role_sync import RoleSync, set_role_sync
+
+    await init_db()
+    set_role_sync(RoleSync(await get_pool()))
 
 
 def _generate_local_session_keyset(args: list[str]) -> int:
@@ -131,6 +151,24 @@ def _read_password_source(source: str) -> str:
     return password
 
 
+def _read_optional_bootstrap_secret_file(source: str) -> str:
+    if source == "-":
+        raise _ProvisioningInputError("Standalone SSO secrets require explicit files")
+    try:
+        text = Path(source).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        # The default overlay keeps required Secret objects with retired
+        # sentinel values.  A custom steady-state overlay may unmount them;
+        # receipt-backed readback then proves the permanent management path.
+        return ""
+    except OSError:
+        raise _ProvisioningInputError("Unable to read the bootstrap secret source") from None
+    secret = text.rstrip("\r\n")
+    if "\r" in secret or "\n" in secret:
+        raise _ProvisioningInputError("A bootstrap secret source must contain one line")
+    return secret
+
+
 def _write_generated_password(target: str, password: str) -> Path:
     if target == "-":
         raise _ProvisioningInputError("Generated passwords require an explicit file")
@@ -182,7 +220,7 @@ async def _provision_recovery_admin(args: list[str]) -> int:
         return 2
 
     from app.config import AuthModeConfigurationError
-    from app.db.postgres import close_pool, init_db
+    from app.db.postgres import close_pool
     from app.exceptions import AKBError
     from app.services.recovery_admin_service import (
         provision_local_recovery_admin,
@@ -194,7 +232,7 @@ async def _provision_recovery_admin(args: list[str]) -> int:
     report: dict | None = None
     error: tuple[str, str] | None = None
     try:
-        await init_db()
+        await _initialize_operator_database()
         if parsed.profile == "local":
             if parsed.generate_password_file is not None:
                 password = secrets.token_urlsafe(32)
@@ -261,6 +299,169 @@ async def _provision_recovery_admin(args: list[str]) -> int:
         "password_file_written": keep_generated,
     }
     print(json.dumps(public_report, sort_keys=True))
+    return 0
+
+
+def _standalone_sso_parser() -> argparse.ArgumentParser:
+    parser = _SafeArgumentParser(add_help=False)
+    parser.add_argument("--bootstrap-client-id", required=True)
+    parser.add_argument("--bootstrap-client-secret-file", required=True)
+    parser.add_argument("--product-admin-username", required=True)
+    parser.add_argument("--product-admin-email", required=True)
+    parser.add_argument("--product-admin-password-file", required=True)
+    return parser
+
+
+async def _bootstrap_standalone_sso(args: list[str]) -> int:
+    try:
+        parsed = _standalone_sso_parser().parse_args(args)
+    except _CLIUsageError:
+        print(STANDALONE_SSO_BOOTSTRAP_USAGE, file=sys.stderr)
+        return 2
+
+    from app.config import AuthModeConfigurationError, settings
+    from app.db.postgres import close_pool
+    from app.services.recovery_admin_service import provision_sso_recovery_admin
+    from app.services.standalone_sso_bootstrap import (
+        StandaloneSSOBootstrapError,
+        StandaloneSSOBootstrapSpec,
+        bootstrap_standalone_sso,
+    )
+    from app.services.standalone_sso_keycloak import KeycloakStandaloneSSOControl
+    from app.services.standalone_sso_receipt import (
+        load_standalone_sso_retirement_receipt,
+        record_standalone_sso_retirement_receipt,
+    )
+
+    control: KeycloakStandaloneSSOControl | None = None
+    report: dict[str, object] | None = None
+    error: tuple[str, str] | None = None
+    try:
+        bootstrap_secret = _read_optional_bootstrap_secret_file(
+            parsed.bootstrap_client_secret_file
+        )
+        product_admin_password = _read_optional_bootstrap_secret_file(
+            parsed.product_admin_password_file
+        )
+        if settings.require_auth_mode() != "sso" or not settings.keycloak_enabled:
+            raise _ProvisioningInputError(
+                "Standalone SSO bootstrap requires auth_mode=sso and Keycloak enabled"
+            )
+        required = {
+            "keycloak_server_url": settings.keycloak_server_url,
+            "keycloak_internal_url or keycloak_server_url": (
+                settings.keycloak_internal_url or settings.keycloak_server_url
+            ),
+            "keycloak_realm": settings.keycloak_realm,
+            "public_base_url": settings.public_base_url,
+            "keycloak_client_id": settings.keycloak_client_id,
+            "keycloak_client_secret": settings.keycloak_client_secret,
+            "keycloak_admin_client_id": settings.keycloak_admin_client_id,
+            "keycloak_admin_client_secret": settings.keycloak_admin_client_secret,
+            "keycloak_management_client_id": settings.keycloak_management_client_id,
+            "keycloak_management_client_secret": (
+                settings.keycloak_management_client_secret
+            ),
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            raise _ProvisioningInputError(
+                "Standalone SSO configuration is incomplete: " + ", ".join(missing)
+            )
+        if settings.keycloak_public_client:
+            raise _ProvisioningInputError(
+                "Bundled standalone SSO requires a confidential API client"
+            )
+        credentials = [
+            settings.keycloak_client_secret,
+            settings.keycloak_admin_client_secret,
+            settings.keycloak_management_client_secret,
+            bootstrap_secret,
+            product_admin_password,
+        ]
+        configured_credentials = [value for value in credentials if value]
+        if len(set(configured_credentials)) != len(configured_credentials):
+            raise _ProvisioningInputError(
+                "Standalone SSO credentials must be independently generated"
+            )
+        client_ids = {
+            settings.keycloak_client_id,
+            settings.keycloak_admin_client_id,
+            settings.keycloak_management_client_id,
+        }
+        if len(client_ids) != 3:
+            raise _ProvisioningInputError(
+                "Standalone SSO API, admin, and management clients must be distinct"
+            )
+
+        spec = StandaloneSSOBootstrapSpec(
+            keycloak_internal_url=(
+                settings.keycloak_internal_url or settings.keycloak_server_url
+            ),
+            keycloak_public_url=settings.keycloak_server_url,
+            realm=settings.keycloak_realm,
+            akb_public_url=settings.public_base_url,
+            bootstrap_client_id=parsed.bootstrap_client_id,
+            bootstrap_client_secret=bootstrap_secret,
+            management_client_id=settings.keycloak_management_client_id,
+            management_client_secret=settings.keycloak_management_client_secret,
+            api_client_id=settings.keycloak_client_id,
+            api_client_secret=settings.keycloak_client_secret,
+            admin_client_id=settings.keycloak_admin_client_id,
+            admin_client_secret=settings.keycloak_admin_client_secret,
+            product_admin_username=parsed.product_admin_username,
+            product_admin_email=parsed.product_admin_email,
+            product_admin_password=product_admin_password,
+        )
+        await _initialize_operator_database()
+        control = KeycloakStandaloneSSOControl(
+            verify_ssl=settings.keycloak_verify_ssl
+        )
+        report = await bootstrap_standalone_sso(
+            spec,
+            control=control,
+            provision_admin=provision_sso_recovery_admin,
+            load_retirement_receipt=load_standalone_sso_retirement_receipt,
+            record_retirement_receipt=record_standalone_sso_retirement_receipt,
+        )
+    except StandaloneSSOBootstrapError as exc:
+        error = (exc.code, "Standalone SSO bootstrap failed")
+    except AuthModeConfigurationError as exc:
+        error = ("standalone_sso_mode_configuration", str(exc))
+    except _ProvisioningInputError as exc:
+        error = ("standalone_sso_input_invalid", str(exc))
+    except Exception:
+        # Keycloak, HTTP, database, and driver exceptions may retain request
+        # bodies or DSNs. Never render an unexpected exception from this
+        # credential-bearing command.
+        error = (
+            "standalone_sso_bootstrap_failed",
+            "Standalone SSO bootstrap failed",
+        )
+    finally:
+        if control is not None:
+            try:
+                await control.aclose()
+            except Exception:
+                if error is None:
+                    error = (
+                        "standalone_sso_keycloak_cleanup_failed",
+                        "Keycloak connection cleanup failed",
+                    )
+        try:
+            await close_pool()
+        except Exception:
+            if error is None:
+                error = (
+                    "standalone_sso_database_cleanup_failed",
+                    "Database connection cleanup failed",
+                )
+
+    if error is not None:
+        print(f"{error[0]}: {error[1]}", file=sys.stderr)
+        return 1
+    assert report is not None
+    print(json.dumps(report, sort_keys=True))
     return 0
 
 
@@ -431,6 +632,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "Subcommands: generate-local-session-keyset, "
             "provision-recovery-admin {local|sso}, "
+            "bootstrap-standalone-sso, "
             "reset-password <username>, repair-resource-hashes, "
             "initialize-postgres-native, okf-validate <dir>, "
             "okf-export --from-git <worktree> --vault <name> --out <dir>",
@@ -442,6 +644,8 @@ def main(argv: list[str] | None = None) -> int:
         return _generate_local_session_keyset(argv[1:])
     if cmd == "provision-recovery-admin":
         return asyncio.run(_provision_recovery_admin(argv[1:]))
+    if cmd == "bootstrap-standalone-sso":
+        return asyncio.run(_bootstrap_standalone_sso(argv[1:]))
     if cmd == "reset-password":
         if len(argv) != 2:
             print("Usage: python -m app.cli reset-password <username>", file=sys.stderr)

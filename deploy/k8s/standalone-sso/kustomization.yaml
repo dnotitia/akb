@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: akb
+
+resources:
+  - ../namespace.yaml
+  - akb-postgres.yaml
+  - ../backend.yaml
+  - ../frontend.yaml
+  - ../ingress.yaml
+  - bootstrap-config.yaml
+  - keycloak-postgres.yaml
+  - keycloak.yaml
+  - keycloak-ingress.yaml
+
+patches:
+  - path: backend-config-patch.yaml
+  - path: backend-deployment-patch.yaml

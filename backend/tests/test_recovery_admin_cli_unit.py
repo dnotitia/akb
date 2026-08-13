@@ -26,16 +26,60 @@ def _result(*, mode: str, created: bool = True) -> dict:
 
 
 def _patch_database(monkeypatch):
+    from app import cli
     from app.db import postgres
 
-    async def _init_db():
+    async def _initialize_operator_database():
         return None
 
     async def _close_pool():
         return None
 
-    monkeypatch.setattr(postgres, "init_db", _init_db)
+    monkeypatch.setattr(
+        cli,
+        "_initialize_operator_database",
+        _initialize_operator_database,
+    )
     monkeypatch.setattr(postgres, "close_pool", _close_pool)
+
+
+async def test_operator_database_initialization_installs_role_sync(monkeypatch):
+    from app import cli
+    from app.db import postgres
+    from app.services import role_sync
+
+    events: list[object] = []
+    pool = object()
+
+    async def _init_db():
+        events.append("init-db")
+
+    async def _get_pool():
+        events.append("get-pool")
+        return pool
+
+    class _RoleSync:
+        def __init__(self, actual_pool):
+            assert actual_pool is pool
+            events.append("construct-role-sync")
+
+    def _set_role_sync(instance):
+        assert isinstance(instance, _RoleSync)
+        events.append("set-role-sync")
+
+    monkeypatch.setattr(postgres, "init_db", _init_db)
+    monkeypatch.setattr(postgres, "get_pool", _get_pool)
+    monkeypatch.setattr(role_sync, "RoleSync", _RoleSync)
+    monkeypatch.setattr(role_sync, "set_role_sync", _set_role_sync)
+
+    await cli._initialize_operator_database()
+
+    assert events == [
+        "init-db",
+        "get-pool",
+        "construct-role-sync",
+        "set-role-sync",
+    ]
 
 
 async def test_generated_password_is_only_written_to_requested_0600_file(

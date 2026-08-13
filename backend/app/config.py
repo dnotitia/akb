@@ -854,6 +854,12 @@ class Settings(BaseModel):
     # silently disagree about path ownership.
     keycloak_admin_client_id: str = "akb-admin"
     keycloak_admin_client_secret: str = ""
+    # Permanent least-privilege service account used by the standalone
+    # product-admin control plane after Keycloak's one-time bootstrap service
+    # account has been removed. Managed deployments may leave this blank when
+    # the platform owns IdP changes out of band.
+    keycloak_management_client_id: str = "akb-sso-manager"
+    keycloak_management_client_secret: str = ""
     admin_browser_session_ttl_secs: int = Field(default=900, ge=60, le=3600)
     keycloak_verify_ssl: bool = True       # set false only for local self-signed Keycloak
     # Exact identity is issuer/subject and does not require email. Open-mode

@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: akb
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: bootstrap-standalone-sso
+          image: akb-backend:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.cli
+            - bootstrap-standalone-sso
+          args:
+            - --bootstrap-client-id
+            - $(AKB_BOOTSTRAP_CLIENT_ID)
+            - --bootstrap-client-secret-file
+            - /var/run/akb-bootstrap/keycloak/client-secret
+            - --product-admin-username
+            - $(AKB_PRODUCT_ADMIN_USERNAME)
+            - --product-admin-email
+            - $(AKB_PRODUCT_ADMIN_EMAIL)
+            - --product-admin-password-file
+            - /var/run/akb-bootstrap/product-admin/password
+          env:
+            - name: AKB_BOOTSTRAP_CLIENT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: akb-sso-bootstrap-config
+                  key: bootstrap-client-id
+            - name: AKB_PRODUCT_ADMIN_USERNAME
+              valueFrom:
+                configMapKeyRef:
+                  name: akb-sso-bootstrap-config
+                  key: product-admin-username
+            - name: AKB_PRODUCT_ADMIN_EMAIL
+              valueFrom:
+                configMapKeyRef:
+                  name: akb-sso-bootstrap-config
+                  key: product-admin-email
+          volumeMounts:
+            - name: app-config
+              mountPath: /etc/akb/app.yaml
+              subPath: app.yaml
+              readOnly: true
+            - name: secret-config
+              mountPath: /etc/akb/secret.yaml
+              subPath: secret.yaml
+              readOnly: true
+            - name: keycloak-bootstrap
+              mountPath: /var/run/akb-bootstrap/keycloak
+              readOnly: true
+            - name: product-admin-bootstrap
+              mountPath: /var/run/akb-bootstrap/product-admin
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      containers:
+        - name: backend
+          volumeMounts:
+            - name: local-session-keys
+              $patch: delete
+      volumes:
+        - name: local-session-keys
+          $patch: delete
+        - name: keycloak-bootstrap
+          secret:
+            secretName: akb-keycloak-bootstrap # pragma: allowlist secret
+            defaultMode: 0400
+        - name: product-admin-bootstrap
+          secret:
+            secretName: akb-product-admin-bootstrap # pragma: allowlist secret
+            defaultMode: 0400
