@@ -15,6 +15,7 @@ real Keycloak. Concretely:
 - ``_www_authenticate_header`` carries ``resource_metadata`` when MCP
   OAuth is on, plain Bearer challenge when off
 """
+
 from __future__ import annotations
 
 import tempfile
@@ -511,9 +512,7 @@ async def test_grep_with_replace_is_refused_for_read_only_oauth_caller():
     from mcp_server.server import _dispatch, _MCPUser
 
     user = _MCPUser(user_id="u-1", oauth_scopes=["akb:vault:read"])
-    result = await _dispatch(
-        "akb_grep", {"vault": "v", "pattern": "x", "replace": "y"}, user
-    )
+    result = await _dispatch("akb_grep", {"vault": "v", "pattern": "x", "replace": "y"}, user)
     assert result.get("code") == "insufficient_scope"
     assert result.get("details", {}).get("required_scope") == "akb:vault:write"
 
@@ -523,9 +522,7 @@ async def test_grep_with_replace_is_refused_for_read_only_pat():
     from mcp_server.server import _dispatch, _MCPUser
 
     user = _MCPUser(user_id="u-1", token_scopes=frozenset({"read"}))
-    result = await _dispatch(
-        "akb_grep", {"vault": "v", "pattern": "x", "replace": "y"}, user
-    )
+    result = await _dispatch("akb_grep", {"vault": "v", "pattern": "x", "replace": "y"}, user)
     assert result.get("code") == "insufficient_scope"
     assert result.get("details", {}).get("required_scope") == "write"
 
@@ -585,13 +582,10 @@ def test_every_arg_write_trigger_names_a_real_tool_argument():
     from mcp_server.server import _ARG_WRITE_TRIGGERS, _TOOL_ARG_NAMES
 
     for tool, triggers in _ARG_WRITE_TRIGGERS.items():
-        assert tool in _TOOL_ARG_NAMES, (
-            f"_ARG_WRITE_TRIGGERS names unknown tool {tool!r}"
-        )
+        assert tool in _TOOL_ARG_NAMES, f"_ARG_WRITE_TRIGGERS names unknown tool {tool!r}"
         for arg in triggers:
             assert arg in _TOOL_ARG_NAMES[tool], (
-                f"_ARG_WRITE_TRIGGERS[{tool!r}] names {arg!r}, "
-                f"which is not an argument of {tool}"
+                f"_ARG_WRITE_TRIGGERS[{tool!r}] names {arg!r}, which is not an argument of {tool}"
             )
 
 
@@ -661,9 +655,7 @@ def test_read_scoped_tools_that_can_write_declare_an_arg_trigger():
     offenders = sorted(
         name
         for name, handler in _HANDLERS.items()
-        if _TOOL_SCOPES.get(name) == _READ_SCOPE
-        and name not in _ARG_WRITE_TRIGGERS
-        and _handler_can_write(handler)
+        if _TOOL_SCOPES.get(name) == _READ_SCOPE and name not in _ARG_WRITE_TRIGGERS and _handler_can_write(handler)
     )
     assert offenders == [], (
         f"Read-scoped tools whose handler performs a writer-gated write, with no "
@@ -793,10 +785,8 @@ async def test_unmapped_tool_falls_back_to_write_scope_when_oauth_caller():
 
 
 @pytest.mark.asyncio
-async def test_verify_access_token_returns_none_on_jwks_unreachable(monkeypatch, rsa_keypair):
-    """JWKS endpoint flap must not surface as 502 — return None so the
-    MCP handler issues a clean 401 with the RFC 9728 hint and the
-    client retries discovery."""
+async def test_verify_access_token_preserves_jwks_unreachable(monkeypatch, rsa_keypair):
+    """A pinned-JWKS outage is availability failure, not bad credentials."""
     from app.services.keycloak_oidc import KeycloakOIDC
     from app.exceptions import AKBError
 
@@ -806,9 +796,11 @@ async def test_verify_access_token_returns_none_on_jwks_unreachable(monkeypatch,
     monkeypatch.setattr(settings, "keycloak_realm", "akb", raising=False)
 
     svc = KeycloakOIDC()
+
     # Stub _fetch_jwks to simulate "Keycloak unreachable".
     async def _boom(*_a, **_kw):
         raise AKBError("Keycloak unreachable fetching JWKS", status_code=502)
+
     monkeypatch.setattr(svc, "_fetch_jwks", _boom)
 
     token = _mint_access_token(
@@ -817,7 +809,10 @@ async def test_verify_access_token_returns_none_on_jwks_unreachable(monkeypatch,
         audience=audience,
         issuer=issuer,
     )
-    assert await svc.verify_access_token(token, audience, route_profile="mcp") is None
+    with pytest.raises(AKBError) as captured:
+        await svc.verify_access_token(token, audience, route_profile="mcp")
+
+    assert captured.value.status_code == 502
 
 
 # ── SPA-audience token must not be usable at /mcp ──────────────────

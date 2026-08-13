@@ -20,10 +20,13 @@ The bundle implements the product-administrator bootstrap and recovery slice:
    original one-time value only when its current Keycloak and AKB identities
    exactly match that durable receipt.
 
-Ordinary-user browser SSO remains staged until the server-side token-custody
-slice is released. `/admin` uses the dedicated confidential client and requires
-a fresh native Keycloak password ceremony; a brokered upstream identity is not
-accepted as the recovery administrator.
+Ordinary-user browser SSO uses server-side token custody: the browser receives
+an opaque HttpOnly handle and readable double-submit CSRF value, while AKB
+encrypts the Keycloak refresh/ID token set and never persists an access token.
+It becomes ready only after the browser-session encryption key is supplied and
+an upstream provider is enabled. `/admin` uses the dedicated confidential
+client and requires a fresh native Keycloak password ceremony; a brokered
+upstream identity is not accepted as the recovery administrator.
 
 ## Required operator inputs
 
@@ -49,12 +52,14 @@ commit their values.
 | `akb-keycloak-bootstrap` | `client-secret` | one-time |
 | `akb-product-admin-bootstrap` | `password` | one-time |
 
-The mounted `secret.yaml` must include the AKB database password plus three
-independently generated confidential-client secrets:
+The mounted `secret.yaml` must include the AKB database password, an
+independent browser-session encryption key, and three independently generated
+confidential-client secrets:
 
 ```yaml
 db_password: <same value as akb-postgres-credentials>
 system_hmac_secret: <independent random value>
+sso_browser_session_encryption_key: <independent 32-byte base64url value>
 keycloak_client_secret: <akb-web secret>
 keycloak_admin_client_secret: <akb-admin secret>
 keycloak_management_client_secret: <akb-sso-manager secret>
@@ -66,6 +71,16 @@ temporary, must be at least 12 characters, must differ from its username and
 email, and Keycloak forces `UPDATE_PASSWORD` on first login. The realm enforces
 the same lean policy for the replacement password. The bootstrap client secret
 is not the product-admin password.
+
+Generate the browser-session key as an unpadded 32-byte base64url value:
+
+```bash
+python -c 'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("="))'
+```
+
+Keep it stable across backend restarts. Replacing this single key intentionally
+invalidates every outstanding ordinary-user SSO browser session and requires a
+fresh login; it does not rotate a Keycloak realm signing key.
 
 Render and validate the public overlay before applying:
 

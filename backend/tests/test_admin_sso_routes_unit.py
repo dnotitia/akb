@@ -51,16 +51,10 @@ def _provider(
         state=state,  # type: ignore[arg-type]
         enabled=is_enabled,
         issuer="https://accounts.example.com/realms/workforce",
-        discovery_url=(
-            "https://accounts.example.com/realms/workforce/"
-            ".well-known/openid-configuration"
-        ),
+        discovery_url=("https://accounts.example.com/realms/workforce/.well-known/openid-configuration"),
         client_id="akb-broker",
         client_secret_configured=True,
-        redirect_uri=(
-            "https://auth.akb.example.com/realms/akb/"
-            "broker/workforce/endpoint"
-        ),
+        redirect_uri=("https://auth.akb.example.com/realms/akb/broker/workforce/endpoint"),
         supports_logout=True,
         supports_identity_migration=True,
     )
@@ -145,9 +139,7 @@ def test_delegated_catalog_is_explicit_without_attempting_a_read(monkeypatch):
         async def list_providers(self, **_kwargs):
             raise AssertionError("delegated control must not call Admin REST")
 
-    response = _client(monkeypatch, Delegated()).get(
-        "/api/v1/admin/sso/providers"
-    )
+    response = _client(monkeypatch, Delegated()).get("/api/v1/admin/sso/providers")
 
     assert response.status_code == 200
     assert response.json()["control_mode"] == "delegated"
@@ -175,10 +167,7 @@ def test_configure_accepts_secret_once_and_audits_only_redacted_metadata(monkeyp
             "provider_type": "keycloak-oidc",
             "display_name": "Company SSO",
             "issuer": "https://accounts.example.com/realms/workforce",
-            "discovery_url": (
-                "https://accounts.example.com/realms/workforce/"
-                ".well-known/openid-configuration"
-            ),
+            "discovery_url": ("https://accounts.example.com/realms/workforce/.well-known/openid-configuration"),
             "client_id": "akb-broker",
             "client_secret": _SECRET,
         },
@@ -204,15 +193,11 @@ def test_configure_accepts_secret_once_and_audits_only_redacted_metadata(monkeyp
 )
 def test_enable_disable_are_explicit_mutations(monkeypatch, suffix, enabled):
     control = Control()
-    response = _client(monkeypatch, control).post(
-        f"/api/v1/admin/sso/providers/workforce/{suffix}"
-    )
+    response = _client(monkeypatch, control).post(f"/api/v1/admin/sso/providers/workforce/{suffix}")
 
     assert response.status_code == 200
     assert control.toggles == [("workforce", enabled)]
-    assert response.json()["provider"]["state"] == (
-        "enabled" if enabled else "configured_disabled"
-    )
+    assert response.json()["provider"]["state"] == ("enabled" if enabled else "configured_disabled")
 
 
 def test_provider_errors_are_status_mapped_without_leaking_values(monkeypatch):
@@ -227,19 +212,14 @@ def test_provider_errors_are_status_mapped_without_leaking_values(monkeypatch):
             "provider_type": "keycloak-oidc",
             "display_name": "Company SSO",
             "issuer": "https://accounts.example.com/realms/workforce",
-            "discovery_url": (
-                "https://accounts.example.com/realms/workforce/"
-                ".well-known/openid-configuration"
-            ),
+            "discovery_url": ("https://accounts.example.com/realms/workforce/.well-known/openid-configuration"),
             "client_id": "akb-broker",
             "client_secret": _SECRET,
         },
     )
 
     assert response.status_code == 409
-    assert response.json()["detail"]["code"] == (
-        "provider_disable_before_reconfigure"
-    )
+    assert response.json()["detail"]["code"] == ("provider_disable_before_reconfigure")
     assert _SECRET not in response.text
 
 
@@ -252,10 +232,7 @@ def test_invalid_secret_json_type_is_rejected_without_echoing_its_value(monkeypa
             "provider_type": "keycloak-oidc",
             "display_name": "Company SSO",
             "issuer": "https://accounts.example.com/realms/workforce",
-            "discovery_url": (
-                "https://accounts.example.com/realms/workforce/"
-                ".well-known/openid-configuration"
-            ),
+            "discovery_url": ("https://accounts.example.com/realms/workforce/.well-known/openid-configuration"),
             "client_id": "akb-broker",
             "client_secret": {"value": leaked_value},
         },
@@ -280,10 +257,7 @@ def test_invalid_alias_is_hashed_in_audit_instead_of_reflected(monkeypatch):
             "provider_type": "keycloak-oidc",
             "display_name": "Company SSO",
             "issuer": "https://accounts.example.com/realms/workforce",
-            "discovery_url": (
-                "https://accounts.example.com/realms/workforce/"
-                ".well-known/openid-configuration"
-            ),
+            "discovery_url": ("https://accounts.example.com/realms/workforce/.well-known/openid-configuration"),
             "client_id": "akb-broker",
             "client_secret": _SECRET,
         },
@@ -309,10 +283,7 @@ def test_unexpected_mutation_failures_still_emit_a_result_audit(monkeypatch):
                 "provider_type": "keycloak-oidc",
                 "display_name": "Company SSO",
                 "issuer": "https://accounts.example.com/realms/workforce",
-                "discovery_url": (
-                    "https://accounts.example.com/realms/workforce/"
-                    ".well-known/openid-configuration"
-                ),
+                "discovery_url": ("https://accounts.example.com/realms/workforce/.well-known/openid-configuration"),
                 "client_id": "akb-broker",
                 "client_secret": _SECRET,
             },
@@ -330,8 +301,8 @@ async def test_sso_mutation_dependency_rejects_missing_csrf_before_resolution(
 
     class Request:
         cookies = {
-            "akb_admin_session": "opaque-session-value-that-is-long-enough",
-            "akb_admin_csrf": "opaque-csrf-value-that-is-long-enough",
+            "__Host-akb_admin_session": "opaque-session-value-that-is-long-enough",
+            "__Host-akb_admin_csrf": "opaque-csrf-value-that-is-long-enough",
         }
 
     with pytest.raises(AuthenticationError, match="Invalid admin CSRF token"):
@@ -397,9 +368,7 @@ def test_identity_migration_apply_requires_provider_disabled_before_db_write(
     )
 
     assert response.status_code == 409
-    assert response.json()["detail"]["code"] == (
-        "identity_migration_provider_must_be_disabled"
-    )
+    assert response.json()["detail"]["code"] == ("identity_migration_provider_must_be_disabled")
 
 
 def test_identity_migration_apply_is_audited_without_raw_subjects(monkeypatch):
@@ -649,9 +618,7 @@ def test_identity_migration_conflicts_are_value_less(monkeypatch):
     )
 
     assert response.status_code == 409
-    assert response.json()["detail"]["code"] == (
-        "identity_migration_old_binding_missing"
-    )
+    assert response.json()["detail"]["code"] == ("identity_migration_old_binding_missing")
 
 
 def test_identity_migration_malformed_subject_type_is_not_echoed(monkeypatch):
@@ -699,10 +666,7 @@ def test_identity_migration_openapi_keeps_all_identifiers_required_strings():
         "upstream_subject",
         "broker_subject",
     ]
-    assert {
-        name: value["type"]
-        for name, value in schema["properties"].items()
-    } == {
+    assert {name: value["type"] for name, value in schema["properties"].items()} == {
         "existing_user_id": "string",
         "upstream_subject": "string",
         "broker_subject": "string",

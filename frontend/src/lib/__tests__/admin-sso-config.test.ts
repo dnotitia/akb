@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  adminLogout,
   configureAdminSsoProvider,
   getAdminSsoCatalog,
   parseAdminSsoCatalog,
@@ -42,7 +43,7 @@ function response(body: unknown, status = 200): Response {
 
 afterEach(() => {
   vi.unstubAllGlobals();
-  document.cookie = "akb_admin_csrf=; Max-Age=0; Path=/";
+  document.cookie = "akb_dev_admin_csrf=; Max-Age=0; Path=/";
 });
 
 describe("admin SSO provider API", () => {
@@ -82,7 +83,7 @@ describe("admin SSO provider API", () => {
   });
 
   it("sends a write-only secret with same-origin CSRF and never expects it back", async () => {
-    document.cookie = "akb_admin_csrf=csrf-proof-value; Path=/";
+    document.cookie = "akb_dev_admin_csrf=csrf-proof-value; Path=/";
     const fetchMock = vi.fn().mockResolvedValue(response({ provider }));
     vi.stubGlobal("fetch", fetchMock);
 
@@ -116,5 +117,17 @@ describe("admin SSO provider API", () => {
       expect.objectContaining({ method: "POST" }),
     );
     expect(fetchMock.mock.calls[0][1]).not.toHaveProperty("body");
+  });
+
+  it("rejects a non-HTTP product-admin logout navigation", async () => {
+    document.cookie = "akb_dev_admin_csrf=csrf-proof-value; Path=/";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(response({ logout_url: "javascript:alert(1)" })),
+    );
+
+    await expect(adminLogout()).rejects.toThrow(
+      "Invalid product-admin logout response",
+    );
   });
 });

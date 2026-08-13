@@ -21,15 +21,10 @@ def _provider(alias: str, state: str) -> ProviderReadback:
         state=state,  # type: ignore[arg-type]
         enabled=state == "enabled",
         issuer=f"https://{alias}.example.com/realms/workforce",
-        discovery_url=(
-            f"https://{alias}.example.com/realms/workforce/"
-            ".well-known/openid-configuration"
-        ),
+        discovery_url=(f"https://{alias}.example.com/realms/workforce/.well-known/openid-configuration"),
         client_id="akb-broker",
         client_secret_configured=True,
-        redirect_uri=(
-            f"https://auth.akb.example.com/realms/akb/broker/{alias}/endpoint"
-        ),
+        redirect_uri=(f"https://auth.akb.example.com/realms/akb/broker/{alias}/endpoint"),
         supports_logout=True,
         supports_identity_migration=True,
     )
@@ -112,6 +107,31 @@ def test_v2_sso_config_lists_only_enabled_provider_buttons(monkeypatch):
         ],
         "mcp_oauth": {"enabled": False},
     }
+
+
+def test_v2_ready_sso_config_publishes_only_enabled_provider_login_urls(
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+    monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "mcp_oauth_enabled", False, raising=False)
+    monkeypatch.setattr(auth, "sso_browser_session_ready", lambda: True)
+    monkeypatch.setattr(auth, "get_keycloak_provider_control", lambda: Control())
+
+    cfg = _call()
+
+    assert cfg["keycloak"] == {
+        "enabled": True,
+        "browser_session_ready": True,
+    }
+    assert cfg["providers"] == [
+        {
+            "provider_type": "keycloak-oidc",
+            "alias": "workforce",
+            "display_name": "Workforce",
+            "login_url": "/api/v1/auth/sso/workforce/login",
+        }
+    ]
 
 
 def test_v2_public_config_has_only_non_secret_capability_fields(monkeypatch):

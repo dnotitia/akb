@@ -27,10 +27,12 @@ from app.util.text import NFCModel
 
 router = APIRouter()
 
-_ADMIN_SESSION_COOKIE = "akb_admin_session"
-_ADMIN_CSRF_COOKIE = "akb_admin_csrf"
-_ADMIN_OIDC_BINDING_COOKIE = "akb_admin_oidc_binding"
-_ADMIN_OIDC_CALLBACK_PATH = "/api/v1/admin/auth/keycloak/callback"
+_ADMIN_SESSION_COOKIE = "__Host-akb_admin_session"
+_ADMIN_CSRF_COOKIE = "__Host-akb_admin_csrf"
+_ADMIN_OIDC_BINDING_COOKIE = "__Host-akb_admin_oidc_binding"
+_ADMIN_SESSION_COOKIE_DEV = "akb_dev_admin_session"
+_ADMIN_CSRF_COOKIE_DEV = "akb_dev_admin_csrf"
+_ADMIN_OIDC_BINDING_COOKIE_DEV = "akb_dev_admin_oidc_binding"
 
 
 class AdminLocalLoginRequest(NFCModel):
@@ -50,9 +52,7 @@ async def get_current_product_admin(
         if not authorization:
             raise AuthenticationError()
         return await resolve_local_product_admin(authorization)
-    return await resolve_sso_admin_browser_session(
-        request.cookies.get(_ADMIN_SESSION_COOKIE, "")
-    )
+    return await resolve_sso_admin_browser_session(request.cookies.get(_admin_session_cookie_name(), ""))
 
 
 async def get_product_admin_mutation(
@@ -68,8 +68,8 @@ async def get_product_admin_mutation(
     if csrf_header is None:
         raise AuthenticationError("Invalid admin CSRF token")
     return await validate_sso_admin_browser_session_csrf(
-        request.cookies.get(_ADMIN_SESSION_COOKIE, ""),
-        request.cookies.get(_ADMIN_CSRF_COOKIE, ""),
+        request.cookies.get(_admin_session_cookie_name(), ""),
+        request.cookies.get(_admin_csrf_cookie_name(), ""),
         csrf_header,
     )
 
@@ -100,6 +100,20 @@ def _secure_cookie() -> bool:
     return urlsplit(settings.public_base_url).scheme == "https"
 
 
+def _admin_session_cookie_name() -> str:
+    return _ADMIN_SESSION_COOKIE if _secure_cookie() else _ADMIN_SESSION_COOKIE_DEV
+
+
+def _admin_csrf_cookie_name() -> str:
+    return _ADMIN_CSRF_COOKIE if _secure_cookie() else _ADMIN_CSRF_COOKIE_DEV
+
+
+def _admin_oidc_binding_cookie_name() -> str:
+    if _secure_cookie():
+        return _ADMIN_OIDC_BINDING_COOKIE
+    return _ADMIN_OIDC_BINDING_COOKIE_DEV
+
+
 def _identity_response(
     identity: ProductAdminIdentity | AuthenticatedUser,
 ) -> dict:
@@ -125,16 +139,16 @@ def _set_admin_cookies(
     )
     secure = _secure_cookie()
     response.set_cookie(
-        _ADMIN_SESSION_COOKIE,
+        _admin_session_cookie_name(),
         token,
         max_age=max_age,
         secure=secure,
         httponly=True,
         samesite="lax",
-        path="/api/v1/admin",
+        path="/",
     )
     response.set_cookie(
-        _ADMIN_CSRF_COOKIE,
+        _admin_csrf_cookie_name(),
         csrf_token,
         max_age=max_age,
         secure=secure,
@@ -149,14 +163,14 @@ def _set_admin_cookies(
 def _clear_admin_cookies(response: JSONResponse) -> None:
     secure = _secure_cookie()
     response.delete_cookie(
-        _ADMIN_SESSION_COOKIE,
+        _admin_session_cookie_name(),
         secure=secure,
         httponly=True,
         samesite="lax",
-        path="/api/v1/admin",
+        path="/",
     )
     response.delete_cookie(
-        _ADMIN_CSRF_COOKIE,
+        _admin_csrf_cookie_name(),
         secure=secure,
         httponly=False,
         samesite="lax",
@@ -169,23 +183,23 @@ def _set_admin_oidc_binding_cookie(
     browser_binding: str,
 ) -> None:
     response.set_cookie(
-        _ADMIN_OIDC_BINDING_COOKIE,
+        _admin_oidc_binding_cookie_name(),
         browser_binding,
         max_age=600,
         secure=_secure_cookie(),
         httponly=True,
         samesite="lax",
-        path=_ADMIN_OIDC_CALLBACK_PATH,
+        path="/",
     )
 
 
 def _clear_admin_oidc_binding_cookie(response: RedirectResponse) -> None:
     response.delete_cookie(
-        _ADMIN_OIDC_BINDING_COOKIE,
+        _admin_oidc_binding_cookie_name(),
         secure=_secure_cookie(),
         httponly=True,
         samesite="lax",
-        path=_ADMIN_OIDC_CALLBACK_PATH,
+        path="/",
     )
 
 
@@ -214,7 +228,12 @@ async def admin_local_login(request: AdminLocalLoginRequest):
     return await authenticate_local_product_admin(request.username, request.password)
 
 
-@router.get("/admin/auth/keycloak/login", summary="Keycloak product-admin login")
+@router.get(
+    "/admin/auth/keycloak/login",
+    summary="Keycloak product-admin login",
+    status_code=status.HTTP_303_SEE_OTHER,
+    response_class=RedirectResponse,
+)
 async def admin_keycloak_login():
     _require_admin_sso()
     issued = await get_keycloak_oidc().begin_admin_login()
@@ -229,6 +248,8 @@ async def admin_keycloak_login():
 @router.get(
     "/admin/auth/keycloak/callback",
     summary="Keycloak product-admin callback",
+    status_code=status.HTTP_303_SEE_OTHER,
+    response_class=RedirectResponse,
 )
 async def admin_keycloak_callback(
     request: Request,
@@ -240,7 +261,7 @@ async def admin_keycloak_callback(
     if error is not None or not code or not state:
         raise AuthenticationError("Product-admin sign-in failed")
     oidc = get_keycloak_oidc()
-    browser_binding = request.cookies.get(_ADMIN_OIDC_BINDING_COOKIE, "")
+    browser_binding = request.cookies.get(_admin_oidc_binding_cookie_name(), "")
     transient = await oidc.consume_admin_state(state, browser_binding)
     if not isinstance(transient, dict) or set(transient) != {
         "code_verifier",
@@ -296,8 +317,8 @@ async def admin_logout(
     else:
         if csrf_header is None:
             raise AuthenticationError("Invalid admin CSRF token")
-        raw_token = request.cookies.get(_ADMIN_SESSION_COOKIE, "")
-        csrf_cookie = request.cookies.get(_ADMIN_CSRF_COOKIE, "")
+        raw_token = request.cookies.get(_admin_session_cookie_name(), "")
+        csrf_cookie = request.cookies.get(_admin_csrf_cookie_name(), "")
         await revoke_sso_admin_browser_session(
             raw_token,
             csrf_cookie,

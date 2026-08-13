@@ -1,10 +1,11 @@
 """REST auth routes: mode-gated humans plus mode-independent PAT management."""
 
 import uuid
-from typing import NoReturn
-from urllib.parse import quote
+from datetime import datetime, timezone
+from urllib.parse import quote, urlsplit
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import ConfigDict, Field, field_validator
 
 from app.api.deps import get_current_user
@@ -26,18 +27,30 @@ from app.services.auth_service import (
     revoke_all_sessions,
     token_has_scope,
     update_profile,
+    project_verified_principal,
 )
-from app.services.auth_policy import (
-    SSO_BROWSER_SESSION_READY,
-    require_local_auth_enabled,
+from app.services.auth_policy import require_local_auth_enabled, sso_browser_session_ready
+from app.services.keycloak_oidc import get_keycloak_oidc
+from app.services.sso_browser_session_service import (
+    IssuedSsoBrowserSession,
+    SSO_BROWSER_CSRF_HEADER,
+    create_sso_browser_session,
+    revoke_sso_browser_session,
+    revoke_sso_browser_sessions_from_logout_token,
+    sso_browser_csrf_cookie_name,
+    sso_browser_session_cookie_name,
 )
 from app.sso.keycloak_admin import (
     ProviderControlError,
     get_keycloak_provider_control,
 )
+from app.sso.providers.keycloak_oidc import ProviderDefinitionError, validate_alias
 from app.util.text import NFCModel
 
 router = APIRouter()
+
+_SSO_OIDC_BINDING_COOKIE = "__Host-akb_sso_oidc_binding"
+_SSO_OIDC_BINDING_COOKIE_DEV = "akb_dev_sso_oidc_binding"
 
 
 class RegisterRequest(NFCModel):
@@ -150,7 +163,7 @@ async def auth_config(response: Response):
     response.headers["Pragma"] = "no-cache"
     mode = settings.require_auth_mode()
     human_sso_enabled = mode == "sso" and settings.keycloak_enabled
-    browser_session_ready = human_sso_enabled and SSO_BROWSER_SESSION_READY
+    browser_session_ready = human_sso_enabled and sso_browser_session_ready()
     providers: list[dict[str, object]] = []
     if human_sso_enabled:
         control = get_keycloak_provider_control()
@@ -169,9 +182,7 @@ async def auth_config(response: Response):
         providers = [
             provider.public_view(
                 login_url=(
-                    f"/api/v1/auth/sso/{quote(provider.alias, safe='')}/login"
-                    if browser_session_ready
-                    else None
+                    f"/api/v1/auth/sso/{quote(provider.alias, safe='')}/login" if browser_session_ready else None
                 )
             )
             for provider in catalog
@@ -207,59 +218,344 @@ async def local_session_jwks():
     return get_local_session_keyset().public_jwks
 
 
-# ── Staged Keycloak browser surface ───────────────────────────────────
-#
-# Each handler 404s outside SSO mode and returns the stable staging error in
-# SSO mode. No handler reaches OIDC, projection, or credential issuance.
-
-
-def _reject_staged_keycloak_browser_route() -> NoReturn:
-    """Hide human SSO in local mode and fail closed until Phase 4 custody."""
+def _require_sso_mode() -> None:
     if settings.require_auth_mode() != "sso" or not settings.keycloak_enabled:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
             "Human Keycloak SSO is not enabled",
         )
-    raise BrowserSessionNotReadyError()
+
+
+def _require_sso_browser_session() -> None:
+    _require_sso_mode()
+    if not sso_browser_session_ready():
+        raise BrowserSessionNotReadyError()
+
+
+def _secure_cookie() -> bool:
+    return urlsplit(settings.public_base_url).scheme == "https"
+
+
+def _sso_oidc_binding_cookie_name() -> str:
+    if _secure_cookie():
+        return _SSO_OIDC_BINDING_COOKIE
+    return _SSO_OIDC_BINDING_COOKIE_DEV
+
+
+def _safe_redirect_path(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= 2048
+        or not value.startswith("/")
+        or value.startswith("//")
+        or "\\" in value
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+    ):
+        raise AuthenticationError("Invalid SSO redirect target")
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        raise AuthenticationError("Invalid SSO redirect target") from None
+    if parsed.scheme or parsed.netloc or parsed.fragment:
+        raise AuthenticationError("Invalid SSO redirect target")
+    return value
+
+
+def _set_sso_oidc_binding_cookie(
+    response: RedirectResponse,
+    browser_binding: str,
+) -> None:
+    response.set_cookie(
+        _sso_oidc_binding_cookie_name(),
+        browser_binding,
+        max_age=600,
+        secure=_secure_cookie(),
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+
+
+def _clear_sso_oidc_binding_cookie(response: RedirectResponse) -> None:
+    response.delete_cookie(
+        _sso_oidc_binding_cookie_name(),
+        secure=_secure_cookie(),
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+
+
+def _set_sso_session_cookies(
+    response: RedirectResponse,
+    issued: IssuedSsoBrowserSession,
+) -> None:
+    max_age = max(
+        1,
+        int((issued.expires_at - datetime.now(timezone.utc)).total_seconds()),
+    )
+    secure = _secure_cookie()
+    response.set_cookie(
+        sso_browser_session_cookie_name(),
+        issued.token,
+        max_age=max_age,
+        secure=secure,
+        httponly=True,
+        samesite="lax",
+        # Protected surfaces also exist at /api/assets and /health/vault.
+        # The value is opaque + HttpOnly, so root scope does not expose token
+        # material to the SPA while allowing one same-origin session carrier.
+        path="/",
+    )
+    response.set_cookie(
+        sso_browser_csrf_cookie_name(),
+        issued.csrf_token,
+        max_age=max_age,
+        secure=secure,
+        httponly=False,
+        samesite="lax",
+        path="/",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+
+
+def _clear_sso_session_cookies(response: Response) -> None:
+    secure = _secure_cookie()
+    response.delete_cookie(
+        sso_browser_session_cookie_name(),
+        secure=secure,
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+    response.delete_cookie(
+        sso_browser_csrf_cookie_name(),
+        secure=secure,
+        httponly=False,
+        samesite="lax",
+        path="/",
+    )
+
+
+async def _require_enabled_provider(alias: str) -> str:
+    try:
+        alias = validate_alias(alias)
+    except ProviderDefinitionError:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "SSO provider is not enabled",
+        ) from None
+    control = get_keycloak_provider_control()
+    if control.control_mode != "direct":
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "SSO provider catalog is unavailable",
+        )
+    try:
+        catalog = await control.list_providers(
+            force_refresh=True,
+            allow_stale=False,
+        )
+    except ProviderControlError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "SSO provider catalog is unavailable",
+        ) from exc
+    if not any(provider.alias == alias and provider.state == "enabled" for provider in catalog):
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "SSO provider is not enabled",
+        )
+    return alias
+
+
+@router.get(
+    "/auth/sso/{alias}/login",
+    summary="Start an enabled SSO login",
+    status_code=status.HTTP_303_SEE_OTHER,
+    response_class=RedirectResponse,
+)
+async def sso_provider_login(alias: str, redirect: str = "/"):
+    _require_sso_browser_session()
+    redirect_path = _safe_redirect_path(redirect)
+    provider_alias = await _require_enabled_provider(alias)
+    issued = await get_keycloak_oidc().begin_browser_login(
+        redirect_path,
+        provider_alias=provider_alias,
+    )
+    response = RedirectResponse(issued.location, status_code=status.HTTP_303_SEE_OTHER)
+    _set_sso_oidc_binding_cookie(response, issued.browser_binding)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
 
 
 @router.get(
     "/auth/keycloak/login",
-    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-    summary="Keycloak SSO login (staged unavailable)",
+    summary="Retired provider-less Keycloak login",
+    status_code=status.HTTP_410_GONE,
 )
 async def keycloak_login(redirect: str = "/"):
     del redirect
-    _reject_staged_keycloak_browser_route()
+    _require_sso_mode()
+    raise HTTPException(
+        status.HTTP_410_GONE,
+        "Select one of the enabled SSO providers from /api/v1/auth/config",
+    )
 
 
 @router.get(
     "/auth/keycloak/callback",
-    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-    summary="Keycloak SSO callback (staged unavailable)",
+    summary="Complete an ordinary Keycloak SSO browser login",
+    status_code=status.HTTP_303_SEE_OTHER,
+    response_class=RedirectResponse,
 )
-async def keycloak_callback(request: Request):
-    del request
-    _reject_staged_keycloak_browser_route()
+async def keycloak_callback(
+    request: Request,
+    code: str = "",
+    state: str = "",
+    error: str | None = None,
+):
+    _require_sso_browser_session()
+    if error is not None or not code or not state:
+        raise AuthenticationError("SSO sign-in failed")
+    oidc = get_keycloak_oidc()
+    transient = await oidc.consume_browser_state(
+        state,
+        request.cookies.get(_sso_oidc_binding_cookie_name(), ""),
+    )
+    if not isinstance(transient, dict) or set(transient) != {
+        "redirect_path",
+        "provider_alias",
+        "client_id",
+        "code_verifier",
+        "nonce",
+    }:
+        raise AuthenticationError("SSO sign-in failed")
+    if transient.get("client_id") != settings.keycloak_client_id:
+        raise AuthenticationError("SSO sign-in failed")
+    provider_alias = transient.get("provider_alias")
+    if not isinstance(provider_alias, str):
+        raise AuthenticationError("SSO sign-in failed")
+    try:
+        validate_alias(provider_alias)
+    except ProviderDefinitionError:
+        raise AuthenticationError("SSO sign-in failed") from None
+    redirect_path = _safe_redirect_path(transient.get("redirect_path"))
+    verifier = transient.get("code_verifier")
+    nonce = transient.get("nonce")
+    if not isinstance(verifier, str) or not isinstance(nonce, str):
+        raise AuthenticationError("SSO sign-in failed")
+    tokens = await oidc.exchange_browser_code(code, verifier)
+    access_token = tokens.get("access_token")
+    id_token = tokens.get("id_token")
+    if tokens.get("token_type") != "Bearer" or not isinstance(access_token, str) or not isinstance(id_token, str):
+        raise AuthenticationError("SSO sign-in failed")
+    principal = await oidc.verify_access_token(
+        access_token,
+        settings.api_oauth_audience_effective,
+        route_profile="api",
+    )
+    if principal is None:
+        raise AuthenticationError("SSO sign-in failed")
+    id_claims = await oidc.verify_browser_id_token(
+        id_token,
+        expected_nonce=nonce,
+        access_token=access_token,
+    )
+    user = await project_verified_principal(principal)
+    if user is None:
+        raise AuthenticationError("SSO sign-in failed")
+    issued = await create_sso_browser_session(
+        user,
+        principal,
+        id_claims,
+        tokens,
+    )
+    response = RedirectResponse(redirect_path, status_code=status.HTTP_303_SEE_OTHER)
+    _set_sso_session_cookies(response, issued)
+    _clear_sso_oidc_binding_cookie(response)
+    return response
 
 
 @router.get(
     "/auth/keycloak/logout",
-    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-    summary="Keycloak SSO logout (staged unavailable)",
+    summary="Retired token-bearing SSO logout",
+    status_code=status.HTTP_410_GONE,
 )
 async def keycloak_logout(id_token_hint: str | None = None):
     del id_token_hint
-    _reject_staged_keycloak_browser_route()
+    _require_sso_mode()
+    raise HTTPException(
+        status.HTTP_410_GONE,
+        "Use POST /api/v1/auth/logout",
+    )
 
 
 @router.post(
     "/auth/keycloak/exchange",
-    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-    summary="Legacy SSO exchange (staged unavailable)",
+    summary="Retired AKB JWT exchange",
+    status_code=status.HTTP_410_GONE,
 )
 async def keycloak_exchange():
-    _reject_staged_keycloak_browser_route()
+    _require_sso_mode()
+    raise HTTPException(
+        status.HTTP_410_GONE,
+        "SSO mode does not issue an AKB user JWT",
+    )
+
+
+@router.post("/auth/logout", summary="End the current SSO browser session")
+async def sso_browser_logout(request: Request):
+    _require_sso_browser_session()
+    revoked = await revoke_sso_browser_session(
+        request.cookies.get(sso_browser_session_cookie_name(), ""),
+        request.cookies.get(sso_browser_csrf_cookie_name(), ""),
+        request.headers.get(SSO_BROWSER_CSRF_HEADER, ""),
+    )
+    oidc = get_keycloak_oidc()
+    if revoked.refresh_token is not None:
+        await oidc.revoke_browser_refresh_token(revoked.refresh_token)
+    logout_url = oidc.ordinary_logout_url(
+        # The service API cannot accept an ID-token hint, so custodied identity
+        # material cannot be serialized into a SPA-visible navigation URL.
+        f"{settings.public_base_url.rstrip('/')}/auth",
+    )
+    response = JSONResponse({"logout_url": logout_url})
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    _clear_sso_session_cookies(response)
+    return response
+
+
+@router.post(
+    "/auth/keycloak/backchannel-logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Receive a Keycloak back-channel logout token",
+)
+async def keycloak_backchannel_logout(logout_token: str = Form(...)):
+    _require_sso_mode()
+    try:
+        claims = await get_keycloak_oidc().verify_backchannel_logout_token(logout_token)
+        await revoke_sso_browser_sessions_from_logout_token(
+            issuer=claims["iss"],
+            sid=claims["sid"],
+            subject=claims.get("sub"),
+            issued_at=claims["iat"],
+            expires_at=claims["exp"],
+        )
+    except AuthenticationError:
+        # OpenID Connect Back-Channel Logout requires invalid logout tokens to
+        # receive 400 rather than an interactive-authentication 401 challenge.
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            {
+                "message": "Invalid back-channel logout token",
+                "code": "invalid_logout_token",
+            },
+        ) from None
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/auth/me", summary="Get current user info")

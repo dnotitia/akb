@@ -9,8 +9,9 @@ updated: 2026-08-13
 
 This is the Phase 0 architecture decision for
 [#357](https://github.com/dnotitia/akb/issues/357). The Phase 1 mode and
-verifier boundary and the Phase 2 local-session/admin-provisioning subset are
-implemented; browser SSO and provider control remain staged.
+verifier boundary, local-session/admin provisioning, runtime provider control,
+and server-custodied ordinary browser sessions are implemented. Companion BFF
+and managed-platform cutover remain later release gates.
 The record fixes the authority and security boundaries that later phases must
 preserve without fixing their route layout, claim schema, or code structure.
 Public revision and review summaries are recorded in

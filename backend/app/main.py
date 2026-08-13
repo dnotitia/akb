@@ -58,7 +58,15 @@ from app.services.health import vault_health
 from app.services.lifecycle import init_storage, shutdown_storage, start_workers, stop_workers
 from app.services.revision_backend import selected_document_revision_backend
 from app.services.vector_store import get_vector_store
-from app.util.errors import CONFLICT, INTERNAL, INVALID_ARGUMENT, METHOD_NOT_ALLOWED, NOT_FOUND, PERMISSION_DENIED
+from app.util.errors import (
+    CONFLICT,
+    GONE,
+    INTERNAL,
+    INVALID_ARGUMENT,
+    METHOD_NOT_ALLOWED,
+    NOT_FOUND,
+    PERMISSION_DENIED,
+)
 from mcp_server.http_app import mcp_app
 
 logging.basicConfig(
@@ -203,8 +211,7 @@ def _error_payload(
             details = detail["details"]
         if details is None:
             details = {
-                k: v for k, v in detail.items()
-                if k not in {"message", "error", "detail", "code", "hint", "details"}
+                k: v for k, v in detail.items() if k not in {"message", "error", "detail", "code", "hint", "details"}
             } or None
         if legacy_detail is None:
             legacy_detail = detail
@@ -239,6 +246,8 @@ def _code_for_status(status_code: int) -> str:
         return PERMISSION_DENIED
     if status_code == 404:
         return NOT_FOUND
+    if status_code == 410:
+        return GONE
     if status_code == 409:
         return CONFLICT
     return INTERNAL
@@ -280,10 +289,7 @@ async def _no_store_public_surfaces(request: Request, call_next):
         or path.startswith("/api/v1/app/installations/")
         or path.startswith("/api/v1/app/rollouts")
         or (path.startswith("/api/v1/apps/") and "/rollouts" in path)
-        or (
-            path.startswith("/api/v1/apps/")
-            and "/installations/" in path
-        )
+        or (path.startswith("/api/v1/apps/") and "/installations/" in path)
     ):
         response.headers["Cache-Control"] = "no-store"
         response.headers["Pragma"] = "no-cache"
@@ -390,11 +396,7 @@ def _cache_fresh(state: _ReadyState) -> bool:
     # immediately so recovery is reflected in /readyz on the very next
     # call — a 30s stale-failure cache pulls the pod from the Service for
     # twice the actual outage window.
-    return (
-        state.detail is not None
-        and state.ok
-        and (time.monotonic() - state.ts) < _READY_TTL_SECONDS
-    )
+    return state.detail is not None and state.ok and (time.monotonic() - state.ts) < _READY_TTL_SECONDS
 
 
 @app.get("/readyz")
@@ -430,6 +432,7 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
     reporting the same `chunks.vector_indexed_at IS NULL` count.
     """
     from app.services import sparse_encoder, vault_backfill
+
     store = get_vector_store()
     vs_info: dict = {"reachable": await store.health()}
     try:
@@ -474,6 +477,7 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
     if user is not None:
         try:
             from app.services.role_sync import get_role_sync
+
             result["rbac"] = get_role_sync().metrics_snapshot()
         except Exception as e:  # noqa: BLE001
             result["rbac"] = {"error": str(e)}

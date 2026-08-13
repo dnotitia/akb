@@ -1,6 +1,6 @@
 # OPTIONAL local Keycloak overlay — for developing/testing the route-selected
-# Keycloak verifier, the dedicated product-admin browser login, and the MCP
-# OAuth Resource Server path. Ordinary-user browser login remains staged.
+# Keycloak verifier, server-custodied ordinary browser sessions, the dedicated
+# product-admin browser login, and the MCP OAuth Resource Server path.
 # This overlay is NOT part of the default stack.
 #
 # Usage:
@@ -21,7 +21,9 @@
 #   public_base_url: "http://localhost:3000"          # same-origin SPA + /api proxy
 #
 # In config/secret.yaml:
+#   keycloak_client_secret: "local-akb-dev-secret"
 #   keycloak_admin_client_secret: "local-akb-admin-dev-secret"
+#   sso_browser_session_encryption_key: <independent 32-byte base64url value>
 #
 # Pre-bind the imported product-admin fixture before opening
 # http://localhost:3000/admin (password: product-admin-password):
@@ -34,7 +36,9 @@
 # Ordinary test user: alice / alice-password (alice@example.com).
 # The `akb-web` fixed dev secret may be used by a headless test client to
 # obtain an ordinary API token. AKB consumes only the separate `akb-admin`
-# secret for its active product-admin callback in this phase.
+# secret for its product-admin callback. An ordinary provider button
+# additionally requires a distinct upstream IdP configured through /admin;
+# the broker realm cannot broker itself.
 #
 # === MCP OAuth path === additionally:
 #

@@ -13,6 +13,7 @@ import {
   Unlock,
 } from "lucide-react";
 import {
+  authenticatedFetch,
   ApiError,
   deleteDocument,
   getDocument,
@@ -313,11 +314,9 @@ export default function DocumentPage() {
 
   // History = `git log -- <doc.path>` scoped to this document.
   async function loadHistory(vault: string, docPath: string) {
-    const t = localStorage.getItem("akb_token") || "";
     try {
-      const r = await fetch(
+      const r = await authenticatedFetch(
         `/api/v1/activity/${encodeURIComponent(vault)}?collection=${encodeURIComponent(docPath)}&limit=20`,
-        { headers: { Authorization: `Bearer ${t}` } },
       );
       if (!r.ok) {
         setProvenance([]);

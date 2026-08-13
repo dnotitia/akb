@@ -14,8 +14,8 @@ from app.main import app
 
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
-SUCCESS_STATUSES = ("200", "201", "202")
-ERROR_STATUSES = ("400", "401", "403", "404", "409", "422", "500", "503")
+SUCCESS_STATUSES = ("200", "201", "202", "204")
+ERROR_STATUSES = ("400", "401", "403", "404", "409", "410", "422", "500", "503")
 M3_SDK_CONTRACT_PATH = Path(__file__).parents[2] / "packages" / "akb-client" / "scripts" / "sdk-surface-contract.json"
 
 
@@ -107,7 +107,6 @@ def test_api_operations_have_codegen_safe_ids_tags_and_success_schema():
         success = next((responses.get(code) for code in SUCCESS_STATUSES if code in responses), None)
         if (method, path) in {
             ("get", "/api/v1/auth/keycloak/login"),
-            ("get", "/api/v1/auth/keycloak/callback"),
             ("get", "/api/v1/auth/keycloak/logout"),
             ("post", "/api/v1/auth/keycloak/exchange"),
         }:
@@ -119,6 +118,9 @@ def test_api_operations_have_codegen_safe_ids_tags_and_success_schema():
             continue
         assert success is not None, f"{method.upper()} {path} missing success response"
         content = success.get("content", {})
+        if success is responses.get("204"):
+            assert content == {}, f"{method.upper()} {path} 204 must not advertise content"
+            continue
         if "application/json" in content:
             schema = content["application/json"].get("schema")
             assert schema, f"{method.upper()} {path} missing JSON success schema"
@@ -884,6 +886,21 @@ def test_framework_405_runtime_shape_is_not_internal():
     assert response.json()["code"] == "method_not_allowed"
 
 
+def test_framework_410_runtime_shape_uses_stable_gone_code():
+    test_app = FastAPI()
+
+    @test_app.get("/retired")
+    async def retired():
+        raise HTTPException(status_code=410, detail="Retired flow")
+
+    for handler_key, handler in app.exception_handlers.items():
+        test_app.add_exception_handler(handler_key, handler)
+
+    response = TestClient(test_app).get("/retired")
+    assert response.status_code == 410
+    assert response.json()["code"] == "gone"
+
+
 def test_password_gate_compat_fields_stay_top_level():
     test_app = FastAPI()
 
@@ -927,24 +944,37 @@ def test_unhandled_exception_runtime_shape_matches_akb_error_schema():
     }
 
 
-def test_staged_browser_sso_operations_advertise_no_redirect_or_success():
+def test_browser_sso_operations_distinguish_active_redirects_from_retired_flows():
     schema = app.openapi()
-    operations = (
-        ("/api/v1/auth/keycloak/login", "get"),
+    active_redirects = (
+        ("/api/v1/auth/sso/{alias}/login", "get"),
         ("/api/v1/auth/keycloak/callback", "get"),
+        ("/api/v1/admin/auth/keycloak/login", "get"),
+        ("/api/v1/admin/auth/keycloak/callback", "get"),
+    )
+    for path, method in active_redirects:
+        responses = schema["paths"][path][method]["responses"]
+        assert "303" in responses
+        assert "200" not in responses
+
+    retired_operations = (
+        ("/api/v1/auth/keycloak/login", "get"),
         ("/api/v1/auth/keycloak/logout", "get"),
         ("/api/v1/auth/keycloak/exchange", "post"),
     )
-    for path, method in operations:
+    for path, method in retired_operations:
         responses = schema["paths"][path][method]["responses"]
-        assert "503" in responses
-        assert responses["503"]["content"]["application/json"]["schema"] == {"$ref": "#/components/schemas/AkbError"}
+        assert "410" in responses
         assert "200" not in responses
-        assert "302" not in responses
+        assert not any(str(code).startswith("3") for code in responses)
 
     exchange = schema["paths"]["/api/v1/auth/keycloak/exchange"]["post"]
-    assert exchange["summary"] == "Legacy SSO exchange (staged unavailable)"
-    assert "JWT" not in exchange["summary"]
+    assert exchange["summary"] == "Retired AKB JWT exchange"
+
+    backchannel = schema["paths"]["/api/v1/auth/keycloak/backchannel-logout"]["post"]
+    assert "204" in backchannel["responses"]
+    assert "200" not in backchannel["responses"]
+    assert "content" not in backchannel["responses"]["204"]
 
 
 def test_non_json_success_operations_keep_their_media_types():

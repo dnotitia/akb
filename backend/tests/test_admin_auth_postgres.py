@@ -97,6 +97,10 @@ async def _fresh_database():
             from app.db.postgres import _load_migration
 
             fresh_admin_shape = await _admin_schema_shape(conn)
+            # Migration 074 intentionally reuses the composite
+            # external-identity/user key. Remove its dependent table while
+            # reconstructing the older 072 migration in isolation.
+            await conn.execute("DROP TABLE sso_browser_sessions")
             await conn.execute("DROP TABLE admin_browser_sessions")
             await conn.execute("DROP INDEX external_identities_id_user_key")
             admin_session_migration = _load_migration("072_admin_browser_sessions.py")
@@ -281,12 +285,10 @@ async def test_sso_admin_is_exact_prebound_opaque_and_live_rechecked(
                 issued.csrf_token,
                 "wrong-csrf-token-that-is-long-enough",
             )
-        mutation_identity = (
-            await admin_auth_service.validate_sso_admin_browser_session_csrf(
-                issued.token,
-                issued.csrf_token,
-                issued.csrf_token,
-            )
+        mutation_identity = await admin_auth_service.validate_sso_admin_browser_session_csrf(
+            issued.token,
+            issued.csrf_token,
+            issued.csrf_token,
         )
         assert mutation_identity.user_id == admin_user_id
 

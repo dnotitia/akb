@@ -1,9 +1,8 @@
 """Migration 034: retain the legacy ``oidc_transients`` schema.
 
-The dedicated Phase 2 product-admin client uses a namespaced, single-use
-``admin-state-v1`` record whose payload also binds the initiating browser by
-an opaque-cookie hash. Ordinary SSO browser routes remain staged and may reuse
-a different kind only as part of the Phase 4 browser-session design.
+The dedicated product-admin and ordinary browser clients use distinct,
+namespaced single-use records whose payloads bind the initiating browser by an
+opaque-cookie hash.
 
 Idempotent: ``CREATE TABLE IF NOT EXISTS``.
 """
@@ -44,10 +43,7 @@ async def _run(conn):
             )
             """
         )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_oidc_transients_expiry "
-            "ON oidc_transients(expires_at)"
-        )
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_oidc_transients_expiry ON oidc_transients(expires_at)")
 
     logger.info("Migration 034 ensured oidc_transients table")
 

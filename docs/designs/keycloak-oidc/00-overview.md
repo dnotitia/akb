@@ -1,7 +1,7 @@
 # Keycloak OIDC boundary
 
-**Status:** Phase 3A provider control and dedicated admin browser session active;
-exact identity migration and ordinary SSO browser-session cutover staged unavailable
+**Status:** AKB Phase 4 ordinary browser-session custody active; companion BFF
+and managed-platform cutover remain a cross-repository release gate
 
 The accepted
 [Authentication Mode Boundary](../../design/accepted/2026-08-13-authentication-mode-boundary/README.md)
@@ -82,17 +82,19 @@ through the hash of a short-lived HttpOnly cookie, preventing a callback copied
 into another browser from creating an admin session. It discards all Keycloak
 token material after proof,
 then creates a short-lived AKB-owned opaque HttpOnly session and separate CSRF
-cookie. PostgreSQL stores only SHA-256 hashes, the exact external-identity FK,
+cookie. Production HTTPS uses the same browser-enforced `__Host-`, `Secure`,
+no-`Domain`, root-path profile as ordinary sessions. PostgreSQL stores only
+SHA-256 hashes, the exact external-identity FK,
 the bound issuer/subject snapshot, the Keycloak session ID, and expiry. Every
 admin request rechecks the account, unchanged exact binding, status, kind,
-provider, and `is_admin`; demotion or binding mutation/removal invalidates the
-next request. The session lifetime is capped by both
+provider, and `is_admin`; demotion deletes existing admin handles in the same
+transaction, while binding mutation/removal also invalidates resolution. The
+session lifetime is capped by both
 `admin_browser_session_ttl_secs` and the verified ID-token expiry.
 
-This intentionally does not implement refresh-token custody, ordinary-user
-BFF sessions, back-channel logout, or long-lived provider sessions. Those
-remain Phase 4 work; the short admin session bounds IdP-side revocation lag in
-this MVP.
+The admin session deliberately remains a separate short-lived proof and does
+not share the ordinary-user refresh-token store. Its bounded lifetime limits
+IdP-side revocation lag without broadening the recovery client's authority.
 
 ## Runtime provider control
 
@@ -110,20 +112,64 @@ Provider client secrets are write-only and excluded from admin, public, event,
 and audit views. The contribution contract and operator guide live under
 [`docs/sso/`](../../sso/README.md).
 
-## Ordinary browser routes are staged unavailable
+## Ordinary browser-session custody
 
-Phase 1 does not expose a browser token transport:
+AKB's own SPA uses a server-selected authorization-code flow with PKCE, nonce,
+single-use state, and a short HttpOnly browser-binding cookie. The callback URI
+is derived only from `public_base_url`; request input cannot select a client,
+callback, issuer, or verifier. Login may start only through an exact enabled
+provider alias returned by the current Keycloak read-back.
 
-| Mode | `/auth/keycloak/login`, callback, exchange, logout |
-| --- | --- |
-| `local` | `404`; Keycloak may exist solely for MCP OAuth and is not called |
-| `sso` | stable `503 browser_session_not_ready` before state, token exchange, projection, code redemption, or logout calls |
+After access- and ID-token verification and exact account projection, the
+browser receives:
 
-The former browser callback-to-exchange path and its AKB human-session minting
-entry point are removed. The frontend callback page performs no network
-exchange, token write, or SSO identity marker write. Phase 4 owns server-side
-access/refresh token custody, browser session transport, refresh, logout, and
-revocation before these routes can become available.
+- an opaque, high-entropy `__Host-akb_sso_session` HttpOnly cookie;
+- a separate readable `__Host-akb_sso_csrf` cookie used as a double-submit value.
+
+On production HTTPS both use the browser-enforced `__Host-` prefix, `Secure`,
+no `Domain`, and `Path=/`; the short OIDC binding cookie follows the same rule.
+Explicit loopback HTTP development uses separate `akb_dev_*` names because a
+browser correctly refuses `__Host-` without `Secure`. Session and CSRF cookies
+are `SameSite=Lax` and root-scoped because protected AKB
+surfaces exist at `/api/v1`, `/api/assets`, and `/health/vault`. The SPA sends
+cookies only same-origin and adds `X-AKB-CSRF` to unsafe cookie-backed methods.
+If an `Authorization` header is present, that Bearer credential owns the
+request; rejection never falls through to a cookie session.
+
+PostgreSQL stores only the opaque-handle and CSRF hashes, exact
+`(issuer, subject)` identity FK, Keycloak `sid`, bounded expiry metadata, and an
+AES-256-GCM envelope containing the refresh token, ID token, and scope. Access
+tokens are never persisted. Every request rechecks the live AKB account and
+exact identity binding. Near access-token expiry, one row lock serializes
+refresh-token rotation. A non-locking expiry probe and bounded refresh gate
+ensure waiting requests do not consume the PostgreSQL pool before admission;
+invalid refresh deletes the session while a transient
+Keycloak/JWKS outage rolls the transaction back and preserves it. Account
+suspension deletes ordinary and admin handles in the state-change transaction.
+Signed back-channel logout writes a short-lived `(issuer, sid, iat)` ordering
+fence under the same advisory lock used by session creation, so a callback that
+resumes after logout cannot recreate that session. Idle expiry never extends
+the absolute lifetime, and active sessions per user are bounded.
+
+The encryption key is an independent, installation-owned 256-bit base64url
+secret. A blank key keeps ordinary browser SSO fail-closed during a staged
+deployment; a malformed configured key fails startup. Replacing the only key
+forces ordinary SSO reauthentication. Key-ring rotation is not part of this
+MVP.
+
+| Route | `local` | ready `sso` |
+| --- | --- | --- |
+| `GET /auth/sso/{alias}/login` | `404` | starts only an enabled provider |
+| `GET /auth/keycloak/callback` | `404` | verifies and creates opaque session |
+| `POST /auth/logout` | `404` | local handle delete, best-effort realm revoke, cookie clear |
+| `POST /auth/keycloak/backchannel-logout` | `404` | signed exact issuer/`sid` revoke plus late-callback fence |
+| provider-less login / AKB JWT exchange | `404` | permanently `410` |
+
+When SSO is configured but browser custody is not ready, login/callback/logout
+fail before issuing state or contacting the token endpoint. SSO never issues,
+stores, or transports an AKB user JWT. Reef and Naut must instead own their
+separate BFF callback/token custody and present their Keycloak access token to
+AKB; that cross-product change remains part of the release gate.
 
 ## Public capability schema v2
 
@@ -136,14 +182,14 @@ revocation before these routes can become available.
   "local_auth": { "enabled": false },
   "keycloak": {
     "enabled": true,
-    "browser_session_ready": false
+    "browser_session_ready": true
   },
   "providers": [
     {
       "provider_type": "keycloak-oidc",
       "alias": "workforce",
       "display_name": "Company SSO",
-      "login_url": null
+      "login_url": "/api/v1/auth/sso/workforce/login"
     }
   ],
   "mcp_oauth": { "enabled": false }
@@ -153,8 +199,9 @@ revocation before these routes can become available.
 `local_auth.enabled` derives from `auth_mode`. `keycloak.enabled` means the
 ordinary human SSO authority, so local mode with Keycloak enabled solely for
 MCP still publishes it as `false`. `providers` contains only exact enabled,
-non-drifted provider read-backs. Until Phase 4, browser readiness is false and
-each provider `login_url` is null. MCP OAuth remains orthogonal.
+non-drifted provider read-backs. A provider login URL is non-null only when the
+browser-session encryption/client profile is ready; otherwise the same enabled
+provider may be listed with `login_url: null`. MCP OAuth remains orthogonal.
 
 Clients accept only schema v2 with a known mode and internally consistent
 capabilities. Fetch failure, non-success status, malformed JSON, old/missing

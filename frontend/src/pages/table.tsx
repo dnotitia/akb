@@ -4,6 +4,7 @@ import { EmptyState } from "@/components/empty-state";
 import { Alert } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TooltipText } from "@/components/ui/tooltip-text";
+import { authenticatedFetch } from "@/lib/api";
 
 interface Column {
   name: string;
@@ -38,8 +39,7 @@ export default function TablePage() {
     setTotal(0);
     setError("");
     setLoading(true);
-    const t = localStorage.getItem("akb_token") || "";
-    fetch(`/api/v1/tables/${vault}`, { headers: { Authorization: `Bearer ${t}` } })
+    authenticatedFetch(`/api/v1/tables/${encodeURIComponent(vault)}`)
       .then((r) => (r.ok ? r.json().catch(() => null) : null))
       .then((d) => {
         if (cancelled || !d) return;
@@ -55,9 +55,9 @@ export default function TablePage() {
     // bypassed the mapping → "relation <table> does not exist". Table names are
     // constrained to ^[a-z][a-z0-9_]*$, so a bare reference is always well-formed.
     const ident = table || "";
-    fetch(`/api/v1/tables/${vault}/sql`, {
+    authenticatedFetch(`/api/v1/tables/${encodeURIComponent(vault)}/sql`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${t}` },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sql: `SELECT * FROM ${ident} LIMIT ${limit}` }),
     })
       .then((r) => r.json())

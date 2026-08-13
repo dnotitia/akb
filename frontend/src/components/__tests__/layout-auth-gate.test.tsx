@@ -1,6 +1,7 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Layout } from "../layout";
 import * as api from "@/lib/api";
 
@@ -10,8 +11,10 @@ import * as api from "@/lib/api";
 // throw inside React's commit phase.
 vi.mock("@/lib/api", () => ({
   getToken: vi.fn(),
-  setToken: vi.fn(),
-  getMe: vi.fn().mockResolvedValue(null),
+  getAuthConfig: vi.fn(),
+  getMe: vi.fn(),
+  logoutOrdinarySession: vi.fn(),
+  clearPrivateAssetCache: vi.fn(),
 }));
 
 vi.mock("@/hooks/use-health", () => ({
@@ -23,59 +26,121 @@ vi.mock("@/hooks/use-measured-height", () => ({
   useMeasuredHeight: () => [vi.fn(), 0],
 }));
 
-function renderAt(path: string) {
+function renderAt(path: string, queryClient = new QueryClient()) {
   return render(
-    <MemoryRouter initialEntries={[path]}>
-      <Routes>
-        <Route element={<Layout />}>
-          <Route path="/" element={<div data-testid="home" />} />
-          <Route path="/search" element={<div data-testid="search-page" />} />
-        </Route>
-        <Route path="/auth" element={<div data-testid="auth-page" />} />
-      </Routes>
-    </MemoryRouter>,
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route element={<Layout />}>
+            <Route path="/" element={<div data-testid="home" />} />
+            <Route path="/search" element={<div data-testid="search-page" />} />
+          </Route>
+          <Route path="/auth" element={<div data-testid="auth-page" />} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 
 describe("Layout — auth gate", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(api.getAuthConfig).mockResolvedValue({
+      available: true,
+      schema_version: 2,
+      auth_mode: "local",
+      local_auth: { enabled: true },
+      keycloak: { enabled: false, browser_session_ready: false },
+      providers: [],
+      mcp_oauth: { enabled: false },
+    });
+    vi.mocked(api.getMe).mockResolvedValue({
+      user_id: "user-1",
+      username: "alice",
+      email: "alice@example.com",
+      display_name: "Alice",
+      is_admin: false,
+      auth_method: "jwt",
+      key_class: null,
+    });
+  });
   afterEach(() => cleanup());
 
-  it("redirects to /auth when no token", () => {
-    (api.getToken as any).mockReturnValue(null);
+  it("redirects to /auth when local mode has no token", async () => {
+    vi.mocked(api.getToken).mockReturnValue(null);
     renderAt("/");
-    expect(screen.getByTestId("auth-page")).toBeTruthy();
+    expect(await screen.findByTestId("auth-page")).toBeTruthy();
     expect(screen.queryByTestId("home")).toBeNull();
   });
 
-  it("renders the outlet when a token is present", () => {
-    (api.getToken as any).mockReturnValue("fake-jwt");
+  it("renders the outlet only after the local token is verified", async () => {
+    vi.mocked(api.getToken).mockReturnValue("fake-jwt");
     renderAt("/");
-    expect(screen.getByTestId("home")).toBeTruthy();
+    expect(await screen.findByTestId("home")).toBeTruthy();
+    expect(api.getMe).toHaveBeenCalledWith({ redirectOnUnauthorized: false });
     expect(screen.queryByTestId("auth-page")).toBeNull();
   });
 
-  it("preserves hook order across a logged-in → logged-out re-render", () => {
-    // Logged-in mount succeeds.
-    (api.getToken as any).mockReturnValue("fake-jwt");
-    const { rerender, unmount } = renderAt("/");
-    expect(screen.getByTestId("home")).toBeTruthy();
+  it("accepts a verified SSO cookie session without any local token", async () => {
+    vi.mocked(api.getAuthConfig).mockResolvedValue({
+      available: true,
+      schema_version: 2,
+      auth_mode: "sso",
+      local_auth: { enabled: false },
+      keycloak: { enabled: true, browser_session_ready: true },
+      providers: [],
+      mcp_oauth: { enabled: true },
+    });
+    vi.mocked(api.getToken).mockReturnValue(null);
 
-    // Flip to logged-out and re-render. With the old code (hooks AFTER
-    // the auth-gate early return) this would throw
-    // "Rendered fewer hooks than expected" — the regression we just fixed.
-    (api.getToken as any).mockReturnValue(null);
-    rerender(
-      <MemoryRouter initialEntries={["/"]}>
-        <Routes>
-          <Route element={<Layout />}>
-            <Route path="/" element={<div data-testid="home" />} />
-          </Route>
-          <Route path="/auth" element={<div data-testid="auth-page" />} />
-        </Routes>
-      </MemoryRouter>,
-    );
-    expect(screen.getByTestId("auth-page")).toBeTruthy();
-    unmount();
+    renderAt("/");
+
+    expect(await screen.findByTestId("home")).toBeTruthy();
+    expect(api.getMe).toHaveBeenCalledWith({ redirectOnUnauthorized: false });
+  });
+
+  it("rechecks a foreground SSO identity before clearing prior private queries", async () => {
+    vi.mocked(api.getAuthConfig).mockResolvedValue({
+      available: true,
+      schema_version: 2,
+      auth_mode: "sso",
+      local_auth: { enabled: false },
+      keycloak: { enabled: true, browser_session_ready: true },
+      providers: [],
+      mcp_oauth: { enabled: true },
+    });
+    vi.mocked(api.getToken).mockReturnValue(null);
+    vi.mocked(api.getMe)
+      .mockResolvedValueOnce({
+        user_id: "user-1",
+        username: "alice",
+        email: "alice@example.com",
+        display_name: "Alice",
+        is_admin: false,
+        auth_method: "browser_session",
+        key_class: null,
+      })
+      .mockResolvedValueOnce({
+        user_id: "user-2",
+        username: "bob",
+        email: "bob@example.com",
+        display_name: "Bob",
+        is_admin: false,
+        auth_method: "browser_session",
+        key_class: null,
+      });
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(["private", "alice"], { secret: true });
+
+    renderAt("/", queryClient);
+    expect(await screen.findByTestId("home")).toBeTruthy();
+
+    window.dispatchEvent(new Event("focus"));
+
+    expect(await screen.findByText("Verifying session…")).toBeTruthy();
+    await waitFor(() => expect(api.getMe).toHaveBeenCalledTimes(2));
+    expect(await screen.findByTestId("home")).toBeTruthy();
+    expect(queryClient.getQueryData(["private", "alice"])).toBeUndefined();
+    expect(api.clearPrivateAssetCache).toHaveBeenCalled();
   });
 });

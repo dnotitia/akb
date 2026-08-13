@@ -41,7 +41,7 @@ def _required(value: str, field: str) -> str:
 def _uuid(value: str, field: str) -> uuid.UUID:
     try:
         return uuid.UUID(value)
-    except (AttributeError, TypeError, ValueError):
+    except AttributeError, TypeError, ValueError:
         raise ValidationError(f"{field} must be a UUID") from None
 
 
@@ -82,11 +82,7 @@ async def ensure_human_external_identity(
     issuer = _required(issuer, "issuer")
     subject = _required(subject, "subject")
     email = _required(email, "email").lower()
-    existing_user_uuid = (
-        _uuid(existing_user_id, "existing_user_id")
-        if existing_user_id is not None
-        else None
-    )
+    existing_user_uuid = _uuid(existing_user_id, "existing_user_id") if existing_user_id is not None else None
     pool = await get_pool()
     new_user_id: uuid.UUID | None = None
     token_ids: list[uuid.UUID] = []
@@ -110,12 +106,8 @@ async def ensure_human_external_identity(
                     subject,
                 )
                 if bound is not None:
-                    if (
-                        bound["account_kind"] != "human"
-                        or (
-                            existing_user_uuid is not None
-                            and bound["id"] != existing_user_uuid
-                        )
+                    if bound["account_kind"] != "human" or (
+                        existing_user_uuid is not None and bound["id"] != existing_user_uuid
                     ):
                         raise ExternalIdentityConflictError()
                     user_id = bound["id"]
@@ -393,14 +385,8 @@ async def adopt_current_admin_as_service(
                 or not current["is_admin"]
                 or current["has_external_identity"]
                 or current["account_kind"] not in {"human", "service"}
-                or (
-                    current["account_kind"] == "human"
-                    and current["auth_provider"] != "local"
-                )
-                or (
-                    current["account_kind"] == "service"
-                    and current["auth_provider"] != "service"
-                )
+                or (current["account_kind"] == "human" and current["auth_provider"] != "local")
+                or (current["account_kind"] == "service" and current["auth_provider"] != "service")
             ):
                 raise ServiceIdentityAdoptionError()
 
@@ -428,10 +414,7 @@ async def adopt_current_admin_as_service(
                 or current["password_hash"] != _SERVICE_SENTINEL_HASH
             )
             wanted_scopes = ["read", "write", "admin"]
-            token_changed = (
-                token["key_class"] != "service"
-                or list(token["scopes"] or []) != wanted_scopes
-            )
+            token_changed = token["key_class"] != "service" or list(token["scopes"] or []) != wanted_scopes
             if user_changed:
                 await conn.execute(
                     """
@@ -639,10 +622,7 @@ async def get_managed_account_state(
         issues.add("active_human_set_mismatch")
     if any(provider != "keycloak" for provider, _ in observed.values()):
         issues.add("human_auth_provider_mismatch")
-    if any(
-        observed.get(user_id, ("", set()))[1] != {subject}
-        for user_id, subject in expected.items()
-    ):
+    if any(observed.get(user_id, ("", set()))[1] != {subject} for user_id, subject in expected.items()):
         issues.add("expected_identity_mismatch")
 
     account_issues = set(issues)
@@ -696,6 +676,13 @@ async def set_user_admin(user_id: str, *, is_admin: bool, actor_id: str) -> dict
                 user_uuid,
                 is_admin,
             )
+            if not is_admin:
+                # A demoted account must not regain an old admin browser
+                # handle if it is promoted again before that handle is used.
+                await conn.execute(
+                    "DELETE FROM admin_browser_sessions WHERE user_id = $1",
+                    user_uuid,
+                )
             await emit_event(
                 conn,
                 "auth.user_role_changed",
@@ -766,6 +753,17 @@ async def _suspend_user_in_conn(
             user_id,
             actor_id=actor_id,
             reason=REVOKE_REASON_ADMIN,
+        )
+        # Browser handles carry no self-contained status cutoff. Delete them
+        # in the same account-state transaction so suspend -> activate cannot
+        # revive a cookie that was never observed while suspended.
+        await conn.execute(
+            "DELETE FROM admin_browser_sessions WHERE user_id = $1",
+            user_id,
+        )
+        await conn.execute(
+            "DELETE FROM sso_browser_sessions WHERE user_id = $1",
+            user_id,
         )
         deleted = await conn.fetch(
             "DELETE FROM tokens WHERE user_id = $1 RETURNING id",

@@ -67,7 +67,7 @@ JSON_OBJECT_ARRAY_SCHEMA: dict[str, Any] = {
     "items": {"$ref": "#/components/schemas/AkbJsonObject"},
 }
 
-ERROR_STATUSES = ("400", "401", "403", "404", "409", "422", "500", "503")
+ERROR_STATUSES = ("400", "401", "403", "404", "409", "410", "422", "500", "503")
 SUCCESS_STATUSES = ("200", "201", "202")
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 KIND_SUCCESS_RESPONSE_REFS = {
@@ -140,7 +140,6 @@ OPERATION_TAG_OVERRIDES = {
 }
 NO_SUCCESS_RESPONSE_OPERATIONS = {
     ("get", "/api/v1/auth/keycloak/login"),
-    ("get", "/api/v1/auth/keycloak/callback"),
     ("get", "/api/v1/auth/keycloak/logout"),
     ("post", "/api/v1/auth/keycloak/exchange"),
 }
@@ -228,7 +227,10 @@ def _ensure_success_response(path: str, method: str, operation: dict[str, Any]) 
         return
     status = next((code for code in SUCCESS_STATUSES if code in responses), None)
     if status is None:
-        if any(str(code).startswith("3") for code in responses):
+        # Preserve explicit no-content/binary/redirect responses. In
+        # particular, a 204-only back-channel endpoint must not acquire a
+        # fictitious 200 JSON body during normalization.
+        if any(str(code).startswith(("2", "3")) for code in responses):
             return
         status = "200"
     response = responses.setdefault(status, {"description": "Successful Response"})
@@ -284,6 +286,7 @@ def _error_description(status: str) -> str:
         "403": "Forbidden",
         "404": "Not Found",
         "409": "Conflict",
+        "410": "Gone",
         "422": "Validation Error",
         "500": "Internal Server Error",
         "503": "Service Unavailable",

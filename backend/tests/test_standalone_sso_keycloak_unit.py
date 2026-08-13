@@ -136,11 +136,15 @@ async def test_duplicate_exact_client_fails_closed():
 
 
 async def test_signing_key_readback_measures_active_key_and_rotation_window():
-    active_public = base64.b64encode(
-        rsa.generate_private_key(public_exponent=65537, key_size=3072)
-        .public_key()
-        .public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
-    ).decode("ascii").rstrip("=")
+    active_public = (
+        base64.b64encode(
+            rsa.generate_private_key(public_exponent=65537, key_size=3072)
+            .public_key()
+            .public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
     passive_public = (
         rsa.generate_private_key(public_exponent=65537, key_size=2048)
         .public_key()
@@ -235,9 +239,7 @@ async def test_bootstrap_retirement_deletes_only_exact_master_client_and_reauth_
     finally:
         await control.aclose()
 
-    assert deleted_paths == [
-        "/admin/realms/master/clients/bootstrap-client-uuid"
-    ]
+    assert deleted_paths == ["/admin/realms/master/clients/bootstrap-client-uuid"]
 
 
 async def test_missing_one_time_password_cannot_create_product_admin():
@@ -282,9 +284,7 @@ async def test_existing_product_admin_password_is_reset_to_the_operator_input():
                         "email": "product-admin@example.com",
                         "enabled": True,
                         "emailVerified": True,
-                        "requiredActions": (
-                            ["UPDATE_PASSWORD"] if user_reads > 1 else []
-                        ),
+                        "requiredActions": (["UPDATE_PASSWORD"] if user_reads > 1 else []),
                     }
                 ],
             )
@@ -531,13 +531,14 @@ async def test_client_profiles_separate_user_admin_and_management_authorities():
         "akb-admin",
         "akb-sso-manager",
     }
-    assert api["redirectUris"] == [
-        "https://akb.example.com/api/v1/auth/keycloak/callback"
-    ]
-    assert admin["redirectUris"] == [
-        "https://akb.example.com/api/v1/admin/auth/keycloak/callback"
-    ]
+    assert api["redirectUris"] == ["https://akb.example.com/api/v1/auth/keycloak/callback"]
+    assert admin["redirectUris"] == ["https://akb.example.com/api/v1/admin/auth/keycloak/callback"]
     assert api["attributes"]["pkce.code.challenge.method"] == "S256"
+    assert api["frontchannelLogout"] is False
+    assert api["attributes"]["backchannel.logout.url"] == (
+        "https://akb.example.com/api/v1/auth/keycloak/backchannel-logout"
+    )
+    assert api["attributes"]["backchannel.logout.session.required"] == "true"
     assert admin["attributes"]["pkce.code.challenge.method"] == "S256"
     assert api["defaultClientScopes"] == ["basic", "profile", "email"]
     assert admin["defaultClientScopes"] == ["basic", "profile", "email"]

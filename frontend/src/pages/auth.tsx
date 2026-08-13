@@ -5,6 +5,7 @@ import {
   authLogin,
   authRegister,
   getAuthConfig,
+  getMe,
   getToken,
   setToken,
   type AuthConfig,
@@ -60,19 +61,30 @@ export default function AuthPage() {
 
   useEffect(() => {
     let cancelled = false;
-    void getAuthConfig().then((config) => {
+    void (async () => {
+      const config = await getAuthConfig();
       if (cancelled) return;
-      setAuthConfig(config);
-      if (config.available !== true) return;
-      if (config.auth_mode === "sso") {
-        // A pre-cutover local JWT must never drive the SSO browser path or
-        // bounce the auth guard in a redirect loop.
-        if (getToken()) setToken(null);
+      if (config.available !== true || config.auth_mode === null) {
+        setAuthConfig(config);
         return;
       }
-      // Already signed in (back button / bookmark)? Don't re-show the local form.
-      if (getToken()) navigate(next, { replace: true });
-    });
+      if (config.auth_mode === "sso" && getToken()) {
+        // Defense in depth for mocked/legacy config clients: a local JWT must
+        // never shadow the SSO cookie carrier.
+        setToken(null);
+      }
+      const hasSessionCandidate = config.auth_mode === "sso" || getToken() !== null;
+      if (hasSessionCandidate) {
+        try {
+          await getMe({ redirectOnUnauthorized: false });
+          if (!cancelled) navigate(next, { replace: true });
+          return;
+        } catch {
+          // No current session: reveal only the options allowed by config.
+        }
+      }
+      if (!cancelled) setAuthConfig(config);
+    })();
     return () => {
       cancelled = true;
     };

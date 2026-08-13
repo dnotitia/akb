@@ -696,6 +696,34 @@ async def test_keycloak_access_v1_unknown_kid_refreshes_same_pinned_jwks_once(
 
 
 @pytest.mark.asyncio
+async def test_keycloak_access_v1_distinguishes_pinned_jwks_outage_from_rejection(
+    monkeypatch,
+    rsa_keypair,
+):
+    from app.exceptions import AKBError
+    from app.services.keycloak_oidc import KeycloakOIDC
+
+    issuer, api_audience, _ = _configure_keycloak(monkeypatch)
+    service = KeycloakOIDC()
+    token = _mint_keycloak_token(
+        rsa_keypair,
+        issuer=issuer,
+        audience=api_audience,
+    )
+
+    async def unavailable(*, force: bool = False):
+        del force
+        raise AKBError("Pinned JWKS unavailable", status_code=502)
+
+    service._fetch_jwks = unavailable  # type: ignore[method-assign]
+
+    with pytest.raises(AKBError) as captured:
+        await service.verify_access_token(token, api_audience, route_profile="api")
+
+    assert captured.value.status_code == 502
+
+
+@pytest.mark.asyncio
 async def test_keycloak_access_v1_unknown_kid_refresh_is_single_flight_and_bounded(
     monkeypatch,
     rsa_keypair,
