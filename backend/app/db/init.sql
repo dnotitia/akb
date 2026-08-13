@@ -81,12 +81,15 @@ CREATE INDEX IF NOT EXISTS idx_external_identities_user
 CREATE UNIQUE INDEX IF NOT EXISTS external_identities_id_user_key
     ON external_identities(id, user_id);
 
--- Singleton observation of the last runtime auth boundary. Startup holds this
--- row FOR UPDATE and revokes every SSO browser handle/fence whenever the mode
--- or explicit epoch changes. Local mode never carries an SSO epoch.
+-- Singleton authority for the last accepted runtime auth boundary. The
+-- installation generation is monotonic: an exact restart is accepted, a
+-- greater generation performs one transition, and stale/conflicting starts
+-- fail closed. Local mode never carries an SSO epoch.
 CREATE TABLE IF NOT EXISTS auth_runtime_state (
     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE
         CHECK (singleton),
+    runtime_generation BIGINT NOT NULL
+        CHECK (runtime_generation > 0),
     auth_mode TEXT NOT NULL
         CHECK (auth_mode IN ('local', 'sso')),
     sso_session_epoch UUID,
@@ -101,13 +104,33 @@ CREATE TABLE IF NOT EXISTS auth_runtime_state (
         )
 );
 
+-- Machine-readable state for the one-time pre-epoch stop-the-world bridge.
+-- `required` blocks normal startup until the explicit upgrade acknowledgement;
+-- `enforced` makes legacy NULL writes fail; `rollback_ready` is written only
+-- after every epoch-bound row and runtime authority row has been purged.
+CREATE TABLE IF NOT EXISTS auth_runtime_epoch_upgrade (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE
+        CHECK (singleton),
+    state TEXT NOT NULL
+        CHECK (state IN ('ready', 'required', 'enforced', 'rollback_ready')),
+    runtime_generation_floor BIGINT NOT NULL DEFAULT 0
+        CHECK (runtime_generation_floor >= 0),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO auth_runtime_epoch_upgrade (singleton, state)
+VALUES (TRUE, 'ready')
+ON CONFLICT (singleton) DO NOTHING;
+
 -- Dedicated product-admin browser sessions. These rows contain only hashes
 -- of opaque AKB session/CSRF values, an exact external-identity FK, and the
 -- issuer/subject snapshot used to invalidate a changed binding. No Keycloak
 -- access, refresh, or ID token is stored here.
 CREATE TABLE IF NOT EXISTS admin_browser_sessions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    session_epoch UUID NOT NULL,
+    -- Nullable only for pre-epoch image rollback compatibility. Migration 076
+    -- installs a database guard that rejects NULL while current code is active.
+    session_epoch UUID,
     token_hash TEXT NOT NULL UNIQUE
         CHECK (token_hash ~ '^[0-9a-f]{64}$'),
     csrf_token_hash TEXT NOT NULL
@@ -144,7 +167,7 @@ CREATE INDEX IF NOT EXISTS idx_admin_browser_sessions_user
 -- exact row and AKB user. Access tokens are verified and discarded.
 CREATE TABLE IF NOT EXISTS sso_browser_sessions (
     id UUID PRIMARY KEY,
-    session_epoch UUID NOT NULL,
+    session_epoch UUID,
     token_hash TEXT NOT NULL UNIQUE
         CHECK (token_hash ~ '^[0-9a-f]{64}$'),
     csrf_token_hash TEXT NOT NULL
@@ -197,7 +220,7 @@ CREATE INDEX IF NOT EXISTS idx_sso_browser_sessions_subject
 -- logout. Session creation and logout also share a transaction advisory lock;
 -- this row rejects a callback that resumes only after logout committed.
 CREATE TABLE IF NOT EXISTS sso_browser_logout_fences (
-    session_epoch UUID NOT NULL,
+    session_epoch UUID,
     identity_issuer TEXT NOT NULL
         CHECK (char_length(identity_issuer) BETWEEN 1 AND 2048),
     keycloak_sid TEXT NOT NULL
@@ -210,7 +233,9 @@ CREATE TABLE IF NOT EXISTS sso_browser_logout_fences (
     logout_issued_at TIMESTAMPTZ NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL,
     received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (session_epoch, identity_issuer, keycloak_sid),
+    -- Retain the pre-epoch key so an explicitly prepared rollback image can
+    -- still execute its original ON CONFLICT target.
+    PRIMARY KEY (identity_issuer, keycloak_sid),
     CONSTRAINT sso_browser_logout_fence_epoch_fk
         FOREIGN KEY (session_epoch)
         REFERENCES auth_runtime_state(sso_session_epoch),

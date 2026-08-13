@@ -64,6 +64,40 @@ def test_runtime_load_accepts_explicit_sso_auth_mode(
     assert loaded.keycloak_sso_only is True
 
 
+def test_runtime_generation_is_positive_and_upgrade_ack_is_versioned(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    loaded = _load(
+        monkeypatch,
+        tmp_path,
+        {
+            "auth_mode": "local",
+            "auth_runtime_generation": 7,
+            "sso_session_epoch_upgrade": "stop-the-world-v1",
+        },
+    )
+
+    assert loaded.auth_runtime_generation == 7
+    assert loaded.sso_session_epoch_upgrade == "stop-the-world-v1"
+
+    with pytest.raises(ValueError):
+        _load(
+            monkeypatch,
+            tmp_path,
+            {"auth_mode": "local", "auth_runtime_generation": 0},
+        )
+    with pytest.raises(ValueError):
+        _load(
+            monkeypatch,
+            tmp_path,
+            {
+                "auth_mode": "local",
+                "sso_session_epoch_upgrade": "rolling",
+            },
+        )
+
+
 def test_programmatic_settings_construction_does_not_require_runtime_mode() -> None:
     configured = app_config.Settings()
 

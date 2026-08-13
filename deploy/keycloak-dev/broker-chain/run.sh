@@ -68,6 +68,7 @@ mkdir -p "$fixture_run_dir/config"
 sso_session_epoch="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 cat >"$fixture_run_dir/config/app.yaml" <<YAML
 auth_mode: sso
+auth_runtime_generation: 1
 sso_session_epoch: "$sso_session_epoch"
 keycloak_enabled: true
 keycloak_server_url: https://broker.localhost:19443

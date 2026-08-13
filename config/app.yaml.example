@@ -152,6 +152,13 @@ document_asset_upload_body_timeout_secs: 60
 # Provision the designated administrator explicitly with
 # `python -m app.cli provision-recovery-admin`; ordinary registration is never admin.
 auth_mode: local
+# Installation-owned monotonic boundary. Keep it unchanged for an exact
+# restart. Increase it for every auth_mode or sso_session_epoch transition;
+# PostgreSQL rejects stale, replayed, or same-generation conflicting starts.
+auth_runtime_generation: 1
+# Existing installations upgrading from a pre-epoch image use this temporary
+# acknowledgement only while running the documented quiescent preflight:
+# sso_session_epoch_upgrade: stop-the-world-v1
 jwt_algorithm: RS256
 jwt_expire_hours: 24
 # Generate once before the first local-mode start:
@@ -211,10 +218,11 @@ app_credential_overlap_seconds: 300
 #                                         # permanent least-privilege IdP control client
 # admin_browser_session_ttl_secs: 900     # also capped by the verified ID-token expiry
 # Required for every SSO-mode start, including a staged ordinary-browser
-# rollout. Generate one UUID per installation, persist it across normal
-# restarts, and change it only to revoke all ordinary/admin SSO browser
-# sessions and logout fences. It is a generation marker, not a credential,
-# and may instead live in the durable secret.yaml operational input.
+# rollout. Generate one UUID per installation and persist it across normal
+# restarts. To revoke all ordinary/admin SSO browser sessions and logout
+# fences, change it and increase auth_runtime_generation in the same config
+# revision. It is an authority epoch, not a credential, and may instead live
+# in the durable secret.yaml operational input.
 # sso_session_epoch: "<installation-owned UUID>"
 # keycloak_verify_ssl: true          # false only for local self-signed Keycloak
 # keycloak_require_verified_email: true   # refuse unverified email for open-mode JIT.

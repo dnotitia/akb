@@ -123,10 +123,18 @@ async def _fresh_database():
             await conn.execute(
                 """
                 INSERT INTO auth_runtime_state (
-                    singleton, auth_mode, sso_session_epoch
-                ) VALUES (TRUE, 'sso', $1)
+                    singleton, runtime_generation, auth_mode,
+                    sso_session_epoch
+                ) VALUES (TRUE, 1, 'sso', $1)
                 """,
                 _SSO_SESSION_EPOCH,
+            )
+            await conn.execute(
+                """
+                UPDATE auth_runtime_epoch_upgrade
+                   SET state = 'enforced'
+                 WHERE singleton = TRUE
+                """
             )
         finally:
             await conn.close()
@@ -158,6 +166,7 @@ async def test_sso_admin_is_exact_prebound_opaque_and_live_rechecked(
         monkeypatch.setattr(admin_auth_service, "get_pool", get_test_pool)
         monkeypatch.setattr(keycloak_oidc, "get_pool", get_test_pool)
         monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+        monkeypatch.setattr(settings, "auth_runtime_generation", 1, raising=False)
         monkeypatch.setattr(
             settings,
             "keycloak_server_url",

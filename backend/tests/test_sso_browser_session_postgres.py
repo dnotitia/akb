@@ -112,10 +112,18 @@ async def _fresh_database():
             await conn.execute(
                 """
                 INSERT INTO auth_runtime_state (
-                    singleton, auth_mode, sso_session_epoch
-                ) VALUES (TRUE, 'sso', $1)
+                    singleton, runtime_generation, auth_mode,
+                    sso_session_epoch
+                ) VALUES (TRUE, 1, 'sso', $1)
                 """,
                 _SSO_SESSION_EPOCH,
+            )
+            await conn.execute(
+                """
+                UPDATE auth_runtime_epoch_upgrade
+                   SET state = 'enforced'
+                 WHERE singleton = TRUE
+                """
             )
         finally:
             await conn.close()
@@ -229,6 +237,7 @@ def _configure(monkeypatch, service, pool) -> None:
 
     monkeypatch.setattr(service, "get_pool", get_test_pool)
     monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+    monkeypatch.setattr(settings, "auth_runtime_generation", 1, raising=False)
     monkeypatch.setattr(settings, "sso_session_epoch", _SSO_SESSION_EPOCH, raising=False)
     monkeypatch.setattr(settings, "keycloak_server_url", "https://id.example", raising=False)
     monkeypatch.setattr(settings, "keycloak_realm", "akb", raising=False)
@@ -664,6 +673,7 @@ async def test_runtime_epoch_reconcile_prevents_mode_transition_resurrection(
         assert (await service.resolve_sso_browser_session(original.token)).user_id == str(user_id)
 
         monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+        monkeypatch.setattr(settings, "auth_runtime_generation", 2, raising=False)
         local = await epoch_service.reconcile_sso_session_epoch()
         assert local.auth_mode_changed is True
         assert (
@@ -698,6 +708,7 @@ async def test_runtime_epoch_reconcile_prevents_mode_transition_resurrection(
 
         # Returning to SSO remains an explicit mode boundary even when the
         # operator reuses the same UUID. No stale row can survive or be added.
+        monkeypatch.setattr(settings, "auth_runtime_generation", 3, raising=False)
         resumed = await epoch_service.reconcile_sso_session_epoch()
         assert resumed.auth_mode_changed is True
         assert (
@@ -711,6 +722,7 @@ async def test_runtime_epoch_reconcile_prevents_mode_transition_resurrection(
         prior_epoch = await issue_ordinary()
         await seed_admin_and_fence(_SSO_SESSION_EPOCH, "rotation")
         next_epoch = uuid.UUID("f243032e-8f74-42af-93e9-911222e4e748")
+        monkeypatch.setattr(settings, "auth_runtime_generation", 4, raising=False)
         monkeypatch.setattr(settings, "sso_session_epoch", next_epoch, raising=False)
         rotated = await epoch_service.reconcile_sso_session_epoch()
         assert rotated.auth_mode_changed is False

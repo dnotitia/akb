@@ -89,13 +89,39 @@ is not the product-admin password.
 
 `sso_session_epoch` is not a credential. Generate it once with
 `python -c 'import uuid; print(uuid.uuid4())'` and keep it stable across normal
-restarts. Changing it is an explicit global SSO-session revocation: AKB removes
-ordinary and product-admin browser handles plus back-channel logout fences.
-AKB also records the last active auth mode, so a later `sso` start revokes rows
-that predate an intervening `local` start, even if the same UUID was
-accidentally reused. A draining replica cannot reintroduce its prior generation
-after the boundary because session writes also bind to the database-owned
-active epoch.
+restarts. The ConfigMap's positive `auth_runtime_generation` is also stable for
+an exact restart. Increase that generation for every auth-mode transition or
+epoch rotation. PostgreSQL rejects stale and same-generation conflicting
+starts; an accepted greater generation removes ordinary and product-admin
+browser handles plus back-channel logout fences before readiness.
+
+### Upgrade from a pre-epoch backend
+
+This first cutover is an explicit stop-the-world operation, not a rolling
+upgrade. Use the new backend image for the preflight, in this exact order:
+
+1. Scale the backend to zero and stop every other client of the AKB database.
+2. Set `auth_runtime_generation: 1`, persist `sso_session_epoch`, and temporarily
+   add `sso_session_epoch_upgrade: stop-the-world-v1` to `app.yaml`.
+3. Run `cd backend && uv run python
+   scripts/sso_session_epoch_preflight.py prepare-upgrade`. It exits nonzero if
+   another database client is connected. On success it applies the compatible
+   nullable-column bridge, purges pre-epoch sessions/fences, and enables the
+   database legacy-write guard. Starting the application directly cannot
+   activate a required bridge, even with the acknowledgement configured.
+4. Remove `sso_session_epoch_upgrade`, then start only the new backend at the
+   exact prepared generation/mode/epoch tuple.
+
+For an image rollback, first scale the new backend to zero and stop every other
+database client. With the new image and its current config, run `cd backend &&
+uv run python scripts/sso_session_epoch_preflight.py prepare-rollback`. Only
+after it succeeds, remove `auth_runtime_generation`,
+`sso_session_epoch_upgrade`, and `sso_session_epoch` from the old image's
+configuration and start the old backend. The preparation purges all current
+SSO browser authority and reopens legacy writes while retaining a generation
+floor; a later re-upgrade must use a greater generation. No browser session
+survives rollback. The preflight `status` command reports only contract state
+and legacy-row presence, never epoch/generation values or credentials.
 
 Generate the browser-session key as an unpadded 32-byte base64url value:
 

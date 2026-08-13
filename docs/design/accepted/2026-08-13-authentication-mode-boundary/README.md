@@ -2,7 +2,7 @@
 status: accepted
 stage: implementation
 created: 2026-08-13
-updated: 2026-08-13
+updated: 2026-08-14
 ---
 
 # Authentication Mode Boundary
@@ -78,15 +78,22 @@ migration persists the derived canonical mode before normal startup; ambiguous
 legacy state fails closed and requires an explicit operator choice.
 
 An SSO runtime binds every ordinary browser session, product-admin browser
-session, and logout fence to one installation-owned authority generation.
-Normal restarts preserve that generation. An explicit generation change or
-any observed transition between `local` and `sso` revokes those rows
-transactionally before authentication traffic is accepted. Returning to SSO
-must not revive state ignored during local mode, and a draining replica must
-not reintroduce its prior generation after the mode-transition transaction.
-The concrete
-configuration field and storage layout are versioned implementation details;
-the no-resurrection boundary is permanent.
+session, and logout fence to one installation-owned epoch. A separate positive
+runtime generation is monotonic across both auth modes. Normal restarts present
+the exact persisted generation/mode/epoch tuple; every mode or epoch transition
+presents a greater generation. Stale and same-generation conflicting starts
+fail closed, while an accepted transition transactionally revokes all SSO
+browser authority before authentication traffic is accepted. Returning to SSO
+must not revive state ignored during local mode, and replica start order cannot
+restore an older boundary. The concrete configuration and storage layout are
+versioned implementation details; the no-resurrection boundary is permanent.
+
+The first pre-epoch upgrade uses an executable stop-the-world bridge. Epoch
+columns remain nullable only for image rollback compatibility; current code
+always writes/resolves an exact non-null epoch, and a database guard rejects
+legacy writes after cutover. Upgrade and rollback both require a quiescent
+preflight and purge all SSO browser authority. Rollback retains the monotonic
+generation floor so a later upgrade cannot replay the prior boundary.
 
 ### Credential authority
 
@@ -223,7 +230,9 @@ failing test.
 Browser-session cutover also owns executable coverage that a same-generation
 restart preserves sessions, while an epoch change or `sso → local → sso`
 transition revokes ordinary/admin sessions and logout fences without recording
-the generation value in audit payloads.
+authority values in audit payloads. It also owns real PostgreSQL coverage for
+pre-epoch writes, cutover rejection, prepared image rollback, stale and
+out-of-order starts, and concurrent migration/startup lock ordering.
 
 Mode-boundary acceptance requires:
 
