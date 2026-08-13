@@ -219,16 +219,23 @@ export const authLogin = (username: string, password: string) =>
 
 export type AuthMode = "local" | "sso";
 
+export interface AuthProviderOption {
+  provider_type: string;
+  alias: string;
+  display_name: string;
+  login_url: string | null;
+}
+
 export interface AuthConfig {
   available: boolean;
-  schema_version: 1 | null;
+  schema_version: 2 | null;
   auth_mode: AuthMode | null;
   local_auth: { enabled: boolean };
   keycloak: {
     enabled: boolean;
     browser_session_ready: boolean;
-    login_url: string | null;
   };
+  providers: AuthProviderOption[];
   mcp_oauth: { enabled: boolean };
 }
 
@@ -240,8 +247,8 @@ export const AUTH_CONFIG_UNAVAILABLE: AuthConfig = {
   keycloak: {
     enabled: false,
     browser_session_ready: false,
-    login_url: null,
   },
+  providers: [],
   mcp_oauth: { enabled: false },
 };
 
@@ -261,42 +268,85 @@ function hasExactKeys(
   return actual.length === exact.length && actual.every((key, index) => key === exact[index]);
 }
 
+function hasControlCharacters(value: string): boolean {
+  return Array.from(value).some((character) => {
+    const code = character.charCodeAt(0);
+    return code < 0x20 || code === 0x7f;
+  });
+}
+
 export function parseAuthConfig(value: unknown): AuthConfig {
   const root = record(value);
   const localAuth = record(root?.local_auth);
   const keycloak = record(root?.keycloak);
   const mcpOauth = record(root?.mcp_oauth);
   const mode = root?.auth_mode;
-  const loginUrl = keycloak?.login_url;
+  const providerValues = root?.providers;
   if (
-    !hasExactKeys(root, ["schema_version", "auth_mode", "local_auth", "keycloak", "mcp_oauth"]) ||
+    !hasExactKeys(root, ["schema_version", "auth_mode", "local_auth", "keycloak", "providers", "mcp_oauth"]) ||
     !hasExactKeys(localAuth, ["enabled"]) ||
-    !hasExactKeys(keycloak, ["enabled", "browser_session_ready", "login_url"]) ||
+    !hasExactKeys(keycloak, ["enabled", "browser_session_ready"]) ||
     !hasExactKeys(mcpOauth, ["enabled"]) ||
-    root?.schema_version !== 1 ||
+    root?.schema_version !== 2 ||
     (mode !== "local" && mode !== "sso") ||
     typeof localAuth?.enabled !== "boolean" ||
     typeof keycloak?.enabled !== "boolean" ||
     typeof keycloak?.browser_session_ready !== "boolean" ||
-    (loginUrl !== null && typeof loginUrl !== "string") ||
+    !Array.isArray(providerValues) ||
+    providerValues.length > 100 ||
     typeof mcpOauth?.enabled !== "boolean" ||
     localAuth.enabled !== (mode === "local") ||
     keycloak.enabled !== (mode === "sso") ||
-    (keycloak.browser_session_ready && (!keycloak.enabled || !loginUrl)) ||
-    (!keycloak.browser_session_ready && loginUrl !== null)
+    (keycloak.browser_session_ready && !keycloak.enabled) ||
+    (mode === "local" && providerValues.length !== 0)
   ) {
     return AUTH_CONFIG_UNAVAILABLE;
   }
+  const aliases = new Set<string>();
+  const providers: AuthProviderOption[] = [];
+  for (const value of providerValues) {
+    const provider = record(value);
+    if (!hasExactKeys(provider, ["provider_type", "alias", "display_name", "login_url"])) {
+      return AUTH_CONFIG_UNAVAILABLE;
+    }
+    const providerType = provider.provider_type;
+    const alias = provider.alias;
+    const displayName = provider.display_name;
+    const loginUrl = provider.login_url;
+    if (
+      typeof providerType !== "string" ||
+      !/^[a-z0-9][a-z0-9-]{0,79}$/.test(providerType) ||
+      typeof alias !== "string" ||
+      !/^[a-z0-9][a-z0-9._-]{0,62}$/.test(alias) ||
+      aliases.has(alias) ||
+      typeof displayName !== "string" ||
+      !displayName.trim() ||
+      displayName.length > 80 ||
+      hasControlCharacters(displayName) ||
+      (loginUrl !== null && typeof loginUrl !== "string") ||
+      (!keycloak.browser_session_ready && loginUrl !== null) ||
+      (keycloak.browser_session_ready && loginUrl !== `/api/v1/auth/sso/${alias}/login`)
+    ) {
+      return AUTH_CONFIG_UNAVAILABLE;
+    }
+    aliases.add(alias);
+    providers.push({
+      provider_type: providerType,
+      alias,
+      display_name: displayName,
+      login_url: loginUrl,
+    });
+  }
   return {
     available: true,
-    schema_version: 1,
+    schema_version: 2,
     auth_mode: mode,
     local_auth: { enabled: localAuth.enabled },
     keycloak: {
       enabled: keycloak.enabled,
       browser_session_ready: keycloak.browser_session_ready,
-      login_url: loginUrl,
     },
+    providers,
     mcp_oauth: { enabled: mcpOauth.enabled },
   };
 }
@@ -464,6 +514,210 @@ export async function adminLogout(): Promise<{ logout_url: string }> {
     throw new Error("Invalid product-admin logout response");
   }
   return { logout_url: payload.logout_url };
+}
+
+export type AdminSsoProviderState =
+  | "configured_disabled"
+  | "enabled"
+  | "configuration_error";
+
+export interface AdminSsoProvider {
+  provider_type: string;
+  alias: string;
+  display_name: string;
+  state: AdminSsoProviderState;
+  enabled: boolean;
+  issuer: string | null;
+  discovery_url: string | null;
+  client_id: string | null;
+  client_secret_configured: boolean;
+  redirect_uri: string;
+  capabilities: {
+    supports_logout: boolean;
+    supports_identity_migration: boolean;
+  };
+}
+
+export interface AdminSsoCatalog {
+  schema_version: 1;
+  auth_mode: "sso";
+  control_mode: "direct" | "delegated";
+  supported_provider_types: string[];
+  providers: AdminSsoProvider[];
+}
+
+function parseAdminSsoProvider(value: unknown): AdminSsoProvider {
+  const provider = record(value);
+  const capabilities = record(provider?.capabilities);
+  const state = provider?.state;
+  if (
+    !hasExactKeys(provider, [
+      "provider_type", "alias", "display_name", "state", "enabled", "issuer",
+      "discovery_url", "client_id", "client_secret_configured",
+      "redirect_uri", "capabilities",
+    ]) ||
+    !hasExactKeys(capabilities, ["supports_logout", "supports_identity_migration"]) ||
+    typeof provider.provider_type !== "string" ||
+    !/^[a-z0-9][a-z0-9-]{0,79}$/.test(provider.provider_type) ||
+    typeof provider.alias !== "string" ||
+    !/^[a-z0-9][a-z0-9._-]{0,62}$/.test(provider.alias) ||
+    typeof provider.display_name !== "string" ||
+    !provider.display_name.trim() ||
+    provider.display_name.length > 80 ||
+    hasControlCharacters(provider.display_name) ||
+    (state !== "configured_disabled" && state !== "enabled" && state !== "configuration_error") ||
+    typeof provider.enabled !== "boolean" ||
+    (state === "enabled" && provider.enabled !== true) ||
+    (state === "configured_disabled" && provider.enabled !== false) ||
+    (provider.issuer !== null && (
+      typeof provider.issuer !== "string" ||
+      provider.issuer.length > 2048 ||
+      hasControlCharacters(provider.issuer)
+    )) ||
+    (provider.discovery_url !== null && (
+      typeof provider.discovery_url !== "string" ||
+      provider.discovery_url.length > 2048 ||
+      hasControlCharacters(provider.discovery_url)
+    )) ||
+    (provider.client_id !== null && (
+      typeof provider.client_id !== "string" ||
+      provider.client_id.length > 255 ||
+      hasControlCharacters(provider.client_id)
+    )) ||
+    typeof provider.client_secret_configured !== "boolean" || // pragma: allowlist secret
+    typeof provider.redirect_uri !== "string" ||
+    !provider.redirect_uri ||
+    provider.redirect_uri.length > 2048 ||
+    hasControlCharacters(provider.redirect_uri) ||
+    ((state === "enabled" || state === "configured_disabled") && (
+      provider.issuer === null ||
+      provider.discovery_url === null ||
+      provider.client_id === null ||
+      provider.client_secret_configured !== true // pragma: allowlist secret
+    )) ||
+    typeof capabilities.supports_logout !== "boolean" ||
+    typeof capabilities.supports_identity_migration !== "boolean"
+  ) {
+    throw new Error("Invalid SSO provider response");
+  }
+  return {
+    provider_type: provider.provider_type,
+    alias: provider.alias,
+    display_name: provider.display_name,
+    state,
+    enabled: provider.enabled,
+    issuer: provider.issuer as string | null,
+    discovery_url: provider.discovery_url as string | null,
+    client_id: provider.client_id as string | null,
+    client_secret_configured: provider.client_secret_configured,
+    redirect_uri: provider.redirect_uri,
+    capabilities: {
+      supports_logout: capabilities.supports_logout,
+      supports_identity_migration: capabilities.supports_identity_migration,
+    },
+  };
+}
+
+export function parseAdminSsoCatalog(value: unknown): AdminSsoCatalog {
+  const root = record(value);
+  const types = root?.supported_provider_types;
+  const values = root?.providers;
+  if (
+    !hasExactKeys(root, [
+      "schema_version", "auth_mode", "control_mode",
+      "supported_provider_types", "providers",
+    ]) ||
+    root.schema_version !== 1 ||
+    root.auth_mode !== "sso" ||
+    (root.control_mode !== "direct" && root.control_mode !== "delegated") ||
+    !Array.isArray(types) ||
+    types.length > 32 ||
+    types.some((type) => typeof type !== "string" || !/^[a-z0-9][a-z0-9-]{0,79}$/.test(type)) ||
+    new Set(types).size !== types.length ||
+    !Array.isArray(values) ||
+    values.length > 100 ||
+    (root.control_mode === "delegated" && values.length !== 0)
+  ) {
+    throw new Error("Invalid SSO provider catalog response");
+  }
+  const providers = values.map(parseAdminSsoProvider);
+  if (
+    new Set(providers.map((provider) => provider.alias)).size !== providers.length ||
+    providers.some((provider) => !types.includes(provider.provider_type))
+  ) {
+    throw new Error("Invalid SSO provider catalog response");
+  }
+  return {
+    schema_version: 1,
+    auth_mode: "sso",
+    control_mode: root.control_mode,
+    supported_provider_types: types,
+    providers,
+  };
+}
+
+function adminSsoHeaders({ mutation = false }: { mutation?: boolean } = {}): Headers {
+  const headers = adminHeaders();
+  if (mutation) {
+    headers.set("Content-Type", "application/json");
+    const csrf = cookieValue("akb_admin_csrf");
+    if (csrf) headers.set("X-AKB-Admin-CSRF", csrf);
+  }
+  return headers;
+}
+
+export async function getAdminSsoCatalog(): Promise<AdminSsoCatalog> {
+  const response = await fetch(`${API_BASE}/admin/sso/providers`, {
+    credentials: "same-origin",
+    headers: adminSsoHeaders(),
+  });
+  if (!response.ok) await throwJsonApiError(response);
+  return parseAdminSsoCatalog(await response.json());
+}
+
+export interface ConfigureAdminSsoProvider {
+  provider_type: string;
+  display_name: string;
+  issuer: string;
+  discovery_url: string;
+  client_id: string;
+  client_secret?: string;
+}
+
+async function parseAdminSsoMutation(response: Response): Promise<AdminSsoProvider> {
+  if (!response.ok) await throwJsonApiError(response);
+  const payload = record(await response.json());
+  if (!hasExactKeys(payload, ["provider"])) {
+    throw new Error("Invalid SSO provider mutation response");
+  }
+  return parseAdminSsoProvider(payload.provider);
+}
+
+export function configureAdminSsoProvider(
+  alias: string,
+  input: ConfigureAdminSsoProvider,
+): Promise<AdminSsoProvider> {
+  return fetch(`${API_BASE}/admin/sso/providers/${encodeURIComponent(alias)}`, {
+    method: "PUT",
+    credentials: "same-origin",
+    headers: adminSsoHeaders({ mutation: true }),
+    body: JSON.stringify(input),
+  }).then(parseAdminSsoMutation);
+}
+
+export function setAdminSsoProviderEnabled(
+  alias: string,
+  enabled: boolean,
+): Promise<AdminSsoProvider> {
+  const verb = enabled ? "enable" : "disable";
+  return fetch(
+    `${API_BASE}/admin/sso/providers/${encodeURIComponent(alias)}/${verb}`,
+    {
+      method: "POST",
+      credentials: "same-origin",
+      headers: adminSsoHeaders({ mutation: true }),
+    },
+  ).then(parseAdminSsoMutation);
 }
 
 // ── Auth (token) ──

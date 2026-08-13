@@ -30,14 +30,14 @@ vi.mock("@/lib/api", () => ({
   // hidden and AuthPage's mount effect resolves cleanly.
   getAuthConfig: vi.fn().mockResolvedValue({
     available: true,
-    schema_version: 1,
+    schema_version: 2,
     auth_mode: "local",
     local_auth: { enabled: true },
     keycloak: {
       enabled: false,
       browser_session_ready: false,
-      login_url: null,
     },
+    providers: [],
     mcp_oauth: { enabled: false },
   }),
 }));

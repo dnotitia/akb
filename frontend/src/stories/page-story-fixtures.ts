@@ -4,26 +4,31 @@ import type { PublicationResponse } from "@/lib/api";
 export const API = "/api/v1";
 
 export const localAuthConfig = {
-  schema_version: 1,
+  schema_version: 2,
   auth_mode: "local",
   local_auth: { enabled: true },
   keycloak: {
     enabled: false,
     browser_session_ready: false,
-    login_url: null,
   },
+  providers: [],
   mcp_oauth: { enabled: false },
 };
 
 export const stagedSsoAuthConfig = {
-  schema_version: 1,
+  schema_version: 2,
   auth_mode: "sso",
   local_auth: { enabled: false },
   keycloak: {
     enabled: true,
     browser_session_ready: false,
-    login_url: null,
   },
+  providers: [{
+    provider_type: "keycloak-oidc",
+    alias: "workforce",
+    display_name: "Company SSO",
+    login_url: null,
+  }],
   mcp_oauth: { enabled: true },
 };
 

@@ -1,0 +1,70 @@
+{
+  "realm": "akb",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": false,
+  "duplicateEmailsAllowed": false,
+  "clients": [
+    {
+      "clientId": "akb-sso-manager",
+      "name": "AKB SSO fixture management",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "fixture-only-management-secret",
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "implicitFlowEnabled": false,
+      "fullScopeAllowed": false,
+      "defaultClientScopes": ["service_account"],
+      "optionalClientScopes": []
+    },
+    {
+      "clientId": "fixture-browser",
+      "name": "Broker chain browser probe",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "implicitFlowEnabled": false,
+      "redirectUris": ["https://client.localhost/callback"],
+      "webOrigins": []
+    }
+  ],
+  "users": [
+    {
+      "username": "service-account-akb-sso-manager",
+      "enabled": true,
+      "serviceAccountClientId": "akb-sso-manager",
+      "clientRoles": {
+        "realm-management": [
+          "manage-identity-providers",
+          "query-clients",
+          "query-users",
+          "view-clients",
+          "view-realm",
+          "view-users"
+        ]
+      }
+    }
+  ],
+  "clientScopeMappings": {
+    "realm-management": [
+      {
+        "client": "akb-sso-manager",
+        "roles": [
+          "manage-identity-providers",
+          "query-clients",
+          "query-users",
+          "view-clients",
+          "view-realm",
+          "view-users"
+        ]
+      }
+    ]
+  }
+}

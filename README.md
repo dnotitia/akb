@@ -336,6 +336,15 @@ refuses non-admin accounts. In `sso` mode local credentials are absent:
 and nonce, then accepts only the exact pre-bound `(issuer, subject)` whose AKB
 account is still active and `is_admin=true`.
 
+In SSO mode the same `/admin` surface can configure a built-in upstream IdP,
+save it disabled, inspect its exact broker redirect URI, and enable or disable
+its ordinary-login option without redeploying AKB. The option becomes a usable
+button only when the server-side browser-session capability is ready. Client
+secrets are write-only, and an enabled provider must be disabled before
+reconfiguration.
+See the [SSO provider guide](./docs/sso/README.md) and the first reference
+integration, [Keycloak OIDC behind Keycloak](./docs/sso/providers/keycloak-oidc.md).
+
 The SSO callback stores no Keycloak access, refresh, or ID token. It creates a
 short-lived opaque HttpOnly admin cookie plus a CSRF token; PostgreSQL stores
 only their hashes plus the exact identity snapshot, and rechecks the account,

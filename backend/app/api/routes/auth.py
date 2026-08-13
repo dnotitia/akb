@@ -2,8 +2,9 @@
 
 import uuid
 from typing import NoReturn
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import ConfigDict, Field, field_validator
 
 from app.api.deps import get_current_user
@@ -29,6 +30,10 @@ from app.services.auth_service import (
 from app.services.auth_policy import (
     SSO_BROWSER_SESSION_READY,
     require_local_auth_enabled,
+)
+from app.sso.keycloak_admin import (
+    ProviderControlError,
+    get_keycloak_provider_control,
 )
 from app.util.text import NFCModel
 
@@ -139,13 +144,41 @@ async def login_user(req: LoginRequest):
 
 
 @router.get("/auth/config", summary="Public auth configuration")
-async def auth_config():
-    """Unauthenticated versioned capabilities; reveals no secrets."""
+async def auth_config(response: Response):
+    """Return unauthenticated versioned capabilities without secrets."""
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
     mode = settings.require_auth_mode()
     human_sso_enabled = mode == "sso" and settings.keycloak_enabled
     browser_session_ready = human_sso_enabled and SSO_BROWSER_SESSION_READY
+    providers: list[dict[str, object]] = []
+    if human_sso_enabled:
+        control = get_keycloak_provider_control()
+        if control.control_mode != "direct":
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "SSO provider catalog is unavailable",
+            )
+        try:
+            catalog = await control.list_providers(allow_stale=True)
+        except ProviderControlError as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "SSO provider catalog is unavailable",
+            ) from exc
+        providers = [
+            provider.public_view(
+                login_url=(
+                    f"/api/v1/auth/sso/{quote(provider.alias, safe='')}/login"
+                    if browser_session_ready
+                    else None
+                )
+            )
+            for provider in catalog
+            if provider.state == "enabled"
+        ]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "auth_mode": mode,
         "local_auth": {
             "enabled": mode == "local",
@@ -153,12 +186,8 @@ async def auth_config():
         "keycloak": {
             "enabled": human_sso_enabled,
             "browser_session_ready": browser_session_ready,
-            "login_url": (
-                "/api/v1/auth/keycloak/login"
-                if browser_session_ready
-                else None
-            ),
         },
+        "providers": providers,
         "mcp_oauth": {
             "enabled": settings.mcp_oauth_enabled,
         },
