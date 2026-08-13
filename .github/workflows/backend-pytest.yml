@@ -183,6 +183,12 @@ jobs:
         # and triggers hold. It was absent from this list with a
         # since-renumbered migration tuple, so it silently self-skipped in
         # both jobs.
+        #
+        # Recovery-admin provisioning and the dedicated admin browser-session
+        # contract are also database guarantees.  Their ordinary unit-job
+        # collection intentionally skips without Postgres, so keep both files
+        # explicit here: otherwise account uniqueness, exact identity FKs,
+        # session concurrency, and the 072 upgrade path would never gate CI.
         run: >
           pytest
           tests/test_pgvector_ext_bootstrap_e2e.py
@@ -205,6 +211,8 @@ jobs:
           tests/test_app_inventory_postgres.py
           tests/test_app_installation_postgres.py
           tests/test_app_rollout_postgres.py
+          tests/test_recovery_admin_provisioning_postgres.py
+          tests/test_admin_auth_postgres.py
           tests/test_tool_usage_e2e.py
           tests/test_table_if_not_exists_e2e.py
           -v --tb=short

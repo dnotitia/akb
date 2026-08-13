@@ -847,6 +847,14 @@ class Settings(BaseModel):
     keycloak_client_id: str = "akb-web"
     keycloak_client_secret: str = ""       # secret.yaml — blank for public (PKCE) clients
     keycloak_public_client: bool = False   # true → PKCE (no client_secret); false → confidential
+    # Dedicated confidential browser client for the product-admin surface.
+    # It is intentionally excluded from keycloak_human_client_ids and cannot
+    # authorize ordinary AKB API bearer traffic. The callback URI is derived
+    # from public_base_url so the deployment and Keycloak registration cannot
+    # silently disagree about path ownership.
+    keycloak_admin_client_id: str = "akb-admin"
+    keycloak_admin_client_secret: str = ""
+    admin_browser_session_ttl_secs: int = Field(default=900, ge=60, le=3600)
     keycloak_verify_ssl: bool = True       # set false only for local self-signed Keycloak
     # Exact identity is issuer/subject and does not require email. Open-mode
     # JIT requires a verified email only when creating a brand-new AKB user;
@@ -1170,6 +1178,18 @@ class Settings(BaseModel):
     def keycloak_end_session_endpoint(self) -> str:
         # Browser-facing → public issuer.
         return f"{self.keycloak_issuer}/protocol/openid-connect/logout"
+
+    @property
+    def keycloak_admin_redirect_uri(self) -> str:
+        """Exact callback owned by the dedicated product-admin client."""
+        return (
+            f"{self.public_base_url.rstrip('/')}"
+            "/api/v1/admin/auth/keycloak/callback"
+        )
+
+    @property
+    def keycloak_admin_post_logout_redirect_uri(self) -> str:
+        return f"{self.public_base_url.rstrip('/')}/admin"
 
     @property
     def api_oauth_audience_effective(self) -> str:

@@ -48,6 +48,27 @@
       "attributes": {
         "use.refresh.tokens": "true"
       }
+    },
+    {
+      "clientId": "akb-admin",
+      "name": "AKB product administration",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "local-akb-admin-dev-secret",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost:3000/api/v1/admin/auth/keycloak/callback"
+      ],
+      "webOrigins": [
+        "http://localhost:3000"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://localhost:3000/admin"
+      }
     }
   ],
   "clientScopes": [
@@ -149,6 +170,19 @@
     ]
   },
   "users": [
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "username": "product-admin",
+      "email": "product-admin@example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Product",
+      "lastName": "Admin",
+      "credentials": [
+        { "type": "password", "value": "product-admin-password", "temporary": false }
+      ],
+      "realmRoles": ["default-roles-akb"]
+    },
     {
       "username": "alice",
       "email": "alice@example.com",

@@ -328,6 +328,27 @@ command stores no usable local password and does not contact the identity
 provider. Generated output files are create-only and never overwritten; for a
 retry after the file exists, pass that file back with `--password-file`.
 
+Open `/admin` for the separate product-administration surface. In `local`
+mode it accepts the provisioned local administrator and returns the same
+`local-session-rs256-v2` profile used by local human authentication, but it
+refuses non-admin accounts. In `sso` mode local credentials are absent:
+`/admin` uses a dedicated confidential `akb-admin` Keycloak client with PKCE
+and nonce, then accepts only the exact pre-bound `(issuer, subject)` whose AKB
+account is still active and `is_admin=true`.
+
+The SSO callback stores no Keycloak access, refresh, or ID token. It creates a
+short-lived opaque HttpOnly admin cookie plus a CSRF token; PostgreSQL stores
+only their hashes plus the exact identity snapshot, and rechecks the account,
+unchanged external binding, and admin flag on every request. The one-time OIDC
+state is also bound to a short-lived
+HttpOnly cookie so a callback copied into another browser fails before token
+exchange. Configure `keycloak_admin_client_secret`, register
+`<public_base_url>/api/v1/admin/auth/keycloak/callback` and
+`<public_base_url>/admin` in the dedicated client, and keep the admin client ID
+out of every API/MCP resource-client path. Browser-facing AKB and Keycloak URLs
+must use HTTPS outside the explicit loopback development exception. Ordinary SSO browser
+login remains staged until its Phase 4 server-side token-custody work lands.
+
 Local login issues only the versioned `local-session-rs256-v2` profile:
 RS256 with an installation-owned RSA-3072 key, an RFC 7638 `kid`, exact
 deployment issuer/audience, `jti`, and a public-only JWKS at

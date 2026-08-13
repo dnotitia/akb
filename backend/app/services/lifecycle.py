@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from urllib.parse import urlsplit
 
 from app.config import settings
 from app.db.postgres import close_pool, get_pool, init_db
@@ -44,6 +45,29 @@ from app.services.vector_store import get_vector_store
 logger = logging.getLogger("akb.lifecycle")
 
 
+def _is_secure_browser_url(value: str) -> bool:
+    """Require HTTPS for browser authorities, with a narrow loopback exception."""
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if (
+        parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    if parsed.scheme == "https":
+        return True
+    return parsed.scheme == "http" and parsed.hostname in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }
+
+
 def _validate_required_settings() -> None:
     """Fail fast on missing required config so misconfigured deploys don't
     silently serve unsigned tokens or produce confusing downstream errors."""
@@ -76,9 +100,9 @@ def _validate_required_settings() -> None:
             "https://akb.example.com)"
         )
     # A configured Keycloak authority always needs its pinned issuer inputs.
-    # Phase 1 SSO serves only as an API resource server, so startup validates
-    # the active human access-token profile but deliberately does not require
-    # dormant browser callback/client-secret inputs owned by Phase 4.
+    # Ordinary SSO browser custody remains staged for Phase 4. The dedicated
+    # Phase 2 product-admin client is active, confidential, and independently
+    # validated here.
     if settings.keycloak_enabled:
         if not settings.keycloak_server_url.strip():
             missing.append("keycloak_server_url (keycloak_enabled is true)")
@@ -91,6 +115,12 @@ def _validate_required_settings() -> None:
                 )
             if not settings.api_oauth_audience_effective.strip():
                 missing.append("api_oauth_audience (auth_mode is sso — human API resource audience is empty)")
+            if not settings.keycloak_admin_client_id.strip():
+                missing.append("keycloak_admin_client_id (auth_mode is sso — product-admin client is empty)")
+            if not settings.keycloak_admin_client_secret:
+                missing.append(
+                    "keycloak_admin_client_secret (auth_mode is sso — confidential product-admin client is required)"
+                )
     # MCP-OAuth (the Resource Server path) reuses the Keycloak JWKS,
     # issuer, and audience-mapped scopes — so it's only meaningful when
     # `keycloak_enabled` is also true. A deployment with mcp_oauth on +
@@ -105,6 +135,17 @@ def _validate_required_settings() -> None:
         )
     if missing:
         raise RuntimeError("Required configuration missing:\n  - " + "\n  - ".join(missing))
+    if auth_mode == "sso":
+        if settings.keycloak_admin_client_id in settings.keycloak_human_client_ids:
+            raise RuntimeError("keycloak_admin_client_id must be dedicated to the product-admin surface")
+        if not _is_secure_browser_url(settings.public_base_url):
+            raise RuntimeError(
+                "auth_mode=sso requires an HTTPS public_base_url; plain HTTP is allowed only on loopback"
+            )
+        if not _is_secure_browser_url(settings.keycloak_server_url):
+            raise RuntimeError(
+                "auth_mode=sso requires an HTTPS public Keycloak URL; plain HTTP is allowed only on loopback"
+            )
     if auth_mode == "local":
         from app.services.local_session_keys import get_local_session_keyset
 

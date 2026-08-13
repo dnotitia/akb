@@ -303,7 +303,7 @@ def test_sso_startup_requires_active_human_api_verifier_config_only(
     assert "keycloak_client_secret" not in message
 
 
-def test_sso_startup_defers_browser_callback_inputs_until_browser_sessions_exist(
+def test_sso_startup_defers_ordinary_browser_inputs_but_requires_admin_client(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -326,7 +326,105 @@ def test_sso_startup_defers_browser_callback_inputs_until_browser_sessions_exist
     )
     monkeypatch.setattr(lifecycle, "settings", loaded)
 
+    with pytest.raises(RuntimeError, match="keycloak_admin_client_secret"):
+        lifecycle._validate_required_settings()
+
+
+def test_sso_admin_client_is_dedicated_and_callback_is_deployment_bound(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from app.services import lifecycle
+
+    loaded = _load(
+        monkeypatch,
+        tmp_path,
+        {
+            "auth_mode": "sso",
+            "keycloak_enabled": True,
+            "keycloak_server_url": "https://auth.example.com",
+            "keycloak_client_id": "akb-web",
+            "keycloak_admin_client_id": "akb-admin",
+            "keycloak_admin_client_secret": "admin-client-secret",  # pragma: allowlist secret
+            "system_hmac_secret": "test-system-hmac-secret",  # pragma: allowlist secret
+            "db_password": "test-db-password",  # pragma: allowlist secret
+            "public_base_url": "https://akb.example.com",
+        },
+    )
+    monkeypatch.setattr(lifecycle, "settings", loaded)
+
     lifecycle._validate_required_settings()
+    assert loaded.keycloak_admin_redirect_uri == (
+        "https://akb.example.com/api/v1/admin/auth/keycloak/callback"
+    )
+    assert loaded.keycloak_admin_post_logout_redirect_uri == (
+        "https://akb.example.com/admin"
+    )
+    assert "akb-admin" not in loaded.keycloak_human_client_ids
+
+
+def test_sso_startup_rejects_admin_client_reuse_and_non_tls_public_origin(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from app.services import lifecycle
+
+    reused = _load(
+        monkeypatch,
+        tmp_path,
+        {
+            "auth_mode": "sso",
+            "keycloak_enabled": True,
+            "keycloak_server_url": "https://auth.example.com",
+            "keycloak_client_id": "akb-web",
+            "keycloak_admin_client_id": "akb-web",
+            "keycloak_admin_client_secret": "admin-client-secret",  # pragma: allowlist secret
+            "system_hmac_secret": "test-system-hmac-secret",  # pragma: allowlist secret
+            "db_password": "test-db-password",  # pragma: allowlist secret
+            "public_base_url": "https://akb.example.com",
+        },
+    )
+    monkeypatch.setattr(lifecycle, "settings", reused)
+    with pytest.raises(RuntimeError, match="dedicated"):
+        lifecycle._validate_required_settings()
+
+    insecure = _load(
+        monkeypatch,
+        tmp_path,
+        {
+            "auth_mode": "sso",
+            "keycloak_enabled": True,
+            "keycloak_server_url": "https://auth.example.com",
+            "keycloak_client_id": "akb-web",
+            "keycloak_admin_client_id": "akb-admin",
+            "keycloak_admin_client_secret": "admin-client-secret",  # pragma: allowlist secret
+            "system_hmac_secret": "test-system-hmac-secret",  # pragma: allowlist secret
+            "db_password": "test-db-password",  # pragma: allowlist secret
+            "public_base_url": "http://akb.example.com",
+        },
+    )
+    monkeypatch.setattr(lifecycle, "settings", insecure)
+    with pytest.raises(RuntimeError, match="HTTPS"):
+        lifecycle._validate_required_settings()
+
+    insecure_issuer = _load(
+        monkeypatch,
+        tmp_path,
+        {
+            "auth_mode": "sso",
+            "keycloak_enabled": True,
+            "keycloak_server_url": "http://auth.example.com",
+            "keycloak_client_id": "akb-web",
+            "keycloak_admin_client_id": "akb-admin",
+            "keycloak_admin_client_secret": "admin-client-secret",  # pragma: allowlist secret
+            "system_hmac_secret": "test-system-hmac-secret",  # pragma: allowlist secret
+            "db_password": "test-db-password",  # pragma: allowlist secret
+            "public_base_url": "https://akb.example.com",
+        },
+    )
+    monkeypatch.setattr(lifecycle, "settings", insecure_issuer)
+    with pytest.raises(RuntimeError, match="HTTPS public Keycloak"):
+        lifecycle._validate_required_settings()
 
 
 def test_sso_startup_rejects_missing_system_hmac_secret(
@@ -344,6 +442,7 @@ def test_sso_startup_rejects_missing_system_hmac_secret(
             "keycloak_server_url": "https://auth.example.com",
             "keycloak_redirect_uri": "https://akb.example.com/auth/keycloak/callback",
             "keycloak_client_secret": "test-keycloak-client-secret",  # pragma: allowlist secret
+            "keycloak_admin_client_secret": "test-admin-client-secret",  # pragma: allowlist secret
             "db_password": "test-db-password",  # pragma: allowlist secret
             "public_base_url": "https://akb.example.com",
         },
@@ -371,6 +470,7 @@ def test_sso_startup_accepts_legacy_jwt_secret_only_as_system_hmac_migration_inp
             "keycloak_server_url": "https://auth.example.com",
             "keycloak_redirect_uri": "https://akb.example.com/auth/keycloak/callback",
             "keycloak_client_secret": "test-keycloak-client-secret",  # pragma: allowlist secret
+            "keycloak_admin_client_secret": "test-admin-client-secret",  # pragma: allowlist secret
             "jwt_algorithm": "RS256",
             "jwt_secret": "compatibility-hmac-secret",  # pragma: allowlist secret
             "db_password": "test-db-password",  # pragma: allowlist secret

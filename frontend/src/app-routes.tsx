@@ -2,6 +2,7 @@ import type { ComponentType } from "react";
 import { Navigate, Route, Routes, useParams } from "react-router-dom";
 import { Layout } from "@/components/layout";
 import { VaultShell } from "@/components/vault-shell";
+import AdminPage from "@/pages/admin";
 import AuthPage from "@/pages/auth";
 import AuthForgotPage from "@/pages/auth-forgot";
 import AuthCallbackPage from "@/pages/auth-callback";
@@ -41,6 +42,7 @@ function SkillRedirect() {
 }
 
 const routeComponents = {
+  AdminPage,
   AuthPage,
   AuthForgotPage,
   AuthCallbackPage,
@@ -77,7 +79,7 @@ function renderRoutes(boundaries: readonly AppRouteBoundary[]) {
 export function AppRoutes() {
   return (
     <Routes>
-      {renderRoutes(["auth", "public"])}
+      {renderRoutes(["admin", "auth", "public"])}
       <Route element={<Layout />}>
         {renderRoutes(["app-layout"])}
         <Route element={<VaultShell />}>

@@ -169,7 +169,7 @@ spec:
             secretName: akb-secret-config
         - name: local-session-keys
           secret:
-            secretName: akb-local-session-keys
+            secretName: akb-local-session-keys # pragma: allowlist secret
             defaultMode: 0400
         - name: vaultdata
           persistentVolumeClaim:

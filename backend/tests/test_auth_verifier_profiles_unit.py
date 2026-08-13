@@ -486,6 +486,49 @@ async def test_keycloak_mcp_profile_does_not_apply_static_human_azp_allowlist(
         is not None
     )
 
+    admin_client_token = _mint_keycloak_token(
+        rsa_keypair,
+        issuer=issuer,
+        audience=mcp_audience,
+        claim_overrides={"azp": settings.keycloak_admin_client_id},
+    )
+    assert (
+        await service.verify_access_token(
+            admin_client_token,
+            mcp_audience,
+            route_profile="mcp",
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_keycloak_access_v1_rejects_malformed_trusted_rsa_jwk(
+    monkeypatch,
+    rsa_keypair,
+):
+    from app.services.keycloak_oidc import KeycloakOIDC
+
+    issuer, api_audience, _ = _configure_keycloak(monkeypatch)
+    malformed = {**rsa_keypair["jwk"]}
+    malformed.pop("n")
+    service = KeycloakOIDC()
+    service._jwks = {"keys": [malformed]}
+    token = _mint_keycloak_token(
+        rsa_keypair,
+        issuer=issuer,
+        audience=api_audience,
+    )
+
+    assert (
+        await service.verify_access_token(
+            token,
+            api_audience,
+            route_profile="api",
+        )
+        is None
+    )
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(

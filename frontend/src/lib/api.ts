@@ -312,6 +312,160 @@ export async function getAuthConfig(): Promise<AuthConfig> {
   }
 }
 
+export interface AdminAuthConfig {
+  available: boolean;
+  schema_version: 1 | null;
+  auth_mode: AuthMode | null;
+  local: { enabled: boolean; login_url: string | null };
+  keycloak: { enabled: boolean; login_url: string | null };
+}
+
+export const ADMIN_AUTH_CONFIG_UNAVAILABLE: AdminAuthConfig = {
+  available: false,
+  schema_version: null,
+  auth_mode: null,
+  local: { enabled: false, login_url: null },
+  keycloak: { enabled: false, login_url: null },
+};
+
+export function parseAdminAuthConfig(value: unknown): AdminAuthConfig {
+  const root = record(value);
+  const local = record(root?.local);
+  const keycloak = record(root?.keycloak);
+  const mode = root?.auth_mode;
+  const localUrl = local?.login_url;
+  const keycloakUrl = keycloak?.login_url;
+  if (
+    !hasExactKeys(root, ["schema_version", "auth_mode", "local", "keycloak"]) ||
+    !hasExactKeys(local, ["enabled", "login_url"]) ||
+    !hasExactKeys(keycloak, ["enabled", "login_url"]) ||
+    root?.schema_version !== 1 ||
+    (mode !== "local" && mode !== "sso") ||
+    typeof local?.enabled !== "boolean" ||
+    typeof keycloak?.enabled !== "boolean" ||
+    (localUrl !== null && typeof localUrl !== "string") ||
+    (keycloakUrl !== null && typeof keycloakUrl !== "string") ||
+    local.enabled !== (mode === "local") ||
+    keycloak.enabled !== (mode === "sso") ||
+    localUrl !== (mode === "local" ? "/api/v1/admin/auth/local/login" : null) ||
+    keycloakUrl !== (mode === "sso" ? "/api/v1/admin/auth/keycloak/login" : null)
+  ) {
+    return ADMIN_AUTH_CONFIG_UNAVAILABLE;
+  }
+  return {
+    available: true,
+    schema_version: 1,
+    auth_mode: mode,
+    local: { enabled: local.enabled, login_url: localUrl },
+    keycloak: { enabled: keycloak.enabled, login_url: keycloakUrl },
+  };
+}
+
+export async function getAdminAuthConfig(): Promise<AdminAuthConfig> {
+  try {
+    const response = await fetch(`${API_BASE}/admin/auth/config`);
+    if (!response.ok) return ADMIN_AUTH_CONFIG_UNAVAILABLE;
+    return parseAdminAuthConfig(await response.json());
+  } catch {
+    return ADMIN_AUTH_CONFIG_UNAVAILABLE;
+  }
+}
+
+export interface AdminSession {
+  schema_version: 1;
+  auth_mode: AuthMode;
+  user: {
+    id: string;
+    username: string;
+    email: string;
+    display_name: string | null;
+    is_admin: true;
+  };
+}
+
+function parseAdminSession(value: unknown): AdminSession {
+  const root = record(value);
+  const user = record(root?.user);
+  const mode = root?.auth_mode;
+  if (
+    !hasExactKeys(root, ["schema_version", "auth_mode", "user"]) ||
+    !hasExactKeys(user, ["id", "username", "email", "display_name", "is_admin"]) ||
+    root?.schema_version !== 1 ||
+    (mode !== "local" && mode !== "sso") ||
+    typeof user?.id !== "string" ||
+    typeof user?.username !== "string" ||
+    typeof user?.email !== "string" ||
+    (user?.display_name !== null && typeof user?.display_name !== "string") ||
+    user?.is_admin !== true
+  ) {
+    throw new Error("Invalid product-admin session response");
+  }
+  return {
+    schema_version: 1,
+    auth_mode: mode,
+    user: {
+      id: user.id,
+      username: user.username,
+      email: user.email,
+      display_name: user.display_name as string | null,
+      is_admin: true,
+    },
+  };
+}
+
+function adminHeaders(headers?: HeadersInit): Headers {
+  const result = new Headers(headers);
+  const token = getToken();
+  if (token) result.set("Authorization", `Bearer ${token}`);
+  return result;
+}
+
+function cookieValue(name: string): string | null {
+  const prefix = `${encodeURIComponent(name)}=`;
+  for (const entry of document.cookie.split(";")) {
+    const candidate = entry.trim();
+    if (candidate.startsWith(prefix)) {
+      return decodeURIComponent(candidate.slice(prefix.length));
+    }
+  }
+  return null;
+}
+
+export async function getAdminSession(): Promise<AdminSession | null> {
+  const response = await fetch(`${API_BASE}/admin/auth/session`, {
+    credentials: "same-origin",
+    headers: adminHeaders(),
+  });
+  if (response.status === 401 || response.status === 403) return null;
+  if (!response.ok) await throwJsonApiError(response);
+  return parseAdminSession(await response.json());
+}
+
+export const adminLocalLogin = (username: string, password: string) =>
+  fetch(`${API_BASE}/admin/auth/local/login`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  }).then(parseAuthResponse);
+
+export async function adminLogout(): Promise<{ logout_url: string }> {
+  const headers = adminHeaders();
+  const csrf = cookieValue("akb_admin_csrf");
+  if (csrf) headers.set("X-AKB-Admin-CSRF", csrf);
+  const response = await fetch(`${API_BASE}/admin/auth/logout`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers,
+  });
+  if (!response.ok) await throwJsonApiError(response);
+  const payload = record(await response.json());
+  if (!hasExactKeys(payload, ["logout_url"]) || typeof payload.logout_url !== "string") {
+    throw new Error("Invalid product-admin logout response");
+  }
+  return { logout_url: payload.logout_url };
+}
+
 // ── Auth (token) ──
 export const getMe = () => api<any>("/auth/me");
 export const createPAT = (name: string, scopes?: string[], expires_days?: number) =>
