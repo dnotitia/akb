@@ -691,6 +691,11 @@ async def resume_rollout(
                 if not source_targets:
                     raise ConflictError("Source rollout has no targets")
 
+                # The immutable source target rows define identity.  A blocked
+                # source can leave the failed target blocked while untouched
+                # targets remain upgrading; active targets may already have
+                # converged.  Lifecycle is therefore bounded to those states
+                # without narrowing the source target set by desired release.
                 installations = await conn.fetch(
                     """
                     SELECT i.id AS installation_id, i.vault_id, i.current_release_id,
@@ -710,10 +715,7 @@ async def resume_rollout(
                       LEFT JOIN app_installation_observed_states AS o
                         ON o.installation_id=i.id
                      WHERE i.app_id=$1
-                       AND (
-                           (i.lifecycle='blocked' AND i.desired_release_id=$2)
-                           OR i.lifecycle='active'
-                       )
+                       AND i.lifecycle IN ('blocked', 'upgrading', 'active')
                      ORDER BY st.ordinal, i.id
                      FOR UPDATE OF i
                     """,

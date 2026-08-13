@@ -1716,6 +1716,40 @@ class E2ERuntime:
                     "vault_id": str(install_vault),
                     "release_id": str(release_b),
                 },
+                "restore_compatible": {
+                    "app_id": str(target_app_id),
+                    "vault_id": str(target_vault_ids["restore-compatible"]),
+                    "release_id": str(release_a),
+                    "capabilities": ["installation:read", "inventory:read"],
+                    "mode": "restore",
+                    "request": {
+                        "service": "app",
+                        "method": "PUT",
+                        "path": f"/api/v1/apps/{target_app_id}/installations/{target_vault_ids['restore-compatible']}",
+                        "body": {
+                            "release_id": str(release_a),
+                            "capabilities": ["installation:read", "inventory:read"],
+                            "mode": "restore",
+                        },
+                    },
+                },
+                "fresh_empty": {
+                    "app_id": str(target_app_id),
+                    "vault_id": str(target_vault_ids["fresh-empty"]),
+                    "release_id": str(release_b),
+                    "capabilities": ["installation:read", "inventory:read"],
+                    "mode": "fresh",
+                    "request": {
+                        "service": "app",
+                        "method": "PUT",
+                        "path": f"/api/v1/apps/{target_app_id}/installations/{target_vault_ids['fresh-empty']}",
+                        "body": {
+                            "release_id": str(release_b),
+                            "capabilities": ["installation:read", "inventory:read"],
+                            "mode": "fresh",
+                        },
+                    },
+                },
             },
             "foreign_installation": {
                 "app_id": str(foreign_app_id),

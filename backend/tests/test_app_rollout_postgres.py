@@ -332,3 +332,187 @@ async def test_blocked_resume_creates_immutable_new_attempt_and_replays(monkeypa
                 "SELECT count(*) FROM app_rollout_jobs WHERE source_rollout_id=$1",
                 source_id,
             ) == 1
+
+
+async def test_blocked_resume_accepts_mixed_source_target_lifecycles(monkeypatch):
+    """A blocked source may leave failed and untouched targets in mixed states."""
+    async with _fresh_database() as pool:
+        monkeypatch.setattr(rollout, "get_pool", lambda: pool)
+        manifest, checksum = _manifest()
+        async with pool.acquire() as conn:
+            app_id = await conn.fetchval(
+                "INSERT INTO app_definitions(app_key) VALUES($1) RETURNING id",
+                f"resume-mixed-{uuid.uuid4().hex}",
+            )
+            old_release = await conn.fetchval(
+                """
+                INSERT INTO app_releases(app_id,version,manifest,manifest_checksum)
+                VALUES($1,'1.0.0',$2::jsonb,$3) RETURNING id
+                """,
+                app_id,
+                json.dumps(manifest),
+                checksum,
+            )
+            new_release = await conn.fetchval(
+                """
+                INSERT INTO app_releases(app_id,version,manifest,manifest_checksum)
+                VALUES($1,'2.0.0',$2::jsonb,$3) RETURNING id
+                """,
+                app_id,
+                json.dumps(manifest),
+                checksum,
+            )
+            source_snapshot = await conn.fetchval(
+                "INSERT INTO app_rollout_snapshots(app_id) VALUES($1) RETURNING id",
+                app_id,
+            )
+            source_targets: list[tuple[uuid.UUID, uuid.UUID, uuid.UUID]] = []
+            for ordinal in range(13):
+                vault_id = await conn.fetchval(
+                    "INSERT INTO vaults(name,git_path) VALUES($1,$2) RETURNING id",
+                    f"resume-mixed-{uuid.uuid4().hex}",
+                    f"/tmp/resume-mixed-{uuid.uuid4().hex}.git",
+                )
+                lifecycle = "blocked" if ordinal == 0 else "upgrading"
+                installation_id = await conn.fetchval(
+                    """
+                    INSERT INTO vault_app_installations(
+                        app_id,vault_id,desired_release_id,current_release_id,
+                        lifecycle,blocked_reason
+                    ) VALUES($1,$2,$3,$4,$5,$6) RETURNING id
+                    """,
+                    app_id,
+                    vault_id,
+                    new_release,
+                    old_release,
+                    lifecycle,
+                    "step_failed" if ordinal == 0 else None,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO installation_grants(
+                        installation_id,generation,capabilities,issuer
+                    ) VALUES($1,1,$2,'test')
+                    """,
+                    installation_id,
+                    ["rollout:read", "rollout:request"],
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO app_owned_resources(
+                        installation_id,vault_id,resource_kind,resource_key,status
+                    ) VALUES($1,$2,'table','orders','owned')
+                    """,
+                    installation_id,
+                    vault_id,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO app_installation_observed_states(
+                        installation_id,app_id,vault_id,observed_generation,
+                        observed_at,observed_release_id,observed_release_version,
+                        observed_grant_generation
+                    ) VALUES($1,$2,$3,1,NOW(),$4,'1.0.0',1)
+                    """,
+                    installation_id,
+                    app_id,
+                    vault_id,
+                    old_release,
+                )
+                snapshot_target = await conn.fetchval(
+                    """
+                    INSERT INTO app_rollout_snapshot_targets(
+                        snapshot_id,app_id,installation_id,vault_id,
+                        desired_release_id,current_release_id,
+                        baseline_grant_generation,state,reason_code
+                    ) VALUES($1,$2,$3,$4,$5,$6,1,$7,'step_failed') RETURNING id
+                    """,
+                    source_snapshot,
+                    app_id,
+                    installation_id,
+                    vault_id,
+                    new_release,
+                    old_release,
+                    "failed" if ordinal == 0 else "skipped",
+                )
+                source_targets.append((installation_id, vault_id, snapshot_target))
+
+            await conn.execute(
+                "UPDATE app_rollout_snapshots SET sealed_at=NOW() WHERE id=$1",
+                source_snapshot,
+            )
+            source_id = await conn.fetchval(
+                """
+                INSERT INTO app_rollout_jobs(
+                    app_id,release_id,manifest_checksum,idempotency_key,
+                    snapshot_id,requested_by_kind,status,blocked_reason,completed_at
+                ) VALUES($1,$2,$3,$4,$5,'admin','blocked','step_failed',NOW()) RETURNING id
+                """,
+                app_id,
+                new_release,
+                checksum,
+                uuid.uuid4(),
+                source_snapshot,
+            )
+            for ordinal, (installation_id, vault_id, snapshot_target) in enumerate(source_targets):
+                await conn.execute(
+                    """
+                    INSERT INTO app_rollout_targets(
+                        job_id,app_id,installation_id,snapshot_target_id,vault_id,
+                        release_id,ordinal,batch_no,is_canary,state,reason_code
+                    ) VALUES($1,$2,$3,$4,$5,$6,$7,0,$8,'blocked','step_failed')
+                    """,
+                    source_id,
+                    app_id,
+                    installation_id,
+                    snapshot_target,
+                    vault_id,
+                    new_release,
+                    ordinal,
+                    ordinal == 0,
+                )
+            before = await conn.fetchrow(
+                "SELECT status, blocked_reason FROM app_rollout_jobs WHERE id=$1",
+                source_id,
+            )
+
+        key = str(uuid.uuid4())
+        first = await rollout.resume_rollout(
+            app_id,
+            source_id,
+            release_id=new_release,
+            manifest_checksum_value=checksum,
+            idempotency_key=key,
+            requested_by_kind="admin",
+            correlation_id="resume-mixed-test",
+            actor="test",
+            actor_id="test",
+        )
+        replay = await rollout.resume_rollout(
+            app_id,
+            source_id,
+            release_id=new_release,
+            manifest_checksum_value=checksum,
+            idempotency_key=key,
+            requested_by_kind="admin",
+            correlation_id="resume-mixed-test",
+            actor="test",
+            actor_id="test",
+        )
+
+        assert first["replayed"] is False
+        assert replay["replayed"] is True
+        assert replay["job_id"] == first["job_id"]
+        async with pool.acquire() as conn:
+            assert await conn.fetchrow(
+                "SELECT status, blocked_reason FROM app_rollout_jobs WHERE id=$1",
+                source_id,
+            ) == before
+            assert await conn.fetchval(
+                "SELECT count(*) FROM app_rollout_targets WHERE job_id=$1",
+                uuid.UUID(first["job_id"]),
+            ) == 13
+            assert await conn.fetchval(
+                "SELECT count(*) FROM app_rollout_resume_attempts WHERE source_rollout_id=$1",
+                source_id,
+            ) == 1

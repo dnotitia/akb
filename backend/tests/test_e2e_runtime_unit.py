@@ -167,6 +167,58 @@ def test_fixture_discovery_declares_auth_and_observability_without_secrets(
     assert "external-password-value" not in serialized
 
 
+def test_installation_discovery_publishes_success_lifecycle_command_bodies(tmp_path):
+    runtime = E2ERuntime(
+        dataclasses.replace(
+            make_config(tmp_path), scenario="app-installation-lifecycle"
+        )
+    )
+    runtime._fixture_catalog = {
+        "status": "ready",
+        "scenario": "app-installation-lifecycle",
+        "commands": {
+            "restore_compatible": {
+                "app_id": "target-app",
+                "vault_id": "restore-vault",
+                "release_id": "release-primary",
+                "capabilities": ["installation:read", "inventory:read"],
+                "mode": "restore",
+                "request": {
+                    "service": "app",
+                    "method": "PUT",
+                    "path": "/api/v1/apps/target-app/installations/restore-vault",
+                    "body": {
+                        "release_id": "release-primary",
+                        "capabilities": ["installation:read", "inventory:read"],
+                        "mode": "restore",
+                    },
+                },
+            },
+            "fresh_empty": {
+                "app_id": "target-app",
+                "vault_id": "fresh-vault",
+                "release_id": "release-next",
+                "capabilities": ["installation:read", "inventory:read"],
+                "mode": "fresh",
+                "request": {
+                    "service": "app",
+                    "method": "PUT",
+                    "path": "/api/v1/apps/target-app/installations/fresh-vault",
+                    "body": {
+                        "release_id": "release-next",
+                        "capabilities": ["installation:read", "inventory:read"],
+                        "mode": "fresh",
+                    },
+                },
+            },
+        },
+    }
+
+    discovery = runtime.fixture_discovery()
+
+    assert discovery["commands"] == runtime._fixture_catalog["commands"]
+
+
 def test_scenario_argument_supports_the_lifecycle_fixture():
     config = _parse_args(["serve", "--scenario", "empty"])
     assert config.scenario == "empty"
