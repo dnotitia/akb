@@ -369,10 +369,7 @@ class E2ERuntime:
             self._fixture_controls["restart_requested"] = bool(enabled)
             if enabled:
                 asyncio.create_task(
-                    self._restart_backend(
-                        self._lifecycle_generation,
-                        requested_during_reset=self._resetting or self._reset_lock.locked(),
-                    ),
+                    self._restart_backend(self._lifecycle_generation),
                     name="backend-restart",
                 )
         elif action == "fault_injection":
@@ -470,16 +467,13 @@ class E2ERuntime:
     async def _restart_backend(
         self,
         requested_generation: int | None = None,
-        *,
-        requested_during_reset: bool = False,
     ) -> None:
         try:
             async with self._reset_lock:
                 if requested_generation is None:
                     requested_generation = self._lifecycle_generation
                 if (
-                    requested_during_reset
-                    or requested_generation != self._lifecycle_generation
+                    requested_generation != self._lifecycle_generation
                     or self._resetting
                 ):
                     return

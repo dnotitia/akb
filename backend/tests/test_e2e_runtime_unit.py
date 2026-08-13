@@ -584,24 +584,35 @@ async def test_serve_ignores_process_exit_after_reset_replaces_the_process(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_restart_requested_during_reset_does_not_restart_after_reset(tmp_path):
+async def test_restart_requested_during_reset_is_deferred_until_reset_finishes(tmp_path):
     runtime = E2ERuntime(make_config(tmp_path))
     runtime._lifecycle_generation = 4
-    runtime._resetting = True
     calls: list[str] = []
 
     async def record_stop(_name: str) -> None:
         calls.append("stop")
+        runtime._children.pop("backend", None)
 
     async def record_start() -> None:
         calls.append("start")
+        runtime._children["backend"] = ManagedProcess(_LifecycleProcess())
 
     runtime._stop_named_process = record_stop  # type: ignore[method-assign]
     runtime._start_backend = record_start  # type: ignore[method-assign]
 
-    await runtime._restart_backend(4, requested_during_reset=True)
+    async with runtime._reset_lock:
+        runtime._resetting = True
+        result = await runtime.fixture_control("restart", None, True)
+        await asyncio.sleep(0)
+        assert calls == []
+        runtime._resetting = False
 
-    assert calls == []
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert result["status"] == "accepted"
+    assert calls == ["stop", "start"]
+    assert runtime.app_ready is True
 
 
 def test_rollout_fixture_discovery_is_generic_and_redacted(tmp_path):
