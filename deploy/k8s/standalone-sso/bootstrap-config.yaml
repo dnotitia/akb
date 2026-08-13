@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: akb-sso-bootstrap-config
+  namespace: akb
+data:
+  bootstrap-client-id: akb-bootstrap-temporary
+  product-admin-username: admin
+  product-admin-email: admin@example.com
