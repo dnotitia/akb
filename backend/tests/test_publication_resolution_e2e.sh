@@ -58,6 +58,15 @@ TOKEN=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" \
 
 acurl() { curl -sk -H "Authorization: Bearer $TOKEN" "$@"; }
 
+# MCP is an automation surface: a local browser/session JWT must not cross
+# that capability boundary. Mint a dedicated PAT for the one MCP-only move
+# below and keep TOKEN exclusively on the REST user-session path.
+MCP_PAT=$(acurl -X POST "$BASE_URL/api/v1/auth/tokens" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"publication-resolution-e2e-mcp"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])" 2>/dev/null)
+[ -n "$MCP_PAT" ] && pass "MCP PAT acquired" || { fail "MCP PAT" "no token"; exit 1; }
+
 R=$(acurl -X POST "$BASE_URL/api/v1/vaults?name=$VAULT&description=resolution%20regression")
 [ "$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("name",""))' 2>/dev/null)" = "$VAULT" ] \
   && pass "Vault created ($VAULT)" || { fail "Vault create" "$R"; exit 1; }
@@ -190,7 +199,7 @@ T2_MOVER_URI="${OUT%%|*}"; T2_MOVER_PATH="${OUT##*|}"
 
 # There is no REST move endpoint — move is MCP-only (akb_move).
 SESS=$(curl -sk -X POST "$BASE_URL/mcp/" \
-  -H "Authorization: Bearer $TOKEN" \
+  -H "Authorization: Bearer $MCP_PAT" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"pubres-e2e","version":"0.1"}}}' \
@@ -198,7 +207,7 @@ SESS=$(curl -sk -X POST "$BASE_URL/mcp/" \
 [ -n "$SESS" ] && pass "T2: MCP session initialized" || fail "T2 MCP init" "no session id"
 
 curl -sk -X POST "$BASE_URL/mcp/" \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $MCP_PAT" -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" -H "Mcp-Session-Id: $SESS" \
   -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null
 
@@ -206,7 +215,7 @@ mcp() {
   local id=$1; shift
   local name=$1; shift
   curl -sk -X POST "$BASE_URL/mcp/" \
-    -H "Authorization: Bearer $TOKEN" \
+    -H "Authorization: Bearer $MCP_PAT" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
     -H "Mcp-Session-Id: $SESS" \
@@ -476,7 +485,7 @@ echo ""
 echo "▸ 99. Cleanup"
 mcp 99 akb_delete_vault "{\"vault\":\"$VAULT\"}" >/dev/null 2>&1
 pass "Cleanup done"
-curl -sk -X DELETE "$BASE_URL/mcp/" -H "Authorization: Bearer $TOKEN" -H "Mcp-Session-Id: ${SESS:-}" >/dev/null 2>&1
+curl -sk -X DELETE "$BASE_URL/mcp/" -H "Authorization: Bearer $MCP_PAT" -H "Mcp-Session-Id: ${SESS:-}" >/dev/null 2>&1
 
 echo ""
 echo "╔══════════════════════════════════════════╗"
