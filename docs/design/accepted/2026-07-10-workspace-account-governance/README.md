@@ -2,10 +2,39 @@
 status: accepted
 stage: applied
 created: 2026-07-10
-updated: 2026-07-10
+updated: 2026-08-13
 ---
 
 # Workspace Account Governance
+
+## Amendment — 2026-08-13
+
+[Authentication Mode Boundary](../2026-08-13-authentication-mode-boundary/README.md)
+partially supersedes this record for the target human-auth architecture.
+
+Superseded statements are limited to:
+
+- the `Decision`, `Authentication Policy`, `Rollout`, and `Verification`
+  statements that local password and OIDC login remain simultaneously enabled
+  or default as a permanent runtime model;
+- the `Compatibility Contract` promise that HS256 validation and existing AKB
+  human-session JWT behavior remain permanently unchanged (legacy acceptance
+  is now migration-only), while its PAT compatibility promises remain;
+- the `Non-Goals` statement about making OIDC mandatory for standalone AKB,
+  only to the extent that it would prevent a standalone installation from
+  choosing `auth_mode=sso`; standalone installations may still choose
+  `auth_mode=local`; and
+- the `Non-Goals` statement against changing token formats, only for versioned
+  AKB human-session profiles. The prohibition on re-keying users remains.
+
+Still authoritative are the durable `users.id` projection, exact external
+identity binding, account status and lifecycle, PAT and service identities,
+Vault ownership and grants, PostgreSQL roles, and shared authorization and
+administrative controls.
+
+The original text below is preserved as the accepted, applied 2026-07-10
+record. For the limited conflicts listed above, the 2026-08-13 ADR governs the
+target state; all other portions of this record continue to govern.
 
 ## Decision
 

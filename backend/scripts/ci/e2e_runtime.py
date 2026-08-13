@@ -547,8 +547,16 @@ class E2ERuntime:
 
     def _write_config(self) -> None:
         import yaml
+        from app.services.local_session_keys import generate_local_session_keyset
+
+        local_key_dir = self.config.config_dir / "local-session"
+        generate_local_session_keyset(local_key_dir)
 
         app_config = {
+            "auth_mode": "local",
+            "jwt_algorithm": "RS256",
+            "local_session_private_key_path": str(local_key_dir / "private.pem"),
+            "local_session_jwks_path": str(local_key_dir / "jwks.json"),
             "db_host": "127.0.0.1",
             "db_port": 15432,
             "db_name": "akb",
@@ -568,7 +576,7 @@ class E2ERuntime:
         }
         secret_config = {
             "db_password": "akb",
-            "jwt_secret": secrets.token_urlsafe(48),
+            "system_hmac_secret": secrets.token_urlsafe(48),
             "app_token_secret": secrets.token_urlsafe(48),
             "embed_api_key": "ci-stub-no-auth",
             "s3_access_key": "akb-ci",

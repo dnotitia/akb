@@ -20,14 +20,8 @@ from app.main import app
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 SUCCESS_STATUSES = ("200", "201", "202")
-ERROR_STATUSES = ("400", "401", "403", "404", "409", "422", "500")
-M3_SDK_CONTRACT_PATH = (
-    Path(__file__).parents[2]
-    / "packages"
-    / "akb-client"
-    / "scripts"
-    / "sdk-surface-contract.json"
-)
+ERROR_STATUSES = ("400", "401", "403", "404", "409", "422", "500", "503")
+M3_SDK_CONTRACT_PATH = Path(__file__).parents[2] / "packages" / "akb-client" / "scripts" / "sdk-surface-contract.json"
 
 
 def _api_operations():
@@ -57,9 +51,7 @@ def test_m3_sdk_contract_matrix_matches_live_openapi():
         assert operation["operationId"] == operation_id
 
         success = next(
-            operation["responses"][status]
-            for status in SUCCESS_STATUSES
-            if status in operation["responses"]
+            operation["responses"][status] for status in SUCCESS_STATUSES if status in operation["responses"]
         )
         assert success["content"]["application/json"]["schema"] == {
             "$ref": f"#/components/schemas/{item['successSchema']}"
@@ -88,10 +80,9 @@ def test_m3_sdk_contract_matrix_matches_live_openapi():
         }
         assert required_headers == set(item.get("requiredHeaders", [])), operation_id
         for status in ERROR_STATUSES:
-            assert (
-                operation["responses"][status]["content"]["application/json"]["schema"]
-                == {"$ref": f"#/components/schemas/{contract['errorSchema']}"}
-            ), f"{operation_id} {status}"
+            assert operation["responses"][status]["content"]["application/json"]["schema"] == {
+                "$ref": f"#/components/schemas/{contract['errorSchema']}"
+            }, f"{operation_id} {status}"
 
 
 def test_bearer_auth_scheme_is_registered():
@@ -99,7 +90,9 @@ def test_bearer_auth_scheme_is_registered():
     assert schema["components"]["securitySchemes"]["bearerAuth"] == {
         "type": "http",
         "scheme": "bearer",
-        "description": "JWT or AKB personal access token supplied as a Bearer token.",
+        "description": (
+            "Route-selected human credential or namespaced AKB PAT/service credential supplied as a Bearer token."
+        ),
     }
 
 
@@ -117,6 +110,15 @@ def test_api_operations_have_codegen_safe_ids_tags_and_success_schema():
 
         responses = operation.get("responses", {})
         success = next((responses.get(code) for code in SUCCESS_STATUSES if code in responses), None)
+        if (method, path) in {
+            ("get", "/api/v1/auth/keycloak/login"),
+            ("get", "/api/v1/auth/keycloak/callback"),
+            ("get", "/api/v1/auth/keycloak/logout"),
+            ("post", "/api/v1/auth/keycloak/exchange"),
+        }:
+            assert success is None
+            assert not any(str(code).startswith("3") for code in responses)
+            continue
         if success is None and any(str(code).startswith("3") for code in responses):
             assert "200" not in responses
             continue
@@ -145,12 +147,7 @@ def test_api_error_responses_reference_single_akb_error_component():
     for path, method, operation in _api_operations():
         responses = operation.get("responses", {})
         for status in ERROR_STATUSES:
-            error_schema = (
-                responses.get(status, {})
-                .get("content", {})
-                .get("application/json", {})
-                .get("schema")
-            )
+            error_schema = responses.get(status, {}).get("content", {}).get("application/json", {}).get("schema")
             assert error_schema == {"$ref": "#/components/schemas/AkbError"}, (
                 f"{method.upper()} {path} {status} does not reference AkbError"
             )
@@ -161,16 +158,24 @@ def test_activity_history_diff_openapi_contract_is_codegen_typed():
     paths = schema["paths"]
     expected = {
         "/api/v1/activity/{vault}": (
-            "activityList", "activity", "AkbActivityEnvelope",
+            "activityList",
+            "activity",
+            "AkbActivityEnvelope",
         ),
         "/api/v1/recent": (
-            "activityRecent", "activity", "AkbRecentChangesEnvelope",
+            "activityRecent",
+            "activity",
+            "AkbRecentChangesEnvelope",
         ),
         "/api/v1/history/{vault}/{doc_id}": (
-            "documentsHistory", "documents", "AkbDocumentHistoryEnvelope",
+            "documentsHistory",
+            "documents",
+            "AkbDocumentHistoryEnvelope",
         ),
         "/api/v1/diff/{vault}/{doc_id}": (
-            "documentsDiff", "documents", "AkbDocumentDiffEnvelope",
+            "documentsDiff",
+            "documents",
+            "AkbDocumentDiffEnvelope",
         ),
     }
 
@@ -180,15 +185,13 @@ def test_activity_history_diff_openapi_contract_is_codegen_typed():
         assert operation["operationId"] == operation_id
         assert operation["tags"] == [tag]
         assert operation_ids.count(operation_id) == 1
-        assert (
-            operation["responses"]["200"]["content"]["application/json"]["schema"]
-            == {"$ref": f"#/components/schemas/{model}"}
-        )
+        assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+            "$ref": f"#/components/schemas/{model}"
+        }
         for status in ERROR_STATUSES:
-            assert (
-                operation["responses"][status]["content"]["application/json"]["schema"]
-                == {"$ref": "#/components/schemas/AkbError"}
-            )
+            assert operation["responses"][status]["content"]["application/json"]["schema"] == {
+                "$ref": "#/components/schemas/AkbError"
+            }
 
 
 def test_activity_history_diff_schemas_have_literal_kinds_and_typed_fields():
@@ -214,14 +217,17 @@ def test_activity_history_diff_schemas_have_literal_kinds_and_typed_fields():
         "items": {"$ref": "#/components/schemas/ActivityEntry"},
     }
     assert schemas["ActivityEntry"]["properties"]["date"] == {
-        "type": "string", "format": "date-time",
+        "type": "string",
+        "format": "date-time",
     }
     assert schemas["ActivityEntry"]["properties"]["files"] == {
         "type": "array",
         "items": {"$ref": "#/components/schemas/ActivityFileChange"},
     }
     assert schemas["ActivityFileChange"]["properties"]["change"]["enum"] == [
-        "added", "deleted", "modified",
+        "added",
+        "deleted",
+        "modified",
     ]
 
     recent_items = schemas["AkbRecentChangesEnvelope"]["properties"]["changes"]
@@ -242,7 +248,11 @@ def test_activity_history_diff_schemas_have_literal_kinds_and_typed_fields():
     diff = schemas["AkbDocumentDiffEnvelope"]
     assert {"file", "commit", "type", "diff"}.issubset(diff["required"])
     assert diff["properties"]["type"]["enum"] == [
-        "added", "deleted", "modified", "unknown", "unchanged",
+        "added",
+        "deleted",
+        "modified",
+        "unknown",
+        "unchanged",
     ]
     assert diff["properties"]["diff"]["type"] == "string"
     assert "error" not in diff["required"]
@@ -370,10 +380,7 @@ def test_kind_envelope_routes_reference_typed_success_schemas():
         ("/api/v1/collections/{vault}/{path}", "delete", "200"): "AkbCollectionDeleteEnvelope",
     }
     for (path, method, status), component in expected.items():
-        success_schema = (
-            schema["paths"][path][method]["responses"][status]
-            ["content"]["application/json"]["schema"]
-        )
+        success_schema = schema["paths"][path][method]["responses"][status]["content"]["application/json"]["schema"]
         assert success_schema == {"$ref": f"#/components/schemas/{component}"}
 
 
@@ -403,9 +410,7 @@ def test_graph_rest_openapi_contract_is_codegen_typed():
             "graph_overview": "#/components/schemas/AkbGraphOverviewEnvelope",
         },
     }
-    assert {item["$ref"] for item in graph_union["oneOf"]} == set(
-        graph_union["discriminator"]["mapping"].values()
-    )
+    assert {item["$ref"] for item in graph_union["oneOf"]} == set(graph_union["discriminator"]["mapping"].values())
 
     node = schemas["AkbGraphNode"]
     assert node["properties"]["resource_type"]["enum"] == ["doc", "table", "file"]
@@ -444,15 +449,13 @@ def test_document_openapi_contract_is_codegen_typed():
     assert browse["tags"] == ["documents"]
 
     for operation in (get, delete, browse):
-        assert (
-            operation["responses"]["200"]["content"]["application/json"]["schema"]
-            == {"$ref": "#/components/schemas/AkbDocumentEnvelope"}
-        )
+        assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/AkbDocumentEnvelope"
+        }
     for operation in (put, patch):
-        assert (
-            operation["responses"]["200"]["content"]["application/json"]["schema"]
-            == {"$ref": "#/components/schemas/AkbDocumentWriteEnvelope"}
-        )
+        assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/AkbDocumentWriteEnvelope"
+        }
 
     schemas = schema["components"]["schemas"]
     document = schemas["AkbDocumentEnvelope"]
@@ -497,8 +500,13 @@ def test_collection_openapi_contract_is_codegen_typed():
     assert create_envelope["properties"]["kind"]["enum"] == ["collection_create"]
     delete_envelope = schemas["AkbCollectionDeleteEnvelope"]
     assert {
-        "kind", "ok", "collection", "deleted_docs", "deleted_files",
-        "deleted_sub_collections", "deleted_tables",
+        "kind",
+        "ok",
+        "collection",
+        "deleted_docs",
+        "deleted_files",
+        "deleted_sub_collections",
+        "deleted_tables",
     } == set(delete_envelope["required"])
     assert delete_envelope["properties"]["kind"]["enum"] == ["collection_delete"]
 
@@ -526,18 +534,15 @@ def test_search_openapi_contract_is_codegen_typed():
     assert drill_down["operationId"] == "searchDrillDown"
     assert grep["operationId"] == "searchGrepDocuments"
 
-    assert (
-        search["responses"]["200"]["content"]["application/json"]["schema"]
-        == {"$ref": "#/components/schemas/AkbSearchEnvelope"}
-    )
-    assert (
-        drill_down["responses"]["200"]["content"]["application/json"]["schema"]
-        == {"$ref": "#/components/schemas/AkbDrillDownEnvelope"}
-    )
-    assert (
-        grep["responses"]["200"]["content"]["application/json"]["schema"]
-        == {"$ref": "#/components/schemas/AkbGrepEnvelope"}
-    )
+    assert search["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AkbSearchEnvelope"
+    }
+    assert drill_down["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AkbDrillDownEnvelope"
+    }
+    assert grep["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AkbGrepEnvelope"
+    }
 
     search_params = {param["name"]: param for param in search["parameters"]}
     for name in (
@@ -583,15 +588,13 @@ def test_row_read_openapi_contract_is_codegen_typed():
     assert rows["tags"] == ["tables"]
     assert query["tags"] == ["tables"]
     for operation in (rows, query):
-        assert (
-            operation["responses"]["200"]["content"]["application/json"]["schema"]
-            == {"$ref": "#/components/schemas/AkbTableQueryEnvelope"}
-        )
+        assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/AkbTableQueryEnvelope"
+        }
         for status in ERROR_STATUSES:
-            assert (
-                operation["responses"][status]["content"]["application/json"]["schema"]
-                == {"$ref": "#/components/schemas/AkbError"}
-            )
+            assert operation["responses"][status]["content"]["application/json"]["schema"] == {
+                "$ref": "#/components/schemas/AkbError"
+            }
 
     query_request_schema = query["requestBody"]["content"]["application/json"]["schema"]
     assert query_request_schema == {"$ref": "#/components/schemas/QueryRowsRequest"}
@@ -616,22 +619,19 @@ def test_row_write_openapi_contract_is_codegen_typed():
         operation = rows_path[method]
         assert operation["operationId"] == operation_id
         assert operation["tags"] == ["tables"]
-        assert (
-            operation["responses"][success_status]["content"]["application/json"]["schema"]
-            == {"$ref": "#/components/schemas/AkbTableQueryEnvelope"}
-        )
+        assert operation["responses"][success_status]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/AkbTableQueryEnvelope"
+        }
         assert "content" not in operation["responses"]["204"]
         for status in ERROR_STATUSES:
-            assert (
-                operation["responses"][status]["content"]["application/json"]["schema"]
-                == {"$ref": "#/components/schemas/AkbError"}
-            )
+            assert operation["responses"][status]["content"]["application/json"]["schema"] == {
+                "$ref": "#/components/schemas/AkbError"
+            }
 
     assert query["operationId"] == "tablesQueryRows"
-    assert (
-        query["responses"]["201"]["content"]["application/json"]["schema"]
-        == {"$ref": "#/components/schemas/AkbTableQueryEnvelope"}
-    )
+    assert query["responses"]["201"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AkbTableQueryEnvelope"
+    }
     assert "content" not in query["responses"]["204"]
 
 
@@ -641,19 +641,16 @@ def test_alter_table_openapi_contract_is_codegen_typed():
 
     assert operation["operationId"] == "tablesAlterTable"
     assert operation["tags"] == ["tables"]
-    assert (
-        operation["responses"]["200"]["content"]["application/json"]["schema"]
-        == {"$ref": "#/components/schemas/AkbTableEnvelope"}
-    )
-    assert (
-        operation["requestBody"]["content"]["application/json"]["schema"]
-        == {"$ref": "#/components/schemas/AlterTableRequest"}
-    )
+    assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AkbTableEnvelope"
+    }
+    assert operation["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AlterTableRequest"
+    }
     for status in ERROR_STATUSES:
-        assert (
-            operation["responses"][status]["content"]["application/json"]["schema"]
-            == {"$ref": "#/components/schemas/AkbError"}
-        )
+        assert operation["responses"][status]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/AkbError"
+        }
 
 
 def test_table_admin_request_components_are_structured():
@@ -672,9 +669,7 @@ def test_table_admin_request_components_are_structured():
 
     create_request = schemas["CreateTableRequest"]
     assert set(create_request["required"]) == {"name", "columns"}
-    assert create_request["properties"]["columns"]["items"] == {
-        "$ref": "#/components/schemas/TableColumnSpec"
-    }
+    assert create_request["properties"]["columns"]["items"] == {"$ref": "#/components/schemas/TableColumnSpec"}
     assert create_request["properties"]["unique_keys"]["anyOf"][0]["items"] == {
         "$ref": "#/components/schemas/TableUniqueKeySpec"
     }
@@ -713,13 +708,10 @@ def test_table_migration_openapi_contract_is_codegen_typed():
 
     assert operation["operationId"] == "tablesApplyMigration"
     assert operation["tags"] == ["tables"]
-    assert (
-        operation["responses"]["200"]["content"]["application/json"]["schema"]
-        == {"$ref": "#/components/schemas/AkbTableMigrationEnvelope"}
-    )
-    idempotency = next(
-        param for param in operation["parameters"] if param["name"] == "Idempotency-Key"
-    )
+    assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AkbTableMigrationEnvelope"
+    }
+    idempotency = next(param for param in operation["parameters"] if param["name"] == "Idempotency-Key")
     assert idempotency["in"] == "header"
     assert idempotency["required"] is True
     assert idempotency["schema"]["type"] == "string"
@@ -759,10 +751,9 @@ def test_table_migration_openapi_contract_is_codegen_typed():
         migration["required"]
     )
     for status in ERROR_STATUSES:
-        assert (
-            operation["responses"][status]["content"]["application/json"]["schema"]
-            == {"$ref": "#/components/schemas/AkbError"}
-        )
+        assert operation["responses"][status]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/AkbError"
+        }
 
 
 def test_table_schema_openapi_contract_is_codegen_typed():
@@ -775,19 +766,15 @@ def test_table_schema_openapi_contract_is_codegen_typed():
     assert vault_schema["operationId"] == "tablesGetVaultSchema"
     assert table_schema["tags"] == ["tables"]
     assert vault_schema["tags"] == ["tables"]
-    assert (
-        table_schema["responses"]["200"]["content"]["application/json"]["schema"]
-        == {"$ref": "#/components/schemas/AkbTableSchemaEnvelope"}
-    )
-    assert (
-        vault_schema["responses"]["200"]["content"]["application/json"]["schema"]
-        == {"$ref": "#/components/schemas/AkbVaultTableSchemaEnvelope"}
-    )
+    assert table_schema["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AkbTableSchemaEnvelope"
+    }
+    assert vault_schema["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AkbVaultTableSchemaEnvelope"
+    }
 
     component = schema["components"]["schemas"]["AkbTableSchemaEnvelope"]
-    assert {"kind", "vault", "name", "columns", "pg_types", "drift"}.issubset(
-        component["required"]
-    )
+    assert {"kind", "vault", "name", "columns", "pg_types", "drift"}.issubset(component["required"])
     column_props = component["properties"]["columns"]["items"]["properties"]
     for field in (
         "name",
@@ -806,10 +793,9 @@ def test_table_schema_openapi_contract_is_codegen_typed():
         assert field in column_props
     for operation in (table_schema, vault_schema):
         for status in ERROR_STATUSES:
-            assert (
-                operation["responses"][status]["content"]["application/json"]["schema"]
-                == {"$ref": "#/components/schemas/AkbError"}
-            )
+            assert operation["responses"][status]["content"]["application/json"]["schema"] == {
+                "$ref": "#/components/schemas/AkbError"
+            }
 
 
 def test_http_exception_runtime_shape_matches_akb_error_schema():
@@ -870,12 +856,14 @@ def test_http_exception_preserves_nested_details_as_akb_error_details():
 
 def test_table_rest_bridge_promotes_service_err_dict_to_http_akb_error():
     with pytest.raises(HTTPException) as exc:
-        _raise_service_error({
-            "error": "Multi-statement SQL is not allowed.",
-            "code": "multi_statement",
-            "hint": "Send one statement at a time.",
-            "details": {"separator_count": 2},
-        })
+        _raise_service_error(
+            {
+                "error": "Multi-statement SQL is not allowed.",
+                "code": "multi_statement",
+                "hint": "Send one statement at a time.",
+                "details": {"separator_count": 2},
+            }
+        )
 
     assert exc.value.status_code == 400
     assert exc.value.detail == {
@@ -944,17 +932,24 @@ def test_unhandled_exception_runtime_shape_matches_akb_error_schema():
     }
 
 
-def test_redirect_operations_do_not_advertise_json_success():
+def test_staged_browser_sso_operations_advertise_no_redirect_or_success():
     schema = app.openapi()
-    for path in (
-        "/api/v1/auth/keycloak/login",
-        "/api/v1/auth/keycloak/callback",
-        "/api/v1/auth/keycloak/logout",
-    ):
-        responses = schema["paths"][path]["get"]["responses"]
-        assert "302" in responses
+    operations = (
+        ("/api/v1/auth/keycloak/login", "get"),
+        ("/api/v1/auth/keycloak/callback", "get"),
+        ("/api/v1/auth/keycloak/logout", "get"),
+        ("/api/v1/auth/keycloak/exchange", "post"),
+    )
+    for path, method in operations:
+        responses = schema["paths"][path][method]["responses"]
+        assert "503" in responses
+        assert responses["503"]["content"]["application/json"]["schema"] == {"$ref": "#/components/schemas/AkbError"}
         assert "200" not in responses
-        assert "application/json" not in responses["302"].get("content", {})
+        assert "302" not in responses
+
+    exchange = schema["paths"]["/api/v1/auth/keycloak/exchange"]["post"]
+    assert exchange["summary"] == "Legacy SSO exchange (staged unavailable)"
+    assert "JWT" not in exchange["summary"]
 
 
 def test_non_json_success_operations_keep_their_media_types():

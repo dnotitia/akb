@@ -2,7 +2,7 @@
 
 JWTs are stateless — the server cannot recall an already-issued token
 without keeping per-user state. Before this column, the only way to
-invalidate a leaked/stale JWT was to rotate ``jwt_secret`` (which kills
+invalidate a leaked/stale JWT was to rotate the installation signing key (which kills
 every session in the system).
 
 The column holds the timestamp after which any JWT issued by this user

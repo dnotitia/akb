@@ -123,6 +123,39 @@ class ServiceIdentityAdoptionError(AKBError):
         )
 
 
+class RecoveryAdminConflictError(AKBError):
+    """Provisioning input conflicts with the designated recovery identity."""
+
+    def __init__(self):
+        super().__init__(
+            "Recovery administrator conflicts with existing account state",
+            status_code=409,
+            code="recovery_admin_conflict",
+        )
+
+
+class RecoveryAdminModeError(AKBError):
+    """The requested provisioning profile is not the configured auth mode."""
+
+    def __init__(self):
+        super().__init__(
+            "Recovery administrator provisioning does not match the configured auth mode",
+            status_code=409,
+            code="recovery_admin_mode_mismatch",
+        )
+
+
+class RecoveryAdminProtectedError(AKBError):
+    """The designated recovery identity must remain an administrator."""
+
+    def __init__(self):
+        super().__init__(
+            "The designated recovery administrator cannot be demoted or deleted",
+            status_code=409,
+            code="recovery_admin_protected",
+        )
+
+
 class ExternalAuthDisabledError(AKBError):
     """External authentication is disabled by deployment policy."""
 
@@ -131,6 +164,17 @@ class ExternalAuthDisabledError(AKBError):
             "External authentication is disabled",
             status_code=403,
             code="external_auth_disabled",
+        )
+
+
+class BrowserSessionNotReadyError(AKBError):
+    """Human SSO is selected, but Phase 4 browser custody is not active."""
+
+    def __init__(self):
+        super().__init__(
+            "SSO browser sessions are not available in this release",
+            status_code=503,
+            code="browser_session_not_ready",
         )
 
 

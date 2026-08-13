@@ -1,78 +1,56 @@
-// RTL coverage for the AuthPage `sso_only` mode: when the backend
-// advertises `keycloak.sso_only = true`, the page must redirect to
-// Keycloak immediately without rendering the local username/password
-// form. `?local=1` suppresses automatic navigation, but only keeps the
-// form alive when the server has not disabled local authentication.
-//
-// Both checks pin down the documented contract — drift here would
-// either trap admins (no escape) or strand SSO-only deployments with
-// a confusing local form they were configured to hide.
-
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, cleanup, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 
+import { AUTH_CONFIG_UNAVAILABLE, getAuthConfig } from "@/lib/api";
 import AuthPage from "../auth";
-import { getAuthConfig } from "@/lib/api";
 
-vi.mock("@/lib/api", () => ({
-  authLogin: vi.fn(),
-  authRegister: vi.fn(),
-  setToken: vi.fn(),
-  getToken: vi.fn(() => null),
-  getAuthConfig: vi.fn(),
-  clearSsoSession: vi.fn(),
-}));
+
+vi.mock("@/lib/api", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
+  return {
+    ...actual,
+    authLogin: vi.fn(),
+    authRegister: vi.fn(),
+    setToken: vi.fn(),
+    getToken: vi.fn(() => null),
+    getAuthConfig: vi.fn(),
+  };
+});
 
 const navigate = vi.fn();
 vi.mock("react-router-dom", async () => {
   const actual = await vi.importActual<typeof import("react-router-dom")>(
     "react-router-dom",
   );
-  return {
-    ...actual,
-    useNavigate: () => navigate,
-  };
+  return { ...actual, useNavigate: () => navigate };
 });
 
-// jsdom's `window.location.href` setter triggers a real "navigation"
-// that aborts the test. Stub it so we can ASSERT the destination
-// without taking the navigation. The `search` getter reads a mutable
-// outer variable, so a test can set the query string AFTER beforeEach
-// (which is when `?local=1` cases naturally do so).
-const originalLocation = window.location;
-let hrefAssignments: string[] = [];
-let stubbedSearch = "";
+const localConfig = {
+  available: true,
+  schema_version: 1 as const,
+  auth_mode: "local" as const,
+  local_auth: { enabled: true },
+  keycloak: {
+    enabled: false,
+    browser_session_ready: false,
+    login_url: null,
+  },
+  mcp_oauth: { enabled: false },
+};
 
-beforeEach(() => {
-  hrefAssignments = [];
-  stubbedSearch = "";
-  Object.defineProperty(window, "location", {
-    configurable: true,
-    value: {
-      ...originalLocation,
-      pathname: "/auth",
-      get search() {
-        return stubbedSearch;
-      },
-      get href() {
-        return originalLocation.href;
-      },
-      set href(v: string) {
-        hrefAssignments.push(v);
-      },
-    },
-  });
-});
-
-afterEach(() => {
-  Object.defineProperty(window, "location", {
-    configurable: true,
-    value: originalLocation,
-  });
-  cleanup();
-  navigate.mockReset();
-});
+const stagedSsoConfig = {
+  available: true,
+  schema_version: 1 as const,
+  auth_mode: "sso" as const,
+  local_auth: { enabled: false },
+  keycloak: {
+    enabled: true,
+    browser_session_ready: false,
+    login_url: null,
+  },
+  mcp_oauth: { enabled: false },
+};
 
 function renderAuth() {
   return render(
@@ -82,114 +60,73 @@ function renderAuth() {
   );
 }
 
-describe("AuthPage — SSO-only mode", () => {
-  it("redirects to Keycloak immediately and never renders the form", async () => {
-    vi.mocked(getAuthConfig).mockResolvedValue({
-      keycloak: {
-        enabled: true,
-        login_url: "/api/v1/auth/keycloak/login",
-        sso_only: true,
-      },
-    });
+beforeEach(() => {
+  window.history.replaceState({}, "", "/auth");
+});
+
+afterEach(() => {
+  cleanup();
+  navigate.mockReset();
+  vi.clearAllMocks();
+});
+
+describe("AuthPage mode gate", () => {
+  it("renders only local login, registration, and recovery in local mode", async () => {
+    vi.mocked(getAuthConfig).mockResolvedValue(localConfig);
 
     renderAuth();
 
-    await waitFor(() => expect(hrefAssignments.length).toBeGreaterThan(0));
-    expect(hrefAssignments[0]).toMatch(
-      /\/api\/v1\/auth\/keycloak\/login\?redirect=/,
-    );
-    // Form is never rendered — `Sign in` button (which the form owns)
-    // must not appear, and the "Redirecting to SSO…" placeholder must.
-    expect(screen.queryByRole("button", { name: /^Sign in$/ })).toBeNull();
-    expect(screen.getByText(/Redirecting to SSO/i)).toBeInTheDocument();
+    expect(await screen.findByLabelText(/Username/i)).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /Register/i })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Forgot password/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /SSO/i })).toBeNull();
   });
 
-  it("`?local=1` keeps the local form visible even when sso_only is on", async () => {
-    stubbedSearch = "?local=1";
-    vi.mocked(getAuthConfig).mockResolvedValue({
-      keycloak: {
-        enabled: true,
-        login_url: "/api/v1/auth/keycloak/login",
-        sso_only: true,
-      },
-    });
+  it("renders no local or unusable SSO controls while browser custody is staged", async () => {
+    vi.mocked(getAuthConfig).mockResolvedValue(stagedSsoConfig);
 
     renderAuth();
 
-    // Form renders with both Username + Sign-in-with-SSO option.
-    await waitFor(() =>
-      expect(screen.getByLabelText(/Username/i)).toBeInTheDocument(),
-    );
-    expect(
-      screen.getByRole("button", { name: /Sign in with SSO/i }),
-    ).toBeInTheDocument();
-    // No redirect dispatched.
-    expect(hrefAssignments).toEqual([]);
+    expect(await screen.findByText(/SSO browser sign-in is not available yet/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/Username/i)).toBeNull();
+    expect(screen.queryByRole("tab", { name: /Register/i })).toBeNull();
+    expect(screen.queryByRole("link", { name: /Forgot password/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Sign in with SSO/i })).toBeNull();
   });
 
-  it("`?local=1` cannot restore a server-disabled local auth form", async () => {
-    stubbedSearch = "?local=1";
-    vi.mocked(getAuthConfig).mockResolvedValue({
-      local_auth: { enabled: false },
-      keycloak: {
-        enabled: true,
-        login_url: "/api/v1/auth/keycloak/login",
-        sso_only: true,
-        enrollment_mode: "invite_only",
-      },
-    });
+  it("does not treat ?local=1 as an SSO-mode escape", async () => {
+    window.history.replaceState({}, "", "/auth?local=1");
+    vi.mocked(getAuthConfig).mockResolvedValue(stagedSsoConfig);
 
     renderAuth();
 
-    expect(
-      await screen.findByRole("button", { name: /Sign in with SSO/i }),
-    ).toBeInTheDocument();
+    expect(await screen.findByText(/SSO browser sign-in is not available yet/i)).toBeInTheDocument();
     expect(screen.queryByLabelText(/Username/i)).toBeNull();
   });
 
-  it("`?sso_error=…` suppresses the auto-redirect even in sso_only mode", async () => {
-    // Without this guard an SSO-only deployment whose callback fails
-    // (realm misconfig, IdP downtime, email_verified rejection) would
-    // loop forever: /auth?sso_error → auto-redirect → IdP same fail →
-    // /auth?sso_error → … The user can never see the error or escape.
-    stubbedSearch = "?sso_error=invalid_state";
-    vi.mocked(getAuthConfig).mockResolvedValue({
-      keycloak: {
-        enabled: true,
-        login_url: "/api/v1/auth/keycloak/login",
-        sso_only: true,
-      },
-    });
+  it("fails closed when public auth configuration is unavailable", async () => {
+    vi.mocked(getAuthConfig).mockResolvedValue(AUTH_CONFIG_UNAVAILABLE);
 
     renderAuth();
 
-    // Form renders with the error; the SSO button stays available
-    // for a manual retry.
-    await waitFor(() =>
-      expect(screen.getByLabelText(/Username/i)).toBeInTheDocument(),
-    );
-    expect(screen.getByText(/SSO login failed/i)).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: /Sign in with SSO/i }),
-    ).toBeInTheDocument();
-    // Critical: no auto-redirect was dispatched.
-    expect(hrefAssignments).toEqual([]);
+    expect(await screen.findByText(/configuration could not be verified/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/Username/i)).toBeNull();
   });
 
-  it("does not redirect when sso_only is false (hybrid mode)", async () => {
+  it("shows only a usable SSO option and never auto-redirects", async () => {
     vi.mocked(getAuthConfig).mockResolvedValue({
+      ...stagedSsoConfig,
       keycloak: {
         enabled: true,
+        browser_session_ready: true,
         login_url: "/api/v1/auth/keycloak/login",
-        sso_only: false,
       },
     });
 
     renderAuth();
 
-    await waitFor(() =>
-      expect(screen.getByLabelText(/Username/i)).toBeInTheDocument(),
-    );
-    expect(hrefAssignments).toEqual([]);
+    expect(await screen.findByRole("button", { name: /Sign in with SSO/i })).toBeInTheDocument();
+    expect(screen.queryByLabelText(/Username/i)).toBeNull();
+    expect(navigate).not.toHaveBeenCalled();
   });
 });

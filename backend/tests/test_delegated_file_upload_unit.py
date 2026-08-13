@@ -5,12 +5,12 @@ from __future__ import annotations
 import uuid
 from types import SimpleNamespace
 
-import jwt
 import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 
 from app.api import file_write_context
+from app.config import settings
 from app.services.auth_service import AuthenticatedUser
 
 
@@ -59,40 +59,56 @@ async def test_write_action_normalization_is_small_deterministic_and_fail_closed
         normalize_write_actions(["document_write"])
 
 
-async def test_secondary_resolver_accepts_only_akb_session_jwt_without_mutating_primary_context(
+async def test_secondary_resolver_accepts_only_mode_selected_human_without_mutating_primary_context(
     monkeypatch,
 ):
     from app.models.vault_scope import current_key_class, current_token_id
     from app.services import auth_service
+    from app.services.auth_verifier_profiles import VerifiedPrincipal
 
     delegated = _user(key_class=None, auth_method="jwt", username="alice")
     observed: list[str] = []
+    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+    principal = VerifiedPrincipal(
+        profile_id="local-session-rs256-v2",
+        issuer=settings.local_session_issuer_effective,
+        subject=delegated.user_id,
+        credential_type="session",
+        claims={"iat": 1},
+        audience=settings.local_session_audience_effective,
+    )
 
-    async def _resolve_session(raw: str):
+    def _verify_session(raw: str):
         observed.append(raw)
+        return principal
+
+    async def _project(value):
+        assert value is principal
         return delegated
 
-    monkeypatch.setattr(auth_service, "_resolve_akb_session_jwt", _resolve_session)
-    raw = jwt.encode(
-        {"sub": delegated.user_id},
-        "unit-secret-at-least-32-bytes-long",
-        algorithm="HS256",
-    )
+    monkeypatch.setattr(auth_service, "verify_local_session_rs256_v2", _verify_session)
+    monkeypatch.setattr(auth_service, "project_verified_principal", _project)
+    raw = "delegated-human.jwt"
     token_marker = current_token_id.set("primary-service-token-id")
     class_marker = current_key_class.set("service")
     try:
-        resolved = await auth_service.resolve_akb_session_authorization(f"Bearer {raw}")
+        resolved = await auth_service.resolve_delegated_human_authorization(
+            f"Bearer {raw}"
+        )
         assert resolved is delegated
         assert observed == [raw]
         assert current_token_id.get() == "primary-service-token-id"
         assert current_key_class.get() == "service"
-        assert await auth_service.resolve_akb_session_authorization("Bearer akb_pat") is None
+        assert (
+            await auth_service.resolve_delegated_human_authorization("Bearer akb_pat")
+            is None
+        )
     finally:
         current_key_class.reset(class_marker)
         current_token_id.reset(token_marker)
 
 
-async def test_delegated_actor_requires_service_key_and_active_session(monkeypatch):
+async def test_delegated_actor_requires_service_key_and_active_human(monkeypatch):
     from app.api import deps
 
     service = _user(key_class="service", token_id=str(uuid.uuid4()))
@@ -101,7 +117,7 @@ async def test_delegated_actor_requires_service_key_and_active_session(monkeypat
     async def _resolve(_authorization: str):
         return delegated
 
-    monkeypatch.setattr(deps, "resolve_akb_session_authorization", _resolve)
+    monkeypatch.setattr(deps, "resolve_delegated_human_authorization", _resolve)
     actor = await deps.require_delegated_actor(
         _request("Bearer user.jwt"), service,
     )
@@ -123,7 +139,7 @@ async def test_delegated_actor_requires_service_key_and_active_session(monkeypat
     async def _reject(_authorization: str):
         return None
 
-    monkeypatch.setattr(deps, "resolve_akb_session_authorization", _reject)
+    monkeypatch.setattr(deps, "resolve_delegated_human_authorization", _reject)
     with pytest.raises(HTTPException) as invalid:
         await deps.require_delegated_actor(_request("Bearer stale.jwt"), service)
     assert invalid.value.detail["code"] == "invalid_delegated_authorization"
@@ -136,7 +152,7 @@ async def test_delegated_actor_requires_service_key_and_active_session(monkeypat
             username="not-a-session",
         )
 
-    monkeypatch.setattr(deps, "resolve_akb_session_authorization", _resolve_pat)
+    monkeypatch.setattr(deps, "resolve_delegated_human_authorization", _resolve_pat)
     with pytest.raises(HTTPException) as delegated_pat:
         await deps.require_delegated_actor(_request("Bearer akb_pat"), service)
     assert delegated_pat.value.detail["code"] == "invalid_delegated_authorization"

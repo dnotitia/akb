@@ -42,6 +42,14 @@ TOKEN=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" \
 
 acurl() { curl -sk -H "Authorization: Bearer $TOKEN" "$@"; }
 
+# Keep human sessions and automation credentials distinct. REST assertions use
+# TOKEN; the MCP compatibility section uses this purpose-created PAT.
+MCP_PAT=$(acurl -X POST "$BASE_URL/api/v1/auth/tokens" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"publications-e2e-mcp"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])" 2>/dev/null)
+[ -n "$MCP_PAT" ] && pass "MCP PAT acquired" || { fail "MCP PAT" "no token"; exit 1; }
+
 # Create vault
 R=$(acurl -X POST "$BASE_URL/api/v1/vaults?name=$VAULT&description=Pub%20test")
 [ "$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("name",""))' 2>/dev/null)" = "$VAULT" ] \
@@ -677,8 +685,16 @@ echo ""
 echo "▸ 12. MCP backward compat"
 
 # Init MCP session
-SESS=$(curl -sk -X POST "$BASE_URL/mcp/" \
+# A local user-session JWT is deliberately not an MCP credential.
+JWT_MCP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test-local-session-boundary","version":"0.1"}}}')
+[ "$JWT_MCP_CODE" = "401" ] && pass "Local session JWT rejected by MCP" || fail "MCP local JWT boundary" "HTTP $JWT_MCP_CODE"
+
+SESS=$(curl -sk -X POST "$BASE_URL/mcp/" \
+  -H "Authorization: Bearer $MCP_PAT" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}' \
@@ -686,7 +702,7 @@ SESS=$(curl -sk -X POST "$BASE_URL/mcp/" \
 [ -n "$SESS" ] && pass "MCP session initialized" || fail "MCP init" "no session"
 
 curl -sk -X POST "$BASE_URL/mcp/" \
-  -H "Authorization: Bearer $TOKEN" \
+  -H "Authorization: Bearer $MCP_PAT" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -H "Mcp-Session-Id: $SESS" \
@@ -697,7 +713,7 @@ mcp() {
   local name=$1; shift
   local args=$1
   curl -sk -X POST "$BASE_URL/mcp/" \
-    -H "Authorization: Bearer $TOKEN" \
+    -H "Authorization: Bearer $MCP_PAT" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
     -H "Mcp-Session-Id: $SESS" \
@@ -1023,7 +1039,7 @@ DELOK=$(echo "$DELV" | python3 -c 'import json,sys; print(json.load(sys.stdin).g
 [ "$DELOK" = "True" ] && pass "Cleanup: test vault deleted" || fail "Cleanup vault delete" "$DELV"
 
 # Terminate MCP session
-curl -sk -X DELETE "$BASE_URL/mcp/" -H "Authorization: Bearer $TOKEN" -H "Mcp-Session-Id: $SESS" >/dev/null 2>&1
+curl -sk -X DELETE "$BASE_URL/mcp/" -H "Authorization: Bearer $MCP_PAT" -H "Mcp-Session-Id: $SESS" >/dev/null 2>&1
 
 echo ""
 echo "╔══════════════════════════════════════════╗"

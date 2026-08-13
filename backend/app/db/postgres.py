@@ -210,7 +210,7 @@ async def _apply_migrations() -> None:
         "031_drop_memories_sessions.py",        # drop legacy memories+sessions tables; agent memory is now vault-shaped
         "032_drop_supersedes.py",               # drop never-used documents.supersedes column (status leaned to draft/active/archived)
         "033_users_auth_provider.py",           # users.auth_provider ('local' default | 'keycloak' for JIT-provisioned SSO accounts)
-        "034_oidc_transients.py",               # oidc_transients: short-lived OIDC state + one-time exchange codes (HA-safe; empty when Keycloak off)
+        "034_oidc_transients.py",               # oidc_transients: retained legacy browser-flow schema (unused while Phase 1 routes are staged)
         "035_fix_wikilink_alias_edges.py",      # repair edges whose target_uri carries a wikilink alias ([[…|label]] → …|label); strip alias, re-validate existence, drop orphans
         "036_resource_aliases.py",              # rename/move redirect table (old path/name → current resource id); old akb:// URIs keep resolving after a move
         "037_table_unique_keys_indexes.py",     # vault_tables.unique_keys + .indexes JSONB (declarative DDL metadata; AKB #215)
@@ -247,7 +247,9 @@ async def _apply_migrations() -> None:
         "068_vault_file_lifecycle_indexes.py",  # indexed attachment health counts + stale pending File collection
         "069_document_asset_revision_lock_order.py",  # remove redundant vault FK so manifest writes keep vault→asset lock order
         "070_vault_files_s3_key_lookup.py",  # physical-key reachability + pending-delete barrier indexes
-        "071_app_rollout_resume.py",  # immutable-source new-attempt rollout resume ledger
+        "071_recovery_admin.py",  # explicit singleton recovery administrator + external username snapshot
+        "072_admin_browser_sessions.py",  # short-lived opaque sessions for the dedicated SSO admin client
+        "073_app_rollout_resume.py",  # immutable-source new-attempt rollout resume ledger
     ):
         if filename in applied:
             continue

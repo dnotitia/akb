@@ -15,6 +15,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.api.deps import get_current_user, get_optional_user
 from app.api.routes import (
     access,
+    admin_auth,
     activity,
     assets,
     app_inventory,
@@ -274,7 +275,8 @@ async def _no_store_public_surfaces(request: Request, call_next):
             response.headers["Cache-Control"] = "no-store"
             break
     if (
-        path.startswith("/api/v1/app/installations/")
+        path.startswith("/api/v1/admin/")
+        or path.startswith("/api/v1/app/installations/")
         or path.startswith("/api/v1/app/rollouts")
         or (path.startswith("/api/v1/apps/") and "/rollouts" in path)
         or (
@@ -288,6 +290,7 @@ async def _no_store_public_surfaces(request: Request, call_next):
 
 
 app.include_router(auth.router, prefix="/api/v1", tags=["auth"])
+app.include_router(admin_auth.router, prefix="/api/v1", tags=["admin-auth"])
 app.include_router(app_identity.router, prefix="/api/v1", tags=["app-identity"])
 app.include_router(app_registry.router, prefix="/api/v1", tags=["app-registry"])
 app.include_router(app_inventory.router, prefix="/api/v1", tags=["app-inventory"])

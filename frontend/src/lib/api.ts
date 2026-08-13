@@ -81,36 +81,6 @@ export function getToken(): string | null {
   return _token;
 }
 
-// ── SSO session marker (optional Keycloak) ──
-// Records whether the *current* session was obtained via Keycloak SSO, so
-// "Sign out" can also end the Keycloak session (RP-initiated logout) —
-// otherwise the live KC session would silently re-authenticate on the next
-// SSO click. Local-auth sessions never set this, so their logout is
-// unaffected. We also keep the KC id_token to pass as id_token_hint for a
-// prompt-free logout.
-const SSO_FLAG = "akb_sso";
-const KC_HINT = "akb_kc_id_token";
-
-export function markSsoSession(kcIdToken?: string) {
-  localStorage.setItem(SSO_FLAG, "1");
-  if (kcIdToken) localStorage.setItem(KC_HINT, kcIdToken);
-}
-
-export function clearSsoSession() {
-  localStorage.removeItem(SSO_FLAG);
-  localStorage.removeItem(KC_HINT);
-}
-
-export function isSsoSession(): boolean {
-  return localStorage.getItem(SSO_FLAG) === "1";
-}
-
-/** Backend RP-initiated logout endpoint (bounces to KC end_session → /auth). */
-export function keycloakLogoutUrl(): string {
-  const hint = localStorage.getItem(KC_HINT);
-  return `${API_BASE}/auth/keycloak/logout${hint ? `?id_token_hint=${encodeURIComponent(hint)}` : ""}`;
-}
-
 /**
  * Error thrown by `api()` when the server returns a structured 4xx/5xx body
  * (FastAPI `HTTPException(detail=dict)`). Inherits from `Error` so existing
@@ -247,47 +217,254 @@ export const authLogin = (username: string, password: string) =>
     body: JSON.stringify({ username, password }),
   }).then(parseAuthResponse);
 
+export type AuthMode = "local" | "sso";
+
 export interface AuthConfig {
-  // Optional for compatibility with AKB versions that predate the explicit
-  // server-side local-auth policy. Missing means the legacy enabled default.
-  local_auth?: { enabled: boolean };
+  available: boolean;
+  schema_version: 1 | null;
+  auth_mode: AuthMode | null;
+  local_auth: { enabled: boolean };
   keycloak: {
     enabled: boolean;
+    browser_session_ready: boolean;
     login_url: string | null;
-    // UX preference only. `local_auth.enabled` remains the authoritative
-    // policy; `?local=1` may suppress automatic SSO navigation but cannot
-    // restore a server-disabled local form.
-    sso_only?: boolean;
-    enrollment_mode?: "open" | "invite_only" | "disabled";
   };
-  // Optional — present on newer backends. Tells the connect-snippet UI
-  // whether the OAuth Resource Server path is live so it can offer
-  // `claude mcp add --transport http … && claude mcp login` alongside
-  // the PAT snippet.
-  mcp_oauth?: { enabled: boolean };
+  mcp_oauth: { enabled: boolean };
 }
 
-const _AUTH_CONFIG_FALLBACK: AuthConfig = {
-  local_auth: { enabled: true },
-  keycloak: { enabled: false, login_url: null, sso_only: false },
+export const AUTH_CONFIG_UNAVAILABLE: AuthConfig = {
+  available: false,
+  schema_version: null,
+  auth_mode: null,
+  local_auth: { enabled: false },
+  keycloak: {
+    enabled: false,
+    browser_session_ready: false,
+    login_url: null,
+  },
   mcp_oauth: { enabled: false },
 };
 
-/** Public auth config — drives whether the optional SSO button shows
- * and whether the connect-snippet UI offers the OAuth path. Falls back
- * to all-disabled if the endpoint is unreachable/old. */
-export const getAuthConfig = (): Promise<AuthConfig> =>
-  fetch(`${API_BASE}/auth/config`)
-    .then((r) => (r.ok ? r.json() : _AUTH_CONFIG_FALLBACK))
-    .catch(() => _AUTH_CONFIG_FALLBACK);
+function record(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
 
-/** Redeem the one-time SSO code from the Keycloak callback for an AKB JWT. */
-export const keycloakExchange = (code: string) =>
-  fetch(`${API_BASE}/auth/keycloak/exchange`, {
+function hasExactKeys(
+  value: Record<string, unknown> | null,
+  expected: readonly string[],
+): value is Record<string, unknown> {
+  if (!value) return false;
+  const actual = Object.keys(value).sort();
+  const exact = [...expected].sort();
+  return actual.length === exact.length && actual.every((key, index) => key === exact[index]);
+}
+
+export function parseAuthConfig(value: unknown): AuthConfig {
+  const root = record(value);
+  const localAuth = record(root?.local_auth);
+  const keycloak = record(root?.keycloak);
+  const mcpOauth = record(root?.mcp_oauth);
+  const mode = root?.auth_mode;
+  const loginUrl = keycloak?.login_url;
+  if (
+    !hasExactKeys(root, ["schema_version", "auth_mode", "local_auth", "keycloak", "mcp_oauth"]) ||
+    !hasExactKeys(localAuth, ["enabled"]) ||
+    !hasExactKeys(keycloak, ["enabled", "browser_session_ready", "login_url"]) ||
+    !hasExactKeys(mcpOauth, ["enabled"]) ||
+    root?.schema_version !== 1 ||
+    (mode !== "local" && mode !== "sso") ||
+    typeof localAuth?.enabled !== "boolean" ||
+    typeof keycloak?.enabled !== "boolean" ||
+    typeof keycloak?.browser_session_ready !== "boolean" ||
+    (loginUrl !== null && typeof loginUrl !== "string") ||
+    typeof mcpOauth?.enabled !== "boolean" ||
+    localAuth.enabled !== (mode === "local") ||
+    keycloak.enabled !== (mode === "sso") ||
+    (keycloak.browser_session_ready && (!keycloak.enabled || !loginUrl)) ||
+    (!keycloak.browser_session_ready && loginUrl !== null)
+  ) {
+    return AUTH_CONFIG_UNAVAILABLE;
+  }
+  return {
+    available: true,
+    schema_version: 1,
+    auth_mode: mode,
+    local_auth: { enabled: localAuth.enabled },
+    keycloak: {
+      enabled: keycloak.enabled,
+      browser_session_ready: keycloak.browser_session_ready,
+      login_url: loginUrl,
+    },
+    mcp_oauth: { enabled: mcpOauth.enabled },
+  };
+}
+
+/** Versioned public capabilities. Any transport/schema error is deny-all. */
+export async function getAuthConfig(): Promise<AuthConfig> {
+  try {
+    const response = await fetch(`${API_BASE}/auth/config`);
+    if (!response.ok) return AUTH_CONFIG_UNAVAILABLE;
+    return parseAuthConfig(await response.json());
+  } catch {
+    return AUTH_CONFIG_UNAVAILABLE;
+  }
+}
+
+export interface AdminAuthConfig {
+  available: boolean;
+  schema_version: 1 | null;
+  auth_mode: AuthMode | null;
+  local: { enabled: boolean; login_url: string | null };
+  keycloak: { enabled: boolean; login_url: string | null };
+}
+
+export const ADMIN_AUTH_CONFIG_UNAVAILABLE: AdminAuthConfig = {
+  available: false,
+  schema_version: null,
+  auth_mode: null,
+  local: { enabled: false, login_url: null },
+  keycloak: { enabled: false, login_url: null },
+};
+
+export function parseAdminAuthConfig(value: unknown): AdminAuthConfig {
+  const root = record(value);
+  const local = record(root?.local);
+  const keycloak = record(root?.keycloak);
+  const mode = root?.auth_mode;
+  const localUrl = local?.login_url;
+  const keycloakUrl = keycloak?.login_url;
+  if (
+    !hasExactKeys(root, ["schema_version", "auth_mode", "local", "keycloak"]) ||
+    !hasExactKeys(local, ["enabled", "login_url"]) ||
+    !hasExactKeys(keycloak, ["enabled", "login_url"]) ||
+    root?.schema_version !== 1 ||
+    (mode !== "local" && mode !== "sso") ||
+    typeof local?.enabled !== "boolean" ||
+    typeof keycloak?.enabled !== "boolean" ||
+    (localUrl !== null && typeof localUrl !== "string") ||
+    (keycloakUrl !== null && typeof keycloakUrl !== "string") ||
+    local.enabled !== (mode === "local") ||
+    keycloak.enabled !== (mode === "sso") ||
+    localUrl !== (mode === "local" ? "/api/v1/admin/auth/local/login" : null) ||
+    keycloakUrl !== (mode === "sso" ? "/api/v1/admin/auth/keycloak/login" : null)
+  ) {
+    return ADMIN_AUTH_CONFIG_UNAVAILABLE;
+  }
+  return {
+    available: true,
+    schema_version: 1,
+    auth_mode: mode,
+    local: { enabled: local.enabled, login_url: localUrl },
+    keycloak: { enabled: keycloak.enabled, login_url: keycloakUrl },
+  };
+}
+
+export async function getAdminAuthConfig(): Promise<AdminAuthConfig> {
+  try {
+    const response = await fetch(`${API_BASE}/admin/auth/config`);
+    if (!response.ok) return ADMIN_AUTH_CONFIG_UNAVAILABLE;
+    return parseAdminAuthConfig(await response.json());
+  } catch {
+    return ADMIN_AUTH_CONFIG_UNAVAILABLE;
+  }
+}
+
+export interface AdminSession {
+  schema_version: 1;
+  auth_mode: AuthMode;
+  user: {
+    id: string;
+    username: string;
+    email: string;
+    display_name: string | null;
+    is_admin: true;
+  };
+}
+
+function parseAdminSession(value: unknown): AdminSession {
+  const root = record(value);
+  const user = record(root?.user);
+  const mode = root?.auth_mode;
+  if (
+    !hasExactKeys(root, ["schema_version", "auth_mode", "user"]) ||
+    !hasExactKeys(user, ["id", "username", "email", "display_name", "is_admin"]) ||
+    root?.schema_version !== 1 ||
+    (mode !== "local" && mode !== "sso") ||
+    typeof user?.id !== "string" ||
+    typeof user?.username !== "string" ||
+    typeof user?.email !== "string" ||
+    (user?.display_name !== null && typeof user?.display_name !== "string") ||
+    user?.is_admin !== true
+  ) {
+    throw new Error("Invalid product-admin session response");
+  }
+  return {
+    schema_version: 1,
+    auth_mode: mode,
+    user: {
+      id: user.id,
+      username: user.username,
+      email: user.email,
+      display_name: user.display_name as string | null,
+      is_admin: true,
+    },
+  };
+}
+
+function adminHeaders(headers?: HeadersInit): Headers {
+  const result = new Headers(headers);
+  const token = getToken();
+  if (token) result.set("Authorization", `Bearer ${token}`);
+  return result;
+}
+
+function cookieValue(name: string): string | null {
+  const prefix = `${encodeURIComponent(name)}=`;
+  for (const entry of document.cookie.split(";")) {
+    const candidate = entry.trim();
+    if (candidate.startsWith(prefix)) {
+      return decodeURIComponent(candidate.slice(prefix.length));
+    }
+  }
+  return null;
+}
+
+export async function getAdminSession(): Promise<AdminSession | null> {
+  const response = await fetch(`${API_BASE}/admin/auth/session`, {
+    credentials: "same-origin",
+    headers: adminHeaders(),
+  });
+  if (response.status === 401 || response.status === 403) return null;
+  if (!response.ok) await throwJsonApiError(response);
+  return parseAdminSession(await response.json());
+}
+
+export const adminLocalLogin = (username: string, password: string) =>
+  fetch(`${API_BASE}/admin/auth/local/login`, {
     method: "POST",
+    credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ code }),
+    body: JSON.stringify({ username, password }),
   }).then(parseAuthResponse);
+
+export async function adminLogout(): Promise<{ logout_url: string }> {
+  const headers = adminHeaders();
+  const csrf = cookieValue("akb_admin_csrf");
+  if (csrf) headers.set("X-AKB-Admin-CSRF", csrf);
+  const response = await fetch(`${API_BASE}/admin/auth/logout`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers,
+  });
+  if (!response.ok) await throwJsonApiError(response);
+  const payload = record(await response.json());
+  if (!hasExactKeys(payload, ["logout_url"]) || typeof payload.logout_url !== "string") {
+    throw new Error("Invalid product-admin logout response");
+  }
+  return { logout_url: payload.logout_url };
+}
 
 // ── Auth (token) ──
 export const getMe = () => api<any>("/auth/me");

@@ -8,10 +8,27 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from urllib.parse import urlsplit
 
 from app.config import settings
 from app.db.postgres import close_pool, get_pool, init_db
-from app.services import asset_gc_worker, audit_log, app_rollout_worker, delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, m1_file_transfer_reaper, metadata_worker, s3_delete_worker, sparse_encoder, tool_usage, vault_backfill, write_lane
+from app.services import (
+    asset_gc_worker,
+    audit_log,
+    app_rollout_worker,
+    delete_worker,
+    embed_worker,
+    events_publisher,
+    external_git_poller,
+    http_pool,
+    m1_file_transfer_reaper,
+    metadata_worker,
+    s3_delete_worker,
+    sparse_encoder,
+    tool_usage,
+    vault_backfill,
+    write_lane,
+)
 from app.services.git_service import GitService
 from app.services.native_revision_authority import (
     pre_migration_revision_authority_guard,
@@ -28,12 +45,52 @@ from app.services.vector_store import get_vector_store
 logger = logging.getLogger("akb.lifecycle")
 
 
+def _is_secure_browser_url(value: str) -> bool:
+    """Require HTTPS for browser authorities, with a narrow loopback exception."""
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if (
+        parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    if parsed.scheme == "https":
+        return True
+    return parsed.scheme == "http" and parsed.hostname in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }
+
+
 def _validate_required_settings() -> None:
     """Fail fast on missing required config so misconfigured deploys don't
     silently serve unsigned tokens or produce confusing downstream errors."""
+    auth_mode = settings.require_auth_mode()
+    if auth_mode == "local" and settings.jwt_algorithm != "RS256":
+        raise RuntimeError(
+            "jwt_algorithm must be RS256 for the local-session-rs256-v2 profile; "
+            "HS256 sessions require forced re-login during upgrade"
+        )
+    if settings.mcp_oauth_enabled and settings.api_oauth_audience_effective == settings.mcp_oauth_audience_effective:
+        raise RuntimeError("API and MCP OAuth audiences must be distinct resource identifiers")
     missing: list[str] = []
-    if not settings.jwt_secret:
-        missing.append("AKB_JWT_SECRET (signs auth tokens — use a strong random string)")
+    if not settings.system_hmac_secret_effective:
+        missing.append("system_hmac_secret (internal non-session HMAC material — use a strong random string)")
+    if auth_mode == "local":
+        if not settings.local_session_private_key_path.strip():
+            missing.append("local_session_private_key_path (auth_mode is local)")
+        if not settings.local_session_jwks_path.strip():
+            missing.append("local_session_jwks_path (auth_mode is local)")
+        if not settings.local_session_issuer_effective:
+            missing.append("local_session_issuer or public_base_url (auth_mode is local)")
+        if not settings.local_session_audience_effective:
+            missing.append("local_session_audience or public_base_url (auth_mode is local)")
     if not settings.db_password:
         missing.append("AKB_DB_PASSWORD")
     if not settings.public_base_url:
@@ -42,22 +99,28 @@ def _validate_required_settings() -> None:
             "publication response carries an absolute share_url; e.g. "
             "https://akb.example.com)"
         )
-    # Keycloak is OPTIONAL — only validate its config when it's turned on.
-    # When enabled, an incomplete config would 500 mid-login instead of
-    # failing the deploy, so fail fast here.
+    # A configured Keycloak authority always needs its pinned issuer inputs.
+    # Ordinary SSO browser custody remains staged for Phase 4. The dedicated
+    # Phase 2 product-admin client is active, confidential, and independently
+    # validated here.
     if settings.keycloak_enabled:
-        if not settings.keycloak_server_url:
+        if not settings.keycloak_server_url.strip():
             missing.append("keycloak_server_url (keycloak_enabled is true)")
-        if not settings.keycloak_redirect_uri:
-            missing.append(
-                "keycloak_redirect_uri (keycloak_enabled is true — the "
-                "backend callback URL registered on the Keycloak client)"
-            )
-        if not settings.keycloak_public_client and not settings.keycloak_client_secret:
-            missing.append(
-                "keycloak_client_secret (confidential client — set it in "
-                "secret.yaml, or set keycloak_public_client: true for PKCE)"
-            )
+        if not settings.keycloak_realm.strip():
+            missing.append("keycloak_realm (keycloak_enabled is true)")
+        if settings.sso_human_auth_enabled:
+            if not settings.keycloak_human_client_ids:
+                missing.append(
+                    "keycloak_client_id or companion client ID (auth_mode is sso — human API client allowlist is empty)"
+                )
+            if not settings.api_oauth_audience_effective.strip():
+                missing.append("api_oauth_audience (auth_mode is sso — human API resource audience is empty)")
+            if not settings.keycloak_admin_client_id.strip():
+                missing.append("keycloak_admin_client_id (auth_mode is sso — product-admin client is empty)")
+            if not settings.keycloak_admin_client_secret:
+                missing.append(
+                    "keycloak_admin_client_secret (auth_mode is sso — confidential product-admin client is required)"
+                )
     # MCP-OAuth (the Resource Server path) reuses the Keycloak JWKS,
     # issuer, and audience-mapped scopes — so it's only meaningful when
     # `keycloak_enabled` is also true. A deployment with mcp_oauth on +
@@ -71,9 +134,22 @@ def _validate_required_settings() -> None:
             "either turn keycloak on, or turn mcp_oauth off)"
         )
     if missing:
-        raise RuntimeError(
-            "Required configuration missing:\n  - " + "\n  - ".join(missing)
-        )
+        raise RuntimeError("Required configuration missing:\n  - " + "\n  - ".join(missing))
+    if auth_mode == "sso":
+        if settings.keycloak_admin_client_id in settings.keycloak_human_client_ids:
+            raise RuntimeError("keycloak_admin_client_id must be dedicated to the product-admin surface")
+        if not _is_secure_browser_url(settings.public_base_url):
+            raise RuntimeError(
+                "auth_mode=sso requires an HTTPS public_base_url; plain HTTP is allowed only on loopback"
+            )
+        if not _is_secure_browser_url(settings.keycloak_server_url):
+            raise RuntimeError(
+                "auth_mode=sso requires an HTTPS public Keycloak URL; plain HTTP is allowed only on loopback"
+            )
+    if auth_mode == "local":
+        from app.services.local_session_keys import get_local_session_keyset
+
+        get_local_session_keyset()
 
 
 async def init_storage() -> None:
@@ -179,7 +255,15 @@ def start_workers() -> None:
     # Git mutations run here so blocked/slow commits can never crowd git
     # READS out of asyncio.to_thread's shared default executor.
     write_lane.start_commit_pool()
-    started = ["tokenizer_pool", "git_commit_pool", "embed_worker", "delete_worker", "app_rollout_worker", "bm25_stats_refresher", "vault_backfill"]
+    started = [
+        "tokenizer_pool",
+        "git_commit_pool",
+        "embed_worker",
+        "delete_worker",
+        "app_rollout_worker",
+        "bm25_stats_refresher",
+        "vault_backfill",
+    ]
     if bare_git_selected and settings.external_git_enabled:
         started.append("external_git_poller")
     if m1_file_transfer_reaper.enabled():
@@ -202,9 +286,7 @@ def start_workers() -> None:
     # LLM consumer in the request-independent path, so it still stays off when
     # LLM isn't configured (no retry/abandon noise for OSS users without a key).
     if not bare_git_selected:
-        logger.info(
-            "metadata_worker disabled (document revision backend is not Bare Git)"
-        )
+        logger.info("metadata_worker disabled (document revision backend is not Bare Git)")
     elif not settings.external_git_enabled:
         logger.info(
             "metadata_worker disabled (external_git_enabled=false; it only "
@@ -284,5 +366,6 @@ async def shutdown_storage() -> None:
     # Close the optional Keycloak OIDC client if it was ever constructed.
     if settings.keycloak_enabled:
         from app.services.keycloak_oidc import get_keycloak_oidc
+
         await get_keycloak_oidc().aclose()
     await close_pool()

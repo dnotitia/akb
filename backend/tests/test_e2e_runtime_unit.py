@@ -234,17 +234,24 @@ def test_runtime_root_is_private_and_separate(tmp_path):
         assert stat.S_IMODE(directory.stat().st_mode) == 0o700
 
 
-def test_runtime_configures_distinct_app_token_signing_secret(tmp_path):
+def test_runtime_configures_local_auth_mode_keys_and_distinct_app_token_secret(tmp_path):
     runtime = E2ERuntime(make_config(tmp_path))
     prepare_private_runtime_root(runtime.config.runtime_root)
 
     runtime._write_config()
 
+    app_config = yaml.safe_load(
+        (runtime.config.config_dir / "app.yaml").read_text(encoding="utf-8")
+    )
     secret_config = yaml.safe_load(
         (runtime.config.config_dir / "secret.yaml").read_text(encoding="utf-8")
     )
+    assert app_config["auth_mode"] == "local"
+    assert app_config["jwt_algorithm"] == "RS256"
+    assert Path(app_config["local_session_private_key_path"]).is_file()
+    assert Path(app_config["local_session_jwks_path"]).is_file()
     assert secret_config["app_token_secret"]
-    assert secret_config["app_token_secret"] != secret_config["jwt_secret"]
+    assert secret_config["app_token_secret"] != secret_config["system_hmac_secret"]
 
 
 def test_suite_summary_uses_last_complete_line_and_fails_closed():

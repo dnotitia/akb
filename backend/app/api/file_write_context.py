@@ -46,7 +46,7 @@ async def resolve_file_read_actor(
     """Resolve the uploader identity used by an unclaimed-image preview.
 
     Normal readers use their own username. An action-limited service request
-    that forwards a delegated user session must be matched to the same human
+    that forwards a delegated human credential must be matched to the same
     identity recorded by the upload route; claimed document images remain
     authorized independently through their document references.
     """

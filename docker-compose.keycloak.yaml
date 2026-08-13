@@ -1,25 +1,40 @@
-# OPTIONAL local Keycloak overlay — for developing/testing the optional
-# Keycloak SSO login path AND the MCP OAuth Resource Server path
-# (claude.ai / Claude Code Custom Connectors). NOT part of the default stack.
+# OPTIONAL local Keycloak overlay — for developing/testing the route-selected
+# Keycloak verifier, the dedicated product-admin browser login, and the MCP
+# OAuth Resource Server path. Ordinary-user browser login remains staged.
+# This overlay is NOT part of the default stack.
 #
 # Usage:
 #   docker compose -f docker-compose.yaml -f docker-compose.keycloak.yaml up
 #
-# === SSO path === enable in config/app.yaml (matches the imported realm
-# `deploy/keycloak-dev/akb-realm.json` and the split localhost/container URLs):
+# === Human API access-token path === enable in config/app.yaml (matches the
+# imported realm `deploy/keycloak-dev/akb-realm.json` and split URLs):
 #
+#   auth_mode: sso
 #   keycloak_enabled: true
 #   keycloak_server_url: "http://localhost:8080"      # browser-facing → issuer
 #   keycloak_internal_url: "http://keycloak:8080"     # backend → keycloak container
 #   keycloak_realm: "akb"
 #   keycloak_client_id: "akb-web"
+#   keycloak_admin_client_id: "akb-admin"
 #   keycloak_verify_ssl: false
-#   keycloak_redirect_uri: "http://localhost:3000/api/v1/auth/keycloak/callback"
+#   api_oauth_audience: "http://localhost:8000/api"
+#   public_base_url: "http://localhost:3000"          # same-origin SPA + /api proxy
 #
-# and in config/secret.yaml:
-#   keycloak_client_secret: "local-akb-dev-secret"
+# In config/secret.yaml:
+#   keycloak_admin_client_secret: "local-akb-admin-dev-secret"
 #
-# Test user (in the imported realm): alice / alice-password (alice@example.com).
+# Pre-bind the imported product-admin fixture before opening
+# http://localhost:3000/admin (password: product-admin-password):
+#
+#   docker compose exec backend python -m app.cli provision-recovery-admin sso \
+#     --username product-admin --email product-admin@example.com \
+#     --issuer http://localhost:8080/realms/akb \
+#     --subject 00000000-0000-4000-8000-000000000001
+#
+# Ordinary test user: alice / alice-password (alice@example.com).
+# The `akb-web` fixed dev secret may be used by a headless test client to
+# obtain an ordinary API token. AKB consumes only the separate `akb-admin`
+# secret for its active product-admin callback in this phase.
 #
 # === MCP OAuth path === additionally:
 #
@@ -29,12 +44,15 @@
 #                             # MUST match the audience baked into the
 #                             # akb:vault:* scope mappers in akb-realm.json
 #
-# For E2E / CI (`backend/tests/test_mcp_oauth_e2e.sh`) the realm ships
-# `akb-mcp-test` — a confidential service-account client (secret
-# "local-akb-mcp-test-secret") with `akb:vault:read|write` as default
-# scopes. It mints access tokens via the client_credentials grant so
-# the test exercises the Resource Server path headlessly, without a
-# browser DCR roundtrip.
+# To test MCP OAuth while keeping human login local, use `auth_mode: local`
+# with the same Keycloak authority + `mcp_oauth_enabled: true`; no human OIDC
+# redirect/client settings are required for that resource-server-only mode.
+#
+# For local E2E (`backend/tests/test_mcp_oauth_e2e.sh`), the `alice` fixture
+# uses the `akb-web` direct-access grant to mint a human access token without
+# a browser roundtrip. The realm's `akb-mcp-test` service-account client stays
+# available for legacy/manual experiments but is intentionally not accepted by
+# the human verifier profile.
 #
 # Real Claude Code / claude.ai validation: the local Keycloak overlay
 # works for headless E2E but Claude Code's OAuth discovery requires
@@ -44,7 +62,7 @@
 # walkthrough.
 #
 # The realm import ships FIXED dev client secrets ("local-akb-dev-secret",
-# "local-akb-mcp-test-secret"). Throwaway local values (same spirit as
+# "local-akb-mcp-test-secret", "local-akb-admin-dev-secret"). Throwaway local values (same spirit as
 # the hard-coded `akb` Postgres password in docker-compose.yaml) — never
 # reuse them anywhere real.
 

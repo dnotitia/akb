@@ -74,11 +74,11 @@ async def test_managed_account_query_uses_one_exact_database_snapshot(monkeypatc
         monkeypatch.setattr(account_service, "get_pool", _get_pool)
         settings = account_service.settings
         for field, value in {
+            "auth_mode": "sso",
             "keycloak_enabled": True,
             "keycloak_enrollment_mode": "invite_only",
             "keycloak_link_by_email": False,
             "keycloak_require_verified_email": True,
-            "local_auth_enabled": False,
             "keycloak_server_url": "https://id.example.com",
             "keycloak_realm": "akb-platform",
         }.items():

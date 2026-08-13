@@ -239,7 +239,7 @@ export default function HomePage() {
   useEffect(() => {
     let cancelled = false;
     getAuthConfig().then((cfg) => {
-      if (!cancelled) setOauthEnabled(!!cfg.mcp_oauth?.enabled);
+      if (!cancelled) setOauthEnabled(cfg.available && cfg.mcp_oauth.enabled);
     });
     return () => {
       cancelled = true;
@@ -720,6 +720,7 @@ export default function HomePage() {
         open={quickstartOpen}
         onOpenChange={setQuickstartOpen}
         onTokenCreated={loadPATs}
+        mcpOauthEnabled={oauthEnabled}
       />
     </div>
   );

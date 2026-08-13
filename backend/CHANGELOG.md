@@ -5,7 +5,29 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
-## Unreleased
+## 0.14.2 — 2026-08-13  *(feat — exact PAT authority self-verification)*
+
+### Added PAT authority self-verification
+
+Managed clients can verify that the authenticating PAT has an exact expected
+Vault scope and effective writer authority without performing a synthetic
+write. The endpoint returns only the current token id, canonical scope, and
+verified Vault roles and write actions; it does not expose token material, ACLs, or write-policy
+details.
+
+## 0.14.1 — 2026-08-12  *(fix — name the exception class behind a degraded hybrid search)*
+
+### Fixed an undiagnosable degraded-search log line
+
+When `hybrid_search` fails for a reason the pgvector driver does not convert
+into `VectorStoreUnavailable`, search degrades to an empty result and logs the
+cause. That log rendered only `str(e)`, so the exception classes that actually
+reach it in production — ones carrying an empty message — produced
+`vector hybrid_search failed ()` and named nothing. A search that silently
+returned zero rows was therefore not diagnosable from the logs. The line now
+records the exception class and the raising frame.
+
+## 0.14.0 — 2026-08-12  *(feat — inline document images; PostgreSQL Native revision mode; app release rollout)*
 
 ### Added generic app control-plane registry, typed SDK, and resume attempts
 

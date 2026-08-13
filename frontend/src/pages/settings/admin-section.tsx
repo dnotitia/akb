@@ -20,10 +20,17 @@ interface Props {
   user: User;
   users: AdminUser[] | null;
   usersError: boolean;
+  localPasswordEnabled: boolean;
   onReloadUsers: () => void;
 }
 
-export function AdminSection({ user, users, usersError, onReloadUsers }: Props) {
+export function AdminSection({
+  user,
+  users,
+  usersError,
+  localPasswordEnabled,
+  onReloadUsers,
+}: Props) {
   const [adminQuery, setAdminQuery] = useState("");
   const [adminSort, setAdminSort] = useState<AdminSort>("recent");
   const debouncedQuery = useDebounce(adminQuery, 200);
@@ -191,16 +198,18 @@ export function AdminSection({ user, users, usersError, onReloadUsers }: Props) 
                       </span>
                     ) : (
                       <>
-                        <button
-                          type="button"
-                          onClick={() => setResetTarget(u)}
-                          title={`Reset password for ${u.username}`}
-                          aria-label={`Reset password for ${u.username}`}
-                          className="inline-flex items-center gap-1 px-2 min-h-[36px] rounded-[var(--radius-sm)] text-xs text-foreground-muted hover:text-primary hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-                        >
-                          <Key className="h-3 w-3" aria-hidden />
-                          Reset
-                        </button>
+                        {localPasswordEnabled && (
+                          <button
+                            type="button"
+                            onClick={() => setResetTarget(u)}
+                            title={`Reset password for ${u.username}`}
+                            aria-label={`Reset password for ${u.username}`}
+                            className="inline-flex items-center gap-1 px-2 min-h-[36px] rounded-[var(--radius-sm)] text-xs text-foreground-muted hover:text-primary hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                          >
+                            <Key className="h-3 w-3" aria-hidden />
+                            Reset
+                          </button>
+                        )}
                         <button
                           onClick={() => setPendingDeleteUser(u)}
                           disabled={deletingId === u.id}
@@ -238,14 +247,16 @@ export function AdminSection({ user, users, usersError, onReloadUsers }: Props) 
         onConfirm={confirmDeleteUser}
       />
 
-      <AdminResetPasswordDialog
-        userId={resetTarget?.id ?? ""}
-        username={resetTarget?.username ?? ""}
-        open={resetTarget !== null}
-        onOpenChange={(o) => {
-          if (!o) setResetTarget(null);
-        }}
-      />
+      {localPasswordEnabled && (
+        <AdminResetPasswordDialog
+          userId={resetTarget?.id ?? ""}
+          username={resetTarget?.username ?? ""}
+          open={resetTarget !== null}
+          onOpenChange={(o) => {
+            if (!o) setResetTarget(null);
+          }}
+        />
+      )}
     </>
   );
 }

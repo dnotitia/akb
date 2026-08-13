@@ -2,10 +2,12 @@ import { useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { ArrowLeft } from "lucide-react";
 import {
+  getAuthConfig,
   getMe,
   listPATs,
   getToken,
   adminListUsers,
+  type AuthConfig,
   type AdminUser,
 } from "@/lib/api";
 import {
@@ -27,6 +29,7 @@ export default function SettingsPage() {
   const [patsError, setPatsError] = useState(false);
   const [users, setUsers] = useState<AdminUser[] | null>(null);
   const [usersError, setUsersError] = useState(false);
+  const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
 
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
@@ -57,14 +60,21 @@ export default function SettingsPage() {
       location.href = "/auth";
       return;
     }
-    getMe()
+    let cancelled = false;
+    void getMe()
       .then((u) => {
-        setUser(u);
+        if (!cancelled) setUser(u);
       })
       .catch(() => {
         location.href = "/auth";
       });
-    loadPATs();
+    void getAuthConfig().then((config) => {
+      if (!cancelled) setAuthConfig(config);
+    });
+    void loadPATs();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   async function loadPATs() {
@@ -116,6 +126,12 @@ export default function SettingsPage() {
     rawTab && allowedTabs.includes(rawTab as TabId)
       ? (rawTab as TabId)
       : "profile";
+  const localPasswordEnabled =
+    authConfig?.available === true &&
+    authConfig.auth_mode === "local" &&
+    authConfig.local_auth.enabled;
+  const mcpOauthEnabled =
+    authConfig?.available === true && authConfig.mcp_oauth.enabled;
 
   const setTab = (v: string) => {
     const next = new URLSearchParams(searchParams);
@@ -172,6 +188,8 @@ export default function SettingsPage() {
         <TabsContent value="profile" className="pt-6 space-y-6">
           <ProfileSection
             user={user}
+            localPasswordEnabled={localPasswordEnabled}
+            localProfileEditingEnabled={localPasswordEnabled}
             onUserUpdate={(patch) =>
               setUser((u) => (u ? { ...u, ...patch } : u))
             }
@@ -182,6 +200,7 @@ export default function SettingsPage() {
           <TokensSection
             pats={pats}
             patsError={patsError}
+            mcpOauthEnabled={mcpOauthEnabled}
             onReloadPats={loadPATs}
           />
         </TabsContent>
@@ -203,6 +222,7 @@ export default function SettingsPage() {
               user={user}
               users={users}
               usersError={usersError}
+              localPasswordEnabled={localPasswordEnabled}
               onReloadUsers={loadUsers}
             />
           </TabsContent>

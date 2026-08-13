@@ -10,7 +10,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { createPAT, getAuthConfig, revokePAT } from "@/lib/api";
+import { createPAT, revokePAT } from "@/lib/api";
 import { formatDate, timeAgo } from "@/lib/utils";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -43,10 +43,16 @@ export interface PAT {
 interface Props {
   pats: PAT[] | null;
   patsError: boolean;
+  mcpOauthEnabled: boolean;
   onReloadPats: () => void;
 }
 
-export function TokensSection({ pats, patsError, onReloadPats }: Props) {
+export function TokensSection({
+  pats,
+  patsError,
+  mcpOauthEnabled,
+  onReloadPats,
+}: Props) {
   const [newName, setNewName] = useState("");
   const [newPat, setNewPat] = useState<string | null>(null);
   const [showPat, setShowPat] = useState<boolean>(true);
@@ -63,21 +69,7 @@ export function TokensSection({ pats, patsError, onReloadPats }: Props) {
   const [pendingRevokePat, setPendingRevokePat] = useState<PAT | null>(null);
 
   const [clientTab, setClientTab] = useState<ClientTab>("claude");
-  // OAuth path is gated on the backend advertising mcp_oauth.enabled.
-  // Fetched once on mount; stays `false` if the auth-config endpoint is
-  // a pre-MCP-OAuth backend (the field will be absent and the optional
-  // chain falls through).
-  const [oauthEnabled, setOauthEnabled] = useState(false);
   const [connectMode, setConnectMode] = useState<ConnectMode>("pat");
-  useEffect(() => {
-    let cancelled = false;
-    getAuthConfig().then((cfg) => {
-      if (!cancelled) setOauthEnabled(!!cfg.mcp_oauth?.enabled);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
   // OAuth snippets cover only the agents whose remote-HTTP MCP support
   // is solid (Claude Code, Cursor, VS Code). Codex / OpenClaw still
   // route through the stdio PAT proxy, so a tab in OAuth mode that has
@@ -429,7 +421,7 @@ export function TokensSection({ pats, patsError, onReloadPats }: Props) {
                     OAuth is the lighter UX (no token to mint or rotate) but
                     requires a configured OIDC provider on the backend; the
                     PAT flow keeps working unchanged in either mode. */}
-                {oauthEnabled && (
+                {mcpOauthEnabled && (
                   <div className="flex items-center gap-2 text-xs">
                     <span className="coord">Auth</span>
                     <div className="inline-flex rounded-[var(--radius-sm)] border border-border overflow-hidden">

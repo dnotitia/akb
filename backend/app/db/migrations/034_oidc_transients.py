@@ -1,23 +1,9 @@
-"""Migration 034: `oidc_transients` — short-lived OIDC flow state.
+"""Migration 034: retain the legacy ``oidc_transients`` schema.
 
-The optional Keycloak login flow has two short-lived secrets that must
-survive the redirect round-trip AND work when AKB runs more than one
-backend replica (the login redirect and the callback can land on
-different pods, so in-process dicts would lose the state):
-
-- ``kind='state'``    — CSRF state token + (for PKCE clients) the
-                        code_verifier + the post-login redirect path.
-                        Issued by /auth/keycloak/login, consumed by the
-                        callback.
-- ``kind='exchange'`` — a one-time opaque code mapped to the freshly
-                        minted AKB JWT + user payload. Issued by the
-                        callback, consumed by /auth/keycloak/exchange so
-                        the token is delivered over a POST body instead
-                        of riding in a redirect URL.
-
-Both are single-use (consumed via DELETE … RETURNING) and TTL-bounded
-(``expires_at``). The table is harmless when Keycloak is disabled — it
-simply stays empty.
+The dedicated Phase 2 product-admin client uses a namespaced, single-use
+``admin-state-v1`` record whose payload also binds the initiating browser by
+an opaque-cookie hash. Ordinary SSO browser routes remain staged and may reuse
+a different kind only as part of the Phase 4 browser-session design.
 
 Idempotent: ``CREATE TABLE IF NOT EXISTS``.
 """

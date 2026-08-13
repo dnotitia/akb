@@ -14,12 +14,10 @@
 # request reaches PG. The denial is therefore PG refusing the `akb_token_<tid>`
 # role, whose membership = owner-ACL ∩ scope.
 #
-# The user is the first-registered account (admin on a fresh DB), so the
-# out-of-scope denial ALSO demonstrates that a scoped ADMIN token does not
-# bypass (the executor switches to akb_token_<tid> with precedence over the
-# is_admin bypass). And reads are confined on THIS surface too (stricter than
-# surface 1's read-broad doc tools — defense-in-depth on the raw-SQL power
-# tool), which test 4 asserts.
+# The user owns both test vaults, so the out-of-scope denial demonstrates that
+# ownership does not bypass the scoped PostgreSQL role. Reads are confined on
+# THIS surface too (stricter than surface 1's read-broad doc tools —
+# defense-in-depth on the raw-SQL power tool), which test 4 asserts.
 #
 set -uo pipefail
 

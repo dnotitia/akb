@@ -1048,7 +1048,18 @@ class SearchService:
         except Exception as e:  # noqa: BLE001
             # Unexpected (e.g. seahorse filter-size overflow from a giant IN list
             # — the #189 silent-failure mode). Log loudly + surface the signal.
-            logger.error("vector hybrid_search failed (%s); degraded empty result", e)
+            #
+            # Log the exception CLASS, not just str(e). The classes that actually
+            # show up here under load — asyncio/asyncpg timeouts, cancellations —
+            # carry an empty message, so a bare "%s" renders the useless
+            # "hybrid_search failed ()" and the operator learns nothing about a
+            # search that silently returned zero rows. exc_info keeps the driver
+            # frame that raised, which is what separates "query too slow" from
+            # "filter payload too large".
+            logger.error(
+                "vector hybrid_search failed (%s: %s); degraded empty result",
+                type(e).__name__, e, exc_info=True,
+            )
             return [], "vector_store_error"
 
     async def grep(

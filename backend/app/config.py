@@ -19,8 +19,10 @@ per deployment without re-rendering config files.
 import ipaddress
 import re
 import uuid
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -52,6 +54,174 @@ NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME = "akb_revision_m1_measurement"
 
 _DNS1123_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _NATIVE_RUNTIME_IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+AuthMode = Literal["local", "sso"]
+LegacyAuthModeStatus = Literal[
+    "local_only", "strict_sso", "ambiguous_hybrid", "invalid"
+]
+
+
+class AuthModeConfigurationError(RuntimeError):
+    """Safe-to-log failure at the canonical human-auth mode boundary."""
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyAuthModeClassification:
+    """Diagnostic-only classification for a later explicit migration command."""
+
+    status: LegacyAuthModeStatus
+    derived_mode: AuthMode | None
+    diagnostic: str
+
+
+def classify_legacy_auth_mode(
+    *,
+    local_auth_enabled: bool,
+    keycloak_enabled: bool,
+    keycloak_sso_only: bool,
+) -> LegacyAuthModeClassification:
+    """Classify legacy flags without selecting a mode for normal startup."""
+    if keycloak_sso_only and not keycloak_enabled:
+        return LegacyAuthModeClassification(
+            status="invalid",
+            derived_mode=None,
+            diagnostic=(
+                "keycloak_sso_only is enabled while the Keycloak authority is disabled"
+            ),
+        )
+    if local_auth_enabled and not keycloak_enabled:
+        return LegacyAuthModeClassification(
+            status="local_only",
+            derived_mode="local",
+            diagnostic="only local human authentication is enabled",
+        )
+    if not local_auth_enabled and keycloak_enabled:
+        return LegacyAuthModeClassification(
+            status="strict_sso",
+            derived_mode="sso",
+            diagnostic="local human authentication is disabled and Keycloak is enabled",
+        )
+    if local_auth_enabled and keycloak_enabled:
+        return LegacyAuthModeClassification(
+            status="ambiguous_hybrid",
+            derived_mode=None,
+            diagnostic="legacy local and Keycloak human login paths are both enabled",
+        )
+    return LegacyAuthModeClassification(
+        status="invalid",
+        derived_mode=None,
+        diagnostic="both legacy human authentication paths are disabled",
+    )
+
+
+def _auth_config_bool(
+    values: Mapping[str, object],
+    name: str,
+    *,
+    default: bool,
+) -> bool:
+    if name not in values:
+        return default
+    value = values[name]
+    if type(value) is not bool:
+        raise AuthModeConfigurationError(
+            f"{name} must be a YAML boolean (true or false)"
+        )
+    return cast(bool, value)
+
+
+def _resolve_auth_mode_config(
+    values: Mapping[str, object],
+    *,
+    require_mode: bool,
+) -> dict[str, object]:
+    """Validate canonical mode and derive deprecated compatibility booleans."""
+    resolved = dict(values)
+    if "auth_mode" not in values or values["auth_mode"] in (None, ""):
+        if not require_mode:
+            return resolved
+        classification = classify_legacy_auth_mode(
+            local_auth_enabled=_auth_config_bool(
+                values, "local_auth_enabled", default=True
+            ),
+            keycloak_enabled=_auth_config_bool(
+                values, "keycloak_enabled", default=False
+            ),
+            keycloak_sso_only=_auth_config_bool(
+                values, "keycloak_sso_only", default=False
+            ),
+        )
+        raise AuthModeConfigurationError(
+            "auth_mode is required in runtime YAML and must be explicitly set to "
+            "'local' or 'sso'; legacy flags classify as "
+            f"{classification.status} ({classification.diagnostic}), but startup "
+            "will not infer or persist a mode. Set auth_mode explicitly before restart."
+        )
+
+    raw_mode = values["auth_mode"]
+    if raw_mode not in ("local", "sso"):
+        raise AuthModeConfigurationError(
+            "auth_mode must be 'local' or 'sso'; no other or hybrid mode is supported"
+        )
+    mode = cast(AuthMode, raw_mode)
+
+    local_auth_enabled = _auth_config_bool(
+        values, "local_auth_enabled", default=mode == "local"
+    )
+    expected_local_auth = mode == "local"
+    if "local_auth_enabled" in values and local_auth_enabled is not expected_local_auth:
+        configured = str(local_auth_enabled).lower()
+        expected = str(expected_local_auth).lower()
+        raise AuthModeConfigurationError(
+            f"auth_mode={mode} contradicts local_auth_enabled={configured}; remove "
+            f"the deprecated flag or set local_auth_enabled={expected}"
+        )
+
+    keycloak_sso_only = _auth_config_bool(
+        values, "keycloak_sso_only", default=mode == "sso"
+    )
+    expected_sso_only = mode == "sso"
+    if "keycloak_sso_only" in values and keycloak_sso_only is not expected_sso_only:
+        configured = str(keycloak_sso_only).lower()
+        expected = str(expected_sso_only).lower()
+        raise AuthModeConfigurationError(
+            f"auth_mode={mode} contradicts keycloak_sso_only={configured}; remove "
+            f"the deprecated flag or set keycloak_sso_only={expected}"
+        )
+
+    keycloak_enabled = _auth_config_bool(
+        values, "keycloak_enabled", default=False
+    )
+    mcp_oauth_enabled = _auth_config_bool(
+        values, "mcp_oauth_enabled", default=False
+    )
+    if mode == "sso" and not keycloak_enabled:
+        raise AuthModeConfigurationError(
+            "auth_mode=sso contradicts keycloak_enabled=false; auth_mode=sso "
+            "requires keycloak_enabled=true and a configured OIDC authority"
+        )
+    if mode == "local" and keycloak_enabled and not mcp_oauth_enabled:
+        raise AuthModeConfigurationError(
+            "auth_mode=local contradicts keycloak_enabled=true without an explicit "
+            "non-human use; local mode with a Keycloak authority requires "
+            "mcp_oauth_enabled=true"
+        )
+    if mcp_oauth_enabled and not keycloak_enabled:
+        raise AuthModeConfigurationError(
+            "mcp_oauth_enabled=true contradicts keycloak_enabled=false; the MCP OAuth "
+            "resource server requires a configured Keycloak authority"
+        )
+    if _auth_config_bool(values, "keycloak_link_by_email", default=False):
+        raise AuthModeConfigurationError(
+            "keycloak_link_by_email=true is no longer accepted by canonical runtime; "
+            "external identities must be prebound or created from an unclaimed "
+            "issuer/subject without adopting an account by email"
+        )
+
+    resolved["auth_mode"] = mode
+    resolved["local_auth_enabled"] = expected_local_auth
+    resolved["keycloak_sso_only"] = expected_sso_only
+    return resolved
 
 
 def is_dns1123_namespace(value: str) -> bool:
@@ -230,7 +400,19 @@ class ExternalGitHostRule(BaseModel):
 class Settings(BaseModel):
     # Forbid unknown keys so a typo in app.yaml / secret.yaml fails loudly
     # instead of being silently dropped (pydantic default is 'ignore').
-    model_config = ConfigDict(extra="forbid")
+    # Never include the merged config input in validation errors: it can contain
+    # secrets loaded from secret.yaml.
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def resolve_explicit_auth_mode(cls, values: object) -> object:
+        # Direct Settings() construction remains available to isolated unit
+        # tests. Whenever a canonical mode is supplied, however, it is already
+        # authoritative and the deprecated booleans are only checked/derived.
+        if isinstance(values, Mapping) and "auth_mode" in values:
+            return _resolve_auth_mode_config(values, require_mode=False)
+        return values
 
     # Database
     db_host: str = "localhost"
@@ -595,10 +777,31 @@ class Settings(BaseModel):
     document_asset_gc_interval_secs: int = Field(default=300, ge=10, le=86400)
     document_asset_upload_body_timeout_secs: float = Field(default=60.0, ge=1.0, le=900.0)
 
-    # Auth — jwt_secret must be set (validated at startup in lifecycle.init_storage)
+    # Deprecated Phase-1 compatibility input. It is never a human-session
+    # signing authority after the local-session-rs256-v2 cutover. Canonical
+    # runtime config rejects it when supplied; `system_hmac_secret` owns the
+    # remaining publication/cursor HMAC capabilities.
     jwt_secret: str = ""
-    jwt_algorithm: str = "HS256"
+    jwt_algorithm: str = "RS256"
     jwt_expire_hours: int = 24
+
+    # Internal non-session HMAC material. This must be independent of the
+    # local-session private key and of app-token signing material.
+    system_hmac_secret: str = ""
+
+    # Local human-session v2. The keyset is generated explicitly by the
+    # operator, persisted outside the image, and loaded read-only at runtime.
+    # A public JWKS may retain old v2 verification keys for bounded rotation;
+    # the private PEM always identifies the single active signer.
+    local_session_private_key_path: str = ""
+    local_session_jwks_path: str = ""
+    local_session_issuer: str = ""
+    local_session_audience: str = ""
+
+    # Canonical install-time discriminator for human authentication. None is
+    # allowed only so unrelated tests can construct Settings directly; the real
+    # YAML loader rejects a missing mode before the runtime can start.
+    auth_mode: AuthMode | None = None
 
     # App principals use a separate exchange-only carrier. Keeping a distinct
     # signing secret makes an app token cryptographically unusable as a user
@@ -609,23 +812,17 @@ class Settings(BaseModel):
     app_token_ttl_seconds: int = Field(default=300, ge=30, le=3600)
     app_credential_overlap_seconds: int = Field(default=300, ge=0, le=86400)
 
-    # Server-side gate for every username/password lifecycle operation.
-    # Defaults true so standalone OSS deployments retain registration,
-    # login, password change, and administrator/CLI reset behavior. Managed
-    # SSO-only tenants set false; this is independent from the SPA-only
-    # keycloak_sso_only redirect hint below.
+    # Deprecated compatibility input. Runtime YAML derives this from auth_mode
+    # and rejects an explicit mismatch; later slices should consume the
+    # canonical mode helpers instead of treating this as an authority.
     local_auth_enabled: bool = True
 
-    # Auth — Keycloak OIDC (OPTIONAL external IdP). Disabled by default.
+    # Auth — Keycloak OIDC authority configuration. Disabled by default.
     #
-    # When `keycloak_enabled` is false NONE of these are read and AKB uses
-    # local username/password + PAT exactly as before — the SSO routes
-    # return 404 and zero Keycloak code runs. Enabling adds an SSO login
-    # path that, on success, resolves an exact issuer/subject binding. The
-    # default open mode may JIT-provision by verified email once and then
-    # persists that binding. It issues a normal AKB JWT; the internal user model, PG-native
-    # RBAC, and PATs are all unchanged. Keycloak is authentication only —
-    # it never drives AKB authorization.
+    # Human login is selected only by auth_mode. `keycloak_enabled` says an
+    # authority is configured: sso mode requires it, while local mode may use
+    # it only for the explicitly enabled MCP OAuth resource-server capability.
+    # Keycloak never drives AKB authorization.
     #
     # Flat `keycloak_*` keys (matching jwt_* / s3_* / embed_*) so the
     # secret can live in secret.yaml without the shallow app.yaml+secret.yaml
@@ -634,17 +831,8 @@ class Settings(BaseModel):
     #
     # See docs/designs/keycloak-oidc/00-overview.md.
     keycloak_enabled: bool = False
-    # When true AND `keycloak_enabled` is also true, the AKB sign-in page
-    # bypasses the local username/password form entirely and redirects an
-    # unauthenticated browser straight to Keycloak. Use this on
-    # deployments where every account is provisioned through SSO and the
-    # local form is more confusing than useful.
-    #
-    # The login page still honours `?local=1` as a presentation escape hatch.
-    # It cannot bypass `local_auth_enabled=false`; keycloak_sso_only is never
-    # an authorization control.
-    #
-    # Ignored when `keycloak_enabled = false`.
+    # Deprecated compatibility/UI input. Runtime YAML derives this from
+    # auth_mode and rejects an explicit mismatch. It is not an auth authority.
     keycloak_sso_only: bool = False
     keycloak_server_url: str = ""          # e.g. https://auth.example.com (no /realms suffix)
     # Optional backchannel base URL for server→Keycloak calls (token
@@ -659,83 +847,54 @@ class Settings(BaseModel):
     keycloak_client_id: str = "akb-web"
     keycloak_client_secret: str = ""       # secret.yaml — blank for public (PKCE) clients
     keycloak_public_client: bool = False   # true → PKCE (no client_secret); false → confidential
+    # Dedicated confidential browser client for the product-admin surface.
+    # It is intentionally excluded from keycloak_human_client_ids and cannot
+    # authorize ordinary AKB API bearer traffic. The callback URI is derived
+    # from public_base_url so the deployment and Keycloak registration cannot
+    # silently disagree about path ownership.
+    keycloak_admin_client_id: str = "akb-admin"
+    keycloak_admin_client_secret: str = ""
+    admin_browser_session_ttl_secs: int = Field(default=900, ge=60, le=3600)
     keycloak_verify_ssl: bool = True       # set false only for local self-signed Keycloak
-    # Exact identity is issuer/subject and does not require email. During the
-    # open-mode JIT/link fallback we REQUIRE the id_token's `email_verified`
-    # claim to be true before provisioning / adopting an AKB user — otherwise
-    # an IdP that allows unverified or
-    # self-asserted emails (open self-registration, social federation)
-    # becomes an account-spoofing vector. Set false ONLY for a trusted
-    # realm where every account's email is controlled out-of-band.
+    # Exact identity is issuer/subject and does not require email. Open-mode
+    # JIT requires a verified email only when creating a brand-new AKB user;
+    # email is never an account lookup or adoption key. Set false ONLY for a
+    # trusted realm where every account's email is controlled out-of-band.
     keycloak_require_verified_email: bool = True
-    # OIDC account admission policy. `open` preserves historical verified-email
-    # JIT/link behavior. `invite_only` accepts only an exact pre-provisioned
-    # (issuer, subject) binding. `disabled` rejects external login entirely.
+    # OIDC account admission policy. `open` permits atomic creation of a fresh
+    # user plus exact binding. `invite_only` accepts only an exact prebound
+    # (issuer, subject) identity. `disabled` rejects external login entirely.
     keycloak_enrollment_mode: Literal["open", "invite_only", "disabled"] = "open"
-    # Link an SSO login to a pre-existing AKB account that has the SAME
-    # email but a different auth_provider (e.g. a local/password account).
-    #
-    # Default false → such a collision is rejected (no silent identity
-    # merge; the OSS-safe default). Set true for a MANAGED deployment where
-    # the control plane intentionally pre-provisions an AKB user (+ PAT) for
-    # a member and that same person then logs in via SSO — without linking,
-    # every pre-provisioned member is locked out of SSO. Linking keeps the
-    # existing user_id, so the member's PAT, vault ownership and grants all
-    # survive. SAFE ONLY with verified emails: a cross-provider link is
-    # refused unless the id_token's email_verified is true, regardless of
-    # keycloak_require_verified_email, so a relaxed realm can't be used to
-    # take over an existing account by asserting its email.
+    # Deprecated migration input retained so Phase 3 readiness tooling can
+    # identify legacy installations. Canonical config loading rejects true,
+    # and the projection service repeats that guard for directly constructed
+    # Settings. Runtime email adoption has no compatibility bypass.
     keycloak_link_by_email: bool = False
-    # Absolute URL Keycloak redirects the browser back to after login.
-    # Must point at the AKB backend callback route and be registered as a
-    # valid redirect URI on the Keycloak client, e.g.
-    #   http://localhost:3000/api/v1/auth/keycloak/callback
+    # Reserved Phase 4 browser-session inputs. Phase 1 browser routes are
+    # fail-closed and do not issue state, exchange codes, or session tokens.
     keycloak_redirect_uri: str = ""
-    # SPA path the callback bounces the browser to with a one-time code.
-    # Relative → resolves against the request origin (same host the user
-    # is already on), so it works for both :3000 dev proxy and prod ingress.
+    # Deprecated callback-delivery compatibility input; inactive in Phase 1.
     keycloak_post_login_path: str = "/auth/callback"
-    # Companion-app post-login origins for cross-origin SSO delegation.
-    #
-    # Empty (default) → the post-login one-time code is ALWAYS delivered to
-    # the same-site keycloak_post_login_path (AKB's own SPA). Behaviour is
-    # then 100% identical to before this option existed; no other origin can
-    # ever receive the code.
-    #
-    # When set, a first-party companion app served on a listed origin (e.g.
-    # reef at https://reef-<slug>.<domain>) can ride THIS akb's Keycloak
-    # client without owning its own client/realm/secret. It starts SSO via
-    #   GET /auth/keycloak/login?redirect=<absolute-callback-URL-on-that-origin>
-    # and akb delivers the one-time code to that URL (which the companion
-    # then exchanges server-side via POST /auth/keycloak/exchange). This is
-    # what makes a single per-instance keycloak_post_login_path stop being a
-    # bottleneck: akb's own SPA and the companion can both complete SSO,
-    # selected per request by the redirect target rather than one global path.
-    #
-    # Open-redirect protection is preserved: a redirect whose origin is NOT
-    # in this list collapses to the safe same-site path. Each entry must be a
-    # full origin matched as scheme://host[:port], e.g.
-    #   ["https://reef-acme.example.com"]
+    # Deprecated callback-origin compatibility input; inactive in Phase 1.
     keycloak_post_login_allowed_origins: list[str] = Field(default_factory=list)
-    # Optional per-companion OIDC client selection. Keys are companion origins
-    # (normalized as scheme://host[:port]); values are Keycloak client ids.
-    # The mapping is consulted only after the origin passes the allowlist above,
-    # so adding a mapping can never grant a new redirect destination. The AKB
-    # backend remains the sole OIDC client and uses its backend-only secret for
-    # the selected confidential client. Empty preserves the historical single
-    # `keycloak_client_id` flow.
+    # Companion client IDs remain active as accepted `azp` values for the
+    # human API profile. Origin-keyed browser routing is inactive until Phase 4.
     keycloak_companion_client_ids_by_origin: dict[str, str] = Field(
         default_factory=dict
     )
-    # One-time exchange-code TTL (seconds). The callback hands the SPA a
-    # short-lived opaque code; the SPA trades it for the AKB JWT over a
-    # POST so the token never rides in a URL. Keep this small.
+    # Deprecated legacy exchange-code input; no Phase 1 route issues/redeems it.
     keycloak_exchange_code_ttl_secs: int = 60
+
+    # Audience required on Keycloak access tokens presented to human REST or
+    # delegated-human routes in SSO mode. Its effective default follows the
+    # existing public-resource convention used by MCP, but stays distinct.
+    api_oauth_audience: str = ""
 
     # === MCP OAuth Resource Server (optional, separate from SSO) ===
     # When true, AKB's /mcp endpoint accepts Keycloak-issued access tokens
-    # (RS256) in addition to the existing PAT (`akb_*`) and AKB JWT (HS256)
-    # paths. Web-hosted LLM clients (claude.ai / ChatGPT Custom Connectors,
+    # (RS256) in addition to token-store PAT/service credentials (`akb_*`).
+    # Local human-session JWTs are never MCP credentials. Web-hosted LLM
+    # clients (claude.ai / ChatGPT Custom Connectors,
     # Claude Code's HTTP transport) discover the authorization server via
     # `/.well-known/oauth-protected-resource` (RFC 9728), register
     # themselves via DCR (RFC 7591) against Keycloak, and obtain an access
@@ -927,6 +1086,46 @@ class Settings(BaseModel):
     # ToolUsageSettings above for why it is not folded into `audit`.
     tool_usage: ToolUsageSettings = Field(default_factory=ToolUsageSettings)
 
+    def require_auth_mode(self) -> AuthMode:
+        """Return the canonical runtime mode or fail without legacy inference."""
+        if self.auth_mode is None:
+            raise AuthModeConfigurationError(
+                "auth_mode is required at runtime; set it explicitly to 'local' or 'sso'"
+            )
+        return self.auth_mode
+
+    @property
+    def local_human_auth_enabled(self) -> bool:
+        """Derived local-human capability for later route/verifier slices."""
+        return self.require_auth_mode() == "local"
+
+    @property
+    def sso_human_auth_enabled(self) -> bool:
+        """Derived SSO-human capability for later route/verifier slices."""
+        return self.require_auth_mode() == "sso"
+
+    @property
+    def local_session_issuer_effective(self) -> str:
+        """Deployment-bound issuer for local application sessions."""
+        return (self.local_session_issuer or self.public_base_url).rstrip("/")
+
+    @property
+    def local_session_audience_effective(self) -> str:
+        """REST resource audience for local application sessions."""
+        if self.local_session_audience:
+            return self.local_session_audience
+        return f"{self.public_base_url.rstrip('/')}/api"
+
+    @property
+    def system_hmac_secret_effective(self) -> str:
+        """Non-session HMAC authority with one-release legacy input support.
+
+        `jwt_secret` is accepted only as migration input for capabilities that
+        were already HMAC-backed.  It is never consulted by a human-session
+        issuer or verifier after the RS256 v2 cutover.
+        """
+        return self.system_hmac_secret or self.jwt_secret
+
     # ── Keycloak OIDC derived endpoints ───────────────────────────
     # All computed off the realm issuer so only server_url + realm are
     # configured. Standard Keycloak OIDC paths under /realms/<realm>.
@@ -960,9 +1159,44 @@ class Settings(BaseModel):
         return f"{self._keycloak_backchannel_issuer}/protocol/openid-connect/certs"
 
     @property
+    def keycloak_human_client_ids(self) -> frozenset[str]:
+        """OIDC clients allowed to authorize human API access tokens.
+
+        MCP DCR clients are intentionally excluded: MCP has its own route
+        profile, audience, and scope contract rather than this static list.
+        """
+        return frozenset(
+            client_id.strip()
+            for client_id in (
+                self.keycloak_client_id,
+                *self.keycloak_companion_client_ids_by_origin.values(),
+            )
+            if client_id.strip()
+        )
+
+    @property
     def keycloak_end_session_endpoint(self) -> str:
         # Browser-facing → public issuer.
         return f"{self.keycloak_issuer}/protocol/openid-connect/logout"
+
+    @property
+    def keycloak_admin_redirect_uri(self) -> str:
+        """Exact callback owned by the dedicated product-admin client."""
+        return (
+            f"{self.public_base_url.rstrip('/')}"
+            "/api/v1/admin/auth/keycloak/callback"
+        )
+
+    @property
+    def keycloak_admin_post_logout_redirect_uri(self) -> str:
+        return f"{self.public_base_url.rstrip('/')}/admin"
+
+    @property
+    def api_oauth_audience_effective(self) -> str:
+        """Audience required on SSO human access tokens at API routes."""
+        if self.api_oauth_audience:
+            return self.api_oauth_audience
+        return f"{self.public_base_url.rstrip('/')}/api"
 
     @property
     def mcp_oauth_audience_effective(self) -> str:
@@ -1003,7 +1237,7 @@ def _find_config_dir() -> Path:
 
 def _load_settings() -> Settings:
     cfg_dir = _find_config_dir()
-    merged: dict = {}
+    merged: dict[str, object] = {}
     for name in ("app.yaml", "secret.yaml"):
         path = cfg_dir / name
         if not path.exists():
@@ -1016,7 +1250,8 @@ def _load_settings() -> Settings:
         if not isinstance(data, dict):
             raise RuntimeError(f"{path} must be a YAML mapping at the top level")
         merged.update(data)
-    return Settings(**merged)
+    resolved = _resolve_auth_mode_config(merged, require_mode=True)
+    return Settings.model_validate(resolved)
 
 
 settings = _load_settings()
