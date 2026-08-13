@@ -14,7 +14,7 @@ flow there is unchanged.
 | AKB backend ≥ the version that ships `mcp_oauth_enabled` | Adds the Resource Server code path |
 | An OIDC IdP — Keycloak in the reference deployment | AKB does NOT host an Authorization Server; the IdP issues access tokens |
 | Realm configuration: `akb:vault:read`, `akb:vault:write` scopes (each with an audience mapper) + DCR trusted hosts + `offline_access` exposed | Lets clients DCR-register and request the scopes the consent screen presents |
-| `config/app.yaml`: `mcp_oauth_enabled: true`, a non-empty `public_base_url` | Activates the new path. Default keeps it off so PAT-only deployments are bit-for-bit unchanged |
+| `config/app.yaml`: explicit `auth_mode`, `mcp_oauth_enabled: true`, a non-empty `public_base_url` | Activates the new path without changing the chosen human-login mode. Default keeps it off so PAT-only deployments are bit-for-bit unchanged |
 
 ## Configure the IdP (one-shot)
 
@@ -72,8 +72,9 @@ In the Keycloak admin console, in your realm:
 In `config/app.yaml`:
 
 ```yaml
-# Existing SSO settings (required — MCP OAuth piggybacks on the JWKS
-# config). If your deployment already has SSO on, leave these as-is.
+# MCP OAuth needs an OIDC authority, but it does not require human SSO.
+# Keep local here unless this installation intentionally uses OIDC human login.
+auth_mode: local
 keycloak_enabled: true
 keycloak_server_url: "https://auth.example.com"      # browser-facing → token `iss`
 keycloak_internal_url: "https://auth.example.com"    # backend → IdP backchannel

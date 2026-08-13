@@ -20,7 +20,15 @@ vi.mock("@/lib/api", () => ({
   // OAuth toggle alongside the PAT snippet. Mock as "OAuth off" so
   // these tests stay focused on the PAT-mint UX they were written for.
   getAuthConfig: vi.fn().mockResolvedValue({
-    keycloak: { enabled: false, login_url: null },
+    available: true,
+    schema_version: 1,
+    auth_mode: "local",
+    local_auth: { enabled: true },
+    keycloak: {
+      enabled: false,
+      browser_session_ready: false,
+      login_url: null,
+    },
     mcp_oauth: { enabled: false },
   }),
 }));
@@ -75,5 +83,30 @@ describe("Tokens setup guide smart default", () => {
     });
     render(wrap());
     expect(await screen.findByText(/Mint a token/i)).toBeVisible();
+  });
+
+  it("keeps PAT management available in SSO mode", async () => {
+    const { getAuthConfig, getMe, listPATs } = await import("@/lib/api");
+    (getAuthConfig as any).mockResolvedValue({
+      available: true,
+      schema_version: 1,
+      auth_mode: "sso",
+      local_auth: { enabled: false },
+      keycloak: {
+        enabled: true,
+        browser_session_ready: false,
+        login_url: null,
+      },
+      mcp_oauth: { enabled: true },
+    });
+    (getMe as any).mockResolvedValue({ user_id: "u1", username: "u", email: "u@x", is_admin: false });
+    (listPATs as any).mockResolvedValue({
+      tokens: [{ token_id: "t1", name: "automation", prefix: "akb_real", created_at: "2026-08-13", last_used_at: null }],
+    });
+
+    render(wrap());
+
+    expect(await screen.findByText("automation")).toBeVisible();
+    expect(screen.getByRole("button", { name: /revoke token automation/i })).toBeVisible();
   });
 });

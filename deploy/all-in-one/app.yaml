@@ -35,6 +35,7 @@ s3_bucket: akb-files
 s3_region: us-east-1
 
 # === Auth ===
+auth_mode: local
 jwt_algorithm: HS256
 jwt_expire_hours: 24
 

@@ -18,6 +18,7 @@ vi.mock("@/lib/api", () => ({
   adminDeleteUser: vi.fn(),
   changePassword: vi.fn(),
   updateProfile: vi.fn(),
+  getAuthConfig: vi.fn(),
 }));
 
 // Bypass the theme hook — it pokes localStorage / matchMedia at mount.
@@ -41,10 +42,37 @@ const USER = {
   is_admin: false,
 };
 
+const LOCAL_AUTH_CONFIG = {
+  available: true,
+  schema_version: 1,
+  auth_mode: "local",
+  local_auth: { enabled: true },
+  keycloak: {
+    enabled: false,
+    browser_session_ready: false,
+    login_url: null,
+  },
+  mcp_oauth: { enabled: false },
+};
+
+const SSO_AUTH_CONFIG = {
+  available: true,
+  schema_version: 1,
+  auth_mode: "sso",
+  local_auth: { enabled: false },
+  keycloak: {
+    enabled: true,
+    browser_session_ready: false,
+    login_url: null,
+  },
+  mcp_oauth: { enabled: true },
+};
+
 describe("settings — profile edit", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     (api.getMe as any).mockResolvedValue(USER);
+    (api.getAuthConfig as any).mockResolvedValue(LOCAL_AUTH_CONFIG);
     (api.updateProfile as any).mockResolvedValue({
       updated: true,
       username: USER.username,
@@ -59,6 +87,24 @@ describe("settings — profile edit", () => {
     renderSettings();
     expect(await screen.findByDisplayValue("Alice Original")).toBeTruthy();
     expect(screen.getByDisplayValue("alice@example.com")).toBeTruthy();
+    expect(
+      await screen.findByText("Change password", { selector: "#change-pw-heading" }),
+    ).toBeInTheDocument();
+  });
+
+  it("hides the local password lifecycle in SSO mode", async () => {
+    (api.getAuthConfig as any).mockResolvedValue(SSO_AUTH_CONFIG);
+
+    renderSettings();
+
+    await screen.findByDisplayValue("Alice Original");
+    await waitFor(() => expect(api.getAuthConfig as any).toHaveBeenCalledOnce());
+    expect(screen.queryByText("Change password", { selector: "#change-pw-heading" })).toBeNull();
+    expect(screen.queryByLabelText(/current password/i)).toBeNull();
+    expect(screen.getByLabelText(/display name/i)).toBeDisabled();
+    expect(screen.getByLabelText(/email/i)).toBeDisabled();
+    expect(screen.queryByRole("button", { name: /save profile/i })).toBeNull();
+    expect(screen.getByText(/managed by your identity provider/i)).toBeInTheDocument();
   });
 
   it("'Save profile' is disabled when nothing changed", async () => {

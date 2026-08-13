@@ -81,36 +81,6 @@ export function getToken(): string | null {
   return _token;
 }
 
-// ── SSO session marker (optional Keycloak) ──
-// Records whether the *current* session was obtained via Keycloak SSO, so
-// "Sign out" can also end the Keycloak session (RP-initiated logout) —
-// otherwise the live KC session would silently re-authenticate on the next
-// SSO click. Local-auth sessions never set this, so their logout is
-// unaffected. We also keep the KC id_token to pass as id_token_hint for a
-// prompt-free logout.
-const SSO_FLAG = "akb_sso";
-const KC_HINT = "akb_kc_id_token";
-
-export function markSsoSession(kcIdToken?: string) {
-  localStorage.setItem(SSO_FLAG, "1");
-  if (kcIdToken) localStorage.setItem(KC_HINT, kcIdToken);
-}
-
-export function clearSsoSession() {
-  localStorage.removeItem(SSO_FLAG);
-  localStorage.removeItem(KC_HINT);
-}
-
-export function isSsoSession(): boolean {
-  return localStorage.getItem(SSO_FLAG) === "1";
-}
-
-/** Backend RP-initiated logout endpoint (bounces to KC end_session → /auth). */
-export function keycloakLogoutUrl(): string {
-  const hint = localStorage.getItem(KC_HINT);
-  return `${API_BASE}/auth/keycloak/logout${hint ? `?id_token_hint=${encodeURIComponent(hint)}` : ""}`;
-}
-
 /**
  * Error thrown by `api()` when the server returns a structured 4xx/5xx body
  * (FastAPI `HTTPException(detail=dict)`). Inherits from `Error` so existing
@@ -247,47 +217,100 @@ export const authLogin = (username: string, password: string) =>
     body: JSON.stringify({ username, password }),
   }).then(parseAuthResponse);
 
+export type AuthMode = "local" | "sso";
+
 export interface AuthConfig {
-  // Optional for compatibility with AKB versions that predate the explicit
-  // server-side local-auth policy. Missing means the legacy enabled default.
-  local_auth?: { enabled: boolean };
+  available: boolean;
+  schema_version: 1 | null;
+  auth_mode: AuthMode | null;
+  local_auth: { enabled: boolean };
   keycloak: {
     enabled: boolean;
+    browser_session_ready: boolean;
     login_url: string | null;
-    // UX preference only. `local_auth.enabled` remains the authoritative
-    // policy; `?local=1` may suppress automatic SSO navigation but cannot
-    // restore a server-disabled local form.
-    sso_only?: boolean;
-    enrollment_mode?: "open" | "invite_only" | "disabled";
   };
-  // Optional — present on newer backends. Tells the connect-snippet UI
-  // whether the OAuth Resource Server path is live so it can offer
-  // `claude mcp add --transport http … && claude mcp login` alongside
-  // the PAT snippet.
-  mcp_oauth?: { enabled: boolean };
+  mcp_oauth: { enabled: boolean };
 }
 
-const _AUTH_CONFIG_FALLBACK: AuthConfig = {
-  local_auth: { enabled: true },
-  keycloak: { enabled: false, login_url: null, sso_only: false },
+export const AUTH_CONFIG_UNAVAILABLE: AuthConfig = {
+  available: false,
+  schema_version: null,
+  auth_mode: null,
+  local_auth: { enabled: false },
+  keycloak: {
+    enabled: false,
+    browser_session_ready: false,
+    login_url: null,
+  },
   mcp_oauth: { enabled: false },
 };
 
-/** Public auth config — drives whether the optional SSO button shows
- * and whether the connect-snippet UI offers the OAuth path. Falls back
- * to all-disabled if the endpoint is unreachable/old. */
-export const getAuthConfig = (): Promise<AuthConfig> =>
-  fetch(`${API_BASE}/auth/config`)
-    .then((r) => (r.ok ? r.json() : _AUTH_CONFIG_FALLBACK))
-    .catch(() => _AUTH_CONFIG_FALLBACK);
+function record(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
 
-/** Redeem the one-time SSO code from the Keycloak callback for an AKB JWT. */
-export const keycloakExchange = (code: string) =>
-  fetch(`${API_BASE}/auth/keycloak/exchange`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ code }),
-  }).then(parseAuthResponse);
+function hasExactKeys(
+  value: Record<string, unknown> | null,
+  expected: readonly string[],
+): value is Record<string, unknown> {
+  if (!value) return false;
+  const actual = Object.keys(value).sort();
+  const exact = [...expected].sort();
+  return actual.length === exact.length && actual.every((key, index) => key === exact[index]);
+}
+
+export function parseAuthConfig(value: unknown): AuthConfig {
+  const root = record(value);
+  const localAuth = record(root?.local_auth);
+  const keycloak = record(root?.keycloak);
+  const mcpOauth = record(root?.mcp_oauth);
+  const mode = root?.auth_mode;
+  const loginUrl = keycloak?.login_url;
+  if (
+    !hasExactKeys(root, ["schema_version", "auth_mode", "local_auth", "keycloak", "mcp_oauth"]) ||
+    !hasExactKeys(localAuth, ["enabled"]) ||
+    !hasExactKeys(keycloak, ["enabled", "browser_session_ready", "login_url"]) ||
+    !hasExactKeys(mcpOauth, ["enabled"]) ||
+    root?.schema_version !== 1 ||
+    (mode !== "local" && mode !== "sso") ||
+    typeof localAuth?.enabled !== "boolean" ||
+    typeof keycloak?.enabled !== "boolean" ||
+    typeof keycloak?.browser_session_ready !== "boolean" ||
+    (loginUrl !== null && typeof loginUrl !== "string") ||
+    typeof mcpOauth?.enabled !== "boolean" ||
+    localAuth.enabled !== (mode === "local") ||
+    keycloak.enabled !== (mode === "sso") ||
+    (keycloak.browser_session_ready && (!keycloak.enabled || !loginUrl)) ||
+    (!keycloak.browser_session_ready && loginUrl !== null)
+  ) {
+    return AUTH_CONFIG_UNAVAILABLE;
+  }
+  return {
+    available: true,
+    schema_version: 1,
+    auth_mode: mode,
+    local_auth: { enabled: localAuth.enabled },
+    keycloak: {
+      enabled: keycloak.enabled,
+      browser_session_ready: keycloak.browser_session_ready,
+      login_url: loginUrl,
+    },
+    mcp_oauth: { enabled: mcpOauth.enabled },
+  };
+}
+
+/** Versioned public capabilities. Any transport/schema error is deny-all. */
+export async function getAuthConfig(): Promise<AuthConfig> {
+  try {
+    const response = await fetch(`${API_BASE}/auth/config`);
+    if (!response.ok) return AUTH_CONFIG_UNAVAILABLE;
+    return parseAuthConfig(await response.json());
+  } catch {
+    return AUTH_CONFIG_UNAVAILABLE;
+  }
+}
 
 // ── Auth (token) ──
 export const getMe = () => api<any>("/auth/me");

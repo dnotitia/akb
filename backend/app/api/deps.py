@@ -14,8 +14,8 @@ from app.models.vault_scope import (
 )
 from app.services.auth_service import (
     AuthenticatedUser,
-    resolve_akb_session_authorization,
-    resolve_token,
+    resolve_delegated_human_authorization,
+    resolve_rest_user_authorization,
     token_has_scope,
 )
 from app.services.app_identity_service import (
@@ -90,10 +90,10 @@ async def require_delegated_actor(
             f"{_DELEGATED_AUTH_HEADER} is required",
             "delegated_authorization_required",
         )
-    delegated = await resolve_akb_session_authorization(authorization)
-    if delegated is None or delegated.auth_method != "jwt":
+    delegated = await resolve_delegated_human_authorization(authorization)
+    if delegated is None or delegated.auth_method not in {"jwt", "oauth"}:
         _reject_delegation(
-            "Delegated authorization must be an active AKB user session",
+            "Delegated authorization must be an active human credential",
             "invalid_delegated_authorization",
         )
     return DelegatedActor(
@@ -129,7 +129,7 @@ async def get_current_user(
     authorization = request.headers.get("authorization")
     if not authorization:
         raise HTTPException(status_code=401, detail="Authorization header required")
-    user = await resolve_token(authorization)
+    user = await resolve_rest_user_authorization(authorization)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     required_scope = _required_scope_for_request(request)
@@ -158,7 +158,7 @@ async def get_optional_user(
         if _claim_header(request) is not None:
             _apply_claim_header(request, None)
         return None
-    user = await resolve_token(authorization)
+    user = await resolve_rest_user_authorization(authorization)
     if user is None:
         if _claim_header(request) is not None:
             _apply_claim_header(request, None)

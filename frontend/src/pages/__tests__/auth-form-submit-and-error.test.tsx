@@ -29,9 +29,17 @@ vi.mock("@/lib/api", () => ({
   // Optional Keycloak SSO probe — default disabled so the SSO button stays
   // hidden and AuthPage's mount effect resolves cleanly.
   getAuthConfig: vi.fn().mockResolvedValue({
-    keycloak: { enabled: false, login_url: null },
+    available: true,
+    schema_version: 1,
+    auth_mode: "local",
+    local_auth: { enabled: true },
+    keycloak: {
+      enabled: false,
+      browser_session_ready: false,
+      login_url: null,
+    },
+    mcp_oauth: { enabled: false },
   }),
-  clearSsoSession: vi.fn(),
 }));
 
 const mockedLogin = vi.mocked(authLogin);

@@ -1,7 +1,14 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { ArrowRight, Database, Boxes, GitBranch } from "lucide-react";
-import { authLogin, authRegister, clearSsoSession, getAuthConfig, getToken, setToken } from "@/lib/api";
+import {
+  authLogin,
+  authRegister,
+  getAuthConfig,
+  getToken,
+  setToken,
+  type AuthConfig,
+} from "@/lib/api";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { Alert } from "@/components/ui/alert";
@@ -33,18 +40,21 @@ export default function AuthPage() {
   const [displayName, setDisplayName] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  // Unknown until the public server policy arrives. Keeping the form hidden
-  // during this short interval prevents a disabled login path from flashing.
-  const [localAuthEnabled, setLocalAuthEnabled] = useState<boolean | null>(null);
-  const [ssoLoginUrl, setSsoLoginUrl] = useState<string | null>(null);
-  // True while we're navigating away to Keycloak in sso_only mode — used
-  // to suppress the form flash that would otherwise render between the
-  // useEffect dispatching the redirect and the browser actually leaving.
-  const [redirectingToSso, setRedirectingToSso] = useState(false);
-  // `?local=1` suppresses automatic SSO navigation for recovery/debugging.
-  // It never overrides the server's local-auth policy.
-  const localEscape = new URLSearchParams(window.location.search).has("local");
+  // Unknown until the versioned public policy is validated. No UI capability
+  // is inferred while loading or when the fetch/schema fails.
+  const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
   const next = safeNext(new URLSearchParams(window.location.search).get("next"));
+  const localAuthEnabled =
+    authConfig?.available === true &&
+    authConfig.auth_mode === "local" &&
+    authConfig.local_auth.enabled;
+  const ssoLoginUrl =
+    authConfig?.available === true &&
+    authConfig.auth_mode === "sso" &&
+    authConfig.keycloak.enabled &&
+    authConfig.keycloak.browser_session_ready
+      ? authConfig.keycloak.login_url
+      : null;
 
   useEffect(() => {
     // Already signed in (back button / bookmark)? Don't re-show the form.
@@ -52,42 +62,14 @@ export default function AuthPage() {
       navigate(next, { replace: true });
       return;
     }
-    // Read sso_error BEFORE the async getAuthConfig() so the captured
-    // value is available to the auto-redirect branch below — without
-    // this, an SSO-only deployment whose callback fails would loop:
-    // /auth?sso_error → auto-redirect → IdP same failure → /auth?sso_error → …
-    const params = new URLSearchParams(window.location.search);
-    const ssoErr = params.get("sso_error");
-    if (ssoErr) {
-      setError(`SSO login failed (${ssoErr}). Please try again.`);
-      params.delete("sso_error");
-      const qs = params.toString();
-      window.history.replaceState({}, "", window.location.pathname + (qs ? `?${qs}` : ""));
-    }
-    // Optional Keycloak SSO: show the button only if the backend reports it on.
-    getAuthConfig().then((cfg) => {
-      const localEnabled = cfg.local_auth?.enabled ?? true;
-      setLocalAuthEnabled(localEnabled);
-      if (!localEnabled) setMode("login");
-
-      if (!cfg.keycloak.enabled || !cfg.keycloak.login_url) return;
-      setSsoLoginUrl(cfg.keycloak.login_url);
-      // SSO-only mode — every account goes through Keycloak, so skip
-      // the local form entirely. Three things turn the auto-redirect
-      // off so the user can recover instead of looping:
-      //   - `?local=1` (admin escape hatch)
-      //   - landing here with `?sso_error=…` (we just bounced from a
-      //     failed callback; immediately re-firing the redirect would
-      //     re-attempt the same failure)
-      // When auto-redirect is suppressed, the hybrid view renders
-      // with the error message + the manual SSO retry button.
-      if (cfg.keycloak.sso_only && !localEscape && !ssoErr) {
-        setRedirectingToSso(true);
-        window.location.href = `${cfg.keycloak.login_url}?redirect=${encodeURIComponent(next)}`;
-      }
+    let cancelled = false;
+    void getAuthConfig().then((config) => {
+      if (!cancelled) setAuthConfig(config);
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    return () => {
+      cancelled = true;
+    };
+  }, [navigate, next]);
 
   function startSso() {
     if (!ssoLoginUrl) return;
@@ -127,7 +109,6 @@ export default function AuthPage() {
         return;
       }
       setToken(r.token);
-      clearSsoSession();
       try {
         if ("PasswordCredential" in window) {
           const cred = new PasswordCredential({ id: username, password });
@@ -142,20 +123,6 @@ export default function AuthPage() {
     } finally {
       setLoading(false);
     }
-  }
-
-  // SSO-only redirect in flight — suppress the form flash. The browser
-  // is leaving in milliseconds; rendering the form would show it for a
-  // beat and look like a UI glitch. `?local=1` may bypass this redirect,
-  // but the server policy still decides whether the local form exists.
-  if (redirectingToSso) {
-    return (
-      <div className="relative flex min-h-screen items-center justify-center bg-background text-foreground">
-        <div className="text-center coord" role="status" aria-live="polite">
-          Redirecting to SSO…
-        </div>
-      </div>
-    );
   }
 
   return (
@@ -202,7 +169,7 @@ export default function AuthPage() {
             <Logo size={40} subtitle />
           </div>
           <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-lg p-7 sm:p-8">
-            {localAuthEnabled === null && (
+            {authConfig === null && (
               <div className="py-8 text-center coord" role="status" aria-live="polite">
                 Loading sign-in options…
               </div>
@@ -242,27 +209,16 @@ export default function AuthPage() {
               </Tabs>
             )}
 
-            {localAuthEnabled === false && error && (
-              <Alert variant="destructive" id="auth-error">
-                {error}
-              </Alert>
-            )}
-
-            {localAuthEnabled === false && !ssoLoginUrl && (
+            {authConfig !== null && !localAuthEnabled && !ssoLoginUrl && (
               <Alert variant="destructive">
-                No sign-in method is available. Contact your administrator.
+                {authConfig.available && authConfig.auth_mode === "sso"
+                  ? "SSO browser sign-in is not available yet. Contact your administrator."
+                  : "Sign-in is unavailable because authentication configuration could not be verified."}
               </Alert>
             )}
 
             {ssoLoginUrl && (
-              <div className={localAuthEnabled ? "mt-6" : error ? "mt-4" : ""}>
-                {localAuthEnabled && (
-                  <div className="mb-4 flex items-center gap-3">
-                    <div className="h-px flex-1 bg-border" aria-hidden />
-                    <span className="text-xs text-foreground-muted">or</span>
-                    <div className="h-px flex-1 bg-border" aria-hidden />
-                  </div>
-                )}
+              <div>
                 <Button type="button" variant="outline" size="lg" className="w-full" onClick={startSso}>
                   Sign in with SSO
                 </Button>

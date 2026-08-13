@@ -210,7 +210,7 @@ async def _apply_migrations() -> None:
         "031_drop_memories_sessions.py",        # drop legacy memories+sessions tables; agent memory is now vault-shaped
         "032_drop_supersedes.py",               # drop never-used documents.supersedes column (status leaned to draft/active/archived)
         "033_users_auth_provider.py",           # users.auth_provider ('local' default | 'keycloak' for JIT-provisioned SSO accounts)
-        "034_oidc_transients.py",               # oidc_transients: short-lived OIDC state + one-time exchange codes (HA-safe; empty when Keycloak off)
+        "034_oidc_transients.py",               # oidc_transients: retained legacy browser-flow schema (unused while Phase 1 routes are staged)
         "035_fix_wikilink_alias_edges.py",      # repair edges whose target_uri carries a wikilink alias ([[…|label]] → …|label); strip alias, re-validate existence, drop orphans
         "036_resource_aliases.py",              # rename/move redirect table (old path/name → current resource id); old akb:// URIs keep resolving after a move
         "037_table_unique_keys_indexes.py",     # vault_tables.unique_keys + .indexes JSONB (declarative DDL metadata; AKB #215)

@@ -3,12 +3,9 @@
 Each authenticated session gets its own transport + server loop.
 Agents connect via one of:
   POST http://localhost:8000/mcp/
-  Authorization: Bearer akb_<pat>              # PAT (always)
-  Authorization: Bearer <hs256-jwt>            # AKB session JWT (always)
-  Authorization: Bearer <rs256-jwt>            # Keycloak access token,
-                                               # when mcp_oauth_enabled=true.
-                                               # Discovery + DCR via
-                                               # /.well-known/oauth-protected-resource.
+  Authorization: Bearer akb_<pat-or-service>   # token-store credential
+  Authorization: Bearer <rs256-access-token>   # keycloak-access-v1 only when
+                                               # mcp_oauth_enabled=true
 """
 
 from __future__ import annotations
@@ -24,7 +21,7 @@ from starlette.types import Receive, Scope, Send
 from mcp.server.streamable_http import StreamableHTTPServerTransport
 
 from app.config import settings
-from app.services.auth_service import resolve_token
+from app.services.auth_service import resolve_mcp_authorization
 
 logger = logging.getLogger("akb.mcp")
 
@@ -83,7 +80,7 @@ async def _ensure_server_running(session_id: str, transport: StreamableHTTPServe
 
 
 class MCPApp:
-    """ASGI app that handles MCP Streamable HTTP with PAT auth."""
+    """ASGI app that handles MCP Streamable HTTP authorization."""
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -91,9 +88,10 @@ class MCPApp:
 
         request = Request(scope, receive, send)
 
-        # Auth check. resolve_token handles all three Bearer shapes
-        # (PAT, AKB JWT, Keycloak access token); MCP-OAuth gating is
-        # internal to it. 401s carry an RFC 9728 WWW-Authenticate
+        # Auth check. The MCP capability accepts only namespaced token-store
+        # credentials and, when enabled, keycloak-access-v1 for the MCP
+        # audience. Local human sessions are never MCP credentials. 401s carry
+        # an RFC 9728 WWW-Authenticate
         # header so a standards-compliant MCP client can autodiscover
         # the AS and complete OAuth without an out-of-band tip-off.
         auth_header = request.headers.get("authorization", "")
@@ -112,7 +110,7 @@ class MCPApp:
             await response(scope, receive, send)
             return
 
-        user = await resolve_token(auth_header)
+        user = await resolve_mcp_authorization(auth_header)
         if not user:
             response = JSONResponse(
                 {"error": "Invalid or expired token"},

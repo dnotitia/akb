@@ -1,37 +1,25 @@
-"""Keycloak OIDC client — the OPTIONAL external-IdP login path.
+"""Pinned Keycloak verification plus dormant browser OIDC primitives.
 
-This module is *only* exercised when ``settings.keycloak_enabled`` is
-true. With it off, nothing here runs and AKB authenticates exactly as
-before (local username/password + PAT).
+Phase 1 request authorization uses :meth:`verify_access_token` only. The
+route-selected ``keycloak-access-v1`` profile pins RS256, issuer, JWKS, route
+audience, token kind, and required claims before exact ``(issuer, subject)``
+projection. It never treats an ID token as an API access token.
 
-Design (see docs/designs/keycloak-oidc/00-overview.md):
-
-- Keycloak authenticates the person at the front door using the OIDC
-  **authorization-code** flow (+ PKCE S256 for public clients).
-- The ID token is verified **locally** against Keycloak's JWKS (RS256,
-  cached, refetched once on key rotation) — no remote introspection on
-  the hot path.
-- Keycloak is **authentication only**. The caller maps the verified
-  identity (by email) to an internal AKB user and mints a normal AKB
-  JWT; the internal user model, PG-native RBAC, and PATs are untouched.
-
-Implemented on the dependencies AKB already ships — ``httpx`` for the
-token/JWKS HTTP calls and ``pyjwt`` for RS256 verification. No new
-third-party packages.
-
-Transient flow state (CSRF ``state`` + PKCE verifier, and the one-time
-exchange codes) is persisted in the ``oidc_transients`` table so the
-redirect round-trip works across multiple backend replicas. Each entry
-is single-use and TTL-bounded.
+Authorization-code, ID-token, and logout helpers remain internal candidates
+for the Phase 4 server-side browser-session design. No Phase 1 production
+route calls them, and this module has no AKB human-session issuance or account
+adoption entry point. See ``docs/designs/keycloak-oidc/00-overview.md``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
 import logging
 import secrets
+import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
@@ -43,20 +31,27 @@ from jwt.algorithms import RSAAlgorithm
 from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import AKBError, AuthenticationError
+from app.services.auth_verifier_profiles import (
+    KEYCLOAK_ACCESS_V1,
+    KeycloakRouteProfile,
+    VerifiedPrincipal,
+)
 
 logger = logging.getLogger("akb.keycloak")
 
-# OIDC scopes requested at the authorization endpoint. `openid` is
-# mandatory for an ID token; `profile`+`email` populate name/email claims
-# we map onto the AKB user.
+# Reserved Phase 4 authorization-code scopes. The staged Phase 1 browser
+# routes never issue an authorization request.
 _SCOPE = "openid profile email"
+_TOKEN_SUPPLIED_KEY_HEADERS = frozenset({"jku", "x5u", "jwk", "x5c"})
+_SERVICE_ACCOUNT_CLAIMS = frozenset({"client_id", "clientId", "clientHost", "clientAddress"})
+_JWKS_REFRESH_COOLDOWN_SECONDS = 30.0
 
 
 # ── Transient store (oidc_transients table) ──────────────────────────
 #
-# Two single-use, TTL-bounded record kinds backing the redirect flow.
-# Consume is an atomic DELETE … RETURNING so a code can never be redeemed
-# twice even under concurrent callbacks.
+# Legacy single-use, TTL-bounded transient storage retained for schema
+# compatibility and possible Phase 4 reuse. Staged Phase 1 browser routes do
+# not issue or consume these records. Consume remains atomic DELETE … RETURNING.
 
 
 async def _store_issue(key: str, kind: str, payload: dict, ttl_secs: int) -> None:
@@ -71,7 +66,10 @@ async def _store_issue(key: str, kind: str, payload: dict, ttl_secs: int) -> Non
             INSERT INTO oidc_transients (key, kind, payload, expires_at)
             VALUES ($1, $2, $3::jsonb, $4)
             """,
-            key, kind, json.dumps(payload), expires_at,
+            key,
+            kind,
+            json.dumps(payload),
+            expires_at,
         )
 
 
@@ -85,7 +83,8 @@ async def _store_consume(key: str, kind: str) -> dict | None:
              WHERE key = $1 AND kind = $2 AND expires_at > NOW()
             RETURNING payload
             """,
-            key, kind,
+            key,
+            kind,
         )
     if row is None:
         return None
@@ -95,11 +94,15 @@ async def _store_consume(key: str, kind: str) -> dict | None:
 
 
 class KeycloakOIDC:
-    """Stateless-per-process OIDC client. All flow state lives in PG."""
+    """Pinned verifier with dormant, PostgreSQL-backed browser helpers."""
 
     def __init__(self) -> None:
-        # JWKS cached in-process; refetched on key rotation (kid miss).
+        # JWKS is cached in-process. Unknown kids may request one bounded,
+        # single-flight refresh per cooldown window so attacker-controlled
+        # headers cannot amplify unauthenticated traffic to Keycloak.
         self._jwks: dict[str, Any] | None = None
+        self._jwks_refresh_lock = asyncio.Lock()
+        self._jwks_refresh_attempt_at: float | None = None
         self._http: httpx.AsyncClient | None = None
 
     # ── HTTP client (honors verify_ssl) ──────────────────────────────
@@ -133,23 +136,15 @@ class KeycloakOIDC:
     @staticmethod
     def _effective_client_id(client_id: str | None) -> str:
         """Resolve an optional server-selected client to the legacy default."""
-        return (
-            client_id.strip()
-            if client_id and client_id.strip()
-            else settings.keycloak_client_id
-        )
+        return client_id.strip() if client_id and client_id.strip() else settings.keycloak_client_id
 
-    async def begin_login(
-        self, redirect_path: str = "/", *, client_id: str | None = None
-    ) -> str:
-        """Create CSRF state (+PKCE for public clients) and return the
-        Keycloak authorization URL to redirect the browser to.
+    async def begin_login(self, redirect_path: str = "/", *, client_id: str | None = None) -> str:
+        """Build dormant Phase 4 authorization state and redirect URL.
 
-        ``redirect_path`` is the caller-vetted post-login destination carried
-        opaquely through flow state. It is normally a same-site path, but may
-        be an allowlisted companion-app absolute URL (cross-origin SSO); the
-        callback (`_post_login_target`) re-validates it before delivering the
-        one-time code, so this layer just stores it verbatim."""
+        No Phase 1 production route calls this helper. Any future caller must
+        validate ``redirect_path`` against the server-side browser-session
+        design before enabling it.
+        """
         selected_client_id = self._effective_client_id(client_id)
         state = secrets.token_urlsafe(32)
         payload: dict[str, str] = {
@@ -170,7 +165,9 @@ class KeycloakOIDC:
             params["code_challenge_method"] = "S256"
 
         await _store_issue(
-            state, "state", payload,
+            state,
+            "state",
+            payload,
             ttl_secs=600,  # 10 min to complete the Keycloak login screen
         )
         return f"{settings.keycloak_authorization_endpoint}?{urllib.parse.urlencode(params)}"
@@ -179,7 +176,7 @@ class KeycloakOIDC:
         """Verify+consume the CSRF state. Returns {redirect_path, code_verifier?}."""
         return await _store_consume(state, "state")
 
-    # ── Token exchange ───────────────────────────────────────────────
+    # ── Dormant authorization-code exchange (Phase 4 candidate) ─────
     async def exchange_code_for_tokens(
         self,
         code: str,
@@ -201,9 +198,7 @@ class KeycloakOIDC:
             data["client_secret"] = settings.keycloak_client_secret
 
         try:
-            resp = await self._client().post(
-                settings.keycloak_token_endpoint, data=data
-            )
+            resp = await self._client().post(settings.keycloak_token_endpoint, data=data)
         except httpx.HTTPError as e:
             logger.error("Keycloak token exchange network error: %s", e)
             raise AKBError("Keycloak unreachable during token exchange", status_code=502) from e
@@ -211,36 +206,64 @@ class KeycloakOIDC:
         if resp.status_code != 200:
             logger.warning(
                 "Keycloak token exchange failed: %s %s",
-                resp.status_code, resp.text[:500],
+                resp.status_code,
+                resp.text[:500],
             )
             # A bad/expired/replayed code is a client-side auth failure.
             raise AuthenticationError("Authorization code exchange failed")
         return resp.json()
 
-    # ── JWKS + ID-token verification ─────────────────────────────────
+    # ── Dormant ID-token verification (Phase 4 candidate) ────────────
     async def _fetch_jwks(self, *, force: bool = False) -> dict[str, Any]:
         if self._jwks is not None and not force:
             return self._jwks
-        try:
-            resp = await self._client().get(settings.keycloak_jwks_uri)
-        except httpx.HTTPError as e:
-            logger.error("Keycloak JWKS fetch network error: %s", e)
-            raise AKBError("Keycloak unreachable fetching JWKS", status_code=502) from e
-        if resp.status_code != 200:
-            logger.error("Keycloak JWKS fetch failed: %s", resp.status_code)
-            raise AKBError("Failed to fetch Keycloak public keys", status_code=502)
-        self._jwks = resp.json()
-        return self._jwks
+        async with self._jwks_refresh_lock:
+            if self._jwks is not None and not force:
+                return self._jwks
+
+            now = time.monotonic()
+            if (
+                self._jwks_refresh_attempt_at is not None
+                and now - self._jwks_refresh_attempt_at < _JWKS_REFRESH_COOLDOWN_SECONDS
+            ):
+                if self._jwks is not None:
+                    return self._jwks
+                raise AKBError(
+                    "Keycloak public keys are temporarily unavailable",
+                    status_code=502,
+                )
+
+            # Record attempts, not just successes. A Keycloak outage must not
+            # turn malformed bearer traffic into an upstream request storm.
+            self._jwks_refresh_attempt_at = now
+            try:
+                resp = await self._client().get(settings.keycloak_jwks_uri)
+            except httpx.HTTPError as e:
+                logger.error("Keycloak JWKS fetch network error: %s", e)
+                raise AKBError("Keycloak unreachable fetching JWKS", status_code=502) from e
+            if resp.status_code != 200:
+                logger.error("Keycloak JWKS fetch failed: %s", resp.status_code)
+                raise AKBError("Failed to fetch Keycloak public keys", status_code=502)
+            try:
+                candidate = resp.json()
+            except (TypeError, ValueError) as e:
+                raise AKBError("Keycloak returned invalid public keys", status_code=502) from e
+            if not isinstance(candidate, dict) or not isinstance(candidate.get("keys"), list):
+                raise AKBError("Keycloak returned invalid public keys", status_code=502)
+            self._jwks = candidate
+            return self._jwks
 
     @staticmethod
     def _find_key(jwks: dict[str, Any], kid: str) -> dict | None:
+        keys = jwks.get("keys")
+        if not isinstance(keys, list):
+            return None
         return next(
-            (k for k in jwks.get("keys", []) if k.get("kid") == kid), None
+            (key for key in keys if isinstance(key, dict) and key.get("kid") == kid),
+            None,
         )
 
-    async def verify_id_token(
-        self, id_token: str, *, client_id: str | None = None
-    ) -> dict[str, Any]:
+    async def verify_id_token(self, id_token: str, *, client_id: str | None = None) -> dict[str, Any]:
         """Verify a Keycloak ID token locally and return its claims.
 
         Validates signature (RS256), audience (client_id), issuer (realm),
@@ -253,8 +276,13 @@ class KeycloakOIDC:
         except jwt.InvalidTokenError as e:
             raise AuthenticationError(f"Malformed ID token: {e}") from e
 
+        if header.get("alg") != "RS256" or header.get("typ") != "JWT":
+            raise AuthenticationError("ID token does not match the RS256 JWT profile")
+        if _TOKEN_SUPPLIED_KEY_HEADERS.intersection(header):
+            raise AuthenticationError("ID token contains an untrusted key-source header")
+
         kid = header.get("kid")
-        if not kid:
+        if not isinstance(kid, str) or not kid:
             raise AuthenticationError("ID token missing kid header")
 
         jwks = await self._fetch_jwks()
@@ -265,6 +293,8 @@ class KeycloakOIDC:
             key = self._find_key(jwks, kid)
         if key is None:
             raise AuthenticationError("No matching Keycloak public key for token")
+        if key.get("kty") != "RSA" or key.get("use") != "sig" or key.get("alg") != "RS256":
+            raise AuthenticationError("Keycloak ID-token signing key is not allowed")
 
         try:
             public_key = RSAAlgorithm.from_jwk(json.dumps(key))
@@ -282,47 +312,36 @@ class KeycloakOIDC:
 
         return claims
 
-    # ── Access-token verification (MCP OAuth Resource Server) ────────
+    # ── Route-selected access-token verification ────────────────────
     async def verify_access_token(
-        self, token: str, audience: str
-    ) -> dict[str, Any] | None:
-        """Verify a Keycloak-issued access token for the MCP Resource
-        Server path. Returns the claim set on success, ``None`` on any
-        verification failure.
+        self,
+        token: str,
+        audience: str,
+        *,
+        route_profile: KeycloakRouteProfile,
+    ) -> VerifiedPrincipal | None:
+        """Verify one route-selected keycloak-access-v1 credential.
 
-        Distinct from :meth:`verify_id_token` in three ways:
-        - The expected ``aud`` is the *resource* (``<host>/mcp``), not the
-          OIDC client id, because Keycloak emits the audience via the
-          scope-level hardcoded-audience mapper set up by the realm
-          bootstrap script.
-        - Returns ``None`` rather than raising on failure: the caller is
-          an MCP request handler that distinguishes "no auth" from "bad
-          auth" via response codes, not exceptions.
-        - Stricter required-claims set: ``exp``, ``iat``, ``iss``, ``aud``,
-          ``sub`` (a Keycloak access token may carry no ``scope`` claim
-          when no scopes were requested — the scope check is enforced
-          downstream in the MCP dispatcher, not here).
+        The caller supplies the already-selected API or MCP audience. Token
+        headers may only confirm this fixed RS256/JWKS profile; they never
+        select an algorithm, issuer, key source, or fallback verifier.
         """
         try:
             header = jwt.get_unverified_header(token)
         except jwt.InvalidTokenError as e:
-            logger.debug("MCP access token: malformed header (%s)", e)
+            logger.debug("Keycloak access token: malformed header (%s)", e)
             return None
 
-        # AKB-issued JWTs are HS256; only RS256 (Keycloak) reaches this
-        # path. The caller already discriminated by alg, but defend in
-        # depth so a config flip doesn't silently downgrade trust.
-        if header.get("alg") != "RS256":
+        if route_profile not in ("api", "mcp"):
+            return None
+        if header.get("alg") != "RS256" or header.get("typ") != "JWT":
+            return None
+        if _TOKEN_SUPPLIED_KEY_HEADERS.intersection(header):
             return None
         kid = header.get("kid")
-        if not kid:
+        if not isinstance(kid, str) or not kid:
             return None
 
-        # `_fetch_jwks` raises `AKBError` on IdP unreachability — catch
-        # it here so a transient JWKS blip surfaces as a clean 401
-        # (with the RFC 9728 `WWW-Authenticate` header the MCP handler
-        # adds) rather than a bare 502. The 401 lets a spec-compliant
-        # client re-run discovery; a 502 has no such affordance.
         try:
             jwks = await self._fetch_jwks()
             key = self._find_key(jwks, kid)
@@ -330,9 +349,11 @@ class KeycloakOIDC:
                 jwks = await self._fetch_jwks(force=True)
                 key = self._find_key(jwks, kid)
         except AKBError as e:
-            logger.warning("MCP access token: JWKS unavailable (%s)", e)
+            logger.warning("Keycloak access token: JWKS unavailable (%s)", e)
             return None
         if key is None:
+            return None
+        if key.get("kty") != "RSA" or key.get("use") != "sig" or key.get("alg") != "RS256":
             return None
 
         try:
@@ -343,15 +364,70 @@ class KeycloakOIDC:
                 algorithms=["RS256"],
                 audience=audience,
                 issuer=settings.keycloak_issuer,
-                options={"require": ["exp", "iat", "aud", "iss", "sub"]},
+                options={
+                    "require": [
+                        "exp",
+                        "iat",
+                        "jti",
+                        "aud",
+                        "iss",
+                        "sub",
+                        "typ",
+                        "azp",
+                        "sid",
+                        "scope",
+                    ]
+                },
             )
-        except jwt.InvalidTokenError as e:
-            logger.debug("MCP access token verification failed: %s", e)
+        except (jwt.InvalidTokenError, TypeError, ValueError) as e:
+            logger.debug("Keycloak access token verification failed: %s", e)
             return None
 
-        return claims
+        required_strings = ("iss", "sub", "jti", "typ", "azp", "sid", "scope")
+        if any(not isinstance(claims.get(name), str) or not claims[name].strip() for name in required_strings):
+            return None
+        if claims["typ"] != "Bearer":
+            return None
+        for optional_name in ("email", "name", "preferred_username"):
+            optional_value = claims.get(optional_name)
+            if optional_value is not None and not isinstance(optional_value, str):
+                return None
+        if "email_verified" in claims and type(claims["email_verified"]) is not bool:
+            return None
+        if route_profile == "api" and claims["azp"] not in settings.keycloak_human_client_ids:
+            return None
+        if type(claims.get("iat")) is not int or type(claims.get("exp")) is not int:
+            return None
+        if claims["exp"] <= claims["iat"]:
+            return None
+        raw_audience = claims.get("aud")
+        if isinstance(raw_audience, str):
+            audiences = {raw_audience}
+        elif isinstance(raw_audience, list) and all(isinstance(item, str) and item for item in raw_audience):
+            audiences = set(raw_audience)
+        else:
+            return None
+        other_route_audience = (
+            settings.mcp_oauth_audience_effective if route_profile == "api" else settings.api_oauth_audience_effective
+        )
+        if other_route_audience and other_route_audience != audience and other_route_audience in audiences:
+            return None
+        if _SERVICE_ACCOUNT_CLAIMS.intersection(claims):
+            return None
+        preferred_username = claims.get("preferred_username")
+        if isinstance(preferred_username, str) and preferred_username.startswith("service-account-"):
+            return None
 
-    # ── Logout URL ───────────────────────────────────────────────────
+        return VerifiedPrincipal(
+            profile_id=KEYCLOAK_ACCESS_V1,
+            issuer=claims["iss"],
+            subject=claims["sub"],
+            credential_type="access_token",
+            claims=claims,
+            audience=audience,
+        )
+
+    # ── Dormant logout URL construction (Phase 4 candidate) ─────────
     def logout_url(self, id_token_hint: str | None, post_logout_redirect: str | None) -> str:
         params: dict[str, str] = {}
         if post_logout_redirect:
@@ -372,23 +448,3 @@ def get_keycloak_oidc() -> KeycloakOIDC:
     if _service is None:
         _service = KeycloakOIDC()
     return _service
-
-
-# ── One-time exchange code (callback → SPA) ──────────────────────────
-
-
-async def issue_exchange_code(login_response: dict) -> str:
-    """Store the freshly minted AKB JWT + user payload under a one-time
-    opaque code and return the code. The SPA trades it via /exchange so
-    the token is delivered in a POST body, never in a redirect URL."""
-    code = secrets.token_urlsafe(32)
-    await _store_issue(
-        code, "exchange", login_response,
-        ttl_secs=settings.keycloak_exchange_code_ttl_secs,
-    )
-    return code
-
-
-async def redeem_exchange_code(code: str) -> dict | None:
-    """Atomically redeem a one-time exchange code → {token, user} or None."""
-    return await _store_consume(code, "exchange")

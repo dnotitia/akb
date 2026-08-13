@@ -67,7 +67,7 @@ JSON_OBJECT_ARRAY_SCHEMA: dict[str, Any] = {
     "items": {"$ref": "#/components/schemas/AkbJsonObject"},
 }
 
-ERROR_STATUSES = ("400", "401", "403", "404", "409", "422", "500")
+ERROR_STATUSES = ("400", "401", "403", "404", "409", "422", "500", "503")
 SUCCESS_STATUSES = ("200", "201", "202")
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 KIND_SUCCESS_RESPONSE_REFS = {
@@ -99,7 +99,10 @@ KIND_SUCCESS_RESPONSE_REFS = {
     ("post", "/api/v1/files/{vault}/upload"): "#/components/schemas/AkbFileEnvelope",
     ("post", "/api/v1/files/{vault}/{file_id}/confirm"): "#/components/schemas/AkbFileEnvelope",
     ("post", "/api/v1/files/{vault}/{file_id}/replace"): "#/components/schemas/AkbFileEnvelope",
-    ("post", "/api/v1/files/{vault}/{file_id}/replace/{replacement_id}/confirm"): "#/components/schemas/AkbFileEnvelope",
+    (
+        "post",
+        "/api/v1/files/{vault}/{file_id}/replace/{replacement_id}/confirm",
+    ): "#/components/schemas/AkbFileEnvelope",
     ("get", "/api/v1/files/{vault}/{file_id}/download"): "#/components/schemas/AkbFileEnvelope",
     ("get", "/api/v1/files/{vault}"): "#/components/schemas/AkbFileEnvelope",
     ("delete", "/api/v1/files/{vault}/{file_id}"): "#/components/schemas/AkbFileEnvelope",
@@ -134,6 +137,12 @@ OPERATION_TAG_OVERRIDES = {
     ("get", "/api/v1/recent"): ["activity"],
     ("get", "/api/v1/history/{vault}/{doc_id}"): ["documents"],
     ("get", "/api/v1/diff/{vault}/{doc_id}"): ["documents"],
+}
+NO_SUCCESS_RESPONSE_OPERATIONS = {
+    ("get", "/api/v1/auth/keycloak/login"),
+    ("get", "/api/v1/auth/keycloak/callback"),
+    ("get", "/api/v1/auth/keycloak/logout"),
+    ("post", "/api/v1/auth/keycloak/exchange"),
 }
 
 
@@ -180,9 +189,7 @@ def _prepare_api_routes(app: FastAPI) -> None:
 def _install_components(schema: dict[str, Any]) -> None:
     components = schema.setdefault("components", {})
     schemas = components.setdefault("schemas", {})
-    schemas["AkbError"] = AkbErrorModel.model_json_schema(
-        ref_template="#/components/schemas/{model}"
-    )
+    schemas["AkbError"] = AkbErrorModel.model_json_schema(ref_template="#/components/schemas/{model}")
     schemas["AkbJsonValue"] = JSON_VALUE_SCHEMA
     schemas["AkbJsonObject"] = JSON_OBJECT_SCHEMA
     schemas.update(_success_envelope_schemas())
@@ -190,7 +197,9 @@ def _install_components(schema: dict[str, Any]) -> None:
     security["bearerAuth"] = {
         "type": "http",
         "scheme": "bearer",
-        "description": "JWT or AKB personal access token supplied as a Bearer token.",
+        "description": (
+            "Route-selected human credential or namespaced AKB PAT/service credential supplied as a Bearer token."
+        ),
     }
 
 
@@ -212,6 +221,11 @@ def _normalize_api_operations(schema: dict[str, Any]) -> None:
 
 def _ensure_success_response(path: str, method: str, operation: dict[str, Any]) -> None:
     responses = operation.setdefault("responses", {})
+    if (method, path) in NO_SUCCESS_RESPONSE_OPERATIONS:
+        for status in tuple(responses):
+            if str(status).startswith("2") or str(status).startswith("3"):
+                responses.pop(status)
+        return
     status = next((code for code in SUCCESS_STATUSES if code in responses), None)
     if status is None:
         if any(str(code).startswith("3") for code in responses):
@@ -272,6 +286,7 @@ def _error_description(status: str) -> str:
         "409": "Conflict",
         "422": "Validation Error",
         "500": "Internal Server Error",
+        "503": "Service Unavailable",
     }[status]
 
 
@@ -300,8 +315,13 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
         "AkbCollectionDeleteEnvelope": {
             "type": "object",
             "required": [
-                "kind", "ok", "collection", "deleted_docs", "deleted_files",
-                "deleted_sub_collections", "deleted_tables",
+                "kind",
+                "ok",
+                "collection",
+                "deleted_docs",
+                "deleted_files",
+                "deleted_sub_collections",
+                "deleted_tables",
             ],
             "properties": {
                 "kind": {"type": "string", "enum": ["collection_delete"]},
@@ -501,10 +521,18 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
             "properties": {
                 "source": {"type": "string"},
                 "target": {"type": "string"},
-                "relation": {"type": "string", "enum": [
-                    "depends_on", "related_to", "implements", "references",
-                    "attached_to", "derived_from", "links_to",
-                ]},
+                "relation": {
+                    "type": "string",
+                    "enum": [
+                        "depends_on",
+                        "related_to",
+                        "implements",
+                        "references",
+                        "attached_to",
+                        "derived_from",
+                        "links_to",
+                    ],
+                },
                 "kind": {"type": "string", "enum": ["implicit", "explicit"]},
             },
             "additionalProperties": {"$ref": "#/components/schemas/AkbJsonValue"},
@@ -514,10 +542,18 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
             "required": ["direction", "relation", "uri", "resource_type"],
             "properties": {
                 "direction": {"type": "string", "enum": ["incoming", "outgoing"]},
-                "relation": {"type": "string", "enum": [
-                    "depends_on", "related_to", "implements", "references",
-                    "attached_to", "derived_from", "links_to",
-                ]},
+                "relation": {
+                    "type": "string",
+                    "enum": [
+                        "depends_on",
+                        "related_to",
+                        "implements",
+                        "references",
+                        "attached_to",
+                        "derived_from",
+                        "links_to",
+                    ],
+                },
                 "uri": {"type": "string"},
                 "resource_type": {"type": "string", "enum": ["doc", "table", "file"]},
                 "name": _nullable_string(),
@@ -559,8 +595,17 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                 "orphans_truncated": {"type": "boolean"},
             },
             "Vault graph overview with connected and orphan totals.",
-            required=("kind", "nodes", "edges", "nodes_total", "edges_total", "returned",
-                      "truncated", "orphans_returned", "orphans_truncated"),
+            required=(
+                "kind",
+                "nodes",
+                "edges",
+                "nodes_total",
+                "edges_total",
+                "returned",
+                "truncated",
+                "orphans_returned",
+                "orphans_truncated",
+            ),
         ),
         "AkbGraphHealthEnvelope": _kind_schema(
             "graph_health",
@@ -594,10 +639,17 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                 "linked": {"type": "boolean"},
                 "source": {"type": "string"},
                 "target": {"type": "string"},
-                "relation": {"type": "string", "enum": [
-                    "depends_on", "related_to", "implements", "references",
-                    "attached_to", "derived_from",
-                ]},
+                "relation": {
+                    "type": "string",
+                    "enum": [
+                        "depends_on",
+                        "related_to",
+                        "implements",
+                        "references",
+                        "attached_to",
+                        "derived_from",
+                    ],
+                },
             },
             "Relation link result.",
             required=("kind", "linked", "source", "target", "relation"),
@@ -627,8 +679,19 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                 "relations": {"type": "array", "items": {"$ref": "#/components/schemas/AkbRelation"}},
             },
             "Flat document provenance payload.",
-            required=("kind", "doc_id", "title", "path", "vault", "uri", "created_by",
-                      "created_at", "updated_at", "current_commit", "relations"),
+            required=(
+                "kind",
+                "doc_id",
+                "title",
+                "path",
+                "vault",
+                "uri",
+                "created_by",
+                "created_at",
+                "updated_at",
+                "current_commit",
+                "relations",
+            ),
         ),
         "AkbSqlEnvelope": {
             "description": "SQL execution success envelope.",

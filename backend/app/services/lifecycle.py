@@ -11,7 +11,23 @@ import logging
 
 from app.config import settings
 from app.db.postgres import close_pool, get_pool, init_db
-from app.services import asset_gc_worker, audit_log, app_rollout_worker, delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, m1_file_transfer_reaper, metadata_worker, s3_delete_worker, sparse_encoder, tool_usage, vault_backfill, write_lane
+from app.services import (
+    asset_gc_worker,
+    audit_log,
+    app_rollout_worker,
+    delete_worker,
+    embed_worker,
+    events_publisher,
+    external_git_poller,
+    http_pool,
+    m1_file_transfer_reaper,
+    metadata_worker,
+    s3_delete_worker,
+    sparse_encoder,
+    tool_usage,
+    vault_backfill,
+    write_lane,
+)
 from app.services.git_service import GitService
 from app.services.native_revision_authority import (
     pre_migration_revision_authority_guard,
@@ -31,9 +47,14 @@ logger = logging.getLogger("akb.lifecycle")
 def _validate_required_settings() -> None:
     """Fail fast on missing required config so misconfigured deploys don't
     silently serve unsigned tokens or produce confusing downstream errors."""
+    auth_mode = settings.require_auth_mode()
+    if auth_mode == "local" and settings.jwt_algorithm != "HS256":
+        raise RuntimeError("jwt_algorithm must be HS256 while local-session-legacy-v1 is active")
+    if settings.mcp_oauth_enabled and settings.api_oauth_audience_effective == settings.mcp_oauth_audience_effective:
+        raise RuntimeError("API and MCP OAuth audiences must be distinct resource identifiers")
     missing: list[str] = []
     if not settings.jwt_secret:
-        missing.append("AKB_JWT_SECRET (signs auth tokens — use a strong random string)")
+        missing.append("AKB_JWT_SECRET (compatibility HMAC material — use a strong random string)")
     if not settings.db_password:
         missing.append("AKB_DB_PASSWORD")
     if not settings.public_base_url:
@@ -42,22 +63,22 @@ def _validate_required_settings() -> None:
             "publication response carries an absolute share_url; e.g. "
             "https://akb.example.com)"
         )
-    # Keycloak is OPTIONAL — only validate its config when it's turned on.
-    # When enabled, an incomplete config would 500 mid-login instead of
-    # failing the deploy, so fail fast here.
+    # A configured Keycloak authority always needs its pinned issuer inputs.
+    # Phase 1 SSO serves only as an API resource server, so startup validates
+    # the active human access-token profile but deliberately does not require
+    # dormant browser callback/client-secret inputs owned by Phase 4.
     if settings.keycloak_enabled:
-        if not settings.keycloak_server_url:
+        if not settings.keycloak_server_url.strip():
             missing.append("keycloak_server_url (keycloak_enabled is true)")
-        if not settings.keycloak_redirect_uri:
-            missing.append(
-                "keycloak_redirect_uri (keycloak_enabled is true — the "
-                "backend callback URL registered on the Keycloak client)"
-            )
-        if not settings.keycloak_public_client and not settings.keycloak_client_secret:
-            missing.append(
-                "keycloak_client_secret (confidential client — set it in "
-                "secret.yaml, or set keycloak_public_client: true for PKCE)"
-            )
+        if not settings.keycloak_realm.strip():
+            missing.append("keycloak_realm (keycloak_enabled is true)")
+        if settings.sso_human_auth_enabled:
+            if not settings.keycloak_human_client_ids:
+                missing.append(
+                    "keycloak_client_id or companion client ID (auth_mode is sso — human API client allowlist is empty)"
+                )
+            if not settings.api_oauth_audience_effective.strip():
+                missing.append("api_oauth_audience (auth_mode is sso — human API resource audience is empty)")
     # MCP-OAuth (the Resource Server path) reuses the Keycloak JWKS,
     # issuer, and audience-mapped scopes — so it's only meaningful when
     # `keycloak_enabled` is also true. A deployment with mcp_oauth on +
@@ -71,9 +92,7 @@ def _validate_required_settings() -> None:
             "either turn keycloak on, or turn mcp_oauth off)"
         )
     if missing:
-        raise RuntimeError(
-            "Required configuration missing:\n  - " + "\n  - ".join(missing)
-        )
+        raise RuntimeError("Required configuration missing:\n  - " + "\n  - ".join(missing))
 
 
 async def init_storage() -> None:
@@ -179,7 +198,15 @@ def start_workers() -> None:
     # Git mutations run here so blocked/slow commits can never crowd git
     # READS out of asyncio.to_thread's shared default executor.
     write_lane.start_commit_pool()
-    started = ["tokenizer_pool", "git_commit_pool", "embed_worker", "delete_worker", "app_rollout_worker", "bm25_stats_refresher", "vault_backfill"]
+    started = [
+        "tokenizer_pool",
+        "git_commit_pool",
+        "embed_worker",
+        "delete_worker",
+        "app_rollout_worker",
+        "bm25_stats_refresher",
+        "vault_backfill",
+    ]
     if bare_git_selected and settings.external_git_enabled:
         started.append("external_git_poller")
     if m1_file_transfer_reaper.enabled():
@@ -202,9 +229,7 @@ def start_workers() -> None:
     # LLM consumer in the request-independent path, so it still stays off when
     # LLM isn't configured (no retry/abandon noise for OSS users without a key).
     if not bare_git_selected:
-        logger.info(
-            "metadata_worker disabled (document revision backend is not Bare Git)"
-        )
+        logger.info("metadata_worker disabled (document revision backend is not Bare Git)")
     elif not settings.external_git_enabled:
         logger.info(
             "metadata_worker disabled (external_git_enabled=false; it only "
@@ -284,5 +309,6 @@ async def shutdown_storage() -> None:
     # Close the optional Keycloak OIDC client if it was ever constructed.
     if settings.keycloak_enabled:
         from app.services.keycloak_oidc import get_keycloak_oidc
+
         await get_keycloak_oidc().aclose()
     await close_pool()

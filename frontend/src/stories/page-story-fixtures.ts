@@ -4,15 +4,25 @@ import type { PublicationResponse } from "@/lib/api";
 export const API = "/api/v1";
 
 export const localAuthConfig = {
-  keycloak: { enabled: false, login_url: null, sso_only: false },
+  schema_version: 1,
+  auth_mode: "local",
+  local_auth: { enabled: true },
+  keycloak: {
+    enabled: false,
+    browser_session_ready: false,
+    login_url: null,
+  },
   mcp_oauth: { enabled: false },
 };
 
-export const hybridSsoAuthConfig = {
+export const stagedSsoAuthConfig = {
+  schema_version: 1,
+  auth_mode: "sso",
+  local_auth: { enabled: false },
   keycloak: {
     enabled: true,
-    login_url: "https://sso.example.test/realms/akb/protocol/openid-connect/auth",
-    sso_only: false,
+    browser_session_ready: false,
+    login_url: null,
   },
   mcp_oauth: { enabled: true },
 };

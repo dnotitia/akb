@@ -1,21 +1,18 @@
-"""Migration 033: add `users.auth_provider` to tag external-IdP accounts.
+"""Migration 033: add ``users.auth_provider`` account-origin metadata.
 
-AKB's baseline auth is local (username/password → bcrypt). The optional
-Keycloak OIDC login path provisions a user row on first SSO login (JIT),
-but such a user has no usable local password. This column records *how*
-the account authenticates so the local login path can refuse a password
-login against an SSO-only account instead of silently failing the bcrypt
-compare.
+AKB's baseline auth is local (username/password → bcrypt). A user projected
+from a fully verified external principal has no usable local password. This
+column lets the local login path refuse such an account before bcrypt compare;
+it does not select a verifier or link identities.
 
 Values:
 - ``'local'``   — registered via POST /auth/register; has a real bcrypt hash.
-- ``'keycloak'``— JIT-provisioned on first Keycloak login; ``password_hash``
-                  holds an unusable sentinel that no bcrypt input can match.
+- ``'keycloak'``— externally projected account; ``password_hash`` holds an
+                  unusable sentinel that no bcrypt input can match.
 
 Default ``'local'`` so every pre-migration row keeps its current behavior.
-The column is NOT a hard auth switch: it is advisory metadata. Keycloak
-itself is gated by ``keycloak_enabled`` in config — when that is false this
-column is simply never read, and AKB behaves exactly as before.
+The column is NOT a hard auth switch: ``auth_mode`` and the route capability
+select the verifier, while exact external-identity bindings select accounts.
 
 Idempotent: ``ADD COLUMN IF NOT EXISTS`` so re-running is a no-op.
 """
@@ -68,7 +65,7 @@ async def _run(conn):
 
     logger.info(
         "Migration 033 added users.auth_provider (default 'local' — "
-        "existing accounts unaffected; only SSO-provisioned rows differ)"
+        "existing accounts unaffected; only externally projected rows differ)"
     )
 
 

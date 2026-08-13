@@ -646,11 +646,11 @@ async def get_managed_account_state(
 
     account_issues = set(issues)
     profile_ready = (
-        settings.keycloak_enabled
+        settings.sso_human_auth_enabled
+        and settings.keycloak_enabled
         and settings.keycloak_enrollment_mode == "invite_only"
         and not settings.keycloak_link_by_email
         and settings.keycloak_require_verified_email
-        and not settings.local_auth_enabled
     )
     if not profile_ready:
         issues.add("managed_auth_profile_mismatch")
