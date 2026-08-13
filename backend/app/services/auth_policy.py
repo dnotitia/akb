@@ -19,6 +19,7 @@ def sso_browser_session_ready() -> bool:
     if (
         settings.require_auth_mode() != "sso"
         or not settings.keycloak_enabled
+        or settings.sso_session_epoch is None
         or not settings.keycloak_client_id.strip()
         or not settings.sso_browser_session_encryption_key
         or (not settings.keycloak_public_client and not settings.keycloak_client_secret)

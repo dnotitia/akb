@@ -110,6 +110,10 @@ def _validate_required_settings() -> None:
         if not settings.keycloak_realm.strip():
             missing.append("keycloak_realm (keycloak_enabled is true)")
         if settings.sso_human_auth_enabled:
+            if settings.sso_session_epoch is None:
+                missing.append(
+                    "sso_session_epoch (auth_mode is sso — generate and persist one UUID per SSO authority epoch)"
+                )
             if not settings.keycloak_human_client_ids:
                 missing.append(
                     "keycloak_client_id or companion client ID (auth_mode is sso — human API client allowlist is empty)"
@@ -177,6 +181,16 @@ async def init_storage() -> None:
     await pre_migration_revision_authority_guard()
     await init_db()
     logger.info("Database initialized")
+    from app.services.sso_session_epoch import reconcile_sso_session_epoch
+
+    epoch_result = await reconcile_sso_session_epoch()
+    if epoch_result.changed:
+        logger.warning(
+            "Authentication runtime boundary changed; revoked ordinary=%d admin=%d logout_fences=%d",
+            epoch_result.ordinary_sessions_revoked,
+            epoch_result.admin_sessions_revoked,
+            epoch_result.logout_fences_revoked,
+        )
     authority_status = await startup_revision_authority_preflight()
     logger.info(
         "Document revision authority ready: backend=%s status=%s",

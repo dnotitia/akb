@@ -73,6 +73,7 @@ confidential-client secrets:
 ```yaml
 db_password: <same value as akb-postgres-credentials>
 system_hmac_secret: <independent random value>
+sso_session_epoch: <installation-owned UUID>
 sso_browser_session_encryption_key: <independent 32-byte base64url value>
 keycloak_client_secret: <akb-web secret>
 keycloak_admin_client_secret: <akb-admin secret>
@@ -86,15 +87,27 @@ email, and Keycloak forces `UPDATE_PASSWORD` on first login. The realm enforces
 the same lean policy for the replacement password. The bootstrap client secret
 is not the product-admin password.
 
+`sso_session_epoch` is not a credential. Generate it once with
+`python -c 'import uuid; print(uuid.uuid4())'` and keep it stable across normal
+restarts. Changing it is an explicit global SSO-session revocation: AKB removes
+ordinary and product-admin browser handles plus back-channel logout fences.
+AKB also records the last active auth mode, so a later `sso` start revokes rows
+that predate an intervening `local` start, even if the same UUID was
+accidentally reused. A draining replica cannot reintroduce its prior generation
+after the boundary because session writes also bind to the database-owned
+active epoch.
+
 Generate the browser-session key as an unpadded 32-byte base64url value:
 
 ```bash
 python -c 'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("="))'
 ```
 
-Keep it stable across backend restarts. Replacing this single key intentionally
-invalidates every outstanding ordinary-user SSO browser session and requires a
-fresh login; it does not rotate a Keycloak realm signing key.
+Keep the encryption key stable across backend restarts. Replacing this single
+key makes ordinary-user envelopes unreadable and requires a fresh login; use
+the epoch change above when the intended operation is a complete, auditable
+ordinary/admin SSO-session revocation. Neither operation rotates a Keycloak
+realm signing key.
 
 Render and validate the public overlay before applying:
 

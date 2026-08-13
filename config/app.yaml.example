@@ -210,6 +210,12 @@ app_credential_overlap_seconds: 300
 # keycloak_management_client_id: "akb-sso-manager" # standalone bundle only:
 #                                         # permanent least-privilege IdP control client
 # admin_browser_session_ttl_secs: 900     # also capped by the verified ID-token expiry
+# Required for every SSO-mode start, including a staged ordinary-browser
+# rollout. Generate one UUID per installation, persist it across normal
+# restarts, and change it only to revoke all ordinary/admin SSO browser
+# sessions and logout fences. It is a generation marker, not a credential,
+# and may instead live in the durable secret.yaml operational input.
+# sso_session_epoch: "<installation-owned UUID>"
 # keycloak_verify_ssl: true          # false only for local self-signed Keycloak
 # keycloak_require_verified_email: true   # refuse unverified email for open-mode JIT.
 #                                         # Exact subject bindings need no email claim.

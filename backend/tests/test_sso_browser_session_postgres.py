@@ -23,6 +23,7 @@ _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret
 )
+_SSO_SESSION_EPOCH = uuid.UUID("8db8b1f8-5f70-43ec-b9c6-039effe26b38")
 
 
 def _dsn_for_database(dsn: str, database: str) -> str:
@@ -47,7 +48,7 @@ async def _schema_shape(conn) -> dict[str, tuple[tuple[object, ...], ...]]:
             SELECT column_name, data_type, is_nullable, column_default
               FROM information_schema.columns
              WHERE table_schema = 'public' AND table_name = $1
-             ORDER BY ordinal_position
+             ORDER BY column_name
             """,
             table,
         )
@@ -99,11 +100,23 @@ async def _fresh_database():
             assert migration is not None
             await migration.migrate(conn=conn)
             await migration.migrate(conn=conn)
+            epoch_migration = _load_migration("076_sso_session_epoch.py")
+            assert epoch_migration is not None
+            await epoch_migration.migrate(conn=conn)
+            await epoch_migration.migrate(conn=conn)
             assert await _schema_shape(conn) == fresh_shape
 
             events_migration = _load_migration("015_events_outbox.py")
             assert events_migration is not None
             await events_migration.migrate(conn=conn)
+            await conn.execute(
+                """
+                INSERT INTO auth_runtime_state (
+                    singleton, auth_mode, sso_session_epoch
+                ) VALUES (TRUE, 'sso', $1)
+                """,
+                _SSO_SESSION_EPOCH,
+            )
         finally:
             await conn.close()
         pool = await asyncpg.create_pool(target_dsn, min_size=1, max_size=8)
@@ -216,6 +229,7 @@ def _configure(monkeypatch, service, pool) -> None:
 
     monkeypatch.setattr(service, "get_pool", get_test_pool)
     monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+    monkeypatch.setattr(settings, "sso_session_epoch", _SSO_SESSION_EPOCH, raising=False)
     monkeypatch.setattr(settings, "keycloak_server_url", "https://id.example", raising=False)
     monkeypatch.setattr(settings, "keycloak_realm", "akb", raising=False)
     monkeypatch.setattr(settings, "keycloak_client_id", "akb-web", raising=False)
@@ -557,3 +571,173 @@ async def test_identity_state_and_verified_backchannel_selector_revoke_immediate
         newer = _principal(issued_at=principal.claims["iat"] + 1)
         replacement = await issue(newer)
         assert (await service.resolve_sso_browser_session(replacement.token)).user_id == str(user_id)
+
+
+async def test_runtime_epoch_reconcile_prevents_mode_transition_resurrection(
+    monkeypatch,
+) -> None:
+    from app.config import settings
+    from app.exceptions import AuthenticationError
+    from app.services import sso_browser_session_service as service
+    from app.services import sso_session_epoch as epoch_service
+
+    async with _fresh_database() as pool:
+        _configure(monkeypatch, service, pool)
+
+        async def get_test_pool():
+            return pool
+
+        monkeypatch.setattr(epoch_service, "get_pool", get_test_pool)
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM auth_runtime_state")
+        first = await epoch_service.reconcile_sso_session_epoch()
+        assert first.changed is True
+        assert first.auth_mode_changed is False
+        assert first.epoch_changed is False
+        assert (
+            first.ordinary_sessions_revoked,
+            first.admin_sessions_revoked,
+            first.logout_fences_revoked,
+        ) == (0, 0, 0)
+
+        user_id, identity_id = await _seed_identity(pool)
+        principal = _principal()
+
+        async def issue_ordinary():
+            return await service.create_sso_browser_session(
+                _actor(user_id),
+                principal,
+                {
+                    "iss": principal.issuer,
+                    "sub": principal.subject,
+                    "sid": principal.claims["sid"],
+                    "identity_provider": "workforce",
+                },
+                _tokens(),
+            )
+
+        async def seed_admin_and_fence(epoch: uuid.UUID, suffix: str) -> None:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE users SET is_admin = TRUE WHERE id = $1",
+                    user_id,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO admin_browser_sessions (
+                        session_epoch, token_hash, csrf_token_hash, user_id,
+                        external_identity_id, identity_issuer, identity_subject,
+                        keycloak_sid, expires_at
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8,
+                        NOW() + INTERVAL '5 minutes'
+                    )
+                    """,
+                    epoch,
+                    uuid.uuid4().hex * 2,
+                    uuid.uuid4().hex * 2,
+                    user_id,
+                    identity_id,
+                    principal.issuer,
+                    principal.subject,
+                    f"admin-{suffix}",
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO sso_browser_logout_fences (
+                        session_epoch, identity_issuer, keycloak_sid,
+                        identity_subject, logout_issued_at, expires_at
+                    ) VALUES (
+                        $1, $2, $3, $4, NOW(), NOW() + INTERVAL '5 minutes'
+                    )
+                    """,
+                    epoch,
+                    principal.issuer,
+                    f"fence-{suffix}",
+                    principal.subject,
+                )
+
+        original = await issue_ordinary()
+        await seed_admin_and_fence(_SSO_SESSION_EPOCH, "initial")
+        unchanged = await epoch_service.reconcile_sso_session_epoch()
+        assert unchanged.changed is False
+        assert (await service.resolve_sso_browser_session(original.token)).user_id == str(user_id)
+
+        monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+        local = await epoch_service.reconcile_sso_session_epoch()
+        assert local.auth_mode_changed is True
+        assert (
+            local.ordinary_sessions_revoked,
+            local.admin_sessions_revoked,
+            local.logout_fences_revoked,
+        ) == (1, 1, 1)
+
+        # Model one draining old SSO replica using its prior generation after
+        # the local-mode startup transaction committed. The runtime-state
+        # share lock rejects it before a write, and the FK independently
+        # prevents that epoch from being reintroduced while local mode owns
+        # the singleton row.
+        monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+        with pytest.raises(AuthenticationError, match="authority"):
+            await issue_ordinary()
+        async with pool.acquire() as conn:
+            with pytest.raises(asyncpg.ForeignKeyViolationError):
+                await conn.execute(
+                    """
+                    INSERT INTO sso_browser_logout_fences (
+                        session_epoch, identity_issuer, keycloak_sid,
+                        logout_issued_at, expires_at
+                    ) VALUES (
+                        $1, $2, 'stale-draining-sid',
+                        NOW(), NOW() + INTERVAL '5 minutes'
+                    )
+                    """,
+                    _SSO_SESSION_EPOCH,
+                    principal.issuer,
+                )
+
+        # Returning to SSO remains an explicit mode boundary even when the
+        # operator reuses the same UUID. No stale row can survive or be added.
+        resumed = await epoch_service.reconcile_sso_session_epoch()
+        assert resumed.auth_mode_changed is True
+        assert (
+            resumed.ordinary_sessions_revoked,
+            resumed.admin_sessions_revoked,
+            resumed.logout_fences_revoked,
+        ) == (0, 0, 0)
+        with pytest.raises(AuthenticationError):
+            await service.resolve_sso_browser_session(original.token)
+
+        prior_epoch = await issue_ordinary()
+        await seed_admin_and_fence(_SSO_SESSION_EPOCH, "rotation")
+        next_epoch = uuid.UUID("f243032e-8f74-42af-93e9-911222e4e748")
+        monkeypatch.setattr(settings, "sso_session_epoch", next_epoch, raising=False)
+        rotated = await epoch_service.reconcile_sso_session_epoch()
+        assert rotated.auth_mode_changed is False
+        assert rotated.epoch_changed is True
+        assert (
+            rotated.ordinary_sessions_revoked,
+            rotated.admin_sessions_revoked,
+            rotated.logout_fences_revoked,
+        ) == (1, 1, 1)
+        with pytest.raises(AuthenticationError):
+            await service.resolve_sso_browser_session(prior_epoch.token)
+
+        async with pool.acquire() as conn:
+            state = await conn.fetchrow(
+                "SELECT auth_mode, sso_session_epoch FROM auth_runtime_state"
+            )
+            assert tuple(state) == ("sso", next_epoch)
+            assert await conn.fetchval("SELECT COUNT(*) FROM sso_browser_sessions") == 0
+            assert await conn.fetchval("SELECT COUNT(*) FROM admin_browser_sessions") == 0
+            assert await conn.fetchval("SELECT COUNT(*) FROM sso_browser_logout_fences") == 0
+            audit_payload = await conn.fetchval(
+                """
+                SELECT string_agg(payload::TEXT, ' ' ORDER BY id)
+                  FROM events
+                 WHERE kind = 'auth.runtime_boundary_changed'
+                """
+            )
+        assert audit_payload is not None
+        assert str(_SSO_SESSION_EPOCH) not in audit_payload
+        assert str(next_epoch) not in audit_payload

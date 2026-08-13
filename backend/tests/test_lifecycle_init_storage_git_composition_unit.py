@@ -30,6 +30,9 @@ def _settings(tmp_path, backend: str | None = None) -> Settings:
 
 
 def _stub_init_storage_dependencies(monkeypatch, lifecycle, settings, events: list[str]) -> None:
+    from app.services import sso_session_epoch
+    from app.services.sso_session_epoch import SsoSessionEpochReconcileResult
+
     monkeypatch.setattr(lifecycle, "settings", settings)
     monkeypatch.setattr(lifecycle, "_validate_required_settings", lambda: None)
 
@@ -40,8 +43,24 @@ def _stub_init_storage_dependencies(monkeypatch, lifecycle, settings, events: li
         events.append("authority_preflight")
         return "ready"
 
+    async def reconcile_epoch() -> SsoSessionEpochReconcileResult:
+        events.append("reconcile_sso_session_epoch")
+        return SsoSessionEpochReconcileResult(
+            changed=False,
+            auth_mode_changed=False,
+            epoch_changed=False,
+            ordinary_sessions_revoked=0,
+            admin_sessions_revoked=0,
+            logout_fences_revoked=0,
+        )
+
     monkeypatch.setattr(lifecycle, "pre_migration_revision_authority_guard", no_op)
     monkeypatch.setattr(lifecycle, "init_db", no_op)
+    monkeypatch.setattr(
+        sso_session_epoch,
+        "reconcile_sso_session_epoch",
+        reconcile_epoch,
+    )
     monkeypatch.setattr(lifecycle, "startup_revision_authority_preflight", authority_preflight)
 
     class _VectorStore:
@@ -107,6 +126,7 @@ async def test_init_storage_default_and_explicit_bare_git_clean_stale_locks(
 
     assert _TrackingGit.constructed == 1
     assert _TrackingGit.cleanups == 1
+    assert "reconcile_sso_session_epoch" in events
     assert "RoleSync.reconcile_from_catalog" in events
 
 

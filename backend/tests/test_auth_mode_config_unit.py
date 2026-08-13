@@ -10,6 +10,9 @@ import yaml
 from app import config as app_config
 
 
+_VALID_SSO_EPOCH = "b71eb45d-1091-4673-a4bc-e3646d4dd279"
+
+
 def _load(
     monkeypatch,
     tmp_path: Path,
@@ -284,6 +287,7 @@ def test_sso_startup_requires_active_human_api_verifier_config_only(
         tmp_path,
         {
             "auth_mode": "sso",
+            "sso_session_epoch": _VALID_SSO_EPOCH,
             "keycloak_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
             "keycloak_client_id": "",
@@ -314,6 +318,7 @@ def test_sso_startup_defers_ordinary_browser_inputs_but_requires_admin_client(
         tmp_path,
         {
             "auth_mode": "sso",
+            "sso_session_epoch": _VALID_SSO_EPOCH,
             "keycloak_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
             "keycloak_client_id": "akb-web",
@@ -341,6 +346,7 @@ def test_sso_admin_client_is_dedicated_and_callback_is_deployment_bound(
         tmp_path,
         {
             "auth_mode": "sso",
+            "sso_session_epoch": _VALID_SSO_EPOCH,
             "keycloak_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
             "keycloak_client_id": "akb-web",
@@ -371,6 +377,7 @@ def test_sso_backchannel_logout_uri_defaults_public_and_rejects_non_callback_tar
 
     common = {
         "auth_mode": "sso",
+        "sso_session_epoch": _VALID_SSO_EPOCH,
         "keycloak_enabled": True,
         "keycloak_server_url": "https://auth.example.com",
         "keycloak_client_id": "akb-web",
@@ -433,6 +440,7 @@ def test_sso_startup_rejects_admin_client_reuse_and_non_tls_public_origin(
         tmp_path,
         {
             "auth_mode": "sso",
+            "sso_session_epoch": _VALID_SSO_EPOCH,
             "keycloak_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
             "keycloak_client_id": "akb-web",
@@ -452,6 +460,7 @@ def test_sso_startup_rejects_admin_client_reuse_and_non_tls_public_origin(
         tmp_path,
         {
             "auth_mode": "sso",
+            "sso_session_epoch": _VALID_SSO_EPOCH,
             "keycloak_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
             "keycloak_client_id": "akb-web",
@@ -471,6 +480,7 @@ def test_sso_startup_rejects_admin_client_reuse_and_non_tls_public_origin(
         tmp_path,
         {
             "auth_mode": "sso",
+            "sso_session_epoch": _VALID_SSO_EPOCH,
             "keycloak_enabled": True,
             "keycloak_server_url": "http://auth.example.com",
             "keycloak_client_id": "akb-web",
@@ -497,6 +507,7 @@ def test_sso_startup_rejects_missing_system_hmac_secret(
         tmp_path,
         {
             "auth_mode": "sso",
+            "sso_session_epoch": _VALID_SSO_EPOCH,
             "keycloak_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
             "keycloak_redirect_uri": "https://akb.example.com/auth/keycloak/callback",
@@ -525,6 +536,7 @@ def test_sso_startup_accepts_legacy_jwt_secret_only_as_system_hmac_migration_inp
         tmp_path,
         {
             "auth_mode": "sso",
+            "sso_session_epoch": _VALID_SSO_EPOCH,
             "keycloak_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
             "keycloak_redirect_uri": "https://akb.example.com/auth/keycloak/callback",

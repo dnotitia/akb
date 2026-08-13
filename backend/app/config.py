@@ -798,6 +798,14 @@ class Settings(BaseModel):
     keycloak_management_client_id: str = "akb-sso-manager"
     keycloak_management_client_secret: str = ""
     admin_browser_session_ttl_secs: int = Field(default=900, ge=60, le=3600)
+    # Installation-owned SSO authority generation. Every ordinary and admin
+    # browser session, plus each back-channel logout fence, is bound to this
+    # UUID. It remains stable across normal SSO restarts and must change when
+    # an operator deliberately starts a new SSO authority epoch. AKB also
+    # records the last running auth mode in PostgreSQL, so an observed
+    # sso -> local -> sso transition revokes old handles even if an operator
+    # accidentally reuses the same UUID.
+    sso_session_epoch: uuid.UUID | None = None
     # Ordinary SSO browsers receive only an opaque AKB handle. The Keycloak
     # refresh/ID token set is encrypted at rest with this independent,
     # installation-owned AES-256-GCM key. Blank keeps the capability

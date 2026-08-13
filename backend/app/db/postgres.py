@@ -258,6 +258,7 @@ async def _apply_migrations() -> None:
         "073_sso_bootstrap_receipt.py",  # durable proof that the temporary bundled-Keycloak client was retired
         "074_sso_browser_sessions.py",  # encrypted ordinary-user SSO browser-session custody
         "075_sso_callback_receipt.py",  # bind current SSO receipts to the effective back-channel callback
+        "076_sso_session_epoch.py",  # revoke on auth-mode/epoch change; bind ordinary/admin SSO sessions and logout fences
     ):
         if filename in applied:
             continue

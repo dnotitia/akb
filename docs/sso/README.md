@@ -14,6 +14,15 @@ Product administration remains separate at `/admin`. A product administrator
 can configure an upstream provider while it is disabled, inspect the exact
 redirect URI, and then enable or disable it without redeploying AKB.
 
+Every SSO installation also owns a required UUID `sso_session_epoch`. It is a
+non-secret authority-generation marker: keep it stable for normal restarts and
+change it only to revoke all ordinary and product-admin browser sessions plus
+back-channel logout fences. AKB persists the last observed auth mode and
+reconciles it transactionally at startup. Consequently, `sso → local → sso`
+cannot revive ignored SSO rows; the database rejects a draining replica that
+tries to reintroduce the prior generation after the local-mode boundary, and
+returning to SSO remains a revocation boundary even if the UUID is reused.
+
 ## Provider lifecycle
 
 ```text

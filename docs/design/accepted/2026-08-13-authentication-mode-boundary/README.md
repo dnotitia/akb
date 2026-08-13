@@ -77,6 +77,17 @@ settings, and only when those settings identify one mode unambiguously. The
 migration persists the derived canonical mode before normal startup; ambiguous
 legacy state fails closed and requires an explicit operator choice.
 
+An SSO runtime binds every ordinary browser session, product-admin browser
+session, and logout fence to one installation-owned authority generation.
+Normal restarts preserve that generation. An explicit generation change or
+any observed transition between `local` and `sso` revokes those rows
+transactionally before authentication traffic is accepted. Returning to SSO
+must not revive state ignored during local mode, and a draining replica must
+not reintroduce its prior generation after the mode-transition transaction.
+The concrete
+configuration field and storage layout are versioned implementation details;
+the no-resurrection boundary is permanent.
+
 ### Credential authority
 
 In `local` mode, AKB remains the human login authority and continues to issue
@@ -171,7 +182,7 @@ following.
 
 | Class | Contracts fixed by this ADR | Change or retirement rule |
 | --- | --- | --- |
-| Permanent | One required canonical mode with no silent default; no hybrid or failure fallback; mode-selected verification; exact OIDC issuer, AKB audience/resource, and credential/token type validation before projection; no AKB user session minted in `sso`; common principal-to-actor authorization; separate ordinary and product-admin surfaces; PAT/service orthogonality | Changing one requires an ADR that explicitly supersedes this record. |
+| Permanent | One required canonical mode with no silent default; no hybrid or failure fallback; no SSO browser-state resurrection across mode/authority-generation boundaries; mode-selected verification; exact OIDC issuer, AKB audience/resource, and credential/token type validation before projection; no AKB user session minted in `sso`; common principal-to-actor authorization; separate ordinary and product-admin surfaces; PAT/service orthogonality | Changing one requires an ADR that explicitly supersedes this record. |
 | Versioned | Local asymmetric session profile; OIDC access-token profile; public login-options and admin-control schemas | Introduce a new named version with compatibility, migration, and retirement rules. Do not silently widen an existing verifier profile. |
 | Migration-only | Acceptance of legacy symmetric AKB sessions and any compatibility for legacy hybrid configuration | Must have a bounded entry condition and the retirement criteria below. Remove its code, configuration, and tests when retired. |
 
@@ -208,6 +219,11 @@ failing test.
 | Installation and admin bootstrap | Fresh-install rejection of missing or unknown `auth_mode`; explicit unambiguous legacy derivation and persistence; rejection of ambiguous legacy state; key persistence and rollover for the selected local profile; explicit product-admin provisioning; mode-appropriate admin recovery; any bounded legacy-hybrid migration. |
 | Login and IdP control | UI and API capability agreement by mode; enabled-provider projection; fail-closed login-options behavior; disabled-provider and secret redaction; separation of ordinary login from product-admin control. |
 | Browser session cutover | OIDC access, refresh, expiry, logout, revocation, and account suspension across AKB and first-party clients; proof that the `sso` path does not issue, store, or forward an AKB user session token. |
+
+Browser-session cutover also owns executable coverage that a same-generation
+restart preserves sessions, while an epoch change or `sso → local → sso`
+transition revokes ordinary/admin sessions and logout fences without recording
+the generation value in audit payloads.
 
 Mode-boundary acceptance requires:
 

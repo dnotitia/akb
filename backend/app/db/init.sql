@@ -81,12 +81,33 @@ CREATE INDEX IF NOT EXISTS idx_external_identities_user
 CREATE UNIQUE INDEX IF NOT EXISTS external_identities_id_user_key
     ON external_identities(id, user_id);
 
+-- Singleton observation of the last runtime auth boundary. Startup holds this
+-- row FOR UPDATE and revokes every SSO browser handle/fence whenever the mode
+-- or explicit epoch changes. Local mode never carries an SSO epoch.
+CREATE TABLE IF NOT EXISTS auth_runtime_state (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE
+        CHECK (singleton),
+    auth_mode TEXT NOT NULL
+        CHECK (auth_mode IN ('local', 'sso')),
+    sso_session_epoch UUID,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT auth_runtime_state_sso_session_epoch_key
+        UNIQUE (sso_session_epoch),
+    CONSTRAINT auth_runtime_state_epoch_shape
+        CHECK (
+            (auth_mode = 'local' AND sso_session_epoch IS NULL)
+            OR
+            (auth_mode = 'sso' AND sso_session_epoch IS NOT NULL)
+        )
+);
+
 -- Dedicated product-admin browser sessions. These rows contain only hashes
 -- of opaque AKB session/CSRF values, an exact external-identity FK, and the
 -- issuer/subject snapshot used to invalidate a changed binding. No Keycloak
 -- access, refresh, or ID token is stored here.
 CREATE TABLE IF NOT EXISTS admin_browser_sessions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    session_epoch UUID NOT NULL,
     token_hash TEXT NOT NULL UNIQUE
         CHECK (token_hash ~ '^[0-9a-f]{64}$'),
     csrf_token_hash TEXT NOT NULL
@@ -105,6 +126,9 @@ CREATE TABLE IF NOT EXISTS admin_browser_sessions (
     CONSTRAINT admin_browser_session_external_user_fk
         FOREIGN KEY (external_identity_id, user_id)
         REFERENCES external_identities(id, user_id) ON DELETE CASCADE,
+    CONSTRAINT admin_browser_session_epoch_fk
+        FOREIGN KEY (session_epoch)
+        REFERENCES auth_runtime_state(sso_session_epoch),
     CONSTRAINT admin_browser_session_positive_lifetime
         CHECK (expires_at > created_at)
 );
@@ -120,6 +144,7 @@ CREATE INDEX IF NOT EXISTS idx_admin_browser_sessions_user
 -- exact row and AKB user. Access tokens are verified and discarded.
 CREATE TABLE IF NOT EXISTS sso_browser_sessions (
     id UUID PRIMARY KEY,
+    session_epoch UUID NOT NULL,
     token_hash TEXT NOT NULL UNIQUE
         CHECK (token_hash ~ '^[0-9a-f]{64}$'),
     csrf_token_hash TEXT NOT NULL
@@ -144,6 +169,9 @@ CREATE TABLE IF NOT EXISTS sso_browser_sessions (
     CONSTRAINT sso_browser_session_external_user_fk
         FOREIGN KEY (external_identity_id, user_id)
         REFERENCES external_identities(id, user_id) ON DELETE CASCADE,
+    CONSTRAINT sso_browser_session_epoch_fk
+        FOREIGN KEY (session_epoch)
+        REFERENCES auth_runtime_state(sso_session_epoch),
     CONSTRAINT sso_browser_session_positive_lifetime
         CHECK (
             access_expires_at > created_at
@@ -161,14 +189,15 @@ CREATE INDEX IF NOT EXISTS idx_sso_browser_sessions_absolute_expiry
 CREATE INDEX IF NOT EXISTS idx_sso_browser_sessions_user
     ON sso_browser_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sso_browser_sessions_sid
-    ON sso_browser_sessions(identity_issuer, keycloak_sid);
+    ON sso_browser_sessions(session_epoch, identity_issuer, keycloak_sid);
 CREATE INDEX IF NOT EXISTS idx_sso_browser_sessions_subject
-    ON sso_browser_sessions(identity_issuer, identity_subject);
+    ON sso_browser_sessions(session_epoch, identity_issuer, identity_subject);
 
 -- Durable, short-lived ordering fence for verified Keycloak back-channel
 -- logout. Session creation and logout also share a transaction advisory lock;
 -- this row rejects a callback that resumes only after logout committed.
 CREATE TABLE IF NOT EXISTS sso_browser_logout_fences (
+    session_epoch UUID NOT NULL,
     identity_issuer TEXT NOT NULL
         CHECK (char_length(identity_issuer) BETWEEN 1 AND 2048),
     keycloak_sid TEXT NOT NULL
@@ -181,7 +210,10 @@ CREATE TABLE IF NOT EXISTS sso_browser_logout_fences (
     logout_issued_at TIMESTAMPTZ NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL,
     received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (identity_issuer, keycloak_sid),
+    PRIMARY KEY (session_epoch, identity_issuer, keycloak_sid),
+    CONSTRAINT sso_browser_logout_fence_epoch_fk
+        FOREIGN KEY (session_epoch)
+        REFERENCES auth_runtime_state(sso_session_epoch),
     CONSTRAINT sso_browser_logout_fence_positive_lifetime
         CHECK (expires_at > logout_issued_at)
 );

@@ -157,6 +157,15 @@ deployment; a malformed configured key fails startup. Replacing the only key
 forces ordinary SSO reauthentication. Key-ring rotation is not part of this
 MVP.
 
+All ordinary sessions, product-admin sessions, and logout fences are also
+bound to the required non-secret `sso_session_epoch` UUID. Normal restarts keep
+the UUID. Changing it transactionally revokes every row in those three
+classes. Startup separately persists the observed auth mode, so any real mode
+change is also a revocation boundary; returning from `local` to `sso` cannot
+resurrect stale rows even when the configured UUID is reused. This generation
+binding is intentionally separate from encryption-key custody: it covers the
+admin session class, which stores no encrypted Keycloak token.
+
 | Route | `local` | ready `sso` |
 | --- | --- | --- |
 | `GET /auth/sso/{alias}/login` | `404` | starts only an enabled provider |
