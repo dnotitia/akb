@@ -705,7 +705,7 @@ async def resume_rollout(
                            o.observed_generation, st.ordinal
                       FROM vault_app_installations AS i
                       JOIN app_rollout_targets AS st
-                        ON st.job_id=$3 AND st.installation_id=i.id
+                        ON st.job_id=$2 AND st.installation_id=i.id
                       LEFT JOIN LATERAL (
                           SELECT generation, status
                             FROM installation_grants
@@ -720,7 +720,6 @@ async def resume_rollout(
                      FOR UPDATE OF i
                     """,
                     app_uuid,
-                    release_uuid,
                     source_uuid,
                 )
                 if (
