@@ -539,6 +539,8 @@ async def test_client_profiles_separate_user_admin_and_management_authorities():
     ]
     assert api["attributes"]["pkce.code.challenge.method"] == "S256"
     assert admin["attributes"]["pkce.code.challenge.method"] == "S256"
+    assert api["defaultClientScopes"] == ["basic", "profile", "email"]
+    assert admin["defaultClientScopes"] == ["basic", "profile", "email"]
     assert management["standardFlowEnabled"] is False
     assert management["serviceAccountsEnabled"] is True
     assert management["defaultClientScopes"] == ["service_account"]

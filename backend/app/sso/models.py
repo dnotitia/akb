@@ -91,3 +91,16 @@ class ProviderMutationReadback:
             "before": self.before.audit_view() if self.before is not None else None,
             "after": self.after.audit_view(),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class IdentityPrelinkReadback:
+    """Exact, read-only evidence for a brokered Keycloak user link."""
+
+    provider_alias: str
+    provider_state: ProviderState
+    upstream_issuer: str
+    broker_issuer: str
+    broker_subject: str = field(repr=False)
+    upstream_subject: str = field(repr=False)
+    broker_username: str

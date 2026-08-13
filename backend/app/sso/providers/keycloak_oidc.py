@@ -399,7 +399,8 @@ def readback(
         client_secret_configured=secret_configured,
         redirect_uri=redirect_uri,
         supports_logout=True,
-        # Exact old/new binding prelink and readiness are delivered by the
-        # migration slice, not inferred merely because Keycloak can federate.
-        supports_identity_migration=False,
+        # This capability means AKB can verify an operator-created exact
+        # Keycloak prelink and atomically add the broker identity to one
+        # existing AKB user.  It does not imply automatic/email-based linking.
+        supports_identity_migration=True,
     )

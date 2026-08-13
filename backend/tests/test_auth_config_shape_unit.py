@@ -31,7 +31,7 @@ def _provider(alias: str, state: str) -> ProviderReadback:
             f"https://auth.akb.example.com/realms/akb/broker/{alias}/endpoint"
         ),
         supports_logout=True,
-        supports_identity_migration=False,
+        supports_identity_migration=True,
     )
 
 

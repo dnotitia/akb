@@ -44,7 +44,9 @@ The admin API reports one of two control modes:
 
 The standalone SSO bundle provisions a dedicated `akb-sso-manager` service
 account with only the Keycloak realm-management roles needed for provider
-control. It does not retain the one-time bootstrap credential.
+control and read-only user/prelink verification. It has no `manage-users`;
+broker-user and federated-link mutations require a separate one-time Keycloak
+operator. It does not retain the bootstrap credential.
 
 ## Built-in providers
 
@@ -59,6 +61,13 @@ Ordinary browser-session custody, refresh, logout, and revocation are a
 separate boundary. An enabled provider is listed by name before that boundary
 is active, but its login URL remains unavailable until the server-side browser
 session capability is ready.
+
+Existing-account migration is an exact identity operation, not a normal
+first-login convenience. See the reference provider's
+[continuity runbook](providers/keycloak-oidc.md#existing-account-continuity).
+AKB verifies an operator-created Keycloak prelink and adds the broker
+`(issuer, sub)` to the same AKB user without changing PAT or Vault ownership.
+Email and username never select the target account.
 
 ## Primary references
 

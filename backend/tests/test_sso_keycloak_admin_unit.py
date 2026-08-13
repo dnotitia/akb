@@ -53,6 +53,9 @@ def _spec(**changes: object) -> ProviderConfigureSpec:
 class KeycloakFixture:
     def __init__(self) -> None:
         self.providers: dict[str, dict[str, object]] = {}
+        self.users: dict[str, dict[str, object]] = {}
+        self.credentials: dict[str, list[dict[str, object]]] = {}
+        self.federated_identities: dict[str, list[dict[str, object]]] = {}
         self.requests: list[tuple[str, str]] = []
         self.fail_admin = False
         self.drift_readback_after_write = False
@@ -134,6 +137,28 @@ class KeycloakFixture:
                 if self.drift_readback_after_write:
                     self._drift_readback = True
                 return httpx.Response(204)
+        users = "/auth/admin/realms/akb/users/"
+        if path.startswith(users) and request.method == "GET":
+            suffix = path.removeprefix(users)
+            if suffix.endswith("/credentials"):
+                user_id = suffix.removesuffix("/credentials")
+                if user_id not in self.users:
+                    return httpx.Response(404)
+                return httpx.Response(200, json=self.credentials.get(user_id, []))
+            if suffix.endswith("/federated-identity"):
+                user_id = suffix.removesuffix("/federated-identity")
+                if user_id not in self.users:
+                    return httpx.Response(404)
+                return httpx.Response(
+                    200,
+                    json=self.federated_identities.get(user_id, []),
+                )
+            user = self.users.get(suffix)
+            return (
+                httpx.Response(404)
+                if user is None
+                else httpx.Response(200, json=user)
+            )
         raise AssertionError(f"unexpected request: {request.method} {path}")
 
 
@@ -396,4 +421,171 @@ async def test_delegated_control_mode_never_attempts_keycloak_management():
     with pytest.raises(ProviderControlError) as captured:
         await control.list_providers(force_refresh=True)
     assert captured.value.code == "keycloak_provider_control_delegated"
+    assert fixture.requests == []
+
+
+async def test_identity_prelink_verifies_exact_native_passwordless_broker_user():
+    fixture = KeycloakFixture()
+    control = _control(fixture)
+    await control.configure(_spec())
+    fixture.users["broker-subject"] = {
+        "id": "broker-subject",
+        "username": "alice",
+        "enabled": True,
+    }
+    fixture.federated_identities["broker-subject"] = [
+        {
+            "identityProvider": "workforce",
+            "userId": "upstream-subject",
+            "userName": "alice",
+        }
+    ]
+
+    prelink = await control.verify_identity_prelink(
+        "workforce",
+        broker_subject="broker-subject",
+        upstream_subject="upstream-subject",
+    )
+
+    assert prelink.provider_alias == "workforce"
+    assert prelink.provider_state == "configured_disabled"
+    assert prelink.upstream_issuer == _ISSUER
+    assert prelink.broker_issuer == "https://auth.akb.example.com/realms/akb"
+    assert prelink.broker_subject == "broker-subject"
+    assert prelink.upstream_subject == "upstream-subject"
+    assert "broker-subject" not in repr(prelink)
+    assert "upstream-subject" not in repr(prelink)
+    assert all(
+        method == "GET" or "/protocol/openid-connect/token" in path
+        for method, path in fixture.requests
+        if "/users/" in path
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        ("missing_user", "identity_prelink_user_not_found"),
+        ("disabled_user", "identity_prelink_user_inactive"),
+        ("federated_storage_user", "identity_prelink_user_not_native"),
+        ("local_password", "identity_prelink_local_credential_present"),
+        ("local_passkey", "identity_prelink_local_credential_present"),
+        ("required_action", "identity_prelink_local_credential_present"),
+        ("missing_link", "identity_prelink_missing"),
+        ("wrong_subject", "identity_prelink_subject_mismatch"),
+        ("duplicate_link", "identity_prelink_ambiguous"),
+        ("other_provider_link", "identity_prelink_ambiguous"),
+    ],
+)
+async def test_identity_prelink_fails_closed_on_non_exact_keycloak_state(
+    mutation,
+    code,
+):
+    fixture = KeycloakFixture()
+    control = _control(fixture)
+    await control.configure(_spec())
+    if mutation != "missing_user":
+        fixture.users["broker-subject"] = {
+            "id": "broker-subject",
+            "username": "alice",
+            "enabled": mutation != "disabled_user",
+        }
+        if mutation == "federated_storage_user":
+            fixture.users["broker-subject"]["federationLink"] = "ldap-provider"
+        if mutation == "local_password":
+            fixture.credentials["broker-subject"] = [{"type": "password"}]
+        if mutation == "local_passkey":
+            fixture.credentials["broker-subject"] = [{"type": "webauthn-passwordless"}]
+        if mutation == "required_action":
+            fixture.users["broker-subject"]["requiredActions"] = ["UPDATE_PASSWORD"]
+        if mutation == "wrong_subject":
+            fixture.federated_identities["broker-subject"] = [
+                {
+                    "identityProvider": "workforce",
+                    "userId": "someone-else",
+                    "userName": "alice",
+                }
+            ]
+        elif mutation == "duplicate_link":
+            fixture.federated_identities["broker-subject"] = [
+                {
+                    "identityProvider": "workforce",
+                    "userId": "upstream-subject",
+                    "userName": "alice",
+                },
+                {
+                    "identityProvider": "workforce",
+                    "userId": "upstream-subject",
+                    "userName": "alice-duplicate",
+                },
+            ]
+        elif mutation == "other_provider_link":
+            fixture.federated_identities["broker-subject"] = [
+                {
+                    "identityProvider": "workforce",
+                    "userId": "upstream-subject",
+                    "userName": "alice",
+                },
+                {
+                    "identityProvider": "unexpected-provider",
+                    "userId": "another-subject",
+                    "userName": "alice",
+                },
+            ]
+
+    with pytest.raises(ProviderControlError) as captured:
+        await control.verify_identity_prelink(
+            "workforce",
+            broker_subject="broker-subject",
+            upstream_subject="upstream-subject",
+        )
+
+    assert captured.value.code == code
+
+
+async def test_identity_prelink_rejects_unmanaged_or_drifted_provider():
+    fixture = KeycloakFixture()
+    control = _control(fixture)
+    await control.configure(_spec())
+    config = fixture.providers["workforce"]["config"]
+    assert isinstance(config, dict)
+    config["validateSignature"] = "false"
+
+    with pytest.raises(ProviderControlError) as captured:
+        await control.verify_identity_prelink(
+            "workforce",
+            broker_subject="broker-subject",
+            upstream_subject="upstream-subject",
+        )
+
+    assert captured.value.code == "provider_configuration_invalid"
+
+
+async def test_identity_prelink_subjects_are_opaque_and_excluded_from_repr():
+    fixture = KeycloakFixture()
+    control = _control(fixture)
+    await control.configure(_spec())
+
+    with pytest.raises(ProviderControlError) as captured:
+        await control.verify_identity_prelink(
+            "workforce",
+            broker_subject=" broker-subject ",
+            upstream_subject="upstream-subject",
+        )
+
+    assert captured.value.code == "identity_prelink_user_not_found"
+
+
+async def test_identity_prelink_rejects_non_utf8_subject_before_network():
+    fixture = KeycloakFixture()
+    control = _control(fixture)
+
+    with pytest.raises(ProviderControlError) as captured:
+        await control.verify_identity_prelink(
+            "workforce",
+            broker_subject="\ud800",
+            upstream_subject="upstream-subject",
+        )
+
+    assert captured.value.code == "identity_prelink_subject_invalid"
     assert fixture.requests == []

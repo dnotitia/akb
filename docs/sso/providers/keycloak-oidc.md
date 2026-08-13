@@ -14,7 +14,8 @@ Create a confidential OpenID Connect client in the upstream realm with:
 - standard authorization code flow enabled;
 - implicit flow, direct access grants, and service accounts disabled;
 - PKCE method `S256`;
-- scopes `openid profile email`;
+- scopes `openid profile email` and the Keycloak built-in `basic` default
+  client scope so access tokens contain the canonical `sub` claim;
 - the exact redirect URI shown by AKB after the provider is saved.
 
 The redirect URI has this Keycloak broker shape:
@@ -64,6 +65,79 @@ To rotate the upstream client secret, disable the provider, edit it with the
 new secret, save, and enable it again. Leaving the secret field blank preserves
 the existing value; no UI or API can read it back.
 
-The provider catalog does not advertise identity-migration support yet. Exact
-old/new subject prelink and readiness are a separate migration slice; an IdP
-being configurable is not evidence that existing AKB accounts were preserved.
+## Existing-account continuity
+
+Changing from an upstream realm to an AKB broker changes the trusted identity
+from `(upstream issuer, upstream sub)` to `(broker issuer, broker sub)`. Do not
+join those identities by email or username. For each existing account:
+
+1. Disable the provider and keep it hidden from ordinary login.
+2. Resolve the existing AKB `users.id` from its exact upstream issuer and
+   subject. Local-only, missing, inactive, service, or conflicting accounts
+   require manual resolution.
+3. Using a one-time Keycloak operator credential, create a native,
+   passwordless broker user and attach the exact federated identity with
+   `identityProvider=<alias>` and `userId=<upstream sub>`.
+4. Call the authenticated preflight endpoint with the provider alias, existing
+   AKB user ID, upstream subject, and broker subject. AKB derives both issuers
+   server-side, verifies the disabled managed provider, native enabled broker
+   user, absence of every local credential or credential-registration required
+   action, and exactly one federated link to the selected provider, then
+   verifies the old AKB binding without writing.
+5. Call `identity-migrations/apply` with the same body and product-admin CSRF
+   header. AKB adds only the broker identity row to the same user. It does not
+   update the user profile, adopt by email, revoke a PAT, or move a Vault role.
+6. Read back `state=linked`, then enable the provider. Keep the old binding for
+   the rollback window.
+
+The relevant paths are:
+
+```text
+POST /api/v1/admin/sso/providers/<alias>/identity-migrations/preflight
+POST /api/v1/admin/sso/providers/<alias>/identity-migrations/apply
+POST /api/v1/admin/sso/providers/<alias>/identity-migrations/rollback
+```
+
+All three accept this shape; callers do not supply either issuer:
+
+```json
+{
+  "existing_user_id": "<canonical AKB user UUID>",
+  "upstream_subject": "<opaque upstream sub>",
+  "broker_subject": "<opaque broker user UUID/sub>"
+}
+```
+
+Apply and rollback require the provider to remain disabled and use the SSO
+product-admin double-submit CSRF boundary. Operations are idempotent and audit
+only subject digests at the admin API boundary. The domain event records the
+exact old/new identity so an operator can reconcile the transaction.
+
+For rollback, disable the provider first, call the AKB rollback endpoint and
+read back `state=ready_to_link`, then use the one-time Keycloak operator to
+remove the federated link and broker user. The permanent `akb-sso-manager`
+credential intentionally cannot perform these user mutations.
+
+## Least-privilege split
+
+The permanent management service account has only these realm-management role
+and client-scope mappings:
+
+```text
+manage-identity-providers
+query-clients
+query-users
+view-clients
+view-realm
+view-users
+```
+
+It has no `manage-users`. Provider lifecycle and exact prelink read-back are
+available at runtime; broker user creation, federated-link mutation, and final
+cleanup stay explicit one-time Keycloak operator actions.
+
+Run `deploy/keycloak-dev/broker-chain/run.sh` before enabling a release. The
+disposable two-Keycloak fixture completes Authorization Code + PKCE login,
+projects the broker access token to the same AKB user, proves PAT and Vault
+continuity, rejects an upstream token even when it carries the AKB API
+audience, then exercises rollback and operator cleanup.

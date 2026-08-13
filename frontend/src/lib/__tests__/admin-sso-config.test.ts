@@ -21,7 +21,7 @@ const provider = {
   redirect_uri: "https://auth.akb.example.com/realms/akb/broker/workforce/endpoint",
   capabilities: {
     supports_logout: true,
-    supports_identity_migration: false,
+    supports_identity_migration: true,
   },
 };
 

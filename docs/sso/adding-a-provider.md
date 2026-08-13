@@ -53,6 +53,12 @@ Configuration always lands disabled. Creation requires a client secret;
 reconfiguration may use Keycloak's masked-secret preservation sentinel only
 after exact read-back proved that the existing managed provider has a secret.
 
+Leave `supports_identity_migration` false unless the contribution can prove an
+operator-created broker user and its sole federated link by exact provider
+alias and upstream subject. Email or username similarity is never sufficient.
+The migration must preserve the existing AKB user ID, PATs, and Vault grants,
+remain disabled through apply/read-back, and provide an exact rollback path.
+
 ## Required tests
 
 Contributions must cover:
@@ -64,6 +70,8 @@ Contributions must cover:
 - disabled-before-reconfigure enforcement;
 - enable, disable, idempotency, and read-back drift;
 - public catalog inclusion only for an exact enabled profile;
+- identity-migration capability false by default, or exact prelink,
+  conflict, continuity, and rollback proofs when enabled;
 - strict frontend parsing and a named provider button;
 - a live two-authority fixture when the provider depends on another identity
   server.

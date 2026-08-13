@@ -31,8 +31,28 @@
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": false,
       "implicitFlowEnabled": false,
+      "fullScopeAllowed": false,
       "redirectUris": ["https://client.localhost/callback"],
-      "webOrigins": []
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "defaultClientScopes": ["basic", "profile", "email"],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "akb-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "https://broker.localhost:19443/api",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
     }
   ],
   "users": [
