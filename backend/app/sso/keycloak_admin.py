@@ -19,6 +19,7 @@ from urllib.parse import quote
 import httpx
 
 from app.sso.models import (
+    IdentityPrelinkReadback,
     ProviderConfigureSpec,
     ProviderMutationReadback,
     ProviderReadback,
@@ -33,6 +34,7 @@ _CACHE_FRESH_SECONDS = 15.0
 _CACHE_STALE_SECONDS = 60.0
 _FAILURE_BACKOFF_SECONDS = 5.0
 _MAX_RESPONSE_BYTES = 1_048_576
+_MAX_SUBJECT_LENGTH = 1024
 
 
 class ProviderControlError(RuntimeError):
@@ -49,6 +51,23 @@ def _fail(code: str) -> ProviderControlError:
 
 def _path(value: str) -> str:
     return quote(value, safe="")
+
+
+def _opaque_subject(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _MAX_SUBJECT_LENGTH
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+    ):
+        raise _fail("identity_prelink_subject_invalid")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise _fail("identity_prelink_subject_invalid") from None
+    # OIDC subjects are opaque and case-sensitive.  Whitespace is not
+    # normalized: it either identifies the exact Keycloak user/link or fails.
+    return value
 
 
 def _object(value: object, *, code: str) -> dict[str, Any]:
@@ -594,6 +613,145 @@ class KeycloakProviderControl:
         self._catalog_error_code = None
         self._catalog_error_at = 0.0
         return ProviderMutationReadback(before=current, after=readback)
+
+    async def verify_identity_prelink(
+        self,
+        alias: str,
+        *,
+        broker_subject: str,
+        upstream_subject: str,
+    ) -> IdentityPrelinkReadback:
+        """Verify a one-time operator-created broker link without mutating it.
+
+        The permanent AKB management client needs only read access to users and
+        federated identities.  Creating the native broker user and attaching
+        the federated identity remain explicit Keycloak-operator actions.
+        """
+
+        self._require_direct()
+        try:
+            validated_alias = keycloak_oidc.validate_alias(alias)
+        except ProviderDefinitionError as exc:
+            raise _fail(exc.code) from exc
+        broker_subject = _opaque_subject(broker_subject)
+        upstream_subject = _opaque_subject(upstream_subject)
+
+        async with self._client() as client:
+            token = await self._token(client)
+            representation = await self._get_exact(client, token, validated_alias)
+            if representation is None:
+                raise _fail("provider_not_found")
+            definition = self._definition_for_representation(representation)
+            if definition is None:
+                raise _fail("provider_alias_conflict")
+            provider = self._readback(definition, representation)
+            if provider.state == "configuration_error" or provider.issuer is None:
+                raise _fail("provider_configuration_invalid")
+
+            user_base = (
+                f"/admin/realms/{_path(self.config.realm)}/users/"
+                f"{_path(broker_subject)}"
+            )
+            user_response = await self._request(
+                client,
+                "GET",
+                user_base,
+                token=token,
+                expected=frozenset({200, 404}),
+                code="identity_prelink_read_failed",
+            )
+            if user_response.status_code == 404:
+                raise _fail("identity_prelink_user_not_found")
+            user = _object(
+                self._json(user_response, code="identity_prelink_read_failed"),
+                code="identity_prelink_read_failed",
+            )
+            if user.get("id") != broker_subject:
+                raise _fail("identity_prelink_user_mismatch")
+            if user.get("enabled") is not True:
+                raise _fail("identity_prelink_user_inactive")
+            federation_link = user.get("federationLink")
+            if federation_link not in (None, ""):
+                raise _fail("identity_prelink_user_not_native")
+            username = user.get("username")
+            if (
+                not isinstance(username, str)
+                or not username
+                or len(username) > 255
+                or any(
+                    ord(character) < 0x20 or ord(character) == 0x7F
+                    for character in username
+                )
+            ):
+                raise _fail("identity_prelink_read_failed")
+            required_actions = user.get("requiredActions", [])
+            if required_actions is None:
+                required_actions = []
+            if not isinstance(required_actions, list) or any(
+                not isinstance(action, str) or not action
+                for action in required_actions
+            ):
+                raise _fail("identity_prelink_read_failed")
+            if required_actions:
+                # UPDATE_PASSWORD, CONFIGURE_TOTP, and WebAuthn registration
+                # can mint a local login authority after this check.
+                raise _fail("identity_prelink_local_credential_present")
+
+            credential_response = await self._request(
+                client,
+                "GET",
+                f"{user_base}/credentials",
+                token=token,
+                expected=frozenset({200}),
+                code="identity_prelink_read_failed",
+            )
+            credentials = _objects(
+                self._json(
+                    credential_response,
+                    code="identity_prelink_read_failed",
+                ),
+                code="identity_prelink_read_failed",
+            )
+            if credentials:
+                # Passwordless WebAuthn, OTP, and recovery credentials are
+                # local login authorities too.  A migration broker user must
+                # be reachable only through its exact upstream federation.
+                raise _fail("identity_prelink_local_credential_present")
+
+            link_response = await self._request(
+                client,
+                "GET",
+                f"{user_base}/federated-identity",
+                token=token,
+                expected=frozenset({200}),
+                code="identity_prelink_read_failed",
+            )
+            links = _objects(
+                self._json(link_response, code="identity_prelink_read_failed"),
+                code="identity_prelink_read_failed",
+            )
+            if not links:
+                raise _fail("identity_prelink_missing")
+            if len(links) != 1:
+                raise _fail("identity_prelink_ambiguous")
+            link = links[0]
+            if link.get("identityProvider") != validated_alias:
+                raise _fail("identity_prelink_missing")
+            if link.get("userId") != upstream_subject:
+                raise _fail("identity_prelink_subject_mismatch")
+            linked_username = link.get("userName")
+            if not isinstance(linked_username, str) or not linked_username:
+                raise _fail("identity_prelink_read_failed")
+
+        return IdentityPrelinkReadback(
+            provider_alias=validated_alias,
+            provider_state=provider.state,
+            upstream_issuer=provider.issuer,
+            broker_issuer=self.config.broker_issuer,
+            broker_subject=broker_subject,
+            upstream_subject=upstream_subject,
+            broker_username=username,
+        )
 
 
 def _runtime_config() -> KeycloakAdminConfig:

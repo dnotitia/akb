@@ -403,7 +403,11 @@ class KeycloakStandaloneSSOControl:
                 f"{spec.akb_public_url.rstrip('/')}/api/v1/auth/keycloak/callback"
             ],
             "webOrigins": [spec.akb_public_url.rstrip("/")],
-            "defaultClientScopes": ["profile", "email"],
+            # Keycloak 26.x puts the access-token subject mapper in its
+            # built-in `basic` client scope.  Omitting it yields a validly
+            # signed browser access token with no `sub`, which AKB must and
+            # does reject at the exact-identity boundary.
+            "defaultClientScopes": ["basic", "profile", "email"],
             "optionalClientScopes": [],
             "attributes": {
                 "pkce.code.challenge.method": "S256",
@@ -427,7 +431,7 @@ class KeycloakStandaloneSSOControl:
             "fullScopeAllowed": False,
             "redirectUris": [spec.admin_redirect_uri],
             "webOrigins": [spec.akb_public_url.rstrip("/")],
-            "defaultClientScopes": ["profile", "email"],
+            "defaultClientScopes": ["basic", "profile", "email"],
             "optionalClientScopes": [],
             "attributes": {
                 "pkce.code.challenge.method": "S256",

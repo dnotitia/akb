@@ -1,4 +1,4 @@
-"""Static safety contract for the disposable two-Keycloak fixture."""
+"""Static safety contract for the disposable broker-chain fixture."""
 
 from __future__ import annotations
 
@@ -14,12 +14,23 @@ _ROOT = Path(__file__).resolve().parents[2]
 _FIXTURE = _ROOT / "deploy" / "keycloak-dev" / "broker-chain"
 
 
-def test_broker_chain_uses_two_pinned_keycloaks_and_no_persistent_volume():
+def test_broker_chain_uses_pinned_images_and_no_persistent_volume():
     compose = yaml.safe_load((_FIXTURE / "compose.yaml").read_text())
-    assert set(compose["services"]) == {"broker", "upstream"}
-    images = {service["image"] for service in compose["services"].values()}
-    assert len(images) == 1
-    assert next(iter(images)).startswith("quay.io/keycloak/keycloak@sha256:")
+    services = compose["services"]
+    assert set(services) == {"broker", "upstream", "postgres"}
+    assert services["broker"]["image"] == services["upstream"]["image"]
+    assert services["broker"]["image"].startswith(
+        "quay.io/keycloak/keycloak@sha256:"
+    )
+    assert services["postgres"]["image"].startswith("postgres:16-alpine@sha256:")
+    assert services["postgres"]["tmpfs"] == ["/var/lib/postgresql/data"]
+    assert services["broker"]["ports"] == ["127.0.0.1:19443:8443"]
+    assert services["upstream"]["ports"] == ["127.0.0.1:19444:19444"]
+    assert services["postgres"]["ports"] == ["127.0.0.1:19445:5432"]
+    assert "extra_hosts" not in services["broker"]
+    assert services["upstream"]["networks"]["default"]["aliases"] == [
+        "upstream.localhost"
+    ]
     assert "volumes" not in compose
 
 
@@ -34,7 +45,18 @@ def test_realms_are_distinct_and_upstream_client_is_code_pkce_only():
     assert client["implicitFlowEnabled"] is False
     assert client["directAccessGrantsEnabled"] is False
     assert client["serviceAccountsEnabled"] is False
+    assert client["fullScopeAllowed"] is False
     assert client["attributes"]["pkce.code.challenge.method"] == "S256"
+    browser = next(
+        value for value in broker["clients"] if value["clientId"] == "fixture-browser"
+    )
+    probe = next(
+        value for value in upstream["clients"] if value["clientId"] == "upstream-probe"
+    )
+    for public_client in (browser, probe):
+        assert public_client["publicClient"] is True
+        assert public_client["fullScopeAllowed"] is False
+        assert public_client["defaultClientScopes"] == ["basic", "profile", "email"]
 
 
 def test_fixture_management_authority_matches_the_product_bootstrap_profile():

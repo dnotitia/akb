@@ -13,7 +13,15 @@ from app.config import settings
 from app.exceptions import AuthenticationError
 from app.services.admin_auth_service import ProductAdminIdentity
 from app.sso.keycloak_admin import ProviderControlError
-from app.sso.models import ProviderMutationReadback, ProviderReadback
+from app.sso.identity_migration import (
+    IdentityMigrationError,
+    IdentityMigrationReadback,
+)
+from app.sso.models import (
+    IdentityPrelinkReadback,
+    ProviderMutationReadback,
+    ProviderReadback,
+)
 
 
 _SECRET = "write-only-provider-secret-must-not-leak"  # pragma: allowlist secret
@@ -54,7 +62,7 @@ def _provider(
             "broker/workforce/endpoint"
         ),
         supports_logout=True,
-        supports_identity_migration=False,
+        supports_identity_migration=True,
     )
 
 
@@ -81,6 +89,23 @@ class Control:
                 state="enabled" if enabled else "configured_disabled",
                 enabled=enabled,
             ),
+        )
+
+    async def verify_identity_prelink(
+        self,
+        alias: str,
+        *,
+        broker_subject: str,
+        upstream_subject: str,
+    ) -> IdentityPrelinkReadback:
+        return IdentityPrelinkReadback(
+            provider_alias=alias,
+            provider_state=self.providers[0].state,
+            upstream_issuer="https://accounts.example.com/realms/workforce",
+            broker_issuer="https://auth.akb.example.com/realms/akb",
+            broker_subject=broker_subject,
+            upstream_subject=upstream_subject,
+            broker_username="alice",
         )
 
 
@@ -315,3 +340,370 @@ async def test_sso_mutation_dependency_rejects_missing_csrf_before_resolution(
             authorization=None,
             csrf_header=None,
         )
+
+
+def test_identity_migration_preflight_derives_both_issuers_server_side(monkeypatch):
+    user_id = uuid.uuid4()
+    captured: dict[str, object] = {}
+
+    async def _inspect(**values):
+        captured.update(values)
+        return IdentityMigrationReadback(
+            user_id=user_id,
+            state="ready_to_link",
+            old_issuer=values["old_issuer"],
+            new_issuer=values["new_issuer"],
+        )
+
+    monkeypatch.setattr(admin_sso, "inspect_identity_migration", _inspect)
+    response = _client(monkeypatch, Control()).post(
+        "/api/v1/admin/sso/providers/workforce/identity-migrations/preflight",
+        json={
+            "existing_user_id": str(user_id),
+            "upstream_subject": "upstream-subject",
+            "broker_subject": "broker-subject",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["schema_version"] == 1
+    assert captured == {
+        "existing_user_id": str(user_id),
+        "old_issuer": "https://accounts.example.com/realms/workforce",
+        "old_subject": "upstream-subject",
+        "new_issuer": "https://auth.akb.example.com/realms/akb",
+        "new_subject": "broker-subject",
+    }
+    assert response.json()["migration"]["state"] == "ready_to_link"
+
+
+def test_identity_migration_apply_requires_provider_disabled_before_db_write(
+    monkeypatch,
+):
+    control = Control()
+    control.providers = [_provider(state="enabled")]
+
+    async def _must_not_apply(**_values):
+        raise AssertionError("enabled provider must not mutate AKB identity state")
+
+    monkeypatch.setattr(admin_sso, "apply_identity_migration", _must_not_apply)
+    response = _client(monkeypatch, control).post(
+        "/api/v1/admin/sso/providers/workforce/identity-migrations/apply",
+        json={
+            "existing_user_id": str(uuid.uuid4()),
+            "upstream_subject": "upstream-subject",
+            "broker_subject": "broker-subject",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == (
+        "identity_migration_provider_must_be_disabled"
+    )
+
+
+def test_identity_migration_apply_is_audited_without_raw_subjects(monkeypatch):
+    user_id = uuid.uuid4()
+    records: list[dict[str, object]] = []
+    applied: list[dict[str, object]] = []
+
+    async def _apply(**values):
+        applied.append(values)
+        return IdentityMigrationReadback(
+            user_id=user_id,
+            state="linked",
+            old_issuer=values["old_issuer"],
+            new_issuer=values["new_issuer"],
+        )
+
+    monkeypatch.setattr(admin_sso, "apply_identity_migration", _apply)
+    monkeypatch.setattr(admin_sso.audit_log, "record", lambda **value: records.append(value))
+    response = _client(monkeypatch, Control()).post(
+        "/api/v1/admin/sso/providers/workforce/identity-migrations/apply",
+        json={
+            "existing_user_id": str(user_id),
+            "upstream_subject": "upstream-subject",
+            "broker_subject": "broker-subject",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["migration"] == {
+        "user_id": str(user_id),
+        "state": "linked",
+        "old_issuer": "https://accounts.example.com/realms/workforce",
+        "new_issuer": "https://auth.akb.example.com/realms/akb",
+    }
+    assert applied[0]["actor_id"] == "product-admin"
+    assert [record["action"] for record in records] == [
+        "admin.sso.identity_migration.apply.requested",
+        "admin.sso.identity_migration.apply",
+    ]
+    assert "upstream-subject" not in repr(records)
+    assert "broker-subject" not in repr(records)
+    assert records[-1]["meta"]["old_subject_sha256"]
+    assert records[-1]["meta"]["new_subject_sha256"]
+
+
+def test_identity_migration_apply_compensates_fresh_binding_on_postcheck_drift(
+    monkeypatch,
+):
+    user_id = uuid.uuid4()
+    rollbacks: list[dict[str, object]] = []
+
+    class DriftAfterApply(Control):
+        def __init__(self) -> None:
+            super().__init__()
+            self.prelink_reads = 0
+
+        async def verify_identity_prelink(self, *args, **kwargs):
+            self.prelink_reads += 1
+            if self.prelink_reads == 2:
+                raise ProviderControlError("identity_prelink_missing")
+            return await super().verify_identity_prelink(*args, **kwargs)
+
+    async def _readback(**values):
+        return IdentityMigrationReadback(
+            user_id=user_id,
+            state="ready_to_link",
+            old_issuer=values["old_issuer"],
+            new_issuer=values["new_issuer"],
+        )
+
+    async def _apply(**values):
+        return IdentityMigrationReadback(
+            user_id=user_id,
+            state="linked",
+            old_issuer=values["old_issuer"],
+            new_issuer=values["new_issuer"],
+            binding_changed=True,
+        )
+
+    async def _rollback(**values):
+        rollbacks.append(values)
+        return await _readback(**values)
+
+    monkeypatch.setattr(admin_sso, "apply_identity_migration", _apply)
+    monkeypatch.setattr(admin_sso, "rollback_identity_migration", _rollback)
+    response = _client(monkeypatch, DriftAfterApply()).post(
+        "/api/v1/admin/sso/providers/workforce/identity-migrations/apply",
+        json={
+            "existing_user_id": str(user_id),
+            "upstream_subject": "upstream-subject",
+            "broker_subject": "broker-subject",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "identity_prelink_missing"
+    assert len(rollbacks) == 1
+
+
+def test_identity_migration_postcheck_never_removes_a_preexisting_binding(
+    monkeypatch,
+):
+    user_id = uuid.uuid4()
+
+    class DriftAfterIdempotentApply(Control):
+        def __init__(self) -> None:
+            super().__init__()
+            self.prelink_reads = 0
+
+        async def verify_identity_prelink(self, *args, **kwargs):
+            self.prelink_reads += 1
+            if self.prelink_reads == 2:
+                raise ProviderControlError("identity_prelink_missing")
+            return await super().verify_identity_prelink(*args, **kwargs)
+
+    async def _linked(**values):
+        return IdentityMigrationReadback(
+            user_id=user_id,
+            state="linked",
+            old_issuer=values["old_issuer"],
+            new_issuer=values["new_issuer"],
+        )
+
+    async def _must_not_rollback(**_values):
+        raise AssertionError("a binding owned by an earlier call must remain")
+
+    monkeypatch.setattr(admin_sso, "apply_identity_migration", _linked)
+    monkeypatch.setattr(
+        admin_sso,
+        "rollback_identity_migration",
+        _must_not_rollback,
+    )
+    response = _client(monkeypatch, DriftAfterIdempotentApply()).post(
+        "/api/v1/admin/sso/providers/workforce/identity-migrations/apply",
+        json={
+            "existing_user_id": str(user_id),
+            "upstream_subject": "upstream-subject",
+            "broker_subject": "broker-subject",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "identity_prelink_missing"
+
+
+def test_identity_migration_postcheck_never_removes_a_concurrent_binding(
+    monkeypatch,
+):
+    user_id = uuid.uuid4()
+    rollbacks: list[dict[str, object]] = []
+
+    class DriftAfterConcurrentApply(Control):
+        def __init__(self) -> None:
+            super().__init__()
+            self.prelink_reads = 0
+
+        async def verify_identity_prelink(self, *args, **kwargs):
+            self.prelink_reads += 1
+            if self.prelink_reads == 2:
+                raise ProviderControlError("identity_prelink_missing")
+            return await super().verify_identity_prelink(*args, **kwargs)
+
+    async def _ready(**values):
+        return IdentityMigrationReadback(
+            user_id=user_id,
+            state="ready_to_link",
+            old_issuer=values["old_issuer"],
+            new_issuer=values["new_issuer"],
+        )
+
+    async def _concurrently_linked(**values):
+        return IdentityMigrationReadback(
+            user_id=user_id,
+            state="linked",
+            old_issuer=values["old_issuer"],
+            new_issuer=values["new_issuer"],
+        )
+
+    async def _rollback(**values):
+        rollbacks.append(values)
+        return await _ready(**values)
+
+    monkeypatch.setattr(admin_sso, "apply_identity_migration", _concurrently_linked)
+    monkeypatch.setattr(admin_sso, "rollback_identity_migration", _rollback)
+    response = _client(monkeypatch, DriftAfterConcurrentApply()).post(
+        "/api/v1/admin/sso/providers/workforce/identity-migrations/apply",
+        json={
+            "existing_user_id": str(user_id),
+            "upstream_subject": "upstream-subject",
+            "broker_subject": "broker-subject",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "identity_prelink_missing"
+    assert rollbacks == []
+
+
+def test_identity_migration_rollback_is_exact_audited_and_idempotent(monkeypatch):
+    user_id = uuid.uuid4()
+    records: list[dict[str, object]] = []
+    rolled_back: list[dict[str, object]] = []
+
+    async def _rollback(**values):
+        rolled_back.append(values)
+        return IdentityMigrationReadback(
+            user_id=user_id,
+            state="ready_to_link",
+            old_issuer=values["old_issuer"],
+            new_issuer=values["new_issuer"],
+        )
+
+    monkeypatch.setattr(admin_sso, "rollback_identity_migration", _rollback)
+    monkeypatch.setattr(admin_sso.audit_log, "record", lambda **value: records.append(value))
+    response = _client(monkeypatch, Control()).post(
+        "/api/v1/admin/sso/providers/workforce/identity-migrations/rollback",
+        json={
+            "existing_user_id": str(user_id),
+            "upstream_subject": "upstream-subject",
+            "broker_subject": "broker-subject",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["migration"]["state"] == "ready_to_link"
+    assert rolled_back[0]["actor_id"] == "product-admin"
+    assert [record["action"] for record in records] == [
+        "admin.sso.identity_migration.rollback.requested",
+        "admin.sso.identity_migration.rollback",
+    ]
+    assert "upstream-subject" not in repr(records)
+    assert "broker-subject" not in repr(records)
+
+
+def test_identity_migration_conflicts_are_value_less(monkeypatch):
+    async def _inspect(**_values):
+        raise IdentityMigrationError("identity_migration_old_binding_missing")
+
+    monkeypatch.setattr(admin_sso, "inspect_identity_migration", _inspect)
+    response = _client(monkeypatch, Control()).post(
+        "/api/v1/admin/sso/providers/workforce/identity-migrations/preflight",
+        json={
+            "existing_user_id": str(uuid.uuid4()),
+            "upstream_subject": "upstream-subject",
+            "broker_subject": "broker-subject",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == (
+        "identity_migration_old_binding_missing"
+    )
+
+
+def test_identity_migration_malformed_subject_type_is_not_echoed(monkeypatch):
+    leaked = "subject-value-must-not-be-reflected"
+    response = _client(monkeypatch, Control()).post(
+        "/api/v1/admin/sso/providers/workforce/identity-migrations/preflight",
+        json={
+            "existing_user_id": str(uuid.uuid4()),
+            "upstream_subject": {"value": leaked},
+            "broker_subject": "broker-subject",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "identity_migration_subject_invalid"
+    assert leaked not in response.text
+
+
+def test_identity_migration_missing_subject_does_not_echo_the_other_subject(
+    monkeypatch,
+):
+    leaked = "present-subject-must-not-be-reflected"
+    response = _client(monkeypatch, Control()).post(
+        "/api/v1/admin/sso/providers/workforce/identity-migrations/preflight",
+        json={
+            "existing_user_id": str(uuid.uuid4()),
+            "upstream_subject": leaked,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "identity_migration_subject_invalid"
+    assert leaked not in response.text
+
+
+def test_identity_migration_audit_digest_handles_non_utf8_subject():
+    assert admin_sso._subject_digest("\ud800") == "<invalid>"
+
+
+def test_identity_migration_openapi_keeps_all_identifiers_required_strings():
+    schema = admin_sso.IdentityMigrationRequest.model_json_schema()
+
+    assert schema["required"] == [
+        "existing_user_id",
+        "upstream_subject",
+        "broker_subject",
+    ]
+    assert {
+        name: value["type"]
+        for name, value in schema["properties"].items()
+    } == {
+        "existing_user_id": "string",
+        "upstream_subject": "string",
+        "broker_subject": "string",
+    }
