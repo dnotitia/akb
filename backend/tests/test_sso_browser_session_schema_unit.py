@@ -71,6 +71,33 @@ def test_runtime_epoch_preflight_is_executable_and_public_safe():
     assert '"sso_session_epoch":' not in preflight
 
 
+def test_epoch_bridge_has_named_migration_only_retirement_contract():
+    contract = (_BACKEND.parent / "docs" / "sso" / "README.md").read_text()
+    heading = "## SSO session epoch migration bridge retirement gate"
+
+    assert heading in contract
+    section = contract.split(heading, 1)[1].split("\n## ", 1)[0]
+    normalized = " ".join(section.replace("`", "").split()).casefold()
+    for required_condition in (
+        "all supported AKB rollback artifacts are epoch-capable",
+        "pre-epoch image rollback support is formally ended",
+        "deployment and fleet inventory shows no pre-epoch artifact",
+        "upgrade and rollback rehearsal receipts exist for every supported deployment profile",
+    ):
+        assert required_condition.casefold() in normalized
+    for atomic_removal in (
+        "sso_session_epoch_upgrade",
+        "prepare-rollback",
+        "rollback_ready",
+        "legacy NULL trigger and state",
+        "make every session_epoch column NOT NULL",
+        "remove or replace the legacy bridge tests",
+    ):
+        assert atomic_removal.casefold() in normalized
+    assert "migration-only compatibility bridge, not a permanent feature" in normalized
+    assert "all three conditions are evidenced" in normalized
+
+
 def test_browser_session_migration_is_registered():
     registry = (_BACKEND / "app" / "db" / "postgres.py").read_text()
 

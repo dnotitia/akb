@@ -94,14 +94,15 @@ async def _fresh_database():
             await conn.execute(_INIT_SQL)
             from app.db.postgres import _load_migration
 
+            epoch_migration = _load_migration("076_sso_session_epoch.py")
+            assert epoch_migration is not None
+            await epoch_migration.migrate(conn=conn)
             fresh_shape = await _schema_shape(conn)
             await conn.execute("DROP TABLE sso_browser_sessions, sso_browser_logout_fences")
             migration = _load_migration("074_sso_browser_sessions.py")
             assert migration is not None
             await migration.migrate(conn=conn)
             await migration.migrate(conn=conn)
-            epoch_migration = _load_migration("076_sso_session_epoch.py")
-            assert epoch_migration is not None
             await epoch_migration.migrate(conn=conn)
             await epoch_migration.migrate(conn=conn)
             assert await _schema_shape(conn) == fresh_shape

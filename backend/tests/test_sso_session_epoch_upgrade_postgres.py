@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,6 +19,15 @@ pytestmark = pytest.mark.asyncio
 
 _BACKEND = Path(__file__).resolve().parents[1]
 _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
+_EXACT_BASE_INIT_SQL = (
+    _BACKEND / "tests" / "fixtures" / "sso_session_epoch" / "exact_base_0860a0e_init.sql"
+).read_text()
+_EXACT_BASE_INIT_SHA256 = "410c67e62b63f254004430cd3bb2ab72ff0fc9e4af3415ac8218fec6137696b1"
+_MIGRATION_REGISTRY = (_BACKEND / "app" / "db" / "postgres.py").read_text().split("for filename in (", 1)[1]
+_MIGRATION_REGISTRY = _MIGRATION_REGISTRY.split("    ):", 1)[0]
+_CURRENT_MIGRATIONS = re.findall(r'"([0-9]{3}_[^"]+\.py)"', _MIGRATION_REGISTRY)
+_EPOCH_MIGRATION_POSITION = _CURRENT_MIGRATIONS.index("076_sso_session_epoch.py")
+_EXACT_BASE_MIGRATIONS = _CURRENT_MIGRATIONS[:_EPOCH_MIGRATION_POSITION]
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret
@@ -39,6 +49,112 @@ async def _can_connect(dsn: str) -> bool:
         return False
     await conn.close()
     return True
+
+
+@asynccontextmanager
+async def _init_db_regression_database(*, exact_base: bool):
+    if not await _can_connect(_DSN):
+        if os.environ.get("REQUIRE_REAL_PG") == "1":
+            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
+        pytest.skip(f"Postgres not reachable at {_DSN}")
+
+    database = f"akb_sso_epoch_init_{uuid.uuid4().hex[:10]}"
+    admin = await asyncpg.connect(_DSN)
+    await admin.execute(f'CREATE DATABASE "{database}"')
+    pool: asyncpg.Pool | None = None
+    try:
+        target_dsn = _dsn_for_database(_DSN, database)
+        if exact_base:
+            conn = await asyncpg.connect(target_dsn)
+            try:
+                await conn.execute(_EXACT_BASE_INIT_SQL)
+                await conn.executemany(
+                    "INSERT INTO schema_migrations (filename) VALUES ($1)",
+                    [(filename,) for filename in _EXACT_BASE_MIGRATIONS],
+                )
+            finally:
+                await conn.close()
+        pool = await asyncpg.create_pool(target_dsn, min_size=1, max_size=4)
+        yield pool
+    finally:
+        if pool is not None:
+            await pool.close()
+        await admin.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
+            database,
+        )
+        await admin.execute(f'DROP DATABASE "{database}"')
+        await admin.close()
+
+
+async def _run_current_init_db(monkeypatch, pool) -> None:
+    from app.db import postgres
+
+    async def get_test_pool():
+        return pool
+
+    monkeypatch.setattr(postgres, "get_pool", get_test_pool)
+    await postgres.init_db(max_retries=1, delay=0)
+
+
+async def _browser_session_index_columns(pool) -> dict[str, list[str]]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT indexname, indexdef
+              FROM pg_indexes
+             WHERE schemaname = 'public'
+               AND indexname = ANY($1::TEXT[])
+            """,
+            ["idx_sso_browser_sessions_sid", "idx_sso_browser_sessions_subject"],
+        )
+    columns: dict[str, list[str]] = {}
+    for row in rows:
+        column_list = row["indexdef"].rsplit("(", 1)[1].removesuffix(")")
+        columns[row["indexname"]] = column_list.split(", ")
+    return columns
+
+
+async def test_current_init_db_upgrades_exact_base_schema_and_replaces_indexes(
+    monkeypatch,
+) -> None:
+    assert hashlib.sha256(_EXACT_BASE_INIT_SQL.encode()).hexdigest() == _EXACT_BASE_INIT_SHA256
+    assert _EXACT_BASE_MIGRATIONS[-1] == "075_sso_callback_receipt.py"
+
+    async with _init_db_regression_database(exact_base=True) as pool:
+        async with pool.acquire() as conn:
+            assert not await conn.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                      FROM information_schema.columns
+                     WHERE table_schema = 'public'
+                       AND table_name = 'sso_browser_sessions'
+                       AND column_name = 'session_epoch'
+                )
+                """
+            )
+        assert await _browser_session_index_columns(pool) == {
+            "idx_sso_browser_sessions_sid": ["identity_issuer", "keycloak_sid"],
+            "idx_sso_browser_sessions_subject": ["identity_issuer", "identity_subject"],
+        }
+
+        await _run_current_init_db(monkeypatch, pool)
+
+        assert await _browser_session_index_columns(pool) == {
+            "idx_sso_browser_sessions_sid": ["session_epoch", "identity_issuer", "keycloak_sid"],
+            "idx_sso_browser_sessions_subject": ["session_epoch", "identity_issuer", "identity_subject"],
+        }
+
+
+async def test_current_init_db_fresh_schema_finishes_with_epoch_indexes(monkeypatch) -> None:
+    async with _init_db_regression_database(exact_base=False) as pool:
+        await _run_current_init_db(monkeypatch, pool)
+
+        assert await _browser_session_index_columns(pool) == {
+            "idx_sso_browser_sessions_sid": ["session_epoch", "identity_issuer", "keycloak_sid"],
+            "idx_sso_browser_sessions_subject": ["session_epoch", "identity_issuer", "identity_subject"],
+        }
 
 
 @asynccontextmanager

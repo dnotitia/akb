@@ -63,6 +63,23 @@ A later re-upgrade must use a generation greater than the last current-image
 generation; the retained floor rejects replay. `status` prints only the
 contract state and whether legacy rows exist, never authority values.
 
+## SSO session epoch migration bridge retirement gate
+
+This is a migration-only compatibility bridge, not a permanent feature.
+Retire it only after all three conditions are evidenced:
+
+1. All supported AKB rollback artifacts are epoch-capable, and pre-epoch image
+   rollback support is formally ended.
+2. Deployment and fleet inventory shows no pre-epoch artifact.
+3. Upgrade and rollback rehearsal receipts exist for every supported
+   deployment profile.
+
+Then remove the bridge in one atomic schema/runtime change: remove the
+`sso_session_epoch_upgrade` acknowledgement and the `prepare-rollback`
+command/path; remove `rollback_ready` and the legacy NULL trigger and state;
+make every `session_epoch` column NOT NULL; and remove or replace the legacy
+bridge tests.
+
 ## Provider lifecycle
 
 ```text
