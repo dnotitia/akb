@@ -276,6 +276,21 @@ async def test_sso_admin_is_exact_prebound_opaque_and_live_rechecked(
         assert resolved.user_id == admin_user_id
 
         with pytest.raises(AuthenticationError):
+            await admin_auth_service.validate_sso_admin_browser_session_csrf(
+                issued.token,
+                issued.csrf_token,
+                "wrong-csrf-token-that-is-long-enough",
+            )
+        mutation_identity = (
+            await admin_auth_service.validate_sso_admin_browser_session_csrf(
+                issued.token,
+                issued.csrf_token,
+                issued.csrf_token,
+            )
+        )
+        assert mutation_identity.user_id == admin_user_id
+
+        with pytest.raises(AuthenticationError):
             await admin_auth_service.revoke_sso_admin_browser_session(
                 issued.token,
                 issued.csrf_token,

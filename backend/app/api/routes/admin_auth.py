@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.config import settings
@@ -18,6 +18,7 @@ from app.services.admin_auth_service import (
     resolve_prebound_sso_product_admin,
     resolve_sso_admin_browser_session,
     revoke_sso_admin_browser_session,
+    validate_sso_admin_browser_session_csrf,
 )
 from app.services.auth_service import AuthenticatedUser
 from app.services.keycloak_oidc import get_keycloak_oidc
@@ -35,6 +36,42 @@ _ADMIN_OIDC_CALLBACK_PATH = "/api/v1/admin/auth/keycloak/callback"
 class AdminLocalLoginRequest(NFCModel):
     username: str
     password: str
+
+
+ProductAdminActor = ProductAdminIdentity | AuthenticatedUser
+
+
+async def get_current_product_admin(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> ProductAdminActor:
+    """Resolve the mode-selected product-admin credential."""
+    if settings.require_auth_mode() == "local":
+        if not authorization:
+            raise AuthenticationError()
+        return await resolve_local_product_admin(authorization)
+    return await resolve_sso_admin_browser_session(
+        request.cookies.get(_ADMIN_SESSION_COOKIE, "")
+    )
+
+
+async def get_product_admin_mutation(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    csrf_header: str | None = Header(default=None, alias="X-AKB-Admin-CSRF"),
+) -> ProductAdminActor:
+    """Resolve admin authority and require CSRF for cookie-backed SSO."""
+    if settings.require_auth_mode() == "local":
+        if not authorization:
+            raise AuthenticationError()
+        return await resolve_local_product_admin(authorization)
+    if csrf_header is None:
+        raise AuthenticationError("Invalid admin CSRF token")
+    return await validate_sso_admin_browser_session_csrf(
+        request.cookies.get(_ADMIN_SESSION_COOKIE, ""),
+        request.cookies.get(_ADMIN_CSRF_COOKIE, ""),
+        csrf_header,
+    )
 
 
 def _require_mode(expected: str) -> None:
@@ -234,18 +271,9 @@ async def admin_keycloak_callback(
 
 @router.get("/admin/auth/session", summary="Get current product-admin session")
 async def admin_session(
-    request: Request,
-    authorization: str | None = Header(default=None),
+    identity: ProductAdminActor = Depends(get_current_product_admin),
 ):
     mode = settings.require_auth_mode()
-    identity: ProductAdminIdentity | AuthenticatedUser
-    if mode == "local":
-        if not authorization:
-            raise AuthenticationError()
-        identity = await resolve_local_product_admin(authorization)
-    else:
-        raw_token = request.cookies.get(_ADMIN_SESSION_COOKIE, "")
-        identity = await resolve_sso_admin_browser_session(raw_token)
     return {
         "schema_version": 1,
         "auth_mode": mode,

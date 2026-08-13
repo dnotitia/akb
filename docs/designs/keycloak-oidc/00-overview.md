@@ -1,7 +1,7 @@
 # Keycloak OIDC boundary
 
-**Status:** Phase 2 local verifier, admin provisioning, and dedicated admin
-browser session active; ordinary SSO browser session cutover staged unavailable
+**Status:** Phase 3A provider control and dedicated admin browser session active;
+exact identity migration and ordinary SSO browser-session cutover staged unavailable
 
 The accepted
 [Authentication Mode Boundary](../../design/accepted/2026-08-13-authentication-mode-boundary/README.md)
@@ -94,6 +94,22 @@ BFF sessions, back-channel logout, or long-lived provider sessions. Those
 remain Phase 4 work; the short admin session bounds IdP-side revocation lag in
 this MVP.
 
+## Runtime provider control
+
+In SSO mode, `/admin` manages an explicit registry of built-in upstream
+providers. The first provider is `keycloak-oidc`, which brokers a distinct
+Keycloak issuer behind the installation's Keycloak realm. Configuration always
+lands disabled; enable and disable are separate mutations and each result is
+read back from Keycloak. An enabled provider must be disabled before it can be
+reconfigured.
+
+The permanent realm-scoped management client is separate from the one-time
+standalone bootstrap client. A missing management credential produces explicit
+`delegated` control ownership and never falls back to a broader credential.
+Provider client secrets are write-only and excluded from admin, public, event,
+and audit views. The contribution contract and operator guide live under
+[`docs/sso/`](../../sso/README.md).
+
 ## Ordinary browser routes are staged unavailable
 
 Phase 1 does not expose a browser token transport:
@@ -109,30 +125,38 @@ exchange, token write, or SSO identity marker write. Phase 4 owns server-side
 access/refresh token custody, browser session transport, refresh, logout, and
 revocation before these routes can become available.
 
-## Public capability schema v1
+## Public capability schema v2
 
 `GET /api/v1/auth/config` publishes only non-secret capabilities:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "auth_mode": "sso",
   "local_auth": { "enabled": false },
   "keycloak": {
     "enabled": true,
-    "browser_session_ready": false,
-    "login_url": null
+    "browser_session_ready": false
   },
+  "providers": [
+    {
+      "provider_type": "keycloak-oidc",
+      "alias": "workforce",
+      "display_name": "Company SSO",
+      "login_url": null
+    }
+  ],
   "mcp_oauth": { "enabled": false }
 }
 ```
 
 `local_auth.enabled` derives from `auth_mode`. `keycloak.enabled` means the
 ordinary human SSO authority, so local mode with Keycloak enabled solely for
-MCP still publishes it as `false`. Until Phase 4, browser readiness is false
-and `login_url` is null. MCP OAuth remains orthogonal.
+MCP still publishes it as `false`. `providers` contains only exact enabled,
+non-drifted provider read-backs. Until Phase 4, browser readiness is false and
+each provider `login_url` is null. MCP OAuth remains orthogonal.
 
-Clients accept only schema v1 with a known mode and internally consistent
+Clients accept only schema v2 with a known mode and internally consistent
 capabilities. Fetch failure, non-success status, malformed JSON, old/missing
 shape, unknown version/mode, or mode contradiction yields a deny-all
 unavailable state; clients never infer local mode.

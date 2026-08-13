@@ -295,6 +295,69 @@ async def resolve_sso_admin_browser_session(
     return _identity_from_row(row)
 
 
+async def validate_sso_admin_browser_session_csrf(
+    raw_token: str,
+    csrf_cookie: str,
+    csrf_header: str,
+) -> ProductAdminIdentity:
+    """Resolve one live SSO admin session and its double-submit CSRF proof.
+
+    The token, CSRF hash, exact external binding, and current AKB admin status
+    are checked in one database lookup so a demotion or identity rebind takes
+    effect before the control-plane mutation can start.
+    """
+    token = _bounded_credential(raw_token)
+    cookie = _bounded_credential(csrf_cookie)
+    header = _bounded_credential(csrf_header)
+    if (
+        token is None
+        or cookie is None
+        or header is None
+        or not secrets.compare_digest(cookie, header)
+    ):
+        raise AuthenticationError("Invalid admin CSRF token")
+
+    token_hash = _hash_credential(token)
+    csrf_hash = _hash_credential(cookie)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT s.id AS session_id, s.csrf_token_hash,
+                       s.user_id, s.external_identity_id,
+                       u.username, u.email, u.display_name
+                  FROM admin_browser_sessions s
+                  JOIN users u ON u.id = s.user_id
+                  JOIN external_identities e
+                    ON e.id = s.external_identity_id AND e.user_id = s.user_id
+                 WHERE s.token_hash = $1
+                   AND s.expires_at > NOW()
+                   AND s.identity_issuer = $2
+                   AND e.issuer = s.identity_issuer
+                   AND e.subject = s.identity_subject
+                   AND u.is_admin
+                   AND u.account_status = 'active'
+                   AND u.account_kind = 'human'
+                   AND u.auth_provider = 'keycloak'
+                 FOR UPDATE OF s
+                """,
+                token_hash,
+                settings.keycloak_issuer,
+            )
+            if (
+                row is None
+                or not isinstance(row["csrf_token_hash"], str)
+                or not secrets.compare_digest(row["csrf_token_hash"], csrf_hash)
+            ):
+                raise AuthenticationError("Invalid admin CSRF token")
+            await conn.execute(
+                "UPDATE admin_browser_sessions SET last_seen_at = NOW() WHERE id = $1",
+                row["session_id"],
+            )
+    return _identity_from_row(row)
+
+
 async def revoke_sso_admin_browser_session(
     raw_token: str,
     csrf_cookie: str,

@@ -1,0 +1,35 @@
+services:
+  broker:
+    image: quay.io/keycloak/keycloak@sha256:0f198be292568439d700cdbfb893e69a6009bb43a94a06a945b1d3d506c76b13
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: fixture-admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: fixture-only-admin-password # pragma: allowlist secret
+      KC_HOSTNAME: https://broker.localhost:19443
+      KC_HTTPS_CERTIFICATE_FILE: /certs/tls.crt
+      KC_HTTPS_CERTIFICATE_KEY_FILE: /certs/tls.key
+      KC_TRUSTSTORE_PATHS: /certs/tls.crt
+      KC_HEALTH_ENABLED: "true"
+    extra_hosts:
+      - upstream.localhost:host-gateway
+    ports:
+      - "19443:8443"
+    volumes:
+      - ${AKB_SSO_FIXTURE_CERT_DIR:?run through run.sh}:/certs:ro
+      - ./broker-realm.json:/opt/keycloak/data/import/akb-realm.json:ro
+
+  upstream:
+    image: quay.io/keycloak/keycloak@sha256:0f198be292568439d700cdbfb893e69a6009bb43a94a06a945b1d3d506c76b13
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: fixture-admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: fixture-only-admin-password # pragma: allowlist secret
+      KC_HOSTNAME: https://upstream.localhost:19444
+      KC_HTTPS_CERTIFICATE_FILE: /certs/tls.crt
+      KC_HTTPS_CERTIFICATE_KEY_FILE: /certs/tls.key
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "19444:8443"
+    volumes:
+      - ${AKB_SSO_FIXTURE_CERT_DIR:?run through run.sh}:/certs:ro
+      - ./upstream-realm.json:/opt/keycloak/data/import/workforce-realm.json:ro

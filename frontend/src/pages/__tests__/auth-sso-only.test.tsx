@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 
-import { AUTH_CONFIG_UNAVAILABLE, getAuthConfig } from "@/lib/api";
+import {
+  AUTH_CONFIG_UNAVAILABLE,
+  getAuthConfig,
+  getToken,
+  setToken,
+} from "@/lib/api";
 import AuthPage from "../auth";
 
 
@@ -28,27 +33,32 @@ vi.mock("react-router-dom", async () => {
 
 const localConfig = {
   available: true,
-  schema_version: 1 as const,
+  schema_version: 2 as const,
   auth_mode: "local" as const,
   local_auth: { enabled: true },
   keycloak: {
     enabled: false,
     browser_session_ready: false,
-    login_url: null,
   },
+  providers: [],
   mcp_oauth: { enabled: false },
 };
 
 const stagedSsoConfig = {
   available: true,
-  schema_version: 1 as const,
+  schema_version: 2 as const,
   auth_mode: "sso" as const,
   local_auth: { enabled: false },
   keycloak: {
     enabled: true,
     browser_session_ready: false,
-    login_url: null,
   },
+  providers: [{
+    provider_type: "keycloak-oidc",
+    alias: "workforce",
+    display_name: "Company SSO",
+    login_url: null,
+  }],
   mcp_oauth: { enabled: false },
 };
 
@@ -62,6 +72,7 @@ function renderAuth() {
 
 beforeEach(() => {
   window.history.replaceState({}, "", "/auth");
+  vi.mocked(getToken).mockReturnValue(null);
 });
 
 afterEach(() => {
@@ -91,7 +102,7 @@ describe("AuthPage mode gate", () => {
     expect(screen.queryByLabelText(/Username/i)).toBeNull();
     expect(screen.queryByRole("tab", { name: /Register/i })).toBeNull();
     expect(screen.queryByRole("link", { name: /Forgot password/i })).toBeNull();
-    expect(screen.queryByRole("button", { name: /Sign in with SSO/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Company SSO/i })).toBeNull();
   });
 
   it("does not treat ?local=1 as an SSO-mode escape", async () => {
@@ -102,6 +113,17 @@ describe("AuthPage mode gate", () => {
 
     expect(await screen.findByText(/SSO browser sign-in is not available yet/i)).toBeInTheDocument();
     expect(screen.queryByLabelText(/Username/i)).toBeNull();
+  });
+
+  it("clears a stale local JWT instead of redirecting it through SSO mode", async () => {
+    vi.mocked(getAuthConfig).mockResolvedValue(stagedSsoConfig);
+    vi.mocked(getToken).mockReturnValue("legacy-local-session");
+
+    renderAuth();
+
+    expect(await screen.findByText(/SSO browser sign-in is not available yet/i)).toBeInTheDocument();
+    expect(setToken).toHaveBeenCalledWith(null);
+    expect(navigate).not.toHaveBeenCalled();
   });
 
   it("fails closed when public auth configuration is unavailable", async () => {
@@ -119,14 +141,30 @@ describe("AuthPage mode gate", () => {
       keycloak: {
         enabled: true,
         browser_session_ready: true,
-        login_url: "/api/v1/auth/keycloak/login",
       },
+      providers: [{
+        ...stagedSsoConfig.providers[0],
+        login_url: "/api/v1/auth/sso/workforce/login",
+      }],
     });
 
     renderAuth();
 
-    expect(await screen.findByRole("button", { name: /Sign in with SSO/i })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /Sign in with Company SSO/i })).toBeInTheDocument();
     expect(screen.queryByLabelText(/Username/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Sign in with SSO$/i })).toBeNull();
     expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("shows setup pending rather than a local fallback when no IdP is enabled", async () => {
+    vi.mocked(getAuthConfig).mockResolvedValue({
+      ...stagedSsoConfig,
+      providers: [],
+    });
+
+    renderAuth();
+
+    expect(await screen.findByText(/No SSO providers are enabled/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/Username/i)).toBeNull();
   });
 });
