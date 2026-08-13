@@ -56,10 +56,16 @@ service-mesh, or Kubernetes NetworkPolicy controls. Do not grant `/admin` to a
 tenant that must not choose those destinations; use delegated platform control
 for that topology.
 
-AKB deliberately leaves `trustEmail`, upstream-token storage, and read-token
-role creation disabled. Keycloak's first-broker-login flow may create its
-internal broker user, but that does not grant an AKB role or administrator
-status. AKB account projection and authorization remain separate and exact.
+AKB enables Keycloak's `trustEmail` only inside a fail-closed verified-email
+profile: the signed upstream ID token must contain `email_verified=true`, and
+the provider uses `syncMode=FORCE` to reapply verified state on every accepted
+broker login. A missing or false claim is rejected before synchronization and
+first-broker-login; it is never accepted through Keycloak's compatibility
+fallback. The upstream-token store and read-token role remain disabled.
+Keycloak's first-broker-login flow may create its internal broker user, but
+that does not grant an AKB role or administrator status. AKB account projection
+and authorization remain separate and exact; email and username remain
+collision/profile inputs, never automatic AKB account-linking keys.
 
 To rotate the upstream client secret, disable the provider, edit it with the
 new secret, save, and enable it again. Leaving the secret field blank preserves

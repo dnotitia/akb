@@ -88,7 +88,7 @@ def test_valid_spec_renders_a_disabled_allowlisted_representation():
     assert rendered["providerId"] == "oidc"
     assert rendered["enabled"] is False
     assert rendered["hideOnLogin"] is True
-    assert rendered["trustEmail"] is False
+    assert rendered["trustEmail"] is True
     assert rendered["storeToken"] is False
     config = rendered["config"]
     assert isinstance(config, dict)
@@ -98,6 +98,10 @@ def test_valid_spec_renders_a_disabled_allowlisted_representation():
     assert config["useJwksUrl"] == "true"
     assert config["pkceEnabled"] == "true"
     assert config["pkceMethod"] == "S256"
+    assert config["syncMode"] == "FORCE"
+    assert config["filteredByClaim"] == "true"
+    assert config["claimFilterName"] == "email_verified"
+    assert config["claimFilterValue"] == "true"
     assert config["akbProviderType"] == "keycloak-oidc"
     assert "untrustedImportedField" not in config
 
@@ -237,9 +241,13 @@ def test_readback_recognizes_only_exact_disabled_and_enabled_profiles():
     ("path", "value"),
     [
         (("providerId",), "saml"),
-        (("trustEmail",), True),
+        (("trustEmail",), False),
         (("hideOnLogin",), True),
         (("config", "validateSignature"), "false"),
+        (("config", "syncMode"), "IMPORT"),
+        (("config", "filteredByClaim"), "false"),
+        (("config", "claimFilterName"), "email"),
+        (("config", "claimFilterValue"), "false"),
         (("config", "authorizationUrl"), "http://accounts.example.com/auth"),
         (("config", "metadataDescriptorUrl"), "https://accounts.example.com/custom"),
         (("config", "clientSecret"), ""),
