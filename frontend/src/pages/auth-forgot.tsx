@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { ArrowLeft } from "lucide-react";
-import { getAuthConfig, getToken, type AuthConfig } from "@/lib/api";
+import { getAuthConfig, getMe, getToken, type AuthConfig } from "@/lib/api";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Logo } from "@/components/logo";
 
@@ -14,14 +14,24 @@ export default function AuthForgotPage() {
     authConfig.local_auth.enabled;
   // This route sits outside the Layout auth gate — bounce signed-in users home.
   useEffect(() => {
-    if (getToken()) {
-      navigate("/", { replace: true });
-      return;
-    }
     let cancelled = false;
-    void getAuthConfig().then((config) => {
+    void (async () => {
+      const config = await getAuthConfig();
+      if (cancelled) return;
+      const hasSessionCandidate =
+        config.available === true &&
+        (config.auth_mode === "sso" || getToken() !== null);
+      if (hasSessionCandidate) {
+        try {
+          await getMe({ redirectOnUnauthorized: false });
+          if (!cancelled) navigate("/", { replace: true });
+          return;
+        } catch {
+          // No active session; render mode-specific recovery guidance.
+        }
+      }
       if (!cancelled) setAuthConfig(config);
-    });
+    })();
     return () => {
       cancelled = true;
     };

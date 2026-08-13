@@ -168,11 +168,11 @@ class ExternalAuthDisabledError(AKBError):
 
 
 class BrowserSessionNotReadyError(AKBError):
-    """Human SSO is selected, but Phase 4 browser custody is not active."""
+    """Human SSO is selected, but browser custody is not configured."""
 
     def __init__(self):
         super().__init__(
-            "SSO browser sessions are not available in this release",
+            "SSO browser session custody is not configured",
             status_code=503,
             code="browser_session_not_ready",
         )
@@ -225,8 +225,7 @@ class WriteBusyError(AKBError):
     def __init__(self, vault: str, waited_secs: float, retry_after_secs: int = 5):
         self.retry_after_secs = retry_after_secs
         super().__init__(
-            f"Write queue for vault '{vault}' is saturated "
-            f"(gave up after {waited_secs:.0f}s); retry shortly",
+            f"Write queue for vault '{vault}' is saturated (gave up after {waited_secs:.0f}s); retry shortly",
             status_code=429,
         )
 

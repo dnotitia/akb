@@ -10,8 +10,8 @@ export interface User {
   user_id: string;
   username: string;
   email: string;
-  display_name?: string;
-  is_admin?: boolean;
+  display_name: string | null;
+  is_admin: boolean;
 }
 
 interface Props {

@@ -61,7 +61,7 @@ class AuthenticatedUser:
     email: str
     display_name: str | None
     is_admin: bool
-    auth_method: str  # "jwt" | "pat" | "oauth"
+    auth_method: str  # "jwt" | "pat" | "oauth" | "browser_session"
     # Per-PAT vault scope (Option B). None = unscoped: JWT logins, and PATs
     # minted without a scope. A concrete scope gates mutating vault access.
     vault_scope: VaultScope | None = None

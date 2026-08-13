@@ -97,15 +97,54 @@ def test_backend_patch_removes_local_key_authority_and_mounts_one_time_inputs_on
         "bootstrap-standalone-sso",
     ]
     init_mounts = {item["name"] for item in init["volumeMounts"]}
-    assert {"keycloak-bootstrap", "product-admin-bootstrap"}.issubset(init_mounts)
+    assert {
+        "keycloak-bootstrap",
+        "keycloak-upgrade",
+        "product-admin-bootstrap",
+    }.issubset(init_mounts)
     main_mounts = {item["name"] for item in pod["containers"][0]["volumeMounts"]}
     assert "keycloak-bootstrap" not in main_mounts
+    assert "keycloak-upgrade" not in main_mounts
     assert "product-admin-bootstrap" not in main_mounts
     assert pod["containers"][0]["volumeMounts"][0]["$patch"] == "delete"
     volumes = {item["name"]: item for item in pod["volumes"]}
     assert volumes["local-session-keys"]["$patch"] == "delete"
     assert "optional" not in volumes["keycloak-bootstrap"]["secret"]
+    assert volumes["keycloak-upgrade"]["secret"]["optional"] is True
     assert "optional" not in volumes["product-admin-bootstrap"]["secret"]
+    assert "--upgrade-client-id" in init["args"]
+    assert "--upgrade-client-secret-file" in init["args"]
+
+
+def test_legacy_v1_upgrade_job_is_explicit_opt_in_and_uses_temporary_service_admin():
+    kustomization = _one(
+        "kustomization.yaml",
+        kind="Kustomization",
+        resource_name=None,
+    )
+    assert "legacy-v1-upgrade-job.yaml" not in kustomization["resources"]
+
+    job = _one(
+        "legacy-v1-upgrade-job.yaml",
+        kind="Job",
+        resource_name="akb-keycloak-v1-to-v2-authority",
+    )
+    container = job["spec"]["template"]["spec"]["containers"][0]
+    assert container["image"].count("@sha256:") == 1
+    assert container["args"][:2] == ["bootstrap-admin", "service"]
+    assert "--client-id" in container["args"]
+    assert "akb-bootstrap-upgrade-v2" in container["args"]
+    assert "--client-secret:env=AKB_KEYCLOAK_UPGRADE_SECRET" in container["args"]
+    secret_refs = [
+        item["valueFrom"]["secretKeyRef"]
+        for item in container["env"]
+        if "secretKeyRef" in item.get("valueFrom", {})
+    ]
+    assert {
+        "name": "akb-keycloak-upgrade",
+        "key": "client-secret",
+    } in secret_refs
+    assert job["spec"]["template"]["spec"]["restartPolicy"] == "Never"
 
 
 def test_sso_runtime_config_has_one_mode_and_three_distinct_confidential_clients():

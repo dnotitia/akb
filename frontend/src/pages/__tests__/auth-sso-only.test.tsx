@@ -19,6 +19,7 @@ vi.mock("@/lib/api", async () => {
     authRegister: vi.fn(),
     setToken: vi.fn(),
     getToken: vi.fn(() => null),
+    getMe: vi.fn().mockRejectedValue(new Error("no active session")),
     getAuthConfig: vi.fn(),
   };
 });

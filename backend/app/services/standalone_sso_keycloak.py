@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 import re
 from typing import Any
 from urllib.parse import quote
@@ -29,6 +29,7 @@ _KEY_PROVIDER_TYPE = "org.keycloak.keys.KeyProvider"
 _ACTIVE_KEY_PROVIDER_NAME = "akb-rs256-3072-active"
 _NATIVE_AMR_CONFIG_ALIAS = "akb-native-password-amr"
 _API_AUDIENCE_MAPPER_NAME = "akb-api-audience"
+_API_IDENTITY_PROVIDER_MAPPER_NAME = "akb-browser-identity-provider"
 _ADMIN_AMR_MAPPER_NAME = "akb-admin-native-amr"
 _CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,255}$")
 
@@ -157,6 +158,14 @@ class KeycloakStandaloneSSOControl:
             realm="master",
             client_id=spec.bootstrap_client_id,
             client_secret=spec.bootstrap_client_secret,
+        )
+
+    async def acquire_upgrade(self, spec: StandaloneSSOBootstrapSpec) -> str | None:
+        return await self._token(
+            spec,
+            realm="master",
+            client_id=spec.upgrade_client_id,
+            client_secret=spec.upgrade_client_secret,
         )
 
     async def _request(
@@ -296,10 +305,7 @@ class KeycloakStandaloneSSOControl:
         spec: StandaloneSSOBootstrapSpec,
         realm: Mapping[str, object],
     ) -> bool:
-        return all(
-            realm.get(key) == value
-            for key, value in cls._realm_profile(spec).items()
-        )
+        return all(realm.get(key) == value for key, value in cls._realm_profile(spec).items())
 
     async def _list_clients(
         self,
@@ -398,10 +404,9 @@ class KeycloakStandaloneSSOControl:
             "directAccessGrantsEnabled": False,
             "serviceAccountsEnabled": False,
             "implicitFlowEnabled": False,
+            "frontchannelLogout": False,
             "fullScopeAllowed": False,
-            "redirectUris": [
-                f"{spec.akb_public_url.rstrip('/')}/api/v1/auth/keycloak/callback"
-            ],
+            "redirectUris": [f"{spec.akb_public_url.rstrip('/')}/api/v1/auth/keycloak/callback"],
             "webOrigins": [spec.akb_public_url.rstrip("/")],
             # Keycloak 26.x puts the access-token subject mapper in its
             # built-in `basic` client scope.  Omitting it yields a validly
@@ -412,6 +417,10 @@ class KeycloakStandaloneSSOControl:
             "attributes": {
                 "pkce.code.challenge.method": "S256",
                 "post.logout.redirect.uris": f"{spec.akb_public_url.rstrip('/')}/*",
+                "backchannel.logout.url": (
+                    f"{spec.akb_public_url.rstrip('/')}/api/v1/auth/keycloak/backchannel-logout"
+                ),
+                "backchannel.logout.session.required": "true",
             },
         }
 
@@ -428,6 +437,7 @@ class KeycloakStandaloneSSOControl:
             "directAccessGrantsEnabled": False,
             "serviceAccountsEnabled": False,
             "implicitFlowEnabled": False,
+            "frontchannelLogout": False,
             "fullScopeAllowed": False,
             "redirectUris": [spec.admin_redirect_uri],
             "webOrigins": [spec.akb_public_url.rstrip("/")],
@@ -452,6 +462,7 @@ class KeycloakStandaloneSSOControl:
             "directAccessGrantsEnabled": False,
             "serviceAccountsEnabled": True,
             "implicitFlowEnabled": False,
+            "frontchannelLogout": False,
             "fullScopeAllowed": False,
             "redirectUris": [],
             "webOrigins": [],
@@ -471,14 +482,48 @@ class KeycloakStandaloneSSOControl:
     ) -> list[dict[str, Any]]:
         value = await self._json(
             spec,
-            (
-                f"/admin/realms/{_path(spec.realm)}/clients/{_path(client_uuid)}"
-                "/protocol-mappers/models"
-            ),
+            (f"/admin/realms/{_path(spec.realm)}/clients/{_path(client_uuid)}/protocol-mappers/models"),
             token=token,
             code="keycloak_mapper_read_failed",
         )
         return _objects(value, "keycloak_mapper_read_failed")
+
+    @staticmethod
+    def _api_identity_provider_mapper() -> dict[str, Any]:
+        """Project signed broker provenance from Keycloak's user session."""
+        return {
+            "name": _API_IDENTITY_PROVIDER_MAPPER_NAME,
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-usersessionmodel-note-mapper",
+            "consentRequired": False,
+            "config": {
+                "user.session.note": "identity_provider",
+                "claim.name": "identity_provider",
+                "jsonType.label": "String",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "lightweight.claim": "false",
+                "userinfo.token.claim": "false",
+                "introspection.token.claim": "true",
+                "access.tokenResponse.claim": "false",
+            },
+        }
+
+    @staticmethod
+    def _mapper_matches(
+        actual: Mapping[str, object],
+        expected: Mapping[str, object],
+    ) -> bool:
+        if any(
+            actual.get(field) != expected.get(field)
+            for field in ("name", "protocol", "protocolMapper", "consentRequired")
+        ):
+            return False
+        actual_config = actual.get("config")
+        expected_config = expected.get("config")
+        if not isinstance(actual_config, dict) or not isinstance(expected_config, dict):
+            return False
+        return all(actual_config.get(key) == value for key, value in expected_config.items())
 
     async def _reconcile_mapper(
         self,
@@ -495,10 +540,7 @@ class KeycloakStandaloneSSOControl:
             name,
             "keycloak_mapper_duplicate",
         )
-        base = (
-            f"/admin/realms/{_path(spec.realm)}/clients/{_path(client_uuid)}"
-            "/protocol-mappers/models"
-        )
+        base = f"/admin/realms/{_path(spec.realm)}/clients/{_path(client_uuid)}/protocol-mappers/models"
         if existing is None:
             await self._request(
                 spec,
@@ -545,11 +587,7 @@ class KeycloakStandaloneSSOControl:
             code="keycloak_auth_flow_read_failed",
         )
         executions = _objects(value, "keycloak_auth_flow_read_failed")
-        matches = [
-            item
-            for item in executions
-            if item.get("providerId") == "auth-username-password-form"
-        ]
+        matches = [item for item in executions if item.get("providerId") == "auth-username-password-form"]
         if len(matches) != 1:
             raise _fail("keycloak_native_password_execution_ambiguous")
         execution = matches[0]
@@ -570,10 +608,7 @@ class KeycloakStandaloneSSOControl:
             await self._request(
                 spec,
                 "POST",
-                (
-                    f"/admin/realms/{_path(spec.realm)}/authentication/executions/"
-                    f"{_path(execution_id)}/config"
-                ),
+                (f"/admin/realms/{_path(spec.realm)}/authentication/executions/{_path(execution_id)}/config"),
                 token=token,
                 json_body=desired,
                 expected=frozenset({201}),
@@ -585,10 +620,7 @@ class KeycloakStandaloneSSOControl:
             await self._request(
                 spec,
                 "PUT",
-                (
-                    f"/admin/realms/{_path(spec.realm)}/authentication/config/"
-                    f"{_path(config_id)}"
-                ),
+                (f"/admin/realms/{_path(spec.realm)}/authentication/config/{_path(config_id)}"),
                 token=token,
                 json_body=updated,
                 expected=frozenset({204}),
@@ -622,10 +654,7 @@ class KeycloakStandaloneSSOControl:
         config = _object(
             await self._json(
                 spec,
-                (
-                    f"/admin/realms/{_path(spec.realm)}/authentication/config/"
-                    f"{_path(config_id)}"
-                ),
+                (f"/admin/realms/{_path(spec.realm)}/authentication/config/{_path(config_id)}"),
                 token=token,
                 code="keycloak_native_amr_readback_failed",
             ),
@@ -755,8 +784,7 @@ class KeycloakStandaloneSSOControl:
                 )
             )
         mapping_path = (
-            f"{realm_path}/users/{_path(service_user_id)}/role-mappings/clients/"
-            f"{_path(realm_management_uuid)}"
+            f"{realm_path}/users/{_path(service_user_id)}/role-mappings/clients/{_path(realm_management_uuid)}"
         )
         current = _objects(
             await self._json(
@@ -768,8 +796,7 @@ class KeycloakStandaloneSSOControl:
             "keycloak_management_role_read_failed",
         )
         current_by_name = {
-            _required_string(item, "name", "keycloak_management_role_read_failed"): item
-            for item in current
+            _required_string(item, "name", "keycloak_management_role_read_failed"): item for item in current
         }
         desired_names = set(MANAGEMENT_REALM_ROLES)
         extras = [item for name, item in current_by_name.items() if name not in desired_names]
@@ -800,8 +827,7 @@ class KeycloakStandaloneSSOControl:
         # realm-management roles so the permanent token is usable without
         # exposing every role the service account might acquire later.
         scope_path = (
-            f"{realm_path}/clients/{_path(management_uuid)}/scope-mappings/clients/"
-            f"{_path(realm_management_uuid)}"
+            f"{realm_path}/clients/{_path(management_uuid)}/scope-mappings/clients/{_path(realm_management_uuid)}"
         )
         current_scope = _objects(
             await self._json(
@@ -813,17 +839,10 @@ class KeycloakStandaloneSSOControl:
             "keycloak_management_scope_read_failed",
         )
         current_scope_by_name = {
-            _required_string(item, "name", "keycloak_management_scope_read_failed"): item
-            for item in current_scope
+            _required_string(item, "name", "keycloak_management_scope_read_failed"): item for item in current_scope
         }
-        scope_extras = [
-            item
-            for name, item in current_scope_by_name.items()
-            if name not in desired_names
-        ]
-        scope_missing = [
-            item for item in desired_roles if item.get("name") not in current_scope_by_name
-        ]
+        scope_extras = [item for name, item in current_scope_by_name.items() if name not in desired_names]
+        scope_missing = [item for item in desired_roles if item.get("name") not in current_scope_by_name]
         if scope_extras:
             await self._request(
                 spec,
@@ -883,21 +902,13 @@ class KeycloakStandaloneSSOControl:
         roles = _objects(
             await self._json(
                 spec,
-                (
-                    f"{realm_path}/users/{_path(service_user_id)}/role-mappings/clients/"
-                    f"{_path(realm_management_uuid)}"
-                ),
+                (f"{realm_path}/users/{_path(service_user_id)}/role-mappings/clients/{_path(realm_management_uuid)}"),
                 token=token,
                 code="keycloak_management_role_read_failed",
             ),
             "keycloak_management_role_read_failed",
         )
-        return tuple(
-            sorted(
-                _required_string(item, "name", "keycloak_management_role_read_failed")
-                for item in roles
-            )
-        )
+        return tuple(sorted(_required_string(item, "name", "keycloak_management_role_read_failed") for item in roles))
 
     async def _management_scope_roles(
         self,
@@ -932,12 +943,7 @@ class KeycloakStandaloneSSOControl:
             ),
             "keycloak_management_scope_read_failed",
         )
-        return tuple(
-            sorted(
-                _required_string(item, "name", "keycloak_management_scope_read_failed")
-                for item in roles
-            )
-        )
+        return tuple(sorted(_required_string(item, "name", "keycloak_management_scope_read_failed") for item in roles))
 
     async def _exact_user(
         self,
@@ -1020,10 +1026,7 @@ class KeycloakStandaloneSSOControl:
             await self._request(
                 spec,
                 "PUT",
-                (
-                    f"/admin/realms/{_path(spec.realm)}/users/{_path(user_id)}"
-                    "/reset-password"
-                ),
+                (f"/admin/realms/{_path(spec.realm)}/users/{_path(user_id)}/reset-password"),
                 token=token,
                 json_body={
                     "type": "password",
@@ -1089,10 +1092,7 @@ class KeycloakStandaloneSSOControl:
     ) -> int:
         value = await self._json(
             spec,
-            (
-                f"/admin/realms/{_path(spec.realm)}/users/{_path(user_id)}"
-                "/federated-identity"
-            ),
+            (f"/admin/realms/{_path(spec.realm)}/users/{_path(user_id)}/federated-identity"),
             token=token,
             code="keycloak_product_admin_federation_read_failed",
         )
@@ -1157,6 +1157,7 @@ class KeycloakStandaloneSSOControl:
             "directAccessGrantsEnabled",
             "serviceAccountsEnabled",
             "implicitFlowEnabled",
+            "frontchannelLogout",
             "fullScopeAllowed",
             "redirectUris",
             "webOrigins",
@@ -1180,10 +1181,7 @@ class KeycloakStandaloneSSOControl:
             dict,
         ):
             return False
-        return all(
-            actual_attributes.get(key) == value
-            for key, value in expected_attributes.items()
-        )
+        return all(actual_attributes.get(key) == value for key, value in expected_attributes.items())
 
     async def reconcile(
         self,
@@ -1231,14 +1229,18 @@ class KeycloakStandaloneSSOControl:
                 "protocolMapper": "oidc-audience-mapper",
                 "consentRequired": False,
                 "config": {
-                    "included.custom.audience": (
-                        f"{spec.akb_public_url.rstrip('/')}/api"
-                    ),
+                    "included.custom.audience": (f"{spec.akb_public_url.rstrip('/')}/api"),
                     "id.token.claim": "false",
                     "access.token.claim": "true",
                     "lightweight.claim": "false",
                 },
             },
+            token=bootstrap_token,
+        )
+        await self._reconcile_mapper(
+            spec,
+            api_uuid,
+            self._api_identity_provider_mapper(),
             token=bootstrap_token,
         )
         await self._reconcile_mapper(
@@ -1265,11 +1267,12 @@ class KeycloakStandaloneSSOControl:
         await self._reconcile_product_admin(spec, token=bootstrap_token)
         return await self.readback(spec, management_token=bootstrap_token)
 
-    async def readback(
+    async def _readback(
         self,
         spec: StandaloneSSOBootstrapSpec,
         *,
         management_token: str,
+        require_identity_provider_mapper: bool,
     ) -> StandaloneSSOReadback:
         realm = await self._realm(spec, token=management_token)
         if realm is None or not self._realm_matches(spec, realm):
@@ -1305,8 +1308,13 @@ class KeycloakStandaloneSSOControl:
             "keycloak_client_readback_failed",
         )
 
+        api_mappers = await self._protocol_mappers(
+            spec,
+            api_uuid,
+            token=management_token,
+        )
         api_mapper = _exact(
-            await self._protocol_mappers(spec, api_uuid, token=management_token),
+            api_mappers,
             "name",
             _API_AUDIENCE_MAPPER_NAME,
             "keycloak_mapper_duplicate",
@@ -1315,12 +1323,25 @@ class KeycloakStandaloneSSOControl:
             api_mapper is None
             or api_mapper.get("protocolMapper") != "oidc-audience-mapper"
             or not isinstance(api_mapper.get("config"), dict)
-            or api_mapper["config"].get("included.custom.audience")
-            != f"{spec.akb_public_url.rstrip('/')}/api"
+            or api_mapper["config"].get("included.custom.audience") != f"{spec.akb_public_url.rstrip('/')}/api"
             or api_mapper["config"].get("id.token.claim") != "false"
             or api_mapper["config"].get("access.token.claim") != "true"
         ):
             raise _fail("keycloak_api_audience_readback_failed")
+        identity_provider_mapper = _exact(
+            api_mappers,
+            "name",
+            _API_IDENTITY_PROVIDER_MAPPER_NAME,
+            "keycloak_mapper_duplicate",
+        )
+        if require_identity_provider_mapper and (
+            identity_provider_mapper is None
+            or not self._mapper_matches(
+                identity_provider_mapper,
+                self._api_identity_provider_mapper(),
+            )
+        ):
+            raise _fail("keycloak_api_identity_provider_mapper_readback_failed")
         admin_mapper = _exact(
             await self._protocol_mappers(spec, admin_uuid, token=management_token),
             "name",
@@ -1394,34 +1415,130 @@ class KeycloakStandaloneSSOControl:
             product_admin_federated_identities=federation_count,
         )
 
+    async def readback(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        management_token: str,
+    ) -> StandaloneSSOReadback:
+        return await self._readback(
+            spec,
+            management_token=management_token,
+            require_identity_provider_mapper=True,
+        )
+
+    async def readback_legacy_v1(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        management_token: str,
+    ) -> StandaloneSSOReadback:
+        return await self._readback(
+            spec,
+            management_token=management_token,
+            require_identity_provider_mapper=False,
+        )
+
+    async def upgrade_v1_to_v2(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        upgrade_token: str,
+    ) -> StandaloneSSOReadback:
+        expected_api = self._api_client(spec)
+        api = await self._exact_client(
+            spec,
+            spec.realm,
+            spec.api_client_id,
+            token=upgrade_token,
+        )
+        if api is None or not self._selected_client_matches(api, expected_api):
+            raise _fail("keycloak_client_readback_failed")
+        api_uuid = _required_string(api, "id", "keycloak_client_readback_failed")
+        await self._reconcile_mapper(
+            spec,
+            api_uuid,
+            self._api_identity_provider_mapper(),
+            token=upgrade_token,
+        )
+        return await self.readback(
+            spec,
+            management_token=upgrade_token,
+        )
+
+    async def _retire_one_time_client(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        client_id: str,
+        token: str,
+        missing_code: str,
+        invalid_code: str,
+        retire_code: str,
+    ) -> None:
+        if _CLIENT_ID_RE.fullmatch(client_id) is None:
+            raise _fail(invalid_code)
+        client = await self._exact_client(
+            spec,
+            "master",
+            client_id,
+            token=token,
+        )
+        if client is None:
+            raise _fail(missing_code)
+        client_uuid = _required_string(
+            client,
+            "id",
+            invalid_code,
+        )
+        await self._request(
+            spec,
+            "DELETE",
+            f"/admin/realms/master/clients/{_path(client_uuid)}",
+            token=token,
+            expected=frozenset({204}),
+            code=retire_code,
+        )
+
+    async def _assert_one_time_client_retired(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        token: str,
+        acquire_token: Callable[[], Awaitable[str | None]],
+        check_code: str,
+        still_active_code: str,
+    ) -> None:
+        for attempt in range(5):
+            prior = await self._request(
+                spec,
+                "GET",
+                "/admin/realms/master",
+                token=token,
+                expected=frozenset({200, 401, 403}),
+                code=check_code,
+            )
+            prior_token_denied = prior.status_code in {401, 403}
+            new_token_denied = await acquire_token() is None
+            if prior_token_denied and new_token_denied:
+                return
+            if attempt < 4:
+                await asyncio.sleep(0.5)
+        raise _fail(still_active_code)
+
     async def retire_bootstrap(
         self,
         spec: StandaloneSSOBootstrapSpec,
         *,
         bootstrap_token: str,
     ) -> None:
-        if _CLIENT_ID_RE.fullmatch(spec.bootstrap_client_id) is None:
-            raise _fail("keycloak_bootstrap_client_id_invalid")
-        client = await self._exact_client(
+        await self._retire_one_time_client(
             spec,
-            "master",
-            spec.bootstrap_client_id,
+            client_id=spec.bootstrap_client_id,
             token=bootstrap_token,
-        )
-        if client is None:
-            raise _fail("keycloak_bootstrap_client_missing")
-        client_uuid = _required_string(
-            client,
-            "id",
-            "keycloak_bootstrap_client_invalid",
-        )
-        await self._request(
-            spec,
-            "DELETE",
-            f"/admin/realms/master/clients/{_path(client_uuid)}",
-            token=bootstrap_token,
-            expected=frozenset({204}),
-            code="keycloak_bootstrap_client_retire_failed",
+            missing_code="keycloak_bootstrap_client_missing",
+            invalid_code="keycloak_bootstrap_client_invalid",
+            retire_code="keycloak_bootstrap_client_retire_failed",
         )
 
     async def assert_bootstrap_retired(
@@ -1430,19 +1547,39 @@ class KeycloakStandaloneSSOControl:
         *,
         bootstrap_token: str,
     ) -> None:
-        for attempt in range(5):
-            prior = await self._request(
-                spec,
-                "GET",
-                "/admin/realms/master",
-                token=bootstrap_token,
-                expected=frozenset({200, 401, 403}),
-                code="keycloak_bootstrap_retirement_check_failed",
-            )
-            prior_token_denied = prior.status_code in {401, 403}
-            new_token_denied = await self.acquire_bootstrap(spec) is None
-            if prior_token_denied and new_token_denied:
-                return
-            if attempt < 4:
-                await asyncio.sleep(0.5)
-        raise _fail("keycloak_bootstrap_client_still_active")
+        await self._assert_one_time_client_retired(
+            spec,
+            token=bootstrap_token,
+            acquire_token=lambda: self.acquire_bootstrap(spec),
+            check_code="keycloak_bootstrap_retirement_check_failed",
+            still_active_code="keycloak_bootstrap_client_still_active",
+        )
+
+    async def retire_upgrade(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        upgrade_token: str,
+    ) -> None:
+        await self._retire_one_time_client(
+            spec,
+            client_id=spec.upgrade_client_id,
+            token=upgrade_token,
+            missing_code="keycloak_upgrade_client_missing",
+            invalid_code="keycloak_upgrade_client_invalid",
+            retire_code="keycloak_upgrade_client_retire_failed",
+        )
+
+    async def assert_upgrade_retired(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        upgrade_token: str,
+    ) -> None:
+        await self._assert_one_time_client_retired(
+            spec,
+            token=upgrade_token,
+            acquire_token=lambda: self.acquire_upgrade(spec),
+            check_code="keycloak_upgrade_retirement_check_failed",
+            still_active_code="keycloak_upgrade_client_still_active",
+        )

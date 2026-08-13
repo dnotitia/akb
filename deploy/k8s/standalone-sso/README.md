@@ -11,19 +11,26 @@ The bundle implements the product-administrator bootstrap and recovery slice:
    start.
 2. The AKB bootstrap init container creates and reads back the `akb` realm,
    separate `akb-web`, `akb-admin`, and `akb-sso-manager` clients, the
-   RSA-3072 active signing key, the native product administrator, and the exact
-   AKB administrator projection.
+   RSA-3072 active signing key, the signed broker-provenance mapper on
+   `akb-web`, the native product administrator, and the exact AKB administrator
+   projection.
 3. It proves the permanent management credential, deletes the temporary
    bootstrap client, verifies that credential is rejected, and records a
-   non-secret retirement receipt in the AKB database.
+   non-secret `bundled-keycloak-v2` retirement receipt in the AKB database.
 4. A subsequent init-container run is read-only and succeeds without either
    original one-time value only when its current Keycloak and AKB identities
    exactly match that durable receipt.
 
-Ordinary-user browser SSO remains staged until the server-side token-custody
-slice is released. `/admin` uses the dedicated confidential client and requires
-a fresh native Keycloak password ceremony; a brokered upstream identity is not
-accepted as the recovery administrator.
+Ordinary-user browser SSO uses server-side token custody: the browser receives
+an opaque HttpOnly handle and readable double-submit CSRF value, while AKB
+encrypts the Keycloak refresh/ID token set and never persists an access token.
+The bootstrap maps the `identity_provider` user-session note into both ordinary
+token profiles so AKB can bind each callback and refresh to the exact enabled
+broker alias rather than trusting `kc_idp_hint`.
+It becomes ready only after the browser-session encryption key is supplied and
+an upstream provider is enabled. `/admin` uses the dedicated confidential
+client and requires a fresh native Keycloak password ceremony; a brokered
+upstream identity is not accepted as the recovery administrator.
 
 ## Required operator inputs
 
@@ -47,14 +54,17 @@ commit their values.
 | `akb-keycloak-db-credentials` | `POSTGRES_DB=keycloak`, `POSTGRES_USER=keycloak`, `POSTGRES_PASSWORD` | durable |
 | `akb-secret-config` | `secret.yaml` | durable |
 | `akb-keycloak-bootstrap` | `client-secret` | one-time |
+| `akb-keycloak-upgrade` | `client-secret` | optional; one-time v1-to-v2 upgrade only |
 | `akb-product-admin-bootstrap` | `password` | one-time |
 
-The mounted `secret.yaml` must include the AKB database password plus three
-independently generated confidential-client secrets:
+The mounted `secret.yaml` must include the AKB database password, an
+independent browser-session encryption key, and three independently generated
+confidential-client secrets:
 
 ```yaml
 db_password: <same value as akb-postgres-credentials>
 system_hmac_secret: <independent random value>
+sso_browser_session_encryption_key: <independent 32-byte base64url value>
 keycloak_client_secret: <akb-web secret>
 keycloak_admin_client_secret: <akb-admin secret>
 keycloak_management_client_secret: <akb-sso-manager secret>
@@ -67,6 +77,16 @@ email, and Keycloak forces `UPDATE_PASSWORD` on first login. The realm enforces
 the same lean policy for the replacement password. The bootstrap client secret
 is not the product-admin password.
 
+Generate the browser-session key as an unpadded 32-byte base64url value:
+
+```bash
+python -c 'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("="))'
+```
+
+Keep it stable across backend restarts. Replacing this single key intentionally
+invalidates every outstanding ordinary-user SSO browser session and requires a
+fresh login; it does not rotate a Keycloak realm signing key.
+
 Render and validate the public overlay before applying:
 
 ```bash
@@ -76,10 +96,58 @@ kubectl apply --dry-run=client --validate=false \
   -f rendered-standalone-sso.yaml
 ```
 
-Apply only after all durable and one-time Secrets exist. Wait for the backend
+Apply only after all durable and first-install one-time Secrets exist. Wait for the backend
 pod's `bootstrap-standalone-sso` init container and main container to complete,
 then inspect the init log. Its JSON report contains only IDs, key metadata, and
 the exact role names; it never contains credential values.
+
+## Upgrade an existing v1 receipt
+
+An installation that already recorded `bundled-keycloak-v1` retired its
+original master-realm bootstrap client before the signed broker-provenance
+mapper existed. The permanent `akb-sso-manager` deliberately lacks
+`manage-clients`, so a normal rollout cannot add that mapper and must not widen
+the manager's standing authority.
+
+Before rolling this version onto such an installation, create exactly one
+temporary upgrade service account named `akb-bootstrap-upgrade-v2`. Keycloak's
+supported recovery command requires every Keycloak node to be stopped. Follow
+the upstream [temporary admin service account procedure](https://www.keycloak.org/server/bootstrap-admin-recovery)
+and use the same database settings as the server. The opt-in
+`legacy-v1-upgrade-job.yaml` captures those settings but is intentionally not a
+Kustomize resource, so a fresh install never creates this authority.
+
+For the default `akb` namespace, the bounded sequence is:
+
+```bash
+openssl rand -base64 48 | tr -d '\n' | kubectl -n akb create secret generic \
+  akb-keycloak-upgrade \
+  --from-file=client-secret=/dev/stdin
+kubectl -n akb scale statefulset/keycloak --replicas=0
+kubectl -n akb wait --for=delete pod -l app=akb-keycloak --timeout=180s
+kubectl apply -f deploy/k8s/standalone-sso/legacy-v1-upgrade-job.yaml
+kubectl -n akb wait --for=condition=complete \
+  job/akb-keycloak-v1-to-v2-authority --timeout=180s
+kubectl -n akb delete job akb-keycloak-v1-to-v2-authority
+kubectl -n akb scale statefulset/keycloak --replicas=1
+kubectl -n akb rollout status statefulset/keycloak --timeout=300s
+```
+
+Then deploy the new AKB overlay. Its init container must report
+`mode=upgrade-v1-to-v2` and `receipt_profile=bundled-keycloak-v2`. The lifecycle
+first validates every v1 read-back using the permanent manager, changes only
+the `akb-browser-identity-provider` mapper, revalidates the complete v2 profile
+through the permanent manager, deletes the temporary upgrade client, proves
+both its old and newly requested tokens are rejected, and only then writes the
+v2 receipt. It does not require or reset the existing product-admin password.
+
+Delete `akb-keycloak-upgrade` only after that report and a subsequent
+`mode=readback` restart succeed. If the init container reports
+`keycloak_upgrade_credential_required`, do not grant `manage-clients` to
+`akb-sso-manager`; complete this one-time procedure instead. A failed migration
+deliberately leaves the temporary authority available for repair. If deletion
+succeeds but the v2 receipt write does not, use the same official recovery
+procedure to create the exact upgrade client again before retrying.
 
 ## Retire one-time material
 
@@ -90,7 +158,8 @@ written and read back from AKB PostgreSQL. After that report succeeds:
 
 1. Preserve the product-admin password through an approved installer handoff;
    the administrator needs it for the forced first-login password change.
-2. Replace both Secret values with fresh, unrelated retirement sentinels. Keep
+2. Replace both first-install Secret values with fresh, unrelated retirement
+   sentinels. Keep
    the Secret objects because the default first-boot manifest deliberately
    requires them; this prevents an empty Keycloak database from initializing
    without any recovery credential.
@@ -101,7 +170,7 @@ written and read back from AKB PostgreSQL. After that report succeeds:
 5. Confirm `/admin` can complete native login and that the ordinary local
    login/register endpoints remain unavailable.
 
-Do not remove or replace either one-time value before the first successful
+Do not remove or replace either first-install one-time value before the first successful
 report. The Secret references are required on first boot because Keycloak's
 startup bootstrap settings are ignored after the master realm exists. An
 absent value without a matching retirement receipt fails closed; it is never

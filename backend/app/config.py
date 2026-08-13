@@ -56,9 +56,7 @@ _DNS1123_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _NATIVE_RUNTIME_IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 AuthMode = Literal["local", "sso"]
-LegacyAuthModeStatus = Literal[
-    "local_only", "strict_sso", "ambiguous_hybrid", "invalid"
-]
+LegacyAuthModeStatus = Literal["local_only", "strict_sso", "ambiguous_hybrid", "invalid"]
 
 
 class AuthModeConfigurationError(RuntimeError):
@@ -85,9 +83,7 @@ def classify_legacy_auth_mode(
         return LegacyAuthModeClassification(
             status="invalid",
             derived_mode=None,
-            diagnostic=(
-                "keycloak_sso_only is enabled while the Keycloak authority is disabled"
-            ),
+            diagnostic=("keycloak_sso_only is enabled while the Keycloak authority is disabled"),
         )
     if local_auth_enabled and not keycloak_enabled:
         return LegacyAuthModeClassification(
@@ -124,9 +120,7 @@ def _auth_config_bool(
         return default
     value = values[name]
     if type(value) is not bool:
-        raise AuthModeConfigurationError(
-            f"{name} must be a YAML boolean (true or false)"
-        )
+        raise AuthModeConfigurationError(f"{name} must be a YAML boolean (true or false)")
     return cast(bool, value)
 
 
@@ -141,15 +135,9 @@ def _resolve_auth_mode_config(
         if not require_mode:
             return resolved
         classification = classify_legacy_auth_mode(
-            local_auth_enabled=_auth_config_bool(
-                values, "local_auth_enabled", default=True
-            ),
-            keycloak_enabled=_auth_config_bool(
-                values, "keycloak_enabled", default=False
-            ),
-            keycloak_sso_only=_auth_config_bool(
-                values, "keycloak_sso_only", default=False
-            ),
+            local_auth_enabled=_auth_config_bool(values, "local_auth_enabled", default=True),
+            keycloak_enabled=_auth_config_bool(values, "keycloak_enabled", default=False),
+            keycloak_sso_only=_auth_config_bool(values, "keycloak_sso_only", default=False),
         )
         raise AuthModeConfigurationError(
             "auth_mode is required in runtime YAML and must be explicitly set to "
@@ -160,14 +148,10 @@ def _resolve_auth_mode_config(
 
     raw_mode = values["auth_mode"]
     if raw_mode not in ("local", "sso"):
-        raise AuthModeConfigurationError(
-            "auth_mode must be 'local' or 'sso'; no other or hybrid mode is supported"
-        )
+        raise AuthModeConfigurationError("auth_mode must be 'local' or 'sso'; no other or hybrid mode is supported")
     mode = cast(AuthMode, raw_mode)
 
-    local_auth_enabled = _auth_config_bool(
-        values, "local_auth_enabled", default=mode == "local"
-    )
+    local_auth_enabled = _auth_config_bool(values, "local_auth_enabled", default=mode == "local")
     expected_local_auth = mode == "local"
     if "local_auth_enabled" in values and local_auth_enabled is not expected_local_auth:
         configured = str(local_auth_enabled).lower()
@@ -177,9 +161,7 @@ def _resolve_auth_mode_config(
             f"the deprecated flag or set local_auth_enabled={expected}"
         )
 
-    keycloak_sso_only = _auth_config_bool(
-        values, "keycloak_sso_only", default=mode == "sso"
-    )
+    keycloak_sso_only = _auth_config_bool(values, "keycloak_sso_only", default=mode == "sso")
     expected_sso_only = mode == "sso"
     if "keycloak_sso_only" in values and keycloak_sso_only is not expected_sso_only:
         configured = str(keycloak_sso_only).lower()
@@ -189,12 +171,8 @@ def _resolve_auth_mode_config(
             f"the deprecated flag or set keycloak_sso_only={expected}"
         )
 
-    keycloak_enabled = _auth_config_bool(
-        values, "keycloak_enabled", default=False
-    )
-    mcp_oauth_enabled = _auth_config_bool(
-        values, "mcp_oauth_enabled", default=False
-    )
+    keycloak_enabled = _auth_config_bool(values, "keycloak_enabled", default=False)
+    mcp_oauth_enabled = _auth_config_bool(values, "mcp_oauth_enabled", default=False)
     if mode == "sso" and not keycloak_enabled:
         raise AuthModeConfigurationError(
             "auth_mode=sso contradicts keycloak_enabled=false; auth_mode=sso "
@@ -229,10 +207,7 @@ def is_dns1123_namespace(value: str) -> bool:
     if not value or len(value) > 253:
         return False
     labels = value.split(".")
-    return all(
-        1 <= len(label) <= 63 and _DNS1123_LABEL_RE.fullmatch(label) is not None
-        for label in labels
-    )
+    return all(1 <= len(label) <= 63 and _DNS1123_LABEL_RE.fullmatch(label) is not None for label in labels)
 
 
 class AuditSettings(BaseModel):
@@ -246,6 +221,7 @@ class AuditSettings(BaseModel):
     redaction rules, per-action levels, signing keys, syslog/webhook sinks —
     without scattering `audit_*` keys across the flat top level.
     """
+
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
@@ -299,6 +275,7 @@ class ToolUsageSettings(BaseModel):
     Full rationale, schema and rejected alternatives:
     `docs/design/proposal/2026-07-28-mcp-tool-usage-tracking/README.md`.
     """
+
     model_config = ConfigDict(extra="forbid")
 
     # Every numeric below is bounded: an unvalidated 0 or negative turns into a
@@ -379,9 +356,7 @@ class ExternalGitHostRule(BaseModel):
             try:
                 ipaddress.ip_network(cidr, strict=False)
             except ValueError as e:
-                raise ValueError(
-                    f"external_git host allowlist rule '{host}': invalid CIDR '{cidr}': {e}"
-                ) from e
+                raise ValueError(f"external_git host allowlist rule '{host}': invalid CIDR '{cidr}': {e}") from e
         if not self.ports:
             raise ValueError(
                 f"external_git host allowlist rule '{host}': at least one port is "
@@ -390,10 +365,7 @@ class ExternalGitHostRule(BaseModel):
             )
         for port in self.ports:
             if isinstance(port, bool) or not (1 <= port <= 65535):
-                raise ValueError(
-                    f"external_git host allowlist rule '{host}': "
-                    f"port {port!r} is out of range 1..65535"
-                )
+                raise ValueError(f"external_git host allowlist rule '{host}': port {port!r} is out of range 1..65535")
         return self
 
 
@@ -444,9 +416,9 @@ class Settings(BaseModel):
     # Stable document revision selector. ``bare_git`` is the default. The two
     # legacy values remain accepted for receipt compatibility; they are not
     # rendered by new deployment surfaces.
-    document_revision_backend: Literal[
-        "bare_git", "postgres_native", "bare_git_current", "native_ledger_m1"
-    ] = "bare_git"
+    document_revision_backend: Literal["bare_git", "postgres_native", "bare_git_current", "native_ledger_m1"] = (
+        "bare_git"
+    )
     # Positive new-database Native authority bootstrap identity. These values
     # are deliberately YAML-only and are required only by postgres_native.
     document_revision_tenant_id: str = ""
@@ -541,9 +513,7 @@ class Settings(BaseModel):
     # behavior by default. Managed platform deployments opt into the hard
     # profile and declare the exact gateway base URL that every active model
     # route must use; startup rejects a direct-provider escape.
-    model_api_governance_mode: Literal[
-        "external_metering", "platform_hard"
-    ] = "external_metering"
+    model_api_governance_mode: Literal["external_metering", "platform_hard"] = "external_metering"
     platform_gateway_base_url: str = ""
 
     # LLM — optional. Only consumed by metadata_worker (auto-tagging
@@ -557,8 +527,8 @@ class Settings(BaseModel):
     rerank_enabled: bool = False
     rerank_provider: str = "cohere"
     rerank_model: str = "cohere/rerank-v3.5"
-    rerank_base_url: str = ""                  # blank → falls back to llm_base_url
-    rerank_api_key: str = ""                   # blank → falls back to llm_api_key
+    rerank_base_url: str = ""  # blank → falls back to llm_base_url
+    rerank_api_key: str = ""  # blank → falls back to llm_api_key
     rerank_prefetch: int = 30
     # RRF k used when fusing the first-stage hybrid rank with cross-encoder
     # rerank rank. 60 is the common RRF default; lower values make top ranks
@@ -573,49 +543,29 @@ class Settings(BaseModel):
     @model_validator(mode="after")
     def validate_model_api_governance(self) -> "Settings":
         if self.publication_view_grant_session_secs < self.publication_view_grant_ttl_secs:
-            raise ValueError(
-                "publication_view_grant_session_secs must be >= "
-                "publication_view_grant_ttl_secs"
-            )
+            raise ValueError("publication_view_grant_session_secs must be >= publication_view_grant_ttl_secs")
         if self.document_revision_backend == "postgres_native":
             if not self.document_revision_tenant_id.strip():
-                raise ValueError(
-                    "postgres_native requires document_revision_tenant_id"
-                )
+                raise ValueError("postgres_native requires document_revision_tenant_id")
             self.document_revision_tenant_id = self.document_revision_tenant_id.strip()
             if not is_dns1123_namespace(self.document_revision_namespace):
-                raise ValueError(
-                    "postgres_native requires document_revision_namespace in DNS-1123 form"
-                )
+                raise ValueError("postgres_native requires document_revision_namespace in DNS-1123 form")
             if self.document_revision_database_id is None:
+                raise ValueError("postgres_native requires document_revision_database_id")
+            if not _NATIVE_RUNTIME_IMAGE_DIGEST_RE.fullmatch(self.document_revision_runtime_image_digest):
                 raise ValueError(
-                    "postgres_native requires document_revision_database_id"
-                )
-            if not _NATIVE_RUNTIME_IMAGE_DIGEST_RE.fullmatch(
-                self.document_revision_runtime_image_digest
-            ):
-                raise ValueError(
-                    "postgres_native requires document_revision_runtime_image_digest "
-                    "in sha256:<64 lowercase hex> form"
+                    "postgres_native requires document_revision_runtime_image_digest in sha256:<64 lowercase hex> form"
                 )
             if self.db_name == NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME:
-                raise ValueError(
-                    "postgres_native rejects the reserved native measurement database"
-                )
+                raise ValueError("postgres_native rejects the reserved native measurement database")
             if self.native_revision_m1_measurement_only:
-                raise ValueError(
-                    "postgres_native rejects native_revision_m1_measurement_only"
-                )
+                raise ValueError("postgres_native rejects native_revision_m1_measurement_only")
             if self.native_revision_m1_file_driver != "s3_current":
-                raise ValueError(
-                    "postgres_native rejects non-s3_current native_revision_m1_file_driver"
-                )
+                raise ValueError("postgres_native rejects non-s3_current native_revision_m1_file_driver")
 
         if self.document_revision_backend == "native_ledger_m1":
             if not self.native_revision_m1_measurement_only:
-                raise ValueError(
-                    "native_ledger_m1 requires native_revision_m1_measurement_only=true"
-                )
+                raise ValueError("native_ledger_m1 requires native_revision_m1_measurement_only=true")
             if self.db_name != NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME:
                 raise ValueError(
                     "native_ledger_m1 requires dedicated measurement database "
@@ -624,9 +574,7 @@ class Settings(BaseModel):
 
         if self.native_revision_m1_file_driver != "s3_current":
             if not self.native_revision_m1_measurement_only:
-                raise ValueError(
-                    "native_revision_m1_file_driver requires native_revision_m1_measurement_only=true"
-                )
+                raise ValueError("native_revision_m1_file_driver requires native_revision_m1_measurement_only=true")
             if self.db_name != NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME:
                 raise ValueError(
                     "native_revision_m1_file_driver requires dedicated measurement database "
@@ -640,17 +588,13 @@ class Settings(BaseModel):
 
         gateway = self.platform_gateway_base_url.strip().rstrip("/")
         if not gateway:
-            raise ValueError(
-                "platform_gateway_base_url is required in platform_hard mode"
-            )
+            raise ValueError("platform_gateway_base_url is required in platform_hard mode")
 
         routes = [
             ("embed_base_url", self.embed_base_url, "embed_api_key", self.embed_api_key),
         ]
         if self.llm_base_url:
-            routes.append(
-                ("llm_base_url", self.llm_base_url, "llm_api_key", self.llm_api_key)
-            )
+            routes.append(("llm_base_url", self.llm_base_url, "llm_api_key", self.llm_api_key))
         if self.rerank_enabled:
             routes.append(
                 (
@@ -663,10 +607,7 @@ class Settings(BaseModel):
 
         for url_name, url, key_name, key in routes:
             if not url or url.strip().rstrip("/") != gateway:
-                raise ValueError(
-                    f"{url_name} must exactly match platform_gateway_base_url "
-                    "in platform_hard mode"
-                )
+                raise ValueError(f"{url_name} must exactly match platform_gateway_base_url in platform_hard mode")
             if not key.strip():
                 raise ValueError(f"{key_name} is required in platform_hard mode")
         return self
@@ -674,13 +615,9 @@ class Settings(BaseModel):
     @model_validator(mode="after")
     def validate_external_git(self) -> "Settings":
         if self.external_git_poll_interval_min < 60:
-            raise ValueError(
-                "external_git_poll_interval_min must be >= 60 (code-owned security floor)"
-            )
+            raise ValueError("external_git_poll_interval_min must be >= 60 (code-owned security floor)")
         if self.external_git_poll_interval_max < self.external_git_poll_interval_min:
-            raise ValueError(
-                "external_git_poll_interval_max must be >= external_git_poll_interval_min"
-            )
+            raise ValueError("external_git_poll_interval_max must be >= external_git_poll_interval_min")
         if self.external_git_resolver_timeout <= 0:
             raise ValueError("external_git_resolver_timeout must be > 0")
         if self.external_git_max_concurrent_resolutions < 1:
@@ -691,9 +628,7 @@ class Settings(BaseModel):
         # value below the hard floor (an operator may raise it, never lower it).
         parsed_min = parse_git_version(self.external_git_min_git_version)
         if parsed_min is None:
-            raise ValueError(
-                "external_git_min_git_version must be a dotted version like '2.37'"
-            )
+            raise ValueError("external_git_min_git_version must be a dotted version like '2.37'")
         if parsed_min[:2] < EXTERNAL_GIT_MIN_GIT_VERSION_FLOOR:
             floor = ".".join(str(n) for n in EXTERNAL_GIT_MIN_GIT_VERSION_FLOOR)
             raise ValueError(
@@ -705,17 +640,14 @@ class Settings(BaseModel):
             try:
                 ipaddress.ip_network(cidr, strict=False)
             except ValueError as e:
-                raise ValueError(
-                    f"external_git_deny_cidrs: invalid CIDR '{cidr}': {e}"
-                ) from e
+                raise ValueError(f"external_git_deny_cidrs: invalid CIDR '{cidr}': {e}") from e
         # Coherence: with http disabled, no allowlist rule may open port 80 — an
         # http-only exception is dead config under an https-only policy.
         if not self.external_git_allow_http:
             for rule in self.external_git_host_allowlist:
                 if 80 in rule.ports:
                     raise ValueError(
-                        f"external_git_allow_http is False but host allowlist rule "
-                        f"'{rule.host}' lists port 80"
+                        f"external_git_allow_http is False but host allowlist rule '{rule.host}' lists port 80"
                     )
         # Normalize cluster suffixes once for case-insensitive suffix matching.
         self.external_git_cluster_dns_suffixes = [
@@ -745,8 +677,8 @@ class Settings(BaseModel):
     vault_filter_enabled: bool = True
 
     # S3-compatible object storage (for vault files)
-    s3_endpoint_url: str = ""       # Internal endpoint (server → S3)
-    s3_public_url: str = ""         # External endpoint for presigned URLs (client → S3). Falls back to s3_endpoint_url.
+    s3_endpoint_url: str = ""  # Internal endpoint (server → S3)
+    s3_public_url: str = ""  # External endpoint for presigned URLs (client → S3). Falls back to s3_endpoint_url.
     s3_access_key: str = ""
     s3_secret_key: str = ""
     s3_bucket: str = "akb-files"
@@ -834,7 +766,7 @@ class Settings(BaseModel):
     # Deprecated compatibility/UI input. Runtime YAML derives this from
     # auth_mode and rejects an explicit mismatch. It is not an auth authority.
     keycloak_sso_only: bool = False
-    keycloak_server_url: str = ""          # e.g. https://auth.example.com (no /realms suffix)
+    keycloak_server_url: str = ""  # e.g. https://auth.example.com (no /realms suffix)
     # Optional backchannel base URL for server→Keycloak calls (token
     # exchange + JWKS). Defaults to keycloak_server_url. Set this only
     # when the backend reaches Keycloak at a different address than the
@@ -845,8 +777,8 @@ class Settings(BaseModel):
     keycloak_internal_url: str = ""
     keycloak_realm: str = "akb"
     keycloak_client_id: str = "akb-web"
-    keycloak_client_secret: str = ""       # secret.yaml — blank for public (PKCE) clients
-    keycloak_public_client: bool = False   # true → PKCE (no client_secret); false → confidential
+    keycloak_client_secret: str = ""  # secret.yaml — blank for public (PKCE) clients
+    keycloak_public_client: bool = False  # true → PKCE (no client_secret); false → confidential
     # Dedicated confidential browser client for the product-admin surface.
     # It is intentionally excluded from keycloak_human_client_ids and cannot
     # authorize ordinary AKB API bearer traffic. The callback URI is derived
@@ -861,7 +793,24 @@ class Settings(BaseModel):
     keycloak_management_client_id: str = "akb-sso-manager"
     keycloak_management_client_secret: str = ""
     admin_browser_session_ttl_secs: int = Field(default=900, ge=60, le=3600)
-    keycloak_verify_ssl: bool = True       # set false only for local self-signed Keycloak
+    # Ordinary SSO browsers receive only an opaque AKB handle. The Keycloak
+    # refresh/ID token set is encrypted at rest with this independent,
+    # installation-owned AES-256-GCM key. Blank keeps the capability
+    # fail-closed during an expand/contract rollout; a malformed configured
+    # key fails startup.
+    sso_browser_session_encryption_key: str = ""
+    sso_browser_session_idle_ttl_secs: int = Field(
+        default=8 * 60 * 60,
+        ge=5 * 60,
+        le=7 * 24 * 60 * 60,
+    )
+    sso_browser_session_absolute_ttl_secs: int = Field(
+        default=24 * 60 * 60,
+        ge=5 * 60,
+        le=30 * 24 * 60 * 60,
+    )
+    sso_browser_session_refresh_skew_secs: int = Field(default=30, ge=0, le=300)
+    keycloak_verify_ssl: bool = True  # set false only for local self-signed Keycloak
     # Exact identity is issuer/subject and does not require email. Open-mode
     # JIT requires a verified email only when creating a brand-new AKB user;
     # email is never an account lookup or adoption key. Set false ONLY for a
@@ -876,19 +825,17 @@ class Settings(BaseModel):
     # and the projection service repeats that guard for directly constructed
     # Settings. Runtime email adoption has no compatibility bypass.
     keycloak_link_by_email: bool = False
-    # Reserved Phase 4 browser-session inputs. Phase 1 browser routes are
-    # fail-closed and do not issue state, exchange codes, or session tokens.
+    # Deprecated pre-custody callback input. The active ordinary browser
+    # callback is derived from public_base_url and never trusts this value.
     keycloak_redirect_uri: str = ""
-    # Deprecated callback-delivery compatibility input; inactive in Phase 1.
+    # Deprecated callback-delivery compatibility input; inactive.
     keycloak_post_login_path: str = "/auth/callback"
-    # Deprecated callback-origin compatibility input; inactive in Phase 1.
+    # Deprecated callback-origin compatibility input; inactive.
     keycloak_post_login_allowed_origins: list[str] = Field(default_factory=list)
     # Companion client IDs remain active as accepted `azp` values for the
-    # human API profile. Origin-keyed browser routing is inactive until Phase 4.
-    keycloak_companion_client_ids_by_origin: dict[str, str] = Field(
-        default_factory=dict
-    )
-    # Deprecated legacy exchange-code input; no Phase 1 route issues/redeems it.
+    # human API profile. They never select AKB's own browser callback.
+    keycloak_companion_client_ids_by_origin: dict[str, str] = Field(default_factory=dict)
+    # Deprecated legacy exchange-code input; no route issues or redeems it.
     keycloak_exchange_code_ttl_secs: int = 60
 
     # Audience required on Keycloak access tokens presented to human REST or
@@ -966,12 +913,10 @@ class Settings(BaseModel):
     # NULL embedding column, so on those drivers an embed-API
     # outage stalls the indexing queue. Pick a driver that matches
     # your embedding-availability assumptions.
-    vector_store_driver: Literal[
-        "qdrant", "pgvector", "seahorse-cloud", "seahorse-db", "seahorse-db-grpc"
-    ] = "qdrant"
+    vector_store_driver: Literal["qdrant", "pgvector", "seahorse-cloud", "seahorse-db", "seahorse-db-grpc"] = "qdrant"
 
     # Pgvector driver settings.
-    vector_store_dsn: str = ""              # blank = reuse main PG pool
+    vector_store_dsn: str = ""  # blank = reuse main PG pool
     vector_store_schema: str = "vector_index"
     # `posting` (separate term_id table, indexed lookups) is the
     # production-recommended shape. `arrays` is retained for the bench
@@ -979,7 +924,7 @@ class Settings(BaseModel):
     vector_store_sparse_shape: Literal["posting", "arrays"] = "posting"
 
     # Qdrant driver settings.
-    vector_url: str = ""                    # e.g. http://qdrant:6333
+    vector_url: str = ""  # e.g. http://qdrant:6333
     vector_api_key: str = ""
     vector_collection: str = "chunks"
 
@@ -988,9 +933,9 @@ class Settings(BaseModel):
     # discovers the data-plane host from the management lookup; only
     # set the management URL + token + tenant + table identifier.
     seahorse_cloud_management_url: str = "https://console.seahorse.dnotitia.ai/bff"
-    seahorse_cloud_token: str = ""          # secret.yaml — Bearer (shsk_...)
+    seahorse_cloud_token: str = ""  # secret.yaml — Bearer (shsk_...)
     seahorse_cloud_tenant_uuid: str = ""
-    seahorse_cloud_table_name: str = ""     # one of (table_name, table_uuid) required
+    seahorse_cloud_table_name: str = ""  # one of (table_name, table_uuid) required
     seahorse_cloud_table_uuid: str = ""
     seahorse_cloud_auto_create: bool = False  # auto-provision the AKB-shaped table
 
@@ -1079,10 +1024,10 @@ class Settings(BaseModel):
     # external consumers can subscribe. Empty redis_url disables the
     # publisher entirely (no worker started, events still accumulate
     # in PG and are sweepable).
-    redis_url: str = ""                     # e.g. redis://redis:6379/0
+    redis_url: str = ""  # e.g. redis://redis:6379/0
     redis_password: str = ""
     redis_event_stream: str = "akb:events"
-    redis_stream_maxlen: int = 100_000      # XADD MAXLEN ~ ceiling
+    redis_stream_maxlen: int = 100_000  # XADD MAXLEN ~ ceiling
 
     # Audit log — its own nested section so the surface can grow without
     # littering the flat top level. See AuditSettings above.
@@ -1092,12 +1037,16 @@ class Settings(BaseModel):
     # ToolUsageSettings above for why it is not folded into `audit`.
     tool_usage: ToolUsageSettings = Field(default_factory=ToolUsageSettings)
 
+    @model_validator(mode="after")
+    def validate_sso_browser_session_lifetimes(self) -> "Settings":
+        if self.sso_browser_session_idle_ttl_secs > self.sso_browser_session_absolute_ttl_secs:
+            raise ValueError("sso_browser_session_idle_ttl_secs must be <= sso_browser_session_absolute_ttl_secs")
+        return self
+
     def require_auth_mode(self) -> AuthMode:
         """Return the canonical runtime mode or fail without legacy inference."""
         if self.auth_mode is None:
-            raise AuthModeConfigurationError(
-                "auth_mode is required at runtime; set it explicitly to 'local' or 'sso'"
-            )
+            raise AuthModeConfigurationError("auth_mode is required at runtime; set it explicitly to 'local' or 'sso'")
         return self.auth_mode
 
     @property
@@ -1186,12 +1135,19 @@ class Settings(BaseModel):
         return f"{self.keycloak_issuer}/protocol/openid-connect/logout"
 
     @property
+    def keycloak_backchannel_logout_endpoint(self) -> str:
+        """Server-to-Keycloak refresh-token revocation endpoint."""
+        return f"{self._keycloak_backchannel_issuer}/protocol/openid-connect/logout"
+
+    @property
+    def keycloak_browser_redirect_uri(self) -> str:
+        """Deployment-bound callback for the ordinary browser client."""
+        return f"{self.public_base_url.rstrip('/')}/api/v1/auth/keycloak/callback"
+
+    @property
     def keycloak_admin_redirect_uri(self) -> str:
         """Exact callback owned by the dedicated product-admin client."""
-        return (
-            f"{self.public_base_url.rstrip('/')}"
-            "/api/v1/admin/auth/keycloak/callback"
-        )
+        return f"{self.public_base_url.rstrip('/')}/api/v1/admin/auth/keycloak/callback"
 
     @property
     def keycloak_admin_post_logout_redirect_uri(self) -> str:

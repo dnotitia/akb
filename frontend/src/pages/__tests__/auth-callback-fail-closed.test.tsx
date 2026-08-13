@@ -23,7 +23,7 @@ describe("AuthCallbackPage", () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByRole("heading", { name: /SSO sign-in unavailable/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Legacy SSO callback retired/i })).toBeInTheDocument();
     expect(fetchMock).not.toHaveBeenCalled();
     expect(storageWrite).not.toHaveBeenCalled();
   });

@@ -26,6 +26,7 @@ _SECRETS = (
     "api-browser-secret-must-not-leak",  # pragma: allowlist secret
     "admin-browser-secret-must-not-leak",  # pragma: allowlist secret
     "one-time-product-admin-password",  # pragma: allowlist secret
+    "one-time-upgrade-secret-must-not-leak",  # pragma: allowlist secret
 )
 
 
@@ -91,6 +92,60 @@ async def test_removed_bootstrap_secret_skips_token_request():
         await control.aclose()
 
 
+async def test_upgrade_authority_authenticates_only_against_master_realm():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/realms/master/protocol/openid-connect/token"
+        form = dict(item.split("=", 1) for item in request.content.decode().split("&"))
+        assert form["client_id"] == "akb-bootstrap-upgrade-v2"
+        return httpx.Response(200, json={"access_token": "opaque-upgrade-token"})
+
+    control, spec = _control(httpx.MockTransport(handler))
+    spec = replace(spec, upgrade_client_secret=_SECRETS[5])
+    try:
+        assert await control.acquire_upgrade(spec) == "opaque-upgrade-token"
+    finally:
+        await control.aclose()
+
+
+async def test_v1_upgrade_mutates_only_the_signed_provider_mapper(monkeypatch):
+    control = KeycloakStandaloneSSOControl()
+    spec = replace(_spec(), upgrade_client_secret=_SECRETS[5])
+    events: list[tuple[str, object]] = []
+    expected_readback = object()
+
+    async def _exact_client(_spec, realm, client_id, *, token):
+        events.append(("exact-client", (realm, client_id, token)))
+        return {**control._api_client(spec), "id": "api-client-uuid"}  # noqa: SLF001
+
+    async def _reconcile_mapper(_spec, client_uuid, desired, *, token):
+        events.append(("reconcile-mapper", (client_uuid, desired, token)))
+        return desired
+
+    async def _readback(_spec, *, management_token):
+        events.append(("readback", management_token))
+        return expected_readback
+
+    monkeypatch.setattr(control, "_exact_client", _exact_client)
+    monkeypatch.setattr(control, "_reconcile_mapper", _reconcile_mapper)
+    monkeypatch.setattr(control, "readback", _readback)
+
+    result = await control.upgrade_v1_to_v2(
+        spec,
+        upgrade_token="opaque-upgrade-token",  # pragma: allowlist secret
+    )
+
+    assert result is expected_readback
+    assert [name for name, _value in events] == [
+        "exact-client",
+        "reconcile-mapper",
+        "readback",
+    ]
+    client_uuid, desired, token = events[1][1]
+    assert client_uuid == "api-client-uuid"
+    assert desired == control._api_identity_provider_mapper()  # noqa: SLF001
+    assert token == "opaque-upgrade-token"  # pragma: allowlist secret
+
+
 async def test_keycloak_internal_base_path_is_preserved():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/auth/realms/master/protocol/openid-connect/token"
@@ -136,11 +191,15 @@ async def test_duplicate_exact_client_fails_closed():
 
 
 async def test_signing_key_readback_measures_active_key_and_rotation_window():
-    active_public = base64.b64encode(
-        rsa.generate_private_key(public_exponent=65537, key_size=3072)
-        .public_key()
-        .public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
-    ).decode("ascii").rstrip("=")
+    active_public = (
+        base64.b64encode(
+            rsa.generate_private_key(public_exponent=65537, key_size=3072)
+            .public_key()
+            .public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
     passive_public = (
         rsa.generate_private_key(public_exponent=65537, key_size=2048)
         .public_key()
@@ -235,9 +294,54 @@ async def test_bootstrap_retirement_deletes_only_exact_master_client_and_reauth_
     finally:
         await control.aclose()
 
-    assert deleted_paths == [
-        "/admin/realms/master/clients/bootstrap-client-uuid"
-    ]
+    assert deleted_paths == ["/admin/realms/master/clients/bootstrap-client-uuid"]
+
+
+async def test_upgrade_retirement_deletes_only_exact_master_client_and_reauth_denies():
+    deleted_paths: list[str] = []
+    retired = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal retired
+        if request.url.path == "/admin/realms/master/clients":
+            assert request.url.params["clientId"] == "akb-bootstrap-upgrade-v2"
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "upgrade-client-uuid",
+                        "clientId": "akb-bootstrap-upgrade-v2",
+                    }
+                ],
+            )
+        if request.url.path == "/admin/realms/master/clients/upgrade-client-uuid":
+            assert request.method == "DELETE"
+            retired = True
+            deleted_paths.append(request.url.path)
+            return httpx.Response(204)
+        if request.url.path == "/admin/realms/master":
+            assert retired is True
+            return httpx.Response(401)
+        if request.url.path == "/realms/master/protocol/openid-connect/token":
+            assert retired is True
+            return httpx.Response(401)
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    control, spec = _control(httpx.MockTransport(handler))
+    spec = replace(spec, upgrade_client_secret=_SECRETS[5])
+    try:
+        await control.retire_upgrade(
+            spec,
+            upgrade_token="opaque-upgrade-token",  # pragma: allowlist secret
+        )
+        await control.assert_upgrade_retired(
+            spec,
+            upgrade_token="opaque-upgrade-token",  # pragma: allowlist secret
+        )
+    finally:
+        await control.aclose()
+
+    assert deleted_paths == ["/admin/realms/master/clients/upgrade-client-uuid"]
 
 
 async def test_missing_one_time_password_cannot_create_product_admin():
@@ -282,9 +386,7 @@ async def test_existing_product_admin_password_is_reset_to_the_operator_input():
                         "email": "product-admin@example.com",
                         "enabled": True,
                         "emailVerified": True,
-                        "requiredActions": (
-                            ["UPDATE_PASSWORD"] if user_reads > 1 else []
-                        ),
+                        "requiredActions": (["UPDATE_PASSWORD"] if user_reads > 1 else []),
                     }
                 ],
             )
@@ -531,13 +633,14 @@ async def test_client_profiles_separate_user_admin_and_management_authorities():
         "akb-admin",
         "akb-sso-manager",
     }
-    assert api["redirectUris"] == [
-        "https://akb.example.com/api/v1/auth/keycloak/callback"
-    ]
-    assert admin["redirectUris"] == [
-        "https://akb.example.com/api/v1/admin/auth/keycloak/callback"
-    ]
+    assert api["redirectUris"] == ["https://akb.example.com/api/v1/auth/keycloak/callback"]
+    assert admin["redirectUris"] == ["https://akb.example.com/api/v1/admin/auth/keycloak/callback"]
     assert api["attributes"]["pkce.code.challenge.method"] == "S256"
+    assert api["frontchannelLogout"] is False
+    assert api["attributes"]["backchannel.logout.url"] == (
+        "https://akb.example.com/api/v1/auth/keycloak/backchannel-logout"
+    )
+    assert api["attributes"]["backchannel.logout.session.required"] == "true"
     assert admin["attributes"]["pkce.code.challenge.method"] == "S256"
     assert api["defaultClientScopes"] == ["basic", "profile", "email"]
     assert admin["defaultClientScopes"] == ["basic", "profile", "email"]
@@ -545,3 +648,30 @@ async def test_client_profiles_separate_user_admin_and_management_authorities():
     assert management["serviceAccountsEnabled"] is True
     assert management["defaultClientScopes"] == ["service_account"]
     assert management["redirectUris"] == []
+
+
+async def test_api_client_maps_signed_broker_provenance_into_both_token_profiles():
+    mapper = KeycloakStandaloneSSOControl._api_identity_provider_mapper()  # noqa: SLF001
+
+    assert mapper == {
+        "name": "akb-browser-identity-provider",
+        "protocol": "openid-connect",
+        "protocolMapper": "oidc-usersessionmodel-note-mapper",
+        "consentRequired": False,
+        "config": {
+            "user.session.note": "identity_provider",
+            "claim.name": "identity_provider",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "lightweight.claim": "false",
+            "userinfo.token.claim": "false",
+            "introspection.token.claim": "true",
+            "access.tokenResponse.claim": "false",
+        },
+    }
+
+    changed = dict(mapper)
+    changed["config"] = dict(mapper["config"], **{"access.token.claim": "false"})
+    assert KeycloakStandaloneSSOControl._mapper_matches(mapper, mapper) is True  # noqa: SLF001
+    assert KeycloakStandaloneSSOControl._mapper_matches(changed, mapper) is False  # noqa: SLF001

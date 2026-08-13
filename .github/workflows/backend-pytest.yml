@@ -214,6 +214,7 @@ jobs:
           tests/test_recovery_admin_provisioning_postgres.py
           tests/test_admin_auth_postgres.py
           tests/test_sso_identity_migration_postgres.py
+          tests/test_sso_browser_session_postgres.py
           tests/test_tool_usage_e2e.py
           tests/test_table_if_not_exists_e2e.py
           -v --tb=short

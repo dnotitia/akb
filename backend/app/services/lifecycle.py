@@ -100,8 +100,8 @@ def _validate_required_settings() -> None:
             "https://akb.example.com)"
         )
     # A configured Keycloak authority always needs its pinned issuer inputs.
-    # Ordinary SSO browser custody remains staged for Phase 4. The dedicated
-    # Phase 2 product-admin client is active, confidential, and independently
+    # Ordinary browser custody is activated separately by its encryption key;
+    # the dedicated product-admin client remains confidential and independently
     # validated here.
     if settings.keycloak_enabled:
         if not settings.keycloak_server_url.strip():
@@ -136,6 +136,18 @@ def _validate_required_settings() -> None:
     if missing:
         raise RuntimeError("Required configuration missing:\n  - " + "\n  - ".join(missing))
     if auth_mode == "sso":
+        if settings.sso_browser_session_encryption_key:
+            from app.services.sso_browser_session_crypto import (
+                BrowserSessionCipher,
+                BrowserSessionKeyError,
+            )
+
+            try:
+                BrowserSessionCipher.from_encoded_key(settings.sso_browser_session_encryption_key)
+            except BrowserSessionKeyError:
+                raise RuntimeError(
+                    "sso_browser_session_encryption_key must be base64url-encoded 256-bit key material"
+                ) from None
         if settings.keycloak_admin_client_id in settings.keycloak_human_client_ids:
             raise RuntimeError("keycloak_admin_client_id must be dedicated to the product-admin surface")
         if not _is_secure_browser_url(settings.public_base_url):

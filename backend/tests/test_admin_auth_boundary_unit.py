@@ -111,11 +111,12 @@ def test_admin_login_sets_browser_binding_cookie(monkeypatch) -> None:
     assert response.status_code == 303
     assert response.headers["location"].startswith("https://id.example/authorize")
     binding_cookie = next(
-        value for value in response.headers.get_list("set-cookie") if value.startswith("akb_admin_oidc_binding=")
+        value for value in response.headers.get_list("set-cookie") if value.startswith("__Host-akb_admin_oidc_binding=")
     )
     assert "browser-binding-value-that-is-long-enough" in binding_cookie
     assert "HttpOnly" in binding_cookie
-    assert "Path=/api/v1/admin/auth/keycloak/callback" in binding_cookie
+    assert "Path=/" in binding_cookie
+    assert "Domain=" not in binding_cookie
     assert "SameSite=lax" in binding_cookie
     assert "Secure" in binding_cookie
 
@@ -390,9 +391,9 @@ def test_sso_admin_callback_issues_only_short_opaque_cookies(monkeypatch) -> Non
     app.include_router(admin_auth.router, prefix="/api/v1")
     client = TestClient(app)
     client.cookies.set(
-        "akb_admin_oidc_binding",
+        "__Host-akb_admin_oidc_binding",
         "browser-binding-value-that-is-long-enough",
-        path="/api/v1/admin/auth/keycloak/callback",
+        path="/",
     )
     response = client.get(
         "/api/v1/admin/auth/keycloak/callback",
@@ -404,25 +405,25 @@ def test_sso_admin_callback_issues_only_short_opaque_cookies(monkeypatch) -> Non
     assert response.headers["location"] == "/admin"
     cookies = response.headers.get_list("set-cookie")
     assert any(
-        value.startswith("akb_admin_session=opaque-session-value;")
+        value.startswith("__Host-akb_admin_session=opaque-session-value;")
         and "HttpOnly" in value
-        and "Path=/api/v1/admin" in value
+        and "Path=/" in value
         and "SameSite=lax" in value
         and "Secure" in value
+        and "Domain=" not in value
         for value in cookies
     )
     assert any(
-        value.startswith("akb_admin_oidc_binding=")
-        and "Max-Age=0" in value
-        and "Path=/api/v1/admin/auth/keycloak/callback" in value
+        value.startswith("__Host-akb_admin_oidc_binding=") and "Max-Age=0" in value and "Path=/" in value
         for value in cookies
     )
     assert any(
-        value.startswith("akb_admin_csrf=opaque-csrf-value;")
+        value.startswith("__Host-akb_admin_csrf=opaque-csrf-value;")
         and "HttpOnly" not in value
         and "Path=/" in value
         and "SameSite=lax" in value
         and "Secure" in value
+        and "Domain=" not in value
         for value in cookies
     )
     rendered = "\n".join(f"{name}: {value}" for name, value in response.headers.items())
@@ -461,6 +462,7 @@ def test_admin_session_is_mode_selected_and_sso_logout_requires_csrf(monkeypatch
     monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
     monkeypatch.setattr(settings, "keycloak_admin_client_id", "akb-admin", raising=False)
     monkeypatch.setattr(settings, "keycloak_admin_client_secret", "secret", raising=False)
+    monkeypatch.setattr(settings, "public_base_url", "https://akb.example", raising=False)
     monkeypatch.setattr(admin_auth, "resolve_sso_admin_browser_session", resolve_sso)
     monkeypatch.setattr(admin_auth, "revoke_sso_admin_browser_session", revoke)
     monkeypatch.setattr(admin_auth, "get_keycloak_oidc", lambda: OIDC())
@@ -473,8 +475,8 @@ def test_admin_session_is_mode_selected_and_sso_logout_requires_csrf(monkeypatch
         return JSONResponse({"error": exc.message}, status_code=exc.status_code)
 
     client = TestClient(app)
-    client.cookies.set("akb_admin_session", "opaque-session")
-    client.cookies.set("akb_admin_csrf", "csrf-value")
+    client.cookies.set("__Host-akb_admin_session", "opaque-session")
+    client.cookies.set("__Host-akb_admin_csrf", "csrf-value")
 
     session = client.get("/api/v1/admin/auth/session")
     assert session.status_code == 200

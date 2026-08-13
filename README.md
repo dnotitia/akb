@@ -345,18 +345,30 @@ reconfiguration.
 See the [SSO provider guide](./docs/sso/README.md) and the first reference
 integration, [Keycloak OIDC behind Keycloak](./docs/sso/providers/keycloak-oidc.md).
 
-The SSO callback stores no Keycloak access, refresh, or ID token. It creates a
-short-lived opaque HttpOnly admin cookie plus a CSRF token; PostgreSQL stores
-only their hashes plus the exact identity snapshot, and rechecks the account,
-unchanged external binding, and admin flag on every request. The one-time OIDC
-state is also bound to a short-lived
-HttpOnly cookie so a callback copied into another browser fails before token
-exchange. Configure `keycloak_admin_client_secret`, register
+The dedicated admin callback stores no Keycloak access, refresh, or ID token.
+It creates a short-lived opaque HttpOnly admin cookie plus a CSRF token;
+PostgreSQL stores only their hashes plus the exact identity snapshot, and
+rechecks the account, unchanged external binding, and admin flag on every
+request. Its one-time OIDC state is also bound to a short-lived HttpOnly cookie
+so a callback copied into another browser fails before token exchange.
+Configure `keycloak_admin_client_secret`, register
 `<public_base_url>/api/v1/admin/auth/keycloak/callback` and
 `<public_base_url>/admin` in the dedicated client, and keep the admin client ID
 out of every API/MCP resource-client path. Browser-facing AKB and Keycloak URLs
-must use HTTPS outside the explicit loopback development exception. Ordinary SSO browser
-login remains staged until its Phase 4 server-side token-custody work lands.
+must use HTTPS outside the explicit loopback development exception.
+
+Ordinary SSO login uses the separate `akb-web` client. The browser receives
+only an opaque HttpOnly AKB session plus a readable CSRF value; SSO does not
+mint an AKB user JWT. AKB encrypts the Keycloak refresh/ID token set with the
+independent `sso_browser_session_encryption_key` and never persists an access
+token. The client must map Keycloak's `identity_provider` user-session note
+into both ID and access tokens with `oidc-usersessionmodel-note-mapper`; AKB
+binds that signed broker alias to the selected enabled provider on callback
+and every refresh. Production HTTPS cookies use the browser-enforced `__Host-` prefix,
+`Secure`, no `Domain`, and `Path=/`; loopback HTTP uses isolated development
+names. Generate the key as 32 random bytes encoded with unpadded base64url and
+keep it stable across restarts. See the [Keycloak boundary](./docs/designs/keycloak-oidc/00-overview.md)
+for refresh, logout, and back-channel revocation details.
 
 Local login issues only the versioned `local-session-rs256-v2` profile:
 RS256 with an installation-owned RSA-3072 key, an RFC 7638 `kid`, exact

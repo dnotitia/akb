@@ -114,6 +114,81 @@ CREATE INDEX IF NOT EXISTS idx_admin_browser_sessions_expiry
 CREATE INDEX IF NOT EXISTS idx_admin_browser_sessions_user
     ON admin_browser_sessions(user_id);
 
+-- Ordinary-user SSO browser sessions. The browser receives only the opaque
+-- token whose SHA-256 digest is stored here. Keycloak refresh and ID tokens
+-- are held exclusively inside a versioned AES-256-GCM envelope bound to this
+-- exact row and AKB user. Access tokens are verified and discarded.
+CREATE TABLE IF NOT EXISTS sso_browser_sessions (
+    id UUID PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE
+        CHECK (token_hash ~ '^[0-9a-f]{64}$'),
+    csrf_token_hash TEXT NOT NULL
+        CHECK (csrf_token_hash ~ '^[0-9a-f]{64}$'),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    external_identity_id UUID NOT NULL,
+    identity_issuer TEXT NOT NULL
+        CHECK (char_length(identity_issuer) BETWEEN 1 AND 2048),
+    identity_subject TEXT NOT NULL
+        CHECK (char_length(identity_subject) BETWEEN 1 AND 1024),
+    keycloak_sid TEXT NOT NULL
+        CHECK (char_length(keycloak_sid) BETWEEN 1 AND 255),
+    token_envelope TEXT NOT NULL
+        CHECK (char_length(token_envelope) BETWEEN 32 AND 65536),
+    access_expires_at TIMESTAMPTZ NOT NULL,
+    refresh_expires_at TIMESTAMPTZ NOT NULL,
+    idle_expires_at TIMESTAMPTZ NOT NULL,
+    absolute_expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    refreshed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT sso_browser_session_external_user_fk
+        FOREIGN KEY (external_identity_id, user_id)
+        REFERENCES external_identities(id, user_id) ON DELETE CASCADE,
+    CONSTRAINT sso_browser_session_positive_lifetime
+        CHECK (
+            access_expires_at > created_at
+            AND refresh_expires_at > created_at
+            AND idle_expires_at > created_at
+            AND absolute_expires_at > created_at
+            AND idle_expires_at <= absolute_expires_at
+        )
+);
+
+CREATE INDEX IF NOT EXISTS idx_sso_browser_sessions_idle_expiry
+    ON sso_browser_sessions(idle_expires_at);
+CREATE INDEX IF NOT EXISTS idx_sso_browser_sessions_absolute_expiry
+    ON sso_browser_sessions(absolute_expires_at);
+CREATE INDEX IF NOT EXISTS idx_sso_browser_sessions_user
+    ON sso_browser_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sso_browser_sessions_sid
+    ON sso_browser_sessions(identity_issuer, keycloak_sid);
+CREATE INDEX IF NOT EXISTS idx_sso_browser_sessions_subject
+    ON sso_browser_sessions(identity_issuer, identity_subject);
+
+-- Durable, short-lived ordering fence for verified Keycloak back-channel
+-- logout. Session creation and logout also share a transaction advisory lock;
+-- this row rejects a callback that resumes only after logout committed.
+CREATE TABLE IF NOT EXISTS sso_browser_logout_fences (
+    identity_issuer TEXT NOT NULL
+        CHECK (char_length(identity_issuer) BETWEEN 1 AND 2048),
+    keycloak_sid TEXT NOT NULL
+        CHECK (char_length(keycloak_sid) BETWEEN 1 AND 255),
+    identity_subject TEXT
+        CHECK (
+            identity_subject IS NULL OR
+            char_length(identity_subject) BETWEEN 1 AND 1024
+        ),
+    logout_issued_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (identity_issuer, keycloak_sid),
+    CONSTRAINT sso_browser_logout_fence_positive_lifetime
+        CHECK (expires_at > logout_issued_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sso_browser_logout_fences_expiry
+    ON sso_browser_logout_fences(expires_at);
+
 -- A monotonic, non-secret receipt written only after the temporary bundled
 -- Keycloak bootstrap client has been deleted and its credential rejected.
 -- It lets later init-container runs prove that an absent one-time Secret is
@@ -176,13 +251,12 @@ CREATE INDEX IF NOT EXISTS idx_tokens_hash ON tokens(token_hash);
 CREATE INDEX IF NOT EXISTS idx_tokens_user ON tokens(user_id);
 
 -- ============================================================
--- OIDC transients — single-use, TTL-bounded state. The dedicated Phase 2
--- product-admin client uses kind=admin-state-v1; ordinary SSO browser login
--- remains staged for Phase 4. See migration 034.
+-- OIDC transients — single-use, TTL-bounded state. The dedicated product-admin
+-- and ordinary browser clients use distinct namespaced kinds. See migration 034.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS oidc_transients (
     key         TEXT PRIMARY KEY,
-    kind        TEXT NOT NULL,          -- reserved legacy transient kind
+    kind        TEXT NOT NULL,          -- namespaced browser-flow kind
     payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
     expires_at  TIMESTAMPTZ NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()

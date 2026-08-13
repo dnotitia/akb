@@ -1,4 +1,4 @@
-"""Fail-closed Phase 1 browser OIDC route gates."""
+"""Mode gates for ordinary-user browser authentication routes."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from starlette.requests import Request
 
 from app.api.routes import auth
 from app.config import settings
-from app.exceptions import AKBError
 
 
 def _callback_request() -> Request:
@@ -27,7 +26,7 @@ def _callback_request() -> Request:
     )
 
 
-def _browser_route_calls() -> list[tuple[str, Callable[[], Awaitable[object]]]]:
+def _local_browser_route_calls() -> list[tuple[str, Callable[[], Awaitable[object]]]]:
     return [
         ("login", lambda: auth.keycloak_login("/")),
         ("callback", lambda: auth.keycloak_callback(_callback_request())),
@@ -39,11 +38,19 @@ def _browser_route_calls() -> list[tuple[str, Callable[[], Awaitable[object]]]]:
     ]
 
 
+def _retired_sso_route_calls() -> list[tuple[str, Callable[[], Awaitable[object]]]]:
+    return [
+        ("login", lambda: auth.keycloak_login("/")),
+        ("exchange", auth.keycloak_exchange),
+        ("logout", lambda: auth.keycloak_logout()),
+    ]
+
+
 def _forbid_oidc_calls(monkeypatch) -> None:
     from app.services import auth_service, keycloak_oidc
 
     def forbidden(*_args, **_kwargs):
-        raise AssertionError("staged browser route must not call OIDC/session code")
+        raise AssertionError("mode-gated route must not call OIDC/session code")
 
     monkeypatch.setattr(keycloak_oidc, "get_keycloak_oidc", forbidden)
     monkeypatch.setattr(keycloak_oidc, "issue_exchange_code", forbidden, raising=False)
@@ -59,7 +66,7 @@ def _forbid_oidc_calls(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("name,call", _browser_route_calls())
+@pytest.mark.parametrize("name,call", _local_browser_route_calls())
 async def test_local_mode_hides_human_keycloak_routes_before_oidc_calls(
     monkeypatch,
     name,
@@ -78,8 +85,8 @@ async def test_local_mode_hides_human_keycloak_routes_before_oidc_calls(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("name,call", _browser_route_calls())
-async def test_sso_browser_routes_are_stable_503_before_mint_or_redeem(
+@pytest.mark.parametrize("name,call", _retired_sso_route_calls())
+async def test_sso_mode_keeps_token_bearing_legacy_routes_permanently_gone(
     monkeypatch,
     name,
     call,
@@ -89,8 +96,7 @@ async def test_sso_browser_routes_are_stable_503_before_mint_or_redeem(
     monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
     _forbid_oidc_calls(monkeypatch)
 
-    with pytest.raises(AKBError) as exc_info:
+    with pytest.raises(HTTPException) as exc_info:
         await call()
 
-    assert exc_info.value.status_code == 503
-    assert exc_info.value.code == "browser_session_not_ready"
+    assert exc_info.value.status_code == 410

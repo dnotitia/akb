@@ -46,6 +46,7 @@ async def services(monkeypatch):
         for filename in (
             "043_workspace_account_governance.py",
             "071_recovery_admin.py",
+            "072_admin_browser_sessions.py",
         ):
             migration = _load_migration(filename)
             assert migration is not None
@@ -63,9 +64,7 @@ async def services(monkeypatch):
     yield pool, role_sync, account_service
 
     async with pool.acquire() as conn:
-        user_ids = await conn.fetch(
-            "SELECT id FROM users WHERE username LIKE 'governance-%'"
-        )
+        user_ids = await conn.fetch("SELECT id FROM users WHERE username LIKE 'governance-%'")
         ids = [str(row["id"]) for row in user_ids]
         await conn.execute("DELETE FROM users WHERE username LIKE 'governance-%'")
         if ids:
@@ -265,11 +264,14 @@ async def test_concurrent_human_ensure_converges_to_one_user(services):
 
     assert len({result["user_id"] for result in results}) == 1
     async with pool.acquire() as conn:
-        assert await conn.fetchval(
-            "SELECT COUNT(*) FROM external_identities WHERE issuer = $1 AND subject = $2",
-            _ISSUER,
-            subject,
-        ) == 1
+        assert (
+            await conn.fetchval(
+                "SELECT COUNT(*) FROM external_identities WHERE issuer = $1 AND subject = $2",
+                _ISSUER,
+                subject,
+            )
+            == 1
+        )
 
 
 async def test_explicit_user_id_allows_reviewed_issuer_migration(services):
@@ -708,13 +710,11 @@ async def test_concurrent_service_user_ensure_converges_to_one_user(services):
 
     assert len({result["user_id"] for result in results}) == 1
     async with pool.acquire() as conn:
-        assert await conn.fetchval(
-            "SELECT COUNT(*) FROM users WHERE username = $1", username
-        ) == 1
+        assert await conn.fetchval("SELECT COUNT(*) FROM users WHERE username = $1", username) == 1
 
 
 async def test_role_projection_preserves_user_id(services):
-    _, _, service = services
+    pool, _, service = services
     ensured = await service.ensure_human_external_identity(
         issuer=_ISSUER,
         subject=f"role-{uuid.uuid4().hex}",
@@ -723,17 +723,41 @@ async def test_role_projection_preserves_user_id(services):
         actor_id="platform-service",
     )
 
-    promoted = await service.set_user_admin(
-        ensured["user_id"], is_admin=True, actor_id="platform-service"
-    )
-    demoted = await service.set_user_admin(
-        ensured["user_id"], is_admin=False, actor_id="platform-service"
-    )
+    promoted = await service.set_user_admin(ensured["user_id"], is_admin=True, actor_id="platform-service")
+    async with pool.acquire() as conn:
+        identity = await conn.fetchrow(
+            "SELECT id, issuer, subject FROM external_identities WHERE user_id = $1",
+            uuid.UUID(ensured["user_id"]),
+        )
+        await conn.execute(
+            """
+            INSERT INTO admin_browser_sessions (
+                token_hash, csrf_token_hash, user_id, external_identity_id,
+                identity_issuer, identity_subject, keycloak_sid, expires_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() + INTERVAL '5 minutes')
+            """,
+            uuid.uuid4().hex * 2,
+            uuid.uuid4().hex * 2,
+            uuid.UUID(ensured["user_id"]),
+            identity["id"],
+            identity["issuer"],
+            identity["subject"],
+            "admin-session-before-demotion",
+        )
+    demoted = await service.set_user_admin(ensured["user_id"], is_admin=False, actor_id="platform-service")
 
     assert promoted["user_id"] == ensured["user_id"]
     assert promoted["is_admin"] is True
     assert demoted["user_id"] == ensured["user_id"]
     assert demoted["is_admin"] is False
+    async with pool.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT COUNT(*) FROM admin_browser_sessions WHERE user_id = $1",
+                uuid.UUID(ensured["user_id"]),
+            )
+            == 0
+        )
 
 
 async def test_suspended_human_cannot_be_promoted_but_can_be_demoted(services):
@@ -745,20 +769,14 @@ async def test_suspended_human_cannot_be_promoted_but_can_be_demoted(services):
         display_name=None,
         actor_id="platform-service",
     )
-    await service.set_user_admin(
-        ensured["user_id"], is_admin=True, actor_id="platform-service"
-    )
+    await service.set_user_admin(ensured["user_id"], is_admin=True, actor_id="platform-service")
     await service.suspend_user(ensured["user_id"], actor_id="platform-service")
 
     from app.exceptions import AccountSuspendedError
 
     with pytest.raises(AccountSuspendedError):
-        await service.set_user_admin(
-            ensured["user_id"], is_admin=True, actor_id="platform-service"
-        )
-    demoted = await service.set_user_admin(
-        ensured["user_id"], is_admin=False, actor_id="platform-service"
-    )
+        await service.set_user_admin(ensured["user_id"], is_admin=True, actor_id="platform-service")
+    demoted = await service.set_user_admin(ensured["user_id"], is_admin=False, actor_id="platform-service")
     assert demoted["is_admin"] is False
 
 
@@ -773,9 +791,7 @@ async def test_suspend_revokes_sessions_tokens_and_strict_token_roles(services):
     user_id = uuid.UUID(ensured["user_id"])
     token_ids: list[uuid.UUID] = []
     async with pool.acquire() as conn:
-        before = await conn.fetchval(
-            "SELECT tokens_revoked_before FROM users WHERE id = $1", user_id
-        )
+        before = await conn.fetchval("SELECT tokens_revoked_before FROM users WHERE id = $1", user_id)
         for key_class in ("pat", "service", "publishable"):
             token_ids.append(
                 await conn.fetchval(
@@ -793,9 +809,7 @@ async def test_suspend_revokes_sessions_tokens_and_strict_token_roles(services):
                 )
             )
 
-    result = await service.suspend_user(
-        str(user_id), actor_id="platform-service"
-    )
+    result = await service.suspend_user(str(user_id), actor_id="platform-service")
 
     assert result["account_status"] == "suspended"
     assert set(result["revoked_token_ids"]) == {str(token_id) for token_id in token_ids}
@@ -919,9 +933,7 @@ async def test_activation_restores_account_only_not_deleted_credentials(services
         actor_id="platform-service",
     )
     await service.suspend_user(ensured["user_id"], actor_id="platform-service")
-    activated = await service.activate_user(
-        ensured["user_id"], actor_id="platform-service"
-    )
+    activated = await service.activate_user(ensured["user_id"], actor_id="platform-service")
 
     assert activated["account_status"] == "active"
     async with pool.acquire() as conn:
@@ -987,15 +999,11 @@ async def test_exact_owned_token_revocation_is_strict_and_cross_user_safe(servic
     from app.exceptions import NotFoundError
 
     with pytest.raises(NotFoundError):
-        await service.revoke_user_token(
-            other["user_id"], str(token_id), actor_id="platform-service"
-        )
+        await service.revoke_user_token(other["user_id"], str(token_id), actor_id="platform-service")
     async with pool.acquire() as conn:
         assert await conn.fetchval("SELECT EXISTS (SELECT 1 FROM tokens WHERE id = $1)", token_id)
 
-    revoked = await service.revoke_user_token(
-        owner["user_id"], str(token_id), actor_id="platform-service"
-    )
+    revoked = await service.revoke_user_token(owner["user_id"], str(token_id), actor_id="platform-service")
     assert revoked == {"user_id": owner["user_id"], "token_id": str(token_id), "revoked": True}
     assert token_id in role_sync.revoked_tokens
 

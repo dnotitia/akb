@@ -10,6 +10,7 @@ import pytest
 pytestmark = pytest.mark.asyncio
 
 _BOOTSTRAP_SECRET = "temporary-bootstrap-secret-must-not-leak"  # pragma: allowlist secret
+_UPGRADE_SECRET = "temporary-upgrade-secret-must-not-leak"  # pragma: allowlist secret
 _MANAGEMENT_SECRET = "permanent-management-secret-must-not-leak"  # pragma: allowlist secret
 _ADMIN_CLIENT_SECRET = "admin-browser-secret-must-not-leak"  # pragma: allowlist secret
 _PRODUCT_ADMIN_PASSWORD = "one-time-product-admin-password"  # pragma: allowlist secret
@@ -34,6 +35,8 @@ def _spec():
         product_admin_username="product-admin",
         product_admin_email="product-admin@example.com",
         product_admin_password=_PRODUCT_ADMIN_PASSWORD,
+        upgrade_client_id="akb-bootstrap-upgrade-v2",
+        upgrade_client_secret="",
     )
 
 
@@ -70,7 +73,12 @@ def _readback():
     )
 
 
-def _receipt(*, user_id: str = "11111111-1111-4111-8111-111111111111"):
+def _receipt(
+    *,
+    user_id: str = "11111111-1111-4111-8111-111111111111",
+    profile: str | None = None,
+    retired_client_id: str | None = None,
+):
     from app.services.standalone_sso_bootstrap import (
         STANDALONE_SSO_RECEIPT_PROFILE,
         StandaloneSSORetirementReceipt,
@@ -78,10 +86,10 @@ def _receipt(*, user_id: str = "11111111-1111-4111-8111-111111111111"):
 
     readback = _readback()
     return StandaloneSSORetirementReceipt(
-        profile=STANDALONE_SSO_RECEIPT_PROFILE,
+        profile=profile or STANDALONE_SSO_RECEIPT_PROFILE,
         issuer=_spec().issuer,
         realm_id=readback.realm_id,
-        bootstrap_client_id=_spec().bootstrap_client_id,
+        bootstrap_client_id=retired_client_id or _spec().bootstrap_client_id,
         management_client_uuid=readback.management_client_uuid,
         admin_client_uuid=readback.admin_client_uuid,
         api_client_uuid=readback.api_client_uuid,
@@ -91,9 +99,16 @@ def _receipt(*, user_id: str = "11111111-1111-4111-8111-111111111111"):
 
 
 class _Control:
-    def __init__(self, *, manager_available: bool, bootstrap_available: bool):
+    def __init__(
+        self,
+        *,
+        manager_available: bool,
+        bootstrap_available: bool,
+        upgrade_available: bool = False,
+    ):
         self.manager_available = manager_available
         self.bootstrap_available = bootstrap_available
+        self.upgrade_available = upgrade_available
         self.events: list[str] = []
         self._readback = _readback()
 
@@ -104,6 +119,10 @@ class _Control:
     async def acquire_bootstrap(self, _spec):
         self.events.append("acquire-bootstrap")
         return "bootstrap-token" if self.bootstrap_available else None
+
+    async def acquire_upgrade(self, _spec):
+        self.events.append("acquire-upgrade")
+        return "upgrade-token" if self.upgrade_available else None
 
     async def reconcile(self, _spec, *, bootstrap_token: str):
         assert bootstrap_token == "bootstrap-token"
@@ -116,6 +135,16 @@ class _Control:
         self.events.append("readback-keycloak")
         return self._readback
 
+    async def readback_legacy_v1(self, _spec, *, management_token: str):
+        assert management_token == "manager-token"
+        self.events.append("readback-keycloak-v1")
+        return self._readback
+
+    async def upgrade_v1_to_v2(self, _spec, *, upgrade_token: str):
+        assert upgrade_token == "upgrade-token"
+        self.events.append("upgrade-keycloak-v1-to-v2")
+        return self._readback
+
     async def retire_bootstrap(self, _spec, *, bootstrap_token: str):
         assert bootstrap_token == "bootstrap-token"
         self.events.append("retire-bootstrap")
@@ -125,6 +154,16 @@ class _Control:
         assert bootstrap_token == "bootstrap-token"
         self.events.append("assert-bootstrap-retired")
         assert self.bootstrap_available is False
+
+    async def retire_upgrade(self, _spec, *, upgrade_token: str):
+        assert upgrade_token == "upgrade-token"
+        self.events.append("retire-upgrade")
+        self.upgrade_available = False
+
+    async def assert_upgrade_retired(self, _spec, *, upgrade_token: str):
+        assert upgrade_token == "upgrade-token"
+        self.events.append("assert-upgrade-retired")
+        assert self.upgrade_available is False
 
 
 class _ReceiptStore:
@@ -235,6 +274,103 @@ async def test_completed_bootstrap_rerun_is_read_only_and_does_not_need_temp_adm
     assert report["mode"] == "readback"
     assert report["keycloak_mutated"] is False
     assert report["akb_admin_created"] is False
+
+
+async def test_legacy_v1_receipt_uses_one_time_upgrade_authority_then_retires_it():
+    from app.services.standalone_sso_bootstrap import (
+        STANDALONE_SSO_RECEIPT_PROFILE_V1,
+        bootstrap_standalone_sso,
+    )
+
+    control = _Control(
+        manager_available=True,
+        bootstrap_available=False,
+        upgrade_available=True,
+    )
+    receipts = _ReceiptStore(
+        control.events,
+        _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V1),
+    )
+
+    async def _provision(**_kwargs):
+        control.events.append("provision-akb-admin")
+        return {
+            "user_id": "11111111-1111-4111-8111-111111111111",
+            "created": False,
+            "is_admin": True,
+            "is_recovery_admin": True,
+        }
+
+    report = await bootstrap_standalone_sso(
+        replace(
+            _spec(),
+            bootstrap_client_secret="",
+            product_admin_password="",
+            upgrade_client_secret=_UPGRADE_SECRET,
+        ),
+        control=control,
+        provision_admin=_provision,
+        load_retirement_receipt=receipts.load,
+        record_retirement_receipt=receipts.record,
+    )
+
+    assert control.events == [
+        "load-retirement-receipt",
+        "acquire-management",
+        "acquire-bootstrap",
+        "acquire-upgrade",
+        "readback-keycloak-v1",
+        "provision-akb-admin",
+        "upgrade-keycloak-v1-to-v2",
+        "acquire-management",
+        "readback-keycloak",
+        "retire-upgrade",
+        "assert-upgrade-retired",
+        "record-retirement-receipt",
+        "load-retirement-receipt",
+    ]
+    assert receipts.receipt == _receipt(
+        retired_client_id=_spec().upgrade_client_id,
+    )
+    assert report["mode"] == "upgrade-v1-to-v2"
+    assert report["keycloak_mutated"] is True
+    assert report["receipt_profile"] == "bundled-keycloak-v2"
+    assert control.upgrade_available is False
+
+
+async def test_legacy_v1_receipt_without_upgrade_authority_fails_before_mutation():
+    from app.services.standalone_sso_bootstrap import (
+        STANDALONE_SSO_RECEIPT_PROFILE_V1,
+        StandaloneSSOBootstrapError,
+        bootstrap_standalone_sso,
+    )
+
+    control = _Control(manager_available=True, bootstrap_available=False)
+    receipts = _ReceiptStore(
+        control.events,
+        _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V1),
+    )
+
+    async def _should_not_run(**_kwargs):
+        raise AssertionError("legacy migration must not run without its authority")
+
+    with pytest.raises(StandaloneSSOBootstrapError) as captured:
+        await bootstrap_standalone_sso(
+            replace(
+                _spec(),
+                bootstrap_client_secret="",
+                product_admin_password="",
+                upgrade_client_secret="",
+            ),
+            control=control,
+            provision_admin=_should_not_run,
+            load_retirement_receipt=receipts.load,
+            record_retirement_receipt=receipts.record,
+        )
+
+    assert captured.value.code == "keycloak_upgrade_credential_required"
+    assert "upgrade-keycloak-v1-to-v2" not in control.events
+    assert "provision-akb-admin" not in control.events
 
 
 async def test_partial_bootstrap_uses_remaining_temp_admin_then_retires_it():
@@ -510,14 +646,45 @@ async def test_recorded_retirement_rejects_a_reactivated_bootstrap_client():
     assert "reconcile-keycloak" not in control.events
 
 
+async def test_current_receipt_rejects_a_reactivated_upgrade_client():
+    from app.services.standalone_sso_bootstrap import (
+        StandaloneSSOBootstrapError,
+        bootstrap_standalone_sso,
+    )
+
+    control = _Control(
+        manager_available=True,
+        bootstrap_available=False,
+        upgrade_available=True,
+    )
+    receipts = _ReceiptStore(control.events, _receipt())
+
+    async def _should_not_run(**_kwargs):
+        raise AssertionError("a reactivated upgrade client must stop convergence")
+
+    with pytest.raises(StandaloneSSOBootstrapError) as captured:
+        await bootstrap_standalone_sso(
+            replace(_spec(), upgrade_client_secret=_UPGRADE_SECRET),
+            control=control,
+            provision_admin=_should_not_run,
+            load_retirement_receipt=receipts.load,
+            record_retirement_receipt=receipts.record,
+        )
+
+    assert captured.value.code == "keycloak_upgrade_client_reactivated"
+    assert "readback-keycloak" not in control.events
+
+
 async def test_spec_repr_and_mapping_never_expose_secret_values():
-    spec = _spec()
+    spec = replace(_spec(), upgrade_client_secret=_UPGRADE_SECRET)
     rendered = repr(spec)
     # asdict is intentionally not used by production reporting; this assertion
     # documents why the state machine emits an explicit allowlisted report.
     assert asdict(spec)["bootstrap_client_secret"] == _BOOTSTRAP_SECRET
+    assert asdict(spec)["upgrade_client_secret"] == _UPGRADE_SECRET
     for secret in (
         _BOOTSTRAP_SECRET,
+        _UPGRADE_SECRET,
         _MANAGEMENT_SECRET,
         _ADMIN_CLIENT_SECRET,
         _PRODUCT_ADMIN_PASSWORD,

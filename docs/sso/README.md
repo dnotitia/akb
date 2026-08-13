@@ -4,8 +4,7 @@ AKB uses Keycloak as its SSO broker in `auth_mode: sso`. The broker is an
 identity boundary, not an AKB authorization database: AKB continues to own
 accounts, administrator status, Vault roles, PATs, and service credentials.
 
-The ordinary login page is mode-exclusive. Once the browser-session boundary
-is enabled:
+The ordinary login page is mode-exclusive:
 
 - `local` shows AKB login, registration, and local password recovery only;
 - `sso` shows only enabled upstream providers returned by the versioned public
@@ -57,10 +56,30 @@ Additional OSS providers should follow [Adding a provider](adding-a-provider.md)
 The registry is explicit and code-reviewed; AKB does not load arbitrary
 Keycloak JSON or runtime Python plugins.
 
-Ordinary browser-session custody, refresh, logout, and revocation are a
-separate boundary. An enabled provider is listed by name before that boundary
-is active, but its login URL remains unavailable until the server-side browser
-session capability is ready.
+Ordinary browser sessions are server-custodied. The browser receives an opaque
+HttpOnly AKB handle and a readable double-submit CSRF cookie; it never receives
+a Keycloak access, refresh, or ID token and SSO never mints an AKB user JWT.
+AKB encrypts refresh and ID tokens with an installation-owned AES-256-GCM key,
+keeps access tokens only in memory for the current request, and refreshes under
+a per-session database lock behind a bounded, connection-free admission gate.
+The ordinary `akb-web` client maps Keycloak's `identity_provider` user-session
+note into both token profiles. AKB requires that signed alias to equal the
+provider selected in its one-time state, then retains and rechecks the alias in
+the encrypted session envelope; `kc_idp_hint` alone is never an authorization
+boundary.
+An invalid refresh deletes the session; a
+transient Keycloak outage rolls back without converting it into a revocation.
+Production HTTPS uses `__Host-` cookie names with `Secure`, no `Domain`, and
+`Path=/`; loopback HTTP uses separate development-only names.
+
+The public provider catalog advertises a login URL only when the browser
+session encryption key and exact Keycloak client profile are ready. Enabled
+providers may still be listed with a null login URL during a staged rollout.
+Logout deletes the local handle first and then performs best-effort Keycloak
+revocation. Signed Keycloak back-channel logout revokes only sessions matching
+the exact broker issuer and `sid` (and `sub` when present), and writes a
+short-lived ordering fence so an already-started callback cannot recreate the
+logged-out session.
 
 Existing-account migration is an exact identity operation, not a normal
 first-login convenience. See the reference provider's
