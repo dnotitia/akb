@@ -601,6 +601,73 @@ async def test_fixture_control_exposes_reset_discovery_and_sanitized_logs():
         assert "/reset" in openapi.json()["paths"]
 
 
+@pytest.mark.asyncio
+async def test_control_plane_reset_discovery_serializes_success_installation_commands(tmp_path):
+    runtime = E2ERuntime(
+        RuntimeConfig(
+            checkout=REPO_ROOT,
+            runtime_root=tmp_path / "runtime",
+            mode="serve",
+            compose_file=COMPOSE_FILE,
+            compose_project="akb-e2e-control-plane-discovery-unit",
+            scenario="app-control-plane",
+        )
+    )
+    runtime._prepared = True
+    app_id = "11111111-1111-4111-8111-111111111111"
+    restore_vault_id = "22222222-2222-4222-8222-222222222222"
+    fresh_vault_id = "33333333-3333-4333-8333-333333333333"
+    restore_release_id = "44444444-4444-4444-8444-444444444444"
+    fresh_release_id = "55555555-5555-4555-8555-555555555555"
+
+    async def reset_scenario() -> None:
+        runtime._fixture_catalog = {
+            "status": "ready",
+            "scenario": "app-control-plane",
+        }
+        runtime._publish_installation_lifecycle_commands(
+            app_id=app_id,
+            restore_vault_id=restore_vault_id,
+            restore_release_id=restore_release_id,
+            fresh_vault_id=fresh_vault_id,
+            fresh_release_id=fresh_release_id,
+        )
+
+    runtime.reset_scenario = reset_scenario  # type: ignore[method-assign]
+    app = create_app(runtime)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://control-plane-fixture.test"
+    ) as client:
+        reset = await client.post("/reset", json={"scenario": "app-control-plane"})
+        assert reset.status_code == 200
+        discovery = await client.get("/discover")
+
+    commands = discovery.json()["commands"]
+    assert commands["restore_compatible"] == {
+        "app_id": app_id,
+        "vault_id": restore_vault_id,
+        "release_id": restore_release_id,
+        "capabilities": ["installation:read", "inventory:read"],
+        "mode": "restore",
+        "request": {
+            "service": "app",
+            "method": "PUT",
+            "path": f"/api/v1/apps/{app_id}/installations/{restore_vault_id}",
+            "body": {
+                "release_id": restore_release_id,
+                "capabilities": ["installation:read", "inventory:read"],
+                "mode": "restore",
+            },
+        },
+    }
+    assert commands["fresh_empty"]["mode"] == "fresh"
+    assert commands["fresh_empty"]["request"]["body"] == {
+        "release_id": fresh_release_id,
+        "capabilities": ["installation:read", "inventory:read"],
+        "mode": "fresh",
+    }
+
+
 class _LifecycleProcess:
     def __init__(self) -> None:
         self.release = asyncio.Event()
@@ -834,6 +901,50 @@ async def test_rollout_fault_control_applies_before_ack(tmp_path, monkeypatch):
         "target": "target-11",
         "kind": "missing_owned_table",
     }
+
+
+@pytest.mark.asyncio
+async def test_rollout_fault_disable_restores_fixture_before_ack(tmp_path, monkeypatch):
+    runtime = E2ERuntime(
+        RuntimeConfig(
+            checkout=REPO_ROOT,
+            runtime_root=tmp_path / "runtime",
+            mode="serve",
+            compose_file=COMPOSE_FILE,
+            compose_project="akb-e2e-rollout-control-recovery-unit",
+            scenario="app-release-rollout",
+        )
+    )
+    runtime._fixture_catalog = {
+        "status": "ready",
+        "scenario": "app-release-rollout",
+        "installations": [
+            {
+                "fixture_id": "target-00",
+                "id": "installation-0",
+                "vault_id": "vault-0",
+            }
+        ],
+    }
+    runtime._fixture_controls["fault"] = {
+        "target": "target-00",
+        "kind": "missing_owned_table",
+    }
+    restored: list[tuple[str, str]] = []
+
+    async def record_restore(fixture: dict[str, object], kind: str) -> bool:
+        restored.append((str(fixture["fixture_id"]), kind))
+        return True
+
+    monkeypatch.setattr(runtime, "_restore_fault", record_restore)
+    result = await runtime.fixture_control(
+        "fault_injection", "target-00", False, "missing_owned_table"
+    )
+
+    assert result["status"] == "accepted"
+    assert result["enabled"] is False
+    assert restored == [("target-00", "missing_owned_table")]
+    assert result["observed"]["fault_injection"] is None
 
 
 def test_compose_and_hosted_workflow_preserve_the_live_topology():

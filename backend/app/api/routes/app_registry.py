@@ -61,6 +61,12 @@ def _require_system_admin(
     response_model=AppDefinitionProjection,
     operation_id="appsCreate",
     summary="Create or replay a generic app definition",
+    description=(
+        "Natural-key idempotency is authoritative: app_key identifies the app. "
+        "An identical body replays the existing projection with replayed=true; "
+        "a different body for the same app_key returns 409. No Idempotency-Key "
+        "header is used for this registry operation."
+    ),
 )
 async def create_app(
     req: AppCreateRequest,
@@ -130,6 +136,13 @@ async def update_app(
     response_model=AppReleaseProjection,
     operation_id="appsCreateRelease",
     summary="Create or replay an immutable app release",
+    description=(
+        "Natural-key idempotency is authoritative: (app_id, version) identifies "
+        "the release. An identical manifest and checksum replay the existing "
+        "projection with replayed=true; different content for the same version "
+        "returns 409. No Idempotency-Key header is used for this registry "
+        "operation. The manifest must contain a steps array."
+    ),
 )
 async def create_release(
     app_id: uuid.UUID,
@@ -142,7 +155,7 @@ async def create_release(
     result = await create_app_release(
         app_id,
         version=req.version,
-        manifest=req.manifest,
+        manifest=req.manifest.model_dump(),
         manifest_checksum=req.manifest_checksum,
         user=user,
         correlation_id=request_correlation_id(request),

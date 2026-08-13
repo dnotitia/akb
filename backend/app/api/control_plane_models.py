@@ -46,9 +46,17 @@ class AppUpdateRequest(ControlPlaneRequest):
     metadata: JsonObject | None = None
 
 
+class ReleaseManifest(BaseModel):
+    """Published release manifest shape shared by registry and rollout APIs."""
+
+    model_config = ConfigDict(extra="allow")
+
+    steps: list[JsonObject]
+
+
 class ReleaseCreateRequest(ControlPlaneRequest):
     version: str = Field(min_length=1, max_length=256)
-    manifest: JsonObject
+    manifest: ReleaseManifest
     manifest_checksum: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$")
 
 
@@ -67,7 +75,7 @@ class AppReleaseProjection(ControlPlaneModel):
     id: uuid.UUID
     app_id: uuid.UUID
     version: str
-    manifest: JsonObject
+    manifest: ReleaseManifest
     manifest_checksum: str
     registered_at: datetime
     replayed: bool | None = None

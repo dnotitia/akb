@@ -75,3 +75,28 @@ def test_control_plane_fixture_matches_live_operation_contract():
     for schema_name, expected_schema in fixture["components"]["schemas"].items():
         assert live["components"]["schemas"].get(schema_name) == expected_schema
     assert fixture["components"].get("securitySchemes") == live["components"].get("securitySchemes")
+
+
+def test_registry_openapi_advertises_manifest_shape_and_natural_key_replay_contract():
+    schema = app.openapi()
+    manifest = schema["components"]["schemas"]["ReleaseManifest"]
+    assert manifest["required"] == ["steps"]
+    assert manifest["properties"]["steps"]["type"] == "array"
+
+    app_create = schema["paths"]["/api/v1/apps"]["post"]
+    release_create = schema["paths"]["/api/v1/apps/{app_id}/releases"]["post"]
+    assert not any(
+        parameter["name"] == "Idempotency-Key"
+        for parameter in app_create.get("parameters", [])
+    )
+    assert not any(
+        parameter["name"] == "Idempotency-Key"
+        for parameter in release_create.get("parameters", [])
+    )
+    assert "app_key" in app_create["description"]
+    assert "replayed" in app_create["description"]
+    assert "409" in app_create["description"]
+    assert "app_id" in release_create["description"]
+    assert "version" in release_create["description"]
+    assert "replayed" in release_create["description"]
+    assert "409" in release_create["description"]

@@ -24,9 +24,13 @@ export interface AppUpdateRequest {
   metadata?: ControlPlaneJsonObject | null;
 }
 
+export interface ReleaseManifest extends ControlPlaneJsonObject {
+  steps: ControlPlaneJsonObject[];
+}
+
 export interface ReleaseCreateRequest {
   version: string;
-  manifest: ControlPlaneJsonObject;
+  manifest: ReleaseManifest;
   manifest_checksum: string;
 }
 
@@ -45,7 +49,7 @@ export interface AppReleaseProjection {
   id: ControlPlaneUuid;
   app_id: ControlPlaneUuid;
   version: string;
-  manifest: ControlPlaneJsonObject;
+  manifest: ReleaseManifest;
   manifest_checksum: string;
   registered_at: ControlPlaneDateTime;
   replayed?: boolean | null;
