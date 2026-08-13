@@ -30,6 +30,7 @@ from app.services.sso_browser_session_crypto import (
     BrowserSessionKeyError,
     BrowserSessionPayloadError,
 )
+from app.sso.providers.keycloak_oidc import ProviderDefinitionError, validate_alias
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +170,14 @@ def _scope(claims: Mapping[str, object]) -> str:
     return " ".join(values)
 
 
+def _provider_alias(claims: Mapping[str, object]) -> str:
+    value = _required_claim(claims, "identity_provider", maximum=63)
+    try:
+        return validate_alias(value)
+    except ProviderDefinitionError:
+        raise AuthenticationError("Invalid SSO token response") from None
+
+
 def _authenticated_user(row, scope: str) -> AuthenticatedUser:
     return AuthenticatedUser(
         user_id=str(row["user_id"]),
@@ -204,12 +213,14 @@ async def create_sso_browser_session(
     issuer = _required_claim(principal.claims, "iss", maximum=2048)
     subject = _required_claim(principal.claims, "sub", maximum=1024)
     sid = _required_claim(principal.claims, "sid", maximum=255)
+    provider_alias = _provider_alias(principal.claims)
     if (
         (issuer, subject) != (principal.issuer, principal.subject)
         or issuer != settings.keycloak_issuer
         or id_claims.get("iss") != issuer
         or id_claims.get("sub") != subject
         or id_claims.get("sid") != sid
+        or _provider_alias(id_claims) != provider_alias
     ):
         raise AuthenticationError("Invalid SSO token response")
 
@@ -249,6 +260,7 @@ async def create_sso_browser_session(
             "refresh_token": refresh_token,
             "id_token": id_token,
             "scope": scope,
+            "provider_alias": provider_alias,
         },
         context=_session_context(session_id, user_id),
     )
@@ -573,12 +585,14 @@ async def _refresh_locked_session(
         issuer = _required_claim(principal.claims, "iss", maximum=2048)
         subject = _required_claim(principal.claims, "sub", maximum=1024)
         sid = _required_claim(principal.claims, "sid", maximum=255)
+        provider_alias = _provider_alias(principal.claims)
         if (
             principal.profile_id != KEYCLOAK_ACCESS_V1
             or (issuer, subject) != (principal.issuer, principal.subject)
             or issuer != row["identity_issuer"]
             or subject != row["identity_subject"]
             or sid != row["keycloak_sid"]
+            or provider_alias != custody["provider_alias"]
         ):
             raise AuthenticationError("SSO browser session refresh failed")
 
@@ -592,6 +606,7 @@ async def _refresh_locked_session(
                 or id_claims.get("sub") != subject
                 or id_claims.get("sid") != sid
                 or id_claims.get("azp") != settings.keycloak_client_id
+                or _provider_alias(id_claims) != custody["provider_alias"]
             ):
                 raise AuthenticationError("SSO browser session refresh failed")
         else:
@@ -625,6 +640,7 @@ async def _refresh_locked_session(
             "refresh_token": refresh_token,
             "id_token": id_token,
             "scope": scope,
+            "provider_alias": custody["provider_alias"],
         },
         context=context,
     )
@@ -676,6 +692,7 @@ async def _preserve_rotated_refresh_after_verification_outage(
             "refresh_token": candidate_refresh_token,
             "id_token": custody["id_token"],
             "scope": custody["scope"],
+            "provider_alias": custody["provider_alias"],
         },
         context=context,
     )

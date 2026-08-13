@@ -1,6 +1,7 @@
 """REST auth routes: mode-gated humans plus mode-independent PAT management."""
 
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from urllib.parse import quote, urlsplit
 
@@ -353,10 +354,7 @@ async def _require_enabled_provider(alias: str) -> str:
             "SSO provider catalog is unavailable",
         )
     try:
-        catalog = await control.list_providers(
-            force_refresh=True,
-            allow_stale=False,
-        )
+        catalog = await control.list_providers(allow_stale=False)
     except ProviderControlError as exc:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -368,6 +366,21 @@ async def _require_enabled_provider(alias: str) -> str:
             "SSO provider is not enabled",
         )
     return alias
+
+
+def _require_signed_provider(
+    claims: Mapping[str, object],
+    expected_alias: str,
+) -> None:
+    value = claims.get("identity_provider")
+    if not isinstance(value, str):
+        raise AuthenticationError("SSO sign-in failed")
+    try:
+        value = validate_alias(value)
+    except ProviderDefinitionError:
+        raise AuthenticationError("SSO sign-in failed") from None
+    if value != expected_alias:
+        raise AuthenticationError("SSO sign-in failed")
 
 
 @router.get(
@@ -459,11 +472,14 @@ async def keycloak_callback(
     )
     if principal is None:
         raise AuthenticationError("SSO sign-in failed")
+    _require_signed_provider(principal.claims, provider_alias)
     id_claims = await oidc.verify_browser_id_token(
         id_token,
         expected_nonce=nonce,
         access_token=access_token,
+        expected_provider_alias=provider_alias,
     )
+    _require_signed_provider(id_claims, provider_alias)
     user = await project_verified_principal(principal)
     if user is None:
         raise AuthenticationError("SSO sign-in failed")

@@ -12,6 +12,7 @@ import base64
 import binascii
 import json
 import os
+import re
 from collections.abc import Mapping
 
 from cryptography.exceptions import InvalidTag
@@ -25,6 +26,7 @@ _MAX_REFRESH_TOKEN_LENGTH = 16_384
 _MAX_ID_TOKEN_LENGTH = 16_384
 _MAX_SCOPE_LENGTH = 2_048
 _MAX_CONTEXT_LENGTH = 256
+_PROVIDER_ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 
 
 class BrowserSessionKeyError(ValueError):
@@ -68,11 +70,13 @@ def _payload_bytes(payload: object) -> bytes:
         "refresh_token",
         "id_token",
         "scope",
+        "provider_alias",
     }:
         raise BrowserSessionPayloadError("Invalid browser-session payload")
     refresh_token = payload.get("refresh_token")
     id_token = payload.get("id_token")
     scope = payload.get("scope")
+    provider_alias = payload.get("provider_alias")
     if (
         not isinstance(refresh_token, str)
         or not 1 <= len(refresh_token) <= _MAX_REFRESH_TOKEN_LENGTH
@@ -80,6 +84,8 @@ def _payload_bytes(payload: object) -> bytes:
         or not 1 <= len(id_token) <= _MAX_ID_TOKEN_LENGTH
         or not isinstance(scope, str)
         or not 1 <= len(scope) <= _MAX_SCOPE_LENGTH
+        or not isinstance(provider_alias, str)
+        or _PROVIDER_ALIAS_RE.fullmatch(provider_alias) is None
     ):
         raise BrowserSessionPayloadError("Invalid browser-session payload")
     return json.dumps(
@@ -87,6 +93,7 @@ def _payload_bytes(payload: object) -> bytes:
             "refresh_token": refresh_token,
             "id_token": id_token,
             "scope": scope,
+            "provider_alias": provider_alias,
         },
         ensure_ascii=False,
         separators=(",", ":"),

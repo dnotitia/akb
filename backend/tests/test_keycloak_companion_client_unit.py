@@ -145,6 +145,7 @@ async def test_browser_id_token_binds_nonce_access_token_and_client(monkeypatch)
             "sub": "user-1",
             "azp": "akb-web",
             "sid": "session-1",
+            "identity_provider": "workforce",
             "nonce": nonce,
             "at_hash": at_hash,
             "iat": 100,
@@ -158,6 +159,7 @@ async def test_browser_id_token_binds_nonce_access_token_and_client(monkeypatch)
         "signed-id-token",
         expected_nonce=nonce,
         access_token=access_token,
+        expected_provider_alias="workforce",
     )
 
     assert claims["sid"] == "session-1"
@@ -167,4 +169,13 @@ async def test_browser_id_token_binds_nonce_access_token_and_client(monkeypatch)
             "signed-id-token",
             expected_nonce="different",
             access_token=access_token,
+            expected_provider_alias="workforce",
+        )
+
+    with pytest.raises(AuthenticationError, match="Invalid browser identity token"):
+        await service.verify_browser_id_token(
+            "signed-id-token",
+            expected_nonce=nonce,
+            access_token=access_token,
+            expected_provider_alias="another-provider",
         )

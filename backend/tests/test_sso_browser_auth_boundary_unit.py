@@ -112,7 +112,7 @@ async def test_enabled_provider_login_sets_only_a_bound_transient_cookie(monkeyp
     assert "Secure" in cookies[0]
     assert "Path=/" in cookies[0]
     assert "Domain=" not in cookies[0]
-    assert control.calls == [{"force_refresh": True, "allow_stale": False}]
+    assert control.calls == [{"allow_stale": False}]
 
 
 @pytest.mark.asyncio
@@ -170,6 +170,7 @@ async def test_callback_projects_access_token_but_returns_only_opaque_cookies(
             "iss": "https://id.example/realms/akb",
             "sub": "subject-1",
             "sid": "sid-1",
+            "identity_provider": "workforce",
             "scope": "openid profile",
             "iat": 1,
             "exp": 2,
@@ -218,16 +219,25 @@ async def test_callback_projects_access_token_but_returns_only_opaque_cookies(
             )
             return principal
 
-        async def verify_browser_id_token(self, token, *, expected_nonce, access_token):
-            assert (token, expected_nonce, access_token) == (
+        async def verify_browser_id_token(
+            self,
+            token,
+            *,
+            expected_nonce,
+            access_token,
+            expected_provider_alias,
+        ):
+            assert (token, expected_nonce, access_token, expected_provider_alias) == (
                 "keycloak-id-secret",
                 "nonce-value-that-is-long-enough",
                 "keycloak-access-secret",
+                "workforce",
             )
             return {
                 "iss": principal.issuer,
                 "sub": principal.subject,
                 "sid": "sid-1",
+                "identity_provider": "workforce",
             }
 
     captured: dict[str, object] = {}
@@ -275,6 +285,19 @@ async def test_callback_projects_access_token_but_returns_only_opaque_cookies(
     assert "keycloak-refresh-secret" not in wire
     assert "keycloak-id-secret" not in wire
     assert captured["tokens"] is token_response
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [
+        {},
+        {"identity_provider": "another-provider"},
+        {"identity_provider": "Workforce"},
+    ],
+)
+def test_signed_provider_claim_must_match_selected_alias(claims):
+    with pytest.raises(AuthenticationError, match="sign-in failed"):
+        auth._require_signed_provider(claims, "workforce")  # noqa: SLF001
 
 
 @pytest.mark.asyncio

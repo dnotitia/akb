@@ -23,6 +23,7 @@ def test_v1_cipher_round_trips_without_putting_plaintext_in_the_envelope():
         "refresh_token": "keycloak-refresh-secret",
         "id_token": "keycloak-id-token",
         "scope": "openid profile email",
+        "provider_alias": "workforce",
     }
 
     envelope = cipher.seal(payload, context="session:session-1:user-1")
@@ -57,6 +58,7 @@ def test_cipher_binds_ciphertext_to_its_exact_session_context():
             "refresh_token": "refresh-1",
             "id_token": "id-token-1",
             "scope": "openid",
+            "provider_alias": "workforce",
         },
         context="session:one:user-1",
     )
@@ -73,6 +75,7 @@ def test_cipher_rejects_wrong_key_tampering_and_noncanonical_payloads_without_ec
             "refresh_token": "never-echo-this",
             "id_token": "never-echo-id-token",
             "scope": "openid",
+            "provider_alias": "workforce",
         },
         context="session:one:user-1",
     )
@@ -92,10 +95,18 @@ def test_cipher_rejects_wrong_key_tampering_and_noncanonical_payloads_without_ec
         {"refresh_token": 42},
         {"refresh_token": "refresh", "id_token": "id", "scope": []},
         {"refresh_token": "refresh", "id_token": "", "scope": "openid"},
+        {"refresh_token": "refresh", "id_token": "id", "scope": "openid"},
         {
             "refresh_token": "refresh",
             "id_token": "id",
             "scope": "openid",
+            "provider_alias": "Workforce",
+        },
+        {
+            "refresh_token": "refresh",
+            "id_token": "id",
+            "scope": "openid",
+            "provider_alias": "workforce",
             "extra": True,
         },
     ],

@@ -546,3 +546,30 @@ async def test_client_profiles_separate_user_admin_and_management_authorities():
     assert management["serviceAccountsEnabled"] is True
     assert management["defaultClientScopes"] == ["service_account"]
     assert management["redirectUris"] == []
+
+
+async def test_api_client_maps_signed_broker_provenance_into_both_token_profiles():
+    mapper = KeycloakStandaloneSSOControl._api_identity_provider_mapper()  # noqa: SLF001
+
+    assert mapper == {
+        "name": "akb-browser-identity-provider",
+        "protocol": "openid-connect",
+        "protocolMapper": "oidc-usersessionmodel-note-mapper",
+        "consentRequired": False,
+        "config": {
+            "user.session.note": "identity_provider",
+            "claim.name": "identity_provider",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "lightweight.claim": "false",
+            "userinfo.token.claim": "false",
+            "introspection.token.claim": "true",
+            "access.tokenResponse.claim": "false",
+        },
+    }
+
+    changed = dict(mapper)
+    changed["config"] = dict(mapper["config"], **{"access.token.claim": "false"})
+    assert KeycloakStandaloneSSOControl._mapper_matches(mapper, mapper) is True  # noqa: SLF001
+    assert KeycloakStandaloneSSOControl._mapper_matches(changed, mapper) is False  # noqa: SLF001

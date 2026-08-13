@@ -62,6 +62,11 @@ a Keycloak access, refresh, or ID token and SSO never mints an AKB user JWT.
 AKB encrypts refresh and ID tokens with an installation-owned AES-256-GCM key,
 keeps access tokens only in memory for the current request, and refreshes under
 a per-session database lock behind a bounded, connection-free admission gate.
+The ordinary `akb-web` client maps Keycloak's `identity_provider` user-session
+note into both token profiles. AKB requires that signed alias to equal the
+provider selected in its one-time state, then retains and rechecks the alias in
+the encrypted session envelope; `kc_idp_hint` alone is never an authorization
+boundary.
 An invalid refresh deletes the session; a
 transient Keycloak outage rolls back without converting it into a revocation.
 Production HTTPS uses `__Host-` cookie names with `Secure`, no `Domain`, and

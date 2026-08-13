@@ -361,7 +361,10 @@ Ordinary SSO login uses the separate `akb-web` client. The browser receives
 only an opaque HttpOnly AKB session plus a readable CSRF value; SSO does not
 mint an AKB user JWT. AKB encrypts the Keycloak refresh/ID token set with the
 independent `sso_browser_session_encryption_key` and never persists an access
-token. Production HTTPS cookies use the browser-enforced `__Host-` prefix,
+token. The client must map Keycloak's `identity_provider` user-session note
+into both ID and access tokens with `oidc-usersessionmodel-note-mapper`; AKB
+binds that signed broker alias to the selected enabled provider on callback
+and every refresh. Production HTTPS cookies use the browser-enforced `__Host-` prefix,
 `Secure`, no `Domain`, and `Path=/`; loopback HTTP uses isolated development
 names. Generate the key as 32 random bytes encoded with unpadded base64url and
 keep it stable across restarts. See the [Keycloak boundary](./docs/designs/keycloak-oidc/00-overview.md)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -677,9 +678,12 @@ async def test_keycloak_access_v1_unknown_kid_refreshes_same_pinned_jwks_once(
 
     original_fetch = service._fetch_jwks
 
-    async def fetch(*, force: bool = False):
+    async def fetch(*, force: bool = False, observed_jwks=None):
         calls.append(force)
-        return await original_fetch(force=force)
+        return await original_fetch(
+            force=force,
+            observed_jwks=observed_jwks,
+        )
 
     service._fetch_jwks = fetch  # type: ignore[method-assign]
     service._client = lambda: Client()  # type: ignore[method-assign]
@@ -765,6 +769,55 @@ async def test_keycloak_access_v1_unknown_kid_refresh_is_single_flight_and_bound
 
     assert results == [None] * len(tokens)
     assert requested_urls == [settings.keycloak_jwks_uri]
+
+
+@pytest.mark.asyncio
+async def test_keycloak_access_v1_unknown_kid_during_refresh_cooldown_is_transient(
+    monkeypatch,
+    rsa_keypair,
+):
+    from app.exceptions import AKBError
+    from app.services.keycloak_oidc import KeycloakOIDC
+
+    issuer, api_audience, _ = _configure_keycloak(monkeypatch)
+    service = KeycloakOIDC()
+    service._jwks = {"keys": []}
+    service._jwks_refresh_attempt_at = time.monotonic()
+    token = _mint_keycloak_token(
+        rsa_keypair,
+        issuer=issuer,
+        audience=api_audience,
+        header_overrides={"kid": "newly-rotated-key"},
+    )
+
+    with pytest.raises(AKBError) as captured:
+        await service.verify_access_token(token, api_audience, route_profile="api")
+
+    assert captured.value.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_keycloak_access_v1_rejects_wrong_issuer_before_jwks_rotation(
+    monkeypatch,
+    rsa_keypair,
+):
+    from app.services.keycloak_oidc import KeycloakOIDC
+
+    _, api_audience, _ = _configure_keycloak(monkeypatch)
+    service = KeycloakOIDC()
+
+    async def forbidden_fetch(**_kwargs):
+        raise AssertionError("a mismatched issuer must not enter the pinned JWKS path")
+
+    service._fetch_jwks = forbidden_fetch  # type: ignore[method-assign]
+    token = _mint_keycloak_token(
+        rsa_keypair,
+        issuer="https://upstream.example/realms/workforce",
+        audience=api_audience,
+        header_overrides={"kid": "upstream-key"},
+    )
+
+    assert await service.verify_access_token(token, api_audience, route_profile="api") is None
 
 
 @pytest.mark.asyncio

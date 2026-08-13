@@ -38,6 +38,7 @@ from app.services.auth_verifier_profiles import (
     KeycloakRouteProfile,
     VerifiedPrincipal,
 )
+from app.sso.providers.keycloak_oidc import ProviderDefinitionError, validate_alias
 
 logger = logging.getLogger("akb.keycloak")
 
@@ -471,10 +472,25 @@ class KeycloakOIDC:
         return payload
 
     # ── ID-token verification for separated admin and ordinary clients ──
-    async def _fetch_jwks(self, *, force: bool = False) -> dict[str, Any]:
+    async def _fetch_jwks(
+        self,
+        *,
+        force: bool = False,
+        observed_jwks: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if self._jwks is not None and not force:
             return self._jwks
         async with self._jwks_refresh_lock:
+            # Another request refreshed after this caller missed against its
+            # observed cache. Reuse that one result rather than issuing a
+            # duplicate request or misclassifying the cooldown as an outage.
+            if force and observed_jwks is not None and self._jwks is not observed_jwks:
+                if self._jwks is None:
+                    raise AKBError(
+                        "Keycloak public keys are temporarily unavailable",
+                        status_code=502,
+                    )
+                return self._jwks
             if self._jwks is not None and not force:
                 return self._jwks
 
@@ -483,7 +499,7 @@ class KeycloakOIDC:
                 self._jwks_refresh_attempt_at is not None
                 and now - self._jwks_refresh_attempt_at < _JWKS_REFRESH_COOLDOWN_SECONDS
             ):
-                if self._jwks is not None:
+                if self._jwks is not None and not force:
                     return self._jwks
                 raise AKBError(
                     "Keycloak public keys are temporarily unavailable",
@@ -520,6 +536,48 @@ class KeycloakOIDC:
             None,
         )
 
+    @staticmethod
+    def _has_pinned_unverified_issuer(token: str) -> bool:
+        """Reject an obvious issuer mismatch before touching pinned JWKS.
+
+        This untrusted claim can only reject. It never selects an issuer,
+        algorithm, key source, or acceptance path; a matching value still
+        requires the complete pinned signature/profile verification below.
+        """
+        try:
+            claims = jwt.decode(
+                token,
+                options={
+                    "verify_signature": False,
+                    "verify_exp": False,
+                    "verify_aud": False,
+                },
+            )
+        except (jwt.PyJWTError, TypeError, ValueError):
+            return False
+        return isinstance(claims, dict) and claims.get("iss") == settings.keycloak_issuer
+
+    async def _resolve_signing_key(self, kid: str) -> dict | None:
+        """Resolve one kid with one bounded rotation refresh.
+
+        A miss against a cache whose refresh is currently cooldown-blocked is
+        an availability condition, not proof of an invalid signature. A
+        refresh completed after this request observed the old cache may be
+        reused by every waiter.
+        """
+        observed_before_fetch = self._jwks
+        jwks = await self._fetch_jwks()
+        key = self._find_key(jwks, kid)
+        if key is not None or observed_before_fetch is None:
+            return key
+        if jwks is not observed_before_fetch:
+            return None
+        refreshed = await self._fetch_jwks(
+            force=True,
+            observed_jwks=observed_before_fetch,
+        )
+        return self._find_key(refreshed, kid)
+
     async def verify_id_token(self, id_token: str, *, client_id: str | None = None) -> dict[str, Any]:
         """Verify a Keycloak ID token locally and return its claims.
 
@@ -527,6 +585,8 @@ class KeycloakOIDC:
         and expiry. Refetches JWKS once if the token's ``kid`` is unknown
         (key rotation) before giving up.
         """
+        if not isinstance(id_token, str) or not 1 <= len(id_token) <= 16_384:
+            raise AuthenticationError("Malformed ID token")
         selected_client_id = self._effective_client_id(client_id)
         try:
             header = jwt.get_unverified_header(id_token)
@@ -541,13 +601,10 @@ class KeycloakOIDC:
         kid = header.get("kid")
         if not isinstance(kid, str) or not kid:
             raise AuthenticationError("ID token missing kid header")
+        if not self._has_pinned_unverified_issuer(id_token):
+            raise AuthenticationError("Invalid ID token issuer")
 
-        jwks = await self._fetch_jwks()
-        key = self._find_key(jwks, kid)
-        if key is None:
-            # Unknown kid — Keycloak likely rotated keys. Refetch once.
-            jwks = await self._fetch_jwks(force=True)
-            key = self._find_key(jwks, kid)
+        key = await self._resolve_signing_key(kid)
         if key is None:
             raise AuthenticationError("No matching Keycloak public key for token")
         if key.get("kty") != "RSA" or key.get("use") != "sig" or key.get("alg") != "RS256":
@@ -621,6 +678,7 @@ class KeycloakOIDC:
         *,
         expected_nonce: str,
         access_token: str,
+        expected_provider_alias: str,
     ) -> dict[str, Any]:
         """Verify the ordinary browser ID token and bind it to this exchange."""
         claims = await self.verify_id_token(
@@ -634,6 +692,7 @@ class KeycloakOIDC:
             "sid": 255,
             "nonce": 512,
             "at_hash": 512,
+            "identity_provider": 63,
         }
         if any(
             not isinstance(claims.get(name), str) or not claims[name].strip() or len(claims[name]) > limit
@@ -643,6 +702,13 @@ class KeycloakOIDC:
         if claims["iss"] != settings.keycloak_issuer:
             raise AuthenticationError("Invalid browser identity token")
         if claims["azp"] != settings.keycloak_client_id:
+            raise AuthenticationError("Invalid browser identity token")
+        try:
+            actual_provider_alias = validate_alias(claims["identity_provider"])
+            selected_provider_alias = validate_alias(expected_provider_alias)
+        except (ProviderDefinitionError, TypeError):
+            raise AuthenticationError("Invalid browser identity token") from None
+        if actual_provider_alias != selected_provider_alias:
             raise AuthenticationError("Invalid browser identity token")
         if (
             not isinstance(expected_nonce, str)
@@ -690,15 +756,13 @@ class KeycloakOIDC:
         kid = header.get("kid")
         if not isinstance(kid, str) or not kid:
             raise AuthenticationError("Invalid back-channel logout token")
+        if not self._has_pinned_unverified_issuer(logout_token):
+            raise AuthenticationError("Invalid back-channel logout token")
 
         # Preserve availability as a 5xx so Keycloak can retry delivery. A
         # pinned-JWKS outage is not evidence that the signed logout token is
         # invalid and must not be flattened into the route's bounded 400.
-        jwks = await self._fetch_jwks()
-        key = self._find_key(jwks, kid)
-        if key is None:
-            jwks = await self._fetch_jwks(force=True)
-            key = self._find_key(jwks, kid)
+        key = await self._resolve_signing_key(kid)
         if key is None or key.get("kty") != "RSA" or key.get("use") != "sig" or key.get("alg") != "RS256":
             raise AuthenticationError("Invalid back-channel logout token")
         try:
@@ -769,6 +833,8 @@ class KeycloakOIDC:
         headers may only confirm this fixed RS256/JWKS profile; they never
         select an algorithm, issuer, key source, or fallback verifier.
         """
+        if not isinstance(token, str) or not 1 <= len(token) <= 16_384:
+            return None
         try:
             header = jwt.get_unverified_header(token)
         except jwt.InvalidTokenError as e:
@@ -784,16 +850,14 @@ class KeycloakOIDC:
         kid = header.get("kid")
         if not isinstance(kid, str) or not kid:
             return None
+        if not self._has_pinned_unverified_issuer(token):
+            return None
 
         # Availability failure is not an invalid credential. Propagate the
         # bounded 502-class AKBError so browser refresh rolls its transaction
         # back instead of deleting a still-valid local session as if the token
         # had failed cryptographic verification.
-        jwks = await self._fetch_jwks()
-        key = self._find_key(jwks, kid)
-        if key is None:
-            jwks = await self._fetch_jwks(force=True)
-            key = self._find_key(jwks, kid)
+        key = await self._resolve_signing_key(kid)
         if key is None:
             return None
         if key.get("kty") != "RSA" or key.get("use") != "sig" or key.get("alg") != "RS256":

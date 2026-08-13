@@ -29,6 +29,7 @@ _KEY_PROVIDER_TYPE = "org.keycloak.keys.KeyProvider"
 _ACTIVE_KEY_PROVIDER_NAME = "akb-rs256-3072-active"
 _NATIVE_AMR_CONFIG_ALIAS = "akb-native-password-amr"
 _API_AUDIENCE_MAPPER_NAME = "akb-api-audience"
+_API_IDENTITY_PROVIDER_MAPPER_NAME = "akb-browser-identity-provider"
 _ADMIN_AMR_MAPPER_NAME = "akb-admin-native-amr"
 _CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,255}$")
 
@@ -478,6 +479,43 @@ class KeycloakStandaloneSSOControl:
             code="keycloak_mapper_read_failed",
         )
         return _objects(value, "keycloak_mapper_read_failed")
+
+    @staticmethod
+    def _api_identity_provider_mapper() -> dict[str, Any]:
+        """Project signed broker provenance from Keycloak's user session."""
+        return {
+            "name": _API_IDENTITY_PROVIDER_MAPPER_NAME,
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-usersessionmodel-note-mapper",
+            "consentRequired": False,
+            "config": {
+                "user.session.note": "identity_provider",
+                "claim.name": "identity_provider",
+                "jsonType.label": "String",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "lightweight.claim": "false",
+                "userinfo.token.claim": "false",
+                "introspection.token.claim": "true",
+                "access.tokenResponse.claim": "false",
+            },
+        }
+
+    @staticmethod
+    def _mapper_matches(
+        actual: Mapping[str, object],
+        expected: Mapping[str, object],
+    ) -> bool:
+        if any(
+            actual.get(field) != expected.get(field)
+            for field in ("name", "protocol", "protocolMapper", "consentRequired")
+        ):
+            return False
+        actual_config = actual.get("config")
+        expected_config = expected.get("config")
+        if not isinstance(actual_config, dict) or not isinstance(expected_config, dict):
+            return False
+        return all(actual_config.get(key) == value for key, value in expected_config.items())
 
     async def _reconcile_mapper(
         self,
@@ -1193,6 +1231,12 @@ class KeycloakStandaloneSSOControl:
         )
         await self._reconcile_mapper(
             spec,
+            api_uuid,
+            self._api_identity_provider_mapper(),
+            token=bootstrap_token,
+        )
+        await self._reconcile_mapper(
+            spec,
             admin_uuid,
             {
                 "name": _ADMIN_AMR_MAPPER_NAME,
@@ -1255,8 +1299,13 @@ class KeycloakStandaloneSSOControl:
             "keycloak_client_readback_failed",
         )
 
+        api_mappers = await self._protocol_mappers(
+            spec,
+            api_uuid,
+            token=management_token,
+        )
         api_mapper = _exact(
-            await self._protocol_mappers(spec, api_uuid, token=management_token),
+            api_mappers,
             "name",
             _API_AUDIENCE_MAPPER_NAME,
             "keycloak_mapper_duplicate",
@@ -1270,6 +1319,17 @@ class KeycloakStandaloneSSOControl:
             or api_mapper["config"].get("access.token.claim") != "true"
         ):
             raise _fail("keycloak_api_audience_readback_failed")
+        identity_provider_mapper = _exact(
+            api_mappers,
+            "name",
+            _API_IDENTITY_PROVIDER_MAPPER_NAME,
+            "keycloak_mapper_duplicate",
+        )
+        if identity_provider_mapper is None or not self._mapper_matches(
+            identity_provider_mapper,
+            self._api_identity_provider_mapper(),
+        ):
+            raise _fail("keycloak_api_identity_provider_mapper_readback_failed")
         admin_mapper = _exact(
             await self._protocol_mappers(spec, admin_uuid, token=management_token),
             "name",

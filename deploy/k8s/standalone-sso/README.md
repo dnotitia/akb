@@ -11,8 +11,9 @@ The bundle implements the product-administrator bootstrap and recovery slice:
    start.
 2. The AKB bootstrap init container creates and reads back the `akb` realm,
    separate `akb-web`, `akb-admin`, and `akb-sso-manager` clients, the
-   RSA-3072 active signing key, the native product administrator, and the exact
-   AKB administrator projection.
+   RSA-3072 active signing key, the signed broker-provenance mapper on
+   `akb-web`, the native product administrator, and the exact AKB administrator
+   projection.
 3. It proves the permanent management credential, deletes the temporary
    bootstrap client, verifies that credential is rejected, and records a
    non-secret retirement receipt in the AKB database.
@@ -23,6 +24,9 @@ The bundle implements the product-administrator bootstrap and recovery slice:
 Ordinary-user browser SSO uses server-side token custody: the browser receives
 an opaque HttpOnly handle and readable double-submit CSRF value, while AKB
 encrypts the Keycloak refresh/ID token set and never persists an access token.
+The bootstrap maps the `identity_provider` user-session note into both ordinary
+token profiles so AKB can bind each callback and refresh to the exact enabled
+broker alias rather than trusting `kc_idp_hint`.
 It becomes ready only after the browser-session encryption key is supplied and
 an upstream provider is enabled. `/admin` uses the dedicated confidential
 client and requires a fresh native Keycloak password ceremony; a brokered

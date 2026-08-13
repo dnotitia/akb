@@ -651,6 +651,14 @@ async def main() -> None:
         raise _fail("fixture_broker_token_profile_verification_failed")
     if principal.subject != broker_subject:
         raise _fail("fixture_broker_token_subject_not_prelinked_user")
+    if principal.claims.get("identity_provider") != "workforce":
+        raise _fail("fixture_broker_token_provider_not_signed")
+    broker_id_claims = await keycloak_oidc.get_keycloak_oidc().verify_id_token(
+        broker_tokens["id_token"],
+        client_id="fixture-browser",
+    )
+    if broker_id_claims.get("identity_provider") != "workforce":
+        raise _fail("fixture_broker_id_token_provider_not_signed")
     broker_user = await auth_service.project_verified_principal(principal)
     if broker_user is None or broker_user.user_id != str(state["user_id"]):
         raise _fail("fixture_broker_token_projection_failed")

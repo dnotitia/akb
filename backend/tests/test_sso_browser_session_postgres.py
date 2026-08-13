@@ -136,6 +136,7 @@ def _principal(
         "iss": "https://id.example/realms/akb",
         "sub": "subject-1",
         "sid": "keycloak-session-1",
+        "identity_provider": "workforce",
         "scope": scope,
         "iat": now,
         "exp": now + expiry_seconds,
@@ -247,6 +248,7 @@ async def test_opaque_session_is_exact_bound_csrf_safe_and_locally_revocable(
                 "iss": principal.issuer,
                 "sub": principal.subject,
                 "sid": principal.claims["sid"],
+                "identity_provider": "workforce",
             },
             _tokens(),
         )
@@ -315,6 +317,7 @@ async def test_rotation_is_serialized_and_persists_only_new_ciphertext(monkeypat
                 "iss": initial.issuer,
                 "sub": initial.subject,
                 "sid": initial.claims["sid"],
+                "identity_provider": "workforce",
             },
             _tokens(),
         )
@@ -349,6 +352,7 @@ async def test_rotation_is_serialized_and_persists_only_new_ciphertext(monkeypat
                     "sub": refreshed.subject,
                     "sid": refreshed.claims["sid"],
                     "azp": "akb-web",
+                    "identity_provider": "workforce",
                 }
 
         oidc = FakeOIDC()
@@ -375,6 +379,7 @@ async def test_rotation_is_serialized_and_persists_only_new_ciphertext(monkeypat
             "refresh_token": "refresh-token-two",
             "id_token": "id-token-two",
             "scope": "openid profile",
+            "provider_alias": "workforce",
         }
 
 
@@ -397,6 +402,7 @@ async def test_refresh_denial_deletes_but_upstream_outage_preserves_session(
                     "iss": principal.issuer,
                     "sub": principal.subject,
                     "sid": principal.claims["sid"],
+                    "identity_provider": "workforce",
                 },
                 _tokens(),
             )
@@ -470,6 +476,7 @@ async def test_identity_state_and_verified_backchannel_selector_revoke_immediate
                     "iss": value.issuer,
                     "sub": value.subject,
                     "sid": value.claims["sid"],
+                    "identity_provider": "workforce",
                 },
                 _tokens(),
             )
