@@ -130,6 +130,46 @@ async def test_ensure_external_identity_forwards_verified_actor(monkeypatch):
     }
 
 
+async def test_ensure_service_user_is_admin_only_and_forwards_requested_role(monkeypatch):
+    from app.api.routes import access
+
+    observed = {}
+
+    async def _ensure(**kwargs):
+        observed.update(kwargs)
+        return {"user_id": "runtime-user", "is_admin": kwargs["is_admin"]}
+
+    monkeypatch.setattr(access, "ensure_service_user", _ensure)
+    default_request = access.EnsureServiceUserRequest(
+        username="runtime-agent",
+        email="runtime-agent@service.akb.invalid",
+    )
+    assert default_request.is_admin is False
+
+    with pytest.raises(HTTPException) as exc_info:
+        await access.admin_ensure_service_user(default_request, _user(admin=False))
+    assert exc_info.value.status_code == 403
+    assert observed == {}
+
+    admin = _user(admin=True)
+    request = access.EnsureServiceUserRequest(
+        username="runtime-agent",
+        email="runtime-agent@service.akb.invalid",
+        display_name="Runtime agent",
+        is_admin=True,
+    )
+    result = await access.admin_ensure_service_user(request, admin)
+
+    assert result == {"user_id": "runtime-user", "is_admin": True}
+    assert observed == {
+        "username": request.username,
+        "email": request.email,
+        "display_name": request.display_name,
+        "is_admin": True,
+        "actor_id": admin.user_id,
+    }
+
+
 async def test_exact_human_email_lookup_is_admin_only(monkeypatch):
     from app.api.routes import access
 
@@ -358,3 +398,8 @@ async def test_governance_routes_are_explicit_in_openapi(monkeypatch, tmp_path):
     assert "is_recovery_admin" in adoption_schema["required"]
     assert adoption_schema["properties"]["is_recovery_admin"]["const"] is False
     assert "default" not in adoption_schema["properties"]["is_recovery_admin"]
+
+    ensure_schema = app.openapi()["components"]["schemas"]["EnsureServiceUserRequest"]
+    assert "is_admin" not in ensure_schema["required"]
+    assert ensure_schema["properties"]["is_admin"]["type"] == "boolean"
+    assert ensure_schema["properties"]["is_admin"]["default"] is False

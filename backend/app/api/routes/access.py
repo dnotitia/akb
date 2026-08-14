@@ -119,6 +119,7 @@ class EnsureServiceUserRequest(NFCModel):
     username: str
     email: str
     display_name: str | None = None
+    is_admin: bool = False
 
 
 class AdoptCurrentServiceUserRequest(NFCModel):
@@ -455,6 +456,7 @@ async def admin_ensure_service_user(
         username=req.username,
         email=req.email,
         display_name=req.display_name,
+        is_admin=req.is_admin,
         actor_id=user.user_id,
     )
 

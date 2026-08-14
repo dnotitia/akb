@@ -264,6 +264,7 @@ async def ensure_service_user(
     email: str,
     display_name: str | None,
     actor_id: str,
+    is_admin: bool = False,
 ) -> dict:
     username = _required(username, "username")
     email = _required(email, "email").lower()
@@ -279,10 +280,15 @@ async def ensure_service_user(
                 )
                 rows = await conn.fetch(
                     """
-                    SELECT id, username, email, account_kind
-                      FROM users
-                     WHERE username = $1 OR email = $2
-                     FOR UPDATE
+                    SELECT u.id, u.username, u.email, u.account_kind,
+                           u.auth_provider, u.account_status,
+                           EXISTS (
+                               SELECT 1 FROM external_identities e
+                                WHERE e.user_id = u.id
+                           ) AS has_external_identity
+                      FROM users u
+                     WHERE u.username = $1 OR u.email = $2
+                     FOR UPDATE OF u
                     """,
                     username,
                     email,
@@ -293,18 +299,24 @@ async def ensure_service_user(
                         or rows[0]["username"] != username
                         or rows[0]["email"] != email
                         or rows[0]["account_kind"] != "service"
+                        or rows[0]["auth_provider"] != "service"
+                        or rows[0]["has_external_identity"]
                     ):
                         raise ExternalIdentityConflictError()
+                    if rows[0]["account_status"] != "active":
+                        raise AccountSuspendedError()
                     user_id = rows[0]["id"]
                     await conn.execute(
                         """
                         UPDATE users
                            SET display_name = COALESCE($2, display_name),
+                               is_admin = $3,
                                updated_at = NOW()
                          WHERE id = $1
                         """,
                         user_id,
                         display_name,
+                        is_admin,
                     )
                 else:
                     user_id = uuid.uuid4()
@@ -313,7 +325,7 @@ async def ensure_service_user(
                         INSERT INTO users (
                             id, username, email, password_hash, display_name,
                             is_admin, auth_provider, account_status, account_kind
-                        ) VALUES ($1, $2, $3, $4, $5, false, 'service',
+                        ) VALUES ($1, $2, $3, $4, $5, $6, 'service',
                                   'active', 'service')
                         """,
                         user_id,
@@ -321,6 +333,7 @@ async def ensure_service_user(
                         email,
                         _SERVICE_SENTINEL_HASH,
                         display_name,
+                        is_admin,
                     )
                     new_user_id = user_id
 
@@ -328,7 +341,7 @@ async def ensure_service_user(
                     conn,
                     "auth.service_user_ensured",
                     actor_id=actor_id,
-                    payload={"user_id": str(user_id)},
+                    payload={"user_id": str(user_id), "is_admin": is_admin},
                 )
         except asyncpg.UniqueViolationError:
             raise ExternalIdentityConflictError() from None
