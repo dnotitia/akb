@@ -62,6 +62,10 @@ class AuthenticatedUser:
     display_name: str | None
     is_admin: bool
     auth_method: str  # "jwt" | "pat" | "oauth" | "browser_session"
+    # Human is the only account kind reachable through local/OIDC sessions.
+    # Token-store credentials override this from the authoritative users row
+    # so service callers remain distinguishable at the request boundary.
+    account_kind: str = "human"
     # Per-PAT vault scope (Option B). None = unscoped: JWT logins, and PATs
     # minted without a scope. A concrete scope gates mutating vault access.
     vault_scope: VaultScope | None = None
@@ -1130,7 +1134,8 @@ async def _resolve_pat(raw_token: str) -> AuthenticatedUser | None:
                AND (t.expires_at IS NULL OR t.expires_at > NOW())
                AND u.account_status = 'active'
             RETURNING t.id AS token_id, t.user_id, t.scopes, t.vault_scope, t.key_class,
-                      t.expires_at, u.username, u.email, u.display_name, u.is_admin
+                      t.expires_at, u.username, u.email, u.display_name, u.is_admin,
+                      u.account_kind
             """,
             token_hash,
         )
@@ -1165,6 +1170,7 @@ async def _resolve_pat(raw_token: str) -> AuthenticatedUser | None:
             display_name=row["display_name"],
             is_admin=row["is_admin"],
             auth_method="pat",
+            account_kind=row["account_kind"],
             vault_scope=scope,
             token_id=token_id,
             key_class=key_class,
