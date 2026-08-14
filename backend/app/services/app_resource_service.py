@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 import uuid
 
+import asyncpg
+
 from app.exceptions import ConflictError, ValidationError
 from app.util.text import to_nfc_any
 
@@ -125,19 +127,30 @@ async def table_ownership(
     vault_id: uuid.UUID,
     table_name: str,
 ) -> dict[str, Any] | None:
-    row = await conn.fetchrow(
-        """
-        SELECT resource.installation_id, installation.app_id, resource.status
-          FROM app_owned_resources AS resource
-          JOIN vault_app_installations AS installation
-            ON installation.id = resource.installation_id
-         WHERE resource.vault_id = $1
-           AND resource.resource_kind = 'table'
-           AND resource.resource_key = $2
-        """,
-        vault_id,
-        table_name,
-    )
+    # init.sql deliberately contains only the legacy table surface.  Probe
+    # before the ownership query so a real transaction is never aborted by an
+    # ``UndefinedTableError`` on a pre-registry database.
+    fetchval = getattr(conn, "fetchval", None)
+    if fetchval is not None and await fetchval("SELECT to_regclass('public.app_owned_resources')") is None:
+        return None
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT resource.installation_id, installation.app_id, resource.status
+              FROM app_owned_resources AS resource
+              JOIN vault_app_installations AS installation
+                ON installation.id = resource.installation_id
+             WHERE resource.vault_id = $1
+               AND resource.resource_kind = 'table'
+               AND resource.resource_key = $2
+            """,
+            vault_id,
+            table_name,
+        )
+    except asyncpg.UndefinedTableError:
+        # A concurrent schema bootstrap may still race the probe.  Preserve
+        # the legacy mutation path if the registry disappears between reads.
+        return None
     if not row:
         return None
     result = dict(row)

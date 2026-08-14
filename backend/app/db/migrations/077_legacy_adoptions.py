@@ -20,6 +20,19 @@ async def migrate(conn=None):
 
 
 async def _run(conn):
+    # Some upgrade fixtures represent a pre-registry database by marking the
+    # historical migrations as applied while loading only init.sql.  Adoption
+    # is meaningful only once the registry tables exist; keep that legacy
+    # bootstrap path startable and let the migration ledger record this no-op.
+    if not await conn.fetchval(
+        """
+        SELECT bool_and(to_regclass('public.' || table_name) IS NOT NULL)
+          FROM unnest($1::text[]) AS required(table_name)
+        """,
+        ["app_definitions", "app_releases", "vault_app_installations", "app_owned_resources"],
+    ):
+        return
+
     async with conn.transaction():
         await conn.execute(
             """

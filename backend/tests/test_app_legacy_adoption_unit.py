@@ -6,6 +6,7 @@ import hashlib
 import json
 import uuid
 
+import asyncpg
 import pytest
 
 from app.exceptions import ConflictError, ForbiddenError, ValidationError
@@ -132,6 +133,11 @@ class _OwnershipConnection:
         return self.row
 
 
+class _LegacyOwnershipConnection(_OwnershipConnection):
+    async def fetchrow(self, _query: str, *_args):
+        raise asyncpg.UndefinedTableError('relation "app_owned_resources" does not exist')
+
+
 @pytest.mark.asyncio
 async def test_owned_table_requires_exact_rollout_context(monkeypatch) -> None:
     installation_id = uuid.uuid4()
@@ -185,6 +191,13 @@ async def test_retained_table_never_accepts_rollout_context() -> None:
             "orders",
             context=resources.TableOwnershipContext(uuid.uuid4(), uuid.uuid4()),
         )
+
+
+@pytest.mark.asyncio
+async def test_legacy_schema_without_registry_allows_unowned_mutation() -> None:
+    await resources.ensure_table_mutation_allowed(
+        _LegacyOwnershipConnection(None), uuid.uuid4(), "orders"
+    )
 
 
 @pytest.mark.asyncio
