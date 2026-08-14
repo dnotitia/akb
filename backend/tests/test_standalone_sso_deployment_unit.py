@@ -172,6 +172,22 @@ def test_kustomize_render_has_no_local_session_mount_when_kubectl_is_available()
         text=True,
         timeout=30,
     )
+    rendered = [item for item in yaml.safe_load_all(result.stdout) if isinstance(item, dict)]
+    backend = next(
+        item
+        for item in rendered
+        if item.get("kind") == "Deployment" and item.get("metadata", {}).get("name") == "backend"
+    )
+    main = next(
+        item
+        for item in backend["spec"]["template"]["spec"]["containers"]
+        if item["name"] == "backend"
+    )
+    assert {mount["name"] for mount in main["volumeMounts"]} == {
+        "app-config",
+        "secret-config",
+        "vaultdata",
+    }
     assert "local-session-keys" not in result.stdout
     assert "auth_mode: sso" in result.stdout
     assert "kind: Secret" not in result.stdout
