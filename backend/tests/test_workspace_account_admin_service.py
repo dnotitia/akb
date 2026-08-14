@@ -449,9 +449,15 @@ async def test_create_pat_uses_caller_selected_token_id(services):
 
 async def test_adopt_bootstrap_admin_preserves_current_token_and_revokes_others(
     services,
+    monkeypatch,
 ):
     pool, role_sync, service = services
-    from app.services import auth_service
+    from app.config import settings
+    from app.services import auth_service, recovery_admin_service
+
+    monkeypatch.setattr(recovery_admin_service, "get_pool", service.get_pool)
+    monkeypatch.setattr(recovery_admin_service, "get_role_sync", lambda: role_sync)
+    monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
 
     user_id = uuid.uuid4()
     current_token_id = uuid.uuid4()
@@ -465,9 +471,9 @@ async def test_adopt_bootstrap_admin_preserves_current_token_and_revokes_others(
             """
             INSERT INTO users (
                 id, username, email, password_hash, display_name, is_admin,
-                auth_provider, account_status, account_kind
+                is_recovery_admin, auth_provider, account_status, account_kind
             ) VALUES ($1, $2, $3, $4, 'Platform Bot', true,
-                      'local', 'active', 'human')
+                      true, 'local', 'active', 'human')
             """,
             user_id,
             username,
@@ -516,7 +522,7 @@ async def test_adopt_bootstrap_admin_preserves_current_token_and_revokes_others(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT u.password_hash, u.tokens_revoked_before,
+            SELECT u.password_hash, u.tokens_revoked_before, u.is_recovery_admin,
                    t.key_class, t.scopes,
                    (SELECT count(*) FROM tokens WHERE user_id = u.id) AS token_count
               FROM users u
@@ -528,6 +534,7 @@ async def test_adopt_bootstrap_admin_preserves_current_token_and_revokes_others(
         )
     assert row["password_hash"].startswith("!service-account:")
     assert row["tokens_revoked_before"] is not None
+    assert row["is_recovery_admin"] is False
     assert row["key_class"] == "service"
     assert list(row["scopes"]) == ["read", "write", "admin"]
     assert row["token_count"] == 1
@@ -561,6 +568,16 @@ async def test_adopt_bootstrap_admin_preserves_current_token_and_revokes_others(
             str(user_id),
         )
     assert retried_event_count == event_count
+
+    sso_recovery = await recovery_admin_service.provision_sso_recovery_admin(
+        username=f"governance-sso-recovery-{uuid.uuid4().hex[:8]}",
+        email=f"governance-sso-recovery-{uuid.uuid4().hex[:8]}@example.com",
+        issuer=_ISSUER,
+        subject=f"recovery-{uuid.uuid4().hex}",
+    )
+    assert sso_recovery["created"] is True
+    assert sso_recovery["is_recovery_admin"] is True
+    assert sso_recovery["user_id"] != str(user_id)
 
 
 async def test_adopt_bootstrap_admin_rejects_identity_mismatch_atomically(services):
