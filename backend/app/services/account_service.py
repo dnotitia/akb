@@ -61,7 +61,7 @@ def _user_result(row) -> dict:
 async def _fetch_user(conn, user_id: uuid.UUID):
     return await conn.fetchrow(
         """
-        SELECT id, username, email, display_name, is_admin,
+        SELECT id, username, email, display_name, is_admin, is_recovery_admin,
                auth_provider, account_status, account_kind
           FROM users WHERE id = $1
         """,
@@ -485,10 +485,13 @@ async def adopt_current_admin_as_service(
                     },
                 )
             adopted = await _fetch_user(conn, user_uuid)
+            if adopted is None or adopted["is_recovery_admin"] is not False:
+                raise ServiceIdentityAdoptionError()
 
     await _cleanup_token_roles(pool, user_uuid, pending_token_ids)
     return {
         **_user_result(adopted),
+        "is_recovery_admin": adopted["is_recovery_admin"],
         "token_id": token_id,
         "key_class": "service",
         "revoked_token_ids": [str(value) for value in pending_token_ids],
