@@ -1,6 +1,9 @@
 """Static guard for the SSO browser-session epoch boundary."""
 
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import asyncpg
 import pytest
@@ -62,13 +65,25 @@ def test_fresh_and_migrated_schema_share_the_custody_invariants():
 
 
 def test_runtime_epoch_preflight_is_executable_and_public_safe():
-    preflight = (_BACKEND / "scripts" / "sso_session_epoch_preflight.py").read_text()
+    preflight_path = _BACKEND / "scripts" / "sso_session_epoch_preflight.py"
+    preflight = preflight_path.read_text()
 
     assert "prepare-upgrade" in preflight
     assert "prepare-rollback" in preflight
     assert "status" in preflight
     assert '"runtime_generation":' not in preflight
     assert '"sso_session_epoch":' not in preflight
+
+    env = {**os.environ, "PYTHONPATH": ""}
+    result = subprocess.run(
+        [sys.executable, str(preflight_path), "--help"],
+        cwd=_BACKEND,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_epoch_bridge_has_named_migration_only_retirement_contract():
