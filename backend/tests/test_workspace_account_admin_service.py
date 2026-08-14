@@ -515,6 +515,7 @@ async def test_adopt_bootstrap_admin_preserves_current_token_and_revokes_others(
     assert adopted["account_kind"] == "service"
     assert adopted["auth_provider"] == "service"
     assert adopted["is_admin"] is True
+    assert adopted["is_recovery_admin"] is False
     assert adopted["token_id"] == str(current_token_id)
     assert adopted["key_class"] == "service"
     assert adopted["revoked_token_ids"] == [str(stale_token_id)]
@@ -560,6 +561,7 @@ async def test_adopt_bootstrap_admin_preserves_current_token_and_revokes_others(
         expected_email=email,
         actor_id=str(user_id),
     )
+    assert retried["is_recovery_admin"] is False
     assert retried["revoked_token_ids"] == []
     assert role_sync.revoked_tokens == [stale_token_id]
     async with pool.acquire() as conn:

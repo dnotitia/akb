@@ -272,7 +272,11 @@ async def test_adopt_current_service_requires_exact_admin_pat_and_forwards_ids(m
 
     async def _adopt(**kwargs):
         observed.update(kwargs)
-        return {"account_kind": "service", "key_class": "service"}
+        return {
+            "account_kind": "service",
+            "key_class": "service",
+            "is_recovery_admin": False,
+        }
 
     monkeypatch.setattr(access, "adopt_current_admin_as_service", _adopt)
     request = access.AdoptCurrentServiceUserRequest(
@@ -291,7 +295,11 @@ async def test_adopt_current_service_requires_exact_admin_pat_and_forwards_ids(m
     token_id = str(uuid.uuid4())
     actor = _bootstrap_user(token_id=token_id)
     result = await access.admin_adopt_current_service_user(request, actor)
-    assert result == {"account_kind": "service", "key_class": "service"}
+    assert result == {
+        "account_kind": "service",
+        "key_class": "service",
+        "is_recovery_admin": False,
+    }
     assert observed == {
         "user_id": actor.user_id,
         "token_id": token_id,
@@ -336,3 +344,17 @@ async def test_governance_routes_are_explicit_in_openapi(monkeypatch, tmp_path):
     }
     assert expected <= set(paths)
     assert "/api/v1/admin/users/proxy" not in paths
+
+    operation = paths["/api/v1/admin/service-users/adopt-current"]["post"]
+    response_schema = operation["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ]
+    assert response_schema == {
+        "$ref": "#/components/schemas/AdoptCurrentServiceUserResponse"
+    }
+    adoption_schema = app.openapi()["components"]["schemas"][
+        "AdoptCurrentServiceUserResponse"
+    ]
+    assert "is_recovery_admin" in adoption_schema["required"]
+    assert adoption_schema["properties"]["is_recovery_admin"]["const"] is False
+    assert "default" not in adoption_schema["properties"]["is_recovery_admin"]

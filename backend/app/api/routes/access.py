@@ -1,5 +1,7 @@
 """REST API routes for vault access management."""
 
+from typing import Literal
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import Field, SecretStr
 
@@ -122,6 +124,21 @@ class EnsureServiceUserRequest(NFCModel):
 class AdoptCurrentServiceUserRequest(NFCModel):
     expected_username: str
     expected_email: str
+
+
+class AdoptCurrentServiceUserResponse(NFCModel):
+    user_id: str
+    username: str
+    email: str
+    display_name: str | None
+    is_admin: bool
+    is_recovery_admin: Literal[False]
+    account_status: str
+    account_kind: str
+    auth_provider: str
+    token_id: str
+    key_class: str
+    revoked_token_ids: list[str]
 
 
 class SetUserRoleRequest(NFCModel):
@@ -445,6 +462,7 @@ async def admin_ensure_service_user(
 @router.post(
     "/admin/service-users/adopt-current",
     summary="[admin] Adopt the current bootstrap administrator as a service identity",
+    response_model=AdoptCurrentServiceUserResponse,
 )
 async def admin_adopt_current_service_user(
     req: AdoptCurrentServiceUserRequest,
