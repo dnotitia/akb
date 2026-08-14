@@ -366,7 +366,7 @@ async def adopt_current_admin_as_service(
             current = await conn.fetchrow(
                 """
                 SELECT id, username, email, password_hash, display_name, is_admin,
-                       auth_provider, account_status, account_kind,
+                       is_recovery_admin, auth_provider, account_status, account_kind,
                        EXISTS (
                            SELECT 1 FROM external_identities e
                             WHERE e.user_id = users.id
@@ -412,6 +412,7 @@ async def adopt_current_admin_as_service(
                 current["account_kind"] != "service"
                 or current["auth_provider"] != "service"
                 or current["password_hash"] != _SERVICE_SENTINEL_HASH
+                or current["is_recovery_admin"]
             )
             wanted_scopes = ["read", "write", "admin"]
             token_changed = token["key_class"] != "service" or list(token["scopes"] or []) != wanted_scopes
@@ -422,6 +423,7 @@ async def adopt_current_admin_as_service(
                        SET account_kind = 'service',
                            auth_provider = 'service',
                            password_hash = $2,
+                           is_recovery_admin = false,
                            tokens_revoked_before = CASE
                                WHEN account_kind = 'human' THEN NOW()
                                ELSE tokens_revoked_before
