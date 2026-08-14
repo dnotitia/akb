@@ -20,16 +20,23 @@ for (const [path, pathItem] of Object.entries(fixture.paths ?? {})) {
     operations.push({ path, method, ...operation });
   }
 }
+// Legacy adoption is intentionally a REST-only operator surface for this
+// release.  Keep it in the live OpenAPI fixture without inventing a generated
+// SDK facade, while continuing to require a complete typed matrix for the
+// public control-plane SDK operations.
+const sdkOperations = operations.filter(
+  (operation) => !operation.tags?.includes("app-legacy-adoptions"),
+);
 const matrix = contract.controlPlane;
-if (!Array.isArray(matrix) || matrix.length !== operations.length) {
-  throw new Error(`control-plane matrix has ${matrix?.length ?? 0} entries; fixture has ${operations.length}`);
+if (!Array.isArray(matrix) || matrix.length !== sdkOperations.length) {
+  throw new Error(`control-plane matrix has ${matrix?.length ?? 0} entries; fixture has ${sdkOperations.length} SDK operations`);
 }
-const operationIds = new Set(operations.map((operation) => operation.operationId));
+const operationIds = new Set(sdkOperations.map((operation) => operation.operationId));
 const matrixIds = new Set(matrix.map((operation) => operation.operationId));
 if (matrixIds.size !== matrix.length || matrixIds.size !== operationIds.size) {
   throw new Error("control-plane operation IDs are not unique");
 }
-for (const operation of operations) {
+for (const operation of sdkOperations) {
   const item = matrix.find((candidate) => candidate.operationId === operation.operationId);
   if (!item || item.path !== operation.path || item.method !== operation.method) {
     throw new Error(`${operation.operationId}: contract matrix drifted from fixture`);
@@ -59,4 +66,6 @@ for (const forbidden of ["createClient", "AkbClient", "akbFetch", "unwrapAkbResp
   if (publicNames.includes(forbidden)) throw new Error(`${forbidden}: leaked data-plane export`);
 }
 
-console.log(`Control-plane generated contract passed for ${operations.length} operations.`);
+console.log(
+  `Control-plane generated contract passed for ${sdkOperations.length} SDK operations (${operations.length - sdkOperations.length} REST-only operations omitted).`,
+);

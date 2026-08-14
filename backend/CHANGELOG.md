@@ -5,6 +5,19 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## Unreleased
+
+### Added metadata-only legacy app adoption
+
+System administrators and target Vault administrators can now create immutable,
+idempotent adoption plans that preflight an explicit table allowlist and
+baseline schema fingerprint. Applying a plan registers only the active
+installation, owned-resource metadata, observed baseline, and bounded audit
+ledger; existing table schema, rows, Vault access, grants, and credentials are
+untouched. Adopted or retained tables reject generic alter/drop and structured
+migrations, while the owning rollout worker retains its exact installation
+context.
+
 ## 0.14.2 — 2026-08-13  *(feat — exact PAT authority self-verification)*
 
 ### Added PAT authority self-verification

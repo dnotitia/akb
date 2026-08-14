@@ -34,6 +34,11 @@ from app.repositories.events_repo import emit_event
 from app.services.index_service import (
     build_table_chunk, delete_table_chunks, write_source_chunks,
 )
+from app.services.app_resource_service import (
+    TableOwnershipContext,
+    ensure_table_mutation_allowed,
+    lock_table_mutation,
+)
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import table_uri
 from app.services.user_sql_executor import (
@@ -1109,6 +1114,7 @@ async def drop_table(
     table_name: str,
     *,
     actor_id: str,
+    _ownership_context: TableOwnershipContext | None = None,
 ) -> dict:
     """Drop a vault-scoped table: registry row + dynamic PG table +
     edges referencing the table URI + metadata chunk."""
@@ -1119,9 +1125,17 @@ async def drop_table(
             if not vault:
                 raise NotFoundError("Vault", str(vault_id))
 
+            await lock_table_mutation(conn, vault_id, table_name)
             table = await table_registry_repo.find_by_name(conn, vault_id, table_name)
             if not table:
                 raise NotFoundError("Table", table_name)
+
+            await ensure_table_mutation_allowed(
+                conn,
+                vault_id,
+                table_name,
+                context=_ownership_context,
+            )
 
             table_id = table["id"]
             pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
@@ -1186,6 +1200,7 @@ async def alter_table(
     drop_indexes: list[str] | None = None,
     _conn: Any | None = None,
     _defer_index: bool = False,
+    _ownership_context: TableOwnershipContext | None = None,
 ) -> dict:
     """Apply schema changes to a vault table:
        - add_columns: [{name, type}, ...]
@@ -1208,6 +1223,7 @@ async def alter_table(
             if not vault:
                 raise NotFoundError("Vault", str(vault_id))
 
+            await lock_table_mutation(conn, vault_id, table_name)
             # FOR UPDATE serialises concurrent alters' read-modify-write
             # of vault_tables.columns — without it they last-write-wins.
             table = await conn.fetchrow(
@@ -1220,6 +1236,13 @@ async def alter_table(
             )
             if not table:
                 raise NotFoundError("Table", table_name)
+
+            await ensure_table_mutation_allowed(
+                conn,
+                vault_id,
+                table_name,
+                context=_ownership_context,
+            )
 
             columns = table_registry_repo.parse_columns(table["columns"])
             pg_name = table_data_repo.pg_table_name(vault["name"], table_name)

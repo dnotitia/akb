@@ -21,6 +21,7 @@ from app.api.routes import (
     assets,
     app_inventory,
     app_installations,
+    app_legacy_adoptions,
     app_rollouts,
     app_registry,
     agent_sessions,
@@ -291,6 +292,7 @@ async def _no_store_public_surfaces(request: Request, call_next):
         or path.startswith("/api/v1/app/rollouts")
         or (path.startswith("/api/v1/apps/") and "/rollouts" in path)
         or (path.startswith("/api/v1/apps/") and "/installations/" in path)
+        or (path.startswith("/api/v1/apps/") and "/legacy-adoptions" in path)
     ):
         response.headers["Cache-Control"] = "no-store"
         response.headers["Pragma"] = "no-cache"
@@ -304,6 +306,7 @@ app.include_router(app_identity.router, prefix="/api/v1", tags=["app-identity"])
 app.include_router(app_registry.router, prefix="/api/v1", tags=["app-registry"])
 app.include_router(app_inventory.router, prefix="/api/v1", tags=["app-inventory"])
 app.include_router(app_installations.router, prefix="/api/v1", tags=["app-installations"])
+app.include_router(app_legacy_adoptions.router, prefix="/api/v1", tags=["app-legacy-adoptions"])
 app.include_router(app_rollouts.router, prefix="/api/v1", tags=["app-rollouts"])
 app.include_router(access.router, prefix="/api/v1", tags=["access"])
 app.include_router(documents.router, prefix="/api/v1", tags=["documents"])

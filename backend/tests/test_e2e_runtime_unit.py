@@ -265,6 +265,35 @@ def test_app_control_plane_descriptor_keeps_schema_v2_discovery_contract(tmp_pat
     assert discovery["coordinates"]["self_app"]["resume"]["path"] == "/api/v1/app/rollouts/{rollout_id}/resume"
 
 
+def test_app_control_plane_discovery_exposes_legacy_adoption_target_and_drift_control(tmp_path):
+    runtime = E2ERuntime(
+        dataclasses.replace(make_config(tmp_path), scenario="app-control-plane")
+    )
+    runtime._fixture_catalog = {
+        "status": "ready",
+        "scenario": "app-control-plane",
+        "fixtures": {
+            "legacy_adoption": {
+                "fixture_id": "legacy-adoption",
+                "vault_id": "vault-legacy",
+                "before": {"row_count": 3},
+                "after": {"grant_generation": 0},
+            }
+        },
+    }
+
+    discovery = runtime.fixture_discovery()
+    control = discovery["controls"]["fault_injection"]
+    assert "legacy_schema_drift" in control["kinds"]
+    assert {
+        "fixture_id": "legacy-adoption",
+        "vault_id": "vault-legacy",
+        "target_type": "legacy_adoption",
+    } in control["targets"]
+    assert discovery["fixtures"]["legacy_adoption"]["before"]["row_count"] == 3
+    assert discovery["fixtures"]["legacy_adoption"]["after"]["grant_generation"] == 0
+
+
 def test_suite_sql_uses_compose_psql_by_default_and_preserves_override(tmp_path, monkeypatch):
     runtime = E2ERuntime(make_config(tmp_path))
     assert runtime._child_environment()["PYTHONFAULTHANDLER"] == "1"
