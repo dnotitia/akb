@@ -466,7 +466,9 @@ async def test_ensure_service_user_converges_admin_state_with_live_token_and_aud
     assert promoted["is_admin"] is True
     assert demoted["is_admin"] is False
     assert resolved_promoted is not None and resolved_promoted.is_admin is True
+    assert resolved_promoted is not None and resolved_promoted.account_kind == "service"
     assert resolved_demoted is not None and resolved_demoted.is_admin is False
+    assert resolved_demoted is not None and resolved_demoted.account_kind == "service"
     assert role_sync.created_users == [uuid.UUID(promoted["user_id"])]
 
     async with pool.acquire() as conn:

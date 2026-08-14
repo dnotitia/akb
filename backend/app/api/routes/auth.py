@@ -583,6 +583,7 @@ async def me(user: AuthenticatedUser = Depends(get_current_user)):
         "display_name": user.display_name,
         "is_admin": user.is_admin,
         "auth_method": user.auth_method,
+        "account_kind": user.account_kind,
         "key_class": user.key_class,
     }
 

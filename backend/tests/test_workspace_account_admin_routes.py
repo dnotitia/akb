@@ -21,6 +21,7 @@ def _user(*, admin: bool) -> AuthenticatedUser:
         display_name=None,
         is_admin=admin,
         auth_method="pat",
+        account_kind="service",
         key_class="service",
     )
 
@@ -36,6 +37,14 @@ def _bootstrap_user(*, auth_method: str = "pat", token_id: str | None = None) ->
         token_id=token_id,
         key_class="pat",
     )
+
+
+async def test_auth_me_exposes_the_authenticated_account_kind():
+    from app.api.routes import auth
+
+    result = await auth.me(_user(admin=True))
+
+    assert result["account_kind"] == "service"
 
 
 async def test_non_admin_is_rejected_before_account_service(monkeypatch):
