@@ -80,6 +80,7 @@ spec:
         - name: backend
           volumeMounts:
             - name: local-session-keys
+              mountPath: /etc/akb/local-session
               $patch: delete
       volumes:
         - name: local-session-keys
