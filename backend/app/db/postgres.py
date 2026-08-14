@@ -264,6 +264,7 @@ async def _apply_migrations() -> None:
         "074_sso_browser_sessions.py",  # encrypted ordinary-user SSO browser-session custody
         "075_sso_callback_receipt.py",  # bind current SSO receipts to the effective back-channel callback
         "076_sso_session_epoch.py",  # monotonic auth boundary + rollback-compatible epoch bridge/legacy-write guard
+        "077_legacy_adoptions.py",  # immutable legacy app adoption plans, targets, and bounded audit
     ):
         if filename in applied:
             continue

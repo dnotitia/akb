@@ -33,6 +33,7 @@ from app.services.app_inventory_service import (
     sanitize_checkpoint,
     sanitize_recent_error,
 )
+from app.services.app_resource_service import lock_app_vault_pair
 from app.services.auth_service import AuthenticatedUser
 
 LIFECYCLE_MODES = frozenset({"install", "restore", "fresh"})
@@ -368,10 +369,7 @@ async def _authorize_command(
 
 
 async def _lock_pair(conn: Any, app_id: uuid.UUID, vault_id: uuid.UUID) -> None:
-    await conn.fetchval(
-        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-        f"app-installation:{app_id}:{vault_id}",
-    )
+    await lock_app_vault_pair(conn, app_id, vault_id)
 
 
 async def _load_context(

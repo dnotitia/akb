@@ -70,7 +70,7 @@ def test_control_plane_fixture_matches_live_operation_contract():
                     == {"$ref": "#/components/schemas/AkbError"}
                 ), f"{operation['operationId']} {status}"
 
-    assert len(operations) == 31
+    assert len(operations) == 34
     assert len(set(operations)) == len(operations)
     for schema_name, expected_schema in fixture["components"]["schemas"].items():
         assert live["components"]["schemas"].get(schema_name) == expected_schema

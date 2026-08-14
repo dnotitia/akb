@@ -8,7 +8,6 @@ lock; a persisted checkpoint makes a retry resume rather than restart.
 from __future__ import annotations
 
 import logging
-import hashlib
 import json
 import uuid
 from datetime import datetime, timezone
@@ -21,6 +20,10 @@ from app.repositories import table_data_repo, table_registry_repo
 from app.services import app_rollout_service
 from app.services._backfill import BackfillRunner
 from app.services.app_inventory_service import expected_schema_fingerprint
+from app.services.app_resource_service import (
+    TableOwnershipContext,
+    canonical_table_fingerprint,
+)
 from app.services.table_service import alter_table
 from app.services.role_sync import get_role_sync
 
@@ -272,9 +275,36 @@ async def _execute_step(conn: Any, target: dict[str, Any], step: dict[str, Any],
     if operation == "backfill_column":
         return await _run_backfill(conn, target, step, payload)
     if operation == "add_column":
-        await alter_table(target["vault_id"], table_name, actor_id="app-rollout-worker", add_columns=[payload["column"]], _conn=conn, _defer_index=True)
+        await alter_table(
+            target["vault_id"],
+            table_name,
+            actor_id="app-rollout-worker",
+            add_columns=[payload["column"]],
+            _conn=conn,
+            _defer_index=True,
+            _ownership_context=TableOwnershipContext(
+                installation_id=target["installation_id"],
+                app_id=target["app_id"],
+            ),
+        )
     elif operation == "add_index":
-        await alter_table(target["vault_id"], table_name, actor_id="app-rollout-worker", add_indexes=[{"name": payload["name"], "columns": [{"name": c, "order": "asc"} for c in payload["columns"]]}], _conn=conn, _defer_index=True)
+        await alter_table(
+            target["vault_id"],
+            table_name,
+            actor_id="app-rollout-worker",
+            add_indexes=[
+                {
+                    "name": payload["name"],
+                    "columns": [{"name": c, "order": "asc"} for c in payload["columns"]],
+                }
+            ],
+            _conn=conn,
+            _defer_index=True,
+            _ownership_context=TableOwnershipContext(
+                installation_id=target["installation_id"],
+                app_id=target["app_id"],
+            ),
+        )
     elif operation == "set_not_null":
         column = _safe_identifier(payload["column"])
         vault_name = await conn.fetchval("SELECT name FROM vaults WHERE id=$1", target["vault_id"])
@@ -284,7 +314,18 @@ async def _execute_step(conn: Any, target: dict[str, Any], step: dict[str, Any],
         remaining = await conn.fetchval(f"SELECT COUNT(*) FROM {pg_name} WHERE {column} IS NULL")
         if remaining:
             raise ConflictError("Rollout not-null precondition failed")
-        await alter_table(target["vault_id"], table_name, actor_id="app-rollout-worker", alter_columns=[{"name": payload["column"], "set_not_null": True}], _conn=conn, _defer_index=True)
+        await alter_table(
+            target["vault_id"],
+            table_name,
+            actor_id="app-rollout-worker",
+            alter_columns=[{"name": payload["column"], "set_not_null": True}],
+            _conn=conn,
+            _defer_index=True,
+            _ownership_context=TableOwnershipContext(
+                installation_id=target["installation_id"],
+                app_id=target["app_id"],
+            ),
+        )
     await conn.execute("UPDATE app_rollout_steps SET state='applied', completed_at=NOW(), lease_owner=NULL, lease_expires_at=NULL WHERE id=$1", step["id"])
     return True
 
@@ -301,7 +342,7 @@ async def _schema_fingerprint(conn: Any, vault_id: uuid.UUID, installation_id: u
         installation_id,
         vault_id,
     )
-    payload = [
+    return canonical_table_fingerprint(
         {
             "name": row["resource_key"],
             "columns": row["columns"],
@@ -309,8 +350,7 @@ async def _schema_fingerprint(conn: Any, vault_id: uuid.UUID, installation_id: u
             "indexes": row["indexes"],
         }
         for row in rows
-    ]
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    )
 
 
 async def _process_target(target: dict[str, Any]) -> None:

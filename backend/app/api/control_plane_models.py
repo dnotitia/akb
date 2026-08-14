@@ -342,3 +342,53 @@ class RolloutProjection(ControlPlaneModel):
     source_rollout_id: uuid.UUID | None = None
     resume_outcome: Literal["accepted", "replayed", "denied"] | None = None
     resume_reason: str | None = None
+
+
+class LegacyAdoptionTargetRequest(ControlPlaneRequest):
+    vault_id: uuid.UUID
+    table_allowlist: list[str] = Field(min_length=1, max_length=256)
+    expected_schema_fingerprint: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+    )
+
+
+class LegacyAdoptionCreateRequest(ControlPlaneRequest):
+    baseline_release_id: uuid.UUID
+    targets: list[LegacyAdoptionTargetRequest] = Field(min_length=1, max_length=256)
+
+
+class LegacyAdoptionTargetProjection(ControlPlaneModel):
+    target_id: uuid.UUID
+    vault_id: uuid.UUID
+    table_allowlist: list[str]
+    included_tables: list[str] = Field(default_factory=list)
+    excluded_tables: list[str] = Field(default_factory=list)
+    missing_tables: list[str] = Field(default_factory=list)
+    ownership_conflicts: list[str] = Field(default_factory=list)
+    expected_schema_fingerprint: str
+    actual_schema_fingerprint: str | None = None
+    state: Literal["planned", "applied", "replayed", "blocked"]
+    reason_code: str | None = None
+    installation_id: uuid.UUID | None = None
+    checkpoint: JsonObject = Field(default_factory=dict)
+    planned_metadata: JsonObject = Field(default_factory=dict)
+    replayed: bool | None = None
+    outcome: Literal["replayed"] | None = None
+
+
+class LegacyAdoptionProjection(ControlPlaneModel):
+    adoption_id: uuid.UUID
+    app_id: uuid.UUID
+    baseline_release_id: uuid.UUID
+    idempotency_key: uuid.UUID
+    input_digest: str
+    status: Literal["planned", "partial", "applied", "blocked"]
+    targets: list[LegacyAdoptionTargetProjection]
+    checkpoint: JsonObject = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+    applied_at: datetime | None = None
+    replayed: bool | None = None
+    outcome: Literal["applied", "resumed"] | None = None

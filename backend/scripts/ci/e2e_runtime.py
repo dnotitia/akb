@@ -298,6 +298,23 @@ class E2ERuntime:
                     installation_id = item.get("id")
                     if isinstance(fixture_id, str) and isinstance(installation_id, str):
                         targets.append({"fixture_id": fixture_id, "installation_id": installation_id})
+            kinds = ["missing_owned_table"]
+            fixtures = catalog.get("fixtures", {})
+            legacy_target = None
+            if self.config.scenario == "app-control-plane" and isinstance(fixtures, dict):
+                candidate = fixtures.get("legacy_adoption")
+                if isinstance(candidate, dict):
+                    fixture_id = candidate.get("fixture_id", "legacy-adoption")
+                    vault_id = candidate.get("vault_id")
+                    if isinstance(fixture_id, str) and isinstance(vault_id, str):
+                        kinds.append("legacy_schema_drift")
+                        legacy_target = {
+                            "fixture_id": fixture_id,
+                            "vault_id": vault_id,
+                            "target_type": "legacy_adoption",
+                        }
+            if legacy_target is not None:
+                targets.append(legacy_target)
             catalog["controls"] = {
                 "fault_injection": {
                     "service": "fixture",
@@ -305,11 +322,11 @@ class E2ERuntime:
                     "path": "/control",
                     "body": {
                         "action": "fault_injection",
-                        "kind": "missing_owned_table",
+                        "kind": kinds[0],
                         "target": targets[0]["fixture_id"] if targets else None,
                         "enabled": True,
                     },
-                    "kinds": ["missing_owned_table"],
+                    "kinds": kinds,
                     "targets": targets,
                 },
                 "restart": {
@@ -355,6 +372,14 @@ class E2ERuntime:
                 fixture_id = item.get("fixture_id") or item.get("label") or item.get("id")
                 if value == fixture_id or value == item.get("id"):
                     return item
+        fixtures = self._fixture_catalog.get("fixtures", {})
+        if isinstance(fixtures, dict):
+            for name, item in fixtures.items():
+                if not isinstance(item, dict):
+                    continue
+                fixture_id = item.get("fixture_id") or name
+                if value == fixture_id:
+                    return item
         raise ValueError("unsupported fault target")
 
     async def fixture_control(
@@ -394,7 +419,10 @@ class E2ERuntime:
                         "reason": "unsupported_target",
                     }
                 selected_kind = kind or "missing_owned_table"
-                if selected_kind != "missing_owned_table":
+                allowed_kinds = {"missing_owned_table"}
+                if self.config.scenario == "app-control-plane":
+                    allowed_kinds.add("legacy_schema_drift")
+                if selected_kind not in allowed_kinds:
                     return {
                         "status": "rejected",
                         "scenario": self.config.scenario,
@@ -467,6 +495,56 @@ class E2ERuntime:
         while the worker deterministically records ``step_failed`` before any
         migration mutation.  The SQL identifier remains private to the fixture.
         """
+        if kind == "legacy_schema_drift":
+            try:
+                import asyncpg
+
+                vault_id = fixture.get("vault_id")
+                table_name = fixture.get("table_name")
+                baseline_columns = fixture.get("baseline_columns")
+                if (
+                    not isinstance(vault_id, str)
+                    or not isinstance(table_name, str)
+                    or not isinstance(baseline_columns, list)
+                ):
+                    return False
+                connection = await asyncpg.connect(
+                    host="127.0.0.1", port=15432, user="akb", password="akb", database="akb"
+                )
+                try:
+                    current = await connection.fetchval(
+                        "SELECT columns FROM vault_tables WHERE vault_id=$1 AND name=$2",
+                        uuid.UUID(vault_id),
+                        table_name,
+                    )
+                    if current is None:
+                        return False
+                    columns = current
+                    if isinstance(columns, str):
+                        columns = json.loads(columns)
+                    if not isinstance(columns, list):
+                        return False
+                    if not any(
+                        isinstance(column, dict) and column.get("name") == "fixture_drift"
+                        for column in columns
+                    ):
+                        columns = [*columns, {"name": "fixture_drift", "type": "text"}]
+                    await connection.execute(
+                        """
+                        UPDATE vault_tables
+                           SET columns=$3::jsonb
+                         WHERE vault_id=$1 AND name=$2
+                        """,
+                        uuid.UUID(vault_id),
+                        table_name,
+                        json.dumps(columns, separators=(",", ":")),
+                    )
+                    return True
+                finally:
+                    await connection.close()
+            except Exception:
+                # Controls are best effort and must not leak database details.
+                return False
         if kind != "missing_owned_table":
             return False
         try:
@@ -496,6 +574,39 @@ class E2ERuntime:
 
     async def _restore_fault(self, fixture: dict[str, object], kind: str) -> bool:
         """Restore the bounded fixture state removed by a fault control."""
+        if kind == "legacy_schema_drift":
+            try:
+                import asyncpg
+
+                vault_id = fixture.get("vault_id")
+                table_name = fixture.get("table_name")
+                baseline_columns = fixture.get("baseline_columns")
+                if (
+                    not isinstance(vault_id, str)
+                    or not isinstance(table_name, str)
+                    or not isinstance(baseline_columns, list)
+                ):
+                    return False
+                connection = await asyncpg.connect(
+                    host="127.0.0.1", port=15432, user="akb", password="akb", database="akb"
+                )
+                try:
+                    await connection.execute(
+                        """
+                        UPDATE vault_tables
+                           SET columns=$3::jsonb
+                         WHERE vault_id=$1 AND name=$2
+                        """,
+                        uuid.UUID(vault_id),
+                        table_name,
+                        json.dumps(baseline_columns, separators=(",", ":")),
+                    )
+                    return True
+                finally:
+                    await connection.close()
+            except Exception:
+                # Controls are best effort and must not leak database details.
+                return False
         if kind != "missing_owned_table":
             return False
         try:
@@ -1598,6 +1709,181 @@ class E2ERuntime:
             fresh_release_id=str(fresh_release_id),
         )
 
+    async def _seed_control_plane_legacy_adoption(
+        self,
+        connection: Any,
+        *,
+        system_admin_id: uuid.UUID,
+    ) -> None:
+        """Seed one explicit table baseline for the adoption scenario.
+
+        The fixture is intentionally an uninstalled control-plane target:
+        the API creates the immutable plan and baseline rows during the
+        behavior run.  The catalog contains only bounded before/after
+        observations and a reversible registry-only schema-drift control.
+        """
+        apps = self._fixture_catalog.get("apps")
+        actors = self._fixture_catalog.get("actors")
+        namespace = self._fixture_catalog.get("namespace")
+        if not isinstance(apps, dict) or not isinstance(actors, dict) or not isinstance(namespace, str):
+            raise ProvisioningFailure("legacy adoption fixture coordinates are unavailable")
+        target = apps.get("target")
+        owner = actors.get("target_owner")
+        if not isinstance(target, dict) or not isinstance(owner, dict):
+            raise ProvisioningFailure("legacy adoption fixture coordinates are unavailable")
+        target_app_id = target.get("id")
+        owner_id = owner.get("id")
+        if not isinstance(target_app_id, str) or not isinstance(owner_id, str):
+            raise ProvisioningFailure("legacy adoption fixture coordinates are unavailable")
+
+        table_name = "legacy_orders"
+        baseline_columns: list[dict[str, str]] = [
+            {"name": "amount", "type": "numeric"},
+            {"name": "state", "type": "text"},
+        ]
+        descriptor = {
+            "name": table_name,
+            "columns": baseline_columns,
+            "unique_keys": [],
+            "indexes": [],
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                [descriptor],
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        app_uuid = uuid.UUID(target_app_id)
+        owner_uuid = uuid.UUID(owner_id)
+        release_id = await self._insert_fixture_release(
+            connection,
+            app_id=app_uuid,
+            version="5.0.0",
+            expected_fingerprint=fingerprint,
+        )
+        vault_id, vault_name = await self._insert_fixture_vault(
+            connection,
+            namespace=namespace,
+            label="legacy-adoption",
+            owner_id=owner_uuid,
+            grants=[(owner_uuid, "owner")],
+            granted_by=system_admin_id,
+        )
+        physical = f"vt_{re.sub(r'[^a-z0-9]', '_', vault_name.lower())}__{table_name}"
+        if not re.fullmatch(r"[a-z0-9_]+", physical):
+            raise ProvisioningFailure("legacy adoption fixture identifier is invalid")
+        await connection.execute(
+            f"""
+            CREATE TABLE {physical} (
+                id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                amount NUMERIC,
+                state TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        await connection.executemany(
+            f"INSERT INTO {physical}(amount, state) VALUES($1, $2)",
+            [(10, "ready"), (20, "ready"), (30, "queued")],
+        )
+        table_id = uuid.uuid4()
+        await connection.execute(
+            """
+            INSERT INTO vault_tables(
+                id, vault_id, name, description, columns, unique_keys, indexes, created_by
+            ) VALUES($1, $2, $3, '', $4::jsonb, '[]'::jsonb, '[]'::jsonb, $5)
+            """,
+            table_id,
+            vault_id,
+            table_name,
+            json.dumps(baseline_columns, separators=(",", ":")),
+            owner_id,
+        )
+        fixture_id = "legacy-adoption"
+        fixture = {
+            "fixture_id": fixture_id,
+            "app_id": target_app_id,
+            "vault_id": str(vault_id),
+            "vault_name": vault_name,
+            "release_id": str(release_id),
+            "table_name": table_name,
+            "table_allowlist": [table_name],
+            "expected_schema_fingerprint": fingerprint,
+            "baseline_columns": baseline_columns,
+            "physical_table": physical,
+            "before": {
+                "installation_count": 0,
+                "owned_resource_count": 0,
+                "observed_state_count": 0,
+                "table_name": table_name,
+                "schema_fingerprint": fingerprint,
+                "row_count": 3,
+            },
+            "after": {
+                "lifecycle": "active",
+                "desired_current_release_id": str(release_id),
+                "grant_generation": 0,
+                "schema_fingerprint": fingerprint,
+                "row_count": 3,
+            },
+        }
+        fixtures = self._fixture_catalog.setdefault("fixtures", {})
+        if isinstance(fixtures, dict):
+            fixtures["legacy_adoption"] = fixture
+        vaults = self._fixture_catalog.setdefault("vaults", {})
+        if isinstance(vaults, dict):
+            vaults["legacy_adoption"] = {
+                "id": str(vault_id),
+                "name": vault_name,
+            }
+        releases = self._fixture_catalog.setdefault("releases", {})
+        if isinstance(releases, dict):
+            releases["target_legacy_adoption"] = {
+                "id": str(release_id),
+                "version": "5.0.0",
+                "expected_schema_fingerprint": fingerprint,
+            }
+        coordinates = self._fixture_catalog.setdefault("coordinates", {})
+        if isinstance(coordinates, dict):
+            admin = coordinates.setdefault("admin", {})
+            if isinstance(admin, dict):
+                admin["legacy_adoption"] = {
+                    "app_id": target_app_id,
+                    "vault_id": str(vault_id),
+                    "baseline_release_id": str(release_id),
+                    "table_allowlist": [table_name],
+                    "expected_schema_fingerprint": fingerprint,
+                    "create": {
+                        "service": "app",
+                        "method": "POST",
+                        "path": f"/api/v1/apps/{target_app_id}/legacy-adoptions",
+                        "headers": {"Idempotency-Key": "uuid-v4"},
+                        "body": {
+                            "baseline_release_id": str(release_id),
+                            "targets": [
+                                {
+                                    "vault_id": str(vault_id),
+                                    "table_allowlist": [table_name],
+                                    "expected_schema_fingerprint": fingerprint,
+                                }
+                            ],
+                        },
+                    },
+                    "status": {
+                        "service": "app",
+                        "method": "GET",
+                        "path": f"/api/v1/apps/{target_app_id}/legacy-adoptions/{{adoption_id}}",
+                    },
+                    "apply": {
+                        "service": "app",
+                        "method": "POST",
+                        "path": f"/api/v1/apps/{target_app_id}/legacy-adoptions/{{adoption_id}}/apply",
+                    },
+                }
+
     async def _seed_app_installation_lifecycle(
         self,
         connection: Any,
@@ -2056,6 +2342,10 @@ class E2ERuntime:
                         system_admin_id=system_admin_id,
                     )
                     await self._seed_control_plane_installation_lifecycle(
+                        connection,
+                        system_admin_id=system_admin_id,
+                    )
+                    await self._seed_control_plane_legacy_adoption(
                         connection,
                         system_admin_id=system_admin_id,
                     )
