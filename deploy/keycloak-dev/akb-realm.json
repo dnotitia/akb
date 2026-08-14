@@ -27,7 +27,37 @@
       ],
       "attributes": {
         "post.logout.redirect.uris": "http://localhost:3000/*##http://localhost:5173/*"
-      }
+      },
+      "protocolMappers": [
+        {
+          "name": "akb-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "http://localhost:8000/api",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        },
+        {
+          "name": "akb-browser-identity-provider",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usersessionmodel-note-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.session.note": "identity_provider",
+            "claim.name": "identity_provider",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "lightweight.claim": "false",
+            "userinfo.token.claim": "false",
+            "introspection.token.claim": "true",
+            "access.tokenResponse.claim": "false"
+          }
+        }
+      ]
     },
     {
       "clientId": "akb-mcp-test",

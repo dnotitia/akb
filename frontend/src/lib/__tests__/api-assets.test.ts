@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   discardAsset,
   clearPrivateAssetCache,
+  configureAuthTransport,
   getAssetBlob,
   getPublication,
   publicationAssetUrl,
@@ -29,12 +30,14 @@ describe("editor image asset API", () => {
     globalThis.fetch = fetchMock as unknown as typeof fetch;
     localStorage.clear();
     sessionStorage.clear();
+    configureAuthTransport("local");
     setToken("test-token");
     clearPrivateAssetCache();
   });
 
   afterEach(() => {
     setToken(null);
+    configureAuthTransport(null);
     vi.restoreAllMocks();
   });
 
@@ -73,6 +76,7 @@ describe("editor image asset API", () => {
 
     await expect(getAssetBlob(ASSET_ID, "team vault")).resolves.toEqual(blob);
     expect(fetchMock).toHaveBeenCalledWith(`/api/assets/${ASSET_ID}?vault=team+vault`, {
+      credentials: "same-origin",
       headers: { Authorization: "Bearer test-token" },
       signal: expect.any(AbortSignal),
     });
@@ -93,6 +97,7 @@ describe("editor image asset API", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       `/api/assets/${ASSET_ID}?vault=team&document=notes%2Fweekly.md&commit=abcdef123456`, // pragma: allowlist secret — synthetic Git commit
       {
+        credentials: "same-origin",
         headers: { Authorization: "Bearer test-token" },
         signal: expect.any(AbortSignal),
       },
@@ -121,6 +126,7 @@ describe("editor image asset API", () => {
       `/api/v1/assets/team%20vault/${ASSET_ID}`,
       {
         method: "DELETE",
+        credentials: "same-origin",
         headers: { Authorization: "Bearer test-token" },
         keepalive: true,
       },

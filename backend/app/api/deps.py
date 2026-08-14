@@ -8,6 +8,8 @@ import uuid
 from fastapi import HTTPException, Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from app.config import settings
+from app.exceptions import AuthenticationError
 from app.models.vault_scope import (
     current_request_jwt_claims,
     parse_request_jwt_claims_header,
@@ -22,6 +24,13 @@ from app.services.app_identity_service import (
     AppPrincipal,
     record_app_audit,
     resolve_app_authorization,
+)
+from app.services.auth_policy import sso_browser_session_ready
+from app.services.sso_browser_session_service import (
+    SSO_BROWSER_CSRF_HEADER,
+    resolve_sso_browser_session,
+    sso_browser_csrf_cookie_name,
+    sso_browser_session_cookie_name,
 )
 
 bearer_auth = HTTPBearer(auto_error=False, scheme_name="bearerAuth")
@@ -120,6 +129,39 @@ def _apply_claim_header(request: Request, user: AuthenticatedUser | None) -> Non
     current_request_jwt_claims.set(claims)
 
 
+async def _resolve_cookie_user(
+    request: Request,
+    *,
+    optional: bool,
+) -> AuthenticatedUser | None:
+    """Resolve the separate SSO browser-session request carrier.
+
+    This helper is called only when the Authorization header is absent. An
+    explicitly supplied bearer credential always owns the request and can
+    never fall through to a cookie after rejection.
+    """
+    if settings.require_auth_mode() != "sso" or not sso_browser_session_ready():
+        return None
+    raw_token = request.cookies.get(sso_browser_session_cookie_name(), "")
+    if not raw_token:
+        return None
+    require_csrf = _required_scope_for_request(request) == "write"
+    try:
+        return await resolve_sso_browser_session(
+            raw_token,
+            require_csrf=require_csrf,
+            csrf_cookie=request.cookies.get(sso_browser_csrf_cookie_name(), ""),
+            csrf_header=request.headers.get(SSO_BROWSER_CSRF_HEADER, ""),
+        )
+    except AuthenticationError:
+        if optional:
+            return None
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired browser session",
+        ) from None
+
+
 async def get_current_user(
     request: Request,
     _credentials: HTTPAuthorizationCredentials | None = Security(bearer_auth),
@@ -127,9 +169,12 @@ async def get_current_user(
     """Extract and validate user from Authorization header. Required."""
     current_request_jwt_claims.set(None)
     authorization = request.headers.get("authorization")
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header required")
-    user = await resolve_rest_user_authorization(authorization)
+    if authorization:
+        user = await resolve_rest_user_authorization(authorization)
+    else:
+        user = await _resolve_cookie_user(request, optional=False)
+        if user is None:
+            raise HTTPException(status_code=401, detail="Authentication required")
     if not user:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     required_scope = _required_scope_for_request(request)
@@ -155,6 +200,10 @@ async def get_optional_user(
     current_request_jwt_claims.set(None)
     authorization = request.headers.get("authorization")
     if not authorization:
+        user = await _resolve_cookie_user(request, optional=True)
+        if user is not None:
+            _apply_claim_header(request, user)
+            return user
         if _claim_header(request) is not None:
             _apply_claim_header(request, None)
         return None

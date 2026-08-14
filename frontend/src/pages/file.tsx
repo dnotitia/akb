@@ -5,6 +5,7 @@ import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { parseFileUri } from "@/lib/uri";
+import { authenticatedFetch } from "@/lib/api";
 
 interface FileInfo {
   uri: string;
@@ -30,8 +31,7 @@ export default function FilePage() {
     // Reset stale state from previous param before re-fetch resolves.
     setInfo(null);
     setError("");
-    const t = localStorage.getItem("akb_token") || "";
-    fetch(`/api/v1/files/${vault}`, { headers: { Authorization: `Bearer ${t}` } })
+    authenticatedFetch(`/api/v1/files/${encodeURIComponent(vault)}`)
       .then(async (r) => {
         if (!r.ok) {
           if (!cancelled) setError(`Couldn't load the file list (${r.status}).`);
@@ -57,10 +57,9 @@ export default function FilePage() {
     setDownloading(true);
     setError("");
     try {
-      const t = localStorage.getItem("akb_token") || "";
-      const r = await fetch(`/api/v1/files/${vault}/${fileId}/download`, {
-        headers: { Authorization: `Bearer ${t}` },
-      });
+      const r = await authenticatedFetch(
+        `/api/v1/files/${encodeURIComponent(vault || "")}/${encodeURIComponent(fileId || "")}/download`,
+      );
       if (!r.ok) {
         setError(`Download failed (${r.status}).`);
         return;

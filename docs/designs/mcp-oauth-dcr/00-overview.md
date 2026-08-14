@@ -1,6 +1,7 @@
 # MCP OAuth + DCR — Resource Server, delegated AS
 
-**Status**: resource-server boundary implemented; browser SSO remains staged
+**Status**: resource-server and AKB browser-session boundaries implemented;
+companion-product cutover remains a release gate
 **Started**: 2026-06-25
 **Related**: [`keycloak-oidc/00-overview.md`](../keycloak-oidc/00-overview.md) — current route-selected verifier and browser-session boundary
 

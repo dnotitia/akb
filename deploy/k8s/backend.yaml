@@ -69,6 +69,8 @@ data:
 #     secret.yaml: |
 #       db_password: <postgres password>
 #       system_hmac_secret: <openssl rand -hex 32>
+#       # SSO overlay only: independent unpadded base64url-encoded 32 bytes
+#       sso_browser_session_encryption_key: <browser-session encryption key>
 #       embed_api_key: <provider key>
 #       llm_api_key: <provider key>
 #       rerank_api_key: <cohere key>

@@ -1,0 +1,65 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: akb-keycloak-profile-upgrade-authority
+  namespace: akb
+  labels:
+    app.kubernetes.io/name: akb-keycloak-profile-upgrade-authority
+    app.kubernetes.io/part-of: akb
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: akb-keycloak-profile-upgrade-authority
+    spec:
+      restartPolicy: Never
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: bootstrap-upgrade-authority
+          image: quay.io/keycloak/keycloak:26.7.0@sha256:0f198be292568439d700cdbfb893e69a6009bb43a94a06a945b1d3d506c76b13
+          imagePullPolicy: IfNotPresent
+          args:
+            - bootstrap-admin
+            - service
+            # Kept stable so an interrupted v1-to-v2 migration receipt and a
+            # v2-to-v3 migration use one exact, already documented identity.
+            - --client-id
+            - akb-bootstrap-upgrade-v2
+            - --client-secret:env=AKB_KEYCLOAK_UPGRADE_SECRET
+            - --no-prompt
+          env:
+            - name: KC_DB
+              value: postgres
+            - name: KC_DB_URL_HOST
+              value: keycloak-postgres
+            - name: KC_DB_URL_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: akb-keycloak-db-credentials
+                  key: POSTGRES_DB
+            - name: KC_DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: akb-keycloak-db-credentials
+                  key: POSTGRES_USER
+            - name: KC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: akb-keycloak-db-credentials
+                  key: POSTGRES_PASSWORD
+            - name: AKB_KEYCLOAK_UPGRADE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: akb-keycloak-upgrade
+                  key: client-secret
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi

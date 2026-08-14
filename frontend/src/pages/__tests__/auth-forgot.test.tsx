@@ -11,6 +11,7 @@ vi.mock("@/lib/api", async () => {
   return {
     ...actual,
     getToken: vi.fn(() => null),
+    getMe: vi.fn().mockRejectedValue(new Error("no active session")),
     getAuthConfig: vi.fn(),
   };
 });
@@ -24,14 +25,14 @@ describe("AuthForgotPage", () => {
   it("renders password guidance only for validated local mode", async () => {
     vi.mocked(getAuthConfig).mockResolvedValue({
       available: true,
-      schema_version: 1,
+      schema_version: 2,
       auth_mode: "local",
       local_auth: { enabled: true },
       keycloak: {
         enabled: false,
         browser_session_ready: false,
-        login_url: null,
       },
+      providers: [],
       mcp_oauth: { enabled: false },
     });
 
@@ -44,14 +45,19 @@ describe("AuthForgotPage", () => {
   it.each([
     ["sso", {
       available: true,
-      schema_version: 1 as const,
+      schema_version: 2 as const,
       auth_mode: "sso" as const,
       local_auth: { enabled: false },
       keycloak: {
         enabled: true,
         browser_session_ready: false,
-        login_url: null,
       },
+      providers: [{
+        provider_type: "keycloak-oidc",
+        alias: "workforce",
+        display_name: "Company SSO",
+        login_url: null,
+      }],
       mcp_oauth: { enabled: false },
     }],
     ["unavailable", AUTH_CONFIG_UNAVAILABLE],

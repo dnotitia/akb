@@ -27,6 +27,7 @@ Use ``err(...)`` everywhere. Don't hand-craft error dicts; the
 flat-vs-nested rule has to be enforced in one place or it drifts
 back to ~6 shapes within a quarter.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -49,6 +50,7 @@ from app.exceptions import (
 
 # Resource lookup
 NOT_FOUND = "not_found"
+GONE = "gone"
 
 # Authorization / permission
 PERMISSION_DENIED = "permission_denied"
@@ -68,22 +70,22 @@ VAULT_WRITE_MANAGED = "vault_write_managed"
 INSUFFICIENT_SCOPE = "insufficient_scope"
 
 # Caller-side input
-INVALID_ARGUMENT = "invalid_argument"      # generic argument shape problem
+INVALID_ARGUMENT = "invalid_argument"  # generic argument shape problem
 INVALID_COLUMN_TYPE = "invalid_column_type"
-INVALID_URI = "invalid_uri"                # akb:// URI parse failure
-INVALID_PATH = "invalid_path"              # collection / file path failure
-UNKNOWN_ARGUMENT = "unknown_argument"      # arg key not in tool schema (0.5.4)
+INVALID_URI = "invalid_uri"  # akb:// URI parse failure
+INVALID_PATH = "invalid_path"  # collection / file path failure
+UNKNOWN_ARGUMENT = "unknown_argument"  # arg key not in tool schema (0.5.4)
 UNKNOWN_TOOL = "unknown_tool"
-CONFLICT = "conflict"                      # version / expected-state mismatch
+CONFLICT = "conflict"  # version / expected-state mismatch
 NATIVE_REVISION_SELECTOR_AMBIGUOUS = "native_revision_selector_ambiguous"
-WRITE_BUSY = "write_busy"                  # write-lane admission timed out — retry after backoff
-UNIQUE_VIOLATION = "unique_violation"      # PG 23505 — INSERT/UPDATE breaks a unique key
-EDIT_FAILED = "edit_failed"                # akb_edit: old_string match / uniqueness failure
+WRITE_BUSY = "write_busy"  # write-lane admission timed out — retry after backoff
+UNIQUE_VIOLATION = "unique_violation"  # PG 23505 — INSERT/UPDATE breaks a unique key
+EDIT_FAILED = "edit_failed"  # akb_edit: old_string match / uniqueness failure
 
 # SQL surface — `akb_sql`
 MULTI_STATEMENT = "multi_statement"
 METHOD_NOT_ALLOWED = "method_not_allowed"  # DDL via akb_sql, etc.
-SQL_ERROR = "sql_error"                    # generic PG error after enrichment
+SQL_ERROR = "sql_error"  # generic PG error after enrichment
 UNDEFINED_COLUMN = "undefined_column"
 UNDEFINED_TABLE = "undefined_table"
 UNFILTERED_MUTATION = "unfiltered_mutation"
@@ -94,11 +96,11 @@ NO_UNIQUE_CONSTRAINT = "no_unique_constraint"
 # (`table_row_query`). These sit alongside the generic INVALID_ARGUMENT
 # for shape errors, but carry a more specific code so SDK/codegen
 # clients can branch on the exact compiler rejection.
-INVALID_FILTER = "invalid_filter"          # malformed filter operand / op.value grammar
-INVALID_OPERATOR = "invalid_operator"      # unknown or unsupported row-read operator
-INVALID_CAST = "invalid_cast"              # unsupported / malformed JSON-path cast
-FILTER_TOO_DEEP = "filter_too_deep"        # boolean filter nesting past MAX_BOOL_DEPTH
-NOT_IMPLEMENTED = "not_implemented"        # recognized-but-unsupported request shape
+INVALID_FILTER = "invalid_filter"  # malformed filter operand / op.value grammar
+INVALID_OPERATOR = "invalid_operator"  # unknown or unsupported row-read operator
+INVALID_CAST = "invalid_cast"  # unsupported / malformed JSON-path cast
+FILTER_TOO_DEEP = "filter_too_deep"  # boolean filter nesting past MAX_BOOL_DEPTH
+NOT_IMPLEMENTED = "not_implemented"  # recognized-but-unsupported request shape
 
 # Knowledge-graph linking
 SELF_LINK = "self_link"
@@ -179,7 +181,8 @@ def exception_envelope(e: Exception) -> dict:
         )
     if isinstance(e, WriteBusyError):
         return err(
-            str(e), code=WRITE_BUSY,
+            str(e),
+            code=WRITE_BUSY,
             hint="The vault is under heavy write load. Wait a few seconds and retry; no partial write occurred.",
             retry_after_secs=e.retry_after_secs,
         )

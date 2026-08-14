@@ -3,9 +3,9 @@ import { ArrowLeft } from "lucide-react";
 import { Logo } from "@/components/logo";
 
 /**
- * Phase 1 fail-closed landing page. Phase 4 will replace this with a
- * server-custodied browser session; this component never redeems a code,
- * stores a credential, or marks a client-side SSO identity.
+ * Retired client-side callback. Ordinary SSO now completes on the fixed
+ * server callback and redirects with only an opaque AKB cookie. This route
+ * never redeems a code, stores a credential, or marks an SSO identity.
  */
 export default function AuthCallbackPage() {
   return (
@@ -14,11 +14,11 @@ export default function AuthCallbackPage() {
         <Logo size={40} subtitle />
         <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-lg p-7 sm:p-8">
           <h1 className="font-display text-2xl tracking-tight text-foreground mb-4">
-            SSO sign-in unavailable
+            Legacy SSO callback retired
           </h1>
           <p className="text-sm text-foreground-muted leading-relaxed mb-6">
-            Browser SSO sessions are not available in this release. No sign-in
-            code or credential was used.
+            AKB now completes SSO through its fixed server callback. Start the
+            sign-in flow again; no code or credential on this page was used.
           </p>
           <Link
             to="/auth"

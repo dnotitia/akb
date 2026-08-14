@@ -1,7 +1,14 @@
 import { Link, Outlet, useNavigate, Navigate, useLocation, useSearchParams } from "react-router-dom";
 import { useEffect, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Search as SearchIcon } from "lucide-react";
-import { getToken } from "@/lib/api";
+import {
+  clearPrivateAssetCache,
+  getAuthConfig,
+  getMe,
+  getToken,
+  type CurrentUser,
+} from "@/lib/api";
 import { useHealth } from "@/hooks/use-health";
 import { UserMenu } from "@/components/user-menu";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -20,7 +27,20 @@ function asMode(raw: string | null): SearchMode {
   return raw === "literal" ? "literal" : "dense";
 }
 
+function identityFingerprint(user: CurrentUser): string {
+  return JSON.stringify([
+    user.user_id,
+    user.username,
+    user.email,
+    user.display_name,
+    user.is_admin,
+    user.auth_method,
+    user.key_class,
+  ]);
+}
+
 export function Layout() {
+  const queryClient = useQueryClient();
   const navigate = useNavigate();
   const location = useLocation();
   const [searchParams] = useSearchParams();
@@ -31,6 +51,94 @@ export function Layout() {
   const [searchMode, setSearchMode] = useState<SearchMode>(() =>
     onSearchPage ? asMode(searchParams.get("mode")) : "dense",
   );
+  const [session, setSession] = useState<
+    | { status: "checking"; user: null }
+    | { status: "authenticated"; user: CurrentUser }
+    | { status: "unauthenticated"; user: null }
+  >({ status: "checking", user: null });
+  const [revalidating, setRevalidating] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const config = await getAuthConfig();
+      if (
+        config.available !== true ||
+        config.auth_mode === null ||
+        (config.auth_mode === "local" && !getToken())
+      ) {
+        if (!cancelled) setSession({ status: "unauthenticated", user: null });
+        return;
+      }
+      try {
+        const user = await getMe({ redirectOnUnauthorized: false });
+        if (!cancelled) setSession({ status: "authenticated", user });
+      } catch {
+        if (!cancelled) setSession({ status: "unauthenticated", user: null });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const activeUser = session.status === "authenticated" ? session.user : null;
+  const activeFingerprint = activeUser ? identityFingerprint(activeUser) : null;
+
+  useEffect(() => {
+    if (!activeUser || activeFingerprint === null) return;
+    let disposed = false;
+    let running = false;
+
+    const revalidateForegroundIdentity = async () => {
+      if (running || document.visibilityState === "hidden") return;
+      running = true;
+      setRevalidating(true);
+      clearPrivateAssetCache();
+      try {
+        const verified = await getMe({ redirectOnUnauthorized: false });
+        if (disposed) return;
+        const identityChanged = identityFingerprint(verified) !== activeFingerprint;
+        // SSO cookies are shared across tabs and are intentionally invisible
+        // to JavaScript. After every foreground proof, clear query state so a
+        // replaced identity or changed server-side ACL cannot inherit data
+        // rendered under the prior cookie. Local mode only pays this cost when
+        // its storage-backed identity actually changed.
+        if (activeUser.auth_method === "browser_session" || identityChanged) {
+          queryClient.clear();
+        }
+        setSession({ status: "authenticated", user: verified });
+      } catch {
+        if (disposed) return;
+        queryClient.clear();
+        clearPrivateAssetCache();
+        setSession({ status: "unauthenticated", user: null });
+      } finally {
+        running = false;
+        if (!disposed) setRevalidating(false);
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void revalidateForegroundIdentity();
+      }
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === null || event.key === "akb_token") {
+        void revalidateForegroundIdentity();
+      }
+    };
+
+    window.addEventListener("focus", revalidateForegroundIdentity);
+    window.addEventListener("storage", onStorage);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      disposed = true;
+      window.removeEventListener("focus", revalidateForegroundIdentity);
+      window.removeEventListener("storage", onStorage);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [activeFingerprint, activeUser, queryClient]);
 
   useEffect(() => {
     if (onSearchPage) {
@@ -41,9 +149,17 @@ export function Layout() {
   }, [location.pathname, searchParams]);
 
   const wide = appRouteBoundaryForPath(location.pathname) === "vault-shell";
-  const { data: health } = useHealth(!!getToken());
+  const { data: health } = useHealth(session.status === "authenticated");
 
-  if (!getToken()) {
+  if (session.status === "checking" || revalidating) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-background text-foreground">
+        <div className="coord" role="status" aria-live="polite">Verifying session…</div>
+      </div>
+    );
+  }
+
+  if (session.status === "unauthenticated") {
     // Preserve where the user was headed so /auth can return them there after
     // signing in (deep-linked / shared URLs don't dump everyone on home).
     const dest = location.pathname + location.search;
@@ -164,7 +280,7 @@ export function Layout() {
               <IndexingBadge pending={indexingPending} abandoned={indexingAbandoned} />
             </div>
             <ThemeToggle />
-            <UserMenu />
+            <UserMenu initialUser={session.user} />
           </nav>
         </div>
       </header>

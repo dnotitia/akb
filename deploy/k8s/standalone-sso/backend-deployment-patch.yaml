@@ -20,6 +20,10 @@ spec:
             - $(AKB_BOOTSTRAP_CLIENT_ID)
             - --bootstrap-client-secret-file
             - /var/run/akb-bootstrap/keycloak/client-secret
+            - --upgrade-client-id
+            - $(AKB_UPGRADE_CLIENT_ID)
+            - --upgrade-client-secret-file
+            - /var/run/akb-bootstrap/keycloak-upgrade/client-secret
             - --product-admin-username
             - $(AKB_PRODUCT_ADMIN_USERNAME)
             - --product-admin-email
@@ -37,6 +41,11 @@ spec:
                 configMapKeyRef:
                   name: akb-sso-bootstrap-config
                   key: product-admin-username
+            - name: AKB_UPGRADE_CLIENT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: akb-sso-bootstrap-config
+                  key: upgrade-client-id
             - name: AKB_PRODUCT_ADMIN_EMAIL
               valueFrom:
                 configMapKeyRef:
@@ -53,6 +62,9 @@ spec:
               readOnly: true
             - name: keycloak-bootstrap
               mountPath: /var/run/akb-bootstrap/keycloak
+              readOnly: true
+            - name: keycloak-upgrade
+              mountPath: /var/run/akb-bootstrap/keycloak-upgrade
               readOnly: true
             - name: product-admin-bootstrap
               mountPath: /var/run/akb-bootstrap/product-admin
@@ -75,6 +87,11 @@ spec:
         - name: keycloak-bootstrap
           secret:
             secretName: akb-keycloak-bootstrap # pragma: allowlist secret
+            defaultMode: 0400
+        - name: keycloak-upgrade
+          secret:
+            secretName: akb-keycloak-upgrade # pragma: allowlist secret
+            optional: true
             defaultMode: 0400
         - name: product-admin-bootstrap
           secret:

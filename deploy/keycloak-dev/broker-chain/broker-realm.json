@@ -1,0 +1,107 @@
+{
+  "realm": "akb",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": false,
+  "duplicateEmailsAllowed": false,
+  "clients": [
+    {
+      "clientId": "akb-sso-manager",
+      "name": "AKB SSO fixture management",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "fixture-only-management-secret",
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "implicitFlowEnabled": false,
+      "fullScopeAllowed": false,
+      "defaultClientScopes": ["service_account"],
+      "optionalClientScopes": []
+    },
+    {
+      "clientId": "fixture-browser",
+      "name": "Broker chain browser probe",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "implicitFlowEnabled": false,
+      "fullScopeAllowed": false,
+      "redirectUris": ["https://client.localhost/callback"],
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "defaultClientScopes": ["basic", "profile", "email"],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "akb-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "https://broker.localhost:19443/api",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        },
+        {
+          "name": "akb-browser-identity-provider",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usersessionmodel-note-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.session.note": "identity_provider",
+            "claim.name": "identity_provider",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "lightweight.claim": "false",
+            "userinfo.token.claim": "false",
+            "introspection.token.claim": "true",
+            "access.tokenResponse.claim": "false"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "service-account-akb-sso-manager",
+      "enabled": true,
+      "serviceAccountClientId": "akb-sso-manager",
+      "clientRoles": {
+        "realm-management": [
+          "manage-identity-providers",
+          "query-clients",
+          "query-users",
+          "view-clients",
+          "view-realm",
+          "view-users"
+        ]
+      }
+    }
+  ],
+  "clientScopeMappings": {
+    "realm-management": [
+      {
+        "client": "akb-sso-manager",
+        "roles": [
+          "manage-identity-providers",
+          "query-clients",
+          "query-users",
+          "view-clients",
+          "view-realm",
+          "view-users"
+        ]
+      }
+    ]
+  }
+}

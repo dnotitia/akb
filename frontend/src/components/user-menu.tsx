@@ -1,6 +1,7 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   LogOut,
   Monitor,
@@ -8,16 +9,9 @@ import {
   Settings as SettingsIcon,
   Sun,
 } from "lucide-react";
-import { getMe, setToken } from "@/lib/api";
+import { getMe, logoutOrdinarySession, type CurrentUser } from "@/lib/api";
 import { useTheme, type Theme } from "@/hooks/use-theme";
 import { TooltipText } from "@/components/ui/tooltip-text";
-
-interface User {
-  username?: string;
-  email?: string;
-  display_name?: string;
-  is_admin?: boolean;
-}
 
 const THEME_ICONS: Record<Theme, React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>> = {
   light: Sun,
@@ -38,16 +32,43 @@ const THEME_LABELS: Record<Theme, string> = {
  * standalone ThemeToggle, Sign out button) so the header has a single
  * "this is about me" control.
  */
-export function UserMenu() {
+export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const { theme, setTheme } = useTheme();
-  const [user, setUser] = useState<User | null>(null);
+  const [user, setUser] = useState<CurrentUser | null>(initialUser ?? null);
+  const [signOutError, setSignOutError] = useState("");
+  const [signingOut, setSigningOut] = useState(false);
+  const [open, setOpen] = useState(false);
 
   useEffect(() => {
+    if (initialUser) {
+      setUser(initialUser);
+      return;
+    }
     getMe()
       .then(setUser)
       .catch(() => setUser(null));
-  }, []);
+  }, [initialUser]);
+
+  async function signOut() {
+    setSignOutError("");
+    setSigningOut(true);
+    try {
+      const result = await logoutOrdinarySession();
+      queryClient.clear();
+      if (result.mode === "sso") {
+        window.location.assign(result.logout_url);
+        return;
+      }
+      setOpen(false);
+      navigate(result.logout_url, { replace: true });
+    } catch (caught) {
+      setSignOutError(caught instanceof Error ? caught.message : "Sign-out failed");
+    } finally {
+      setSigningOut(false);
+    }
+  }
 
   const label = user?.display_name || user?.username || "Account";
   // Glyph casing is CSS-only (`uppercase` on the avatar), not a JS transform of
@@ -55,7 +76,12 @@ export function UserMenu() {
   const initial = label[0] || "?";
 
   return (
-    <DropdownMenu.Root>
+    <DropdownMenu.Root
+      open={open}
+      onOpenChange={(next) => {
+        if (!signingOut || next) setOpen(next);
+      }}
+    >
       <DropdownMenu.Trigger
         aria-label={`Account menu — ${label}`}
         className="inline-flex h-9 items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface px-2 pr-3 text-foreground hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background transition-token cursor-pointer"
@@ -130,15 +156,22 @@ export function UserMenu() {
 
           <DropdownMenu.Separator className="h-px bg-border my-1" />
 
+          {signOutError && (
+            <div className="px-3 py-2 text-xs text-destructive" role="alert">
+              {signOutError}
+            </div>
+          )}
+
           <DropdownMenu.Item
-            onSelect={() => {
-              setToken(null);
-              navigate("/auth");
+            disabled={signingOut}
+            onSelect={(event) => {
+              event.preventDefault();
+              void signOut();
             }}
             className="flex cursor-pointer items-center gap-2 px-3 py-2 text-sm text-destructive outline-none data-[highlighted]:bg-destructive/10"
           >
             <LogOut className="h-4 w-4" aria-hidden />
-            <span>Sign out</span>
+            <span>{signingOut ? "Signing out…" : "Sign out"}</span>
           </DropdownMenu.Item>
         </DropdownMenu.Content>
       </DropdownMenu.Portal>

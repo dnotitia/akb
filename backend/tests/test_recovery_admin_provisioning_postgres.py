@@ -34,7 +34,7 @@ def _dsn_for_database(dsn: str, database: str) -> str:
 async def _can_connect(dsn: str) -> bool:
     try:
         conn = await asyncpg.connect(dsn, timeout=2.0)
-    except (OSError, asyncpg.PostgresError):
+    except OSError, asyncpg.PostgresError:
         return False
     await conn.close()
     return True
@@ -69,8 +69,7 @@ async def _fresh_database():
         if pool is not None:
             await pool.close()
         await admin.execute(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-            "WHERE datname = $1 AND pid <> pg_backend_pid()",
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
             database,
         )
         await admin.execute(f'DROP DATABASE "{database}"')
@@ -454,9 +453,7 @@ async def test_migration_upgrades_old_schema_and_is_idempotent(services):
 
     async with pool.acquire() as conn:
         await conn.execute("DROP INDEX users_one_recovery_admin")
-        await conn.execute(
-            "ALTER TABLE users DROP CONSTRAINT users_recovery_admin_requires_admin"
-        )
+        await conn.execute("ALTER TABLE users DROP CONSTRAINT users_recovery_admin_requires_admin")
         await conn.execute("ALTER TABLE users DROP COLUMN is_recovery_admin")
         await conn.execute("ALTER TABLE external_identities DROP COLUMN username_snapshot")
 
@@ -542,9 +539,13 @@ async def test_sso_bootstrap_retirement_receipt_migrates_and_is_monotonic(
     async with pool.acquire() as conn:
         await conn.execute("DROP TABLE standalone_sso_bootstrap_retirements")
         migration = _load_migration("073_sso_bootstrap_receipt.py")
+        callback_migration = _load_migration("075_sso_callback_receipt.py")
         assert migration is not None
+        assert callback_migration is not None
         await migration.migrate(conn)
         await migration.migrate(conn)
+        await callback_migration.migrate(conn)
+        await callback_migration.migrate(conn)
 
     async def _get_pool():
         return pool
@@ -560,6 +561,7 @@ async def test_sso_bootstrap_retirement_receipt_migrates_and_is_monotonic(
         api_client_uuid="api-client-uuid",
         product_admin_subject="00000000-0000-4000-8000-000000000001",
         akb_user_id="11111111-1111-4111-8111-111111111111",
+        backchannel_logout_uri=("https://akb.example.com/api/v1/auth/keycloak/backchannel-logout"),
     )
 
     assert await receipt_service.load_standalone_sso_retirement_receipt() is None
@@ -567,12 +569,21 @@ async def test_sso_bootstrap_retirement_receipt_migrates_and_is_monotonic(
     await receipt_service.record_standalone_sso_retirement_receipt(expected)
     assert await receipt_service.load_standalone_sso_retirement_receipt() == expected
 
+    migrated = replace(
+        expected,
+        bootstrap_client_id="akb-bootstrap-upgrade-v2",
+        backchannel_logout_uri=("http://backend:8000/api/v1/auth/keycloak/backchannel-logout"),
+    )
+    await receipt_service.record_standalone_sso_retirement_receipt(
+        migrated,
+        previous_receipt=expected,
+    )
+    assert await receipt_service.load_standalone_sso_retirement_receipt() == migrated
+
     with pytest.raises(StandaloneSSOBootstrapError):
         await receipt_service.record_standalone_sso_retirement_receipt(
-            replace(expected, issuer="https://other.example.com/realms/akb")
+            replace(migrated, issuer="https://other.example.com/realms/akb")
         )
 
     async with pool.acquire() as conn:
-        assert await conn.fetchval(
-            "SELECT COUNT(*) FROM standalone_sso_bootstrap_retirements"
-        ) == 1
+        assert await conn.fetchval("SELECT COUNT(*) FROM standalone_sso_bootstrap_retirements") == 1

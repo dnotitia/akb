@@ -38,6 +38,7 @@ from app.services.revision_backend import (
     canonical_document_revision_backend,
     selected_document_revision_backend,
 )
+from app.services.sso_callback_urls import is_backchannel_logout_uri
 from app.services.role_sync import RoleSync, get_role_sync, set_role_sync
 from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
 from app.services.vector_store import get_vector_store
@@ -100,8 +101,8 @@ def _validate_required_settings() -> None:
             "https://akb.example.com)"
         )
     # A configured Keycloak authority always needs its pinned issuer inputs.
-    # Ordinary SSO browser custody remains staged for Phase 4. The dedicated
-    # Phase 2 product-admin client is active, confidential, and independently
+    # Ordinary browser custody is activated separately by its encryption key;
+    # the dedicated product-admin client remains confidential and independently
     # validated here.
     if settings.keycloak_enabled:
         if not settings.keycloak_server_url.strip():
@@ -109,6 +110,10 @@ def _validate_required_settings() -> None:
         if not settings.keycloak_realm.strip():
             missing.append("keycloak_realm (keycloak_enabled is true)")
         if settings.sso_human_auth_enabled:
+            if settings.sso_session_epoch is None:
+                missing.append(
+                    "sso_session_epoch (auth_mode is sso — generate and persist one UUID per SSO authority epoch)"
+                )
             if not settings.keycloak_human_client_ids:
                 missing.append(
                     "keycloak_client_id or companion client ID (auth_mode is sso — human API client allowlist is empty)"
@@ -136,6 +141,18 @@ def _validate_required_settings() -> None:
     if missing:
         raise RuntimeError("Required configuration missing:\n  - " + "\n  - ".join(missing))
     if auth_mode == "sso":
+        if settings.sso_browser_session_encryption_key:
+            from app.services.sso_browser_session_crypto import (
+                BrowserSessionCipher,
+                BrowserSessionKeyError,
+            )
+
+            try:
+                BrowserSessionCipher.from_encoded_key(settings.sso_browser_session_encryption_key)
+            except BrowserSessionKeyError:
+                raise RuntimeError(
+                    "sso_browser_session_encryption_key must be base64url-encoded 256-bit key material"
+                ) from None
         if settings.keycloak_admin_client_id in settings.keycloak_human_client_ids:
             raise RuntimeError("keycloak_admin_client_id must be dedicated to the product-admin surface")
         if not _is_secure_browser_url(settings.public_base_url):
@@ -145,6 +162,12 @@ def _validate_required_settings() -> None:
         if not _is_secure_browser_url(settings.keycloak_server_url):
             raise RuntimeError(
                 "auth_mode=sso requires an HTTPS public Keycloak URL; plain HTTP is allowed only on loopback"
+            )
+        if not is_backchannel_logout_uri(
+            settings.keycloak_backchannel_logout_uri_effective
+        ):
+            raise RuntimeError(
+                "auth_mode=sso requires an exact HTTP(S) AKB back-channel logout URI"
             )
     if auth_mode == "local":
         from app.services.local_session_keys import get_local_session_keyset
@@ -158,6 +181,16 @@ async def init_storage() -> None:
     await pre_migration_revision_authority_guard()
     await init_db()
     logger.info("Database initialized")
+    from app.services.sso_session_epoch import reconcile_sso_session_epoch
+
+    epoch_result = await reconcile_sso_session_epoch()
+    if epoch_result.changed:
+        logger.warning(
+            "Authentication runtime boundary changed; revoked ordinary=%d admin=%d logout_fences=%d",
+            epoch_result.ordinary_sessions_revoked,
+            epoch_result.admin_sessions_revoked,
+            epoch_result.logout_fences_revoked,
+        )
     authority_status = await startup_revision_authority_preflight()
     logger.info(
         "Document revision authority ready: backend=%s status=%s",

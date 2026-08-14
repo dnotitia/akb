@@ -18,7 +18,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 
 import AuthPage from "../auth";
-import { authLogin, authRegister, getToken, setToken } from "@/lib/api";
+import { authLogin, authRegister, getMe, getToken, setToken } from "@/lib/api";
 
 vi.mock("@/lib/api", () => ({
   authLogin: vi.fn(),
@@ -26,18 +26,19 @@ vi.mock("@/lib/api", () => ({
   setToken: vi.fn(),
   // null → not signed in, so AuthPage's authed-guard doesn't redirect on mount.
   getToken: vi.fn(() => null),
+  getMe: vi.fn(),
   // Optional Keycloak SSO probe — default disabled so the SSO button stays
   // hidden and AuthPage's mount effect resolves cleanly.
   getAuthConfig: vi.fn().mockResolvedValue({
     available: true,
-    schema_version: 1,
+    schema_version: 2,
     auth_mode: "local",
     local_auth: { enabled: true },
     keycloak: {
       enabled: false,
       browser_session_ready: false,
-      login_url: null,
     },
+    providers: [],
     mcp_oauth: { enabled: false },
   }),
 }));
@@ -45,6 +46,7 @@ vi.mock("@/lib/api", () => ({
 const mockedLogin = vi.mocked(authLogin);
 const mockedRegister = vi.mocked(authRegister);
 const mockedSetToken = vi.mocked(setToken);
+const mockedGetMe = vi.mocked(getMe);
 
 const navigate = vi.fn();
 vi.mock("react-router-dom", async () => {
@@ -62,6 +64,16 @@ beforeEach(() => {
   mockedLogin.mockReset();
   mockedRegister.mockReset();
   mockedSetToken.mockReset();
+  mockedGetMe.mockReset();
+  mockedGetMe.mockResolvedValue({
+    user_id: "user-1",
+    username: "alice",
+    email: "alice@example.com",
+    display_name: "Alice",
+    is_admin: false,
+    auth_method: "jwt",
+    key_class: null,
+  });
   navigate.mockReset();
 });
 

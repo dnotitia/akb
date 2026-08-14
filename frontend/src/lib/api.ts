@@ -1,6 +1,12 @@
 const API_BASE = "/api/v1";
 
+export type AuthMode = "local" | "sso";
+
 let _token: string | null = null;
+let _authMode: AuthMode | null = null;
+let _authSessionGeneration = 0;
+const SAFE_AUTH_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+const LOCAL_TOKEN_STORAGE_KEY = "akb_token";
 
 const PRIVATE_ASSET_CACHE_MAX_ENTRIES = 32;
 const PRIVATE_ASSET_CACHE_MAX_BYTES = 64 * 1024 * 1024;
@@ -21,20 +27,63 @@ export function clearPrivateAssetCache() {
   privateAssetFlights.clear();
 }
 
+type StoredTokenRead =
+  | { available: true; value: string | null }
+  | { available: false; value: null };
+
+function readStoredToken(): StoredTokenRead {
+  try {
+    return { available: true, value: localStorage.getItem(LOCAL_TOKEN_STORAGE_KEY) };
+  } catch {
+    // Cookie-backed SSO must remain usable when storage is blocked by browser
+    // policy. Local mode can still retain a token in memory for this tab.
+    return { available: false, value: null };
+  }
+}
+
+function writeStoredToken(token: string | null) {
+  try {
+    if (token) localStorage.setItem(LOCAL_TOKEN_STORAGE_KEY, token);
+    else localStorage.removeItem(LOCAL_TOKEN_STORAGE_KEY);
+  } catch {
+    // Best effort only; `_token` remains the current tab's local carrier.
+  }
+}
+
 export function setToken(t: string | null) {
-  if (_token !== t) clearPrivateAssetCache();
+  const stored = readStoredToken();
+  if (_token !== t || (stored.available && stored.value !== t)) {
+    _authSessionGeneration += 1;
+    clearPrivateAssetCache();
+  }
   _token = t;
-  if (t) localStorage.setItem("akb_token", t);
-  else localStorage.removeItem("akb_token");
+  writeStoredToken(t);
+}
+
+/**
+ * Select the browser credential carrier from the server-owned auth policy.
+ * A stale local JWT is destroyed as soon as an SSO policy is accepted, so an
+ * explicit Authorization header can never shadow the HttpOnly SSO session.
+ */
+export function configureAuthTransport(mode: AuthMode | null) {
+  if (_authMode !== mode) {
+    _authMode = mode;
+    _authSessionGeneration += 1;
+    clearPrivateAssetCache();
+  }
+  const stored = readStoredToken();
+  if (mode === "sso" && (_token !== null || (stored.available && stored.value !== null))) {
+    setToken(null);
+  }
 }
 
 function privateAssetCacheKey(
-  token: string,
+  sessionGeneration: number,
   fileId: string,
   vault: string,
   source?: { document: string; commit: string },
 ) {
-  return [token, vault, source?.document ?? "live", source?.commit ?? "live", fileId].join("\u0000");
+  return [sessionGeneration, vault, source?.document ?? "live", source?.commit ?? "live", fileId].join("\u0000");
 }
 
 function readPrivateAssetCache(key: string): Blob | null {
@@ -77,8 +126,20 @@ function waitForAssetFlight(flight: AssetFlight, signal?: AbortSignal): Promise<
 }
 
 export function getToken(): string | null {
-  if (!_token) _token = localStorage.getItem("akb_token");
+  if (_authMode === "sso") return null;
+  const stored = readStoredToken();
+  if (stored.available && stored.value !== _token) {
+    _token = stored.value;
+    _authSessionGeneration += 1;
+    clearPrivateAssetCache();
+  }
   return _token;
+}
+
+function ssoCsrfCookieName(): string {
+  return window.location.protocol === "https:"
+    ? "__Host-akb_sso_csrf"
+    : "akb_dev_sso_csrf";
 }
 
 /**
@@ -98,41 +159,74 @@ export class ApiError<T = unknown> extends Error {
   }
 }
 
-function withBearerToken(headers?: HeadersInit): HeadersInit {
-  const token = getToken();
+function withAuthCarrier(headers: HeadersInit | undefined, method: string): HeadersInit {
+  const unsafeMethod = !SAFE_AUTH_METHODS.has(method.toUpperCase());
   if (headers instanceof Headers || Array.isArray(headers)) {
     const merged = new Headers(headers);
-    if (token) merged.set("Authorization", `Bearer ${token}`);
+    if (_authMode === "local" && !merged.has("Authorization")) {
+      const token = getToken();
+      if (token) merged.set("Authorization", `Bearer ${token}`);
+    }
+    if (_authMode === "sso" && unsafeMethod && !merged.has("Authorization")) {
+      const csrf = cookieValue(ssoCsrfCookieName());
+      if (csrf) merged.set("X-AKB-CSRF", csrf);
+    }
     return merged;
   }
-  return {
-    ...(headers || {}),
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
-  };
+  const merged = { ...(headers || {}) } as Record<string, string>;
+  const hasHeader = (name: string) =>
+    Object.keys(merged).some((candidate) => candidate.toLowerCase() === name.toLowerCase());
+  if (_authMode === "local" && !hasHeader("Authorization")) {
+    const token = getToken();
+    if (token) merged.Authorization = `Bearer ${token}`;
+  }
+  if (_authMode === "sso" && unsafeMethod && !hasHeader("Authorization")) {
+    const csrf = cookieValue(ssoCsrfCookieName());
+    if (csrf) merged["X-AKB-CSRF"] = csrf;
+  }
+  return merged;
 }
 
 function expireUnauthorizedSession(redirect: boolean) {
-  setToken(null);
+  if (_authMode === "local" || getToken() !== null) {
+    setToken(null);
+  } else {
+    _authSessionGeneration += 1;
+    clearPrivateAssetCache();
+  }
   if (redirect && !location.pathname.startsWith("/auth")) {
     location.href =
       "/auth?next=" + encodeURIComponent(location.pathname + location.search);
   }
 }
 
-async function authenticatedFetch(
+export async function authenticatedFetch(
   input: RequestInfo | URL,
   init?: RequestInit,
   { unauthorized = "expire-and-redirect" }: {
-    unauthorized?: "expire-and-redirect" | "preserve-session";
+    unauthorized?: "expire-and-redirect" | "expire" | "preserve-session";
   } = {},
 ): Promise<Response> {
+  const rawUrl =
+    typeof input === "string"
+      ? input
+      : input instanceof URL
+        ? input.href
+        : input.url;
+  const resolvedUrl = new URL(rawUrl, window.location.href);
+  if (resolvedUrl.origin !== window.location.origin) {
+    throw new Error("Authenticated requests must remain same-origin");
+  }
+  const requestMethod = init?.method || (input instanceof Request ? input.method : "GET");
+  const requestHeaders = init?.headers || (input instanceof Request ? input.headers : undefined);
   const res = await fetch(input, {
     ...init,
-    headers: withBearerToken(init?.headers),
+    credentials: "same-origin",
+    headers: withAuthCarrier(requestHeaders, requestMethod),
   });
   if (res.status === 401) {
-    if (unauthorized === "expire-and-redirect") {
-      expireUnauthorizedSession(true);
+    if (unauthorized !== "preserve-session") {
+      expireUnauthorizedSession(unauthorized === "expire-and-redirect");
     }
     throw new Error("Unauthorized");
   }
@@ -152,12 +246,20 @@ async function throwJsonApiError(res: Response): Promise<never> {
   throw new Error(body.error || body.detail || `${res.status} ${res.statusText}`);
 }
 
-async function api<T>(path: string, opts?: RequestInit): Promise<T> {
+async function api<T>(
+  path: string,
+  opts?: RequestInit,
+  unauthorized: "expire-and-redirect" | "expire" | "preserve-session" = "expire-and-redirect",
+): Promise<T> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...((opts?.headers as Record<string, string>) || {}),
   };
-  const res = await authenticatedFetch(`${API_BASE}${path}`, { ...opts, headers });
+  const res = await authenticatedFetch(
+    `${API_BASE}${path}`,
+    { ...opts, headers },
+    { unauthorized },
+  );
   if (!res.ok) {
     await throwJsonApiError(res);
   }
@@ -217,18 +319,23 @@ export const authLogin = (username: string, password: string) =>
     body: JSON.stringify({ username, password }),
   }).then(parseAuthResponse);
 
-export type AuthMode = "local" | "sso";
+export interface AuthProviderOption {
+  provider_type: string;
+  alias: string;
+  display_name: string;
+  login_url: string | null;
+}
 
 export interface AuthConfig {
   available: boolean;
-  schema_version: 1 | null;
+  schema_version: 2 | null;
   auth_mode: AuthMode | null;
   local_auth: { enabled: boolean };
   keycloak: {
     enabled: boolean;
     browser_session_ready: boolean;
-    login_url: string | null;
   };
+  providers: AuthProviderOption[];
   mcp_oauth: { enabled: boolean };
 }
 
@@ -240,8 +347,8 @@ export const AUTH_CONFIG_UNAVAILABLE: AuthConfig = {
   keycloak: {
     enabled: false,
     browser_session_ready: false,
-    login_url: null,
   },
+  providers: [],
   mcp_oauth: { enabled: false },
 };
 
@@ -261,42 +368,85 @@ function hasExactKeys(
   return actual.length === exact.length && actual.every((key, index) => key === exact[index]);
 }
 
+function hasControlCharacters(value: string): boolean {
+  return Array.from(value).some((character) => {
+    const code = character.charCodeAt(0);
+    return code < 0x20 || code === 0x7f;
+  });
+}
+
 export function parseAuthConfig(value: unknown): AuthConfig {
   const root = record(value);
   const localAuth = record(root?.local_auth);
   const keycloak = record(root?.keycloak);
   const mcpOauth = record(root?.mcp_oauth);
   const mode = root?.auth_mode;
-  const loginUrl = keycloak?.login_url;
+  const providerValues = root?.providers;
   if (
-    !hasExactKeys(root, ["schema_version", "auth_mode", "local_auth", "keycloak", "mcp_oauth"]) ||
+    !hasExactKeys(root, ["schema_version", "auth_mode", "local_auth", "keycloak", "providers", "mcp_oauth"]) ||
     !hasExactKeys(localAuth, ["enabled"]) ||
-    !hasExactKeys(keycloak, ["enabled", "browser_session_ready", "login_url"]) ||
+    !hasExactKeys(keycloak, ["enabled", "browser_session_ready"]) ||
     !hasExactKeys(mcpOauth, ["enabled"]) ||
-    root?.schema_version !== 1 ||
+    root?.schema_version !== 2 ||
     (mode !== "local" && mode !== "sso") ||
     typeof localAuth?.enabled !== "boolean" ||
     typeof keycloak?.enabled !== "boolean" ||
     typeof keycloak?.browser_session_ready !== "boolean" ||
-    (loginUrl !== null && typeof loginUrl !== "string") ||
+    !Array.isArray(providerValues) ||
+    providerValues.length > 100 ||
     typeof mcpOauth?.enabled !== "boolean" ||
     localAuth.enabled !== (mode === "local") ||
     keycloak.enabled !== (mode === "sso") ||
-    (keycloak.browser_session_ready && (!keycloak.enabled || !loginUrl)) ||
-    (!keycloak.browser_session_ready && loginUrl !== null)
+    (keycloak.browser_session_ready && !keycloak.enabled) ||
+    (mode === "local" && providerValues.length !== 0)
   ) {
     return AUTH_CONFIG_UNAVAILABLE;
   }
+  const aliases = new Set<string>();
+  const providers: AuthProviderOption[] = [];
+  for (const value of providerValues) {
+    const provider = record(value);
+    if (!hasExactKeys(provider, ["provider_type", "alias", "display_name", "login_url"])) {
+      return AUTH_CONFIG_UNAVAILABLE;
+    }
+    const providerType = provider.provider_type;
+    const alias = provider.alias;
+    const displayName = provider.display_name;
+    const loginUrl = provider.login_url;
+    if (
+      typeof providerType !== "string" ||
+      !/^[a-z0-9][a-z0-9-]{0,79}$/.test(providerType) ||
+      typeof alias !== "string" ||
+      !/^[a-z0-9][a-z0-9._-]{0,62}$/.test(alias) ||
+      aliases.has(alias) ||
+      typeof displayName !== "string" ||
+      !displayName.trim() ||
+      displayName.length > 80 ||
+      hasControlCharacters(displayName) ||
+      (loginUrl !== null && typeof loginUrl !== "string") ||
+      (!keycloak.browser_session_ready && loginUrl !== null) ||
+      (keycloak.browser_session_ready && loginUrl !== `/api/v1/auth/sso/${alias}/login`)
+    ) {
+      return AUTH_CONFIG_UNAVAILABLE;
+    }
+    aliases.add(alias);
+    providers.push({
+      provider_type: providerType,
+      alias,
+      display_name: displayName,
+      login_url: loginUrl,
+    });
+  }
   return {
     available: true,
-    schema_version: 1,
+    schema_version: 2,
     auth_mode: mode,
     local_auth: { enabled: localAuth.enabled },
     keycloak: {
       enabled: keycloak.enabled,
       browser_session_ready: keycloak.browser_session_ready,
-      login_url: loginUrl,
     },
+    providers,
     mcp_oauth: { enabled: mcpOauth.enabled },
   };
 }
@@ -306,7 +456,11 @@ export async function getAuthConfig(): Promise<AuthConfig> {
   try {
     const response = await fetch(`${API_BASE}/auth/config`);
     if (!response.ok) return AUTH_CONFIG_UNAVAILABLE;
-    return parseAuthConfig(await response.json());
+    const config = parseAuthConfig(await response.json());
+    if (config.available && config.auth_mode !== null) {
+      configureAuthTransport(config.auth_mode);
+    }
+    return config;
   } catch {
     return AUTH_CONFIG_UNAVAILABLE;
   }
@@ -365,7 +519,11 @@ export async function getAdminAuthConfig(): Promise<AdminAuthConfig> {
   try {
     const response = await fetch(`${API_BASE}/admin/auth/config`);
     if (!response.ok) return ADMIN_AUTH_CONFIG_UNAVAILABLE;
-    return parseAdminAuthConfig(await response.json());
+    const config = parseAdminAuthConfig(await response.json());
+    if (config.available && config.auth_mode !== null) {
+      configureAuthTransport(config.auth_mode);
+    }
+    return config;
   } catch {
     return ADMIN_AUTH_CONFIG_UNAVAILABLE;
   }
@@ -425,10 +583,20 @@ function cookieValue(name: string): string | null {
   for (const entry of document.cookie.split(";")) {
     const candidate = entry.trim();
     if (candidate.startsWith(prefix)) {
-      return decodeURIComponent(candidate.slice(prefix.length));
+      try {
+        return decodeURIComponent(candidate.slice(prefix.length));
+      } catch {
+        return null;
+      }
     }
   }
   return null;
+}
+
+function adminCsrfCookieName(): string {
+  return window.location.protocol === "https:"
+    ? "__Host-akb_admin_csrf"
+    : "akb_dev_admin_csrf";
 }
 
 export async function getAdminSession(): Promise<AdminSession | null> {
@@ -451,7 +619,7 @@ export const adminLocalLogin = (username: string, password: string) =>
 
 export async function adminLogout(): Promise<{ logout_url: string }> {
   const headers = adminHeaders();
-  const csrf = cookieValue("akb_admin_csrf");
+  const csrf = cookieValue(adminCsrfCookieName());
   if (csrf) headers.set("X-AKB-Admin-CSRF", csrf);
   const response = await fetch(`${API_BASE}/admin/auth/logout`, {
     method: "POST",
@@ -460,14 +628,306 @@ export async function adminLogout(): Promise<{ logout_url: string }> {
   });
   if (!response.ok) await throwJsonApiError(response);
   const payload = record(await response.json());
-  if (!hasExactKeys(payload, ["logout_url"]) || typeof payload.logout_url !== "string") {
+  if (
+    !hasExactKeys(payload, ["logout_url"]) ||
+    typeof payload.logout_url !== "string" ||
+    !payload.logout_url ||
+    payload.logout_url.length > 4096 ||
+    hasControlCharacters(payload.logout_url)
+  ) {
     throw new Error("Invalid product-admin logout response");
   }
-  return { logout_url: payload.logout_url };
+  let navigation: URL;
+  try {
+    navigation = new URL(payload.logout_url, window.location.href);
+  } catch {
+    throw new Error("Invalid product-admin logout response");
+  }
+  if (
+    !["http:", "https:"].includes(navigation.protocol) ||
+    navigation.username !== "" ||
+    navigation.password !== "" ||
+    navigation.hash !== ""
+  ) {
+    throw new Error("Invalid product-admin logout response");
+  }
+  return {
+    logout_url:
+      navigation.origin === window.location.origin
+        ? `${navigation.pathname}${navigation.search}`
+        : navigation.href,
+  };
 }
 
-// ── Auth (token) ──
-export const getMe = () => api<any>("/auth/me");
+export type AdminSsoProviderState =
+  | "configured_disabled"
+  | "enabled"
+  | "configuration_error";
+
+export interface AdminSsoProvider {
+  provider_type: string;
+  alias: string;
+  display_name: string;
+  state: AdminSsoProviderState;
+  enabled: boolean;
+  issuer: string | null;
+  discovery_url: string | null;
+  client_id: string | null;
+  client_secret_configured: boolean;
+  redirect_uri: string;
+  capabilities: {
+    supports_logout: boolean;
+    supports_identity_migration: boolean;
+  };
+}
+
+export interface AdminSsoCatalog {
+  schema_version: 1;
+  auth_mode: "sso";
+  control_mode: "direct" | "delegated";
+  supported_provider_types: string[];
+  providers: AdminSsoProvider[];
+}
+
+function parseAdminSsoProvider(value: unknown): AdminSsoProvider {
+  const provider = record(value);
+  const capabilities = record(provider?.capabilities);
+  const state = provider?.state;
+  if (
+    !hasExactKeys(provider, [
+      "provider_type", "alias", "display_name", "state", "enabled", "issuer",
+      "discovery_url", "client_id", "client_secret_configured",
+      "redirect_uri", "capabilities",
+    ]) ||
+    !hasExactKeys(capabilities, ["supports_logout", "supports_identity_migration"]) ||
+    typeof provider.provider_type !== "string" ||
+    !/^[a-z0-9][a-z0-9-]{0,79}$/.test(provider.provider_type) ||
+    typeof provider.alias !== "string" ||
+    !/^[a-z0-9][a-z0-9._-]{0,62}$/.test(provider.alias) ||
+    typeof provider.display_name !== "string" ||
+    !provider.display_name.trim() ||
+    provider.display_name.length > 80 ||
+    hasControlCharacters(provider.display_name) ||
+    (state !== "configured_disabled" && state !== "enabled" && state !== "configuration_error") ||
+    typeof provider.enabled !== "boolean" ||
+    (state === "enabled" && provider.enabled !== true) ||
+    (state === "configured_disabled" && provider.enabled !== false) ||
+    (provider.issuer !== null && (
+      typeof provider.issuer !== "string" ||
+      provider.issuer.length > 2048 ||
+      hasControlCharacters(provider.issuer)
+    )) ||
+    (provider.discovery_url !== null && (
+      typeof provider.discovery_url !== "string" ||
+      provider.discovery_url.length > 2048 ||
+      hasControlCharacters(provider.discovery_url)
+    )) ||
+    (provider.client_id !== null && (
+      typeof provider.client_id !== "string" ||
+      provider.client_id.length > 255 ||
+      hasControlCharacters(provider.client_id)
+    )) ||
+    typeof provider.client_secret_configured !== "boolean" || // pragma: allowlist secret
+    typeof provider.redirect_uri !== "string" ||
+    !provider.redirect_uri ||
+    provider.redirect_uri.length > 2048 ||
+    hasControlCharacters(provider.redirect_uri) ||
+    ((state === "enabled" || state === "configured_disabled") && (
+      provider.issuer === null ||
+      provider.discovery_url === null ||
+      provider.client_id === null ||
+      provider.client_secret_configured !== true // pragma: allowlist secret
+    )) ||
+    typeof capabilities.supports_logout !== "boolean" ||
+    typeof capabilities.supports_identity_migration !== "boolean"
+  ) {
+    throw new Error("Invalid SSO provider response");
+  }
+  return {
+    provider_type: provider.provider_type,
+    alias: provider.alias,
+    display_name: provider.display_name,
+    state,
+    enabled: provider.enabled,
+    issuer: provider.issuer as string | null,
+    discovery_url: provider.discovery_url as string | null,
+    client_id: provider.client_id as string | null,
+    client_secret_configured: provider.client_secret_configured,
+    redirect_uri: provider.redirect_uri,
+    capabilities: {
+      supports_logout: capabilities.supports_logout,
+      supports_identity_migration: capabilities.supports_identity_migration,
+    },
+  };
+}
+
+export function parseAdminSsoCatalog(value: unknown): AdminSsoCatalog {
+  const root = record(value);
+  const types = root?.supported_provider_types;
+  const values = root?.providers;
+  if (
+    !hasExactKeys(root, [
+      "schema_version", "auth_mode", "control_mode",
+      "supported_provider_types", "providers",
+    ]) ||
+    root.schema_version !== 1 ||
+    root.auth_mode !== "sso" ||
+    (root.control_mode !== "direct" && root.control_mode !== "delegated") ||
+    !Array.isArray(types) ||
+    types.length > 32 ||
+    types.some((type) => typeof type !== "string" || !/^[a-z0-9][a-z0-9-]{0,79}$/.test(type)) ||
+    new Set(types).size !== types.length ||
+    !Array.isArray(values) ||
+    values.length > 100 ||
+    (root.control_mode === "delegated" && values.length !== 0)
+  ) {
+    throw new Error("Invalid SSO provider catalog response");
+  }
+  const providers = values.map(parseAdminSsoProvider);
+  if (
+    new Set(providers.map((provider) => provider.alias)).size !== providers.length ||
+    providers.some((provider) => !types.includes(provider.provider_type))
+  ) {
+    throw new Error("Invalid SSO provider catalog response");
+  }
+  return {
+    schema_version: 1,
+    auth_mode: "sso",
+    control_mode: root.control_mode,
+    supported_provider_types: types,
+    providers,
+  };
+}
+
+function adminSsoHeaders({ mutation = false }: { mutation?: boolean } = {}): Headers {
+  const headers = adminHeaders();
+  if (mutation) {
+    headers.set("Content-Type", "application/json");
+    const csrf = cookieValue(adminCsrfCookieName());
+    if (csrf) headers.set("X-AKB-Admin-CSRF", csrf);
+  }
+  return headers;
+}
+
+export async function getAdminSsoCatalog(): Promise<AdminSsoCatalog> {
+  const response = await fetch(`${API_BASE}/admin/sso/providers`, {
+    credentials: "same-origin",
+    headers: adminSsoHeaders(),
+  });
+  if (!response.ok) await throwJsonApiError(response);
+  return parseAdminSsoCatalog(await response.json());
+}
+
+export interface ConfigureAdminSsoProvider {
+  provider_type: string;
+  display_name: string;
+  issuer: string;
+  discovery_url: string;
+  client_id: string;
+  client_secret?: string;
+}
+
+async function parseAdminSsoMutation(response: Response): Promise<AdminSsoProvider> {
+  if (!response.ok) await throwJsonApiError(response);
+  const payload = record(await response.json());
+  if (!hasExactKeys(payload, ["provider"])) {
+    throw new Error("Invalid SSO provider mutation response");
+  }
+  return parseAdminSsoProvider(payload.provider);
+}
+
+export function configureAdminSsoProvider(
+  alias: string,
+  input: ConfigureAdminSsoProvider,
+): Promise<AdminSsoProvider> {
+  return fetch(`${API_BASE}/admin/sso/providers/${encodeURIComponent(alias)}`, {
+    method: "PUT",
+    credentials: "same-origin",
+    headers: adminSsoHeaders({ mutation: true }),
+    body: JSON.stringify(input),
+  }).then(parseAdminSsoMutation);
+}
+
+export function setAdminSsoProviderEnabled(
+  alias: string,
+  enabled: boolean,
+): Promise<AdminSsoProvider> {
+  const verb = enabled ? "enable" : "disable";
+  return fetch(
+    `${API_BASE}/admin/sso/providers/${encodeURIComponent(alias)}/${verb}`,
+    {
+      method: "POST",
+      credentials: "same-origin",
+      headers: adminSsoHeaders({ mutation: true }),
+    },
+  ).then(parseAdminSsoMutation);
+}
+
+// ── Auth (ordinary browser session) ──
+export interface CurrentUser {
+  user_id: string;
+  username: string;
+  email: string;
+  display_name: string | null;
+  is_admin: boolean;
+  auth_method: string;
+  key_class: string | null;
+}
+
+export const getMe = (
+  { redirectOnUnauthorized = true }: { redirectOnUnauthorized?: boolean } = {},
+) => api<CurrentUser>(
+  "/auth/me",
+  undefined,
+  redirectOnUnauthorized ? "expire-and-redirect" : "expire",
+);
+
+export interface OrdinaryLogoutResult {
+  mode: AuthMode;
+  logout_url: string;
+}
+
+export async function logoutOrdinarySession(): Promise<OrdinaryLogoutResult> {
+  const mode = _authMode === "sso" ? "sso" : "local";
+  if (mode === "local") {
+    setToken(null);
+    return { mode, logout_url: "/auth" };
+  }
+  const response = await authenticatedFetch(
+    `${API_BASE}/auth/logout`,
+    { method: "POST" },
+    { unauthorized: "preserve-session" },
+  );
+  if (!response.ok) await throwJsonApiError(response);
+  const payload = record(await response.json());
+  if (
+    !hasExactKeys(payload, ["logout_url"]) ||
+    typeof payload.logout_url !== "string" ||
+    !payload.logout_url ||
+    payload.logout_url.length > 4096 ||
+    hasControlCharacters(payload.logout_url)
+  ) {
+    throw new Error("Invalid SSO logout response");
+  }
+  let navigation: URL;
+  try {
+    navigation = new URL(payload.logout_url);
+  } catch {
+    throw new Error("Invalid SSO logout response");
+  }
+  if (
+    !["http:", "https:"].includes(navigation.protocol) ||
+    navigation.username !== "" ||
+    navigation.password !== "" ||
+    navigation.hash !== ""
+  ) {
+    throw new Error("Invalid SSO logout response");
+  }
+  _authSessionGeneration += 1;
+  clearPrivateAssetCache();
+  return { mode, logout_url: navigation.href };
+}
+
 export const createPAT = (name: string, scopes?: string[], expires_days?: number) =>
   api<any>("/auth/tokens", { method: "POST", body: JSON.stringify({ name, scopes, expires_days }) });
 export const listPATs = () => api<{ tokens: any[] }>("/auth/tokens");
@@ -619,8 +1079,28 @@ export async function getAssetBlob(
   signal?: AbortSignal,
   source?: { document: string; commit: string },
 ): Promise<Blob> {
-  const token = getToken();
-  const cacheKey = privateAssetCacheKey(token ?? "anonymous", fileId, vault, source);
+  const fetchBlob = async (requestSignal?: AbortSignal) => {
+    const params = new URLSearchParams({ vault });
+    if (source) {
+      params.set("document", source.document);
+      params.set("commit", source.commit);
+    }
+    const res = await authenticatedFetch(
+      `/api/assets/${encodeURIComponent(fileId)}?${params}`,
+      { signal: requestSignal },
+    );
+    if (!res.ok) throw new Error(`Image unavailable (${res.status})`);
+    return res.blob();
+  };
+
+  // An HttpOnly SSO cookie can be replaced by another tab without a storage
+  // event. Do not serve a persistent private blob cache until the foreground
+  // identity recheck in Layout has observed that change.
+  if (_authMode === "sso") return fetchBlob(signal);
+
+  // The cache is scoped to an in-memory auth generation, never raw credential
+  // material. Login, logout, mode changes, and 401 expiry all rotate it.
+  const cacheKey = privateAssetCacheKey(_authSessionGeneration, fileId, vault, source);
   const cached = readPrivateAssetCache(cacheKey);
   if (cached) return cached;
 
@@ -634,17 +1114,7 @@ export async function getAssetBlob(
       promise: Promise.resolve(new Blob()),
     };
     entry.promise = (async () => {
-      const params = new URLSearchParams({ vault });
-      if (source) {
-        params.set("document", source.document);
-        params.set("commit", source.commit);
-      }
-      const res = await authenticatedFetch(
-        `/api/assets/${encodeURIComponent(fileId)}?${params}`,
-        { signal: controller.signal },
-      );
-      if (!res.ok) throw new Error(`Image unavailable (${res.status})`);
-      const blob = await res.blob();
+      const blob = await fetchBlob(controller.signal);
       writePrivateAssetCache(cacheKey, blob);
       return blob;
     })().finally(() => {
@@ -1133,16 +1603,22 @@ export interface PublicationCapabilities {
   resource_type?: "document" | "table_query" | "file";
 }
 
-// Owner capability probe for the public page. Anonymous-first: only asks the
-// server when a session token exists, and degrades to {can_edit:false} on any
-// error so it can never break (or redirect away from) the public view. (F6.)
+// Owner capability probe for the public page. SSO's HttpOnly cookie cannot be
+// detected in JavaScript, so the request is anonymous/cookie-first and degrades
+// to {can_edit:false} on any error without redirecting the public view. (F6.)
 export async function publicationCapabilities(slug: string): Promise<PublicationCapabilities> {
-  const token = getToken();
-  if (!token) return { can_edit: false };
   try {
-    const res = await fetch(`${API_BASE}/public/${slug}/capabilities`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
+    if (_authMode === null) {
+      const config = await getAuthConfig();
+      if (!config.available) return { can_edit: false };
+    }
+    // An SSO session is HttpOnly and intentionally cannot be detected from
+    // JavaScript. Probe anonymously/cookie-first and degrade to read-only.
+    const res = await authenticatedFetch(
+      `${API_BASE}/public/${slug}/capabilities`,
+      undefined,
+      { unauthorized: "preserve-session" },
+    );
     if (!res.ok) return { can_edit: false };
     return await res.json();
   } catch {

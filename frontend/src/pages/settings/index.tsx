@@ -5,7 +5,6 @@ import {
   getAuthConfig,
   getMe,
   listPATs,
-  getToken,
   adminListUsers,
   type AuthConfig,
   type AdminUser,
@@ -56,10 +55,6 @@ export default function SettingsPage() {
   };
 
   useEffect(() => {
-    if (!getToken()) {
-      location.href = "/auth";
-      return;
-    }
     let cancelled = false;
     void getMe()
       .then((u) => {

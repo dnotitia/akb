@@ -21,14 +21,14 @@ vi.mock("@/lib/api", () => ({
   // these tests stay focused on the PAT-mint UX they were written for.
   getAuthConfig: vi.fn().mockResolvedValue({
     available: true,
-    schema_version: 1,
+    schema_version: 2,
     auth_mode: "local",
     local_auth: { enabled: true },
     keycloak: {
       enabled: false,
       browser_session_ready: false,
-      login_url: null,
     },
+    providers: [],
     mcp_oauth: { enabled: false },
   }),
 }));
@@ -89,14 +89,19 @@ describe("Tokens setup guide smart default", () => {
     const { getAuthConfig, getMe, listPATs } = await import("@/lib/api");
     (getAuthConfig as any).mockResolvedValue({
       available: true,
-      schema_version: 1,
+      schema_version: 2,
       auth_mode: "sso",
       local_auth: { enabled: false },
       keycloak: {
         enabled: true,
         browser_session_ready: false,
-        login_url: null,
       },
+      providers: [{
+        provider_type: "keycloak-oidc",
+        alias: "workforce",
+        display_name: "Company SSO",
+        login_url: null,
+      }],
       mcp_oauth: { enabled: true },
     });
     (getMe as any).mockResolvedValue({ user_id: "u1", username: "u", email: "u@x", is_admin: false });

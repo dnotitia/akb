@@ -152,6 +152,13 @@ document_asset_upload_body_timeout_secs: 60
 # Provision the designated administrator explicitly with
 # `python -m app.cli provision-recovery-admin`; ordinary registration is never admin.
 auth_mode: local
+# Installation-owned monotonic boundary. Keep it unchanged for an exact
+# restart. Increase it for every auth_mode or sso_session_epoch transition;
+# PostgreSQL rejects stale, replayed, or same-generation conflicting starts.
+auth_runtime_generation: 1
+# Existing installations upgrading from a pre-epoch image use this temporary
+# acknowledgement only while running the documented quiescent preflight:
+# sso_session_epoch_upgrade: stop-the-world-v1
 jwt_algorithm: RS256
 jwt_expire_hours: 24
 # Generate once before the first local-mode start:
@@ -180,7 +187,7 @@ publication_view_grant_session_secs: 3600
 app_token_ttl_seconds: 300
 app_credential_overlap_seconds: 300
 
-# === Auth — Keycloak OIDC (OPTIONAL external IdP; OFF by default) ===
+# === Auth — Keycloak OIDC ===
 # Human login is selected only by auth_mode. For SSO, set auth_mode: sso and
 # keycloak_enabled: true. Local mode may configure Keycloak only when
 # mcp_oauth_enabled: true needs it as an OAuth resource-server authority.
@@ -200,14 +207,23 @@ app_credential_overlap_seconds: 300
 # keycloak_enrollment_mode: open           # open | invite_only | disabled
 # keycloak_server_url: "https://auth.example.com"   # no /realms suffix; HTTPS outside loopback
 # keycloak_internal_url: ""          # optional backchannel URL (server→Keycloak); blank → use server_url
+# keycloak_backchannel_logout_uri: "" # Keycloak→AKB callback; blank → public_base_url callback.
+#                                       # In Kubernetes, use the exact backend Service URL.
 # keycloak_realm: "akb"
 # keycloak_client_id: "akb-web"
-# keycloak_public_client: false      # true → PKCE (no client_secret needed)
+# keycloak_public_client: false      # true → no client_secret; both profiles require PKCE
 # keycloak_admin_client_id: "akb-admin"  # dedicated confidential /admin client;
 #                                         # must differ from every ordinary human client
 # keycloak_management_client_id: "akb-sso-manager" # standalone bundle only:
 #                                         # permanent least-privilege IdP control client
 # admin_browser_session_ttl_secs: 900     # also capped by the verified ID-token expiry
+# Required for every SSO-mode start, including a staged ordinary-browser
+# rollout. Generate one UUID per installation and persist it across normal
+# restarts. To revoke all ordinary/admin SSO browser sessions and logout
+# fences, change it and increase auth_runtime_generation in the same config
+# revision. It is an authority epoch, not a credential, and may instead live
+# in the durable secret.yaml operational input.
+# sso_session_epoch: "<installation-owned UUID>"
 # keycloak_verify_ssl: true          # false only for local self-signed Keycloak
 # keycloak_require_verified_email: true   # refuse unverified email for open-mode JIT.
 #                                         # Exact subject bindings need no email claim.
@@ -215,32 +231,34 @@ app_credential_overlap_seconds: 300
 #                                         # controlled emails.
 # keycloak_link_by_email is a deprecated migration marker; omit it. Setting it
 # to true fails canonical startup. Exact pre-binding is the only account-link path.
-# The ordinary-user callback settings below are reserved for the future
-# server-custodied browser session release. Ordinary browser
-# login/callback/logout/exchange routes remain staged unavailable. `/admin`
-# is active in SSO mode through the separate akb-admin client; register its
-# exact callback as `<public_base_url>/api/v1/admin/auth/keycloak/callback`
-# and its post-logout redirect as `<public_base_url>/admin`.
-# keycloak_redirect_uri: "https://akb.example.com/api/v1/auth/keycloak/callback"
-# keycloak_post_login_path: "/auth/callback"
-# keycloak_post_login_allowed_origins: []   # companion-app origins allowed to receive the SSO
-#                                           # one-time code, e.g. ["https://reef-acme.example.com"].
-#                                           # Lets a first-party app (reef) ride this akb's Keycloak
-#                                           # client and get the one-time code or a stable account
-#                                           # error back on ITS origin. Empty =
-#                                           # akb's own SPA only (open-redirect-safe default).
-# keycloak_companion_client_ids_by_origin: {} # optional client-specific theme selector;
-#                                             # keys must also be allowlisted origins, e.g.
-#                                             # {"https://naut.example.com": "naut-web"}.
-#                                             # Empty preserves the global akb-web client.
-# keycloak_exchange_code_ttl_secs: 60
+# Ordinary AKB browser login uses authorization code + PKCE/nonce and a fixed
+# callback derived from public_base_url:
+#   <public_base_url>/api/v1/auth/keycloak/callback
+# The browser receives only an opaque HttpOnly AKB session handle. Refresh and
+# ID tokens are encrypted server-side; access tokens are never persisted.
+# Session custody remains unavailable until the independent 256-bit base64url
+# `sso_browser_session_encryption_key` is present in secret.yaml.
+# sso_browser_session_idle_ttl_secs: 28800      # 8 hours, sliding
+# sso_browser_session_absolute_ttl_secs: 86400  # 24 hours, never extended
+# sso_browser_session_refresh_skew_secs: 30
+#
+# `/admin` uses the separate akb-admin client. Register its exact callback as
+# `<public_base_url>/api/v1/admin/auth/keycloak/callback` and post-logout
+# redirect as `<public_base_url>/admin`.
+#
+# Companion client IDs below are accepted `azp` values for access tokens that
+# Reef/Naut BFFs present to AKB. They do not select AKB's browser callback or
+# receive an AKB JWT/exchange code; each companion owns its own callback and
+# server-side token custody.
+# keycloak_companion_client_ids_by_origin:
+#   "https://reef.example.com": "reef-web"
 # api_oauth_audience: ""               # default: <public_base_url>/api
 # mcp_oauth_enabled: false
 # mcp_oauth_audience: ""               # default: <public_base_url>/mcp
 # API and MCP audiences must remain distinct.
-# keycloak_client_secret, keycloak_admin_client_secret, and the optional
-# standalone keycloak_management_client_secret live in secret.yaml (never
-# commit any value)
+# keycloak_client_secret, keycloak_admin_client_secret,
+# sso_browser_session_encryption_key, and the optional standalone
+# keycloak_management_client_secret live in secret.yaml (never commit values)
 
 # === Server ===
 host: 0.0.0.0

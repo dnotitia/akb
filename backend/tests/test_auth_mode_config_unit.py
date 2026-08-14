@@ -10,6 +10,9 @@ import yaml
 from app import config as app_config
 
 
+_VALID_SSO_EPOCH = "b71eb45d-1091-4673-a4bc-e3646d4dd279"
+
+
 def _load(
     monkeypatch,
     tmp_path: Path,
@@ -59,6 +62,40 @@ def test_runtime_load_accepts_explicit_sso_auth_mode(
     assert loaded.sso_human_auth_enabled is True
     assert loaded.local_auth_enabled is False
     assert loaded.keycloak_sso_only is True
+
+
+def test_runtime_generation_is_positive_and_upgrade_ack_is_versioned(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    loaded = _load(
+        monkeypatch,
+        tmp_path,
+        {
+            "auth_mode": "local",
+            "auth_runtime_generation": 7,
+            "sso_session_epoch_upgrade": "stop-the-world-v1",
+        },
+    )
+
+    assert loaded.auth_runtime_generation == 7
+    assert loaded.sso_session_epoch_upgrade == "stop-the-world-v1"
+
+    with pytest.raises(ValueError):
+        _load(
+            monkeypatch,
+            tmp_path,
+            {"auth_mode": "local", "auth_runtime_generation": 0},
+        )
+    with pytest.raises(ValueError):
+        _load(
+            monkeypatch,
+            tmp_path,
+            {
+                "auth_mode": "local",
+                "sso_session_epoch_upgrade": "rolling",
+            },
+        )
 
 
 def test_programmatic_settings_construction_does_not_require_runtime_mode() -> None:
@@ -284,6 +321,7 @@ def test_sso_startup_requires_active_human_api_verifier_config_only(
         tmp_path,
         {
             "auth_mode": "sso",
+            "sso_session_epoch": _VALID_SSO_EPOCH,
             "keycloak_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
             "keycloak_client_id": "",
@@ -314,6 +352,7 @@ def test_sso_startup_defers_ordinary_browser_inputs_but_requires_admin_client(
         tmp_path,
         {
             "auth_mode": "sso",
+            "sso_session_epoch": _VALID_SSO_EPOCH,
             "keycloak_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
             "keycloak_client_id": "akb-web",
@@ -341,6 +380,7 @@ def test_sso_admin_client_is_dedicated_and_callback_is_deployment_bound(
         tmp_path,
         {
             "auth_mode": "sso",
+            "sso_session_epoch": _VALID_SSO_EPOCH,
             "keycloak_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
             "keycloak_client_id": "akb-web",
@@ -349,18 +389,78 @@ def test_sso_admin_client_is_dedicated_and_callback_is_deployment_bound(
             "system_hmac_secret": "test-system-hmac-secret",  # pragma: allowlist secret
             "db_password": "test-db-password",  # pragma: allowlist secret
             "public_base_url": "https://akb.example.com",
+            "keycloak_backchannel_logout_uri": ("http://backend:8000/api/v1/auth/keycloak/backchannel-logout"),
         },
     )
     monkeypatch.setattr(lifecycle, "settings", loaded)
 
     lifecycle._validate_required_settings()
-    assert loaded.keycloak_admin_redirect_uri == (
-        "https://akb.example.com/api/v1/admin/auth/keycloak/callback"
-    )
-    assert loaded.keycloak_admin_post_logout_redirect_uri == (
-        "https://akb.example.com/admin"
+    assert loaded.keycloak_admin_redirect_uri == ("https://akb.example.com/api/v1/admin/auth/keycloak/callback")
+    assert loaded.keycloak_admin_post_logout_redirect_uri == ("https://akb.example.com/admin")
+    assert loaded.keycloak_backchannel_logout_uri_effective == (
+        "http://backend:8000/api/v1/auth/keycloak/backchannel-logout"
     )
     assert "akb-admin" not in loaded.keycloak_human_client_ids
+
+
+def test_sso_backchannel_logout_uri_defaults_public_and_rejects_non_callback_targets(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from app.services import lifecycle
+
+    common = {
+        "auth_mode": "sso",
+        "sso_session_epoch": _VALID_SSO_EPOCH,
+        "keycloak_enabled": True,
+        "keycloak_server_url": "https://auth.example.com",
+        "keycloak_client_id": "akb-web",
+        "keycloak_admin_client_id": "akb-admin",
+        "keycloak_admin_client_secret": "admin-client-secret",  # pragma: allowlist secret
+        "system_hmac_secret": "test-system-hmac-secret",  # pragma: allowlist secret
+        "db_password": "test-db-password",  # pragma: allowlist secret
+        "public_base_url": "https://akb.example.com",
+    }
+    defaulted = _load(monkeypatch, tmp_path, common)
+    monkeypatch.setattr(lifecycle, "settings", defaulted)
+    lifecycle._validate_required_settings()
+    assert defaulted.keycloak_backchannel_logout_uri_effective == (
+        "https://akb.example.com/api/v1/auth/keycloak/backchannel-logout"
+    )
+
+    for invalid in (
+        "\nhttp://backend:8000/api/v1/auth/keycloak/backchannel-logout",
+        "http://back end:8000/api/v1/auth/keycloak/backchannel-logout",
+        "http://backend:/api/v1/auth/keycloak/backchannel-logout",
+        "http://backend:8000/api/v1/auth/keycloak/backchannel-logout?",
+        "http://backend:8000/api/v1/auth/keycloak/backchannel-logout#",
+        "http://backend:8000/wrong",
+        "http://backend:8000/api/v1/auth/keycloak/backchannel-logout?redirect=unsafe",
+        "file:///api/v1/auth/keycloak/backchannel-logout",
+        "http://user@backend:8000/api/v1/auth/keycloak/backchannel-logout",
+        "http://0x7f000001/api/v1/auth/keycloak/backchannel-logout",
+        "http://0x7f.0x0.0x0.0x1/api/v1/auth/keycloak/backchannel-logout",
+        "http://0x7f.0.0.1/api/v1/auth/keycloak/backchannel-logout",
+    ):
+        configured = _load(
+            monkeypatch,
+            tmp_path,
+            {**common, "keycloak_backchannel_logout_uri": invalid},
+        )
+        monkeypatch.setattr(lifecycle, "settings", configured)
+        with pytest.raises(RuntimeError, match="back-channel logout URI"):
+            lifecycle._validate_required_settings()
+
+    dns_host = _load(
+        monkeypatch,
+        tmp_path,
+        {
+            **common,
+            "keycloak_backchannel_logout_uri": ("http://0x7f.example.com:8000/api/v1/auth/keycloak/backchannel-logout"),
+        },
+    )
+    monkeypatch.setattr(lifecycle, "settings", dns_host)
+    lifecycle._validate_required_settings()
 
 
 def test_sso_startup_rejects_admin_client_reuse_and_non_tls_public_origin(
@@ -374,6 +474,7 @@ def test_sso_startup_rejects_admin_client_reuse_and_non_tls_public_origin(
         tmp_path,
         {
             "auth_mode": "sso",
+            "sso_session_epoch": _VALID_SSO_EPOCH,
             "keycloak_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
             "keycloak_client_id": "akb-web",
@@ -393,6 +494,7 @@ def test_sso_startup_rejects_admin_client_reuse_and_non_tls_public_origin(
         tmp_path,
         {
             "auth_mode": "sso",
+            "sso_session_epoch": _VALID_SSO_EPOCH,
             "keycloak_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
             "keycloak_client_id": "akb-web",
@@ -412,6 +514,7 @@ def test_sso_startup_rejects_admin_client_reuse_and_non_tls_public_origin(
         tmp_path,
         {
             "auth_mode": "sso",
+            "sso_session_epoch": _VALID_SSO_EPOCH,
             "keycloak_enabled": True,
             "keycloak_server_url": "http://auth.example.com",
             "keycloak_client_id": "akb-web",
@@ -438,6 +541,7 @@ def test_sso_startup_rejects_missing_system_hmac_secret(
         tmp_path,
         {
             "auth_mode": "sso",
+            "sso_session_epoch": _VALID_SSO_EPOCH,
             "keycloak_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
             "keycloak_redirect_uri": "https://akb.example.com/auth/keycloak/callback",
@@ -466,6 +570,7 @@ def test_sso_startup_accepts_legacy_jwt_secret_only_as_system_hmac_migration_inp
         tmp_path,
         {
             "auth_mode": "sso",
+            "sso_session_epoch": _VALID_SSO_EPOCH,
             "keycloak_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
             "keycloak_redirect_uri": "https://akb.example.com/auth/keycloak/callback",

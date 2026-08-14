@@ -45,14 +45,14 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(api.getAuthConfig).mockResolvedValue({
     available: true,
-    schema_version: 1,
+    schema_version: 2,
     auth_mode: "local",
     local_auth: { enabled: true },
     keycloak: {
       enabled: false,
       browser_session_ready: false,
-      login_url: null,
     },
+    providers: [],
     mcp_oauth: { enabled: false },
   });
 });
@@ -85,14 +85,19 @@ describe("Admin tab search + sort", () => {
   it("hides admin password reset controls in SSO mode", async () => {
     vi.mocked(api.getAuthConfig).mockResolvedValue({
       available: true,
-      schema_version: 1,
+      schema_version: 2,
       auth_mode: "sso",
       local_auth: { enabled: false },
       keycloak: {
         enabled: true,
         browser_session_ready: false,
-        login_url: null,
       },
+      providers: [{
+        provider_type: "keycloak-oidc",
+        alias: "workforce",
+        display_name: "Company SSO",
+        login_url: null,
+      }],
       mcp_oauth: { enabled: true },
     });
 

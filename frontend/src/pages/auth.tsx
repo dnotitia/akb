@@ -5,6 +5,7 @@ import {
   authLogin,
   authRegister,
   getAuthConfig,
+  getMe,
   getToken,
   setToken,
   type AuthConfig,
@@ -48,32 +49,50 @@ export default function AuthPage() {
     authConfig?.available === true &&
     authConfig.auth_mode === "local" &&
     authConfig.local_auth.enabled;
-  const ssoLoginUrl =
+  const ssoConfigEnabled =
     authConfig?.available === true &&
     authConfig.auth_mode === "sso" &&
-    authConfig.keycloak.enabled &&
-    authConfig.keycloak.browser_session_ready
-      ? authConfig.keycloak.login_url
-      : null;
+    authConfig.keycloak.enabled;
+  const ssoProviders = ssoConfigEnabled ? authConfig.providers : [];
+  const usableSsoProviders =
+    ssoConfigEnabled && authConfig.keycloak.browser_session_ready
+      ? ssoProviders.filter((provider) => provider.login_url !== null)
+      : [];
 
   useEffect(() => {
-    // Already signed in (back button / bookmark)? Don't re-show the form.
-    if (getToken()) {
-      navigate(next, { replace: true });
-      return;
-    }
     let cancelled = false;
-    void getAuthConfig().then((config) => {
+    void (async () => {
+      const config = await getAuthConfig();
+      if (cancelled) return;
+      if (config.available !== true || config.auth_mode === null) {
+        setAuthConfig(config);
+        return;
+      }
+      if (config.auth_mode === "sso" && getToken()) {
+        // Defense in depth for mocked/legacy config clients: a local JWT must
+        // never shadow the SSO cookie carrier.
+        setToken(null);
+      }
+      const hasSessionCandidate = config.auth_mode === "sso" || getToken() !== null;
+      if (hasSessionCandidate) {
+        try {
+          await getMe({ redirectOnUnauthorized: false });
+          if (!cancelled) navigate(next, { replace: true });
+          return;
+        } catch {
+          // No current session: reveal only the options allowed by config.
+        }
+      }
       if (!cancelled) setAuthConfig(config);
-    });
+    })();
     return () => {
       cancelled = true;
     };
   }, [navigate, next]);
 
-  function startSso() {
-    if (!ssoLoginUrl) return;
-    window.location.href = `${ssoLoginUrl}?redirect=${encodeURIComponent(next)}`;
+  function startSso(loginUrl: string | null) {
+    if (!loginUrl) return;
+    window.location.href = `${loginUrl}?redirect=${encodeURIComponent(next)}`;
   }
 
   async function handleSubmit(e: React.FormEvent) {
@@ -209,19 +228,38 @@ export default function AuthPage() {
               </Tabs>
             )}
 
-            {authConfig !== null && !localAuthEnabled && !ssoLoginUrl && (
+            {authConfig !== null && !localAuthEnabled && authConfig.available !== true && (
               <Alert variant="destructive">
-                {authConfig.available && authConfig.auth_mode === "sso"
-                  ? "SSO browser sign-in is not available yet. Contact your administrator."
-                  : "Sign-in is unavailable because authentication configuration could not be verified."}
+                Sign-in is unavailable because authentication configuration could not be verified.
               </Alert>
             )}
 
-            {ssoLoginUrl && (
-              <div>
-                <Button type="button" variant="outline" size="lg" className="w-full" onClick={startSso}>
-                  Sign in with SSO
-                </Button>
+            {ssoConfigEnabled && ssoProviders.length === 0 && (
+              <Alert variant="destructive">
+                No SSO providers are enabled. Contact your administrator.
+              </Alert>
+            )}
+
+            {ssoConfigEnabled && ssoProviders.length > 0 && usableSsoProviders.length === 0 && (
+              <Alert variant="destructive">
+                SSO browser sign-in is not available yet. Contact your administrator.
+              </Alert>
+            )}
+
+            {usableSsoProviders.length > 0 && (
+              <div className="space-y-3">
+                {usableSsoProviders.map((provider) => (
+                  <Button
+                    key={provider.alias}
+                    type="button"
+                    variant="outline"
+                    size="lg"
+                    className="w-full"
+                    onClick={() => startSso(provider.login_url)}
+                  >
+                    Sign in with {provider.display_name}
+                  </Button>
+                ))}
               </div>
             )}
           </div>
