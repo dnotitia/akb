@@ -6,6 +6,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from pathlib import Path
+import sys
+
+# Kubernetes and the documented rollback procedure execute this file directly.
+# Python then puts only ``scripts/`` on sys.path, so make the backend package
+# root explicit instead of relying on a caller-provided PYTHONPATH.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import asyncpg
 
