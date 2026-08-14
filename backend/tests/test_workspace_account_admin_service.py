@@ -419,6 +419,134 @@ async def test_ensure_service_user_is_noninteractive_idempotent_and_non_admin(
     assert password_hash.startswith("!service-account:")
 
 
+async def test_ensure_service_user_converges_admin_state_with_live_token_and_audit(
+    services,
+):
+    pool, role_sync, service = services
+    username = f"governance-admin-runtime-{uuid.uuid4().hex[:10]}"
+    email = f"{username}@service.akb.invalid"
+
+    promoted = await service.ensure_service_user(
+        username=username,
+        email=email,
+        display_name="Administrative runtime",
+        is_admin=True,
+        actor_id="bootstrap-admin",
+    )
+
+    from app.services.auth_service import create_pat, resolve_token
+
+    credential = await create_pat(
+        promoted["user_id"],
+        "runtime-key",
+        key_class="service",
+        scopes=["read", "write", "admin"],
+    )
+    resolved_promoted = await resolve_token(f"Bearer {credential['token']}")
+
+    from app.exceptions import NotFoundError
+
+    with pytest.raises(NotFoundError):
+        await service.set_user_admin(
+            promoted["user_id"],
+            is_admin=False,
+            actor_id="bootstrap-admin",
+        )
+
+    demoted = await service.ensure_service_user(
+        username=username,
+        email=email,
+        display_name=None,
+        is_admin=False,
+        actor_id="bootstrap-admin",
+    )
+    resolved_demoted = await resolve_token(f"Bearer {credential['token']}")
+
+    assert promoted["user_id"] == demoted["user_id"]
+    assert promoted["is_admin"] is True
+    assert demoted["is_admin"] is False
+    assert resolved_promoted is not None and resolved_promoted.is_admin is True
+    assert resolved_demoted is not None and resolved_demoted.is_admin is False
+    assert role_sync.created_users == [uuid.UUID(promoted["user_id"])]
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT account_kind, auth_provider, account_status, is_admin
+              FROM users WHERE id = $1
+            """,
+            uuid.UUID(promoted["user_id"]),
+        )
+        events = await conn.fetch(
+            """
+            SELECT actor_id, payload->>'is_admin' AS is_admin
+              FROM events
+             WHERE kind = 'auth.service_user_ensured'
+               AND payload->>'user_id' = $1
+             ORDER BY id
+            """,
+            promoted["user_id"],
+        )
+
+    assert dict(row) == {
+        "account_kind": "service",
+        "auth_provider": "service",
+        "account_status": "active",
+        "is_admin": False,
+    }
+    assert [dict(event) for event in events] == [
+        {"actor_id": "bootstrap-admin", "is_admin": "true"},
+        {"actor_id": "bootstrap-admin", "is_admin": "false"},
+    ]
+
+
+async def test_ensure_service_user_fails_closed_for_suspended_or_conflicting_identity(
+    services,
+):
+    pool, _, service = services
+    username = f"governance-guarded-runtime-{uuid.uuid4().hex[:10]}"
+    email = f"{username}@service.akb.invalid"
+    ensured = await service.ensure_service_user(
+        username=username,
+        email=email,
+        display_name=None,
+        actor_id="bootstrap-admin",
+    )
+    user_id = uuid.UUID(ensured["user_id"])
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET account_status = 'suspended' WHERE id = $1",
+            user_id,
+        )
+
+    from app.exceptions import AccountSuspendedError, ExternalIdentityConflictError
+
+    with pytest.raises(AccountSuspendedError):
+        await service.ensure_service_user(
+            username=username,
+            email=email,
+            display_name=None,
+            is_admin=True,
+            actor_id="bootstrap-admin",
+        )
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET account_status = 'active', auth_provider = 'local' WHERE id = $1",
+            user_id,
+        )
+
+    with pytest.raises(ExternalIdentityConflictError):
+        await service.ensure_service_user(
+            username=username,
+            email=email,
+            display_name=None,
+            is_admin=True,
+            actor_id="bootstrap-admin",
+        )
+
+
 async def test_create_pat_uses_caller_selected_token_id(services):
     pool, _, service = services
     requested_token_id = uuid.uuid4()
