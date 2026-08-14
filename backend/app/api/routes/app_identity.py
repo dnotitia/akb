@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
-from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from pydantic import Field
+
+from app.api.control_plane_models import (
+    AuthorizeProjection,
+    AuthorizeRequest,
+    CredentialExchangeRequest,
+    CredentialExchangeProjection,
+    CredentialIssueRequest,
+    CredentialIssueProjection,
+    CredentialListProjection,
+    CredentialMetadata,
+    CredentialRotateRequest,
+)
 
 from app.api.deps import get_current_app, get_current_user, request_correlation_id
 from app.services.app_identity_service import (
@@ -21,38 +30,8 @@ from app.services.app_identity_service import (
     rotate_app_credential,
 )
 from app.services.auth_service import AuthenticatedUser
-from app.util.text import NFCModel
 
 router = APIRouter()
-
-DeploymentName = Annotated[
-    str,
-    Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"),
-]
-CapabilityName = Annotated[
-    str,
-    Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"),
-]
-
-
-class IssueCredentialRequest(NFCModel):
-    deployment: DeploymentName
-    expires_at: datetime | None = None
-
-
-class RotateCredentialRequest(NFCModel):
-    expires_at: datetime | None = None
-
-
-class ExchangeCredentialRequest(NFCModel):
-    credential: str
-
-
-class AuthorizeAppRequest(NFCModel):
-    vault_id: uuid.UUID
-    capability: CapabilityName
-    resource_kind: str | None = None
-    resource_key: str | None = None
 
 
 def _mark_no_store(response: Response) -> None:
@@ -84,10 +63,15 @@ def _require_system_admin(
     )
 
 
-@router.post("/apps/{app_id}/credentials", summary="Issue an app deployment credential")
+@router.post(
+    "/apps/{app_id}/credentials",
+    response_model=CredentialIssueProjection,
+    operation_id="appsIssueCredential",
+    summary="Issue an app deployment credential",
+)
 async def issue_credential(
     app_id: uuid.UUID,
-    req: IssueCredentialRequest,
+    req: CredentialIssueRequest,
     request: Request,
     response: Response,
     user: AuthenticatedUser = Depends(get_current_user),
@@ -110,7 +94,12 @@ async def issue_credential(
     return result
 
 
-@router.get("/apps/{app_id}/credentials", summary="List app credential metadata")
+@router.get(
+    "/apps/{app_id}/credentials",
+    response_model=CredentialListProjection,
+    operation_id="appsListCredentials",
+    summary="List app credential metadata",
+)
 async def list_credentials(
     app_id: uuid.UUID,
     request: Request,
@@ -131,12 +120,14 @@ async def list_credentials(
 
 @router.post(
     "/apps/{app_id}/credentials/{credential_id}/rotate",
+    response_model=CredentialIssueProjection,
+    operation_id="appsRotateCredential",
     summary="Rotate an app deployment credential",
 )
 async def rotate_credential(
     app_id: uuid.UUID,
     credential_id: uuid.UUID,
-    req: RotateCredentialRequest,
+    req: CredentialRotateRequest,
     request: Request,
     response: Response,
     user: AuthenticatedUser = Depends(get_current_user),
@@ -161,6 +152,8 @@ async def rotate_credential(
 
 @router.delete(
     "/apps/{app_id}/credentials/{credential_id}",
+    response_model=CredentialMetadata,
+    operation_id="appsRevokeCredential",
     summary="Revoke an app deployment credential",
 )
 async def revoke_credential(
@@ -187,9 +180,14 @@ async def revoke_credential(
     return result
 
 
-@router.post("/auth/app-token", summary="Exchange an app credential for an app token")
+@router.post(
+    "/auth/app-token",
+    response_model=CredentialExchangeProjection,
+    operation_id="authExchangeAppCredential",
+    summary="Exchange an app credential for an app token",
+)
 async def exchange_credential(
-    req: ExchangeCredentialRequest,
+    req: CredentialExchangeRequest,
     request: Request,
     response: Response,
 ):
@@ -203,10 +201,12 @@ async def exchange_credential(
 
 @router.post(
     "/app/authorize",
+    response_model=AuthorizeProjection,
+    operation_id="appAuthorize",
     summary="Evaluate an app control-plane capability against the live registry",
 )
 async def authorize_app(
-    req: AuthorizeAppRequest,
+    req: AuthorizeRequest,
     request: Request,
     principal: AppPrincipal = Depends(get_current_app),
 ):

@@ -47,7 +47,12 @@ from fixture_control import create_app
 
 LOGGER = logging.getLogger("akb.e2e_runtime")
 SCHEMA_VERSION = 2
-Scenario = Literal["empty", "app-installation-lifecycle", "app-release-rollout"]
+Scenario = Literal[
+    "empty",
+    "app-installation-lifecycle",
+    "app-release-rollout",
+    "app-control-plane",
+]
 SCENARIO: Scenario = "empty"
 DEFAULT_USERNAME_ENV = "AKB_E2E_USERNAME"
 DEFAULT_PASSWORD_ENV = "AKB_E2E_PASSWORD"
@@ -282,7 +287,7 @@ class E2ERuntime:
                 "path": "/log-observation",
             }
         }
-        if self.config.scenario == "app-release-rollout":
+        if self.config.scenario in {"app-release-rollout", "app-control-plane"}:
             installations = catalog.get("installations", [])
             targets: list[dict[str, str]] = []
             if isinstance(installations, list):
@@ -364,14 +369,11 @@ class E2ERuntime:
             self._fixture_controls["restart_requested"] = bool(enabled)
             if enabled:
                 asyncio.create_task(
-                    self._restart_backend(
-                        self._lifecycle_generation,
-                        requested_during_reset=self._resetting or self._reset_lock.locked(),
-                    ),
+                    self._restart_backend(self._lifecycle_generation),
                     name="backend-restart",
                 )
         elif action == "fault_injection":
-            if self.config.scenario != "app-release-rollout":
+            if self.config.scenario not in {"app-release-rollout", "app-control-plane"}:
                 return {
                     "status": "rejected",
                     "scenario": self.config.scenario,
@@ -413,6 +415,36 @@ class E2ERuntime:
                     "kind": selected_kind,
                 }
             else:
+                active_fault = self._fixture_controls.get("fault")
+                if isinstance(active_fault, dict):
+                    fault_target = target or active_fault.get("target")
+                    fault_kind = kind or active_fault.get("kind")
+                    if not isinstance(fault_target, str) or not isinstance(fault_kind, str):
+                        return {
+                            "status": "rejected",
+                            "scenario": self.config.scenario,
+                            "action": action,
+                            "enabled": False,
+                            "reason": "fault_unavailable",
+                        }
+                    try:
+                        fixture = self._resolve_fault_target(fault_target)
+                    except ValueError:
+                        return {
+                            "status": "rejected",
+                            "scenario": self.config.scenario,
+                            "action": action,
+                            "enabled": False,
+                            "reason": "unsupported_target",
+                        }
+                    if not await self._restore_fault(fixture, fault_kind):
+                        return {
+                            "status": "rejected",
+                            "scenario": self.config.scenario,
+                            "action": action,
+                            "enabled": False,
+                            "reason": "fault_unavailable",
+                        }
                 self._fixture_controls["fault"] = None
         else:
             return {"status": "ignored", "scenario": self.config.scenario, "action": action}
@@ -462,19 +494,62 @@ class E2ERuntime:
             # Controls are best effort and must not leak database details.
             return False
 
+    async def _restore_fault(self, fixture: dict[str, object], kind: str) -> bool:
+        """Restore the bounded fixture state removed by a fault control."""
+        if kind != "missing_owned_table":
+            return False
+        try:
+            import asyncpg
+
+            vault_id = fixture.get("vault_id")
+            if not isinstance(vault_id, str):
+                return False
+            connection = await asyncpg.connect(
+                host="127.0.0.1", port=15432, user="akb", password="akb", database="akb"
+            )
+            try:
+                vault_name = await connection.fetchval(
+                    "SELECT name FROM vaults WHERE id=$1", uuid.UUID(vault_id)
+                )
+                if not isinstance(vault_name, str):
+                    return False
+                safe_vault = re.sub(r"[^a-zA-Z0-9_]", "_", vault_name)
+                physical = f"vt_{safe_vault}__rollout_data"
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", physical):
+                    return False
+                await connection.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {physical} (
+                        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                        value TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                row_count = await connection.fetchval(f"SELECT COUNT(*) FROM {physical}")
+                if row_count == 0:
+                    await connection.executemany(
+                        f"INSERT INTO {physical}(value) VALUES($1)",
+                        [(None,) for _ in range(25)],
+                    )
+                return True
+            finally:
+                await connection.close()
+        except Exception:
+            # Controls are best effort and must not leak database details.
+            return False
+
     async def _restart_backend(
         self,
         requested_generation: int | None = None,
-        *,
-        requested_during_reset: bool = False,
     ) -> None:
         try:
             async with self._reset_lock:
                 if requested_generation is None:
                     requested_generation = self._lifecycle_generation
                 if (
-                    requested_during_reset
-                    or requested_generation != self._lifecycle_generation
+                    requested_generation != self._lifecycle_generation
                     or self._resetting
                 ):
                     return
@@ -1132,6 +1207,25 @@ class E2ERuntime:
             }
         target_rollout_coordinates = rollout_coordinates(target_app_id, next_release, next_checksum)
         foreign_rollout_coordinates = rollout_coordinates(foreign_app_id, foreign_next, foreign_checksum)
+        target_resume_coordinates = {
+            "method": "POST",
+            "path": f"/api/v1/apps/{target_app_id}/rollouts/{{rollout_id}}/resume",
+            "body": {
+                "release_id": str(next_release),
+                "manifest_checksum": next_checksum,
+                "idempotency_key": "uuid-v4",
+            },
+            "headers": {"Idempotency-Key": "uuid-v4"},
+        }
+        self_app_resume_coordinates = {
+            "method": "POST",
+            "path": "/api/v1/app/rollouts/{rollout_id}/resume",
+            "body": {
+                "release_id": str(next_release),
+                "manifest_checksum": next_checksum,
+            },
+            "headers": {"Idempotency-Key": "uuid-v4"},
+        }
         random_ids = {
             "app_id": str(uuid.uuid4()),
             "release_id": str(uuid.uuid4()),
@@ -1173,6 +1267,21 @@ class E2ERuntime:
                     "exchange": {"service": "app", "method": "POST", "path": "/api/v1/auth/app-token", "body": {"credential": "<issued-value>"}},
                     "request": target_rollout_coordinates["request"],
                     "status": target_rollout_coordinates["status"],
+                    "resume": target_resume_coordinates,
+                    "registry": {
+                        "app_create": {
+                            "service": "app",
+                            "method": "POST",
+                            "path": "/api/v1/apps",
+                            "body_fields": ["app_key", "display_name", "description", "metadata"],
+                        },
+                        "release_create": {
+                            "service": "app",
+                            "method": "POST",
+                            "path": f"/api/v1/apps/{target_app_id}/releases",
+                            "body_fields": ["version", "manifest", "manifest_checksum"],
+                        },
+                    },
                     "apps": {
                         "target": target_rollout_coordinates,
                         "foreign": foreign_rollout_coordinates,
@@ -1181,6 +1290,7 @@ class E2ERuntime:
                 "self_app": {
                     "request": {"service": "app", "method": "POST", "path": "/api/v1/app/rollouts", "body": {"release_id": str(next_release), "manifest_checksum": next_checksum}, "headers": {"Idempotency-Key": "uuid-v4"}},
                     "status": {"service": "app", "method": "GET", "path": "/api/v1/app/rollouts/{rollout_id}"},
+                    "resume": self_app_resume_coordinates,
                 },
                 "installation_status": {"service": "app", "method": "GET", "path": f"/api/v1/apps/{target_app_id}/installations/{{vault_id}}"},
             },
@@ -1321,6 +1431,172 @@ class E2ERuntime:
                 ),
             )
         return installation_id
+
+    def _publish_installation_lifecycle_commands(
+        self,
+        *,
+        app_id: str,
+        restore_vault_id: str,
+        restore_release_id: str,
+        fresh_vault_id: str,
+        fresh_release_id: str,
+    ) -> None:
+        """Publish exact success coordinates for installation lifecycle probes."""
+        commands = self._fixture_catalog.setdefault("commands", {})
+        if not isinstance(commands, dict):
+            commands = {}
+            self._fixture_catalog["commands"] = commands
+        capabilities = ["installation:read", "inventory:read"]
+        commands["restore_compatible"] = {
+            "app_id": app_id,
+            "vault_id": restore_vault_id,
+            "release_id": restore_release_id,
+            "capabilities": capabilities,
+            "mode": "restore",
+            "request": {
+                "service": "app",
+                "method": "PUT",
+                "path": f"/api/v1/apps/{app_id}/installations/{restore_vault_id}",
+                "body": {
+                    "release_id": restore_release_id,
+                    "capabilities": capabilities,
+                    "mode": "restore",
+                },
+            },
+        }
+        commands["fresh_empty"] = {
+            "app_id": app_id,
+            "vault_id": fresh_vault_id,
+            "release_id": fresh_release_id,
+            "capabilities": capabilities,
+            "mode": "fresh",
+            "request": {
+                "service": "app",
+                "method": "PUT",
+                "path": f"/api/v1/apps/{app_id}/installations/{fresh_vault_id}",
+                "body": {
+                    "release_id": fresh_release_id,
+                    "capabilities": capabilities,
+                    "mode": "fresh",
+                },
+            },
+        }
+
+    async def _seed_control_plane_installation_lifecycle(
+        self,
+        connection: Any,
+        *,
+        system_admin_id: uuid.UUID,
+    ) -> None:
+        """Add valid restore/fresh installations to the control-plane scenario."""
+        apps = self._fixture_catalog.get("apps")
+        actors = self._fixture_catalog.get("actors")
+        namespace = self._fixture_catalog.get("namespace")
+        if not isinstance(apps, dict) or not isinstance(actors, dict) or not isinstance(namespace, str):
+            raise ProvisioningFailure("control-plane lifecycle fixture coordinates are unavailable")
+        target = apps.get("target")
+        owner = actors.get("target_owner")
+        if not isinstance(target, dict) or not isinstance(owner, dict):
+            raise ProvisioningFailure("control-plane lifecycle fixture coordinates are unavailable")
+        target_app_id = target.get("id")
+        owner_id = owner.get("id")
+        if not isinstance(target_app_id, str) or not isinstance(owner_id, str):
+            raise ProvisioningFailure("control-plane lifecycle fixture coordinates are unavailable")
+        app_uuid = uuid.UUID(target_app_id)
+        owner_uuid = uuid.UUID(owner_id)
+        restore_release_id = await self._insert_fixture_release(
+            connection,
+            app_id=app_uuid,
+            version="3.0.0",
+            expected_fingerprint="a" * 64,
+        )
+        fresh_release_id = await self._insert_fixture_release(
+            connection,
+            app_id=app_uuid,
+            version="4.0.0",
+            expected_fingerprint="c" * 64,
+        )
+        grants = [(owner_uuid, "owner")]
+        restore_vault_id, restore_vault_name = await self._insert_fixture_vault(
+            connection,
+            namespace=namespace,
+            label="lifecycle-restore-compatible",
+            owner_id=owner_uuid,
+            grants=grants,
+            granted_by=system_admin_id,
+        )
+        fresh_vault_id, fresh_vault_name = await self._insert_fixture_vault(
+            connection,
+            namespace=namespace,
+            label="lifecycle-fresh-empty",
+            owner_id=owner_uuid,
+            grants=grants,
+            granted_by=system_admin_id,
+        )
+        restore_installation_id = await self._insert_fixture_installation(
+            connection,
+            app_id=app_uuid,
+            vault_id=restore_vault_id,
+            desired_release_id=restore_release_id,
+            current_release_id=restore_release_id,
+            lifecycle="uninstalled",
+            capabilities=["installation:read"],
+            resources=[("table", f"{namespace}-restore-table", "retained")],
+            observed_release_id=restore_release_id,
+            observed_release_version="3.0.0",
+            schema_fingerprint="a" * 64,
+        )
+        fresh_installation_id = await self._insert_fixture_installation(
+            connection,
+            app_id=app_uuid,
+            vault_id=fresh_vault_id,
+            desired_release_id=restore_release_id,
+            current_release_id=restore_release_id,
+            lifecycle="uninstalled",
+            capabilities=["installation:read"],
+            resources=[],
+        )
+        vaults = self._fixture_catalog.setdefault("vaults", {})
+        if isinstance(vaults, dict):
+            vaults["lifecycle_restore_compatible"] = {
+                "id": str(restore_vault_id),
+                "name": restore_vault_name,
+            }
+            vaults["lifecycle_fresh_empty"] = {
+                "id": str(fresh_vault_id),
+                "name": fresh_vault_name,
+            }
+        releases = self._fixture_catalog.setdefault("releases", {})
+        if isinstance(releases, dict):
+            releases["target_restore_compatible"] = {
+                "id": str(restore_release_id),
+                "version": "3.0.0",
+            }
+            releases["target_fresh_empty"] = {
+                "id": str(fresh_release_id),
+                "version": "4.0.0",
+            }
+        fixtures = self._fixture_catalog.setdefault("fixtures", {})
+        if isinstance(fixtures, dict):
+            fixtures["restore_compatible"] = {
+                "app_id": target_app_id,
+                "vault_id": str(restore_vault_id),
+                "release_id": str(restore_release_id),
+                "installation_id": str(restore_installation_id),
+            }
+            fixtures["fresh_empty"] = {
+                "app_id": target_app_id,
+                "vault_id": str(fresh_vault_id),
+                "release_id": str(fresh_release_id),
+                "installation_id": str(fresh_installation_id),
+            }
+        self._publish_installation_lifecycle_commands(
+            app_id=target_app_id,
+            restore_vault_id=str(restore_vault_id),
+            restore_release_id=str(restore_release_id),
+            fresh_vault_id=str(fresh_vault_id),
+            fresh_release_id=str(fresh_release_id),
+        )
 
     async def _seed_app_installation_lifecycle(
         self,
@@ -1682,6 +1958,40 @@ class E2ERuntime:
                     "vault_id": str(install_vault),
                     "release_id": str(release_b),
                 },
+                "restore_compatible": {
+                    "app_id": str(target_app_id),
+                    "vault_id": str(target_vault_ids["restore-compatible"]),
+                    "release_id": str(release_a),
+                    "capabilities": ["installation:read", "inventory:read"],
+                    "mode": "restore",
+                    "request": {
+                        "service": "app",
+                        "method": "PUT",
+                        "path": f"/api/v1/apps/{target_app_id}/installations/{target_vault_ids['restore-compatible']}",
+                        "body": {
+                            "release_id": str(release_a),
+                            "capabilities": ["installation:read", "inventory:read"],
+                            "mode": "restore",
+                        },
+                    },
+                },
+                "fresh_empty": {
+                    "app_id": str(target_app_id),
+                    "vault_id": str(target_vault_ids["fresh-empty"]),
+                    "release_id": str(release_b),
+                    "capabilities": ["installation:read", "inventory:read"],
+                    "mode": "fresh",
+                    "request": {
+                        "service": "app",
+                        "method": "PUT",
+                        "path": f"/api/v1/apps/{target_app_id}/installations/{target_vault_ids['fresh-empty']}",
+                        "body": {
+                            "release_id": str(release_b),
+                            "capabilities": ["installation:read", "inventory:read"],
+                            "mode": "fresh",
+                        },
+                    },
+                },
             },
             "foreign_installation": {
                 "app_id": str(foreign_app_id),
@@ -1737,6 +2047,16 @@ class E2ERuntime:
                     await self._seed_app_release_rollout(
                         connection,
                         password_hash=password_hash,
+                        system_admin_id=system_admin_id,
+                    )
+                elif self.config.scenario == "app-control-plane":
+                    await self._seed_app_release_rollout(
+                        connection,
+                        password_hash=password_hash,
+                        system_admin_id=system_admin_id,
+                    )
+                    await self._seed_control_plane_installation_lifecycle(
+                        connection,
                         system_admin_id=system_admin_id,
                     )
                 else:
@@ -2011,7 +2331,12 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
     parser.add_argument("--password-env", default=DEFAULT_PASSWORD_ENV)
     parser.add_argument(
         "--scenario",
-        choices=("empty", "app-installation-lifecycle", "app-release-rollout"),
+        choices=(
+            "empty",
+            "app-installation-lifecycle",
+            "app-release-rollout",
+            "app-control-plane",
+        ),
         default=SCENARIO,
     )
     args = parser.parse_args(argv)

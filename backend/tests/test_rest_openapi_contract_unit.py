@@ -4,10 +4,15 @@ import json
 import re
 from collections import Counter
 from pathlib import Path
+import tempfile
 
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 import pytest
+
+from app.config import settings
+
+settings.git_storage_path = tempfile.mkdtemp(prefix="akb-rest-openapi-")
 
 from app.api.routes.tables import _raise_service_error
 from app.main import app

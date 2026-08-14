@@ -11,6 +11,13 @@ import {
   type CreateCollectionRequest as LiteCreateCollectionRequest,
   type LinkRequest as LiteLinkRequest,
 } from "@akb/client/lite";
+import {
+  createControlPlaneAdminClient,
+  createControlPlaneAppClient,
+  exchangeAppCredential,
+  type ControlPlaneOperations,
+  type RolloutRequest,
+} from "@akb/client/control-plane";
 
 type Body<Operation> = Operation extends { requestBody: infer RequestBody }
   ? RequestBody
@@ -39,6 +46,12 @@ type _LiteLink = Assert<Equal<LinkRequest, LiteLinkRequest>>;
 type _LiteCollection = Assert<
   Equal<CreateCollectionRequest, LiteCreateCollectionRequest>
 >;
+type _ControlPlaneOperation = Assert<
+  Equal<ControlPlaneOperations["appsCreate"]["requestBody"]["app_key"], string>
+>;
+type _ControlPlaneRollout = Assert<
+  Equal<RolloutRequest["manifest_checksum"], string>
+>;
 
 const main = createClient({
   baseUrl: "https://packed.invalid/api/v1",
@@ -54,3 +67,18 @@ main.activity.list satisfies typeof lite.activity.list;
 main.docs.history satisfies typeof lite.docs.history;
 main.docs.createCollection satisfies typeof lite.docs.createCollection;
 main.tables.migrate satisfies typeof lite.tables.migrate;
+
+const admin = createControlPlaneAdminClient({
+  baseUrl: "https://packed.invalid/api/v1",
+  adminToken: "admin-token",
+});
+const app = createControlPlaneAppClient({
+  baseUrl: "https://packed.invalid/api/v1",
+  appToken: "app-token",
+});
+admin.apps.get("app-id");
+app.rollouts.get("rollout-id");
+exchangeAppCredential({
+  baseUrl: "https://packed.invalid/api/v1",
+  credential: "deployment-credential",
+});

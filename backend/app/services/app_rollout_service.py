@@ -14,6 +14,8 @@ import re
 import uuid
 from typing import Any
 
+import asyncpg
+
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationError
 from app.services.app_identity_service import (
@@ -330,7 +332,7 @@ def _public_job(row: Any, targets: list[Any], steps: list[Any]) -> dict[str, Any
                 "reason": _reason(step["reason_code"]),
             }
         )
-    return {
+    result = {
         "job_id": str(row["id"]),
         "app_id": str(row["app_id"]),
         "release_id": str(row["release_id"]),
@@ -356,11 +358,14 @@ def _public_job(row: Any, targets: list[Any], steps: list[Any]) -> dict[str, Any
             for target in targets
         ],
     }
+    if row.get("source_rollout_id") is not None:
+        result["source_rollout_id"] = str(row["source_rollout_id"])
+    return result
 
 
 async def _load_public_job(conn: Any, app_id: uuid.UUID, job_id: uuid.UUID) -> dict[str, Any]:
     row = await conn.fetchrow(
-        "SELECT id, app_id, release_id, manifest_checksum, snapshot_id, status, blocked_reason, created_at, updated_at, completed_at FROM app_rollout_jobs WHERE id=$1 AND app_id=$2",
+        "SELECT id, app_id, release_id, manifest_checksum, snapshot_id, status, blocked_reason, created_at, updated_at, completed_at, source_rollout_id FROM app_rollout_jobs WHERE id=$1 AND app_id=$2",
         job_id,
         app_id,
     )
@@ -566,3 +571,406 @@ async def request_rollout_as_app(
 async def get_rollout_as_app(principal: AppPrincipal, job_id: uuid.UUID | str, *, correlation_id: str) -> dict[str, Any]:
     await authorize_app_capability(principal, capability="rollout:read", correlation_id=correlation_id)
     return await get_rollout(principal.app_id, job_id)
+
+
+async def resume_rollout(
+    app_id: uuid.UUID | str,
+    source_rollout_id: uuid.UUID | str,
+    *,
+    release_id: uuid.UUID | str,
+    manifest_checksum_value: str,
+    idempotency_key: str,
+    requested_by_kind: str,
+    correlation_id: str,
+    actor: str,
+    actor_id: str,
+) -> dict[str, Any]:
+    """Create a new rollout attempt from a blocked immutable source job.
+
+    The source job, snapshot, targets, steps, and checkpoints are read only.
+    Only the new job and its freshly sealed snapshot are mutated.  This keeps
+    recovery auditable and prevents a retry from rewriting the failed attempt.
+    """
+    app_uuid = _as_uuid(app_id, field="app_id")
+    source_uuid = _as_uuid(source_rollout_id, field="rollout_id")
+    release_uuid = _as_uuid(release_id, field="release_id")
+    key = _as_uuid(idempotency_key, field="Idempotency-Key")
+    checksum = _hex(manifest_checksum_value, field="manifest checksum")
+    if requested_by_kind not in {"admin", "app"}:
+        raise ValidationError("requested_by_kind is invalid")
+    pool = await get_pool()
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.fetchval(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    f"app-rollout-resume:{source_uuid}",
+                )
+                existing = await conn.fetchrow(
+                    """
+                    SELECT new_rollout_id, release_id, manifest_checksum
+                      FROM app_rollout_resume_attempts
+                     WHERE source_rollout_id=$1 AND idempotency_key=$2
+                     FOR UPDATE
+                    """,
+                    source_uuid,
+                    key,
+                )
+                if existing is not None:
+                    if (
+                        existing["release_id"] != release_uuid
+                        or existing["manifest_checksum"] != checksum
+                    ):
+                        raise ConflictError("Idempotency-Key was already used with different resume input")
+                    result = await _load_public_job(conn, app_uuid, existing["new_rollout_id"])
+                    await conn.execute(
+                        """
+                        INSERT INTO app_rollout_audit(
+                            job_id, app_id, action, outcome, reason_code
+                        ) VALUES($1,$2,'resume','replayed','same_attempt')
+                        """,
+                        existing["new_rollout_id"],
+                        app_uuid,
+                    )
+                    result.update(
+                        {
+                            "replayed": True,
+                            "resume_outcome": "replayed",
+                            "resume_reason": "same_attempt",
+                            "source_rollout_id": str(source_uuid),
+                        }
+                    )
+                    record_app_audit(
+                        "app.rollout.resume",
+                        correlation_id=correlation_id,
+                        outcome="ok",
+                        reason="replayed",
+                        actor=actor,
+                        actor_id=actor_id,
+                        app_id=app_uuid,
+                    )
+                    return result
+
+                source = await conn.fetchrow(
+                    """
+                    SELECT id, app_id, release_id, manifest_checksum, status
+                      FROM app_rollout_jobs
+                     WHERE id=$1 AND app_id=$2
+                     FOR SHARE
+                    """,
+                    source_uuid,
+                    app_uuid,
+                )
+                if source is None:
+                    raise NotFoundError("Rollout", "not found")
+                if source["status"] != "blocked":
+                    raise ConflictError("Only a blocked rollout can be resumed")
+                if source["release_id"] != release_uuid:
+                    raise ConflictError("Resume release does not match the source rollout")
+                if source["manifest_checksum"] != checksum:
+                    raise ConflictError("Resume checksum does not match the source rollout")
+                release = await conn.fetchrow(
+                    "SELECT id, manifest, manifest_checksum FROM app_releases WHERE app_id=$1 AND id=$2",
+                    app_uuid,
+                    release_uuid,
+                )
+                if release is None:
+                    raise NotFoundError("Release", "not found")
+                if release["manifest_checksum"] != checksum:
+                    raise ConflictError("Release checksum does not match request")
+                normalized = validate_manifest(release["manifest"], checksum)
+                source_targets = await conn.fetch(
+                    """
+                    SELECT installation_id, ordinal
+                      FROM app_rollout_targets
+                     WHERE job_id=$1
+                     ORDER BY ordinal, installation_id
+                    """,
+                    source_uuid,
+                )
+                if not source_targets:
+                    raise ConflictError("Source rollout has no targets")
+
+                # The immutable source target rows define identity.  A blocked
+                # source can leave the failed target blocked while untouched
+                # targets remain upgrading; active targets may already have
+                # converged.  Lifecycle is therefore bounded to those states
+                # without narrowing the source target set by desired release.
+                installations = await conn.fetch(
+                    """
+                    SELECT i.id AS installation_id, i.vault_id, i.current_release_id,
+                           i.desired_release_id, i.grant_generation, i.lifecycle,
+                           g.generation AS active_generation, g.status AS grant_status,
+                           o.observed_release_id, o.observed_grant_generation,
+                           o.observed_generation, st.ordinal
+                      FROM vault_app_installations AS i
+                      JOIN app_rollout_targets AS st
+                        ON st.job_id=$2 AND st.installation_id=i.id
+                      LEFT JOIN LATERAL (
+                          SELECT generation, status
+                            FROM installation_grants
+                           WHERE installation_id=i.id AND status='active'
+                           ORDER BY generation DESC LIMIT 1
+                      ) AS g ON TRUE
+                      LEFT JOIN app_installation_observed_states AS o
+                        ON o.installation_id=i.id
+                     WHERE i.app_id=$1
+                       AND i.lifecycle IN ('blocked', 'upgrading', 'active')
+                     ORDER BY st.ordinal, i.id
+                     FOR UPDATE OF i
+                    """,
+                    app_uuid,
+                    source_uuid,
+                )
+                if (
+                    len(installations) != len(source_targets)
+                    or {target["installation_id"] for target in installations}
+                    != {target["installation_id"] for target in source_targets}
+                ):
+                    raise ConflictError("Resume target set changed")
+
+                # Validate every candidate before creating the snapshot/job so
+                # a stale grant or observation cannot leave partial recovery.
+                for target in installations:
+                    if target["grant_status"] != "active" or target["active_generation"] != target["grant_generation"]:
+                        raise ConflictError("Resume preflight failed")
+                    if target["observed_generation"] is None or target["observed_release_id"] != target["current_release_id"] or target["observed_grant_generation"] != target["grant_generation"]:
+                        raise ConflictError("Resume preflight failed")
+                    for step in normalized["steps"]:
+                        if step["operation"] == "create_table":
+                            continue
+                        owned = await conn.fetchval(
+                            """
+                            SELECT EXISTS (
+                                SELECT 1 FROM app_owned_resources
+                                 WHERE installation_id=$1 AND vault_id=$2
+                                   AND resource_kind='table' AND resource_key=$3
+                                   AND status='owned'
+                            )
+                            """,
+                            target["installation_id"],
+                            target["vault_id"],
+                            step["payload"]["table"],
+                        )
+                        if not owned:
+                            raise ConflictError("Resume preflight failed")
+
+                snapshot = await conn.fetchrow(
+                    "INSERT INTO app_rollout_snapshots(app_id, requested_by_kind) VALUES($1,$2) RETURNING id",
+                    app_uuid,
+                    requested_by_kind,
+                )
+                assert snapshot is not None
+                job_id = uuid.uuid4()
+                for target in installations:
+                    converged = target["current_release_id"] == release_uuid
+                    snapshot_target = await conn.fetchrow(
+                        """
+                        INSERT INTO app_rollout_snapshot_targets(
+                            snapshot_id, app_id, installation_id, vault_id,
+                            desired_release_id, current_release_id,
+                            baseline_grant_generation, state, reason_code
+                        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id
+                        """,
+                        snapshot["id"],
+                        app_uuid,
+                        target["installation_id"],
+                        target["vault_id"],
+                        release_uuid,
+                        target["current_release_id"],
+                        target["grant_generation"],
+                        "replayed" if converged else "pending",
+                        "already_converged" if converged else None,
+                    )
+                    assert snapshot_target is not None
+
+                await conn.execute(
+                    "UPDATE app_rollout_snapshots SET sealed_at=NOW() WHERE id=$1",
+                    snapshot["id"],
+                )
+                pending = [
+                    target for target in installations
+                    if target["current_release_id"] != release_uuid
+                ]
+                job_status = "applied" if not pending else "pending"
+                job = await conn.fetchrow(
+                    """
+                    INSERT INTO app_rollout_jobs(
+                        id, app_id, release_id, manifest_checksum,
+                        idempotency_key, snapshot_id, source_rollout_id,
+                        requested_by_kind, status, completed_at
+                    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,
+                              CASE WHEN $9='applied' THEN NOW() ELSE NULL END)
+                    RETURNING id, created_at, updated_at, completed_at
+                    """,
+                    job_id,
+                    app_uuid,
+                    release_uuid,
+                    checksum,
+                    key,
+                    snapshot["id"],
+                    source_uuid,
+                    requested_by_kind,
+                    job_status,
+                )
+                assert job is not None
+                for ordinal, target in enumerate(installations):
+                    snapshot_target_id = await conn.fetchval(
+                        "SELECT id FROM app_rollout_snapshot_targets WHERE snapshot_id=$1 AND installation_id=$2",
+                        snapshot["id"],
+                        target["installation_id"],
+                    )
+                    converged = target["current_release_id"] == release_uuid
+                    batch_no = 0 if ordinal == 0 else ((ordinal - 1) // 10) + 1
+                    rollout_target = await conn.fetchrow(
+                        """
+                        INSERT INTO app_rollout_targets(
+                            job_id, app_id, installation_id, snapshot_target_id,
+                            vault_id, release_id, ordinal, batch_no, is_canary, state
+                        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id
+                        """,
+                        job_id,
+                        app_uuid,
+                        target["installation_id"],
+                        snapshot_target_id,
+                        target["vault_id"],
+                        release_uuid,
+                        ordinal,
+                        batch_no,
+                        ordinal == 0,
+                        "replayed" if converged else "pending",
+                    )
+                    assert rollout_target is not None
+                    if converged:
+                        continue
+                    for step in normalized["steps"]:
+                        await conn.execute(
+                            """
+                            INSERT INTO app_rollout_steps(
+                                job_id, target_id, installation_id, release_id,
+                                step_id, step_order, step_checksum, operation
+                            ) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+                            """,
+                            job_id,
+                            rollout_target["id"],
+                            target["installation_id"],
+                            release_uuid,
+                            step["id"],
+                            step["step_order"],
+                            step["checksum"],
+                            step["operation"],
+                        )
+                    await conn.execute(
+                        """
+                        UPDATE vault_app_installations
+                           SET desired_release_id=$2, lifecycle='upgrading', blocked_reason=NULL
+                         WHERE id=$1 AND app_id=$3
+                        """,
+                        target["installation_id"],
+                        release_uuid,
+                        app_uuid,
+                    )
+                await conn.execute(
+                    """
+                    INSERT INTO app_rollout_audit(
+                        job_id, app_id, action, outcome, reason_code
+                    ) VALUES($1,$2,'resume','accepted','new_attempt')
+                    """,
+                    job_id,
+                    app_uuid,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO app_rollout_resume_attempts(
+                        app_id, source_rollout_id, new_rollout_id, idempotency_key,
+                        release_id, manifest_checksum, requested_by_kind, outcome
+                    ) VALUES($1,$2,$3,$4,$5,$6,$7,'accepted')
+                    """,
+                    app_uuid,
+                    source_uuid,
+                    job_id,
+                    key,
+                    release_uuid,
+                    checksum,
+                    requested_by_kind,
+                )
+                result = await _load_public_job(conn, app_uuid, job_id)
+                result.update(
+                    {
+                        "replayed": False,
+                        "resume_outcome": "accepted",
+                        "resume_reason": "new_attempt",
+                        "source_rollout_id": str(source_uuid),
+                    }
+                )
+    except asyncpg.UniqueViolationError:
+        raise ConflictError("Resume request conflicted with another attempt") from None
+    except (ConflictError, ValidationError, NotFoundError):
+        record_app_audit(
+            "app.rollout.resume",
+            correlation_id=correlation_id,
+            outcome="error",
+            reason="rejected",
+            actor=actor,
+            actor_id=actor_id,
+            app_id=app_uuid,
+        )
+        raise
+    record_app_audit(
+        "app.rollout.resume",
+        correlation_id=correlation_id,
+        outcome="ok",
+        reason=result.get("resume_outcome", "accepted"),
+        actor=actor,
+        actor_id=actor_id,
+        app_id=app_uuid,
+    )
+    return result
+
+
+async def resume_rollout_as_admin(
+    app_id: uuid.UUID | str,
+    source_rollout_id: uuid.UUID | str,
+    *,
+    release_id: uuid.UUID | str,
+    manifest_checksum_value: str,
+    idempotency_key: str,
+    user: AuthenticatedUser,
+    correlation_id: str,
+) -> dict[str, Any]:
+    if not user.is_admin:
+        raise ForbiddenError("System administrator permission required")
+    return await resume_rollout(
+        app_id,
+        source_rollout_id,
+        release_id=release_id,
+        manifest_checksum_value=manifest_checksum_value,
+        idempotency_key=idempotency_key,
+        requested_by_kind="admin",
+        correlation_id=correlation_id,
+        actor=user.username,
+        actor_id=user.user_id,
+    )
+
+
+async def resume_rollout_as_app(
+    principal: AppPrincipal,
+    source_rollout_id: uuid.UUID | str,
+    *,
+    release_id: uuid.UUID | str,
+    manifest_checksum_value: str,
+    idempotency_key: str,
+    correlation_id: str,
+) -> dict[str, Any]:
+    await authorize_app_capability(principal, capability="rollout:request", correlation_id=correlation_id)
+    return await resume_rollout(
+        principal.app_id,
+        source_rollout_id,
+        release_id=release_id,
+        manifest_checksum_value=manifest_checksum_value,
+        idempotency_key=idempotency_key,
+        requested_by_kind="app",
+        correlation_id=correlation_id,
+        actor=f"app:{principal.app_id}",
+        actor_id=str(principal.app_id),
+    )

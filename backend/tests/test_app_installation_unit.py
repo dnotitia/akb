@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from app.api.control_plane_models import InstallationProjection
 from app.exceptions import ValidationError
 from app.services import app_installation_service as installation
 
@@ -87,6 +88,10 @@ def test_projection_keeps_truthful_state_and_redacts_payloads():
             }
         ],
     )
+    InstallationProjection.model_validate(projection)
+    assert projection["drift"]["release"]["status"] == "in_sync"
+    assert projection["drift"]["schema"]["status"] == "in_sync"
+    assert projection["drift"]["grant"]["status"] == "in_sync"
 
     serialized = str(projection)
     assert projection["lifecycle"] == "blocked"

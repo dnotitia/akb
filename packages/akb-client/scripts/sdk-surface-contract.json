@@ -243,5 +243,515 @@
     "rawPrefix": "/tables",
     "packedProof": "tables.drop"
   }
-  ]
+  ],
+  "controlPlane": [
+  {
+    "operationId": "appAuthorize",
+    "method": "post",
+    "path": "/api/v1/app/authorize",
+    "successSchema": "AuthorizeProjection",
+    "requestSchema": "AuthorizeRequest",
+    "facade": {
+      "namespace": "app",
+      "method": "authorize"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/app/authorize",
+    "packedProof": "controlPlane.appAuthorize"
+  },
+  {
+    "operationId": "appGetInstallation",
+    "method": "get",
+    "path": "/api/v1/app/installations/{vault_id}",
+    "successSchema": "InstallationProjection",
+    "requestSchema": "never",
+    "facade": {
+      "namespace": "app.installations",
+      "method": "get"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/app/installations",
+    "packedProof": "controlPlane.appGetInstallation"
+  },
+  {
+    "operationId": "appListInventory",
+    "method": "get",
+    "path": "/api/v1/app/inventory",
+    "successSchema": "InventoryProjection",
+    "requestSchema": "never",
+    "facade": {
+      "namespace": "app.inventory",
+      "method": "list"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/app/inventory",
+    "packedProof": "controlPlane.appListInventory"
+  },
+  {
+    "operationId": "appReportObservedState",
+    "method": "post",
+    "path": "/api/v1/app/observed-state",
+    "successSchema": "ObservedStateProjection",
+    "requestSchema": "ObservedStateRequest",
+    "facade": {
+      "namespace": "app.inventory",
+      "method": "reportObserved"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/app/observed-state",
+    "packedProof": "controlPlane.appReportObservedState"
+  },
+  {
+    "operationId": "appCreateRolloutSnapshot",
+    "method": "post",
+    "path": "/api/v1/app/rollout-snapshots",
+    "successSchema": "SnapshotCreateProjection",
+    "requestSchema": "app__api__control_plane_models__SnapshotRequest",
+    "facade": {
+      "namespace": "app.snapshots",
+      "method": "create"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/app/rollout-snapshots",
+    "packedProof": "controlPlane.appCreateRolloutSnapshot"
+  },
+  {
+    "operationId": "appGetRolloutSnapshot",
+    "method": "get",
+    "path": "/api/v1/app/rollout-snapshots/{snapshot_id}",
+    "successSchema": "SnapshotProjection",
+    "requestSchema": "never",
+    "facade": {
+      "namespace": "app.snapshots",
+      "method": "get"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/app/rollout-snapshots",
+    "packedProof": "controlPlane.appGetRolloutSnapshot"
+  },
+  {
+    "operationId": "appEvaluateRolloutTarget",
+    "method": "post",
+    "path": "/api/v1/app/rollout-snapshots/{snapshot_id}/targets/{target_id}/eligibility",
+    "successSchema": "EligibilityProjection",
+    "requestSchema": "never",
+    "facade": {
+      "namespace": "app.snapshots",
+      "method": "evaluate"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/app/rollout-snapshots",
+    "packedProof": "controlPlane.appEvaluateRolloutTarget"
+  },
+  {
+    "operationId": "appRequestRollout",
+    "method": "post",
+    "path": "/api/v1/app/rollouts",
+    "successSchema": "RolloutProjection",
+    "requestSchema": "RolloutRequest",
+    "facade": {
+      "namespace": "app.rollouts",
+      "method": "request"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/app/rollouts",
+    "requiredHeaders": [
+      "Idempotency-Key"
+    ],
+    "packedProof": "controlPlane.appRequestRollout"
+  },
+  {
+    "operationId": "appGetRollout",
+    "method": "get",
+    "path": "/api/v1/app/rollouts/{rollout_id}",
+    "successSchema": "RolloutProjection",
+    "requestSchema": "never",
+    "facade": {
+      "namespace": "app.rollouts",
+      "method": "get"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/app/rollouts",
+    "packedProof": "controlPlane.appGetRollout"
+  },
+  {
+    "operationId": "appResumeRollout",
+    "method": "post",
+    "path": "/api/v1/app/rollouts/{rollout_id}/resume",
+    "successSchema": "RolloutProjection",
+    "requestSchema": "RolloutResumeRequest",
+    "facade": {
+      "namespace": "app.rollouts",
+      "method": "resume"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/app/rollouts",
+    "requiredHeaders": [
+      "Idempotency-Key"
+    ],
+    "packedProof": "controlPlane.appResumeRollout"
+  },
+  {
+    "operationId": "appsCreate",
+    "method": "post",
+    "path": "/api/v1/apps",
+    "successSchema": "AppDefinitionProjection",
+    "requestSchema": "AppCreateRequest",
+    "facade": {
+      "namespace": "apps",
+      "method": "create"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "packedProof": "controlPlane.appsCreate"
+  },
+  {
+    "operationId": "appsGet",
+    "method": "get",
+    "path": "/api/v1/apps/{app_id}",
+    "successSchema": "AppDefinitionProjection",
+    "requestSchema": "never",
+    "facade": {
+      "namespace": "apps",
+      "method": "get"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "packedProof": "controlPlane.appsGet"
+  },
+  {
+    "operationId": "appsUpdate",
+    "method": "patch",
+    "path": "/api/v1/apps/{app_id}",
+    "successSchema": "AppDefinitionProjection",
+    "requestSchema": "AppUpdateRequest",
+    "facade": {
+      "namespace": "apps",
+      "method": "update"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "packedProof": "controlPlane.appsUpdate"
+  },
+  {
+    "operationId": "appsIssueCredential",
+    "method": "post",
+    "path": "/api/v1/apps/{app_id}/credentials",
+    "successSchema": "CredentialIssueProjection",
+    "requestSchema": "CredentialIssueRequest",
+    "facade": {
+      "namespace": "credentials",
+      "method": "issue"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "packedProof": "controlPlane.appsIssueCredential"
+  },
+  {
+    "operationId": "appsListCredentials",
+    "method": "get",
+    "path": "/api/v1/apps/{app_id}/credentials",
+    "successSchema": "CredentialListProjection",
+    "requestSchema": "never",
+    "facade": {
+      "namespace": "credentials",
+      "method": "list"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "packedProof": "controlPlane.appsListCredentials"
+  },
+  {
+    "operationId": "appsRevokeCredential",
+    "method": "delete",
+    "path": "/api/v1/apps/{app_id}/credentials/{credential_id}",
+    "successSchema": "CredentialMetadata",
+    "requestSchema": "never",
+    "facade": {
+      "namespace": "credentials",
+      "method": "revoke"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "packedProof": "controlPlane.appsRevokeCredential"
+  },
+  {
+    "operationId": "appsRotateCredential",
+    "method": "post",
+    "path": "/api/v1/apps/{app_id}/credentials/{credential_id}/rotate",
+    "successSchema": "CredentialIssueProjection",
+    "requestSchema": "CredentialRotateRequest",
+    "facade": {
+      "namespace": "credentials",
+      "method": "rotate"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "packedProof": "controlPlane.appsRotateCredential"
+  },
+  {
+    "operationId": "appsApplyInstallation",
+    "method": "put",
+    "path": "/api/v1/apps/{app_id}/installations/{vault_id}",
+    "successSchema": "InstallationProjection",
+    "requestSchema": "InstallationCommandRequest",
+    "facade": {
+      "namespace": "installations",
+      "method": "apply"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "packedProof": "controlPlane.appsApplyInstallation"
+  },
+  {
+    "operationId": "appsGetInstallation",
+    "method": "get",
+    "path": "/api/v1/apps/{app_id}/installations/{vault_id}",
+    "successSchema": "InstallationProjection",
+    "requestSchema": "never",
+    "facade": {
+      "namespace": "installations",
+      "method": "get"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "packedProof": "controlPlane.appsGetInstallation"
+  },
+  {
+    "operationId": "appsUninstallInstallation",
+    "method": "delete",
+    "path": "/api/v1/apps/{app_id}/installations/{vault_id}",
+    "successSchema": "InstallationProjection",
+    "requestSchema": "never",
+    "facade": {
+      "namespace": "installations",
+      "method": "uninstall"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "packedProof": "controlPlane.appsUninstallInstallation"
+  },
+  {
+    "operationId": "appsListInventory",
+    "method": "get",
+    "path": "/api/v1/apps/{app_id}/inventory",
+    "successSchema": "InventoryProjection",
+    "requestSchema": "never",
+    "facade": {
+      "namespace": "inventory",
+      "method": "list"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "packedProof": "controlPlane.appsListInventory"
+  },
+  {
+    "operationId": "appsReportObservedState",
+    "method": "post",
+    "path": "/api/v1/apps/{app_id}/observed-state",
+    "successSchema": "ObservedStateProjection",
+    "requestSchema": "ObservedStateRequest",
+    "facade": {
+      "namespace": "inventory",
+      "method": "reportObserved"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "packedProof": "controlPlane.appsReportObservedState"
+  },
+  {
+    "operationId": "appsCreateRelease",
+    "method": "post",
+    "path": "/api/v1/apps/{app_id}/releases",
+    "successSchema": "AppReleaseProjection",
+    "requestSchema": "ReleaseCreateRequest",
+    "facade": {
+      "namespace": "releases",
+      "method": "create"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "packedProof": "controlPlane.appsCreateRelease"
+  },
+  {
+    "operationId": "appsGetRelease",
+    "method": "get",
+    "path": "/api/v1/apps/{app_id}/releases/{release_id}",
+    "successSchema": "AppReleaseProjection",
+    "requestSchema": "never",
+    "facade": {
+      "namespace": "releases",
+      "method": "get"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "packedProof": "controlPlane.appsGetRelease"
+  },
+  {
+    "operationId": "appsCreateRolloutSnapshot",
+    "method": "post",
+    "path": "/api/v1/apps/{app_id}/rollout-snapshots",
+    "successSchema": "SnapshotCreateProjection",
+    "requestSchema": "app__api__control_plane_models__SnapshotRequest",
+    "facade": {
+      "namespace": "snapshots",
+      "method": "create"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "packedProof": "controlPlane.appsCreateRolloutSnapshot"
+  },
+  {
+    "operationId": "appsGetRolloutSnapshot",
+    "method": "get",
+    "path": "/api/v1/apps/{app_id}/rollout-snapshots/{snapshot_id}",
+    "successSchema": "SnapshotProjection",
+    "requestSchema": "never",
+    "facade": {
+      "namespace": "snapshots",
+      "method": "get"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "packedProof": "controlPlane.appsGetRolloutSnapshot"
+  },
+  {
+    "operationId": "appsEvaluateRolloutTarget",
+    "method": "post",
+    "path": "/api/v1/apps/{app_id}/rollout-snapshots/{snapshot_id}/targets/{target_id}/eligibility",
+    "successSchema": "EligibilityProjection",
+    "requestSchema": "never",
+    "facade": {
+      "namespace": "snapshots",
+      "method": "evaluate"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "packedProof": "controlPlane.appsEvaluateRolloutTarget"
+  },
+  {
+    "operationId": "appsRequestRollout",
+    "method": "post",
+    "path": "/api/v1/apps/{app_id}/rollouts",
+    "successSchema": "RolloutProjection",
+    "requestSchema": "RolloutRequest",
+    "facade": {
+      "namespace": "rollouts",
+      "method": "request"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "requiredHeaders": [
+      "Idempotency-Key"
+    ],
+    "packedProof": "controlPlane.appsRequestRollout"
+  },
+  {
+    "operationId": "appsGetRollout",
+    "method": "get",
+    "path": "/api/v1/apps/{app_id}/rollouts/{rollout_id}",
+    "successSchema": "RolloutProjection",
+    "requestSchema": "never",
+    "facade": {
+      "namespace": "rollouts",
+      "method": "get"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "packedProof": "controlPlane.appsGetRollout"
+  },
+  {
+    "operationId": "appsResumeRollout",
+    "method": "post",
+    "path": "/api/v1/apps/{app_id}/rollouts/{rollout_id}/resume",
+    "successSchema": "RolloutProjection",
+    "requestSchema": "RolloutResumeRequest",
+    "facade": {
+      "namespace": "rollouts",
+      "method": "resume"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "requiredHeaders": [
+      "Idempotency-Key"
+    ],
+    "packedProof": "controlPlane.appsResumeRollout"
+  },
+  {
+    "operationId": "authExchangeAppCredential",
+    "method": "post",
+    "path": "/api/v1/auth/app-token",
+    "successSchema": "CredentialExchangeProjection",
+    "requestSchema": "CredentialExchangeRequest",
+    "facade": {
+      "namespace": "exchange",
+      "method": "appCredential"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/auth/app-token",
+    "packedProof": "controlPlane.authExchangeAppCredential"
+  }
+]
 }

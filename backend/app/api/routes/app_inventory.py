@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
-from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from pydantic import Field
+
+from app.api.control_plane_models import (
+    EligibilityProjection,
+    InventoryProjection,
+    ObservedStateProjection,
+    ObservedStateRequest,
+    SnapshotCreateProjection,
+    SnapshotProjection,
+    SnapshotRequest,
+)
 
 from app.api.deps import get_current_app, get_current_user, request_correlation_id
 from app.services.app_identity_service import (
@@ -23,25 +30,8 @@ from app.services.app_inventory_service import (
     list_inventory,
     report_observed_state,
 )
-from app.util.text import NFCModel
 
 router = APIRouter()
-
-
-class ObservedStateRequest(NFCModel):
-    installation_id: uuid.UUID
-    observed_generation: int = Field(ge=0)
-    observed_at: datetime | None = None
-    observed_release_id: uuid.UUID | None = None
-    observed_release_version: str | None = Field(default=None, max_length=256)
-    schema_fingerprint: str | None = Field(default=None, max_length=256)
-    observed_grant_generation: int | None = Field(default=None, ge=0)
-    checkpoint: dict[str, Any] = Field(default_factory=dict)
-    recent_error: dict[str, Any] | None = None
-
-
-class SnapshotRequest(NFCModel):
-    """Reserved empty request body for future snapshot labels."""
 
 
 def _mark_no_store(response: Response) -> None:
@@ -89,6 +79,8 @@ async def _authorize_app(
 
 @router.get(
     "/apps/{app_id}/inventory",
+    response_model=InventoryProjection,
+    operation_id="appsListInventory",
     summary="Read an app installation inventory as a system administrator",
 )
 async def admin_inventory(
@@ -119,6 +111,8 @@ async def admin_inventory(
 
 @router.get(
     "/app/inventory",
+    response_model=InventoryProjection,
+    operation_id="appListInventory",
     summary="Read the caller app's installation inventory",
 )
 async def app_inventory(
@@ -144,6 +138,8 @@ async def app_inventory(
 
 @router.post(
     "/apps/{app_id}/observed-state",
+    response_model=ObservedStateProjection,
+    operation_id="appsReportObservedState",
     summary="Record an app installation worker observation as a system administrator",
 )
 async def admin_observed_state(
@@ -180,6 +176,8 @@ async def admin_observed_state(
 
 @router.post(
     "/app/observed-state",
+    response_model=ObservedStateProjection,
+    operation_id="appReportObservedState",
     summary="Record the caller app's installation worker observation",
 )
 async def app_observed_state(
@@ -209,6 +207,8 @@ async def app_observed_state(
 
 @router.post(
     "/apps/{app_id}/rollout-snapshots",
+    response_model=SnapshotCreateProjection,
+    operation_id="appsCreateRolloutSnapshot",
     summary="Create an immutable rollout target snapshot as a system administrator",
 )
 async def admin_create_snapshot(
@@ -237,6 +237,8 @@ async def admin_create_snapshot(
 
 @router.post(
     "/app/rollout-snapshots",
+    response_model=SnapshotCreateProjection,
+    operation_id="appCreateRolloutSnapshot",
     summary="Create an immutable rollout target snapshot for the caller app",
 )
 async def app_create_snapshot(
@@ -259,6 +261,8 @@ async def app_create_snapshot(
 
 @router.get(
     "/apps/{app_id}/rollout-snapshots/{snapshot_id}",
+    response_model=SnapshotProjection,
+    operation_id="appsGetRolloutSnapshot",
     summary="Read an app rollout target snapshot as a system administrator",
 )
 async def admin_get_snapshot(
@@ -281,6 +285,8 @@ async def admin_get_snapshot(
 
 @router.get(
     "/app/rollout-snapshots/{snapshot_id}",
+    response_model=SnapshotProjection,
+    operation_id="appGetRolloutSnapshot",
     summary="Read a caller-app rollout target snapshot",
 )
 async def app_get_snapshot(
@@ -297,6 +303,8 @@ async def app_get_snapshot(
 
 @router.post(
     "/apps/{app_id}/rollout-snapshots/{snapshot_id}/targets/{target_id}/eligibility",
+    response_model=EligibilityProjection,
+    operation_id="appsEvaluateRolloutTarget",
     summary="Recheck a rollout target before execution as a system administrator",
 )
 async def admin_evaluate_target(
@@ -327,6 +335,8 @@ async def admin_evaluate_target(
 
 @router.post(
     "/app/rollout-snapshots/{snapshot_id}/targets/{target_id}/eligibility",
+    response_model=EligibilityProjection,
+    operation_id="appEvaluateRolloutTarget",
     summary="Recheck a caller-app rollout target before execution",
 )
 async def app_evaluate_target(

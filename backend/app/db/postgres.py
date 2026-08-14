@@ -260,6 +260,7 @@ async def _apply_migrations() -> None:
         "071_recovery_admin.py",  # explicit singleton recovery administrator + external username snapshot
         "072_admin_browser_sessions.py",  # short-lived opaque sessions for the dedicated SSO admin client
         "073_sso_bootstrap_receipt.py",  # durable proof that the temporary bundled-Keycloak client was retired
+        "073_app_rollout_resume.py",  # immutable-source new-attempt rollout resume ledger
         "074_sso_browser_sessions.py",  # encrypted ordinary-user SSO browser-session custody
         "075_sso_callback_receipt.py",  # bind current SSO receipts to the effective back-channel callback
         "076_sso_session_epoch.py",  # monotonic auth boundary + rollback-compatible epoch bridge/legacy-write guard

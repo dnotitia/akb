@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from app.api.control_plane_models import InventoryProjection
 from app.exceptions import ValidationError
 from app.services import app_inventory_service as inventory
 
@@ -130,6 +131,9 @@ def test_drift_keeps_missing_observations_and_expected_schema_unknown():
     row = _row(observed=True)
     drift = inventory.classify_drift(row)
     assert drift["overall"] == "in_sync"
+    assert drift["release"]["status"] == "in_sync"
+    assert drift["schema"]["status"] == "in_sync"
+    assert drift["grant"]["status"] == "in_sync"
     assert not drift["reasons"]
 
     row = _row(observed=True, mismatch=True)
@@ -146,6 +150,7 @@ def test_drift_keeps_missing_observations_and_expected_schema_unknown():
 
 def test_projection_redacts_unbounded_checkpoint_and_error_payloads():
     item = inventory.project_inventory_item(_row())
+    InventoryProjection.model_validate({"items": [item]})
     serialized = str(item)
     assert "secret-marker" not in serialized
     assert "issuer" not in item["latest_grant"]
