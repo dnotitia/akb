@@ -21,6 +21,7 @@ from app.models.vault_scope import VaultScope, current_token_uuid, current_vault
 from app.repositories import vault_write_policy_repo as write_policy_repo
 from app.repositories.events_repo import emit_event
 from app.repositories.vault_files_repo import confirmed_file_predicate
+from app.services.account_markers import is_retired_recovery_admin_password
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import vault_uri
 from app.services.write_lane import run_compensation, run_git_write
@@ -1683,9 +1684,13 @@ async def delete_user_account(user_id: str) -> dict:
     pool = await get_pool()
 
     async with pool.acquire() as conn:
-        if await conn.fetchval(
-            "SELECT is_recovery_admin FROM users WHERE id = $1",
+        protected = await conn.fetchrow(
+            "SELECT is_recovery_admin, password_hash FROM users WHERE id = $1",
             uid,
+        )
+        if protected is not None and (
+            protected["is_recovery_admin"]
+            or is_retired_recovery_admin_password(protected["password_hash"])
         ):
             raise RecoveryAdminProtectedError()
         owned_vault_names = [

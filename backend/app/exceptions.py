@@ -156,6 +156,28 @@ class RecoveryAdminProtectedError(AKBError):
         )
 
 
+class RecoveryAdminRetirementAuthorizationError(AKBError):
+    """The retirement caller is not an independent service administrator."""
+
+    def __init__(self):
+        super().__init__(
+            "Recovery administrator retirement requires an independent service administrator token",
+            status_code=403,
+            code="recovery_admin_retirement_requires_service_admin",
+        )
+
+
+class RecoveryAdminRetirementConflictError(AKBError):
+    """The expected recovery identity does not match one safe retirement state."""
+
+    def __init__(self):
+        super().__init__(
+            "Recovery administrator does not match the retirement contract",
+            status_code=409,
+            code="recovery_admin_retirement_conflict",
+        )
+
+
 class ExternalAuthDisabledError(AKBError):
     """External authentication is disabled by deployment policy."""
 

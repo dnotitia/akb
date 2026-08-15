@@ -406,10 +406,26 @@ class RoleSync:
         role = token_role_name(token_id)
         try:
             async with self.pool.acquire() as conn:
-                await self._create_role_if_missing(conn, role)
-                accessible = await self._fetch_user_accessible(conn, user_id)
-                for group in wanted_token_group_roles(accessible, scope):
-                    await self._grant_membership(conn, group, role)
+                async with conn.transaction():
+                    rows = await self._locked_live_scoped_tokens(
+                        conn,
+                        token_id=token_id,
+                        user_id=user_id,
+                    )
+                    if len(rows) != 1:
+                        return
+                    live = rows[0]
+                    try:
+                        stored_scope = VaultScope.from_db_json(live["vault_scope"])
+                    except ValueError:
+                        return
+                    if stored_scope is None:
+                        return
+                    scope = stored_scope
+                    await self._create_role_if_missing(conn, role)
+                    accessible = await self._fetch_user_accessible(conn, live["user_id"])
+                    for group in wanted_token_group_roles(accessible, scope):
+                        await self._grant_membership(conn, group, role)
         except Exception as e:  # noqa: BLE001
             self._record_failure("on_token_create", e, token_id)
 
@@ -906,6 +922,37 @@ class RoleSync:
         )
         return {r["group_role"] for r in rows}
 
+    async def _locked_live_scoped_tokens(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        user_id: uuid.UUID | str | None = None,
+        token_id: uuid.UUID | str | None = None,
+    ):
+        """Lock exact catalog authority before any scoped-token role creation."""
+        conditions: list[str] = []
+        values: list[uuid.UUID] = []
+        if user_id is not None:
+            values.append(uuid.UUID(str(user_id)))
+            conditions.append(f"t.user_id = ${len(values)}")
+        if token_id is not None:
+            values.append(uuid.UUID(str(token_id)))
+            conditions.append(f"t.id = ${len(values)}")
+        filters = "" if not conditions else " AND " + " AND ".join(conditions)
+        return await conn.fetch(
+            """
+            SELECT t.id, t.user_id, t.vault_scope
+              FROM tokens t
+              JOIN users u ON u.id = t.user_id
+             WHERE t.vault_scope IS NOT NULL
+               AND (t.expires_at IS NULL OR t.expires_at > NOW())
+               AND u.account_status = 'active'
+            """
+            + filters
+            + " ORDER BY t.id FOR SHARE OF t, u",
+            *values,
+        )
+
     async def _sync_user_scoped_tokens(
         self, conn: asyncpg.Connection, user_id: uuid.UUID | str,
     ) -> None:
@@ -919,15 +966,14 @@ class RoleSync:
         reconcile (the token role would be missing the just-created vault's
         group). A no-op for users with no scoped tokens. Runs inside the
         caller hook's connection + best-effort try/except."""
+        async with conn.transaction():
+            await self._sync_user_scoped_tokens_locked(conn, user_id)
+
+    async def _sync_user_scoped_tokens_locked(
+        self, conn: asyncpg.Connection, user_id: uuid.UUID | str,
+    ) -> None:
         uid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(str(user_id))
-        token_rows = await conn.fetch(
-            """
-            SELECT id, vault_scope FROM tokens
-             WHERE user_id = $1 AND vault_scope IS NOT NULL
-               AND (expires_at IS NULL OR expires_at > NOW())
-            """,
-            uid,
-        )
+        token_rows = await self._locked_live_scoped_tokens(conn, user_id=uid)
         if not token_rows:
             return
         accessible = await self._fetch_user_accessible(conn, uid)
@@ -959,14 +1005,13 @@ class RoleSync:
         joins, and a revoked/downgraded owner grant is withdrawn from the
         token. A malformed scope is logged and skipped (it never widens —
         the token role just keeps its current, already-narrow membership)."""
-        token_rows = await conn.fetch(
-            """
-            SELECT id, user_id, vault_scope
-              FROM tokens
-             WHERE vault_scope IS NOT NULL
-               AND (expires_at IS NULL OR expires_at > NOW())
-            """
-        )
+        async with conn.transaction():
+            await self._reconcile_token_roles_locked(conn, report)
+
+    async def _reconcile_token_roles_locked(
+        self, conn: asyncpg.Connection, report: ReconcileReport,
+    ) -> None:
+        token_rows = await self._locked_live_scoped_tokens(conn)
         live: list[tuple[str, uuid.UUID, VaultScope]] = []
         for r in token_rows:
             try:
@@ -987,13 +1032,17 @@ class RoleSync:
         }
         for role in wanted_roles - existing:
             try:
-                await conn.execute(f'CREATE ROLE "{role}" NOLOGIN')
+                async with conn.transaction():
+                    await self._create_role_if_missing(conn, role)
+                # Count only after the savepoint committed.
                 report.token_roles_created += 1
             except Exception as e:  # noqa: BLE001
                 report.errors.append(f"CREATE ROLE {role}: {e}")
         for orphan in existing - wanted_roles:
             try:
-                await self._drop_role_if_present(conn, orphan)
+                async with conn.transaction():
+                    await self._drop_role_if_present(conn, orphan)
+                # Count only after the savepoint committed.
                 report.token_roles_dropped += 1
             except Exception as e:  # noqa: BLE001
                 report.errors.append(f"DROP ROLE {orphan}: {e}")
@@ -1015,18 +1064,25 @@ class RoleSync:
             actual.setdefault(r["token_role"], set()).add(r["group_role"])
 
         for role, uid, scope in live:
+            added = 0
+            removed = 0
             try:
-                accessible = await self._fetch_user_accessible(conn, uid)
-                wanted = wanted_token_group_roles(accessible, scope)
-                have = actual.get(role, set())
-                for group in wanted - have:
-                    await self._grant_membership(conn, group, role)
-                    report.grants_added += 1
-                for group in have - wanted:
-                    await self._revoke_membership_if_present(conn, group, role)
-                    report.grants_removed += 1
+                async with conn.transaction():
+                    accessible = await self._fetch_user_accessible(conn, uid)
+                    wanted = wanted_token_group_roles(accessible, scope)
+                    have = actual.get(role, set())
+                    for group in wanted - have:
+                        await self._grant_membership(conn, group, role)
+                        added += 1
+                    for group in have - wanted:
+                        await self._revoke_membership_if_present(conn, group, role)
+                        removed += 1
             except Exception as e:  # noqa: BLE001
                 report.errors.append(f"token role {role} membership: {e}")
+            else:
+                # Report only effects whose savepoint committed.
+                report.grants_added += added
+                report.grants_removed += removed
 
     # ── Drift inspection (read-only) ──
 
