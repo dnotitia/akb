@@ -18,6 +18,10 @@ from app.exceptions import (
     ValidationError,
 )
 from app.repositories.events_repo import emit_event
+from app.services.account_markers import (
+    RETIRED_RECOVERY_ADMIN_PASSWORD_SENTINEL,
+    is_retired_recovery_admin_password,
+)
 from app.services.auth_service import (
     REVOKE_REASON_ADMIN,
     _hash_token,
@@ -96,7 +100,7 @@ async def ensure_human_external_identity(
                 )
                 bound = await conn.fetchrow(
                     """
-                    SELECT u.id, u.account_kind
+                    SELECT u.id, u.account_kind, u.password_hash
                       FROM external_identities e
                       JOIN users u ON u.id = e.user_id
                      WHERE e.issuer = $1 AND e.subject = $2
@@ -106,6 +110,8 @@ async def ensure_human_external_identity(
                     subject,
                 )
                 if bound is not None:
+                    if is_retired_recovery_admin_password(bound["password_hash"]):
+                        raise RecoveryAdminProtectedError()
                     if bound["account_kind"] != "human" or (
                         existing_user_uuid is not None and bound["id"] != existing_user_uuid
                     ):
@@ -138,7 +144,7 @@ async def ensure_human_external_identity(
                     if existing_user_uuid is not None:
                         target = await conn.fetchrow(
                             """
-                            SELECT id, account_kind
+                            SELECT id, account_kind, password_hash
                               FROM users WHERE id = $1
                              FOR UPDATE
                             """,
@@ -146,6 +152,8 @@ async def ensure_human_external_identity(
                         )
                         if target is None:
                             raise NotFoundError("User", str(existing_user_uuid))
+                        if is_retired_recovery_admin_password(target["password_hash"]):
+                            raise RecoveryAdminProtectedError()
                         if target["account_kind"] != "human":
                             raise ExternalIdentityConflictError()
                         email_owner = await conn.fetchval(
@@ -170,7 +178,7 @@ async def ensure_human_external_identity(
                     else:
                         rows = await conn.fetch(
                             """
-                            SELECT id, account_kind
+                            SELECT id, account_kind, password_hash
                               FROM users WHERE email = $1
                              FOR UPDATE
                             """,
@@ -180,6 +188,8 @@ async def ensure_human_external_identity(
                             raise ExternalIdentityConflictError()
                         if rows:
                             user_id = rows[0]["id"]
+                            if is_retired_recovery_admin_password(rows[0]["password_hash"]):
+                                raise RecoveryAdminProtectedError()
                             if rows[0]["account_kind"] != "human":
                                 raise ExternalIdentityConflictError()
                             has_identity = await conn.fetchval(
@@ -254,7 +264,7 @@ async def ensure_human_external_identity(
     if new_user_id is not None:
         await get_role_sync().on_user_create(new_user_id)
     if prepare_suspended:
-        await _cleanup_token_roles(pool, user_id, token_ids)
+        await cleanup_token_roles(pool, user_id, token_ids)
     return _user_result(row)
 
 
@@ -501,7 +511,7 @@ async def adopt_current_admin_as_service(
             if adopted is None or adopted["is_recovery_admin"] is not False:
                 raise ServiceIdentityAdoptionError()
 
-    await _cleanup_token_roles(pool, user_uuid, pending_token_ids)
+    await cleanup_token_roles(pool, user_uuid, pending_token_ids)
     return {
         **_user_result(adopted),
         "is_recovery_admin": adopted["is_recovery_admin"],
@@ -710,7 +720,8 @@ async def set_user_admin(user_id: str, *, is_admin: bool, actor_id: str) -> dict
     return _user_result(row)
 
 
-async def _cleanup_token_roles(pool, user_id: uuid.UUID, token_ids: list[uuid.UUID]) -> None:
+async def cleanup_token_roles(pool, user_id: uuid.UUID, token_ids: list[uuid.UUID]) -> None:
+    """Strictly finish durable token-role cleanup before reporting success."""
     failed: list[str] = []
     for token_id in token_ids:
         try:
@@ -830,7 +841,7 @@ async def suspend_user(user_id: str, *, actor_id: str) -> dict:
                 actor_id=actor_id,
             )
 
-    await _cleanup_token_roles(pool, user_uuid, token_ids)
+    await cleanup_token_roles(pool, user_uuid, token_ids)
     return {
         "user_id": user_id,
         "account_status": "suspended",
@@ -847,13 +858,22 @@ async def activate_user(user_id: str, *, actor_id: str) -> dict:
                 """
                 UPDATE users
                    SET account_status = 'active', updated_at = NOW()
-                 WHERE id = $1
+                 WHERE id = $1 AND password_hash <> $2
              RETURNING id, username, email, display_name, is_admin,
                        auth_provider, account_status, account_kind
                 """,
                 user_uuid,
+                RETIRED_RECOVERY_ADMIN_PASSWORD_SENTINEL,
             )
             if row is None:
+                current = await conn.fetchrow(
+                    "SELECT password_hash FROM users WHERE id = $1 FOR UPDATE",
+                    user_uuid,
+                )
+                if current is None:
+                    raise NotFoundError("User", user_id)
+                if is_retired_recovery_admin_password(current["password_hash"]):
+                    raise RecoveryAdminProtectedError()
                 raise NotFoundError("User", user_id)
             await emit_event(
                 conn,
@@ -914,7 +934,7 @@ async def revoke_user_token(user_id: str, token_id: str, *, actor_id: str) -> di
                 needs_cleanup = True
 
     if needs_cleanup:
-        await _cleanup_token_roles(pool, user_uuid, [token_uuid])
+        await cleanup_token_roles(pool, user_uuid, [token_uuid])
     return {"user_id": user_id, "token_id": token_id, "revoked": True}
 
 

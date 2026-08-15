@@ -3,7 +3,7 @@
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import Field, SecretStr
+from pydantic import ConfigDict, Field, SecretStr
 
 from app.api.deps import get_current_user
 from app.services.auth_service import (
@@ -12,6 +12,7 @@ from app.services.auth_service import (
     revoke_all_sessions,
 )
 from app.services.auth_policy import require_local_auth_enabled
+from app.services.recovery_admin_service import retire_local_recovery_admin
 from app.services.account_service import (
     activate_user,
     adopt_current_admin_as_service,
@@ -158,6 +159,26 @@ class ExpectedManagedHuman(NFCModel):
 class ManagedAccountStateRequest(NFCModel):
     issuer: str
     expected_humans: list[ExpectedManagedHuman] = Field(min_length=1, max_length=10_000)
+
+
+class RetireRecoveryAdminRequest(NFCModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_username: str = Field(min_length=1, max_length=255)
+    expected_email: str = Field(min_length=1, max_length=320)
+
+
+class RetireRecoveryAdminResponse(NFCModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str
+    username: str
+    email: str
+    account_status: Literal["suspended"]
+    is_admin: Literal[False]
+    is_recovery_admin: Literal[False]
+    account_kind: Literal["human"]
+    auth_provider: Literal["local"]
 
 
 @router.get("/my/vaults", summary="List vaults accessible to me")
@@ -350,6 +371,37 @@ async def admin_remove_vault_write_grant(
 async def admin_list_users(user: AuthenticatedUser = Depends(get_current_user)):
     _require_admin(user)
     return {"users": await list_all_users_admin()}
+
+
+@router.post(
+    "/admin/recovery-admin/retire",
+    summary="[admin] Retire the exact local recovery administrator",
+    response_model=RetireRecoveryAdminResponse,
+)
+async def admin_retire_recovery_admin(
+    req: RetireRecoveryAdminRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    if not (
+        user.is_admin
+        and user.account_kind == "service"
+        and user.auth_method == "pat"
+        and user.token_id is not None
+        and user.key_class in {"pat", "service"}
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "message": "Recovery administrator retirement requires an independent service administrator token",
+                "code": "recovery_admin_retirement_requires_service_admin",
+            },
+        )
+    return await retire_local_recovery_admin(
+        expected_username=req.expected_username,
+        expected_email=req.expected_email,
+        actor_user_id=user.user_id,
+        actor_token_id=user.token_id,
+    )
 
 
 @router.post(
