@@ -20,6 +20,10 @@ from app.repositories.events_repo import emit_event
 from app.services.account_markers import RETIRED_RECOVERY_ADMIN_PASSWORD_SENTINEL
 from app.services.account_service import cleanup_token_roles
 from app.services.auth_service import hash_password_async
+from app.services.external_identity_contract import (
+    OIDC_SUBJECT_MAX_LENGTH,
+    bounded_nonempty_claim,
+)
 from app.services.role_sync import get_role_sync
 
 
@@ -60,15 +64,16 @@ async def _lock_provisioning(conn) -> None:
     )
 
 
-async def _designated_user(conn):
+async def _designated_user(conn, *, auth_provider: Literal["local", "keycloak"]):
     return await conn.fetchrow(
         """
         SELECT id, username, email, password_hash, is_admin, is_recovery_admin,
                auth_provider, account_status, account_kind
           FROM users
-         WHERE is_recovery_admin
+         WHERE is_recovery_admin AND auth_provider = $1
          FOR UPDATE
-        """
+        """,
+        auth_provider,
     )
 
 
@@ -112,7 +117,7 @@ async def provision_local_recovery_admin(
         async with pool.acquire() as conn:
             async with conn.transaction():
                 await _lock_provisioning(conn)
-                row = await _designated_user(conn)
+                row = await _designated_user(conn, auth_provider="local")
                 if row is not None:
                     identity_count = await conn.fetchval(
                         "SELECT COUNT(*) FROM external_identities WHERE user_id = $1",
@@ -180,6 +185,8 @@ async def provision_sso_recovery_admin(
     email = _email(email)
     issuer = _required(issuer, "issuer")
     subject = _required(subject, "subject")
+    if bounded_nonempty_claim(subject, maximum=OIDC_SUBJECT_MAX_LENGTH) is None:
+        raise ValidationError("subject exceeds maximum length")
     pool = await get_pool()
     created = False
 
@@ -187,7 +194,7 @@ async def provision_sso_recovery_admin(
         async with pool.acquire() as conn:
             async with conn.transaction():
                 await _lock_provisioning(conn)
-                row = await _designated_user(conn)
+                row = await _designated_user(conn, auth_provider="keycloak")
                 if row is not None:
                     identities = await conn.fetch(
                         """
@@ -345,9 +352,8 @@ async def _locked_recovery_rows(conn):
         SELECT u.id, u.username, u.email, u.password_hash, u.is_admin,
                u.is_recovery_admin, u.auth_provider, u.account_status,
                u.account_kind, u.tokens_revoked_before,
-               EXISTS (
-                   SELECT 1 FROM external_identities e WHERE e.user_id = u.id
-               ) AS has_external_identity,
+               (SELECT COUNT(*) FROM external_identities e WHERE e.user_id = u.id)
+                   AS external_identity_count,
                EXISTS (
                    SELECT 1 FROM tokens t WHERE t.user_id = u.id
                ) AS has_tokens,
@@ -365,6 +371,23 @@ async def _locked_recovery_rows(conn):
     )
 
 
+async def _locked_sso_recovery_identities(conn):
+    rows = await conn.fetch(
+        """
+        SELECT e.user_id, e.issuer, e.subject
+          FROM external_identities e
+          JOIN users u ON u.id = e.user_id
+         WHERE u.is_recovery_admin AND u.auth_provider = 'keycloak'
+         ORDER BY e.user_id, e.issuer, e.subject
+         FOR UPDATE OF e /* recovery-successor-authority-lock */
+        """
+    )
+    identities: dict[uuid.UUID, list] = {}
+    for row in rows:
+        identities.setdefault(row["user_id"], []).append(row)
+    return identities
+
+
 async def _locked_retirement_collisions(
     conn,
     *,
@@ -376,9 +399,8 @@ async def _locked_retirement_collisions(
         SELECT u.id, u.username, u.email, u.password_hash, u.is_admin,
                u.is_recovery_admin, u.auth_provider, u.account_status,
                u.account_kind, u.tokens_revoked_before,
-               EXISTS (
-                   SELECT 1 FROM external_identities e WHERE e.user_id = u.id
-               ) AS has_external_identity,
+               (SELECT COUNT(*) FROM external_identities e WHERE e.user_id = u.id)
+                   AS external_identity_count,
                EXISTS (
                    SELECT 1 FROM tokens t WHERE t.user_id = u.id
                ) AS has_tokens,
@@ -412,7 +434,25 @@ def _is_exact_active_local_recovery(
         and row["auth_provider"] == "local"
         and row["account_status"] == "active"
         and row["account_kind"] == "human"
-        and not row["has_external_identity"]
+        and row["external_identity_count"] == 0
+    )
+
+
+def _is_exact_active_sso_recovery(row, identities) -> bool:
+    return bool(
+        row["password_hash"] == _SSO_PASSWORD_SENTINEL
+        and row["is_admin"]
+        and row["is_recovery_admin"]
+        and row["auth_provider"] == "keycloak"
+        and row["account_status"] == "active"
+        and row["account_kind"] == "human"
+        and row["external_identity_count"] == 1
+        and len(identities) == 1
+        and identities[0]["issuer"] == settings.keycloak_issuer
+        and bounded_nonempty_claim(
+            identities[0]["subject"], maximum=OIDC_SUBJECT_MAX_LENGTH
+        )
+        is not None
     )
 
 
@@ -431,7 +471,7 @@ def _is_exact_retired_tombstone(
         and row["auth_provider"] == "local"
         and row["account_status"] == "suspended"
         and row["account_kind"] == "human"
-        and not row["has_external_identity"]
+        and row["external_identity_count"] == 0
         and not row["has_tokens"]
         and not row["has_admin_browser_sessions"]
         and not row["has_sso_browser_sessions"]
@@ -478,12 +518,27 @@ async def retire_local_recovery_admin(
                 actor_token_id=actor_token_id,
             )
             await _lock_provisioning(conn)
+            sso_identities = await _locked_sso_recovery_identities(conn)
             designated = await _locked_recovery_rows(conn)
-            if len(designated) > 1:
+            local_designated = [
+                row for row in designated if row["auth_provider"] == "local"
+            ]
+            sso_successors = []
+            for row in designated:
+                if row["auth_provider"] != "keycloak":
+                    continue
+                identities = sso_identities.get(row["id"], [])
+                if _is_exact_active_sso_recovery(row, identities):
+                    sso_successors.append(row)
+            if (
+                len(local_designated) > 1
+                or len(sso_successors) != 1
+                or len(designated) != len(local_designated) + len(sso_successors)
+            ):
                 raise RecoveryAdminRetirementConflictError()
 
-            if designated:
-                current = designated[0]
+            if local_designated:
+                current = local_designated[0]
                 if current["id"] == actor_id or not _is_exact_active_local_recovery(
                     current,
                     expected_username=expected_username,

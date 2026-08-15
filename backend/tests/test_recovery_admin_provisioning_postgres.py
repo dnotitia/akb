@@ -322,6 +322,183 @@ async def test_sso_prebinding_is_exact_idempotent_and_has_no_local_password(serv
     assert auth_service.verify_password("any-local-password", row["password_hash"]) is False
 
 
+async def test_sso_prebinding_rejects_oversized_subject_without_mutation(
+    services,
+    monkeypatch,
+):
+    pool, _, service, _, _, _ = services
+    from app.config import settings
+    from app.exceptions import ValidationError
+    from app.services.external_identity_contract import OIDC_SUBJECT_MAX_LENGTH
+
+    monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+
+    with pytest.raises(ValidationError):
+        await service.provision_sso_recovery_admin(
+            username="sso-recovery-admin",
+            email="sso-recovery-admin@example.com",
+            issuer=settings.keycloak_issuer,
+            subject="s" * (OIDC_SUBJECT_MAX_LENGTH + 1),
+        )
+
+    async with pool.acquire() as conn:
+        assert await conn.fetchval("SELECT COUNT(*) FROM users") == 0
+        assert await conn.fetchval("SELECT COUNT(*) FROM external_identities") == 0
+
+
+async def test_sso_prebinding_overlaps_local_recovery_until_exact_retirement(
+    services,
+    monkeypatch,
+):
+    pool, _, service, _, _, _ = services
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+    local = await service.provision_local_recovery_admin(
+        username="local-recovery-admin",
+        email="local-recovery-admin@example.com",
+        password=_LOCAL_PASSWORD,
+    )
+    actor_user_id, actor_token_id = await _create_retirement_actor(pool)
+
+    monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+    sso = await service.provision_sso_recovery_admin(
+        username="admin",
+        email="admin@example.com",
+        issuer=settings.keycloak_issuer,
+        subject="stable-admin-subject",
+    )
+
+    async with pool.acquire() as conn:
+        providers = await conn.fetch(
+            "SELECT auth_provider FROM users WHERE is_recovery_admin ORDER BY auth_provider"
+        )
+    assert [row["auth_provider"] for row in providers] == ["keycloak", "local"]
+
+    retired = await service.retire_local_recovery_admin(
+        expected_username="local-recovery-admin",
+        expected_email="local-recovery-admin@example.com",
+        actor_user_id=str(actor_user_id),
+        actor_token_id=str(actor_token_id),
+    )
+    repeated = await service.retire_local_recovery_admin(
+        expected_username="local-recovery-admin",
+        expected_email="local-recovery-admin@example.com",
+        actor_user_id=str(actor_user_id),
+        actor_token_id=str(actor_token_id),
+    )
+
+    assert retired["user_id"] == local["user_id"]
+    assert repeated == retired
+    async with pool.acquire() as conn:
+        active_recovery = await conn.fetchrow(
+            "SELECT id, auth_provider FROM users WHERE is_recovery_admin"
+        )
+        local_state = await conn.fetchrow(
+            "SELECT is_admin, is_recovery_admin, account_status FROM users WHERE id = $1",
+            uuid.UUID(local["user_id"]),
+        )
+    assert dict(active_recovery) == {
+        "id": uuid.UUID(sso["user_id"]),
+        "auth_provider": "keycloak",
+    }
+    assert dict(local_state) == {
+        "is_admin": False,
+        "is_recovery_admin": False,
+        "account_status": "suspended",
+    }
+
+
+async def test_retirement_rejects_sso_successor_bound_to_stale_issuer(
+    services,
+    monkeypatch,
+):
+    pool, _, service, _, _, _ = services
+    from app.config import settings
+    from app.exceptions import RecoveryAdminRetirementConflictError
+
+    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+    local = await service.provision_local_recovery_admin(
+        username="local-recovery-admin",
+        email="local-recovery-admin@example.com",
+        password=_LOCAL_PASSWORD,
+    )
+    actor_user_id, actor_token_id = await _create_retirement_actor(pool)
+    monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+    stale_issuer = settings.keycloak_issuer + "-stale"
+    await service.provision_sso_recovery_admin(
+        username="admin",
+        email="admin@example.com",
+        issuer=stale_issuer,
+        subject="stale-admin-subject",
+    )
+
+    with pytest.raises(RecoveryAdminRetirementConflictError):
+        await service.retire_local_recovery_admin(
+            expected_username="local-recovery-admin",
+            expected_email="local-recovery-admin@example.com",
+            actor_user_id=str(actor_user_id),
+            actor_token_id=str(actor_token_id),
+        )
+
+    async with pool.acquire() as conn:
+        state = await conn.fetchrow(
+            "SELECT is_admin, is_recovery_admin, account_status FROM users WHERE id = $1",
+            uuid.UUID(local["user_id"]),
+        )
+    assert dict(state) == {
+        "is_admin": True,
+        "is_recovery_admin": True,
+        "account_status": "active",
+    }
+
+
+async def test_retirement_rejects_legacy_oversized_sso_subject(
+    services,
+    monkeypatch,
+):
+    pool, _, service, _, _, _ = services
+    from app.config import settings
+    from app.exceptions import RecoveryAdminRetirementConflictError
+    from app.services.external_identity_contract import OIDC_SUBJECT_MAX_LENGTH
+
+    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+    local = await service.provision_local_recovery_admin(
+        username="local-recovery-admin",
+        email="local-recovery-admin@example.com",
+        password=_LOCAL_PASSWORD,
+    )
+    actor_user_id, actor_token_id = await _create_retirement_actor(pool)
+    monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+    successor = await _create_sso_recovery_successor(service)
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE external_identities SET subject = $2 WHERE user_id = $1",
+            uuid.UUID(successor["user_id"]),
+            "s" * (OIDC_SUBJECT_MAX_LENGTH + 1),
+        )
+
+    with pytest.raises(RecoveryAdminRetirementConflictError):
+        await service.retire_local_recovery_admin(
+            expected_username="local-recovery-admin",
+            expected_email="local-recovery-admin@example.com",
+            actor_user_id=str(actor_user_id),
+            actor_token_id=str(actor_token_id),
+        )
+
+    async with pool.acquire() as conn:
+        state = await conn.fetchrow(
+            "SELECT is_admin, is_recovery_admin, account_status FROM users WHERE id = $1",
+            uuid.UUID(local["user_id"]),
+        )
+    assert dict(state) == {
+        "is_admin": True,
+        "is_recovery_admin": True,
+        "account_status": "active",
+    }
+
+
 async def test_sso_prebinding_never_links_an_email_or_existing_binding(services, monkeypatch):
     pool, _, service, _, _, _ = services
     from app.config import settings
@@ -485,6 +662,102 @@ async def _create_retirement_actor(pool) -> tuple[uuid.UUID, uuid.UUID]:
     return user_id, token_id
 
 
+async def _create_sso_recovery_successor(service) -> dict:
+    from app.config import settings
+
+    return await service.provision_sso_recovery_admin(
+        username="sso-recovery-admin",
+        email="sso-recovery-admin@example.com",
+        issuer=settings.keycloak_issuer,
+        subject="stable-sso-recovery-subject",
+    )
+
+
+async def test_retirement_locks_external_identity_before_successor_user(
+    services,
+    monkeypatch,
+):
+    pool, _, service, _, _, _ = services
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+    await service.provision_local_recovery_admin(
+        username="local-recovery-admin",
+        email="local-recovery-admin@example.com",
+        password=_LOCAL_PASSWORD,
+    )
+    actor_user_id, actor_token_id = await _create_retirement_actor(pool)
+    monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+    successor = await _create_sso_recovery_successor(service)
+    successor_id = uuid.UUID(successor["user_id"])
+
+    blocker = await pool.acquire()
+    blocker_tx = blocker.transaction()
+    await blocker_tx.start()
+    blocker_tx_finished = False
+    retire_task: asyncio.Task | None = None
+    try:
+        await blocker.execute(
+            """
+            UPDATE external_identities
+               SET last_seen_at = last_seen_at
+             WHERE user_id = $1
+            """,
+            successor_id,
+        )
+        retire_task = asyncio.create_task(
+            service.retire_local_recovery_admin(
+                expected_username="local-recovery-admin",
+                expected_email="local-recovery-admin@example.com",
+                actor_user_id=str(actor_user_id),
+                actor_token_id=str(actor_token_id),
+            )
+        )
+
+        observed_identity_wait = False
+        for _ in range(100):
+            async with pool.acquire() as observer:
+                observed_identity_wait = bool(
+                    await observer.fetchval(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1
+                              FROM pg_stat_activity
+                             WHERE datname = current_database()
+                               AND pid <> pg_backend_pid()
+                               AND query LIKE '%recovery-successor-authority-lock%'
+                               AND wait_event_type = 'Lock'
+                        )
+                        """
+                    )
+                )
+            if observed_identity_wait:
+                break
+            await asyncio.sleep(0.01)
+        assert observed_identity_wait
+
+        await blocker.execute(
+            "UPDATE users SET updated_at = NOW() WHERE id = $1",
+            successor_id,
+        )
+        await blocker_tx.commit()
+        blocker_tx_finished = True
+        await asyncio.wait_for(retire_task, timeout=5)
+    finally:
+        if not blocker_tx_finished:
+            await blocker_tx.rollback()
+        await pool.release(blocker)
+        if retire_task is not None and not retire_task.done():
+            retire_task.cancel()
+            await asyncio.gather(retire_task, return_exceptions=True)
+
+    async with pool.acquire() as conn:
+        active = await conn.fetchrow(
+            "SELECT id, auth_provider FROM users WHERE is_recovery_admin"
+        )
+    assert dict(active) == {"id": successor_id, "auth_provider": "keycloak"}
+
+
 async def test_retirement_is_disabled_in_local_mode_without_mutation(services, monkeypatch):
     pool, _, service, _, _, _ = services
     from app.config import settings
@@ -563,6 +836,7 @@ async def test_retirement_is_exact_atomic_and_idempotent(services, monkeypatch):
         )
 
     monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+    await _create_sso_recovery_successor(service)
     first = await service.retire_local_recovery_admin(
         expected_username="local-recovery-admin",
         expected_email="local-recovery-admin@example.com",
@@ -680,6 +954,7 @@ async def test_retirement_denial_survives_failed_role_cleanup_and_retry_finishes
         )
 
     monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+    await _create_sso_recovery_successor(service)
     role_sync.fail_token = target_token_id
     with pytest.raises(CredentialCleanupIncompleteError):
         await service.retire_local_recovery_admin(
@@ -794,11 +1069,12 @@ async def test_retirement_serializes_delayed_scoped_token_role_creation(
             async with pool.acquire() as conn:
                 await actual_role_sync._reconcile_token_roles(conn, ReconcileReport())
 
+    monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+    await _create_sso_recovery_successor(service)
     create_task = asyncio.create_task(create_role_path())
     retire_task = None
     try:
         await asyncio.wait_for(create_entered.wait(), timeout=2)
-        monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
         retire_task = asyncio.create_task(
             service.retire_local_recovery_admin(
                 expected_username="local-recovery-admin",
@@ -854,6 +1130,7 @@ async def test_retired_tombstone_rejects_external_identity_adoption(
     )
     actor_user_id, actor_token_id = await _create_retirement_actor(pool)
     monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+    await _create_sso_recovery_successor(service)
     await service.retire_local_recovery_admin(
         expected_username="local-recovery-admin",
         expected_email="local-recovery-admin@example.com",
@@ -984,6 +1261,7 @@ async def test_retirement_mismatch_external_binding_and_collisions_fail_closed(
     recovery_user_id = uuid.UUID(provisioned["user_id"])
     actor_user_id, actor_token_id = await _create_retirement_actor(pool)
     monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+    await _create_sso_recovery_successor(service)
 
     with pytest.raises(RecoveryAdminRetirementConflictError):
         await service.retire_local_recovery_admin(
@@ -1064,6 +1342,7 @@ async def test_retirement_revalidates_service_actor_and_split_collision(services
         )
 
     monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+    await _create_sso_recovery_successor(service)
     with pytest.raises(RecoveryAdminRetirementAuthorizationError):
         await service.retire_local_recovery_admin(
             expected_username="split-username",
@@ -1086,7 +1365,7 @@ async def test_migration_upgrades_old_schema_and_is_idempotent(services):
     from app.db.postgres import _load_migration
 
     async with pool.acquire() as conn:
-        await conn.execute("DROP INDEX users_one_recovery_admin")
+        await conn.execute("DROP INDEX users_one_recovery_admin_per_provider")
         await conn.execute("ALTER TABLE users DROP CONSTRAINT users_recovery_admin_requires_admin")
         await conn.execute("ALTER TABLE users DROP COLUMN is_recovery_admin")
         await conn.execute("ALTER TABLE external_identities DROP COLUMN username_snapshot")
@@ -1150,11 +1429,83 @@ async def test_migration_upgrades_old_schema_and_is_idempotent(services):
                           'migration-recovery-two@example.com', '!hash!', true, true)
                 """
             )
-
     assert user_column is True
     assert snapshot_column is True
     assert constraint == 1
     assert unique_index == 1
+
+
+async def test_recovery_handover_migration_allows_one_recovery_per_provider(services):
+    pool, _, _, _, _, _ = services
+    from app.db.postgres import _load_migration
+
+    async with pool.acquire() as conn:
+        await conn.execute("DROP INDEX users_one_recovery_admin_per_provider")
+        await conn.execute(
+            "ALTER TABLE users DROP CONSTRAINT users_recovery_admin_provider_check"
+        )
+        await conn.execute(
+            """
+            CREATE UNIQUE INDEX users_one_recovery_admin
+                ON users ((is_recovery_admin))
+                WHERE is_recovery_admin
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO users (
+                username, email, password_hash, is_admin, is_recovery_admin,
+                auth_provider
+            ) VALUES ('migration-local', 'migration-local@example.com',
+                      '!local!', true, true, 'local')
+            """
+        )
+        migration = _load_migration("078_recovery_admin_authority_handover.py")
+        assert migration is not None
+        await migration.migrate(conn)
+        await migration.migrate(conn)
+
+        await conn.execute(
+            """
+            INSERT INTO users (
+                username, email, password_hash, is_admin, is_recovery_admin,
+                auth_provider
+            ) VALUES ('migration-sso', 'migration-sso@example.com',
+                      '!sso!', true, true, 'keycloak')
+            """
+        )
+        with pytest.raises(asyncpg.UniqueViolationError):
+            await conn.execute(
+                """
+                INSERT INTO users (
+                    username, email, password_hash, is_admin, is_recovery_admin,
+                    auth_provider
+                ) VALUES ('migration-local-two', 'migration-local-two@example.com',
+                          '!local-two!', true, true, 'local')
+                """
+            )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                """
+                INSERT INTO users (
+                    username, email, password_hash, is_admin, is_recovery_admin,
+                    auth_provider
+                ) VALUES ('migration-foreign', 'migration-foreign@example.com',
+                          '!foreign!', true, true, 'foreign')
+                """
+            )
+        indexes = await conn.fetch(
+            """
+            SELECT indexname FROM pg_indexes
+             WHERE schemaname = 'public' AND tablename = 'users'
+               AND indexname LIKE 'users_one_recovery_admin%'
+             ORDER BY indexname
+            """
+        )
+
+    assert [row["indexname"] for row in indexes] == [
+        "users_one_recovery_admin_per_provider"
+    ]
 
 
 async def test_sso_bootstrap_retirement_receipt_migrates_and_is_monotonic(
