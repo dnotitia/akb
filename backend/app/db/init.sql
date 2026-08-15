@@ -55,11 +55,13 @@ CREATE TABLE IF NOT EXISTS users (
         CONSTRAINT users_account_kind_check
         CHECK (account_kind IN ('human', 'service')),
     CONSTRAINT users_recovery_admin_requires_admin
-        CHECK (NOT is_recovery_admin OR is_admin)
+        CHECK (NOT is_recovery_admin OR is_admin),
+    CONSTRAINT users_recovery_admin_provider_check
+        CHECK (NOT is_recovery_admin OR auth_provider IN ('local', 'keycloak'))
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS users_one_recovery_admin
-    ON users ((is_recovery_admin))
+CREATE UNIQUE INDEX IF NOT EXISTS users_one_recovery_admin_per_provider
+    ON users (auth_provider)
     WHERE is_recovery_admin;
 
 -- Stable external identity binding. Email is a mutable snapshot; verified

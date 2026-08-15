@@ -28,6 +28,10 @@ from app.services.auth_service import (
     login,
     resolve_delegated_human_authorization,
 )
+from app.services.external_identity_contract import (
+    OIDC_SUBJECT_MAX_LENGTH,
+    bounded_nonempty_claim,
+)
 from app.services.sso_session_epoch import (
     current_sso_session_authority,
     lock_active_sso_session_epoch,
@@ -70,10 +74,10 @@ def _required_claim(
     claims: Mapping[str, object],
     name: str,
     *,
-    max_length: int = 1024,
+    max_length: int = OIDC_SUBJECT_MAX_LENGTH,
 ) -> str:
-    value = claims.get(name)
-    if not isinstance(value, str) or not value.strip() or len(value) > max_length:
+    value = bounded_nonempty_claim(claims.get(name), maximum=max_length)
+    if value is None:
         raise AuthenticationError("Invalid admin identity token")
     return value
 
