@@ -297,9 +297,13 @@ docker compose exec -T backend python -m app.cli provision-recovery-admin local 
 open http://localhost:3000
 ```
 
-`config/app.yaml` and `config/secret.yaml` are the **single source of runtime
-configuration** — no environment variables are read by the backend. Mount the
-`config/` directory at `/etc/akb/` in any deployment.
+`config/app.yaml` and `config/secret.yaml` are the **single source of
+application configuration**. Mount the `config/` directory at `/etc/akb/` in
+any deployment. Process composition is the narrow exception:
+`AKB_PROCESS_ROLE=all|api|worker` selects the entrypoint role and
+`AKB_TOKENIZER_PROCESSES=1..4` can lower the per-process tokenizer pool for a
+deployment container. The Kubernetes base owns those two operational values;
+business, auth, storage, and provider settings remain in the YAML files.
 
 Ordinary registration always creates a non-admin account, including on an
 empty database. Administrator bootstrap is available only through the

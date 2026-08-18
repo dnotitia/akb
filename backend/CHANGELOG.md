@@ -7,6 +7,21 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Added crash-safe worker runtime isolation
+
+Kubernetes now composes the serving API and durable background workers as
+separate processes in one RWO-backed Pod, while the default local entrypoint
+retains the all-in-one runtime. Worker shutdown broadcasts every stop signal
+before a shared bounded join, tokenizer process counts are explicit, and the
+worker sidecar has an event-loop heartbeat probe.
+
+Durable queues now count attempts in their claim transaction, record explicit
+claim/abandon state, credit back unattempted batch rows, and use a singleton
+rescuer to close final claims left by process death. Shared Bare-Git worktrees
+are guarded across processes with storage-backed locks and ref compare-and-
+swap. Migration and role-reconciliation startup are serialized for the
+two-process topology.
+
 ### Added metadata-only legacy app adoption
 
 System administrators and target Vault administrators can now create immutable,

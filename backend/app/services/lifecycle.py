@@ -1,17 +1,21 @@
-"""Shared startup/shutdown for the indexing/embedding background workers.
+"""Shared process composition for serving support and durable workers.
 
-Both `app.main` (when AKB_DISABLE_WORKERS is unset) and `app.worker_main`
-import these so the start/stop order stays consistent across entrypoints.
+``AKB_PROCESS_ROLE=all`` preserves the local all-in-one runtime. Kubernetes
+uses ``api`` for FastAPI and ``worker`` for :mod:`app.worker_main`; both
+entrypoints import this module so pool and worker ordering cannot drift.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from urllib.parse import urlsplit
 
-from app.config import settings
 from app.db.postgres import close_pool, get_pool, init_db
+from app.config import settings
+from app.process_role import runtime_process_role
+from app.services._backfill import request_stop_all, runner_snapshots
 from app.services import (
     asset_gc_worker,
     audit_log,
@@ -23,6 +27,7 @@ from app.services import (
     http_pool,
     m1_file_transfer_reaper,
     metadata_worker,
+    queue_rescuer,
     s3_delete_worker,
     sparse_encoder,
     tool_usage,
@@ -211,7 +216,7 @@ async def init_storage() -> None:
     # fail silently until an operator removes the lock by hand.
     if selected_document_revision_backend() == "bare_git":
         try:
-            cleared = GitService().cleanup_stale_locks()
+            cleared = await asyncio.to_thread(GitService().cleanup_stale_locks)
             if cleared:
                 logger.info("Cleared %d stale git lock(s) at startup", cleared)
         except Exception as e:  # noqa: BLE001 — never block startup on best-effort cleanup
@@ -247,7 +252,56 @@ async def init_storage() -> None:
         logger.error("RoleSync reconcile failed at startup: %s", e)
 
 
-def start_workers() -> None:
+def start_runtime_pools() -> None:
+    """Start process-local CPU/Git executors needed by API and workers."""
+    raw_processes = os.getenv("AKB_TOKENIZER_PROCESSES", "").strip()
+    processes = settings.tokenizer_processes
+    if raw_processes:
+        try:
+            processes = int(raw_processes)
+        except ValueError:
+            raise RuntimeError("AKB_TOKENIZER_PROCESSES must be an integer") from None
+        if not 1 <= processes <= 4:
+            raise RuntimeError("AKB_TOKENIZER_PROCESSES must be between 1 and 4")
+    sparse_encoder.start_tokenizer_pool(processes)
+    write_lane.start_commit_pool()
+
+
+def stop_runtime_pools() -> None:
+    sparse_encoder.stop_tokenizer_pool()
+    write_lane.stop_commit_pool()
+
+
+def _start_api_local(started: list[str]) -> None:
+    """Start sinks whose queues live in the serving process's memory."""
+    if settings.audit.enabled:
+        audit_log.init()
+        if settings.audit.bucket:
+            audit_log.start_uploader()
+            started.append("audit_uploader")
+        else:
+            logger.info("audit enabled file-only (audit.bucket not set; no uploader)")
+    else:
+        logger.info("audit disabled (audit.enabled=false)")
+
+    tool_usage.start()
+    started.append("tool_usage_maintenance")
+    if settings.tool_usage.enabled:
+        started.append("tool_usage_flusher")
+    else:
+        logger.info("tool_usage collection disabled (tool_usage.enabled=false)")
+
+
+def start_api_runtime() -> None:
+    """Start only process-local serving support, never durable queue workers."""
+    start_runtime_pools()
+    started = ["tokenizer_pool", "git_commit_pool"]
+    _start_api_local(started)
+    logger.info("API runtime started: %s", ", ".join(started))
+
+
+def start_workers(*, include_api_local: bool = True) -> None:
+    start_runtime_pools()
     embed_worker.start()
     delete_worker.start()
     # ``start_workers`` is normally called from the FastAPI lifespan loop.
@@ -271,6 +325,7 @@ def start_workers() -> None:
     # reports ready (until then the source-id path runs unchanged). No-op for
     # other drivers / separate-instance / fully-backfilled corpora.
     vault_backfill.start()
+    queue_rescuer.start()
     # BM25 corpus stats (total_docs, avgdl, per-term df) only become
     # non-degenerate after `recompute_stats()` runs. The refresher fires
     # once at startup and then on a configurable cadence so the sparse
@@ -282,12 +337,10 @@ def start_workers() -> None:
     # event loop → probe timeouts → 503. Run it off-process. Start it BEFORE the
     # stats refresher, which tokenizes the whole corpus on first tick. (Serving
     # also depends on it — move to the always-run path if API/worker tiers split.)
-    sparse_encoder.start_tokenizer_pool()
     sparse_encoder.start_stats_refresher(settings.bm25_recompute_interval_secs)
     # Dedicated git-commit executor (write-lane, command-lane round-05).
     # Git mutations run here so blocked/slow commits can never crowd git
     # READS out of asyncio.to_thread's shared default executor.
-    write_lane.start_commit_pool()
     started = [
         "tokenizer_pool",
         "git_commit_pool",
@@ -296,6 +349,7 @@ def start_workers() -> None:
         "app_rollout_worker",
         "bm25_stats_refresher",
         "vault_backfill",
+        "queue_rescuer",
     ]
     if bare_git_selected and settings.external_git_enabled:
         started.append("external_git_poller")
@@ -339,29 +393,8 @@ def start_workers() -> None:
         started.append("events_publisher")
     else:
         logger.info("events_publisher disabled (redis_url not configured)")
-    # Audit log — producer-only. `init` seeds the per-file hash chain;
-    # the uploader (daily handoff to the WORM bucket) only runs when a
-    # bucket is configured. File-only mode (no bucket) still writes the
-    # JSON-lines stream for a co-located SIEM/Logstash to tail.
-    if settings.audit.enabled:
-        audit_log.init()
-        if settings.audit.bucket:
-            audit_log.start_uploader()
-            started.append("audit_uploader")
-        else:
-            logger.info("audit enabled file-only (audit.bucket not set; no uploader)")
-    else:
-        logger.info("audit disabled (audit.enabled=false)")
-    # MCP tool-usage analytics — a separate sink from audit (queryable PG rows
-    # rather than a hash-chained ledger) with its own flag. The maintenance
-    # runner starts either way so that disabling collection still rolls up and
-    # prunes what was already gathered.
-    tool_usage.start()
-    started.append("tool_usage_maintenance")
-    if settings.tool_usage.enabled:
-        started.append("tool_usage_flusher")
-    else:
-        logger.info("tool_usage collection disabled (tool_usage.enabled=false)")
+    if include_api_local:
+        _start_api_local(started)
     # PG-RBAC periodic reconcile — converges drift caused by silent
     # lifecycle-hook failures (counted in role_sync.metrics_snapshot).
     # Set role_sync_reconcile_interval_secs <= 0 in config to disable.
@@ -373,25 +406,117 @@ def start_workers() -> None:
     logger.info("Workers started: %s", ", ".join(started))
 
 
-async def stop_workers() -> None:
-    await get_role_sync().stop_reconcile_timer()
-    await m1_file_transfer_reaper.stop()
-    await audit_log.stop_uploader()
-    await tool_usage.stop()
-    await events_publisher.stop()
-    await metadata_worker.stop()
-    await external_git_poller.stop()
-    # Stop producers before the S3 outbox consumer so shutdown cannot leave a
-    # freshly-enqueued object waiting solely because the consumer exited first.
-    await asset_gc_worker.stop()
-    await s3_delete_worker.stop()
-    await app_rollout_worker.stop()
-    await delete_worker.stop()
-    await embed_worker.stop()
-    await vault_backfill.stop()
-    await sparse_encoder.stop_stats_refresher()
-    sparse_encoder.stop_tokenizer_pool()
-    write_lane.stop_commit_pool()
+async def _stop_component(name: str, stop) -> None:
+    """Stop one component without letting it skip the rest of shutdown."""
+    try:
+        await stop()
+    except asyncio.CancelledError:
+        # A component may use cancellation as its normal stop mechanism. The
+        # lifecycle already broadcast the global stop request, so one such
+        # outcome must not prevent siblings from joining.
+        logger.warning("worker shutdown cancelled for %s", name)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("worker shutdown failed for %s: %s", name, exc)
+
+
+async def stop_workers(*, include_api_local: bool = True) -> None:
+    """Signal every worker first, then join them under one absolute budget."""
+    # BackfillRunner.stop used to be called sequentially. A slow first worker
+    # therefore left every later worker claiming new rows until Kubernetes sent
+    # SIGKILL. Broadcast first so all queue consumers become quiescent together.
+    request_stop_all()
+    components = [
+        ("role_sync", lambda: get_role_sync().stop_reconcile_timer()),
+        ("m1_file_transfer_reaper", m1_file_transfer_reaper.stop),
+        ("events_publisher", events_publisher.stop),
+        ("metadata_worker", metadata_worker.stop),
+        ("external_git_poller", external_git_poller.stop),
+        ("asset_gc_worker", asset_gc_worker.stop),
+        ("s3_delete_worker", s3_delete_worker.stop),
+        ("app_rollout_worker", app_rollout_worker.stop),
+        ("delete_worker", delete_worker.stop),
+        ("embed_worker", embed_worker.stop),
+        ("vault_backfill", vault_backfill.stop),
+        ("queue_rescuer", queue_rescuer.stop),
+        ("bm25_stats_refresher", sparse_encoder.stop_stats_refresher),
+    ]
+    if include_api_local:
+        components.extend([
+            ("audit_uploader", audit_log.stop_uploader),
+            ("tool_usage", lambda: tool_usage.stop()),
+        ])
+    tasks = [
+        asyncio.create_task(_stop_component(name, stop), name=f"stop:{name}")
+        for name, stop in components
+    ]
+    try:
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=settings.worker_shutdown_timeout_secs,
+        )
+        for task in done:
+            # Retrieve exceptions even though _stop_component should contain
+            # ordinary failures. Cancellation remains visible to this caller.
+            task.result()
+        if pending:
+            logger.error(
+                "worker shutdown deadline exceeded; %d component(s) still running: %s",
+                len(pending),
+                ", ".join(sorted(task.get_name() for task in pending)),
+            )
+            for task in pending:
+                task.cancel()
+            # Do not wait beyond the shared deadline. Consume eventual task
+            # outcomes so an uncooperative callback cannot emit warnings later.
+            for task in pending:
+                task.add_done_callback(
+                    lambda finished: None
+                    if finished.cancelled()
+                    else finished.exception()
+                )
+    finally:
+        stop_runtime_pools()
+
+
+async def stop_api_runtime() -> None:
+    """Stop only serving-process sinks and process-local executors."""
+    request_stop_all()
+    tasks = [
+        asyncio.create_task(
+            _stop_component("audit_uploader", audit_log.stop_uploader),
+            name="stop:audit_uploader",
+        ),
+        asyncio.create_task(
+            _stop_component("tool_usage", lambda: tool_usage.stop()),
+            name="stop:tool_usage",
+        ),
+    ]
+    try:
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=settings.worker_shutdown_timeout_secs,
+        )
+        for task in done:
+            task.result()
+        for task in pending:
+            task.cancel()
+            task.add_done_callback(
+                lambda finished: None
+                if finished.cancelled()
+                else finished.exception()
+            )
+    finally:
+        stop_runtime_pools()
+
+
+def worker_lifecycle_snapshot() -> dict:
+    runners = runner_snapshots()
+    return {
+        "process_role": runtime_process_role(),
+        "shutdown_timeout_secs": settings.worker_shutdown_timeout_secs,
+        "runners": runners,
+        "abandoned_total": sum(item["abandoned"] for item in runners),
+    }
 
 
 async def shutdown_storage() -> None:

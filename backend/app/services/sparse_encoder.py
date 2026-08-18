@@ -215,7 +215,10 @@ def _english_token_variants(token: str) -> list[str]:
 def _get_kiwi() -> Kiwi:
     global _kiwi
     if _kiwi is None:
-        _kiwi = Kiwi()
+        # One native Kiwi worker per process-pool child. Letting Kiwi size its
+        # own native pool from host CPU count multiplies memory and threads by
+        # the outer ProcessPoolExecutor size and ignores the pod budget.
+        _kiwi = Kiwi(num_workers=1)
         logger.info("Kiwi tokenizer initialized (version=%s)", _kiwi_version)
     return _kiwi
 
@@ -738,6 +741,7 @@ async def _refresh_tick() -> int:
 from app.services._backfill import BackfillRunner  # noqa: E402
 
 _refresher = BackfillRunner("bm25_stats_refresher", _refresh_tick, idle_secs=1)
+_bootstrap_task: asyncio.Task | None = None
 
 
 def start_stats_refresher(interval_secs: int = 1800) -> None:
@@ -747,15 +751,16 @@ def start_stats_refresher(interval_secs: int = 1800) -> None:
     gate) so a fresh install isn't stuck at total_docs=0; subsequent
     ticks honour the gate.
     """
-    global _refresher
-    _refresher = BackfillRunner(
-        "bm25_stats_refresher", _refresh_tick, idle_secs=interval_secs,
-    )
+    global _bootstrap_task
+    if _refresher.is_running():
+        return
+    _refresher.configure_idle_secs(interval_secs)
     # Bootstrap: force one recompute on startup regardless of delta so
     # a brand-new DB doesn't have to wait `interval_secs` for usable
     # sparse weights. Wrapped in a task so startup isn't blocked.
-    import asyncio as _asyncio
-    _asyncio.create_task(_bootstrap_recompute(), name="bm25_stats_bootstrap")
+    _bootstrap_task = asyncio.create_task(
+        _bootstrap_recompute(), name="bm25_stats_bootstrap",
+    )
     _refresher.start()
 
 
@@ -768,6 +773,14 @@ async def _bootstrap_recompute() -> None:
 
 async def stop_stats_refresher() -> None:
     """Signal stop and await the runner. Safe to call when not started."""
+    global _bootstrap_task
+    task, _bootstrap_task = _bootstrap_task, None
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     if _refresher is not None:
         await _refresher.stop()
 

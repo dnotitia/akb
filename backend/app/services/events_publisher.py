@@ -95,16 +95,20 @@ async def _claim_batch(conn) -> list[dict]:
              WHERE redis_published_at IS NULL
                AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
                AND attempts < $2
+               AND abandoned_at IS NULL
              ORDER BY next_attempt_at NULLS FIRST, id
              LIMIT $1
              FOR UPDATE SKIP LOCKED
         )
         UPDATE events e
-           SET next_attempt_at = NOW() + INTERVAL '10 minutes'
+           SET next_attempt_at = NOW() + INTERVAL '10 minutes',
+               claimed_at = NOW(),
+               attempts = attempts + 1
           FROM pending p
          WHERE e.id = p.id
         RETURNING e.id, e.occurred_at, e.vault_id, e.kind,
-                  e.resource_uri, e.actor_id, e.payload, e.attempts
+                  e.resource_uri, e.actor_id, e.payload, e.attempts,
+                  e.claimed_at
         """,
         BATCH_SIZE, MAX_RETRIES,
     )
@@ -116,26 +120,49 @@ async def _mark_published(conn, event_id: int) -> None:
         """
         UPDATE events
            SET redis_published_at = NOW(),
+               attempts = 0,
                last_error = NULL,
-               next_attempt_at = NULL
+               next_attempt_at = NULL,
+               claimed_at = NULL,
+               abandoned_at = NULL
          WHERE id = $1
         """,
         event_id,
     )
 
 
-async def _mark_failure(conn, event_id: int, attempts: int, error: str) -> None:
-    delay = next_attempt_delay(attempts)
-    next_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+async def _mark_failure(conn, event_id: int, attempt_count: int, error: str) -> None:
+    terminal = attempt_count >= MAX_RETRIES
+    delay = next_attempt_delay(max(0, attempt_count - 1))
+    next_at = None if terminal else datetime.now(timezone.utc) + timedelta(seconds=delay)
     await conn.execute(
         """
         UPDATE events
-           SET attempts = attempts + 1,
-               last_error = $2,
-               next_attempt_at = $3
+           SET last_error = $2,
+               next_attempt_at = $3,
+               claimed_at = NULL,
+               abandoned_at = CASE WHEN $4 THEN NOW() ELSE NULL END
          WHERE id = $1
         """,
-        event_id, (error or "")[:500], next_at,
+        event_id, (error or "")[:500], next_at, terminal,
+    )
+
+
+async def _release_unattempted(conn, rows: list[dict]) -> None:
+    if not rows:
+        return
+    await conn.execute(
+        """
+        UPDATE events
+           SET attempts = GREATEST(attempts - 1, 0),
+               next_attempt_at = NOW(), claimed_at = NULL
+         WHERE id = ANY($1::bigint[])
+           AND redis_published_at IS NULL
+           AND abandoned_at IS NULL
+           AND claimed_at = $2
+        """,
+        [row["id"] for row in rows],
+        rows[0]["claimed_at"],
     )
 
 
@@ -190,12 +217,18 @@ async def _process_once() -> int:
         try:
             client = await _client()
         except Exception as e:  # noqa: BLE001
-            for row in batch:
-                await _mark_failure(conn, row["id"], row["attempts"], f"redis client init: {e}")
+            # The connection attempt represents work on one row, not all rows
+            # claimed with it. Preserve the first row's failure/backoff and
+            # return claim credit for the untouched remainder.
+            first, *unattempted = batch
+            await _mark_failure(
+                conn, first["id"], first["attempts"], f"redis client init: {e}",
+            )
+            await _release_unattempted(conn, unattempted)
             return 0
 
         succeeded = 0
-        for row in batch:
+        for position, row in enumerate(batch):
             fields = _xadd_fields(row)
             try:
                 # redis-py's xadd stub takes the wider
@@ -215,6 +248,7 @@ async def _process_once() -> int:
                 # one and short-circuit so we don't hammer a downed
                 # broker. Loop's idle backoff then kicks in.
                 await _mark_failure(conn, row["id"], row["attempts"], str(e))
+                await _release_unattempted(conn, batch[position + 1:])
                 logger.warning("XADD failed for event %s: %s", row["id"], e)
                 # Drop the cached client so the next tick reconnects;
                 # otherwise a dead connection sticks around.
@@ -291,14 +325,14 @@ async def pending_stats() -> dict:
         row = await conn.fetchrow(
             """
             SELECT
-                COUNT(*) FILTER (WHERE redis_published_at IS NULL AND attempts < $1)     AS pending,
+                COUNT(*) FILTER (WHERE redis_published_at IS NULL AND abandoned_at IS NULL) AS pending,
                 COUNT(*) FILTER (WHERE redis_published_at IS NULL
-                                 AND attempts > 0 AND attempts < $1)                      AS retrying,
-                COUNT(*) FILTER (WHERE redis_published_at IS NULL AND attempts >= $1)     AS abandoned,
+                                 AND abandoned_at IS NULL AND attempts > 0)                AS retrying,
+                COUNT(*) FILTER (WHERE redis_published_at IS NULL
+                                 AND abandoned_at IS NOT NULL)                             AS abandoned,
                 COUNT(*) FILTER (WHERE redis_published_at IS NOT NULL)                    AS published
               FROM events
-            """,
-            MAX_RETRIES,
+            """
         )
     return {
         "pending":   int(row["pending"]),

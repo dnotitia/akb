@@ -542,18 +542,28 @@ async def index_table_metadata(
     )
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await write_source_chunks(
-            conn, "table", table_id,
-            vault_id=vault_id,
-            chunks=[chunk],
-        )
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                f"akb:index:table:{table_id}",
+            )
+            await write_source_chunks(
+                conn, "table", table_id,
+                vault_id=vault_id,
+                chunks=[chunk],
+            )
 
 
 async def delete_table_index(table_id: str) -> None:
     """Drop the metadata chunk for a table (outbox-driven vector-store delete)."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await delete_table_chunks(conn, table_id)
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                f"akb:index:table:{table_id}",
+            )
+            await delete_table_chunks(conn, table_id)
 
 
 # ── CRUD ─────────────────────────────────────────────────────────
@@ -1879,7 +1889,6 @@ async def execute_sql(
                 "request.jwt.claims is reserved for service-key claim injection.",
                 code=METHOD_NOT_ALLOWED,
             )
-
         # Archived vaults are READ-ONLY. PG ACL has no archive concept
         # (write grants are intentionally preserved so unarchive is
         # instant), so the write block lives here: a non-read statement

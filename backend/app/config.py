@@ -402,6 +402,15 @@ class Settings(BaseModel):
     pg_pool_min_size: int = 2
     pg_pool_max_size: int = 30
 
+    # Runtime safety budgets. Kiwi keeps a large model resident in every child,
+    # so an implicit CPU-count-sized pool can exhaust a 4 GiB pod as workers
+    # warm up. Keep the production-safe default explicit and bounded.
+    tokenizer_processes: int = Field(default=2, ge=1, le=4)
+    # All background workers share this one absolute shutdown budget. Kubernetes
+    # grants 45 seconds in the base manifest, leaving ten seconds for storage
+    # clients, audit draining, and interpreter teardown after workers quiesce.
+    worker_shutdown_timeout_secs: float = Field(default=35.0, gt=0.0, le=300.0)
+
     # `akb_sql` / REST SQL: rows are coerced to JSON dicts on the single event
     # loop. A huge SELECT (`SELECT * FROM generate_series(1, 2e6)`) coerced in
     # one pass blocks the loop for seconds → /livez probe timeout → 503. We

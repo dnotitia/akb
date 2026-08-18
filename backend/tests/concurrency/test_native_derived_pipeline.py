@@ -487,7 +487,7 @@ async def test_failed_intent_retries_then_reclaims_and_applies(monkeypatch):
                 "SELECT retry_count, delivery_outcome, completed_at, last_error FROM native_invalidation_intents WHERE revision_id = $1",
                 created.revision_id,
             )
-            assert recovered["retry_count"] == 1
+            assert recovered["retry_count"] == 0
             assert recovered["delivery_outcome"] == "applied"
             assert recovered["completed_at"] is not None
             assert recovered["last_error"] is None
@@ -580,7 +580,7 @@ async def test_expired_claim_lease_is_reclaimed_by_another_worker():
         reclaimed = await NativeDerivedWorker(pool)._claim_one()
         assert reclaimed is not None
         assert reclaimed["intent_id"] == first["intent_id"]
-        assert reclaimed["retry_count"] == 0
+        assert reclaimed["retry_count"] == 2
 
 
 async def test_direct_pg_grep_default_and_additive_modes_preserve_acl_and_collection_boundaries():

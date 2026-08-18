@@ -348,6 +348,51 @@ class DocumentService:
         pool = await get_pool()
         return VaultRepository(pool), DocumentRepository(pool), CollectionRepository(pool)
 
+    @asynccontextmanager
+    async def _vault_creation_lock(self, name: str):
+        """Hold the storage-wide create/rollback mutex without blocking loop."""
+        acquire_task = asyncio.create_task(
+            asyncio.to_thread(self.git.acquire_vault_creation_lock, name),
+            name=f"vault-create-lock:{name}",
+        )
+        try:
+            fd = await asyncio.shield(acquire_task)
+        except BaseException:
+            # A thread blocked in flock cannot be cancelled. Settle it, then
+            # release the acquired fd before propagating cancellation/error.
+            while not acquire_task.done():
+                try:
+                    await asyncio.shield(acquire_task)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+            if not acquire_task.cancelled() and acquire_task.exception() is None:
+                await asyncio.to_thread(
+                    self.git.release_vault_creation_lock,
+                    acquire_task.result(),
+                )
+            raise
+        try:
+            yield
+        finally:
+            # Unlock is tiny but still a filesystem operation on the mounted
+            # lock file; settle it even if shutdown cancellation is repeated.
+            release_task = asyncio.create_task(
+                asyncio.to_thread(self.git.release_vault_creation_lock, fd),
+                name=f"vault-create-unlock:{name}",
+            )
+            pending_cancel: asyncio.CancelledError | None = None
+            while not release_task.done():
+                try:
+                    await asyncio.shield(release_task)
+                except asyncio.CancelledError as exc:
+                    pending_cancel = exc
+                    continue
+            release_task.result()
+            if pending_cancel is not None:
+                raise pending_cancel
+
     async def _resolve_author_name(self, created_by: str | None) -> str | None:
         """Resolve a `created_by` token to a human display name for the UI.
 
@@ -1983,8 +2028,9 @@ class DocumentService:
         # vaults row exists. BaseException so SIGTERM and
         # KeyboardInterrupt also unwind cleanly.
         #
-        # `_create_lock(name)` serializes same-name creates in-process for
-        # the WHOLE section including rollback. Without it the ownership
+        # `_create_lock(name)` is the cheap in-process gate; the nested
+        # storage-backed creation lock serializes the WHOLE section including
+        # rollback across API/worker processes. Without the outer ownership
         # probe below is unsound: A and B race the same name, A's init
         # wins, B's fails, and B's rollback would see the dir "appear
         # during its attempt" and delete A's repo. (Distinct from the
@@ -1998,20 +2044,21 @@ class DocumentService:
         # vault's repo. Only ever clean up a directory this request
         # itself brought into existence — and under the create lock,
         # "appeared during this section and wasn't there before" implies
-        # exactly that.
+        # exactly that. Both gates are intentionally held through compensation.
         async with _create_lock(name):
-            return await self._create_vault_standard(
-                name=name, description=description, template=template,
-                public_access=public_access, owner_id=owner_id, uid=uid,
-                external_git=external_git, vault_repo=vault_repo,
-                coll_repo=coll_repo,
-            )
+            async with self._vault_creation_lock(name):
+                return await self._create_vault_standard(
+                    name=name, description=description, template=template,
+                    public_access=public_access, owner_id=owner_id, uid=uid,
+                    external_git=external_git, vault_repo=vault_repo,
+                    coll_repo=coll_repo,
+                )
 
     async def _create_vault_standard(
         self, *, name, description, template, public_access, owner_id, uid,
         external_git, vault_repo, coll_repo,
     ) -> str:
-        existed_before = self.git.vault_exists(name)
+        existed_before = await asyncio.to_thread(self.git.vault_exists, name)
         git_path: str | None = None
         created_vault_id: uuid.UUID | None = None
         try:
@@ -2139,10 +2186,13 @@ class DocumentService:
         `git_path is not None` covers the normal case; the extra
         vault_exists() probe covers an absorbed-cancel during init where
         the thread completed but the coroutine never received git_path —
-        sound only because `_create_lock(name)` excludes concurrent
-        same-name creates.
+        sound because `_vault_creation_lock(name)` excludes concurrent
+        same-name creates across every process sharing the storage volume.
         """
-        if existed_before or (git_path is None and not self.git.vault_exists(name)):
+        if existed_before or (
+            git_path is None
+            and not await asyncio.to_thread(self.git.vault_exists, name)
+        ):
             return
         try:
             # Commit executor: cleanup blocks on the vault threading.Lock

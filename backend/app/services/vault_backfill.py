@@ -139,6 +139,7 @@ async def _process_once() -> int:
                   ) src ON src.id = vi.source_id
                   WHERE vi.vault_id IS NULL
                   LIMIT {_BATCH}
+                  FOR UPDATE OF vi SKIP LOCKED
                 )
                 UPDATE "{schema}".chunks vi
                 SET vault_id = batch.vid

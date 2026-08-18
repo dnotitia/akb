@@ -60,9 +60,22 @@ CREATE TABLE IF NOT EXISTS users (
         CHECK (NOT is_recovery_admin OR auth_provider IN ('local', 'keycloak'))
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS users_one_recovery_admin_per_provider
-    ON users (auth_provider)
-    WHERE is_recovery_admin;
+-- Guarded: `is_recovery_admin` arrives with migration 071 on existing
+-- installations. init.sql runs before migrations, so an unconditional index
+-- here would abort the upgrade before migration 071 can add the column.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'users'
+           AND column_name = 'is_recovery_admin'
+    ) THEN
+        CREATE UNIQUE INDEX IF NOT EXISTS users_one_recovery_admin_per_provider
+            ON users (auth_provider)
+            WHERE is_recovery_admin;
+    END IF;
+END $$;
 
 -- Stable external identity binding. Email is a mutable snapshot; verified
 -- OIDC issuer + subject is the permanent key.
@@ -445,6 +458,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     vector_next_attempt_at TIMESTAMPTZ,
     vector_retry_count INTEGER NOT NULL DEFAULT 0,
     vector_last_error TEXT,
+    vector_claimed_at TIMESTAMPTZ,
+    vector_abandoned_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
