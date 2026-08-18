@@ -473,7 +473,7 @@ class _StubPool:
 
 
 class _LegacyChunkConn:
-    """Serves the one chunk query the legacy Document-only grep branch runs."""
+    """Serves the budget and chunk queries for legacy Document-only grep."""
 
     def __init__(self, rows):
         self.rows = rows
@@ -482,6 +482,13 @@ class _LegacyChunkConn:
     async def fetch(self, sql, *_params):
         self.sql = sql
         return self.rows
+
+    async def fetchrow(self, sql, *_params):
+        self.sql = sql
+        return {
+            "resources": len(self.rows),
+            "bytes": sum(len(row["content"].encode("utf-8")) for row in self.rows),
+        }
 
 
 class _NativeHeadConn:

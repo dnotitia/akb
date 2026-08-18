@@ -784,6 +784,11 @@ class DocumentRepository:
                     doc_type = COALESCE(NULLIF(doc_type, ''), $4, doc_type),
                     domain   = COALESCE(NULLIF(domain, ''), $5, domain),
                     llm_metadata_at = $6,
+                    llm_retry_count = 0,
+                    llm_last_error = NULL,
+                    llm_next_attempt_at = NULL,
+                    llm_claimed_at = NULL,
+                    llm_abandoned_at = NULL,
                     updated_at = $6
                 WHERE id = $1
             """

@@ -34,9 +34,18 @@ test("signup → land in shell → profile edit round-trip", async ({ page }) =>
   await page.getByLabel("Password").fill(PASS);
   await page.getByRole("button", { name: /create account/i }).click();
 
+  // New accounts open the first-agent onboarding dialog. Radix correctly
+  // hides the background shell from the accessibility tree while it is open,
+  // so close it before asserting navigation landmarks.
+  const onboarding = page.getByRole("dialog", {
+    name: /connect your first agent/i,
+  });
+  await expect(onboarding).toBeVisible({ timeout: 10_000 });
+  await onboarding.getByRole("button", { name: "Close", exact: true }).click();
+
   // The authenticated shell sets up nav links — "Home" is the
   // first NavLink in components/layout.tsx.
-  await expect(page.getByRole("link", { name: "Home" })).toBeVisible({
+  await expect(page.getByRole("link", { name: "Home", exact: true })).toBeVisible({
     timeout: 10_000,
   });
 

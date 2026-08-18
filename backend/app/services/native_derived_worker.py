@@ -149,6 +149,9 @@ class NativeDerivedWorker:
                        SET completed_at = NOW(),
                            delivery_outcome = 'superseded',
                            selected_delivery = $1,
+                           retry_count = 0,
+                           claimed_at = NULL,
+                           next_attempt_at = NULL,
                            last_error = NULL
                       FROM ranked r
                      WHERE i.intent_id = r.intent_id AND r.position > 1
@@ -173,18 +176,22 @@ class NativeDerivedWorker:
                 )
                 if row is None:
                     return None
-                await conn.execute(
+                claimed = await conn.fetchrow(
                     """
                     UPDATE native_invalidation_intents
                        SET claimed_at = NOW(),
                            next_attempt_at = NOW() + INTERVAL '10 minutes',
+                           retry_count = retry_count + 1,
                            selected_delivery = $2
                      WHERE intent_id = $1
+                    RETURNING retry_count, claimed_at
                     """,
                     row["intent_id"],
                     SELECTED_DELIVERY,
                 )
-                return dict(row)
+                intent = dict(row)
+                intent.update(dict(claimed))
+                return intent
 
     async def _complete(
         self,
@@ -199,6 +206,7 @@ class NativeDerivedWorker:
                 UPDATE native_invalidation_intents
                    SET completed_at = NOW(), delivery_outcome = $2,
                        selected_delivery = $3,
+                       retry_count = 0, claimed_at = NULL,
                        next_attempt_at = NULL, last_error = NULL
                  WHERE intent_id = $1
                 """,
@@ -208,33 +216,31 @@ class NativeDerivedWorker:
             )
 
     async def _failure(self, intent: dict, error: Exception) -> None:
-        next_retry_count = int(intent["retry_count"]) + 1
-        delay = next_attempt_delay(int(intent["retry_count"]))
+        attempt_count = int(intent["retry_count"])
+        delay = next_attempt_delay(max(0, attempt_count - 1))
         next_at = datetime.now(UTC) + timedelta(seconds=delay)
         async with self.pool.acquire() as conn:
-            if next_retry_count >= MAX_RETRIES:
+            if attempt_count >= MAX_RETRIES:
                 await conn.execute(
                     """
                     UPDATE native_invalidation_intents
-                       SET claimed_at = NULL, retry_count = $2,
+                       SET claimed_at = NULL,
                            completed_at = NOW(), delivery_outcome = 'abandoned',
-                           next_attempt_at = NULL, last_error = $3
+                           next_attempt_at = NULL, last_error = $2
                      WHERE intent_id = $1 AND completed_at IS NULL
                     """,
                     intent["intent_id"],
-                    next_retry_count,
                     type(error).__name__,
                 )
             else:
                 await conn.execute(
                     """
                     UPDATE native_invalidation_intents
-                       SET claimed_at = NULL, retry_count = $2,
-                           next_attempt_at = $3, last_error = $4
+                       SET claimed_at = NULL,
+                           next_attempt_at = $2, last_error = $3
                      WHERE intent_id = $1 AND completed_at IS NULL
                     """,
                     intent["intent_id"],
-                    next_retry_count,
                     next_at,
                     type(error).__name__,
                 )

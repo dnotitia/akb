@@ -3,8 +3,9 @@
 `akb_sql` (and the REST `/api/v1/tables/{vault}/sql` endpoint) routes
 through this class. Inside a transaction we `SET LOCAL ROLE` to the
 caller's `akb_user_<uid>` role and let PostgreSQL enforce vault
-isolation via its native ACL — no application-side identifier
-filtering required.
+isolation via its native ACL. The calling table service separately reserves
+PostgreSQL catalog identifiers because those relations carry `PUBLIC` grants;
+it does not infer vault authorization from SQL text.
 
 `SET LOCAL` is transaction-scoped: it resets automatically on commit
 or rollback, so the same pooled connection can serve different users

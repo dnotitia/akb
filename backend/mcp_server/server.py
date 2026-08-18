@@ -1542,7 +1542,12 @@ async def call_tool(name: str, arguments: dict):
         # deliberately do NOT switch this MCP encode to `to_json`: it would shift
         # datetime/enum output for ~6 tools (put/get/update/move/edit/search) and
         # raise on the odd non-UTF8 bytes that `default=str` degrades to a string.
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, default=str))]
+        # The exact serializer now runs off-loop so a large SQL/tool response
+        # cannot starve HTTP/MCP heartbeats while Python walks the result tree.
+        encoded = await asyncio.to_thread(
+            json.dumps, result, ensure_ascii=False, default=str,
+        )
+        return [TextContent(type="text", text=encoded)]
     except Exception as e:
         # Last-resort envelope so the canonical {error, code, ...} shape
         # introduced in 0.5.6 holds for every response path — including
@@ -1569,10 +1574,10 @@ async def call_tool(name: str, arguments: dict):
                 duration_ms=int((time.perf_counter() - started) * 1000),
                 is_write=is_write,
             )
-        return [TextContent(
-            type="text",
-            text=json.dumps(envelope, ensure_ascii=False, default=str),
-        )]
+        encoded = await asyncio.to_thread(
+            json.dumps, envelope, ensure_ascii=False, default=str,
+        )
+        return [TextContent(type="text", text=encoded)]
 
 
 async def _dispatch(name: str, args: dict, user: "_MCPUser"):

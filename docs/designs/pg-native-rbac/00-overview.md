@@ -6,15 +6,17 @@
 
 ## Statement
 
-AKB's vault boundary is enforced by **PostgreSQL ACL**, not by
-application-side identifier filters. A user issuing arbitrary SQL via
+AKB's vault boundary is enforced by **PostgreSQL ACL**. A user issuing SQL via
 `akb_sql` runs the query under a per-user PG role whose membership
 in vault group roles determines what they can touch. Cross-vault
 reads/writes return `42501` directly from PG.
 
-The application coordinates lifecycle (role creation, grant/revoke)
-but does not gate execution. The grammar of "who can do what" lives in
-PostgreSQL catalogs.
+The application coordinates lifecycle (role creation, grant/revoke). It also
+reserves PostgreSQL's `pg_*`, `pg_catalog`, and `information_schema`
+identifiers because PostgreSQL grants many of those catalog relations to
+`PUBLIC`; that narrow pre-flight closes metadata disclosure that table-level
+vault ACLs cannot express portably. Vault/table authorization still lives in
+PostgreSQL catalogs and is not inferred by parsing user SQL.
 
 ## Why PostgreSQL ACL
 
@@ -28,18 +30,17 @@ Two answers exist:
 
 1. Application-side identifier blocklist that inspects every SQL
    string before execution. This is a regex / parser / allow-list.
-2. PostgreSQL roles + table-level GRANT. The application never
-   inspects SQL for security; PG returns permission-denied for any
+2. PostgreSQL roles + table-level GRANT. PG returns permission-denied for any
    reference to a table the caller's role lacks privilege on.
 
 Answer 2 is correct on first principles:
 
 - The validity question is "does this role have access to this table"
   — exactly the question PG was built to answer.
-- The blocklist approach has unbounded bypass surface (new system
-  catalogs across PG versions, dollar-quoted strings, `SET ROLE`,
-  `COPY ... TO PROGRAM`, comment injection, …) and any single miss
-  exfiltrates cross-tenant data.
+- A general table-name blocklist has unbounded bypass surface and any single
+  miss exfiltrates cross-tenant data. AKB does not use one for vault tables;
+  the only reserved-identifier check is the PostgreSQL-owned catalog namespace
+  that carries unavoidable `PUBLIC` grants.
 - The PG approach has a bounded surface (PG's ACL implementation
   itself), which is part of the platform's trusted base.
 

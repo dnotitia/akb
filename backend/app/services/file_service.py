@@ -371,7 +371,7 @@ class FileService:
                 description=description, content_hash=content_hash,
             )
 
-        s3_adapter.ensure_bucket(self._bucket)
+        await asyncio.to_thread(s3_adapter.ensure_bucket, self._bucket)
         collection_path = _normalize_collection_path(collection)
         preferred_s3_key = _s3_key(
             vault_name, collection_path, filename, content_hash=content_hash,
@@ -499,7 +499,7 @@ class FileService:
                 "unchanged": True,
             }
 
-        s3_adapter.ensure_bucket(self._bucket)
+        await asyncio.to_thread(s3_adapter.ensure_bucket, self._bucket)
         replacement_id = uuid.uuid4()
         staging_key = _replacement_staging_key(vault_name, fid, replacement_id)
         upload_mime_type = mime_type or row.get("mime_type") or "application/octet-stream"
@@ -787,7 +787,7 @@ class FileService:
         # client never finished its presigned upload; clean up the
         # orphan DB record so the same filename can be retried.
         try:
-            meta = s3_adapter.head(row["s3_key"])
+            meta = await asyncio.to_thread(s3_adapter.head, row["s3_key"])
             size_bytes = meta["ContentLength"]
         except NotFoundError:
             async with pool.acquire() as conn:
@@ -1157,8 +1157,13 @@ async def index_file_metadata(
     )
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await write_source_chunks(
-            conn, "file", file_id,
-            vault_id=vault_id,
-            chunks=[chunk],
-        )
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                f"akb:index:file:{file_id}",
+            )
+            await write_source_chunks(
+                conn, "file", file_id,
+                vault_id=vault_id,
+                chunks=[chunk],
+            )

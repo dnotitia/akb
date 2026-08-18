@@ -1177,8 +1177,14 @@ def _read_document_body_uncached(
     content_unavailable = False
     try:
         raw = _get_doc_service().git.read_file(vault_name, path, commit_hash)
-        if raw:
-            body = frontmatter.loads(raw).content
+        if raw is None:
+            raise FileNotFoundError(
+                f"Git blob missing for {vault_name}/{path} at {commit_hash or 'HEAD'}"
+            )
+        # An intentionally empty document is available and distinct from a
+        # missing blob. Never normalize storage drift into a successful blank
+        # page (or cache that false success for a pinned commit).
+        body = frontmatter.loads(raw).content if raw else ""
     except (FileNotFoundError, OSError) as exc:
         logger.warning("Document content unavailable for publication: %s", exc)
         content_unavailable = True

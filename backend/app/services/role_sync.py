@@ -702,15 +702,25 @@ class RoleSync:
 
         report = ReconcileReport()
         async with self.pool.acquire() as conn:
-            await self._create_role_if_missing(conn, AUTHENTICATED_ROLE)
-            await self._reconcile_user_roles(conn, report)
-            await self._reconcile_vault_roles(conn, report)
-            await self._reconcile_memberships(conn, report)
-            await self._reconcile_table_grants(conn, report)
-            await self._reconcile_public_access(conn, report)
-            # Token roles depend on user + vault group roles + memberships
-            # existing, so converge them LAST.
-            await self._reconcile_token_roles(conn, report)
+            # One catalog snapshot prevents an online signup/vault-create from
+            # appearing in the role scan but not the application-table scan (or
+            # vice versa), which could make the orphan pass drop a live role.
+            # The xact advisory lock also keeps API/worker process startups from
+            # running two destructive convergence passes simultaneously.
+            async with conn.transaction(isolation="repeatable_read"):
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    "akb:role-sync:reconcile",
+                )
+                await self._create_role_if_missing(conn, AUTHENTICATED_ROLE)
+                await self._reconcile_user_roles(conn, report)
+                await self._reconcile_vault_roles(conn, report)
+                await self._reconcile_memberships(conn, report)
+                await self._reconcile_table_grants(conn, report)
+                await self._reconcile_public_access(conn, report)
+                # Token roles depend on user + vault group roles + memberships
+                # existing, so converge them LAST.
+                await self._reconcile_token_roles(conn, report)
 
         self.metrics.last_reconcile_errors = len(report.errors)
         self.metrics.last_reconcile_at = datetime.now(timezone.utc).isoformat()
@@ -734,7 +744,8 @@ class RoleSync:
         }
         for role in wanted - existing:
             try:
-                await conn.execute(f'CREATE ROLE "{role}" NOLOGIN')
+                async with conn.transaction():
+                    await self._create_role_if_missing(conn, role)
                 report.user_roles_created += 1
             except Exception as e:  # noqa: BLE001
                 report.errors.append(f"CREATE ROLE {role}: {e}")
@@ -742,12 +753,14 @@ class RoleSync:
         # Idempotent GRANT re-applies are no-ops.
         for role in wanted:
             try:
-                await self._grant_membership(conn, AUTHENTICATED_ROLE, role)
+                async with conn.transaction():
+                    await self._grant_membership(conn, AUTHENTICATED_ROLE, role)
             except Exception as e:  # noqa: BLE001
                 report.errors.append(f"GRANT {AUTHENTICATED_ROLE}→{role}: {e}")
         for orphan in existing - wanted:
             try:
-                await self._drop_role_if_present(conn, orphan)
+                async with conn.transaction():
+                    await self._drop_role_if_present(conn, orphan)
                 report.user_roles_dropped += 1
             except Exception as e:  # noqa: BLE001
                 report.errors.append(f"DROP ROLE {orphan}: {e}")
@@ -777,7 +790,8 @@ class RoleSync:
         }
         for role in wanted - existing:
             try:
-                await conn.execute(f'CREATE ROLE "{role}" NOLOGIN')
+                async with conn.transaction():
+                    await self._create_role_if_missing(conn, role)
                 report.vault_roles_created += 1
             except Exception as e:  # noqa: BLE001
                 report.errors.append(f"CREATE ROLE {role}: {e}")
@@ -788,21 +802,24 @@ class RoleSync:
             writer = vault_group_role_name(r["id"], "writer")
             admin = vault_group_role_name(r["id"], "admin")
             try:
-                await self._grant_membership(conn, reader, writer)
-                await self._grant_membership(conn, writer, admin)
+                async with conn.transaction():
+                    await self._grant_membership(conn, reader, writer)
+                    await self._grant_membership(conn, writer, admin)
             except Exception as e:  # noqa: BLE001
                 report.errors.append(f"hierarchy {r['id']}: {e}")
             if r["owner_id"]:
                 owner_role = user_role_name(r["owner_id"])
                 try:
-                    await self._create_role_if_missing(conn, owner_role)
-                    await self._grant_membership(conn, admin, owner_role)
+                    async with conn.transaction():
+                        await self._create_role_if_missing(conn, owner_role)
+                        await self._grant_membership(conn, admin, owner_role)
                 except Exception as e:  # noqa: BLE001
                     report.errors.append(f"owner grant {r['id']}: {e}")
 
         for orphan in existing - wanted:
             try:
-                await self._drop_role_if_present(conn, orphan)
+                async with conn.transaction():
+                    await self._drop_role_if_present(conn, orphan)
                 report.vault_roles_dropped += 1
             except Exception as e:  # noqa: BLE001
                 report.errors.append(f"DROP ROLE {orphan}: {e}")
@@ -817,7 +834,8 @@ class RoleSync:
             user = user_role_name(ar["user_id"])
             group = vault_group_role_name(ar["vault_id"], ar["role"])
             try:
-                await self._grant_membership(conn, group, user)
+                async with conn.transaction():
+                    await self._grant_membership(conn, group, user)
                 report.grants_added += 1
             except Exception as e:  # noqa: BLE001
                 report.errors.append(f"GRANT {group}→{user}: {e}")
@@ -836,17 +854,18 @@ class RoleSync:
         for r in rows:
             target = _public_access_scope(r["public_access"])
             try:
-                for scope in ("reader", "writer", "admin"):
-                    if scope == target:
-                        continue
-                    group = vault_group_role_name(r["id"], scope)
-                    await self._revoke_membership_if_present(
-                        conn, group, AUTHENTICATED_ROLE,
-                    )
-                if target is not None:
-                    group = vault_group_role_name(r["id"], target)
-                    await self._grant_membership(conn, group, AUTHENTICATED_ROLE)
-                    report.public_grants_applied += 1
+                async with conn.transaction():
+                    for scope in ("reader", "writer", "admin"):
+                        if scope == target:
+                            continue
+                        group = vault_group_role_name(r["id"], scope)
+                        await self._revoke_membership_if_present(
+                            conn, group, AUTHENTICATED_ROLE,
+                        )
+                    if target is not None:
+                        group = vault_group_role_name(r["id"], target)
+                        await self._grant_membership(conn, group, AUTHENTICATED_ROLE)
+                        report.public_grants_applied += 1
             except Exception as e:  # noqa: BLE001
                 report.errors.append(
                     f"public access {r['id']} ({r['public_access']}): {e}"
@@ -871,7 +890,8 @@ class RoleSync:
                 report.errors.append(f"unsafe pg_name: {pg_name}")
                 continue
             try:
-                await self._grant_table(conn, tr["vault_id"], pg_name)
+                async with conn.transaction():
+                    await self._grant_table(conn, tr["vault_id"], pg_name)
                 report.table_grants_applied += 1
             except Exception as e:  # noqa: BLE001
                 report.errors.append(f"GRANT on {pg_name}: {e}")
@@ -1348,13 +1368,15 @@ class RoleSync:
         # DROP ROLE attempt; PG will still refuse if dependencies
         # remain and surface a clearer error there.
         try:
-            await conn.execute(f'DROP OWNED BY "{role}"')
+            async with conn.transaction():
+                await conn.execute(f'DROP OWNED BY "{role}"')
         except asyncpg.exceptions.UndefinedObjectError:
             return
         except Exception as e:  # noqa: BLE001
             logger.warning("DROP OWNED BY %s failed (continuing to DROP ROLE): %s", role, e)
         try:
-            await conn.execute(f'DROP ROLE IF EXISTS "{role}"')
+            async with conn.transaction():
+                await conn.execute(f'DROP ROLE IF EXISTS "{role}"')
         except asyncpg.exceptions.UndefinedObjectError:
             pass
 

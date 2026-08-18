@@ -95,6 +95,9 @@ def test_backend_patch_removes_local_key_authority_and_mounts_one_time_inputs_on
     assert "keycloak-upgrade" not in main_mounts
     assert "product-admin-bootstrap" not in main_mounts
     assert pod["containers"][0]["volumeMounts"][0]["$patch"] == "delete"
+    worker = next(item for item in pod["containers"] if item["name"] == "worker")
+    assert worker["volumeMounts"][0]["name"] == "local-session-keys"
+    assert worker["volumeMounts"][0]["$patch"] == "delete"
     volumes = {item["name"]: item for item in pod["volumes"]}
     assert volumes["local-session-keys"]["$patch"] == "delete"
     assert "optional" not in volumes["keycloak-bootstrap"]["secret"]

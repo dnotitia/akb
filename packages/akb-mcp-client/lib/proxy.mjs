@@ -337,11 +337,35 @@ const FILE_TOOL_NAMES = new Set(FILE_TOOLS.map((t) => t.name));
 // Tools where proxy injects a `file` param as alternative to `content`
 const FILE_CONTENT_TOOLS = new Set(["akb_put", "akb_update"]);
 
+// Retrying a tools/call after a timeout is safe only when the operation is
+// provably read-only.  A transport error is ambiguous: the backend may have
+// committed a mutation and lost only the response.  Default-deny unknown/new
+// tools so adding a mutator cannot silently reintroduce duplicate writes.
+const RETRY_SAFE_BACKEND_TOOLS = new Set([
+  "akb_activity",
+  "akb_browse",
+  "akb_diff",
+  "akb_drill_down",
+  "akb_get",
+  "akb_graph",
+  "akb_grep",
+  "akb_help",
+  "akb_history",
+  "akb_list_vaults",
+  "akb_provenance",
+  "akb_relations",
+  "akb_search",
+  "akb_search_users",
+  "akb_vault_info",
+  "akb_vault_members",
+  "akb_whoami",
+]);
+
 // Kept in sync with package.json `version`. Reported to the client in the
 // local `initialize` response, so it must not silently drift on a proxy
 // behaviour change. There is no import of package.json here to keep lib/
 // zero-dependency and load-safe across Node versions.
-const PROXY_VERSION = "2.2.0";
+const PROXY_VERSION = "2.2.1";
 const PROXY_INSTRUCTIONS =
   "This akb-mcp proxy provides local-file tools in addition to the AKB backend. " +
   "For an inline document image, call akb_put_image and place its returned `markdown` " +
@@ -1171,8 +1195,14 @@ export class AKBProxy {
 
   // ── MCP RPC forwarding ────────────────────────────────────
 
+  _isRetrySafe(msg) {
+    if (msg.method !== "tools/call") return true;
+    return RETRY_SAFE_BACKEND_TOOLS.has(msg.params?.name);
+  }
+
   async _forward(msg) {
-    const maxRetries = 2;
+    const retrySafe = this._isRetrySafe(msg);
+    const maxRetries = retrySafe ? 2 : 0;
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
@@ -1196,6 +1226,11 @@ export class AKBProxy {
               `[akb-mcp] backend unreachable, retrying (attempt ${attempt + 1})...\n`,
             );
             continue;
+          }
+          if (!retrySafe) {
+            process.stderr.write(
+              `[akb-mcp] ambiguous transport failure for non-retryable tool ${msg.params?.name || "<unknown>"}; not replaying\n`,
+            );
           }
         }
         throw err;

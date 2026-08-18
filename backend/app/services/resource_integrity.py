@@ -101,7 +101,11 @@ async def repair_resource_hashes(
                         row["path"],
                         row["current_commit"],
                     )
-                    projection = document_hash_projection(raw or "", row["current_commit"])
+                    if raw is None:
+                        raise FileNotFoundError(
+                            f"Git blob missing at commit {row['current_commit']}"
+                        )
+                    projection = document_hash_projection(raw, row["current_commit"])
                     await conn.execute(
                         """
                         UPDATE documents SET

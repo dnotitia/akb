@@ -25,6 +25,7 @@ from pathlib import Path
 
 from app.repositories.table_data_repo import (
     contains_pg_settings_identifier,
+    contains_postgres_system_identifier,
     contains_set_config_call,
     contains_unicode_escaped_identifier,
     count_statement_separators,
@@ -125,6 +126,27 @@ def test_pg_settings_identifier_detector_ignores_literals_comments_and_prefixes(
     assert not contains_pg_settings_identifier("SELECT pg_settings_value FROM metrics")
 
 
+def test_postgres_system_identifier_detector_blocks_public_catalog_surfaces():
+    assert contains_postgres_system_identifier(
+        "SELECT table_name FROM information_schema.tables"
+    )
+    assert contains_postgres_system_identifier("SELECT * FROM pg_user")
+    assert contains_postgres_system_identifier(
+        'SELECT relname FROM "pg_catalog"."pg_class"'
+    )
+    assert contains_postgres_system_identifier(
+        "SELECT relname FROM akb.pg_catalog.pg_class"
+    )
+    assert contains_postgres_system_identifier("SELECT pg_read_file('/etc/passwd')")
+
+
+def test_postgres_system_identifier_detector_is_literal_and_column_aware():
+    assert not contains_postgres_system_identifier("SELECT 'pg_user' AS note")
+    assert not contains_postgres_system_identifier("SELECT 1 -- pg_class")
+    assert not contains_postgres_system_identifier("SELECT row.pg_reference FROM metrics row")
+    assert not contains_postgres_system_identifier("SELECT row.\"pg_reference\" FROM metrics row")
+
+
 # ── 2. execute_sql wiring (AST; no heavy imports) ───────────────
 
 _TABLE_SERVICE = (
@@ -158,6 +180,10 @@ def test_execute_sql_uses_the_literal_aware_guard():
         "execute_sql must route the multi-statement check through "
         "count_statement_separators"
     )
+
+
+def test_execute_sql_rejects_postgres_system_identifiers():
+    assert "contains_postgres_system_identifier" in _called_names(_execute_sql_fn())
 
 
 def test_execute_sql_dropped_the_literal_blind_membership_test():

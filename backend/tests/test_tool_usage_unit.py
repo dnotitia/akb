@@ -1028,7 +1028,13 @@ def test_lifecycle_starts_and_stops_the_workers():
             for c in calls
         )
 
-    assert _has(_calls("start_workers"), "start"), "lifecycle must start the workers"
+    assert _has(_calls("_start_api_local"), "start"), (
+        "the API-local lifecycle must start tool-usage maintenance"
+    )
+    assert any(
+        isinstance(call.func, ast.Name) and call.func.id == "_start_api_local"
+        for call in _calls("start_workers")
+    ), "all-in-one lifecycle must compose the API-local sinks"
     assert _has(_calls("stop_workers"), "stop"), "lifecycle must stop the workers"
 
     # `start()` must be unconditional — find it and check no enclosing `if`.

@@ -14,6 +14,8 @@ data:
     db_name: akb
     db_user: akbuser
     git_storage_path: /data/vaults
+    tokenizer_processes: 2
+    worker_shutdown_timeout_secs: 35
 
     # Embedding (required) — any OpenAI-compatible /v1/embeddings endpoint.
     # embed_dimensions MUST match the model.
@@ -100,12 +102,28 @@ spec:
       labels:
         app: akb-backend
     spec:
+      # All worker stop signals are broadcast together and joined under the
+      # 35-second application deadline. The remaining 10 seconds cover DB/HTTP
+      # client close, audit drain, and interpreter teardown before SIGKILL.
+      terminationGracePeriodSeconds: 45
       containers:
         - name: backend
           image: akb-backend:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8000
+          env:
+            - name: AKB_PROCESS_ROLE
+              value: "api"
+            # Serving only tokenizes queries; one child avoids duplicating the
+            # worker sidecar's corpus-indexing memory footprint.
+            - name: AKB_TOKENIZER_PROCESSES
+              value: "1"
+            # Ingress keeps upstream connections idle for 60s. The upstream
+            # server must close later so Nginx never reuses a socket Uvicorn is
+            # concurrently expiring.
+            - name: UVICORN_TIMEOUT_KEEP_ALIVE
+              value: "65"
           volumeMounts:
             - name: app-config
               mountPath: /etc/akb/app.yaml
@@ -128,7 +146,7 @@ spec:
             # time out under indexing bursts. Cluster has ~98% CPU headroom;
             # revisit if other tenants land on the same node.
             limits:
-              memory: "4Gi"
+              memory: "2Gi"
           startupProbe:
             httpGet:
               path: /livez
@@ -148,11 +166,12 @@ spec:
             periodSeconds: 15
             timeoutSeconds: 8
             failureThreshold: 3
-          # Liveness RESTARTS the pod (SIGKILL) — with replicas=1 that is a
-          # total outage, so it must fire ONLY on a genuinely dead loop, never
-          # on a transient multi-second stall (a big akb_sql, an indexing
-          # burst). The single event loop can be briefly unschedulable while
-          # still healthy, so tolerate ~6×30s = 3min before assuming deadlock.
+          # Liveness restarts the serving container — with one API replica that
+          # is a total serving outage, so it must fire ONLY on a genuinely dead
+          # loop, never on a transient multi-second stall (for example a large
+          # akb_sql response). Durable indexing now lives in the sidecar. The
+          # API loop can still be briefly unschedulable while healthy, so
+          # tolerate ~6×30s = 3min before assuming deadlock.
           # (Do NOT rely on a runtime `kubectl patch` — deploy-internal.sh
           # re-applies this manifest and clobbers it; the value must live here.)
           livenessProbe:
@@ -162,6 +181,54 @@ spec:
             periodSeconds: 30
             timeoutSeconds: 8
             failureThreshold: 6
+        - name: worker
+          image: akb-backend:latest
+          imagePullPolicy: Always
+          command: ["python", "-m", "app.worker_main"]
+          env:
+            - name: AKB_PROCESS_ROLE
+              value: "worker"
+            - name: AKB_TOKENIZER_PROCESSES
+              value: "2"
+          volumeMounts:
+            - name: app-config
+              mountPath: /etc/akb/app.yaml
+              subPath: app.yaml
+              readOnly: true
+            - name: secret-config
+              mountPath: /etc/akb/secret.yaml
+              subPath: secret.yaml
+              readOnly: true
+            - name: local-session-keys
+              mountPath: /etc/akb/local-session
+              readOnly: true
+            - name: vaultdata
+              mountPath: /data/vaults
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "1"
+            limits:
+              memory: "4Gi"
+          startupProbe:
+            exec:
+              command: ["python", "-m", "app.worker_health"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: ["python", "-m", "app.worker_health"]
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["python", "-m", "app.worker_health"]
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
       volumes:
         - name: app-config
           configMap:

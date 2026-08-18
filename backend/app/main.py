@@ -43,6 +43,7 @@ from app.db.postgres import get_pool
 from app.exceptions import AKBError
 from app.logging_redaction import install_secret_redaction
 from app.openapi_contract import install_openapi_contract
+from app.process_role import runtime_process_role
 from app.services import (
     asset_gc_worker,
     audit_log,
@@ -57,7 +58,15 @@ from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
 from app.services.external_git_capability import check_external_git_capability
 from app.services.health import vault_health
-from app.services.lifecycle import init_storage, shutdown_storage, start_workers, stop_workers
+from app.services.lifecycle import (
+    init_storage,
+    shutdown_storage,
+    start_workers,
+    start_api_runtime,
+    stop_api_runtime,
+    stop_workers,
+    worker_lifecycle_snapshot,
+)
 from app.services.revision_backend import selected_document_revision_backend
 from app.services.vector_store import get_vector_store
 from app.util.errors import (
@@ -91,40 +100,61 @@ async def lifespan(app: FastAPI):
     # loggers/handlers (uvicorn.access/error don't propagate to the root handler).
     # Idempotent — already-covered handlers are skipped.
     install_secret_redaction()
-    await init_storage()
-    bare_git_selected = selected_document_revision_backend() == "bare_git"
-    if bare_git_selected:
-        # Stamp the external-mirror marker on any mirror whose
-        # bare repo predates it, so its reads route through the hermetic runner
-        # (fail-closed) rather than GitPython. Runs AFTER the DB is up (authoritative
-        # mirror list) and BEFORE workers/requests. This remains unconditional
-        # within Bare-Git mode, even when external_git is disabled, because the
-        # marker is the fail-closed safety net that makes the read paths correctly
-        # REFUSE a disabled mirror (503) rather than serve it via GitPython. The
-        # backfill is not composed for PostgreSQL Native, whose vault storage is
-        # PostgreSQL-only and may have no Git write authority. FAIL-FAST: if a
-        # marker cannot be written onto an existing mirror bare (disk/permission),
-        # or the mirror list can't be read, this raises and startup ABORTS rather
-        # than serving mirrors that would fall open. No serving has begun yet, so
-        # the fail-open window is zero.
-        marked = await external_git_service.backfill_mirror_markers()
-        if marked:
-            logger.info("Backfilled external-git mirror marker on %d vault(s)", marked)
-        # When the mirror feature is enabled, prove at boot (in a
-        # thread; it runs a git subprocess + loopback socket) that this git build
-        # actually enforces the network controls the hermetic runner depends on
-        # (http.curloptResolve DNS-pin, proxy-off, --config-env) and meets the git
-        # >= 2.37 floor. Fast-fails the boot BEFORE workers/serving start if not; a
-        # no-op when external_git is disabled. No real network (uses a *.invalid host).
-        await asyncio.to_thread(check_external_git_capability, settings)
-    start_workers()
-    yield
-    await stop_workers()
-    await shutdown_storage()
-    # Drain the audit writer's queue so a rollout doesn't drop its tail. Off the
-    # loop since shutdown() blocks on the queue join.
-    await asyncio.to_thread(audit_log.shutdown)
-    logger.info("Server shutdown")
+    role = runtime_process_role()
+    if role == "worker":
+        raise RuntimeError(
+            "AKB_PROCESS_ROLE=worker must use `python -m app.worker_main`, not uvicorn"
+        )
+    storage_initialized = False
+    runtime_started = False
+    try:
+        await init_storage()
+        storage_initialized = True
+        bare_git_selected = selected_document_revision_backend() == "bare_git"
+        if bare_git_selected:
+            # Stamp the external-mirror marker on any mirror whose
+            # bare repo predates it, so its reads route through the hermetic runner
+            # (fail-closed) rather than GitPython. Runs AFTER the DB is up (authoritative
+            # mirror list) and BEFORE workers/requests. This remains unconditional
+            # within Bare-Git mode, even when external_git is disabled, because the
+            # marker is the fail-closed safety net that makes the read paths correctly
+            # REFUSE a disabled mirror (503) rather than serve it via GitPython. The
+            # backfill is not composed for PostgreSQL Native, whose vault storage is
+            # PostgreSQL-only and may have no Git write authority. FAIL-FAST: if a
+            # marker cannot be written onto an existing mirror bare (disk/permission),
+            # or the mirror list can't be read, this raises and startup ABORTS rather
+            # than serving mirrors that would fall open. No serving has begun yet, so
+            # the fail-open window is zero.
+            marked = await external_git_service.backfill_mirror_markers()
+            if marked:
+                logger.info("Backfilled external-git mirror marker on %d vault(s)", marked)
+            # When the mirror feature is enabled, prove at boot (in a
+            # thread; it runs a git subprocess + loopback socket) that this git build
+            # actually enforces the network controls the hermetic runner depends on
+            # (http.curloptResolve DNS-pin, proxy-off, --config-env) and meets the git
+            # >= 2.37 floor. Fast-fails the boot BEFORE workers/serving start if not; a
+            # no-op when external_git is disabled. No real network (uses a *.invalid host).
+            await asyncio.to_thread(check_external_git_capability, settings)
+        # Mark this before synchronous composition so a partial start is still
+        # unwound if a later component raises.
+        runtime_started = True
+        if role == "all":
+            start_workers()
+        else:
+            start_api_runtime()
+        yield
+    finally:
+        if runtime_started:
+            if role == "all":
+                await stop_workers()
+            else:
+                await stop_api_runtime()
+        if storage_initialized:
+            await shutdown_storage()
+        # Drain the audit writer's queue so a rollout doesn't drop its tail. Off the
+        # loop since shutdown() blocks on the queue join.
+        await asyncio.to_thread(audit_log.shutdown)
+        logger.info("Server shutdown (role=%s)", role)
 
 
 app = FastAPI(
@@ -436,7 +466,7 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
     `vector_store.backfill` and `embed_backfill` is gone — they were
     reporting the same `chunks.vector_indexed_at IS NULL` count.
     """
-    from app.services import sparse_encoder, vault_backfill
+    from app.services import loop_monitor, queue_rescuer, sparse_encoder, vault_backfill
 
     store = get_vector_store()
     vs_info: dict = {"reachable": await store.health()}
@@ -466,6 +496,9 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
     result: dict = {
         "status": "ok",
         "service": "akb",
+        "workers": worker_lifecycle_snapshot(),
+        "event_loop": loop_monitor.snapshot(),
+        "queue_claims": queue_rescuer.snapshot(),
         "external_git": await _safe(external_git_poller.pending_stats),
         "asset_gc": await _safe(asset_gc_worker.pending_stats),
         "metadata_backfill": await _safe(metadata_worker.pending_stats),

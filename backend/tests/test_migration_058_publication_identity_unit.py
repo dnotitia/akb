@@ -272,6 +272,7 @@ async def test_init_sql_still_runs_against_a_database_that_predates_the_migratio
 # file's recorded history — which is why the judgement-based derivation above
 # is not redundant with the replay.
 _MIGRATION_ADDED_COLUMNS = [
+    ("users", "is_recovery_admin", "users_one_recovery_admin_per_provider"),  # 071
     ("publications", "document_id", "idx_publications_document_id"),   # 058
     ("publications", "resource_uri", "idx_publications_resource_uri"),  # 022
     ("chunks", "vector_indexed_at", "idx_chunks_indexing_queue"),       # 009

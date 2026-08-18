@@ -14,6 +14,12 @@ db_user: akb
 # pg_pool_min_size: 2
 # pg_pool_max_size: 30
 
+# Runtime safety budgets. Each Kiwi child holds its own model in memory, so do
+# not derive this from host CPU count. Kubernetes grants 45 seconds for pod
+# termination; workers share 35 seconds and leave the remainder for teardown.
+tokenizer_processes: 2
+worker_shutdown_timeout_secs: 35
+
 # === Git storage (bare repos per vault live under this path) ===
 git_storage_path: /data/vaults
 

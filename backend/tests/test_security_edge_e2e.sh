@@ -370,15 +370,19 @@ SANDBOX_PROBES=(
   "EXPLAIN SELECT 1"
 )
 for SQL in "${SANDBOX_PROBES[@]}"; do
-  R=$(mcp_as "$PAT2" "$SID2" "akb_sql" "$(python3 -c "import json,sys; print(json.dumps({'vault':sys.argv[1],'sql':sys.argv[2]}))" "$VAULT1" "$SQL")" | mr)
-  # Accept either an explicit error envelope OR an empty response —
-  # the latter is what the SSE-stream parser surfaces when the
-  # backend short-circuits before producing a tool result. The
-  # absence of any data row is itself confirmation the SQL never
-  # executed; the substring guard below catches "kind":"table_query"
-  # results that would only appear on a successful leak.
+  ARGS=$(jq -cn --arg vault "$VAULT1" --arg sql "$SQL" \
+    '{vault: $vault, sql: $sql}')
+  R=$(mcp_as "$PAT2" "$SID2" "akb_sql" "$ARGS" | mr)
+  # Require an explicit tool error. Treat an empty/unparseable response as a
+  # test failure: otherwise a client-side payload or SSE parsing bug can turn
+  # into a false-positive "sandbox blocked it" result.
   LEAKED=$(echo "$R" | grep -qE '"kind":"table_query"|"items":\[\{' && echo yes || echo no)
-  [ "$LEAKED" = "no" ] && pass "SQL sandbox blocks: $SQL" || fail "SQL sandbox leak" "$SQL → $R"
+  BLOCKED=$(echo "$R" | python3 -c \
+    "import json,sys; d=json.load(sys.stdin); print(isinstance(d,dict) and 'error' in d)" \
+    2>/dev/null)
+  [ "$LEAKED" = "no" ] && [ "$BLOCKED" = "True" ] \
+    && pass "SQL sandbox blocks: $SQL" \
+    || fail "SQL sandbox leak or invalid response" "$SQL → $R"
 done
 
 # Upgrade to writer

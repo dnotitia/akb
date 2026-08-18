@@ -19,7 +19,7 @@ from typing import Literal
 
 from app.config import settings
 from app.db.postgres import get_pool
-from app.exceptions import ValidationError
+from app.exceptions import AKBError, ValidationError
 from app.models.document import SearchResponse, SearchResult
 from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.services import sparse_encoder
@@ -101,6 +101,36 @@ def strip_chunk_metadata_header(text: str | None) -> str | None:
     if not text:
         return text
     return _CHUNK_HEADER_RE.sub("", text, count=1)
+
+
+def _scan_legacy_chunk_lines(
+    chunks: list[tuple[str, str | None]],
+    pattern: str,
+    *,
+    regex: bool,
+    case_sensitive: bool,
+) -> list[tuple[int, list[dict[str, str | None]]]]:
+    """CPU-only line scan, suitable for a bounded spawned process."""
+    compiled = None
+    folded = pattern.casefold()
+    if regex:
+        compiled = re.compile(pattern, 0 if case_sensitive else re.IGNORECASE)
+    results: list[tuple[int, list[dict[str, str | None]]]] = []
+    for index, (content, section_path) in enumerate(chunks):
+        matches: list[dict[str, str | None]] = []
+        chunk_body = strip_chunk_metadata_header(content) or ""
+        for line in chunk_body.split("\n"):
+            if compiled is not None:
+                matched = compiled.search(line) is not None
+            elif case_sensitive:
+                matched = pattern in line
+            else:
+                matched = folded in line.casefold()
+            if matched:
+                matches.append({"section": section_path, "text": line.strip()})
+        if matches:
+            results.append((index, matches))
+    return results
 
 
 def fuse_original_and_reranked_hits(
@@ -1097,6 +1127,23 @@ class SearchService:
 
         if pattern == "":
             raise ValidationError("grep pattern must not be empty")
+        from app.services.m1_native_grep_service import (
+            NATIVE_GREP_MAX_PATTERN_BYTES,
+            NATIVE_GREP_MAX_REPLACEMENT_BYTES,
+        )
+
+        if len(pattern.encode("utf-8")) > NATIVE_GREP_MAX_PATTERN_BYTES:
+            raise ValidationError(
+                f"grep pattern exceeds {NATIVE_GREP_MAX_PATTERN_BYTES} UTF-8 bytes"
+            )
+        if (
+            replace is not None
+            and len(replace.encode("utf-8")) > NATIVE_GREP_MAX_REPLACEMENT_BYTES
+        ):
+            raise ValidationError(
+                "grep replacement exceeds "
+                f"{NATIVE_GREP_MAX_REPLACEMENT_BYTES} UTF-8 bytes"
+            )
 
         # Mutual exclusion — issue #41.
         if count_only and files_with_matches:
@@ -1175,17 +1222,13 @@ class SearchService:
             idx = 1
 
             # Text match condition
-            if regex:
-                op = "~" if case_sensitive else "~*"
-                conditions.append(f"c.content {op} ${idx}")
-                params.append(pattern)
-            else:
+            if not regex:
                 if case_sensitive:
                     conditions.append(f"c.content LIKE '%' || ${idx} || '%'")
                 else:
                     conditions.append(f"c.content ILIKE '%' || ${idx} || '%'")
                 params.append(pattern)
-            idx += 1
+                idx += 1
 
             if vaults:
                 conditions.append(f"v.name = ANY(${idx})")
@@ -1211,7 +1254,7 @@ class SearchService:
                 idx += 1
 
             where_sql = " AND ".join(conditions)
-            # No prefetch cap. The old `LIMIT (limit * 5)` cap was inherited
+            # The old `LIMIT (limit * 5)` cap was inherited
             # from a score-ordered hybrid search path, but `grep` matches with
             # ILIKE — there is no score, so ORDER + LIMIT was just chopping the
             # corpus alphabetically. Symptoms reported by users:
@@ -1223,11 +1266,35 @@ class SearchService:
             # Both are the same anti-pattern: a user-facing count (total_docs /
             # total_matches) that drifted with the WHERE clause because the
             # cap was tied to `limit`. ILIKE is a full scan either way; the
-            # only thing the cap was buying was a memory safety net. The PG
-            # planner happily streams millions of rows back through asyncpg,
-            # and our largest vault has tens of thousands of chunks — well
-            # within budget. Drop the cap; if a pathological corpus ever
-            # becomes a real concern, gate it on `EXPLAIN` cost instead.
+            # response limit is therefore not a scan limit. A separate fixed
+            # resource/byte safety budget below rejects oversized scans before
+            # asyncpg materializes their bodies in the API process.
+            budget = await conn.fetchrow(
+                f"""
+                SELECT COUNT(*) AS resources,
+                       COALESCE(SUM(OCTET_LENGTH(c.content)), 0) AS bytes
+                FROM chunks c
+                JOIN documents d ON c.source_id = d.id AND c.source_type = 'document'
+                JOIN vaults v ON d.vault_id = v.id
+                WHERE {where_sql}
+                """,
+                *params,
+            )
+            # Keep these imports local so the guarded native-M1 implementation
+            # remains the single source for the shared scan budgets.
+            from app.services.m1_native_grep_service import (
+                NATIVE_GREP_MAX_RESOURCES,
+                NATIVE_GREP_MAX_SEARCH_BYTES,
+            )
+
+            if int(budget["resources"] or 0) > NATIVE_GREP_MAX_RESOURCES:
+                raise ValidationError(
+                    f"grep candidate chunks exceed {NATIVE_GREP_MAX_RESOURCES}"
+                )
+            if int(budget["bytes"] or 0) > NATIVE_GREP_MAX_SEARCH_BYTES:
+                raise ValidationError(
+                    f"grep candidate bytes exceed {NATIVE_GREP_MAX_SEARCH_BYTES}"
+                )
             rows = await conn.fetch(
                 f"""
                 SELECT d.id::text as doc_id, v.name as vault, d.path, d.title,
@@ -1242,12 +1309,58 @@ class SearchService:
                 *params,
             )
 
-        # Group by document and extract matching lines. `_doc_pk` is
+        # Regex execution is never delegated to PostgreSQL or run on the API
+        # event loop: either can spend unbounded time on a hostile pattern.
+        # The native grep arm already owns a killable spawned-process runner;
+        # reuse that exact safety boundary for legacy Git-backed documents.
+        from app.services.m1_native_grep_service import (
+            NATIVE_GREP_MAX_RESOURCES,
+            NATIVE_GREP_MAX_SEARCH_BYTES,
+            NATIVE_GREP_REGEX_TIMEOUT_SECONDS,
+            _RegexScanTimedOut,
+            _run_regex_bounded,
+        )
+
+        if len(rows) > NATIVE_GREP_MAX_RESOURCES:
+            raise ValidationError(
+                f"grep candidate chunks exceed {NATIVE_GREP_MAX_RESOURCES}"
+            )
+        scan_chunks = [
+            (strip_chunk_metadata_header(r["content"]) or "", r["section_path"])
+            for r in rows
+        ]
+        searched_bytes = sum(len(content.encode("utf-8")) for content, _ in scan_chunks)
+        if searched_bytes > NATIVE_GREP_MAX_SEARCH_BYTES:
+            raise ValidationError(
+                f"grep candidate bytes exceed {NATIVE_GREP_MAX_SEARCH_BYTES}"
+            )
+        try:
+            if regex:
+                scanned = await asyncio.to_thread(
+                    _run_regex_bounded,
+                    _scan_legacy_chunk_lines,
+                    (scan_chunks, pattern),
+                    {"regex": True, "case_sensitive": case_sensitive},
+                    NATIVE_GREP_REGEX_TIMEOUT_SECONDS,
+                )
+            else:
+                scanned = await asyncio.to_thread(
+                    _scan_legacy_chunk_lines,
+                    scan_chunks,
+                    pattern,
+                    regex=False,
+                    case_sensitive=case_sensitive,
+                )
+        except _RegexScanTimedOut as exc:
+            raise AKBError("grep regex execution timed out", status_code=408) from exc
+        matches_by_row = {int(index): matches for index, matches in scanned}
+
+        # Group by document and attach off-loop line matches. `_doc_pk` is
         # the internal PG UUID — kept only as a dedup key while building
         # results; stripped before the response leaves this function.
         from app.services.uri_service import doc_uri as _doc_uri
         docs: dict[str, dict] = {}
-        for r in rows:
+        for row_index, r in enumerate(rows):
             doc_key = r["doc_id"]
             if doc_key not in docs:
                 docs[doc_key] = {
@@ -1260,26 +1373,7 @@ class SearchService:
                     "matches": [],
                 }
 
-            # Extract individual matching lines from chunk. Strip the
-            # indexing-time TITLE/SUMMARY/... enrichment so a user
-            # grepping for a real body word doesn't get phantom hits
-            # against the doc-level signals that ride along with every
-            # chunk.
-            chunk_body = strip_chunk_metadata_header(r["content"]) or ""
-            chunk_lines = chunk_body.split("\n")
-            for i, line in enumerate(chunk_lines):
-                if regex:
-                    matched = bool(_re.search(pattern, line, 0 if case_sensitive else _re.IGNORECASE))
-                else:
-                    if case_sensitive:
-                        matched = pattern in line
-                    else:
-                        matched = pattern.lower() in line.lower()
-                if matched:
-                    docs[doc_key]["matches"].append({
-                        "section": r["section_path"],
-                        "text": line.strip(),
-                    })
+            docs[doc_key]["matches"].extend(matches_by_row.get(row_index, []))
 
         # ── count_only (grep -c) — issue #41 ─────────────────────────
         # `limit` is a *snippet-output* knob. For count/files modes we
@@ -1347,13 +1441,28 @@ class SearchService:
                     doc = await doc_service.get(doc_vault, doc_path)
                     body = doc.content or ""
 
-                    new_body = apply_grep_replacement(
-                        body,
-                        pattern,
-                        replace,
-                        regex=regex,
-                        case_sensitive=case_sensitive,
-                    )
+                    try:
+                        if regex:
+                            new_body = await asyncio.to_thread(
+                                _run_regex_bounded,
+                                apply_grep_replacement,
+                                (body, pattern, replace),
+                                {"regex": True, "case_sensitive": case_sensitive},
+                                NATIVE_GREP_REGEX_TIMEOUT_SECONDS,
+                            )
+                        else:
+                            new_body = await asyncio.to_thread(
+                                apply_grep_replacement,
+                                body,
+                                pattern,
+                                replace,
+                                regex=False,
+                                case_sensitive=case_sensitive,
+                            )
+                    except _RegexScanTimedOut as exc:
+                        raise AKBError(
+                            "grep regex replacement timed out", status_code=408,
+                        ) from exc
 
                     if new_body == body:
                         unchanged_docs += 1

@@ -337,7 +337,9 @@ async def create_image_asset(
     file_id = uuid.uuid4()
     safe_name = _safe_filename(filename, actual_mime)
     s3_key = f"{vault_name}/.akb-assets/{file_id}/{safe_name}"
-    digest = hashlib.sha256(body).hexdigest()
+    # Hashing 10 MiB is CPU work as well; keep the full upload-validation path
+    # off-loop, not only Pillow's decoder.
+    digest = await asyncio.to_thread(lambda: hashlib.sha256(body).hexdigest())
 
     await asyncio.to_thread(s3_adapter.ensure_bucket, settings.s3_bucket)
     pool = await get_pool()

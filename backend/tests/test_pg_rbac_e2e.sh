@@ -187,6 +187,27 @@ except Exception:
   [ "$matched" = "Y" ] && pass "$label" || fail "$label" "expected PG-side denial; raw=$raw"
 }
 
+# PostgreSQL deliberately grants many pg_catalog relations to PUBLIC, so
+# per-vault table ACL cannot deny them. AKB reserves the PostgreSQL-owned
+# identifier namespace before execution; assert that narrow application
+# boundary separately instead of misreporting it as a PG 42501.
+assert_catalog_rejected() {
+  local label=$1
+  local raw=$2
+  local matched
+  matched=$(echo "$raw" | python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())
+    err = (d.get('error') or '').lower()
+    print('Y' if d.get('code') == 'method_not_allowed'
+          and 'system catalog identifiers' in err else 'N')
+except Exception:
+    print('N')
+" 2>/dev/null)
+  [ "$matched" = "Y" ] && pass "$label" || fail "$label" "expected catalog-namespace rejection; raw=$raw"
+}
+
 # Revoke Bob first so we test denial cleanly
 mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_revoke" "{\"vault\":\"$VAULT_A\",\"user\":\"$BOB\"}" >/dev/null 2>&1
 # Bob has NO membership on vault B (or A after revoke). Set up: Bob owns
@@ -221,7 +242,7 @@ assert_pg_denied "System table 'users' SELECT" "$R"
 
 # 2f: PG superuser-only catalog.
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT * FROM pg_authid LIMIT 1\"}" | mr)
-assert_pg_denied "pg_authid (superuser-only)" "$R"
+assert_catalog_rejected "pg_authid reserved before execution" "$R"
 
 # 2g: vault_access (AKB bookkeeping).
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT * FROM vault_access LIMIT 1\"}" | mr)
@@ -255,11 +276,11 @@ assert_pg_denied "Scalar subquery cross-vault" "$R"
 
 # 2q: pg_read_file (filesystem read — superuser-only PG function).
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT pg_read_file('/etc/passwd')\"}" | mr)
-assert_pg_denied "pg_read_file filesystem access" "$R"
+assert_catalog_rejected "pg_read_file reserved before execution" "$R"
 
 # 2r: pg_ls_dir (directory listing — superuser-only).
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT pg_ls_dir('/')\"}" | mr)
-assert_pg_denied "pg_ls_dir filesystem access" "$R"
+assert_catalog_rejected "pg_ls_dir reserved before execution" "$R"
 
 # 2s: lo_import / lo_export (large object — superuser-only).
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT lo_export(1, '/tmp/x')\"}" | mr)
@@ -279,17 +300,10 @@ assert_pg_denied "Inline-comment cross-vault SELECT" "$R"
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"WITH ins AS (INSERT INTO $PG_A_SECRETS (item, value) VALUES ('x','y') RETURNING id) SELECT * FROM ins\"}" | mr)
 assert_pg_denied "Modifying CTE cross-vault INSERT" "$R"
 
-# 2z: Quoted system catalog (pg_catalog.pg_class) — qualified path
-#     normally readable by all roles, but tests that we're not
-#     accidentally hiding existence via search_path tricks.
+# 2z: Qualified system catalog is normally readable by all roles, so the
+#      reserved catalog-namespace boundary must reject it before execution.
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT relname FROM pg_catalog.pg_class WHERE relname = '$PG_A_SECRETS'\"}" | mr)
-# pg_class is publicly readable in PG; we accept this returning the
-# row name. The defense isn't "hide existence" but "block content
-# access." Just verify Bob cannot then read the table itself — that
-# was already tested in 2b.
-echo "$R" | python3 -c "import sys,json; sys.exit(0 if 'items' in json.load(sys.stdin) else 1)" 2>/dev/null \
-  && pass "pg_class metadata readable (content still blocked, see 2b)" \
-  || pass "pg_class read returned non-data response (acceptable)"
+assert_catalog_rejected "pg_catalog.pg_class reserved before execution" "$R"
 
 # ── 2-B. Negative — app pre-flight rejects before reaching PG ─
 echo ""

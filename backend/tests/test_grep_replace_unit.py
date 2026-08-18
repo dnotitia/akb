@@ -33,6 +33,12 @@ class _Connection:
     async def fetch(self, *_args):
         return self.rows
 
+    async def fetchrow(self, *_args):
+        return {
+            "resources": len(self.rows),
+            "bytes": sum(len(row["content"].encode("utf-8")) for row in self.rows),
+        }
+
 
 class _Acquire:
     def __init__(self, connection: _Connection):
@@ -95,6 +101,14 @@ def legacy_grep(monkeypatch):
         return SearchService()
 
     return configure
+
+
+@pytest.mark.asyncio
+async def test_legacy_grep_rejects_oversized_pattern_before_query(legacy_grep):
+    service = await legacy_grep([])
+
+    with pytest.raises(ValidationError, match="pattern exceeds"):
+        await service.grep("x" * 4097, vault="test-vault")
 
 
 @pytest.mark.asyncio

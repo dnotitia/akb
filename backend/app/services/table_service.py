@@ -67,6 +67,7 @@ from app.util.text import fuzzy_hint
 from app.repositories.table_data_repo import (  # noqa: F401
     build_table_name_map,
     contains_pg_settings_identifier,
+    contains_postgres_system_identifier,
     contains_set_config_call,
     contains_unicode_escaped_identifier,
     count_statement_separators,
@@ -542,18 +543,28 @@ async def index_table_metadata(
     )
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await write_source_chunks(
-            conn, "table", table_id,
-            vault_id=vault_id,
-            chunks=[chunk],
-        )
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                f"akb:index:table:{table_id}",
+            )
+            await write_source_chunks(
+                conn, "table", table_id,
+                vault_id=vault_id,
+                chunks=[chunk],
+            )
 
 
 async def delete_table_index(table_id: str) -> None:
     """Drop the metadata chunk for a table (outbox-driven vector-store delete)."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await delete_table_chunks(conn, table_id)
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                f"akb:index:table:{table_id}",
+            )
+            await delete_table_chunks(conn, table_id)
 
 
 # ── CRUD ─────────────────────────────────────────────────────────
@@ -1826,8 +1837,9 @@ async def execute_sql(
     Vault isolation is enforced by PostgreSQL ACL: the caller's
     ``akb_user_<uid>`` role has GRANTs only on tables in vaults
     they have access to (via ``akb_vault_<vid>_<scope>`` group role
-    membership). Cross-vault references return PG ``42501``; the
-    application no longer inspects user SQL for forbidden identifiers.
+    membership). Cross-vault references return PG ``42501``. The only
+    identifier pre-flight reserves PostgreSQL's own catalog namespaces, whose
+    ``PUBLIC`` grants sit outside the per-vault ACL model.
 
     Table references are rewritten for UX before execution:
       - Single vault: 'pipeline' → 'vt_sales__pipeline'
@@ -1877,6 +1889,12 @@ async def execute_sql(
             return err(
                 "pg_settings is not available via akb_sql because "
                 "request.jwt.claims is reserved for service-key claim injection.",
+                code=METHOD_NOT_ALLOWED,
+            )
+        if not is_admin and contains_postgres_system_identifier(rewritten):
+            return err(
+                "PostgreSQL system catalog identifiers are not allowed via "
+                "akb_sql. Query only tables registered in the selected vaults.",
                 code=METHOD_NOT_ALLOWED,
             )
 

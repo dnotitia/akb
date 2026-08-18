@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.2.1 — 2026-08-18 — mutation-safe reconnect behavior
+
+Transport failures are ambiguous for mutating MCP calls: the backend may have
+committed the change and lost only the response. The proxy now retries only an
+explicit allowlist of read-only backend tools. Mutating and newly introduced
+tools default to no replay, preventing a reconnect from duplicating a document
+or applying the same change twice. The long-lived reconnect monitor still
+restores backend availability for subsequent calls.
+
 ## 2.2.0 — inline document images and conflict-safe file replacement
 
 Adds two proxy-local tools for agent-authored document images:

@@ -964,6 +964,45 @@ def contains_pg_settings_identifier(sql: str) -> bool:
     return False
 
 
+def contains_postgres_system_identifier(sql: str) -> bool:
+    """Return True for PostgreSQL catalog/schema identifiers in user SQL.
+
+    PostgreSQL grants ``SELECT`` on many ``pg_catalog`` and
+    ``information_schema`` relations to ``PUBLIC``. Table-level vault GRANTs
+    therefore cannot, by themselves, hide those relations from an
+    ``akb_user_*`` role. Reserve the system namespaces on the raw SQL surface
+    while keeping strings, comments, dollar-quoted bodies, and qualified user
+    columns such as ``row.pg_reference`` literal-aware.
+    """
+    previous_significant: str | None = None
+    pos = 0
+    n = len(sql)
+    while pos < n:
+        end = _scan_dollar_quote(sql, pos)
+        if end is not None:
+            previous_significant = "literal"
+            pos = end
+            continue
+        m = _SQL_TOKEN_RE.match(sql, pos)
+        if not m:
+            pos += 1
+            continue
+        kind = m.lastgroup
+        text = m.group()
+        if kind in {"ws", "line_comment", "block_comment"}:
+            pos = m.end()
+            continue
+        name = _token_identifier_name(kind, text)
+        if name is not None:
+            if name in {"pg_catalog", "information_schema"}:
+                return True
+            if name.startswith("pg_") and previous_significant != ".":
+                return True
+        previous_significant = text if kind == "sym" else "identifier"
+        pos = m.end()
+    return False
+
+
 def _token_identifier_name(kind: str | None, text: str) -> str | None:
     if kind == "ident":
         return text.lower()

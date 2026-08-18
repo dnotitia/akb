@@ -201,7 +201,7 @@ V10="v10-$TS"; mkvault "$V10"
 PUT_RESP=$(putdoc "$V10" "pub-doc" "secret")
 URI="akb://$V10/doc/specs/pub-doc.md"
 PUB=$(curl -sk -X POST "$BASE_URL/api/v1/publications/$V10/create" -H "$H_AUTH" -H "$H_JSON" \
-  -d "{\"resource_type\":\"document\",\"uri\":\"$URI\",\"max_views\":1,\"mode\":\"live\"}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"$URI\",\"max_views\":1}")
 SLUG=$(echo "$PUB" | jq_field "['slug']")
 [ -n "$SLUG" ] && pass "T10 pub created (slug=$SLUG)" || fail "T10 pub" "no slug; resp=${PUB:0:160}"
 if [ -n "$SLUG" ]; then

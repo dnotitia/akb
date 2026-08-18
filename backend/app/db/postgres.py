@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import asyncpg
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from app.config import settings
@@ -9,6 +10,7 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 _pool: asyncpg.Pool | None = None
+_MIGRATION_LOCK_KEY = 0x414B425F4D494752  # ``AKB_MIGR``
 
 
 def _pool_sizes() -> tuple[int, int]:
@@ -131,7 +133,17 @@ def _load_migration(filename: str):
     return module
 
 
-async def _run_one_migration(pool, filename: str, module, *, retries: int = 10, backoff: float = 4.0) -> None:
+@asynccontextmanager
+async def _migration_connection(pool_or_conn):
+    """Accept a pool for direct tests or the applier's leader connection."""
+    if hasattr(pool_or_conn, "acquire"):
+        async with pool_or_conn.acquire() as conn:
+            yield conn
+    else:
+        yield pool_or_conn
+
+
+async def _run_one_migration(pool_or_conn, filename: str, module, *, retries: int = 10, backoff: float = 4.0) -> None:
     """Apply one migration under a bounded lock_timeout, retrying on a lock
     conflict, then record it in the ledger.
 
@@ -149,18 +161,28 @@ async def _run_one_migration(pool, filename: str, module, *, retries: int = 10, 
     log = logging.getLogger("akb.migrations")
     for attempt in range(retries):
         try:
-            async with pool.acquire() as conn:
+            async with _migration_connection(pool_or_conn) as conn:
                 await conn.execute("SET lock_timeout = '5s'")
-                await module.migrate(conn=conn)
-                await conn.execute(
-                    "INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT (filename) DO NOTHING",
-                    filename,
-                )
+                if hasattr(conn, "transaction"):
+                    # Migration effects and their ledger receipt are one unit.
+                    # Nested transaction blocks in individual migrations become
+                    # savepoints under asyncpg and remain compatible.
+                    async with conn.transaction():
+                        await module.migrate(conn=conn)
+                        await conn.execute(
+                            "INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT (filename) DO NOTHING",
+                            filename,
+                        )
+                else:  # minimal connection fakes used by unit tests
+                    await module.migrate(conn=conn)
+                    await conn.execute(
+                        "INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT (filename) DO NOTHING",
+                        filename,
+                    )
             return
         except (
             asyncpg.DeadlockDetectedError,
             asyncpg.LockNotAvailableError,
-            asyncpg.QueryCanceledError,
         ) as e:
             if attempt < retries - 1:
                 log.warning(
@@ -187,7 +209,20 @@ async def _apply_migrations() -> None:
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        applied = {r["filename"] for r in await conn.fetch("SELECT filename FROM schema_migrations")}
+        # Session lock serializes the read-of-ledger + apply + ledger-write
+        # sequence across API/worker pods during a rolling deployment.
+        await conn.execute("SELECT pg_advisory_lock($1)", _MIGRATION_LOCK_KEY)
+        try:
+            applied = {
+                r["filename"]
+                for r in await conn.fetch("SELECT filename FROM schema_migrations")
+            }
+            await _apply_pending_migrations(conn, applied)
+        finally:
+            await conn.execute("SELECT pg_advisory_unlock($1)", _MIGRATION_LOCK_KEY)
+
+
+async def _apply_pending_migrations(conn, applied: set[str]) -> None:
     for filename in (
         "002_public_shares.py",  # legacy is_public/public_slug → public_shares
         "003_rename_public_shares.py",  # public_shares → publications
@@ -266,10 +301,11 @@ async def _apply_migrations() -> None:
         "076_sso_session_epoch.py",  # monotonic auth boundary + rollback-compatible epoch bridge/legacy-write guard
         "077_legacy_adoptions.py",  # immutable legacy app adoption plans, targets, and bounded audit
         "078_recovery_admin_authority_handover.py",  # provider-scoped recovery authority during local-to-SSO cutover
+        "079_worker_claim_lifecycle.py",  # attempt-at-claim + explicit claimed/abandoned timestamps for durable queues
     ):
         if filename in applied:
             continue
         module = _load_migration(filename)
         if module is None:
             continue
-        await _run_one_migration(pool, filename, module)
+        await _run_one_migration(conn, filename, module)

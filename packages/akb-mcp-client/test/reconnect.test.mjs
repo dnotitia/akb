@@ -158,7 +158,7 @@ itAsync("monitor stays silent on recovery when the list was never degraded", asy
 
 // ── _forward never kills the process; it recovers or surfaces an error ─
 
-itAsync("_forward retries a connection error then surfaces it (process survives)", async () => {
+itAsync("_forward retries a read-only connection error then surfaces it (process survives)", async () => {
   const proxy = newProxy();
   proxy._startBackendMonitor = () => {}; // observe restart without spinning a loop
   let restarts = 0;
@@ -174,13 +174,15 @@ itAsync("_forward retries a connection error then surfaces it (process survives)
     throw new Error("ECONNRESET");
   };
 
-  await assert.rejects(() => proxy._forward({ method: "tools/call", id: 5, params: {} }));
+  await assert.rejects(() => proxy._forward({
+    method: "tools/call", id: 5, params: { name: "akb_search", arguments: {} },
+  }));
   assert.equal(proxy._backendReady, false, "marks backend not-ready");
   assert.ok(restarts >= 1, "kicks the reconnect monitor");
   assert.ok(calls >= 3, "attempted the initial call plus retries");
 });
 
-itAsync("_forward recovers on a later attempt once the backend returns", async () => {
+itAsync("_forward recovers a read-only call once the backend returns", async () => {
   const proxy = newProxy();
   proxy._startBackendMonitor = () => {};
   proxy._backendReady = true;
@@ -195,9 +197,43 @@ itAsync("_forward recovers on a later attempt once the backend returns", async (
     return true;
   };
 
-  const res = await proxy._forward({ method: "tools/call", id: 7, params: {} });
+  const res = await proxy._forward({
+    method: "tools/call", id: 7, params: { name: "akb_get", arguments: {} },
+  });
   assert.equal(res.result.ok, true, "second attempt succeeds");
   assert.equal(calls, 2);
+});
+
+itAsync("_forward never replays a mutating tool after an ambiguous failure", async () => {
+  const proxy = newProxy();
+  proxy._startBackendMonitor = () => {};
+  proxy._backendReady = true;
+  let calls = 0;
+  proxy._rpc = async () => {
+    calls++;
+    throw new Error("Request timeout");
+  };
+
+  await assert.rejects(() => proxy._forward({
+    method: "tools/call", id: 8, params: { name: "akb_put", arguments: {} },
+  }));
+  assert.equal(calls, 1, "ambiguous mutation must never be replayed");
+});
+
+itAsync("_forward defaults unknown tools to non-retryable", async () => {
+  const proxy = newProxy();
+  proxy._startBackendMonitor = () => {};
+  proxy._backendReady = true;
+  let calls = 0;
+  proxy._rpc = async () => {
+    calls++;
+    throw new Error("ECONNRESET");
+  };
+
+  await assert.rejects(() => proxy._forward({
+    method: "tools/call", id: 9, params: { name: "akb_future_tool", arguments: {} },
+  }));
+  assert.equal(calls, 1);
 });
 
 // ── Summary ──────────────────────────────────────────────────────────
