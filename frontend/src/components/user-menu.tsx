@@ -92,9 +92,15 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
         >
           {initial}
         </span>
-        <span className="hidden sm:inline text-[13px] font-medium">
+        {/* Cap the label so long display names truncate instead of wrapping
+            the header onto a second line; full name stays reachable via the
+            overflow tooltip and the trigger's aria-label. */}
+        <TooltipText
+          as="span"
+          className="hidden sm:inline max-w-[10rem] truncate text-[13px] font-medium"
+        >
           {label}
-        </span>
+        </TooltipText>
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
         <DropdownMenu.Content
