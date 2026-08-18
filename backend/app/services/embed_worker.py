@@ -65,17 +65,20 @@ async def _claim_batch(conn) -> list[dict]:
              WHERE vector_indexed_at IS NULL
                AND (vector_next_attempt_at IS NULL OR vector_next_attempt_at <= NOW())
                AND vector_retry_count < $2
+               AND vector_abandoned_at IS NULL
              ORDER BY created_at DESC, id
              LIMIT $1
              FOR UPDATE SKIP LOCKED
         )
         UPDATE chunks c
-           SET vector_next_attempt_at = NOW() + INTERVAL '10 minutes'
+           SET vector_next_attempt_at = NOW() + INTERVAL '10 minutes',
+               vector_claimed_at = NOW(),
+               vector_retry_count = vector_retry_count + 1
           FROM pending p
          WHERE c.id = p.id
         RETURNING c.id, c.source_type, c.source_id, c.vault_id,
                   c.content, c.section_path, c.chunk_index,
-                  c.vector_retry_count
+                  c.vector_retry_count, c.vector_claimed_at
         """,
         _batch_size(), MAX_RETRIES,
     )
@@ -87,32 +90,59 @@ async def _mark_success(conn, chunk_id) -> None:
         """
         UPDATE chunks
            SET vector_indexed_at = NOW(),
+               vector_retry_count = 0,
                vector_last_error = NULL,
-               vector_next_attempt_at = NULL
+               vector_next_attempt_at = NULL,
+               vector_claimed_at = NULL,
+               vector_abandoned_at = NULL
          WHERE id = $1
         """,
         chunk_id,
     )
 
 
-async def _mark_failure(pool, chunk_id, retry_count: int, error: str) -> None:
+async def _mark_failure(pool, chunk_id, attempt_count: int, error: str) -> None:
     """Failures own a tiny transaction of their own. Done outside the
     upsert path so a single chunk's failure can't poison the rest of
     the batch."""
-    delay = next_attempt_delay(retry_count)
-    next_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+    terminal = attempt_count >= MAX_RETRIES
+    delay = next_attempt_delay(max(0, attempt_count - 1))
+    next_at = None if terminal else datetime.now(timezone.utc) + timedelta(seconds=delay)
     async with pool.acquire() as c:
         async with c.transaction():
             await c.execute(
                 """
                 UPDATE chunks
-                   SET vector_retry_count = vector_retry_count + 1,
-                       vector_last_error = $2,
-                       vector_next_attempt_at = $3
+                   SET vector_last_error = $2,
+                       vector_next_attempt_at = $3,
+                       vector_claimed_at = NULL,
+                       vector_abandoned_at = CASE WHEN $4 THEN NOW() ELSE NULL END
                  WHERE id = $1
                 """,
-                chunk_id, (error or "")[:500], next_at,
+                chunk_id, (error or "")[:500], next_at, terminal,
             )
+
+
+async def _release_unattempted(pool, rows: list[dict]) -> None:
+    """Return claim budget for rows skipped after a batch-wide outage."""
+    if not rows:
+        return
+    claimed_at = rows[0]["vector_claimed_at"]
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE chunks
+               SET vector_retry_count = GREATEST(vector_retry_count - 1, 0),
+                   vector_next_attempt_at = NOW(),
+                   vector_claimed_at = NULL
+             WHERE id = ANY($1::uuid[])
+               AND vector_indexed_at IS NULL
+               AND vector_abandoned_at IS NULL
+               AND vector_claimed_at = $2
+            """,
+            [row["id"] for row in rows],
+            claimed_at,
+        )
 
 
 async def _process_once() -> int:
@@ -202,7 +232,7 @@ async def _process_once() -> int:
     # longer leave the vector store with an unmarked row.
     store = get_vector_store()
     succeeded = 0
-    for row, dense in zip(batch, embeddings_padded):
+    for position, (row, dense) in enumerate(zip(batch, embeddings_padded)):
         content = row["content"] or ""
         try:
             sparse_idx, sparse_vals = await sparse_encoder.encode_document(content)
@@ -271,6 +301,7 @@ async def _process_once() -> int:
             # so we don't hammer it. Remaining rows already have
             # next_attempt_at set by _claim_batch.
             logger.info("vector store unavailable; backing off batch: %s", e)
+            await _release_unattempted(pool, batch[position + 1:])
             return native_processed + succeeded
         except Exception as e:  # noqa: BLE001
             await _mark_failure(
@@ -318,28 +349,29 @@ async def pending_stats(vault_id=None) -> dict:
             chunk_row = await conn.fetchrow(
                 """
                 SELECT
-                    COUNT(*) FILTER (WHERE vector_indexed_at IS NULL)                                          AS pending,
+                    COUNT(*) FILTER (WHERE vector_indexed_at IS NULL AND vector_abandoned_at IS NULL)          AS pending,
                     COUNT(*) FILTER (WHERE vector_indexed_at IS NULL
-                                     AND vector_retry_count > 0 AND vector_retry_count < $1)                    AS retrying,
-                    COUNT(*) FILTER (WHERE vector_indexed_at IS NULL AND vector_retry_count >= $1)             AS abandoned,
+                                     AND vector_abandoned_at IS NULL
+                                     AND vector_retry_count > 0)                                                AS retrying,
+                    COUNT(*) FILTER (WHERE vector_indexed_at IS NULL AND vector_abandoned_at IS NOT NULL)       AS abandoned,
                     COUNT(*) FILTER (WHERE vector_indexed_at IS NOT NULL)                                       AS indexed
                   FROM chunks
                 """,
-                MAX_RETRIES,
             )
         else:
             chunk_row = await conn.fetchrow(
                 """
                 SELECT
-                    COUNT(*) FILTER (WHERE vector_indexed_at IS NULL)                                          AS pending,
+                    COUNT(*) FILTER (WHERE vector_indexed_at IS NULL AND vector_abandoned_at IS NULL)          AS pending,
                     COUNT(*) FILTER (WHERE vector_indexed_at IS NULL
-                                     AND vector_retry_count > 0 AND vector_retry_count < $1)                    AS retrying,
-                    COUNT(*) FILTER (WHERE vector_indexed_at IS NULL AND vector_retry_count >= $1)             AS abandoned,
+                                     AND vector_abandoned_at IS NULL
+                                     AND vector_retry_count > 0)                                                AS retrying,
+                    COUNT(*) FILTER (WHERE vector_indexed_at IS NULL AND vector_abandoned_at IS NOT NULL)       AS abandoned,
                     COUNT(*) FILTER (WHERE vector_indexed_at IS NOT NULL)                                       AS indexed
                   FROM chunks
-                 WHERE vault_id = $2
+                 WHERE vault_id = $1
                 """,
-                MAX_RETRIES, vault_id,
+                vault_id,
             )
 
     stats = {

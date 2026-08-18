@@ -1157,8 +1157,13 @@ async def index_file_metadata(
     )
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await write_source_chunks(
-            conn, "file", file_id,
-            vault_id=vault_id,
-            chunks=[chunk],
-        )
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                f"akb:index:file:{file_id}",
+            )
+            await write_source_chunks(
+                conn, "file", file_id,
+                vault_id=vault_id,
+                chunks=[chunk],
+            )

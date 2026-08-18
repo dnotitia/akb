@@ -51,15 +51,19 @@ async def _claim_delete_batch(conn) -> list[dict]:
              WHERE processed_at IS NULL
                AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
                AND retry_count < $2
+               AND abandoned_at IS NULL
              ORDER BY next_attempt_at NULLS FIRST, id
              LIMIT $1
              FOR UPDATE SKIP LOCKED
         )
         UPDATE vector_delete_outbox o
-           SET next_attempt_at = NOW() + INTERVAL '10 minutes'
+           SET next_attempt_at = NOW() + INTERVAL '10 minutes',
+               claimed_at = NOW(),
+               retry_count = retry_count + 1
           FROM pending p
          WHERE o.id = p.id
-        RETURNING o.id, o.chunk_id, o.source_type, o.source_id, o.retry_count
+        RETURNING o.id, o.chunk_id, o.source_type, o.source_id,
+                  o.retry_count, o.claimed_at
         """,
         BATCH_SIZE, MAX_RETRIES,
     )
@@ -68,24 +72,51 @@ async def _claim_delete_batch(conn) -> list[dict]:
 
 async def _mark_delete_success(conn, outbox_id) -> None:
     await conn.execute(
-        "UPDATE vector_delete_outbox SET processed_at = NOW(), last_error = NULL WHERE id = $1",
+        """
+        UPDATE vector_delete_outbox
+           SET processed_at = NOW(), retry_count = 0, last_error = NULL,
+               next_attempt_at = NULL, claimed_at = NULL, abandoned_at = NULL
+         WHERE id = $1
+        """,
         outbox_id,
     )
 
 
-async def _mark_delete_failure(conn, outbox_id, retry_count: int, error: str) -> None:
-    delay = next_attempt_delay(retry_count)
-    next_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+async def _mark_delete_failure(conn, outbox_id, attempt_count: int, error: str) -> None:
+    terminal = attempt_count >= MAX_RETRIES
+    delay = next_attempt_delay(max(0, attempt_count - 1))
+    next_at = None if terminal else datetime.now(timezone.utc) + timedelta(seconds=delay)
     await conn.execute(
         """
         UPDATE vector_delete_outbox
-           SET retry_count = retry_count + 1,
-               last_error = $2,
-               next_attempt_at = $3
+           SET last_error = $2,
+               next_attempt_at = $3,
+               claimed_at = NULL,
+               abandoned_at = CASE WHEN $4 THEN NOW() ELSE NULL END
          WHERE id = $1
         """,
-        outbox_id, (error or "")[:500], next_at,
+        outbox_id, (error or "")[:500], next_at, terminal,
     )
+
+
+async def _release_unattempted(pool, rows: list[dict]) -> None:
+    if not rows:
+        return
+    claimed_at = rows[0]["claimed_at"]
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE vector_delete_outbox
+               SET retry_count = GREATEST(retry_count - 1, 0),
+                   next_attempt_at = NOW(), claimed_at = NULL
+             WHERE id = ANY($1::bigint[])
+               AND processed_at IS NULL
+               AND abandoned_at IS NULL
+               AND claimed_at = $2
+            """,
+            [row["id"] for row in rows],
+            claimed_at,
+        )
 
 
 async def _process_deletes_once() -> int:
@@ -104,7 +135,7 @@ async def _process_deletes_once() -> int:
     # outbox mark — outer rollback can no longer leave a dangling
     # vector_index row.
     succeeded = 0
-    for row in batch:
+    for position, row in enumerate(batch):
         try:
             async with pool.acquire() as conn:
                 async with conn.transaction():
@@ -114,6 +145,7 @@ async def _process_deletes_once() -> int:
             async with pool.acquire() as conn:
                 async with conn.transaction():
                     await _mark_delete_failure(conn, row["id"], row["retry_count"], str(e))
+            await _release_unattempted(pool, batch[position + 1:])
             return succeeded
         except Exception as e:  # noqa: BLE001
             async with pool.acquire() as conn:
@@ -194,7 +226,7 @@ async def _sweep_outbox_once() -> int:
 
 # ── Abandoned-chunk reaper ────────────────────────────────────────
 
-# A chunk is "abandoned" once vector_retry_count has hit MAX_RETRIES:
+# A chunk is "abandoned" once vector_abandoned_at is stamped:
 # the indexing worker has stopped picking it and it will sit in
 # `vector_indexed_at IS NULL` forever. Operators see them as a stuck
 # `indexing N` counter on the UI. After this grace window we delete
@@ -210,8 +242,7 @@ _last_reap_at: float = 0.0
 
 
 async def _reap_abandoned_chunks_once() -> int:
-    """Delete chunks whose `vector_retry_count >= MAX_RETRIES` and whose
-    last retry attempt was more than REAP_GRACE_INTERVAL ago. Enqueues
+    """Delete chunks abandoned for more than REAP_GRACE_INTERVAL. Enqueues
     them to `vector_delete_outbox` so this worker's normal delete pass
     removes them from the vector store too. Rate-limited."""
     global _last_reap_at
@@ -227,13 +258,10 @@ async def _reap_abandoned_chunks_once() -> int:
                 """
                 WITH abandoned AS (
                     SELECT id, source_type, source_id
-                      FROM chunks
+                     FROM chunks
                      WHERE vector_indexed_at IS NULL
-                       AND vector_retry_count >= $1
-                       AND (
-                           vector_next_attempt_at IS NULL
-                        OR vector_next_attempt_at < NOW() - $2::interval
-                       )
+                       AND vector_abandoned_at IS NOT NULL
+                       AND vector_abandoned_at < NOW() - $1::interval
                      FOR UPDATE SKIP LOCKED
                 ),
                 enqueued AS (
@@ -260,7 +288,7 @@ async def _reap_abandoned_chunks_once() -> int:
                 )
                 SELECT COUNT(*) FROM deleted
                 """,
-                MAX_RETRIES, REAP_GRACE_INTERVAL,
+                REAP_GRACE_INTERVAL,
             )
     n = int(n or 0)
     if n:
@@ -309,11 +337,10 @@ async def delete_outbox_stats() -> dict:
         row = await conn.fetchrow(
             """
             SELECT
-                COUNT(*) FILTER (WHERE processed_at IS NULL AND retry_count < $1)     AS pending,
-                COUNT(*) FILTER (WHERE processed_at IS NULL AND retry_count >= $1)    AS abandoned
+                COUNT(*) FILTER (WHERE processed_at IS NULL AND abandoned_at IS NULL)     AS pending,
+                COUNT(*) FILTER (WHERE processed_at IS NULL AND abandoned_at IS NOT NULL) AS abandoned
               FROM vector_delete_outbox
-            """,
-            MAX_RETRIES,
+            """
         )
     return {
         "pending":   int(row["pending"]),

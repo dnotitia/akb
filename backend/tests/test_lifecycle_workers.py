@@ -50,6 +50,7 @@ def _stub_workers(monkeypatch, lifecycle, started: list[str]) -> None:
     monkeypatch.setattr(lifecycle.external_git_poller, "start", rec("external_git_poller"))
     monkeypatch.setattr(lifecycle.metadata_worker, "start", rec("metadata_worker"))
     monkeypatch.setattr(lifecycle.vault_backfill, "start", rec("vault_backfill"))
+    monkeypatch.setattr(lifecycle.queue_rescuer, "start", rec("queue_rescuer"))
     monkeypatch.setattr(lifecycle.sparse_encoder, "start_tokenizer_pool", rec("tokenizer_pool"))
     monkeypatch.setattr(lifecycle.sparse_encoder, "start_stats_refresher", rec("stats_refresher"))
     monkeypatch.setattr(lifecycle.write_lane, "start_commit_pool", rec("git_commit_pool"))
@@ -68,6 +69,7 @@ def _settings(
     external_git gate."""
     return types.SimpleNamespace(
         external_git_enabled=external_git_enabled,
+        tokenizer_processes=2,
         bm25_recompute_interval_secs=3600,
         s3_endpoint_url=None,
         llm_base_url="http://llm.local/v1" if llm_configured else None,
@@ -103,6 +105,31 @@ def test_start_workers_skips_poller_when_disabled(monkeypatch, tmp_path):
     # … but the always-on workers still start (the gate is surgical).
     assert "embed_worker" in started
     assert "delete_worker" in started
+
+
+def test_worker_role_excludes_api_local_in_memory_sinks(monkeypatch, tmp_path):
+    lifecycle = _import_lifecycle(monkeypatch, tmp_path)
+    started: list[str] = []
+    _stub_workers(monkeypatch, lifecycle, started)
+    monkeypatch.setattr(lifecycle, "settings", _settings(external_git_enabled=False))
+
+    lifecycle.start_workers(include_api_local=False)
+
+    assert "embed_worker" in started
+    assert "tool_usage_maintenance" not in started
+
+
+def test_api_role_starts_no_durable_queue_consumer(monkeypatch, tmp_path):
+    lifecycle = _import_lifecycle(monkeypatch, tmp_path)
+    started: list[str] = []
+    _stub_workers(monkeypatch, lifecycle, started)
+    monkeypatch.setattr(lifecycle, "settings", _settings(external_git_enabled=False))
+
+    lifecycle.start_api_runtime()
+
+    assert "tool_usage_maintenance" in started
+    assert "embed_worker" not in started
+    assert "delete_worker" not in started
 
 
 def test_start_workers_starts_metadata_worker_when_enabled_and_llm(monkeypatch, tmp_path):

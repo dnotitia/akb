@@ -45,6 +45,26 @@ inside the Postgres pod. Other options:
 The `internal/` overlay shows the Qdrant pattern for the production
 cluster.
 
+## Backend process topology
+
+The base Deployment keeps one `Recreate` Pod and one RWO Git PVC, but runs two
+containers from the same backend image:
+
+- `backend` uses `AKB_PROCESS_ROLE=api` and serves FastAPI/MCP. It owns only
+  serving-process sinks and one query-tokenizer child.
+- `worker` runs `python -m app.worker_main` with
+  `AKB_PROCESS_ROLE=worker`. It owns durable queue consumers, external-Git
+  reconciliation, and periodic maintenance. Its exec probe checks an
+  event-loop heartbeat.
+
+This separation prevents a worker stall from blocking the serving loop. It is
+not the final horizontally scalable topology: both containers still mount the
+RWO PVC because synchronous Bare-Git reads/writes remain in the API path.
+Keep `replicas: 1`, `strategy: Recreate`, and the API PVC mount until the
+single-writer gitd, MCP session, audit/throttle, and drift-recovery gates in
+[`docs/design/accepted/2026-08-18-worker-runtime-safety-foundation`](../../docs/design/accepted/2026-08-18-worker-runtime-safety-foundation/README.md)
+are complete.
+
 For a standalone installation whose canonical human-auth mode is `sso`, use
 [`standalone-sso/README.md`](standalone-sso/README.md). That overlay owns its
 Keycloak lifecycle and dedicated database. Do not apply it to a managed tenant

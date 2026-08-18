@@ -82,6 +82,11 @@ spec:
             - name: local-session-keys
               mountPath: /etc/akb/local-session
               $patch: delete
+        - name: worker
+          volumeMounts:
+            - name: local-session-keys
+              mountPath: /etc/akb/local-session
+              $patch: delete
       volumes:
         - name: local-session-keys
           $patch: delete

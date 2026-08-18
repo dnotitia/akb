@@ -19,6 +19,9 @@ import logging
 import time
 from typing import Awaitable, Callable, Optional
 
+
+_RUNNERS: list["BackfillRunner"] = []
+
 # Retry backoff shared by every backfill worker. Index is retry_count (0-based).
 # After MAX_RETRIES the row stays in 'abandoned' until operator intervention.
 BACKOFF_SECS: list[int] = [60, 300, 900, 1800, 3600, 7200, 14400, 21600]
@@ -75,6 +78,33 @@ class BackfillRunner:
         self._inflight: set[asyncio.Task] = set()
         self._stop_event: Optional[asyncio.Event] = None
         self._log = logging.getLogger(f"akb.{name}")
+        _RUNNERS.append(self)
+
+    def request_stop(self) -> None:
+        """Stop claiming new work without waiting for the current iteration."""
+        if self._stop_event is not None:
+            self._stop_event.set()
+
+    def snapshot(self) -> dict:
+        return {
+            "name": self._name,
+            "loop_tasks": len([task for task in self._tasks if not task.done()]),
+            "inflight": len([task for task in self._inflight if not task.done()]),
+            "abandoned": self.abandoned(),
+            "stop_requested": bool(
+                self._stop_event is not None and self._stop_event.is_set()
+            ),
+        }
+
+    def is_running(self) -> bool:
+        """Return whether this runner currently owns a live loop task."""
+        return any(not task.done() for task in self._tasks)
+
+    def configure_idle_secs(self, idle_secs: int) -> None:
+        """Set the idle cadence before starting or restarting the runner."""
+        if self.is_running():
+            return
+        self._idle_secs = idle_secs
 
     def abandoned(self) -> int:
         """Iterations that ignored cancellation and outlived a `stop()`.
@@ -87,7 +117,7 @@ class BackfillRunner:
         return len([t for t in self._inflight if not t.done()])
 
     def start(self) -> None:
-        if self._tasks and any(not t.done() for t in self._tasks):
+        if self.is_running():
             return
         # A previous `stop()` may have abandoned an iteration that ignored
         # cancellation. Starting a second loop over the same queue while that
@@ -122,8 +152,7 @@ class BackfillRunner:
         `_inflight` rather than forgotten, so `start()` can refuse to run a
         second loop over the same queue.
         """
-        if self._stop_event:
-            self._stop_event.set()
+        self.request_stop()
         deadline = time.monotonic() + max(0.0, timeout)
 
         await self._join(self._tasks, deadline, "loop task")
@@ -207,3 +236,14 @@ class BackfillRunner:
                 await asyncio.sleep(0)
 
         log.info("%s loop stopped", task_name)
+
+
+def request_stop_all() -> None:
+    """Broadcast stop before lifecycle starts waiting on any one worker."""
+    for runner in tuple(_RUNNERS):
+        runner.request_stop()
+
+
+def runner_snapshots() -> list[dict]:
+    """Operator-facing state for every runner constructed in this process."""
+    return [runner.snapshot() for runner in _RUNNERS]

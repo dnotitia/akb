@@ -66,17 +66,20 @@ async def _claim_batch(conn) -> list[dict]:
                AND llm_metadata_at IS NULL
                AND (llm_next_attempt_at IS NULL OR llm_next_attempt_at <= NOW())
                AND llm_retry_count < $2
+               AND llm_abandoned_at IS NULL
              ORDER BY llm_next_attempt_at NULLS FIRST, id
              LIMIT $1
              FOR UPDATE SKIP LOCKED
         )
         UPDATE documents d
-           SET llm_next_attempt_at = NOW() + ($3 || ' seconds')::interval
+           SET llm_next_attempt_at = NOW() + ($3 || ' seconds')::interval,
+               llm_claimed_at = NOW(),
+               llm_retry_count = llm_retry_count + 1
           FROM pending p
          WHERE d.id = p.id
         RETURNING d.id, d.vault_id, d.path, d.external_blob, d.title,
                   d.summary, d.tags, d.doc_type, d.domain,
-                  d.llm_retry_count,
+                  d.llm_retry_count, d.llm_claimed_at,
                   (SELECT name FROM vaults v WHERE v.id = d.vault_id) AS vault_name
         """,
         BATCH_SIZE, MAX_RETRIES, str(settings.external_git_claim_lookahead_secs),
@@ -84,18 +87,27 @@ async def _claim_batch(conn) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-async def _mark_failure(conn, doc_id, retry_count: int, error: str) -> None:
-    delay = next_attempt_delay(retry_count)
-    next_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+async def _mark_failure(
+    conn,
+    doc_id,
+    attempt_count: int,
+    error: str,
+    *,
+    permanent: bool = False,
+) -> None:
+    terminal = permanent or attempt_count >= MAX_RETRIES
+    delay = next_attempt_delay(max(0, attempt_count - 1))
+    next_at = None if terminal else datetime.now(timezone.utc) + timedelta(seconds=delay)
     await conn.execute(
         """
         UPDATE documents
-           SET llm_retry_count     = llm_retry_count + 1,
-               llm_last_error      = $2,
-               llm_next_attempt_at = $3
+           SET llm_last_error      = $2,
+               llm_next_attempt_at = $3,
+               llm_claimed_at      = NULL,
+               llm_abandoned_at    = CASE WHEN $4 THEN NOW() ELSE NULL END
          WHERE id = $1
         """,
-        doc_id, error[:500], next_at,
+        doc_id, error[:500], next_at, terminal,
     )
 
 
@@ -172,10 +184,12 @@ async def _process_once() -> int:
         vault_name = row["vault_name"]
         if not blob_sha or not vault_name:
             # Either field missing means this row can never make progress
-            # — burn retries to MAX in one go so the worker stops picking it.
+            # — mark it terminal without inventing attempts that never ran.
             reason = "no external_blob" if not blob_sha else "vault gone"
             async with pool.acquire() as conn:
-                await _mark_failure(conn, doc_id, MAX_RETRIES - 1, reason)
+                await _mark_failure(
+                    conn, doc_id, row["llm_retry_count"], reason, permanent=True,
+                )
             continue
 
         try:
@@ -186,9 +200,11 @@ async def _process_once() -> int:
             fields = await _resolve_metadata(vault_name, body)
         except LLMPermanentError as e:
             # Deterministic LLM failure — retrying will produce the same
-            # result. Burn straight to MAX so the worker stops picking it.
+            # result. Mark terminal immediately so the worker stops picking it.
             async with pool.acquire() as conn:
-                await _mark_failure(conn, doc_id, MAX_RETRIES - 1, str(e))
+                await _mark_failure(
+                    conn, doc_id, row["llm_retry_count"], str(e), permanent=True,
+                )
             continue
         except (LLMError, RuntimeError, OSError) as e:
             async with pool.acquire() as conn:
@@ -216,7 +232,14 @@ async def _process_once() -> int:
         )
         async with pool.acquire() as conn:
             await conn.execute(
-                "UPDATE documents SET llm_next_attempt_at = NULL WHERE id = $1",
+                """
+                UPDATE documents
+                   SET llm_retry_count = 0,
+                       llm_next_attempt_at = NULL,
+                       llm_claimed_at = NULL,
+                       llm_abandoned_at = NULL
+                 WHERE id = $1
+                """,
                 doc_id,
             )
 
@@ -241,30 +264,33 @@ async def pending_stats(vault_id: "uuid.UUID | None" = None) -> dict:
             row = await conn.fetchrow(
                 """
                 SELECT
-                    COUNT(*) FILTER (WHERE source='external_git' AND llm_metadata_at IS NULL)
+                    COUNT(*) FILTER (WHERE source='external_git' AND llm_metadata_at IS NULL
+                                     AND llm_abandoned_at IS NULL)
                                                                                       AS pending,
                     COUNT(*) FILTER (WHERE source='external_git' AND llm_metadata_at IS NULL
-                                     AND llm_retry_count > 0 AND llm_retry_count < $1) AS retrying,
+                                     AND llm_abandoned_at IS NULL
+                                     AND llm_retry_count > 0)                          AS retrying,
                     COUNT(*) FILTER (WHERE source='external_git' AND llm_metadata_at IS NULL
-                                     AND llm_retry_count >= $1)                        AS abandoned
+                                     AND llm_abandoned_at IS NOT NULL)                 AS abandoned
                   FROM documents
-                """,
-                MAX_RETRIES,
+                """
             )
         else:
             row = await conn.fetchrow(
                 """
                 SELECT
-                    COUNT(*) FILTER (WHERE source='external_git' AND llm_metadata_at IS NULL)
+                    COUNT(*) FILTER (WHERE source='external_git' AND llm_metadata_at IS NULL
+                                     AND llm_abandoned_at IS NULL)
                                                                                       AS pending,
                     COUNT(*) FILTER (WHERE source='external_git' AND llm_metadata_at IS NULL
-                                     AND llm_retry_count > 0 AND llm_retry_count < $1) AS retrying,
+                                     AND llm_abandoned_at IS NULL
+                                     AND llm_retry_count > 0)                          AS retrying,
                     COUNT(*) FILTER (WHERE source='external_git' AND llm_metadata_at IS NULL
-                                     AND llm_retry_count >= $1)                        AS abandoned
+                                     AND llm_abandoned_at IS NOT NULL)                 AS abandoned
                   FROM documents
-                 WHERE vault_id = $2
+                 WHERE vault_id = $1
                 """,
-                MAX_RETRIES, vault_id,
+                vault_id,
             )
     return {
         "pending":   int(row["pending"]),

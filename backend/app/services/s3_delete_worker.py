@@ -81,7 +81,8 @@ async def cancel_delete(conn, outbox_id: int) -> None:
     await conn.execute(
         """
         UPDATE s3_delete_outbox
-           SET processed_at = NOW(), last_error = NULL
+           SET processed_at = NOW(), retry_count = 0, last_error = NULL,
+               next_attempt_at = NULL, claimed_at = NULL, abandoned_at = NULL
          WHERE id = $1 AND processed_at IS NULL
         """,
         outbox_id,
@@ -100,15 +101,18 @@ async def _claim_batch(conn, limit: int = BATCH_SIZE) -> list[dict]:
              WHERE processed_at IS NULL
                AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
                AND retry_count < $2
+               AND abandoned_at IS NULL
              ORDER BY next_attempt_at NULLS FIRST, id
              LIMIT $1
              FOR UPDATE SKIP LOCKED
         )
         UPDATE s3_delete_outbox o
-           SET next_attempt_at = NOW() + INTERVAL '10 minutes'
+           SET next_attempt_at = NOW() + INTERVAL '10 minutes',
+               claimed_at = NOW(),
+               retry_count = retry_count + 1
           FROM pending p
          WHERE o.id = p.id
-        RETURNING o.id, o.s3_key, o.retry_count
+        RETURNING o.id, o.s3_key, o.retry_count, o.claimed_at
         """,
         limit, MAX_RETRIES,
     )
@@ -117,23 +121,30 @@ async def _claim_batch(conn, limit: int = BATCH_SIZE) -> list[dict]:
 
 async def _mark_success(conn, outbox_id) -> None:
     await conn.execute(
-        "UPDATE s3_delete_outbox SET processed_at = NOW(), last_error = NULL WHERE id = $1",
+        """
+        UPDATE s3_delete_outbox
+           SET processed_at = NOW(), retry_count = 0, last_error = NULL,
+               next_attempt_at = NULL, claimed_at = NULL, abandoned_at = NULL
+         WHERE id = $1
+        """,
         outbox_id,
     )
 
 
-async def _mark_failure(conn, outbox_id, retry_count: int, error: str) -> None:
-    delay = next_attempt_delay(retry_count)
-    next_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+async def _mark_failure(conn, outbox_id, attempt_count: int, error: str) -> None:
+    terminal = attempt_count >= MAX_RETRIES
+    delay = next_attempt_delay(max(0, attempt_count - 1))
+    next_at = None if terminal else datetime.now(timezone.utc) + timedelta(seconds=delay)
     await conn.execute(
         """
         UPDATE s3_delete_outbox
-           SET retry_count = retry_count + 1,
-               last_error = $2,
-               next_attempt_at = $3
+           SET last_error = $2,
+               next_attempt_at = $3,
+               claimed_at = NULL,
+               abandoned_at = CASE WHEN $4 THEN NOW() ELSE NULL END
          WHERE id = $1
         """,
-        outbox_id, (error or "")[:500], next_at,
+        outbox_id, (error or "")[:500], next_at, terminal,
     )
 
 
@@ -141,8 +152,10 @@ async def _release_claim(conn, outbox_id, *, delay_seconds: int = 1) -> None:
     await conn.execute(
         """
         UPDATE s3_delete_outbox
-           SET next_attempt_at = NOW() + ($2 * INTERVAL '1 second')
-         WHERE id = $1 AND processed_at IS NULL
+           SET retry_count = GREATEST(retry_count - 1, 0),
+               next_attempt_at = NOW() + ($2 * INTERVAL '1 second'),
+               claimed_at = NULL
+         WHERE id = $1 AND processed_at IS NULL AND abandoned_at IS NULL
         """,
         outbox_id,
         delay_seconds,
@@ -308,11 +321,10 @@ async def pending_stats() -> dict:
         row = await conn.fetchrow(
             """
             SELECT
-                COUNT(*) FILTER (WHERE processed_at IS NULL AND retry_count < $1)  AS pending,
-                COUNT(*) FILTER (WHERE processed_at IS NULL AND retry_count >= $1) AS abandoned
+                COUNT(*) FILTER (WHERE processed_at IS NULL AND abandoned_at IS NULL)     AS pending,
+                COUNT(*) FILTER (WHERE processed_at IS NULL AND abandoned_at IS NOT NULL) AS abandoned
               FROM s3_delete_outbox
-            """,
-            MAX_RETRIES,
+            """
         )
     return {
         "pending":   int(row["pending"]),

@@ -11,9 +11,12 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from git import Repo
 
 from app.services.external_git_service import ExternalGitService
 from app.services.git_service import GitService
@@ -68,6 +71,30 @@ def _block_chdir(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(os, "chdir", fail_chdir)
 
 
+def _direct_cat_file_children() -> set[int]:
+    """Return this pytest process's persistent GitPython cat-file children."""
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,command="],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except FileNotFoundError, subprocess.SubprocessError:
+        pytest.skip("process-table inspection is unavailable")
+
+    children: set[int] = set()
+    for line in result.stdout.splitlines():
+        fields = line.strip().split(maxsplit=2)
+        if len(fields) != 3:
+            continue
+        pid, parent_pid, command = fields
+        if parent_pid == str(os.getpid()) and command.startswith("git cat-file --batch"):
+            children.add(int(pid))
+    return children
+
+
 def test_commit_file_creates_initial_commit(git_service: GitService) -> None:
     name = f"test_vault_{uuid.uuid4().hex[:8]}"
     git_service.init_vault(name)
@@ -84,6 +111,52 @@ def test_commit_file_creates_initial_commit(git_service: GitService) -> None:
     assert len(sha) == 40
     assert git_service.read_file(name, "first.md") == "first\n"
     assert _vault_commit_count(git_service, name) == 1
+
+
+def test_read_file_closes_repo_while_caller_still_references_it(
+    git_service: GitService,
+    vault: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hot read path must not depend on ``Repo.__del__`` or cyclic GC."""
+    bare_repo = Repo(str(git_service._bare_path(vault)))
+    original_close = bare_repo.close
+    close_calls = 0
+
+    def close() -> None:
+        nonlocal close_calls
+        close_calls += 1
+        original_close()
+
+    monkeypatch.setattr(bare_repo, "close", close)
+    monkeypatch.setattr(git_service, "_get_repo", lambda _vault_name: bare_repo)
+
+    assert git_service.read_file(vault, "seed.md") == "seed\n"
+    assert close_calls == 1
+
+
+def test_parallel_reads_leave_no_cat_file_children(
+    git_service: GitService,
+    vault: str,
+) -> None:
+    """Concurrent reads release GitPython's two persistent helper processes."""
+    before = _direct_cat_file_children()
+
+    with ThreadPoolExecutor(max_workers=32) as executor:
+        results = list(
+            executor.map(
+                lambda _index: git_service.read_file(vault, "seed.md"),
+                range(96),
+            )
+        )
+
+    assert results == ["seed\n"] * 96
+    deadline = time.monotonic() + 2
+    after = _direct_cat_file_children()
+    while after - before and time.monotonic() < deadline:
+        time.sleep(0.02)
+        after = _direct_cat_file_children()
+    assert after - before == set()
 
 
 def test_commit_file_existing_worktree_preserves_author_and_message(git_service: GitService, vault: str) -> None:
