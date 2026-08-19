@@ -14,7 +14,13 @@ import {
   Users,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { getDocument, getRecent, getVaultActivity, getVaultInfo } from "@/lib/api";
+import {
+  getDocument,
+  getRecent,
+  getSkillTemplate,
+  getVaultActivity,
+  getVaultInfo,
+} from "@/lib/api";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { recentIcon, recentTone } from "@/lib/recent";
 import { Alert } from "@/components/ui/alert";
@@ -167,10 +173,27 @@ export default function VaultPage() {
     enabled: !!name,
   });
   const skillExists = !skillQuery.isError && !!skillQuery.data;
-  const skillLineCount = skillExists
-    ? (skillQuery.data!.content || "").split("\n").length
-    : undefined;
   const about = skillExists ? aboutExcerpt(skillQuery.data!.content) : "";
+
+  // Every normal vault carries the guide, so "defined?" says nothing — the chip
+  // reports whether anyone has written it yet. The seed body IS the template
+  // with {vault} substituted, so compare against the template endpoint (one
+  // fetch for the whole session: the seed is a build-time constant).
+  const templateQuery = useQuery({
+    queryKey: ["skill-template"],
+    queryFn: getSkillTemplate,
+    staleTime: Infinity,
+    enabled: skillExists,
+  });
+  // Trim both sides: the stored body comes back parsed out of the .md file and
+  // python-frontmatter strips surrounding whitespace on load, so an untouched
+  // guide is the template minus its trailing newline. `undefined` until the
+  // template resolves — the chip renders no state rather than a wrong one.
+  const skillCustomized =
+    skillExists && templateQuery.data != null
+      ? (skillQuery.data!.content || "").trim() !==
+        templateQuery.data.replaceAll("{vault}", name!).trim()
+      : undefined;
 
   function loadInfo(vault: string, alive: () => boolean = () => true) {
     getVaultInfo(vault)
@@ -345,8 +368,15 @@ export default function VaultPage() {
           publicAccess={info?.public_access}
         />
         <IndexingBadge pending={vaultPending} abandoned={vaultAbandoned} />
-        {!skillQuery.isLoading && (
-          <SkillStatusChip vault={name!} defined={skillExists} lineCount={skillLineCount} />
+        {/* Mirror vaults are excluded from the guide seed server-side, so the
+            chip would advertise something that cannot exist there. Withheld
+            until `info` resolves for the same reason — no guessing. */}
+        {!skillQuery.isLoading && info && !info.is_external_git && (
+          <SkillStatusChip
+            vault={name!}
+            defined={skillExists}
+            customized={skillCustomized}
+          />
         )}
       </div>
 
@@ -399,10 +429,10 @@ export default function VaultPage() {
           <div className="flex items-baseline justify-between gap-3 mb-1.5">
             <span className="coord-ink">About this vault</span>
             <Link
-              to={`/vault/${name}/doc/${encodeURIComponent("overview/vault-skill.md")}`}
+              to={`/vault/${name}/settings#skill`}
               className="coord shrink-0 inline-flex items-center min-h-[28px] hover:text-link transition-colors rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
             >
-              Vault skill ↗
+              Vault guide ↗
             </Link>
           </div>
           <p className="text-sm leading-relaxed text-foreground-muted line-clamp-2">
@@ -418,6 +448,7 @@ export default function VaultPage() {
           name={name!}
           canWrite={canWrite}
           skillDefined={skillExists}
+          isMirror={!!info.is_external_git}
         />
       ) : (
       <>
@@ -742,10 +773,12 @@ function VaultEmptyOnboarding({
   name,
   canWrite,
   skillDefined,
+  isMirror,
 }: {
   name: string;
   canWrite: boolean;
   skillDefined: boolean;
+  isMirror: boolean;
 }) {
   return (
     <div className="mt-10">
@@ -774,16 +807,20 @@ function VaultEmptyOnboarding({
       />
       {canWrite && (
         <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <OnboardStep
-            icon={BookText}
-            to={
-              skillDefined
-                ? `/vault/${name}/doc/${encodeURIComponent("overview/vault-skill.md")}`
-                : `/vault/${name}/doc/new`
-            }
-            title={skillDefined ? "Edit the vault skill" : "Describe this vault"}
-            body="Tell agents what this vault is for and how to use it."
-          />
+          {/* Mirror vaults carry no guide, so this step has no destination
+              there — only the agent step remains. */}
+          {!isMirror && (
+            <OnboardStep
+              icon={BookText}
+              to={
+                skillDefined
+                  ? `/vault/${name}/settings#skill`
+                  : `/vault/${name}/doc/new`
+              }
+              title={skillDefined ? "Edit the vault guide" : "Describe this vault"}
+              body="Tell agents what this vault is for and how to use it."
+            />
+          )}
           <OnboardStep
             icon={Plug}
             to="/settings?tab=tokens"

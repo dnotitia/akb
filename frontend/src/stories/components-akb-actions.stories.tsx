@@ -152,7 +152,9 @@ export const SkillEntryPoints: Story = {
       <Panel>
         <PanelHeader label="Skill status chips" />
         <div className="flex flex-wrap items-center gap-3 p-5">
-          <SkillStatusChip vault="akb" defined lineCount={42} />
+          <SkillStatusChip vault="akb" defined customized />
+          <SkillStatusChip vault="akb" defined customized={false} />
+          <SkillStatusChip vault="akb" defined />
           <SkillStatusChip vault="akb" defined={false} />
         </div>
       </Panel>

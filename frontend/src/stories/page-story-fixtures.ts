@@ -385,9 +385,17 @@ export const appLayoutHandlers = [
   defaultVaultListHandler,
 ];
 
+// The vault page compares the stored guide against this to decide its
+// template-vs-customized chip. Left unhandled, the SPA fallback answers with
+// HTML and every guide reads as "customized".
+export const skillTemplateHandler = http.get(`${API}/help/skill-template`, () =>
+  HttpResponse.text("# {vault} Guide\n\n(Describe what this vault is for.)\n"),
+);
+
 export const vaultShellHandlers = [
   ...appLayoutHandlers,
   defaultBrowseHandler,
+  skillTemplateHandler,
 ];
 
 export const activePatTokens = [
