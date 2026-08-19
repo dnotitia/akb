@@ -7,8 +7,6 @@ import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Panel, PanelHeader } from "@/components/ui/panel";
 import { RoleSelect, type MemberLike } from "@/components/role-select";
-import { SkillCreateButton } from "@/components/skill/skill-create-button";
-import { SkillSettingsLink } from "@/components/skill/skill-settings-link";
 import { SkillStatusChip } from "@/components/skill/skill-status-chip";
 import { VaultList, type VaultRow } from "@/components/vault-list";
 
@@ -149,18 +147,6 @@ export const RoleChangeFailure: Story = {
 };
 
 export const SkillEntryPoints: Story = {
-  parameters: {
-    msw: {
-      handlers: [
-        http.get(`${API}/skill/template`, async () =>
-          HttpResponse.text("# {vault} guide\n\nUse durable AKB instructions."),
-        ),
-        http.post(`${API}/documents`, async () =>
-          HttpResponse.json({ ok: true, id: "d-skill" }),
-        ),
-      ],
-    },
-  },
   render: () => (
     <main className="mx-auto max-w-3xl space-y-4 p-6">
       <Panel>
@@ -170,21 +156,9 @@ export const SkillEntryPoints: Story = {
           <SkillStatusChip vault="akb" defined={false} />
         </div>
       </Panel>
-      <Panel>
-        <PanelHeader label="Settings row" />
-        <div className="px-5">
-          <SkillSettingsLink
-            vault="akb"
-            defined
-            updatedAt={new Date(Date.now() - 33 * 60_000).toISOString()}
-          />
-          <SkillSettingsLink vault="research" defined={false} />
-        </div>
-      </Panel>
       <div className="flex items-center gap-3">
-        <SkillCreateButton vault="research" variant="outline" />
         <Button asChild variant="link">
-          <Link to="/vault/akb/doc/overview%2Fvault-skill.md">Open guide</Link>
+          <Link to="/vault/akb/settings#skill">Open guide</Link>
         </Button>
       </div>
     </main>

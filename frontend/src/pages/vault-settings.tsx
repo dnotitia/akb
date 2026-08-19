@@ -1,5 +1,5 @@
 import { type ReactNode, useEffect, useRef, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import {
   AlertTriangle,
   Archive,
@@ -23,7 +23,7 @@ import {
   updateVault,
 } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
-import { SkillSettingsLink } from "@/components/skill/skill-settings-link";
+import { SkillSection } from "@/components/skill/skill-section";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -91,6 +91,7 @@ const PUBLIC_ORDER: PublicAccess[] = ["none", "reader", "writer"];
 export default function VaultSettingsPage() {
   const { name } = useParams<{ name: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
   const { refetchVaults } = useVaultRefresh();
   const [info, setInfo] = useState<VaultInfo | null>(null);
   const [loadError, setLoadError] = useState("");
@@ -112,8 +113,7 @@ export default function VaultSettingsPage() {
     retry: false,
     enabled: !!name,
   });
-  const skillDefined = !skillQuery.isError && !!skillQuery.data;
-  const skillUpdatedAt: string | undefined = skillQuery.data?.updated_at;
+  const skillDoc = skillQuery.isError ? null : skillQuery.data;
 
   function loadInfo(vault: string) {
     setLoadError("");
@@ -137,6 +137,22 @@ export default function VaultSettingsPage() {
     setSavedAt(null);
     loadInfo(name);
   }, [name]);
+
+  // Land on #skill when the canonical-doc redirect (or the vault page's guide
+  // link) sends the browser here. React Router doesn't restore hash targets on
+  // its own, and the section mounts after the doc query resolves — so re-run
+  // once the guide is in hand. Keyed on location.key too so re-clicking the
+  // same in-page hash re-scrolls (mirrors home.tsx).
+  useEffect(() => {
+    const target = location.hash.slice(1);
+    if (target !== "skill") return;
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    requestAnimationFrame(() => {
+      document
+        .getElementById(target)
+        ?.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" });
+    });
+  }, [location.hash, location.key, skillQuery.isLoading]);
 
   // Name the tab/history entry for this page (tab switching + SR orientation).
   useEffect(() => {
@@ -417,10 +433,6 @@ export default function VaultSettingsPage() {
             )}
           </div>
 
-          {!skillQuery.isLoading && (
-            <SkillSettingsLink vault={name!} defined={skillDefined} updatedAt={skillUpdatedAt} />
-          )}
-
           <div>
             <Label id="public-access-label" className="coord-ink mb-1.5 block">
               Public access
@@ -494,6 +506,18 @@ export default function VaultSettingsPage() {
           )}
         </div>
       </section>
+
+      {/* § VAULT GUIDE — the single editing surface for the system-managed
+          skill doc; the document viewer redirects here. */}
+      <SkillSection
+        vault={name}
+        doc={skillDoc}
+        // Hold the skeleton until /info lands too: on a mirror vault the guide
+        // 404s, and without info the section would flash "missing" before the
+        // mirror note replaces it.
+        loading={skillQuery.isLoading || (!info && !loadError)}
+        isMirror={info?.is_external_git}
+      />
 
       {/* § LIFECYCLE — the two non-destructive lifecycle controls grouped into
           one card so the tinted Danger zone below reads as the deliberate

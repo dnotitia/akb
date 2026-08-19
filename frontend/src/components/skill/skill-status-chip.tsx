@@ -9,8 +9,8 @@ interface Props {
 
 export function SkillStatusChip({ vault, defined, lineCount }: Props) {
   // Defined → open the underlying doc directly so users land where they
-  // can read + edit. Undefined → settings, where SkillSettingsLink offers
-  // the Create-from-template button.
+  // can read + edit. Undefined → settings, where the vault-guide section
+  // lives.
   const href = defined
     ? `/vault/${vault}/doc/${encodeURIComponent("overview/vault-skill.md")}`
     : `/vault/${vault}/settings`;
