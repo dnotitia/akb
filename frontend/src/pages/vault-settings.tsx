@@ -24,6 +24,7 @@ import {
 } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { SkillSection } from "@/components/skill/skill-section";
+import { VAULT_SKILL_PATH } from "@/lib/skill";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -108,8 +109,8 @@ export default function VaultSettingsPage() {
   const saveStatusRef = useRef<HTMLSpanElement>(null);
 
   const skillQuery = useQuery({
-    queryKey: ["document", name, "overview/vault-skill.md"],
-    queryFn: () => getDocument(name!, "overview/vault-skill.md"),
+    queryKey: ["document", name, VAULT_SKILL_PATH],
+    queryFn: () => getDocument(name!, VAULT_SKILL_PATH),
     retry: false,
     enabled: !!name,
   });

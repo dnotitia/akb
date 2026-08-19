@@ -31,6 +31,7 @@ import { EmptyState } from "@/components/empty-state";
 import { IndexingBadge, RoleBadge, VaultStateBadge } from "@/components/status-badge";
 import { useVaultHealth } from "@/hooks/use-vault-health";
 import { SkillStatusChip } from "@/components/skill/skill-status-chip";
+import { VAULT_SKILL_PATH } from "@/lib/skill";
 import { StatTile } from "@/components/ui/stat-tile";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { CopyButton } from "@/components/ui/copy-button";
@@ -167,8 +168,8 @@ export default function VaultPage() {
     : null;
 
   const skillQuery = useQuery({
-    queryKey: ["document", name, "overview/vault-skill.md"],
-    queryFn: () => getDocument(name!, "overview/vault-skill.md"),
+    queryKey: ["document", name, VAULT_SKILL_PATH],
+    queryFn: () => getDocument(name!, VAULT_SKILL_PATH),
     retry: false,
     enabled: !!name,
   });

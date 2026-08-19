@@ -128,7 +128,7 @@ export function SkillSection({ vault, doc, loading, isMirror, canWrite }: Props)
               <span className="text-foreground-muted">
                 {doc.updated_at
                   ? `Last updated ${timeAgo(doc.updated_at)}`
-                  : "overview/vault-skill.md"}
+                  : VAULT_SKILL_PATH}
               </span>
             </div>
             <div className="flex items-center gap-1">
