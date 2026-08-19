@@ -47,7 +47,8 @@ REPAIR_RESOURCE_HASHES_USAGE = (
 PROVISION_RECOVERY_ADMIN_USAGE = (
     "Usage: python -m app.cli provision-recovery-admin "
     "{local|sso} --username USER --email EMAIL [profile options]\n"
-    "  local: (--password-file PATH|- | --generate-password-file PATH)\n"
+    "  local: [--password-file PATH|- | --generate-password-file PATH]\n"
+    "         omit both to create the account without a credential\n"
     "  sso:   --issuer ISSUER --subject SUBJECT"
 )
 
@@ -61,7 +62,7 @@ STANDALONE_SSO_BOOTSTRAP_USAGE = (
     "--bootstrap-client-id ID --bootstrap-client-secret-file PATH "
     "[--upgrade-client-id ID --upgrade-client-secret-file PATH] "
     "--product-admin-username USER --product-admin-email EMAIL "
-    "--product-admin-password-file PATH"
+    "[--product-admin-password-file PATH  (accepted, ignored)]"
 )
 
 
@@ -123,7 +124,9 @@ def _recovery_admin_parser() -> argparse.ArgumentParser:
     local = profiles.add_parser("local", add_help=False)
     local.add_argument("--username", required=True)
     local.add_argument("--email", required=True)
-    password_source = local.add_mutually_exclusive_group(required=True)
+    # Neither source is required: with both omitted the account is created
+    # holding no credential at all, and one is issued for it separately.
+    password_source = local.add_mutually_exclusive_group()
     password_source.add_argument("--password-file")
     password_source.add_argument("--generate-password-file")
 
@@ -235,18 +238,20 @@ async def _provision_recovery_admin(args: list[str]) -> int:
     try:
         await _initialize_operator_database()
         if parsed.profile == "local":
+            credential: dict[str, str] = {}
             if parsed.generate_password_file is not None:
                 password = secrets.token_urlsafe(32)
                 generated_path = _write_generated_password(
                     parsed.generate_password_file,
                     password,
                 )
-            else:
-                password = _read_password_source(parsed.password_file)
+                credential["password"] = password
+            elif parsed.password_file is not None:
+                credential["password"] = _read_password_source(parsed.password_file)
             report = await provision_local_recovery_admin(
                 username=parsed.username,
                 email=parsed.email,
-                password=password,
+                **credential,
             )
         else:
             report = await provision_sso_recovery_admin(
@@ -314,7 +319,11 @@ def _standalone_sso_parser() -> argparse.ArgumentParser:
     parser.add_argument("--upgrade-client-secret-file")
     parser.add_argument("--product-admin-username", required=True)
     parser.add_argument("--product-admin-email", required=True)
-    parser.add_argument("--product-admin-password-file", required=True)
+    # Retired input, still accepted so a deployment whose init container
+    # passes it keeps starting. The value is deliberately never read: the
+    # product admin is installed with no credential at all, and honouring a
+    # supplied password here would put a stored one back on the account.
+    parser.add_argument("--product-admin-password-file")
     return parser
 
 
@@ -351,9 +360,6 @@ async def _bootstrap_standalone_sso(args: list[str]) -> int:
             if parsed.upgrade_client_secret_file is not None
             else ""
         )
-        product_admin_password = _read_optional_bootstrap_secret_file(
-            parsed.product_admin_password_file
-        )
         if settings.require_auth_mode() != "sso" or not settings.keycloak_enabled:
             raise _ProvisioningInputError(
                 "Standalone SSO bootstrap requires auth_mode=sso and Keycloak enabled"
@@ -389,7 +395,6 @@ async def _bootstrap_standalone_sso(args: list[str]) -> int:
             settings.keycloak_management_client_secret,
             bootstrap_secret,
             upgrade_secret,
-            product_admin_password,
         ]
         configured_credentials = [value for value in credentials if value]
         if len(set(configured_credentials)) != len(configured_credentials):
@@ -424,7 +429,6 @@ async def _bootstrap_standalone_sso(args: list[str]) -> int:
             admin_client_secret=settings.keycloak_admin_client_secret,
             product_admin_username=parsed.product_admin_username,
             product_admin_email=parsed.product_admin_email,
-            product_admin_password=product_admin_password,
             backchannel_logout_uri=(
                 settings.keycloak_backchannel_logout_uri_effective
             ),
