@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { browseVault } from "@/lib/api";
+import { isReservedCollection } from "@/lib/skill";
 import { parseFileUri } from "@/lib/uri";
 
 export type NodeKind = "collection" | "document" | "table" | "file";
@@ -202,13 +203,20 @@ export function sortCollectionItems<T extends { name: string; raw?: any }>(items
 
 function sortTree(nodes: TreeNode[]) {
   // Collections first, then documents, then tables, then files — each alpha.
-  // Within the document kind, skill docs are pinned to the top.
+  // Within the collection kind, the reserved system collection is pinned to
+  // the top; within the document kind, skill docs are pinned to the top.
   const order: Record<NodeKind, number> = {
     collection: 0, document: 1, table: 2, file: 3,
   };
   nodes.sort((a, b) => {
     const k = order[a.kind] - order[b.kind];
     if (k !== 0) return k;
+    // Within collection kind, pin the reserved system collection to the top.
+    if (a.kind === "collection" && b.kind === "collection") {
+      const aRes = isReservedCollection(a.path) ? 0 : 1;
+      const bRes = isReservedCollection(b.path) ? 0 : 1;
+      if (aRes !== bRes) return aRes - bRes;
+    }
     // Within document kind, pin skill docs to the top.
     if (a.kind === "document" && b.kind === "document") {
       const aSkill = (a.raw?.doc_type ?? a.raw?.type) === "skill" ? 0 : 1;

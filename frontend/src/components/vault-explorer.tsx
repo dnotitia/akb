@@ -6,6 +6,7 @@ import {
   FilePlus,
   FileText,
   FolderPlus,
+  Lock,
   Paperclip,
   RotateCw,
   Sparkles,
@@ -26,6 +27,7 @@ import {
 } from "@/lib/tree-route";
 import { getVaultInfo } from "@/lib/api";
 import { recentTone } from "@/lib/recent";
+import { isReservedCollection } from "@/lib/skill";
 import { CreateCollectionDialog } from "@/components/create-collection-dialog";
 import { DeleteCollectionDialog } from "@/components/delete-collection-dialog";
 
@@ -405,6 +407,10 @@ const TreeRow = memo(function TreeRow({
   if (node.kind === "collection") {
     const count = countDocs(node);
     const ChevronIcon = isOpen ? ChevronDown : ChevronRight;
+    // The reserved `overview` collection holds the vault guide. The backend
+    // rejects writes into it, so the tree shows it read-only (locked, no row
+    // actions) rather than offering affordances that would 403.
+    const isReserved = isReservedCollection(node.path);
     return (
       <div
         role="treeitem"
@@ -432,9 +438,19 @@ const TreeRow = memo(function TreeRow({
           >
             {node.name}
           </span>
+          {isReserved && (
+            <span
+              title="System collection — managed via vault settings"
+              className="inline-flex shrink-0 items-center"
+              style={{ color: "var(--color-primary)" }}
+            >
+              <Lock className="h-3 w-3" aria-hidden />
+              <span className="sr-only">System collection</span>
+            </span>
+          )}
           {count > 0 && <span className="coord ml-auto shrink-0 tabular-nums">{count}</span>}
         </button>
-        {canWrite && onCreateDoc && (
+        {!isReserved && canWrite && onCreateDoc && (
           <button
             type="button"
             onClick={(e) => {
@@ -449,7 +465,7 @@ const TreeRow = memo(function TreeRow({
             <FilePlus className="h-3 w-3" aria-hidden />
           </button>
         )}
-        {canWrite && onCreateSubCollection && (
+        {!isReserved && canWrite && onCreateSubCollection && (
           <button
             type="button"
             onClick={(e) => {
@@ -464,7 +480,7 @@ const TreeRow = memo(function TreeRow({
             <FolderPlus className="h-3 w-3" aria-hidden />
           </button>
         )}
-        {canWrite && onDeleteCollection && (
+        {!isReserved && canWrite && onDeleteCollection && (
           <button
             type="button"
             onClick={(e) => {

@@ -58,6 +58,24 @@ describe("buildTree", () => {
     expect(tree.map((n) => n.kind)).toEqual(["collection", "document", "table", "file"]);
   });
 
+  it("pins the reserved `overview` collection ahead of the other collections", () => {
+    // Alphabetically `architecture` would win; the system collection outranks it.
+    const items = [coll("architecture"), coll("overview"), coll("zzz")];
+    const tree = buildTree(items);
+    expect(tree.map((n) => n.name)).toEqual(["overview", "architecture", "zzz"]);
+  });
+
+  it("does not pin a nested `overview` — only the root path is reserved", () => {
+    const items = [
+      coll("features"),
+      coll("features/aaa"),
+      coll("features/overview"),
+      coll("features/zzz"),
+    ];
+    const tree = buildTree(items);
+    expect(tree[0].children?.map((c) => c.name)).toEqual(["aaa", "overview", "zzz"]);
+  });
+
   it("still shows `overview` nested under each parent (the bug that motivated the refactor)", () => {
     const items = [
       coll("features"),
