@@ -22,6 +22,8 @@ def test_instructions_constant_exists():
     assert len(INSTRUCTIONS) < 2000  # not absurd
     assert "akb_help" in INSTRUCTIONS
     assert "vault-skill" in INSTRUCTIONS
+    # The auto-injected payload key must be named so agents recognize it.
+    assert "vault_skill" in INSTRUCTIONS
     assert "secrets" in INSTRUCTIONS
     assert "akb_delete" in INSTRUCTIONS
 

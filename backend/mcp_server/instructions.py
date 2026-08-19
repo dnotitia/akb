@@ -9,12 +9,12 @@ INSTRUCTIONS = """AKB stores documents, tables, files, and publications in vault
 
 Priority of guidance (highest first):
 1. User-defined rules — CLAUDE.md / AGENTS.md / GEMINI.md / loaded skills / explicit user requests in this conversation. These ALWAYS win.
-2. The vault's own conventions — call akb_help(topic="vault-skill", vault="<vault>") to fetch them. Per-vault, set by the owner.
+2. The vault's own conventions — auto-attached to your first tool response touching a vault as a "vault_skill" payload (re-attached when it changes). For the full text call akb_help(topic="vault-skill", vault="<vault>").
 3. AKB default conventions — the numbered rules below. Fallback when 1 and 2 are silent.
 
 When writing into a vault:
-1. Call akb_help(topic="vault-skill", vault="<vault>") to read the owner's conventions for that vault.
-2. If the vault has no vault-skill, follow the fallback guidance in that response.
+1. Your first tool call touching a vault returns a "vault_skill" payload — read and apply it before writing into that vault.
+2. If no payload arrives (read-only mirror vaults have no skill), follow the fallback guidance from akb_help(topic="vault-skill", vault="<vault>").
 3. Use akb_browse before akb_put on an unfamiliar collection.
 4. Never inline secrets in document bodies — use ${{secrets.X}} placeholders.
 5. Destructive tools (akb_delete_vault, akb_delete_collection) require explicit user confirmation.

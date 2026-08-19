@@ -383,10 +383,13 @@ async def _handle_help(args: dict, uid: str, user: _MCPUser) -> dict:
     if topic == "vault-skill" and vault:
         from mcp_server.help import render_vault_skill_response
         async def _fetch(v, doc_id):
+            from app.exceptions import NotFoundError
             try:
                 resp = await doc_service.get(v, doc_id)
-            except Exception:
-                return None
+            except NotFoundError:
+                return None  # genuinely absent (mirror vault)
+            # Any other exception propagates → canonical error envelope,
+            # so a DB outage no longer renders as "vault has no skill".
             # DocumentResponse fields: .content (from git), .current_commit, .updated_at
             return {
                 "content": resp.content or "",

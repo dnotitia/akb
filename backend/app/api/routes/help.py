@@ -4,6 +4,7 @@ from typing import Any
 from fastapi import APIRouter, Depends
 from fastapi.responses import PlainTextResponse
 
+from app.exceptions import NotFoundError
 from app.services.document_service import VAULT_SKILL_SEED_TEMPLATE
 from app.services.revision_backend import get_document_service
 from app.services.auth_service import AuthenticatedUser
@@ -67,8 +68,11 @@ async def get_vault_skill_preview(
     async def _fetch(v: str, doc_id: str):
         try:
             resp = await doc_service.get(v, doc_id)
-        except Exception:
-            return None
+        except NotFoundError:
+            return None  # genuinely absent (mirror vault)
+        # Anything else propagates to the global handlers (AKBError → its own
+        # status, everything else → 500) instead of rendering a 200 that claims
+        # the vault has no skill.
         return {
             "content": getattr(resp, "content", "") or "",
             "commit": getattr(resp, "current_commit", None),

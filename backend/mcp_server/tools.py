@@ -130,16 +130,17 @@ TOOLS = [
                     ),
                 },
                 "vault": {"type": "string", "description": "Target vault name. Required unless `parent` is given."},
-                "collection": {"type": "string", "description": "Collection (directory) path, e.g. 'api-specs' or 'meeting-notes'. Ignored when `parent` is given."},
+                "collection": {"type": "string", "description": "Collection (directory) path, e.g. 'api-specs' or 'meeting-notes'. Ignored when `parent` is given. 'overview' is a reserved system collection (vault-skill only)."},
                 "slug": {"type": "string", "description": "Optional explicit slug for the document filename. When stored under a collection the URI is `akb://{vault}/coll/{collection}/doc/{slug}.md`; at the vault root it is `akb://{vault}/doc/{slug}.md`. When omitted, the slug is derived from the title. Pass it to keep the path stable and meaningful when the title is friendly, changeable text (e.g. slug `github-issue-123` with a human-readable title)."},
                 "title": {"type": "string", "description": "Document title"},
                 "content": {"type": "string", "description": "Document body in Markdown"},
                 "type": {
                     "type": "string",
                     "description": (
-                        "Document type. Free-form — any string is accepted. "
-                        "Recommended vocabulary: note (default), report, decision, "
-                        "spec, plan, session, task, reference, skill. Use a custom "
+                        "Document type. Free-form — any string is accepted, EXCEPT "
+                        "'skill', which is reserved for the system-managed vault-skill "
+                        "document. Recommended vocabulary: note (default), report, "
+                        "decision, spec, plan, session, task, reference. Use a custom "
                         "value when none fit (e.g. an OKF concept type)."
                     ),
                     "default": "note",
@@ -1211,7 +1212,7 @@ TOOLS = [
                 },
                 "vault": {
                     "type": "string",
-                    "description": "Vault name. Required for topic='vault-skill' — returns that vault's skill doc body if it exists.",
+                    "description": "Vault name. Required for topic='vault-skill' — returns that vault's full skill text (the auto-attached `vault_skill` payload may be truncated). Read-only mirror vaults have no skill; a fallback guide is returned instead.",
                 },
             },
         },
@@ -1249,7 +1250,9 @@ TOOLS = [
             "currently 'okf'. Concept documents are imported as AKB documents; a "
             "`type: table`/`file` concept doc (which carries only schema/metadata, not "
             "rows/bytes) imports as a regular document describing that asset. Existing "
-            "paths are skipped, not overwritten. Writer role required."
+            "paths are skipped, not overwritten. Records targeting the reserved "
+            "'overview' collection or carrying type='skill' are skipped per-record and "
+            "reported in the response's 'reserved' list. Writer role required."
         ),
         inputSchema={
             "type": "object",

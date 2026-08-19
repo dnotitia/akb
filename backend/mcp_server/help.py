@@ -5,6 +5,10 @@ Call akb_help() for overview, akb_help(topic='...') to drill down.
 
 from __future__ import annotations
 
+# Canonical vault-skill path. Single source of truth is the policy module
+# (it imports only app.exceptions, so no cycle) — re-exported here because
+# this module's public API has always carried the name.
+from app.services.skill_policy import VAULT_SKILL_PATH
 
 HELP = {
     # ── Root ──────────────────────────────────────────────────
@@ -128,8 +132,9 @@ Each document has: vault, collection (directory), title, content, type, tags, st
 | `akb_delete_collection` | Deleting a collection (with optional `recursive=true` cascade) |
 
 ## Document Types
-Free-form — any string is accepted. Recommended vocabulary:
-`note` (default), `report`, `decision`, `spec`, `plan`, `session`, `task`, `reference`, `skill`.
+Free-form — any string is accepted, EXCEPT `skill`, which is reserved for the
+system-managed vault-skill document. Recommended vocabulary:
+`note` (default), `report`, `decision`, `spec`, `plan`, `session`, `task`, `reference`.
 Use a custom value when none fit (e.g. an OKF concept type).
 
 ## Document Status
@@ -653,11 +658,11 @@ akb_help(topic="link-resources")    # Workflow guide
 | Param | Required | Description |
 |-------|----------|-------------|
 | vault | ✓ | Target vault name |
-| collection | ✓ | Directory path (e.g. "api-specs", "meeting-notes") |
+| collection | ✓ | Directory path (e.g. "api-specs", "meeting-notes"). `overview` is a reserved system collection (vault-skill only) |
 | title | ✓ | Document title |
 | slug | | Optional filename slug. When omitted, the path is derived from `title`; pass this to pin a stable URI filename independently of the display title. |
 | content | ✓ | Markdown body |
-| type | | free-form; recommended: note, report, decision, spec, plan, session, task, reference, skill |
+| type | | free-form except reserved `skill`; recommended: note, report, decision, spec, plan, session, task, reference |
 | tags | | ["auth", "api"] |
 | domain | | engineering, product, ops, legal, etc. |
 | summary | | Brief summary (auto-generated if omitted) |
@@ -1868,31 +1873,26 @@ Use `akb_help(topic="...")` with any of the above."""
 
 # ── Vault skill router ────────────────────────────────────
 
-VAULT_SKILL_PATH = "overview/vault-skill.md"
-
 VAULT_SKILL_TOPIC_BODY = """# Vault skill
 
-Each AKB vault can declare its writing conventions in a `vault-skill` document
-at `overview/vault-skill.md`. Agents read it via:
+Every AKB vault states its writing conventions in a system-managed `vault-skill`
+document at `overview/vault-skill.md` (`type="skill"`, one per vault).
+
+It is seeded at vault creation, so normal vaults always have one. It cannot be
+deleted, moved, or retyped — to start over, reset it to the template. Edit it
+with `akb_update` on `overview/vault-skill.md`, or from the vault settings UI.
+The `overview` collection and `type="skill"` are reserved for it.
+
+Agents do not have to ask for it: the first tool response touching a vault in a
+session carries the skill as a `vault_skill` payload, re-attached whenever the
+skill changes. Read-only external git mirror vaults have no skill and never
+emit the payload.
+
+For the full text (the payload may be truncated) call:
 
     akb_help(topic="vault-skill", vault="<vault>")
 
-The doc is a normal AKB document with `type="skill"`. The vault owner edits it
-with regular AKB tools (akb_edit / akb_update). New vaults receive a starter
-template at creation time.
-
-If a vault has no vault-skill yet, the owner can create one with:
-
-    akb_put(
-      vault="<vault>",
-      collection="overview",
-      title="<vault> Guide",
-      slug="vault-skill",          # pins path to overview/vault-skill.md
-      type="skill",
-      content="<see template in this topic body>",
-    )
-
-When no vault has a custom skill, agents follow these fallback rules:
+When a vault has no skill, agents follow these fallback rules:
 - akb_browse before writing to learn the existing collection layout
 - akb_search / akb_grep before writing to avoid duplicates
 - Never inline secrets; use ${{secrets.X}} placeholders
@@ -1902,18 +1902,12 @@ When no vault has a custom skill, agents follow these fallback rules:
 HELP["vault-skill"] = VAULT_SKILL_TOPIC_BODY
 
 
-_MISSING_FALLBACK = """No `overview/vault-skill.md` found in this vault.
+_MISSING_FALLBACK = """This vault has no `overview/vault-skill.md`.
 
-The vault owner can create one with:
-
-    akb_put(
-      vault="{vault}",
-      collection="overview",
-      title="{vault} Guide",
-      slug="vault-skill",          # pins path to overview/vault-skill.md
-      type="skill",
-      content="<see akb_help(topic='vault-skill') for the template>",
-    )
+Normal vaults always carry a vault-skill (seeded at creation and protected
+from deletion). A missing skill usually means this is a read-only external
+git mirror vault, which has no skill by design — follow the generic rules
+below and the mirrored repository's own conventions.
 
 First steps when writing into an unfamiliar vault:
 1. akb_browse(vault="{vault}") — see top-level collections, tables, files
