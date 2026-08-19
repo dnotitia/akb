@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Backfill existing violations of the overview/skill reservation.
+
+Thin runner around `app.services.skill_reservation_backfill.run` — all logic
+(and the service-layer-only rule) lives there. Mirror vaults are excluded.
+
+DEFAULT IS A DRY RUN: it only scans and prints per-class counts. Pass
+`--execute` to apply the repairs.
+
+The stdout summary is COUNTS ONLY, deliberately: it gets pasted into a public
+repo's PRs/issues, so no vault name or document path may appear there. Per-item
+detail goes to logging.
+
+Usage:
+    python -m scripts.backfill_skill_reservation             # dry run (counts)
+    python -m scripts.backfill_skill_reservation --execute   # apply
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from app.db.postgres import init_db, close_pool
+from app.services import skill_reservation_backfill
+from app.services.revision_backend import get_document_service
+
+
+async def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Backfill overview/skill reservation violations."
+    )
+    ap.add_argument(
+        "--execute", action="store_true",
+        help="apply the repairs (default: dry run, counts only)",
+    )
+    args = ap.parse_args()
+
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+
+    await init_db()
+    try:
+        result = await skill_reservation_backfill.run(
+            get_document_service(), execute=args.execute
+        )
+    finally:
+        await close_pool()
+
+    if result["dry_run"]:
+        print(result)
+        return 0
+    errors = result["errors"]
+    # Redacted summary: counts + an error COUNT. The error entries carry
+    # vault/path detail and were already logged; they never go to stdout.
+    print({"dry_run": False, "done": result["done"], "errors": len(errors)})
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(main()))
