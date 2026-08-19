@@ -167,9 +167,12 @@ export default function VaultSettingsPage() {
   const canEdit = info?.role === "owner";
   // Vault metadata is owner-only, but the vault guide is an ordinary document
   // write — the backend accepts a canonical body update from any writer (the
-  // skill guards only pin the type). Same rule the document page uses.
+  // skill guards only pin the type). Same rule the document page uses, plus
+  // the archived check: an archived vault is server-side read-only, so a
+  // writer would take a 403 on save (matches vault.tsx's CTA rule).
   const canWrite =
-    info?.role === "writer" || info?.role === "admin" || info?.role === "owner";
+    (info?.role === "writer" || info?.role === "admin" || info?.role === "owner") &&
+    !info?.is_archived;
   const savedPublic = (info?.public_access as PublicAccess) || "none";
   const dirty = Boolean(
     info && (description !== (info.description || "") || publicAccess !== savedPublic),
