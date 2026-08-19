@@ -500,6 +500,9 @@ class NativeDocumentService(DocumentService):
                     resource_id=resource_id,
                 )
                 continue
+            if current.path == skill_policy.VAULT_SKILL_PATH:
+                from app.services import vault_skill_service
+                vault_skill_service.invalidate(vault)
             return DocumentPutResponse(
                 uri=doc_uri(vault, result.path),
                 vault=vault,

@@ -1057,6 +1057,9 @@ class DocumentService:
             hash_algorithm=HASH_ALGORITHM, content_hash_commit=commit_hash,
             tags=req.tags, conn=conn,
         )
+        if file_path == skill_policy.VAULT_SKILL_PATH:
+            from app.services import vault_skill_service
+            vault_skill_service.invalidate(vault)
         await asset_service.sync_document_assets(
             conn,
             document_id=pg_doc_id,

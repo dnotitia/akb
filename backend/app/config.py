@@ -311,6 +311,24 @@ class ToolUsageSettings(BaseModel):
     shutdown_deadline_secs: float = Field(default=8.0, ge=0.5, le=60.0)
 
 
+class VaultSkillSettings(BaseModel):
+    """Auto-injection of the vault-skill into MCP tool responses."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    # Injected body ceiling. The seed template is ~2KB; anything past this is
+    # clipped with truncated=true and a pointer to akb_help — response size,
+    # not a search index, so a hard clip is honest.
+    body_max_bytes: int = Field(default=16384, ge=1024, le=1_048_576)
+    # Per-vault version/body cache TTL. Write-through invalidation covers the
+    # single-replica API; the TTL is the safety net for future replicas.
+    cache_ttl_secs: int = Field(default=60, ge=1, le=3600)
+    # Bound on the (session, vault) tracking map. Eviction's only cost is one
+    # harmless re-injection.
+    session_map_max: int = Field(default=10_000, ge=1, le=1_000_000)
+
+
 class ExternalGitHostRule(BaseModel):
     """One internal-exception entry for the external-git host allowlist.
 
@@ -1065,6 +1083,10 @@ class Settings(BaseModel):
     # MCP tool-usage analytics — separate sink, separate flag. See
     # ToolUsageSettings above for why it is not folded into `audit`.
     tool_usage: ToolUsageSettings = Field(default_factory=ToolUsageSettings)
+
+    # Vault-skill auto-injection into MCP tool responses. See
+    # VaultSkillSettings above; the state lives in `services/vault_skill_service`.
+    vault_skill: VaultSkillSettings = Field(default_factory=VaultSkillSettings)
 
     @model_validator(mode="after")
     def validate_sso_browser_session_lifetimes(self) -> "Settings":
