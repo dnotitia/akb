@@ -181,6 +181,76 @@ async def test_concurrent_misses_single_flight(monkeypatch):
     assert sum(1 for r in results if r is not None) == 8
 
 
+def _blocking_fetch(release: asyncio.Event, started: asyncio.Event):
+    async def slow(vault):
+        started.set()
+        await release.wait()
+        return {"content": "# body", "version": "abc12345"}
+    return slow
+
+
+async def _park_follower(vault: str):
+    """Start a follower and let it reach the `shield` await."""
+    task = asyncio.create_task(vss.injection_payload("follower", vault))
+    for _ in range(3):
+        await asyncio.sleep(0)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_cancelled_leader_hands_followers_a_miss(monkeypatch):
+    """A cancelled leader must not abort the tool calls waiting behind it."""
+    started, release = asyncio.Event(), asyncio.Event()
+    monkeypatch.setattr(vss, "_fetch_skill", _blocking_fetch(release, started))
+
+    leader = asyncio.create_task(vss.injection_payload("leader", "v1"))
+    await started.wait()
+    follower = await _park_follower("v1")
+    assert "v1" in vss._pending
+
+    leader.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await leader
+
+    # The follower completes normally — "no injection this time", not a crash.
+    assert await follower is None
+    assert vss._vault_cache == {}
+    assert vss._pending == {}
+
+    # Nothing was cached, so the next call is a fresh fetch.
+    release.set()
+    monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch())
+    assert await vss.injection_payload("later", "v1") is not None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_follower_propagates_and_spares_the_leader(monkeypatch):
+    """A follower's OWN cancellation is its caller's — it must still raise.
+
+    The two cases are told apart by the shared future's state: a leader
+    outcome always arrives as a COMPLETED future (result or exception), while
+    the follower's own cancellation raises out of `shield` with the inner
+    future untouched — so the leader's fetch survives it.
+    """
+    started, release = asyncio.Event(), asyncio.Event()
+    monkeypatch.setattr(vss, "_fetch_skill", _blocking_fetch(release, started))
+
+    leader = asyncio.create_task(vss.injection_payload("leader", "v1"))
+    await started.wait()
+    follower = await _park_follower("v1")
+    fut = vss._pending["v1"]
+
+    follower.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await follower
+
+    # `shield` kept the shared fetch alive: not done, not cancelled.
+    assert not fut.done()
+    release.set()
+    assert await leader is not None
+    assert fut.result() == ("abc12345", "# body")
+
+
 @pytest.mark.asyncio
 async def test_fetch_timeout_yields_none_and_caches_nothing(monkeypatch):
     """A transient stall must not become a TTL-long negative entry."""

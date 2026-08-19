@@ -33,7 +33,10 @@ A cache MISS costs several DB round trips plus a git read, so it is
 single-flighted per vault (concurrent first-touches share one fetch) and
 bounded by `fetch_timeout_secs`. A timed-out fetch caches NOTHING — turning a
 transient stall into a TTL-long negative entry would silence injection for
-every session long after the stall passed.
+every session long after the stall passed. A CANCELLED leader likewise hands
+its followers a miss rather than its own CancelledError: cancellation belongs
+to the cancelled caller, and a BaseException would slip past the never-raises
+guard below into a tool call that has already done its work.
 
 Mirror vaults are excluded even when the upstream repo carries an
 overview/vault-skill.md: auto-injecting upstream-controlled markdown into
@@ -199,9 +202,19 @@ async def _current(vault: str) -> tuple[str | None, str | None]:
             fut.set_result(result)
             return result
         except BaseException as e:
-            fut.set_exception(e)
-            fut.exception()  # mark retrieved; followers re-raise it themselves
-            raise
+            if isinstance(e, asyncio.CancelledError):
+                # The leader's cancellation belongs to the LEADER's caller
+                # alone. Handing it to followers via the shared future would
+                # raise CancelledError inside their `shield` await — a
+                # BaseException, so it escapes both `except Exception` guards
+                # and aborts an unrelated tool call that already committed its
+                # business work. Followers observe a miss instead; nothing is
+                # cached, so the next call fetches fresh.
+                fut.set_result((None, None))
+            else:
+                fut.set_exception(e)
+                fut.exception()  # mark retrieved; followers re-raise it too
+            raise  # the leader itself must still cancel/fail
         if doc is None:
             result = (None, None)
         else:
