@@ -62,7 +62,6 @@ class StandaloneSSOBootstrapSpec:
     admin_client_secret: str = field(repr=False)
     product_admin_username: str
     product_admin_email: str
-    product_admin_password: str = field(repr=False)
     backchannel_logout_uri: str = ""
     upgrade_client_id: str = "akb-bootstrap-upgrade-v2"
     upgrade_client_secret: str = field(default="", repr=False)
@@ -388,17 +387,9 @@ async def bootstrap_standalone_sso(
             raise StandaloneSSOBootstrapError("keycloak_bootstrap_retirement_receipt_missing")
         if upgrade_token is not None:
             raise StandaloneSSOBootstrapError("keycloak_upgrade_client_unexpected")
-        if not spec.product_admin_password:
-            # Validate the one-time recovery input before reconcile creates or
-            # changes any realm resource. Readback and profile-upgrade runs do
-            # not need the original product-admin password.
-            raise StandaloneSSOBootstrapError("keycloak_product_admin_password_unavailable")
-        if (
-            len(spec.product_admin_password) < 12
-            or spec.product_admin_password == spec.product_admin_username
-            or spec.product_admin_password == spec.product_admin_email
-        ):
-            raise StandaloneSSOBootstrapError("keycloak_product_admin_password_policy")
+        # Installation carries no product-admin password. The account is
+        # created unable to authenticate, and a credential is issued for it
+        # separately; the realm's own password policy governs that credential.
         mode = "fresh" if management_token is None else "recovery"
         keycloak_mutated = True
         readback = await control.reconcile(

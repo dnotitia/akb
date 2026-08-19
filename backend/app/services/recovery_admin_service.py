@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from typing import Literal
 
@@ -17,7 +18,11 @@ from app.exceptions import (
     ValidationError,
 )
 from app.repositories.events_repo import emit_event
-from app.services.account_markers import RETIRED_RECOVERY_ADMIN_PASSWORD_SENTINEL
+from app.services.account_markers import (
+    RETIRED_RECOVERY_ADMIN_PASSWORD_SENTINEL,
+    UNISSUED_RECOVERY_ADMIN_PASSWORD_SENTINEL,
+    is_unissued_recovery_admin_password,
+)
 from app.services.account_service import cleanup_token_roles
 from app.services.auth_service import hash_password_async
 from app.services.external_identity_contract import (
@@ -32,6 +37,9 @@ from app.services.role_sync import get_role_sync
 _PROVISIONING_LOCK_ID = 0x414B425245434F56  # "AKBRECOV"
 # These fixed strings are intentionally invalid credential tombstones, not passwords.
 _SSO_PASSWORD_SENTINEL = "!keycloak-sso:no-local-login!"  # nosec B105
+# Every bcrypt hash starts with a versioned "$2x$<cost>$" prefix, so this
+# distinguishes a real credential from any marker string.
+_BCRYPT_HASH_PREFIX = re.compile(r"^\$2[aby]\$\d{2}\$")
 
 
 def _required(value: str, field: str) -> str:
@@ -48,6 +56,19 @@ def _email(value: str) -> str:
 def _require_mode(expected: Literal["local", "sso"]) -> None:
     if settings.require_auth_mode() != expected:
         raise RecoveryAdminModeError()
+
+
+def _is_local_recovery_credential(password_hash: str | None) -> bool:
+    """Return whether a local recovery admin holds a credential state we set.
+
+    Exactly two are legitimate: a bcrypt hash (a credential has been issued)
+    and the unissued marker (none has). Anything else is an account state this
+    service did not produce, so converging on it would adopt an identity of
+    unknown provenance as the one account that can recover the installation.
+    """
+    if password_hash is None:
+        return False
+    return bool(_BCRYPT_HASH_PREFIX.match(password_hash)) or is_unissued_recovery_admin_password(password_hash)
 
 
 def _validate_password(password: str) -> None:
@@ -102,14 +123,22 @@ async def provision_local_recovery_admin(
     *,
     username: str,
     email: str,
-    password: str,
+    password: str | None = None,
 ) -> dict:
-    """Create the one local recovery admin, or converge on its exact identity."""
+    """Create the one local recovery admin, or converge on its exact identity.
+
+    Without ``password`` the account is created holding the unissued marker
+    instead of a hash, so it exists and carries recovery authority but cannot
+    be authenticated until a credential is issued for it.
+    """
     _require_mode("local")
     username = _required(username, "username")
     email = _email(email)
-    _validate_password(password)
-    password_hash = await hash_password_async(password)
+    if password is None:
+        password_hash = UNISSUED_RECOVERY_ADMIN_PASSWORD_SENTINEL
+    else:
+        _validate_password(password)
+        password_hash = await hash_password_async(password)
     pool = await get_pool()
     created = False
 
@@ -123,9 +152,13 @@ async def provision_local_recovery_admin(
                         "SELECT COUNT(*) FROM external_identities WHERE user_id = $1",
                         row["id"],
                     )
+                    # Convergence deliberately never touches the credential
+                    # column: an issued password is not reset, and an unissued
+                    # account is not silently given one.
                     if not (
                         row["username"] == username
                         and row["email"].lower() == email
+                        and _is_local_recovery_credential(row["password_hash"])
                         and row["is_admin"]
                         and row["is_recovery_admin"]
                         and row["auth_provider"] == "local"

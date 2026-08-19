@@ -299,3 +299,41 @@ async def test_sso_profile_accepts_only_external_identity_and_usage_errors_hide_
     captured = capsys.readouterr()
     assert _SECRET not in captured.out
     assert _SECRET not in captured.err
+
+
+async def test_local_profile_provisions_without_any_password_source(monkeypatch, capsys):
+    from app import cli
+    from app.services import recovery_admin_service
+
+    _patch_database(monkeypatch)
+    observed = {}
+
+    async def _provision(**kwargs):
+        observed.update(kwargs)
+        return _result(mode="local")
+
+    monkeypatch.setattr(
+        recovery_admin_service,
+        "provision_local_recovery_admin",
+        _provision,
+    )
+
+    exit_code = await cli._provision_recovery_admin(
+        [
+            "local",
+            "--username",
+            "recovery-admin",
+            "--email",
+            "recovery-admin@example.com",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    # No password is generated, read, or handed to the service: the account is
+    # created unable to authenticate until a credential is issued on demand.
+    assert observed == {
+        "username": "recovery-admin",
+        "email": "recovery-admin@example.com",
+    }
+    assert json.loads(captured.out)["password_file_written"] is False
