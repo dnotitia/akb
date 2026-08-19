@@ -36,6 +36,7 @@ _DSN = os.environ.get(
 _CHOSEN_PASSWORD = "chosen-by-the-holder"  # pragma: allowlist secret
 _DELIVERED_PASSWORD = "delivered-out-of-band"  # pragma: allowlist secret
 _REPLACEMENT_PASSWORD = "replacement-chosen-now"  # pragma: allowlist secret
+_INSTALLER_PASSWORD = "the-installer-already-had-this"  # pragma: allowlist secret
 
 
 def _dsn_for_database(dsn: str, database: str) -> str:
@@ -187,7 +188,36 @@ async def test_password_reset_leaves_the_account_owing_a_change(pool):
     assert await _credential_change_required(pool, account["user_id"]) is True
 
 
-async def test_local_recovery_admin_provisioning_arms_the_marker(pool):
+async def test_provisioning_arms_the_marker_for_a_credential_it_issued(pool):
+    """The credential provisioning produced and handed back is delivered."""
+    from app.services.recovery_admin_service import provision_local_recovery_admin
+
+    report = await provision_local_recovery_admin(
+        username="recovery-admin",
+        email="recovery-admin@example.com",
+        password=_DELIVERED_PASSWORD,
+        credential_issued_by_akb=True,
+    )
+    assert report["created"] is True
+    assert await _credential_change_required(pool, report["user_id"]) is True
+
+
+async def test_provisioning_arms_nothing_for_a_credential_it_was_given(pool):
+    """A value that existed before AKB saw it was delivered by nobody here."""
+    from app.services.recovery_admin_service import provision_local_recovery_admin
+
+    report = await provision_local_recovery_admin(
+        username="recovery-admin",
+        email="recovery-admin@example.com",
+        password=_INSTALLER_PASSWORD,
+        credential_issued_by_akb=False,
+    )
+    assert report["created"] is True
+    assert await _credential_change_required(pool, report["user_id"]) is False
+
+
+async def test_provisioning_treats_an_unstated_credential_as_delivered(pool):
+    """The default is the fail-closed one: a caller that does not say arms it."""
     from app.services.recovery_admin_service import provision_local_recovery_admin
 
     report = await provision_local_recovery_admin(
@@ -195,7 +225,6 @@ async def test_local_recovery_admin_provisioning_arms_the_marker(pool):
         email="recovery-admin@example.com",
         password=_DELIVERED_PASSWORD,
     )
-    assert report["created"] is True
     assert await _credential_change_required(pool, report["user_id"]) is True
 
 
@@ -362,11 +391,18 @@ async def test_changing_the_password_clears_the_requirement(pool):
 
 
 def _app() -> FastAPI:
-    """The real auth router, with the application's own error envelope."""
+    """The real routers, with the application's own error envelope.
+
+    Both are here because both sides of this contract are routes: the change
+    that clears the requirement is in ``auth``, and the administrative route
+    an installer's bootstrap reaches is in ``access``.
+    """
+    from app.api.routes import access as access_routes
     from app.api.routes import auth as auth_routes
 
     app = FastAPI()
     app.include_router(auth_routes.router, prefix="/api/v1")
+    app.include_router(access_routes.router, prefix="/api/v1")
 
     @app.exception_handler(AKBError)
     async def _akb_error(request, exc: AKBError):
@@ -409,3 +445,144 @@ async def test_every_other_route_refuses_and_the_change_route_escapes(pool):
         )
         assert allowed.status_code == 200
         assert allowed.json()["username"] == account["username"]
+
+
+# ── The installer's own bootstrap ───────────────────────────────────
+
+
+async def _provisioned_by_the_installer(monkeypatch, tmp_path) -> str:
+    """Provision through the operator CLI with a password the caller supplies.
+
+    This is the shape an installer actually runs: it holds the credential
+    already — in a file, an environment variable, or a mounted secret — and
+    AKB is told to install that value, not to produce one.
+    """
+    from app import cli
+    from app.db import postgres
+
+    async def _no_database_lifecycle() -> None:
+        return None
+
+    monkeypatch.setattr(cli, "_initialize_operator_database", _no_database_lifecycle)
+    monkeypatch.setattr(postgres, "close_pool", _no_database_lifecycle)
+
+    password_file = tmp_path / "recovery-admin.password"
+    password_file.write_text(f"{_INSTALLER_PASSWORD}\n", encoding="utf-8")
+
+    exit_code = await cli._provision_recovery_admin(
+        [
+            "local",
+            "--username",
+            "recovery-admin",
+            "--email",
+            "recovery-admin@example.com",
+            "--password-file",
+            str(password_file),
+        ]
+    )
+    assert exit_code == 0
+    return await _signed_in("recovery-admin", _INSTALLER_PASSWORD)
+
+
+async def test_the_installer_bootstrap_reaches_the_account_it_provisioned(
+    pool, monkeypatch, tmp_path
+):
+    """A machine signs in as the account the installer just created.
+
+    Nothing in this sequence hands a credential to anyone: the installer
+    supplied the value, and the session it opens is used to establish the
+    service principal the installation runs as. Refusing it leaves the
+    installation with no machine identity at all.
+    """
+    token = await _provisioned_by_the_installer(monkeypatch, tmp_path)
+    transport = httpx.ASGITransport(app=_app())
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://forced-change.test"
+    ) as client:
+        ensured = await client.post(
+            "/api/v1/admin/service-users/ensure",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "username": "installation-bot",
+                "email": "installation-bot@example.com",
+                "is_admin": True,
+            },
+        )
+
+    assert ensured.status_code == 200
+    assert ensured.json()["account_kind"] == "service"
+
+
+async def test_a_credential_provisioning_issued_must_still_be_replaced(pool, monkeypatch, tmp_path):
+    """The other installer shape, and the promise that must survive this fix.
+
+    When AKB produces the password itself it writes it into an operator-owned
+    file to be handed to the administrator. That is the same delivery a
+    password reset performs, so the account owes a replacement for it and
+    reaches nothing until it has made one.
+    """
+    from app import cli
+    from app.db import postgres
+
+    async def _no_database_lifecycle() -> None:
+        return None
+
+    monkeypatch.setattr(cli, "_initialize_operator_database", _no_database_lifecycle)
+    monkeypatch.setattr(postgres, "close_pool", _no_database_lifecycle)
+
+    password_file = tmp_path / "generated.password"
+    exit_code = await cli._provision_recovery_admin(
+        [
+            "local",
+            "--username",
+            "recovery-admin",
+            "--email",
+            "recovery-admin@example.com",
+            "--generate-password-file",
+            str(password_file),
+        ]
+    )
+    assert exit_code == 0
+
+    delivered = password_file.read_text(encoding="utf-8").rstrip("\n")
+    token = await _signed_in("recovery-admin", delivered)
+    headers = {"Authorization": f"Bearer {token}"}
+    transport = httpx.ASGITransport(app=_app())
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://forced-change.test"
+    ) as client:
+        refused = await client.post(
+            "/api/v1/admin/service-users/ensure",
+            headers=headers,
+            json={
+                "username": "installation-bot",
+                "email": "installation-bot@example.com",
+                "is_admin": True,
+            },
+        )
+        assert refused.status_code == 403
+        assert refused.json()["detail"]["code"] == "credential_change_required"
+
+        changed = await client.post(
+            "/api/v1/auth/change-password",
+            headers=headers,
+            json={
+                "current_password": delivered,
+                "new_password": _REPLACEMENT_PASSWORD,
+            },
+        )
+        assert changed.status_code == 200
+
+        replacement = await _signed_in("recovery-admin", _REPLACEMENT_PASSWORD)
+        allowed = await client.post(
+            "/api/v1/admin/service-users/ensure",
+            headers={"Authorization": f"Bearer {replacement}"},
+            json={
+                "username": "installation-bot",
+                "email": "installation-bot@example.com",
+                "is_admin": True,
+            },
+        )
+        assert allowed.status_code == 200

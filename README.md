@@ -332,6 +332,16 @@ command stores no usable local password and does not contact the identity
 provider. Generated output files are create-only and never overwritten; for a
 retry after the file exists, pass that file back with `--password-file`.
 
+The two local forms differ in one further way. `--generate-password-file` is
+AKB producing a credential and handing it over, so the account it creates owes
+a replacement for it: the first session that credential opens can reach the
+password change and nothing else, exactly as a password reset behaves.
+`--password-file` installs a value the caller already holds — AKB delivers it
+to nobody — so it arms nothing, and an installation that signs in as this
+account to bootstrap its own service identity keeps working. To force a
+replacement for a credential supplied that way, rotate it afterwards with the
+command below; rotation always leaves the account owing a change.
+
 If that credential later leaks, is lost, or has to be taken back, rotate it
 rather than reprovisioning the account:
 
