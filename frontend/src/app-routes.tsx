@@ -29,16 +29,12 @@ import {
   type AppRouteComponentName,
 } from "@/app-route-contract";
 
-// Old /vault/:name/skill URLs redirect to the underlying guide document.
+// Old /vault/:name/skill URLs redirect to the guide editor in vault settings —
+// the vault guide is system-managed and has no plain-viewer surface.
 function SkillRedirect() {
   const { name } = useParams<{ name: string }>();
   if (!name) return <Navigate to="/" replace />;
-  return (
-    <Navigate
-      to={`/vault/${name}/doc/${encodeURIComponent("overview/vault-skill.md")}`}
-      replace
-    />
-  );
+  return <Navigate to={`/vault/${name}/settings#skill`} replace />;
 }
 
 const routeComponents = {

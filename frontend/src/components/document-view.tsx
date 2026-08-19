@@ -1,13 +1,11 @@
 import { useState } from "react";
 import { Loader2 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { getDocument, getVaultSkillPreview } from "@/lib/api";
+import { getDocument } from "@/lib/api";
 import { MarkdownRender } from "@/components/markdown-render";
-import { SkillBanner } from "@/components/skill/skill-banner";
 import { Alert } from "@/components/ui/alert";
-import { Skeleton } from "@/components/ui/skeleton";
 
-type ViewMode = "rendered" | "raw" | "agent";
+type ViewMode = "rendered" | "raw";
 
 interface DocumentViewProps {
   vault: string;
@@ -16,7 +14,7 @@ interface DocumentViewProps {
   view?: ViewMode;
   onViewChange?: (next: ViewMode) => void;
   /**
-   * Optional extra segmented-control tab appended after RENDERED/RAW/AGENT.
+   * Optional extra segmented-control tab appended after RENDERED/RAW.
    * The parent owns the click handler — DocumentView does not switch
    * its own view state when the extra tab is clicked. Used by
    * DocumentPage to inject the body-editor entry point without
@@ -44,13 +42,9 @@ interface DocumentViewProps {
  * and serves whichever landed first.
  *
  * view/onViewChange are optional: when omitted, DocumentView manages
- * its own local toggle state (useful for VaultSkillPage and future
- * embeds). When provided, the caller drives view state (DocumentPage
- * uses this to sync ?view= URL params).
- *
- * T6 NOTE: The segmented control block below is where the AGENT
- * segment will land. When T6 adds it, extend the `ViewMode` union and
- * add a third tab here alongside the doc.type === "skill" guard.
+ * its own local toggle state (useful for embeds). When provided, the
+ * caller drives view state (DocumentPage uses this to sync ?view= URL
+ * params).
  */
 export function DocumentView({ vault, docId, view: viewProp, onViewChange, extraTab, version }: DocumentViewProps) {
   const [localView, setLocalView] = useState<ViewMode>("rendered");
@@ -102,34 +96,18 @@ export function DocumentView({ vault, docId, view: viewProp, onViewChange, extra
     );
   }
 
-  // If the parent passes "agent" but this isn't a skill doc, fall back to "rendered"
-  const isSkill = doc.type === "skill";
-  const effectiveView: ViewMode = view === "agent" && !isSkill ? "rendered" : view;
-
   return (
     <>
-      {/* ── Skill banner (skill docs only) ──────────────────────── */}
-      {isSkill && <SkillBanner vault={vault} docId={docId} />}
-
-      {/* ── Rendered/Raw/Agent segmented control ──────────────────
+      {/* ── Rendered/Raw segmented control ────────────────────────
          WAI-ARIA tabs pattern: ArrowLeft/ArrowRight (and Home/End)
          move focus between tabs; Enter/Space activates. Each tab
          points at its panel via aria-controls so screen readers
          announce the relationship. The extra tab (e.g. EDIT) is
          a navigation trigger, not a panel, so it owns no panel id. */}
-      <TabStrip
-        view={effectiveView}
-        isSkill={isSkill}
-        onSelect={setView}
-        extraTab={extraTab}
-      />
+      <TabStrip view={view} onSelect={setView} extraTab={extraTab} />
 
       {/* ── Doc body ──────────────────────────────────────────────── */}
-      {effectiveView === "agent" ? (
-        <div id="docview-panel-agent" role="tabpanel" aria-labelledby="docview-tab-agent">
-          <AgentPreview vault={vault} />
-        </div>
-      ) : effectiveView === "rendered" ? (
+      {view === "rendered" ? (
         <div
           id="docview-panel-rendered"
           role="tabpanel"
@@ -177,19 +155,15 @@ export function DocumentView({ vault, docId, view: viewProp, onViewChange, extra
 // ── Segmented control with WAI-ARIA tabs keyboard handling ──────
 interface TabStripProps {
   view: ViewMode;
-  isSkill: boolean;
   onSelect: (next: ViewMode) => void;
   extraTab?: { label: string; onClick: () => void };
 }
 
-function TabStrip({ view, isSkill, onSelect, extraTab }: TabStripProps) {
+function TabStrip({ view, onSelect, extraTab }: TabStripProps) {
   const tabs: Array<{ key: ViewMode | "extra"; label: string; selected: boolean; onActivate: () => void }> = [
     { key: "rendered", label: "Rendered", selected: view === "rendered", onActivate: () => onSelect("rendered") },
     { key: "raw", label: "Raw", selected: view === "raw", onActivate: () => onSelect("raw") },
   ];
-  if (isSkill) {
-    tabs.push({ key: "agent", label: "Agent", selected: view === "agent", onActivate: () => onSelect("agent") });
-  }
   if (extraTab) {
     tabs.push({ key: "extra", label: extraTab.label, selected: false, onActivate: extraTab.onClick });
   }
@@ -238,27 +212,5 @@ function TabStrip({ view, isSkill, onSelect, extraTab }: TabStripProps) {
         })}
       </div>
     </div>
-  );
-}
-
-// ── Agent preview (skill docs only) ─────────────────────────────
-
-function AgentPreview({ vault }: { vault: string }) {
-  const helpQuery = useQuery({
-    queryKey: ["vault-skill-preview", vault],
-    queryFn: () => getVaultSkillPreview(vault),
-    retry: false,
-  });
-  if (helpQuery.isLoading) return <div className="p-4"><Skeleton className="h-64 w-full" /></div>;
-  if (helpQuery.isError)
-    return (
-      <Alert variant="destructive" className="m-4">
-        Failed to load agent preview.
-      </Alert>
-    );
-  return (
-    <pre className="font-mono text-[11px] leading-snug whitespace-pre-wrap bg-background border border-border rounded-[var(--radius-lg)] p-4">
-      {helpQuery.data}
-    </pre>
   );
 }
