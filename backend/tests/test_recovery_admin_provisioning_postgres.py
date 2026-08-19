@@ -1629,11 +1629,17 @@ async def test_credential_issue_replaces_the_credential_the_account_already_had(
     )
     actor_id, token_id = await _create_retirement_actor(pool)
     # The installed credential works before the rotation, and the session it
-    # mints is live.
+    # mints is live. That credential was delivered, so the session it mints
+    # may do nothing but replace it — resolve it through the entry point that
+    # serves the forced credential change, which is the one thing this account
+    # can still reach.
     signed_in = await auth_service.login("recovery-admin", _LOCAL_PASSWORD)
     assert signed_in["user"]["id"] == provisioned["user_id"]
     held_session = f"Bearer {signed_in['token']}"
-    assert await auth_service.resolve_rest_user_authorization(held_session) is not None
+    assert (
+        await auth_service.resolve_rest_credential_change_authorization(held_session)
+        is not None
+    )
 
     issued = await service.issue_recovery_admin_credential(
         expected_username="recovery-admin",

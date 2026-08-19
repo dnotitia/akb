@@ -101,6 +101,22 @@ class AccountSuspendedError(AKBError):
         )
 
 
+class CredentialChangeRequiredError(AKBError):
+    """A delivered local credential has not been replaced by its holder yet.
+
+    Local mode's counterpart to the identity provider's ``UPDATE_PASSWORD``
+    required action. The account authenticates, but the only thing the
+    resulting session may do is replace the credential it was issued.
+    """
+
+    def __init__(self):
+        super().__init__(
+            "This account must change its password before doing anything else",
+            status_code=403,
+            code="credential_change_required",
+        )
+
+
 class ExternalIdentityConflictError(AKBError):
     """Verified external claims conflict with an existing stable binding."""
 

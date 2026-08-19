@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response, 
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import ConfigDict, Field, field_validator
 
-from app.api.deps import get_current_user
+from app.api.deps import get_credential_change_user, get_current_user
 from app.config import settings
 from app.exceptions import (
     AuthenticationError,
@@ -701,7 +701,10 @@ async def delete_token(token_id: str, user: AuthenticatedUser = Depends(get_curr
 @router.post("/auth/change-password", summary="Change own password")
 async def change_password_route(
     req: ChangePasswordRequest,
-    user: AuthenticatedUser = Depends(get_current_user),
+    # The only route reachable by an account that still owes a change for a
+    # credential it was issued. Every other route refuses that account until
+    # this one has succeeded.
+    user: AuthenticatedUser = Depends(get_credential_change_user),
 ):
     require_local_auth_enabled()
     from app.services.auth_service import change_password, BadPasswordChange

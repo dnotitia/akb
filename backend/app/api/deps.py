@@ -17,6 +17,7 @@ from app.models.vault_scope import (
 from app.services.auth_service import (
     AuthenticatedUser,
     resolve_delegated_human_authorization,
+    resolve_rest_credential_change_authorization,
     resolve_rest_user_authorization,
     token_has_scope,
 )
@@ -167,10 +168,23 @@ async def get_current_user(
     _credentials: HTTPAuthorizationCredentials | None = Security(bearer_auth),
 ) -> AuthenticatedUser:
     """Extract and validate user from Authorization header. Required."""
+    return await _authenticated_user(request)
+
+
+async def _authenticated_user(
+    request: Request,
+    *,
+    for_credential_change: bool = False,
+) -> AuthenticatedUser:
     current_request_jwt_claims.set(None)
     authorization = request.headers.get("authorization")
     if authorization:
-        user = await resolve_rest_user_authorization(authorization)
+        resolve = (
+            resolve_rest_credential_change_authorization
+            if for_credential_change
+            else resolve_rest_user_authorization
+        )
+        user = await resolve(authorization)
     else:
         user = await _resolve_cookie_user(request, optional=False)
         if user is None:
@@ -190,6 +204,22 @@ async def get_current_user(
         )
     _apply_claim_header(request, user)
     return user
+
+
+async def get_credential_change_user(
+    request: Request,
+    _credentials: HTTPAuthorizationCredentials | None = Security(bearer_auth),
+) -> AuthenticatedUser:
+    """``get_current_user`` for the one route a forced change must reach.
+
+    An account owing a credential change is refused everywhere else, which
+    would include the route that clears the requirement — so exactly one
+    dependency carries the exemption, and only the change-password route
+    depends on it. Everything else about the resolution is unchanged: an
+    invalid credential is still 401, and an insufficient token scope is
+    still 403.
+    """
+    return await _authenticated_user(request, for_credential_change=True)
 
 
 async def get_optional_user(
