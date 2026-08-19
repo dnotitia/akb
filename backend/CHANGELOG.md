@@ -7,6 +7,30 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Added a non-human service authority for identity-provider-only workspaces
+
+An installation whose accounts all come from an identity provider had no way to
+give a control plane a first credential: every administrative call needs a
+bearer, and obtaining one needs an account. `keycloak_service_admin_client_id`
+now names one OIDC client whose client-credentials service account is admitted
+as a non-human AKB administrator. Blank — the default, and every existing
+installation — keeps the capability inert: no service-account token authorizes
+anything.
+
+It is verified by its own `keycloak-service-authority-v1` profile rather than
+by relaxing the human one, because a client-credentials token genuinely is a
+different object: it carries no audience, no session id, and no profile claim.
+The profile pins the realm and the exact authorized party instead, requires
+Keycloak's own machine markers to agree with it, and refuses any token carrying
+a human profile claim or the MCP route audience. The named client can never
+authorize a human route on either profile, and a client that is also an
+ordinary, companion, or `/admin` client is refused at configuration load.
+
+The resulting principal is a `service` account bound through the new
+`service_identities` table, kept deliberately out of the human
+`external_identities` population. The product administrator's prebound
+identity, invite-only enrollment, and the human assertion are unchanged.
+
 ### Added crash-safe worker runtime isolation
 
 Kubernetes now composes the serving API and durable background workers as

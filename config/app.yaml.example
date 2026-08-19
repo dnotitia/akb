@@ -222,6 +222,14 @@ app_credential_overlap_seconds: 300
 #                                         # must differ from every ordinary human client
 # keycloak_management_client_id: "akb-sso-manager" # standalone bundle only:
 #                                         # permanent least-privilege IdP control client
+# keycloak_service_admin_client_id: ""    # blank (default) → no service-account
+#                                         # token authorizes anything. Naming a
+#                                         # client admits its client-credentials
+#                                         # service account as a NON-HUMAN AKB
+#                                         # administrator, so possession of that
+#                                         # client's secret becomes administrative
+#                                         # authority here. It must not be an
+#                                         # ordinary, companion, or /admin client.
 # admin_browser_session_ttl_secs: 900     # also capped by the verified ID-token expiry
 # Required for every SSO-mode start, including a staged ordinary-browser
 # rollout. Generate one UUID per installation and persist it across normal
