@@ -38,6 +38,7 @@ from app.services.resource_hash import (
 )
 from app.services.s3_delete_worker import cancel_delete as _cancel_s3_delete
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
+from app.services import skill_policy
 from app.services.uri_service import file_uri
 from app.services.m1_file_measurement import MeasurementFileService, measurement_enabled
 
@@ -364,6 +365,17 @@ class FileService:
         """
         if content_hash is not None and not is_sha256_hex(content_hash):
             raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
+        # Ahead of the backend split: the measurement facade normalizes the
+        # collection itself, so guarding at this method's own normalization
+        # site (below) would leave the native backend unreserved. A path that
+        # will not normalize cannot reach the reserved namespace either, so it
+        # falls through and raises at the original site — hoisting the
+        # normalizer must not move that error ahead of the storage call.
+        try:
+            _requested_collection = _normalize_collection_path(collection)
+        except ValueError:
+            _requested_collection = None
+        skill_policy.check_resource_collection(_requested_collection)
         if self._measurement is not None:
             return await self._measurement.initiate_upload(
                 vault_name=vault_name, vault_id=vault_id, collection=collection,

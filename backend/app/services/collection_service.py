@@ -28,6 +28,7 @@ from app.services.kg_service import delete_document_relations
 from app.services.m1_file_measurement import _tombstone_native_text_file
 from app.services.publication_service import delete_publications_for_file
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
+from app.services import skill_policy
 from app.services.uri_service import file_uri, table_uri
 from app.services.write_lane import run_git_write, write_lane
 
@@ -213,6 +214,7 @@ class CollectionService:
         collection.
         """
         norm = _normalize_path(path)
+        skill_policy.check_collection_delete(norm)
         vault_repo, coll_repo = await self._repos()
         vault_id = await vault_repo.get_id_by_name(vault)
         if not vault_id:
