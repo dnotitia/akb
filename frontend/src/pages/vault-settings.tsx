@@ -165,6 +165,11 @@ export default function VaultSettingsPage() {
   }, [name]);
 
   const canEdit = info?.role === "owner";
+  // Vault metadata is owner-only, but the vault guide is an ordinary document
+  // write — the backend accepts a canonical body update from any writer (the
+  // skill guards only pin the type). Same rule the document page uses.
+  const canWrite =
+    info?.role === "writer" || info?.role === "admin" || info?.role === "owner";
   const savedPublic = (info?.public_access as PublicAccess) || "none";
   const dirty = Boolean(
     info && (description !== (info.description || "") || publicAccess !== savedPublic),
@@ -517,6 +522,7 @@ export default function VaultSettingsPage() {
         // mirror note replaces it.
         loading={skillQuery.isLoading || (!info && !loadError)}
         isMirror={info?.is_external_git}
+        canWrite={canWrite}
       />
 
       {/* § LIFECYCLE — the two non-destructive lifecycle controls grouped into

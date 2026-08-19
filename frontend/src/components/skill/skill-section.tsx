@@ -29,6 +29,13 @@ interface Props {
   /** External-git mirror vaults never carry a vault guide (backend excludes
    *  them from the seed and the reservation backfill). */
   isMirror?: boolean;
+  /**
+   * Vault write role (writer/admin/owner), matching the document page's
+   * affordance rule. Required, not defaulted, so a caller that forgets it
+   * fails closed at the type level instead of showing a reader controls the
+   * backend will reject. Read surfaces (preview, agent view, history) stay.
+   */
+  canWrite: boolean;
 }
 
 /**
@@ -42,7 +49,7 @@ interface Props {
  * backend's pinned-type guard would reject the save. Title/type/tags on this
  * doc are system-managed anyway.
  */
-export function SkillSection({ vault, doc, loading, isMirror }: Props) {
+export function SkillSection({ vault, doc, loading, isMirror, canWrite }: Props) {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState("preview");
   const [draft, setDraft] = useState("");
@@ -135,10 +142,12 @@ export function SkillSection({ vault, doc, loading, isMirror }: Props) {
                   </Link>
                 </Button>
               )}
-              <Button variant="ghost" size="sm" onClick={() => setResetOpen(true)}>
-                <RotateCcw className="h-3 w-3" aria-hidden />
-                Reset to template
-              </Button>
+              {canWrite && (
+                <Button variant="ghost" size="sm" onClick={() => setResetOpen(true)}>
+                  <RotateCcw className="h-3 w-3" aria-hidden />
+                  Reset to template
+                </Button>
+              )}
             </div>
           </div>
 
@@ -146,7 +155,7 @@ export function SkillSection({ vault, doc, loading, isMirror }: Props) {
             <TabsList>
               <TabsTrigger value="preview">Preview</TabsTrigger>
               <TabsTrigger value="agent">Agent view</TabsTrigger>
-              <TabsTrigger value="edit">Edit</TabsTrigger>
+              {canWrite && <TabsTrigger value="edit">Edit</TabsTrigger>}
             </TabsList>
 
             <TabsContent value="preview">
@@ -171,6 +180,7 @@ export function SkillSection({ vault, doc, loading, isMirror }: Props) {
               <AgentPreview vault={vault} />
             </TabsContent>
 
+            {canWrite && (
             <TabsContent value="edit">
               <Textarea
                 aria-label="Vault guide body"
@@ -206,6 +216,7 @@ export function SkillSection({ vault, doc, loading, isMirror }: Props) {
                 </Button>
               </div>
             </TabsContent>
+            )}
           </Tabs>
         </>
       )}

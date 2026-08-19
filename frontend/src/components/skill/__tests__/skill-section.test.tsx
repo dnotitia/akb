@@ -38,7 +38,7 @@ beforeEach(() => {
 describe("SkillSection", () => {
   it("renders the editor surface for a normal vault with a guide", async () => {
     const u = userEvent.setup();
-    render(wrap(<SkillSection vault="my-v" doc={DOC} />));
+    render(wrap(<SkillSection vault="my-v" doc={DOC} canWrite />));
 
     // Anchor for the #skill redirect target.
     expect(document.getElementById("skill")).toBeTruthy();
@@ -61,7 +61,7 @@ describe("SkillSection", () => {
   it("saves the edited body with a content-only PATCH", async () => {
     updateDocument.mockResolvedValue({ ok: true });
     const u = userEvent.setup();
-    render(wrap(<SkillSection vault="my-v" doc={DOC} />));
+    render(wrap(<SkillSection vault="my-v" doc={DOC} canWrite />));
 
     await u.click(screen.getByRole("tab", { name: /^edit$/i }));
     await u.type(screen.getByLabelText(/vault guide body/i), " more");
@@ -78,7 +78,7 @@ describe("SkillSection", () => {
     getSkillTemplate.mockResolvedValue("# {vault} Vault Skill\n\nBody");
     updateDocument.mockResolvedValue({ ok: true });
     const u = userEvent.setup();
-    render(wrap(<SkillSection vault="my-v" doc={DOC} />));
+    render(wrap(<SkillSection vault="my-v" doc={DOC} canWrite />));
 
     await u.click(screen.getByRole("button", { name: /reset to template/i }));
     expect(await screen.findByText(/replace current content/i)).toBeTruthy();
@@ -91,15 +91,26 @@ describe("SkillSection", () => {
     );
   });
 
+  it("hides Edit and Reset for a reader but keeps the read surfaces", () => {
+    render(wrap(<SkillSection vault="my-v" doc={DOC} canWrite={false} />));
+
+    expect(screen.queryByRole("tab", { name: /^edit$/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /reset to template/i })).toBeNull();
+    // Preview, Agent view and History are reads — a reader keeps them.
+    expect(screen.getByText(/Stored body/)).toBeTruthy();
+    expect(screen.getByRole("tab", { name: /agent view/i })).toBeTruthy();
+    expect(screen.getByRole("link", { name: /history/i })).toBeTruthy();
+  });
+
   it("renders the mirror note instead of the editor for an external-git vault", () => {
-    render(wrap(<SkillSection vault="mirror-v" doc={null} isMirror />));
+    render(wrap(<SkillSection vault="mirror-v" doc={null} isMirror canWrite />));
     expect(screen.getByText(/mirror vaults don't carry a vault guide/i)).toBeTruthy();
     expect(screen.queryByRole("tab", { name: /^edit$/i })).toBeNull();
     expect(screen.queryByRole("button", { name: /reset to template/i })).toBeNull();
   });
 
   it("renders the backfill note (and no create button) when the guide is missing", () => {
-    render(wrap(<SkillSection vault="my-v" doc={null} />));
+    render(wrap(<SkillSection vault="my-v" doc={null} canWrite />));
     expect(screen.getByText(/restored automatically by the system backfill/i)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /create/i })).toBeNull();
     expect(screen.queryByRole("tab", { name: /^edit$/i })).toBeNull();
