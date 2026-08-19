@@ -176,12 +176,23 @@ async def provision_local_recovery_admin(
                     if collision:
                         raise RecoveryAdminConflictError()
                     user_id = uuid.uuid4()
+                    # The operator supplied or generated this password in a
+                    # file and hands it to the administrator, so it is a
+                    # delivered credential and is owed a replacement. The SSO
+                    # profile creates its product administrator the same way:
+                    # a `temporary` credential plus the UPDATE_PASSWORD
+                    # required action. Only creation arms it — the
+                    # convergence branch above leaves the credential column
+                    # alone, so re-running provisioning must not re-arm a
+                    # marker the holder has already cleared.
                     row = await conn.fetchrow(
                         """
                         INSERT INTO users (
                             id, username, email, password_hash, is_admin,
-                            is_recovery_admin, auth_provider, account_status, account_kind
-                        ) VALUES ($1, $2, $3, $4, true, true, 'local', 'active', 'human')
+                            is_recovery_admin, auth_provider, account_status, account_kind,
+                            credential_change_required
+                        ) VALUES ($1, $2, $3, $4, true, true, 'local', 'active', 'human',
+                                  true)
                         RETURNING id, username, email, password_hash, is_admin,
                                   is_recovery_admin, auth_provider, account_status, account_kind
                         """,
@@ -611,6 +622,9 @@ async def retire_local_recovery_admin(
                            is_admin = false,
                            account_status = 'suspended',
                            password_hash = $2,
+                           -- The tombstone is not a credential anyone was
+                           -- handed, so there is nothing left to replace.
+                           credential_change_required = false,
                            tokens_revoked_before = NOW(),
                            updated_at = NOW()
                      WHERE id = $1

@@ -184,7 +184,7 @@ async def test_rest_local_mode_selects_only_local_profile_without_fallback(monke
     async def forbidden_keycloak(*_args, **_kwargs):
         raise AssertionError("local REST must not try the Keycloak verifier")
 
-    async def project(value):
+    async def project(value, **_kwargs):
         assert value is principal
         return actor
 
@@ -217,7 +217,7 @@ async def test_rest_sso_mode_selects_only_api_access_profile_without_fallback(mo
         calls.append((token, route_profile))
         return principal
 
-    async def project(value):
+    async def project(value, **_kwargs):
         assert value is principal
         return actor
 

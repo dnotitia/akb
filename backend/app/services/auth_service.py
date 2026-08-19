@@ -27,6 +27,7 @@ from app.exceptions import (
     AccountSuspendedError,
     AuthenticationError,
     ConflictError,
+    CredentialChangeRequiredError,
     ExternalAuthDisabledError,
     ExternalIdentityConflictError,
     ExternalProfileReadOnlyError,
@@ -263,6 +264,11 @@ async def register(username: str, email: str, password: str, display_name: str |
         if existing:
             raise ConflictError("Username or email already exists")
 
+        # Self-service signup deliberately leaves credential_change_required
+        # at its false default: this password was chosen by the person who
+        # will use it, never delivered to them, so there is nothing to
+        # replace. Arming it here would force a change on an account that
+        # was never issued a credential.
         is_admin = await conn.fetchval(
             """
             INSERT INTO users (id, username, email, password_hash, display_name, is_admin)
@@ -596,10 +602,22 @@ async def _project_keycloak_principal(
 
 async def project_verified_principal(
     principal: VerifiedPrincipal,
+    *,
+    for_credential_change: bool = False,
 ) -> AuthenticatedUser | None:
-    """Common verified-human boundary before existing AKB authorization."""
+    """Common verified-human boundary before existing AKB authorization.
+
+    ``for_credential_change`` is the single exemption from the local
+    forced-credential-change refusal, and belongs to the change-password
+    route alone. Defaulting it to False is what keeps the refusal
+    fail-closed: a future caller of this boundary is gated unless it
+    deliberately asks not to be.
+    """
     if principal.profile_id == LOCAL_SESSION_RS256_V2:
-        return await _project_local_session_principal(principal)
+        return await _project_local_session_principal(
+            principal,
+            for_credential_change=for_credential_change,
+        )
     if principal.profile_id == KEYCLOAK_ACCESS_V1:
         return await _project_keycloak_principal(principal)
     return None
@@ -655,8 +673,17 @@ async def change_password(user_id: str, current: str, new: str) -> None:
             if await verify_password_async(new, row["password_hash"]):
                 raise BadPasswordChange("New password must differ from current")
 
+            # Clearing the marker belongs in the same statement as the new
+            # hash: the marker describes the credential in that column, so
+            # the two can never be observed disagreeing.
             await conn.execute(
-                "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
+                """
+                UPDATE users
+                   SET password_hash = $1,
+                       credential_change_required = false,
+                       updated_at = NOW()
+                 WHERE id = $2
+                """,
                 await hash_password_async(new),
                 uuid.UUID(user_id),
             )
@@ -996,6 +1023,31 @@ async def resolve_rest_user_authorization(
     authorization: str,
 ) -> AuthenticatedUser | None:
     """Resolve the REST capability without token-directed verifier dispatch."""
+    return await _resolve_rest_authorization(authorization)
+
+
+async def resolve_rest_credential_change_authorization(
+    authorization: str,
+) -> AuthenticatedUser | None:
+    """Resolve the REST capability for the forced credential change alone.
+
+    Identical to ``resolve_rest_user_authorization`` except that this is the
+    one entry point exempt from the forced-credential-change refusal. A
+    separate name rather than a flag is what makes the exemption narrow:
+    the resolver every other route reaches cannot be asked to skip the
+    refusal at all.
+    """
+    return await _resolve_rest_authorization(
+        authorization,
+        for_credential_change=True,
+    )
+
+
+async def _resolve_rest_authorization(
+    authorization: str,
+    *,
+    for_credential_change: bool = False,
+) -> AuthenticatedUser | None:
     _reset_request_credential_context()
     token = _bearer_token(authorization)
     if token is None:
@@ -1009,7 +1061,10 @@ async def resolve_rest_user_authorization(
         principal = await verify_keycloak_access_v1(token, "api")
     if principal is None:
         return None
-    return await project_verified_principal(principal)
+    return await project_verified_principal(
+        principal,
+        for_credential_change=for_credential_change,
+    )
 
 
 async def resolve_mcp_authorization(authorization: str) -> AuthenticatedUser | None:
@@ -1057,6 +1112,8 @@ async def resolve_token(authorization: str) -> AuthenticatedUser | None:
 
 async def _project_local_session_principal(
     principal: VerifiedPrincipal,
+    *,
+    for_credential_change: bool = False,
 ) -> AuthenticatedUser | None:
     """Project a verified local session onto its active AKB account."""
     iat = principal.claims["iat"]
@@ -1066,6 +1123,7 @@ async def _project_local_session_principal(
             row = await conn.fetchrow(
                 """
                 SELECT id, username, email, display_name, is_admin,
+                       credential_change_required,
                        CEIL(EXTRACT(EPOCH FROM tokens_revoked_before))::bigint
                            AS revoked_epoch_ceil
                   FROM users
@@ -1094,6 +1152,16 @@ async def _project_local_session_principal(
             # issued in the same second as revoke would survive.
             if int(iat) < int(row["revoked_epoch_ceil"]):
                 return None
+
+            # A credential this account was handed, and has not replaced,
+            # buys exactly one capability: replacing it. The refusal is
+            # here rather than at each route because this is the only
+            # place a local password becomes request authority, so a route
+            # added later is covered without being told about it. It is a
+            # raise, not a None, so the caller can be told what to do
+            # instead of being told its credential is invalid.
+            if row["credential_change_required"] and not for_credential_change:
+                raise CredentialChangeRequiredError()
 
             return AuthenticatedUser(
                 user_id=str(row["id"]),

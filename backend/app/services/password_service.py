@@ -57,6 +57,11 @@ async def reset_password(
 ) -> tuple[str, str]:
     """Generate a temp password, replace the user's password_hash, emit audit.
 
+    The account is left owing a credential change, so the delivered value
+    stops being a working password the moment its holder signs in with it —
+    the local equivalent of the identity provider's ``temporary`` credential
+    plus ``UPDATE_PASSWORD`` required action.
+
     Returns (temp_password, username). `actor_id` is None for CLI invocations
     (no authenticated principal); audit event carries `method` to distinguish.
     """
@@ -80,8 +85,26 @@ async def reset_password(
                 raise PasswordLifecycleUnavailableError()
 
             temp = generate_temp_password()
+            # The returned value is delivered to a person out-of-band, which
+            # is what makes it temporary: the marker is set in the same
+            # statement that installs the hash, so the account cannot be
+            # observed holding an issued credential without owing a
+            # replacement for it. change_password clears it.
+            #
+            # Only the sessions this credential can produce are limited.
+            # Personal Access Tokens the account already holds keep working,
+            # deliberately and consistently with the session revoke below:
+            # a PAT is not the credential that was just handed over, and
+            # breaking stored integrations on every administrative reset is
+            # a different (and larger) change than this one.
             await conn.execute(
-                "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
+                """
+                UPDATE users
+                   SET password_hash = $1,
+                       credential_change_required = true,
+                       updated_at = NOW()
+                 WHERE id = $2
+                """,
                 await hash_password_async(temp),
                 row["id"],
             )

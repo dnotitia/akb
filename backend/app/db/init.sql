@@ -54,6 +54,15 @@ CREATE TABLE IF NOT EXISTS users (
     account_kind TEXT NOT NULL DEFAULT 'human'
         CONSTRAINT users_account_kind_check
         CHECK (account_kind IN ('human', 'service')),
+    -- Local counterpart to the identity provider's UPDATE_PASSWORD required
+    -- action. TRUE while a credential that was issued to this account and
+    -- handed over out-of-band has not yet been replaced by its holder; a
+    -- session projected from it may do nothing but change the password.
+    -- Set by password reset and local recovery-admin provisioning, cleared
+    -- by change_password. Self-service registration never sets it, so every
+    -- account that has never had a credential issued keeps this default.
+    -- See migration 080.
+    credential_change_required BOOLEAN NOT NULL DEFAULT false,
     CONSTRAINT users_recovery_admin_requires_admin
         CHECK (NOT is_recovery_admin OR is_admin),
     CONSTRAINT users_recovery_admin_provider_check
