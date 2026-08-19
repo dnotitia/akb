@@ -4,6 +4,7 @@ import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom"
 import { ArrowLeft, ArrowRight, Check, ChevronRight, FolderPlus } from "lucide-react";
 import { ApiError, putDocument } from "@/lib/api";
 import { DOC_TYPES, type DocType } from "@/lib/doc-constants";
+import { isReservedCollection } from "@/lib/skill";
 import { useVaultTree, type TreeNode } from "@/hooks/use-vault-tree";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import { MarkdownEditorFallback } from "@/components/markdown-editor-fallback";
@@ -44,7 +45,10 @@ export default function DocumentNewPage() {
   // accepted (the field stays a free-text input — created automatically when
   // the typed path doesn't exist yet).
   const collectionOptions = useMemo(
-    () => Array.from(new Set(collectCollectionPaths(tree ?? []))).sort(),
+    () =>
+      Array.from(new Set(collectCollectionPaths(tree ?? [])))
+        .filter((c) => !isReservedCollection(c))
+        .sort(),
     [tree],
   );
   const [title, setTitle] = useState("");
@@ -152,6 +156,12 @@ export default function DocumentNewPage() {
       return fail(
         "collection",
         "Collection must use lowercase letters, digits, hyphens, underscores, and / only.",
+      );
+    }
+    if (isReservedCollection(c)) {
+      return fail(
+        "collection",
+        "'overview' is a system collection reserved for the vault guide. Pick a different collection.",
       );
     }
     if (!body.trim()) return fail("body", "Body cannot be empty.");

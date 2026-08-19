@@ -64,7 +64,9 @@ export const NewDocumentBlank: Story = {
 export const NewDocumentPrefilledCollection: Story = {
   name: "Document create / prefilled collection",
   parameters: {
-    router: { initialEntries: ["/vault/akb/doc/new?collection=overview"] },
+    // `overview` is the reserved system collection and is filtered out of the
+    // picker, so the prefill fixture uses an ordinary collection instead.
+    router: { initialEntries: ["/vault/akb/doc/new?collection=runbooks"] },
     msw: {
       handlers: resourceShellHandlers,
     },
@@ -72,7 +74,7 @@ export const NewDocumentPrefilledCollection: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByDisplayValue("overview")).toBeInTheDocument();
+    await expect(await canvas.findByDisplayValue("runbooks")).toBeInTheDocument();
     await expect(await canvas.findByText("Existing collection")).toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
