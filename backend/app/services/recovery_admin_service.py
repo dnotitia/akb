@@ -127,8 +127,17 @@ async def provision_local_recovery_admin(
     username: str,
     email: str,
     password: str,
+    credential_issued_by_akb: bool = True,
 ) -> dict:
-    """Create the one local recovery admin, or converge on its exact identity."""
+    """Create the one local recovery admin, or converge on its exact identity.
+
+    ``credential_issued_by_akb`` says whether this password is one AKB
+    produced and handed back, which is the generated-output-file form of the
+    provisioning command. That is the only shape in which provisioning
+    delivers a credential to anybody, and delivery is what the forced
+    credential change is about. Defaulting it to True keeps the requirement
+    fail-closed for a caller that does not say.
+    """
     _require_mode("local")
     username = _required(username, "username")
     email = _email(email)
@@ -176,15 +185,26 @@ async def provision_local_recovery_admin(
                     if collision:
                         raise RecoveryAdminConflictError()
                     user_id = uuid.uuid4()
-                    # The operator supplied or generated this password in a
-                    # file and hands it to the administrator, so it is a
-                    # delivered credential and is owed a replacement. The SSO
-                    # profile creates its product administrator the same way:
-                    # a `temporary` credential plus the UPDATE_PASSWORD
-                    # required action. Only creation arms it — the
-                    # convergence branch above leaves the credential column
-                    # alone, so re-running provisioning must not re-arm a
-                    # marker the holder has already cleared.
+                    # A credential AKB produced here is one AKB hands over —
+                    # it leaves in the operator's output file — so it is
+                    # delivered, and is owed a replacement exactly like the
+                    # one `reset_password` issues. The SSO profile creates
+                    # its product administrator the same way: a `temporary`
+                    # credential plus the UPDATE_PASSWORD required action.
+                    #
+                    # A credential the caller supplied is a different event.
+                    # The value existed before this process saw it, nobody
+                    # received it from AKB, and whoever runs the installation
+                    # already holds it — including when that is a machine,
+                    # which then signs in as this account to establish the
+                    # service principal the installation runs as. Arming the
+                    # requirement there refuses the installer's own bootstrap
+                    # for a delivery that never happened.
+                    #
+                    # Only creation arms it — the convergence branch above
+                    # leaves the credential column alone, so re-running
+                    # provisioning must not re-arm a marker the holder has
+                    # already cleared.
                     row = await conn.fetchrow(
                         """
                         INSERT INTO users (
@@ -192,7 +212,7 @@ async def provision_local_recovery_admin(
                             is_recovery_admin, auth_provider, account_status, account_kind,
                             credential_change_required
                         ) VALUES ($1, $2, $3, $4, true, true, 'local', 'active', 'human',
-                                  true)
+                                  $5)
                         RETURNING id, username, email, password_hash, is_admin,
                                   is_recovery_admin, auth_provider, account_status, account_kind
                         """,
@@ -200,6 +220,7 @@ async def provision_local_recovery_admin(
                         username,
                         email,
                         password_hash,
+                        credential_issued_by_akb,
                     )
                     await _emit_provisioned(conn, user_id, "local")
                     created = True

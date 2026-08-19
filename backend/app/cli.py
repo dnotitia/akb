@@ -257,6 +257,12 @@ async def _provision_recovery_admin(args: list[str]) -> int:
                 username=parsed.username,
                 email=parsed.email,
                 password=password,
+                # True for exactly the branch above that produced the value
+                # and wrote it into an operator-owned file: that is AKB
+                # handing a credential to a person, so the account it creates
+                # owes a replacement for it. A caller-supplied password was
+                # never handed over by AKB.
+                credential_issued_by_akb=generated_path is not None,
             )
         else:
             report = await provision_sso_recovery_admin(
