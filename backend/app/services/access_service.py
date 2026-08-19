@@ -1616,6 +1616,19 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
             await conn.execute("DELETE FROM vault_access WHERE vault_id = $1", vault_id)
             await conn.execute("DELETE FROM vaults WHERE id = $1", vault_id)
 
+    # POST-COMMIT, and deliberately ahead of the on-disk/role cleanup below so
+    # it still runs if either of those fails: the vault-skill cache is keyed on
+    # vault NAME, so a same-named recreate within the cache TTL would otherwise
+    # serve the DELETED vault's skill body to the new vault's readers.
+    # Over-invalidating costs one re-fetch; under-invalidating is a
+    # cross-vault disclosure.
+    try:
+        from app.services import vault_skill_service
+
+        vault_skill_service.invalidate(vault_name)
+    except Exception as e:  # noqa: BLE001 — never fail a delete over a cache pop
+        logger.warning("vault_skill cache invalidate failed for %s: %s", vault_name, e)
+
     # Legacy on-disk cleanup: bare repo + persistent worktree. Both must go,
     # otherwise a same-named recreate hits stale state on its second commit.
     # Native-ledger sentinel vaults have no filesystem authority, so even

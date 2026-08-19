@@ -70,6 +70,52 @@ async def test_body_clipped(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_mirror_vault_never_injected_or_fetched(monkeypatch):
+    """Mirror exclusion is a security control, so exercise the REAL
+    `_fetch_skill` — every other test stubs it away. An external-git mirror
+    must yield no payload AND must never reach the document read: upstream
+    markdown may not enter agent context through the automatic channel.
+    """
+    import uuid
+
+    import app.db.postgres as pg
+    import app.repositories.vault_external_git_repo as veg
+    import app.repositories.vault_repo as vr
+    import app.services.revision_backend as rb
+
+    vault_id = uuid.uuid4()
+
+    async def fake_pool():
+        return "POOL"
+
+    class FakeVaultRepo:
+        def __init__(self, pool):
+            pass
+
+        async def get_id_by_name(self, name):
+            return vault_id
+
+    class FakeExtRepo:
+        def __init__(self, pool):
+            pass
+
+        async def exists(self, vid):
+            assert vid == vault_id
+            return True
+
+    def _never():
+        raise AssertionError("mirror vault must not reach the document service")
+
+    monkeypatch.setattr(pg, "get_pool", fake_pool)
+    monkeypatch.setattr(vr, "VaultRepository", FakeVaultRepo)
+    monkeypatch.setattr(veg, "VaultExternalGitRepository", FakeExtRepo)
+    monkeypatch.setattr(rb, "get_document_service", _never)
+
+    assert await vss._fetch_skill("mirror") is None
+    assert await vss.injection_payload("s", "mirror") is None
+
+
+@pytest.mark.asyncio
 async def test_session_map_bounded(monkeypatch):
     monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch())
     monkeypatch.setattr(vss, "_SESSION_MAP_MAX", 3)

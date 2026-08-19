@@ -986,10 +986,22 @@ class DocumentService:
                     f"actual {row['current_commit']}"
                 )
 
-            return await self._update_locked(
+            response = await self._update_locked(
                 req=req, agent_id=agent_id, vault=vault,
                 vault_id=vault_id, doc_repo=doc_repo, row=row, conn=conn,
             )
+
+        # POST-COMMIT. `_path_lock` owns the transaction (it yields inside
+        # `lock_conn.transaction()`), so it commits only as the `async with`
+        # above exits — which is why this cannot live inside `_update_locked`.
+        # Invalidating pre-commit leaves a window in which a concurrent reader
+        # misses, re-reads the *old* row, and re-caches it; no second
+        # invalidation would ever follow, so the stale body would be served for
+        # a full TTL.
+        if file_path == skill_policy.VAULT_SKILL_PATH:
+            from app.services import vault_skill_service
+            vault_skill_service.invalidate(vault)
+        return response
 
     async def _update_locked(self, *, req, agent_id, vault, vault_id, doc_repo, row, conn) -> DocumentPutResponse:
         now = datetime.now(timezone.utc)
@@ -1057,9 +1069,6 @@ class DocumentService:
             hash_algorithm=HASH_ALGORITHM, content_hash_commit=commit_hash,
             tags=req.tags, conn=conn,
         )
-        if file_path == skill_policy.VAULT_SKILL_PATH:
-            from app.services import vault_skill_service
-            vault_skill_service.invalidate(vault)
         await asset_service.sync_document_assets(
             conn,
             document_id=pg_doc_id,

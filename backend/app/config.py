@@ -321,8 +321,10 @@ class VaultSkillSettings(BaseModel):
     # clipped with truncated=true and a pointer to akb_help — response size,
     # not a search index, so a hard clip is honest.
     body_max_bytes: int = Field(default=16384, ge=1024, le=1_048_576)
-    # Per-vault version/body cache TTL. Write-through invalidation covers the
-    # single-replica API; the TTL is the safety net for future replicas.
+    # Per-vault version/body cache TTL. Post-commit write-through invalidation
+    # (document update + vault delete) covers the single-replica API
+    # completely; this TTL is purely the safety net for future replicas, which
+    # would not see each other's invalidations.
     cache_ttl_secs: int = Field(default=60, ge=1, le=3600)
     # Bound on the (session, vault) tracking map. Eviction's only cost is one
     # harmless re-injection.

@@ -6,8 +6,17 @@ the tool call on failure — a lookup error is logged and skipped.
 
 Session tracking is (session_id, vault) → last-injected skill version, so a
 long-lived session re-receives the skill exactly when it changes. The vault
-cache holds (version, body) with a short TTL plus write-through invalidation
-from the document services (same-process; API replicas=1 today).
+cache holds (version, body) with a short TTL plus write-through invalidation.
+
+Every in-process writer that can change what this cache holds calls
+`invalidate()` AFTER its transaction commits — the document update in both
+backends, and vault delete (the cache is name-keyed, so a same-named recreate
+must not inherit the old vault's entry). Invalidating pre-commit would be
+worse than not invalidating: a concurrent reader would miss, re-read the
+pre-commit row, re-cache it, and no second invalidation would ever follow.
+With that discipline the TTL is genuinely just the cross-process safety net —
+it is what would bound staleness if the API ever ran more than one replica
+(it is replicas=1 today), not a cover for same-process gaps.
 
 Mirror vaults are excluded even when the upstream repo carries an
 overview/vault-skill.md: auto-injecting upstream-controlled markdown into
@@ -56,7 +65,8 @@ def reset() -> None:
 
 
 def invalidate(vault: str) -> None:
-    """Write-through hook: a commit landed on the canonical path."""
+    """Write-through hook: a commit landed on the canonical path, or the vault
+    itself was deleted. Callers MUST be past their commit — see module docs."""
     _vault_cache.pop(vault, None)
 
 
