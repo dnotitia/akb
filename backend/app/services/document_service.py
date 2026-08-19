@@ -130,6 +130,7 @@ from app.repositories.vault_external_git_repo import VaultExternalGitRepository
 from app.repositories.vault_repo import VaultRepository, lock_vault_for_child_write
 from app.services.git_service import GitService
 from app.services import asset_service
+from app.services import skill_policy
 from app.services.index_service import (
     build_doc_metadata_header,
     chunk_markdown,
@@ -554,11 +555,15 @@ class DocumentService:
         agent_id: str | None = None,
         *,
         allow_unavailable_asset_refs: bool = False,
+        skill_internal: bool = False,
     ) -> DocumentPutResponse:
         if req.status not in DOC_STATUSES:
             raise ValidationError(
                 f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}"
             )
+        skill_policy.check_put(
+            _normalize_collection(req.collection), req.type, internal=skill_internal,
+        )
         vault_repo, doc_repo, coll_repo = await self._repos()
 
         vault_id = await vault_repo.get_id_by_name(req.vault)
@@ -960,6 +965,7 @@ class DocumentService:
         if not row:
             raise NotFoundError("Document", doc_ref)
         file_path = row["path"]
+        skill_policy.check_update_type(file_path, req.type)
 
         async with self._path_lock(vault_id, file_path, vault_name=vault) as conn:
             # Re-read under the lock so we observe any commit that landed
@@ -1124,6 +1130,7 @@ class DocumentService:
         self, vault: str, doc_ref: str, *,
         collection: str | None = None, slug: str | None = None,
         message: str | None = None, agent_id: str | None = None,
+        skill_internal: bool = False,
     ) -> DocumentPutResponse:
         """Move/rename a document: change its collection and/or slug while
         keeping its identity (id). The move is a ``git mv``, so ``git log
@@ -1167,6 +1174,7 @@ class DocumentService:
             return nc, ns, _doc_path(nc, ns)
 
         _, _, est_new_path = _target(old_path, row["id"])
+        skill_policy.check_move(old_path, est_new_path, internal=skill_internal)
 
         async with self._move_lock(vault_id, old_path, est_new_path, vault_name=vault) as conn:
             # Re-read under the lock and recompute the target from fresh state.
@@ -1180,6 +1188,7 @@ class DocumentService:
             old_collection_id = row["collection_id"]
 
             new_coll, new_base_slug, base_new_path = _target(old_path, pg_doc_id)
+            skill_policy.check_move(old_path, base_new_path, internal=skill_internal)
             if base_new_path == old_path:
                 raise ValidationError(
                     "move is a no-op: the target path equals the current path"
@@ -1564,6 +1573,7 @@ class DocumentService:
         if not row:
             raise NotFoundError("Document", doc_ref)
         file_path = row["path"]
+        skill_policy.check_delete(file_path)
 
         async with self._path_lock(vault_id, file_path, vault_name=vault) as conn:
             # Re-resolve under the lock — a concurrent delete may have run.
@@ -2103,7 +2113,11 @@ class DocumentService:
                 # put() calls coll_repo.get_or_create internally, so no
                 # separate create_empty is needed.
                 seed_req = build_vault_skill_seed_request(name)
-                await self.put(seed_req, agent_id=str(owner_id) if owner_id else None)
+                await self.put(
+                    seed_req,
+                    agent_id=str(owner_id) if owner_id else None,
+                    skill_internal=True,
+                )
         except BaseException:
             # run_compensation: the whole rollback runs to COMPLETION even
             # if the cancellation that may be unwinding us keeps firing;
