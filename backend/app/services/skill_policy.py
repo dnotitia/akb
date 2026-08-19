@@ -58,7 +58,10 @@ def check_put(collection: str | None, doc_type: str, *, internal: bool = False) 
 
 def check_update_type(path: str, new_type: str | None) -> None:
     """Retype rules. Body/other-frontmatter updates are always allowed."""
-    if new_type is None:
+    # Falsy = type untouched. Both backends merge with `if req.type:`
+    # (document_service._update_locked, native _update_from_snapshot), so an
+    # empty string is a no-op there and must not raise here.
+    if not new_type:
         return
     if path == VAULT_SKILL_PATH:
         if new_type != SKILL_DOC_TYPE:

@@ -64,6 +64,10 @@ class TestCheckUpdateType:
         sp.check_update_type("notes/a.md", "report")
         sp.check_update_type("notes/a.md", None)
 
+    def test_empty_string_type_is_ignored(self):
+        sp.check_update_type(sp.VAULT_SKILL_PATH, "")
+        sp.check_update_type("notes/a.md", "")
+
 
 class TestCheckMove:
     def test_move_out_of_overview_blocked(self):
