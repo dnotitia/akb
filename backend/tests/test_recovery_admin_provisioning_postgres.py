@@ -14,6 +14,7 @@ import asyncpg
 import pytest
 
 
+
 pytestmark = pytest.mark.asyncio
 
 _BACKEND = Path(__file__).resolve().parents[1]
@@ -103,6 +104,7 @@ async def services(monkeypatch):
             access_service,
             account_service,
             auth_service,
+            password_service,
             recovery_admin_service,
         )
 
@@ -115,6 +117,7 @@ async def services(monkeypatch):
             access_service,
             account_service,
             auth_service,
+            password_service,
             recovery_admin_service,
         ):
             monkeypatch.setattr(module, "get_pool", _get_pool)
@@ -1600,3 +1603,462 @@ async def test_sso_bootstrap_retirement_receipt_migrates_and_is_monotonic(
 
     async with pool.acquire() as conn:
         assert await conn.fetchval("SELECT COUNT(*) FROM standalone_sso_bootstrap_retirements") == 1
+
+
+async def test_credential_issue_replaces_the_credential_the_account_already_had(
+    services,
+    monkeypatch,
+):
+    """Rotation, not first issue: the old credential must stop working.
+
+    The account is installed enterable, so this endpoint replaces a credential
+    that already exists. It is the response to a credential that leaked or was
+    lost, which is only true if the previous one dies with the rotation — and
+    it rotates a credential currently in use, deliberately, because that is
+    what a compromise response has to do.
+    """
+    pool, _, service, _, _, auth_service = services
+    from app.config import settings
+    from app.exceptions import AuthenticationError
+
+    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+    provisioned = await service.provision_local_recovery_admin(
+        username="recovery-admin",
+        email="recovery-admin@example.com",
+        password=_LOCAL_PASSWORD,
+    )
+    actor_id, token_id = await _create_retirement_actor(pool)
+    # The installed credential works before the rotation, and the session it
+    # mints is live.
+    signed_in = await auth_service.login("recovery-admin", _LOCAL_PASSWORD)
+    assert signed_in["user"]["id"] == provisioned["user_id"]
+    held_session = f"Bearer {signed_in['token']}"
+    assert await auth_service.resolve_rest_user_authorization(held_session) is not None
+
+    issued = await service.issue_recovery_admin_credential(
+        expected_username="recovery-admin",
+        expected_email="recovery-admin@example.com",
+        method="recovery_admin_api",
+        actor_user_id=str(actor_id),
+        actor_token_id=str(token_id),
+    )
+
+    assert issued["user_id"] == provisioned["user_id"]
+    assert issued["username"] == "recovery-admin"
+    assert issued["auth_mode"] == "local"
+    credential = issued["credential"]
+    assert isinstance(credential, str) and credential
+
+    async with pool.acquire() as conn:
+        stored = await conn.fetchval(
+            "SELECT password_hash FROM users WHERE id = $1",
+            uuid.UUID(provisioned["user_id"]),
+        )
+    assert auth_service.verify_password(credential, stored)
+    login = await auth_service.login("recovery-admin", credential)
+    assert login["user"]["id"] == provisioned["user_id"]
+
+    # And the credential it replaced no longer opens the account.
+    assert not auth_service.verify_password(_LOCAL_PASSWORD, stored)
+    with pytest.raises(AuthenticationError):
+        await auth_service.login("recovery-admin", _LOCAL_PASSWORD)
+
+    # Nor does the session that credential had already minted. Replacing the
+    # credential without this would leave whoever held the old one signed in,
+    # which is the case the rotation exists for. The delegate does it; assert
+    # it here so the behaviour cannot be inherited silently.
+    assert await auth_service.resolve_rest_user_authorization(held_session) is None
+
+
+async def test_credential_issue_never_writes_the_value_into_any_audit_payload(services, monkeypatch):
+    pool, _, service, _, _, _ = services
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+    provisioned = await service.provision_local_recovery_admin(
+        username="recovery-admin",
+        email="recovery-admin@example.com",
+        password=_LOCAL_PASSWORD,
+    )
+    actor_id, token_id = await _create_retirement_actor(pool)
+
+    issued = await service.issue_recovery_admin_credential(
+        expected_username="recovery-admin",
+        expected_email="recovery-admin@example.com",
+        method="recovery_admin_api",
+        actor_user_id=str(actor_id),
+        actor_token_id=str(token_id),
+    )
+
+    async with pool.acquire() as conn:
+        every_payload = await conn.fetch("SELECT kind, payload::text AS body FROM events")
+        stored = await conn.fetchval(
+            "SELECT password_hash FROM users WHERE id = $1",
+            uuid.UUID(provisioned["user_id"]),
+        )
+    assert every_payload
+    for record in every_payload:
+        assert issued["credential"] not in record["body"], record["kind"]
+    # Not recoverable from the row either: only the bcrypt hash is stored.
+    assert issued["credential"] not in stored
+
+    issued_events = [
+        record for record in every_payload
+        if record["kind"] == "auth.recovery_admin_credential_issued"
+    ]
+    assert len(issued_events) == 1
+    assert "recovery_admin_api" in issued_events[0]["body"]
+
+
+async def test_credential_issue_requires_an_independent_service_administrator(services, monkeypatch):
+    pool, _, service, _, _, _ = services
+    from app.config import settings
+    from app.exceptions import RecoveryAdminCredentialAuthorizationError
+
+    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+    provisioned = await service.provision_local_recovery_admin(
+        username="recovery-admin",
+        email="recovery-admin@example.com",
+        password=_LOCAL_PASSWORD,
+    )
+    async with pool.acquire() as conn:
+        before = await conn.fetchval(
+            "SELECT password_hash FROM users WHERE id = $1",
+            uuid.UUID(provisioned["user_id"]),
+        )
+    # The designated recovery admin is not an independent authority over itself.
+    async with pool.acquire() as conn:
+        self_token = uuid.uuid4()
+        await conn.execute(
+            """
+            INSERT INTO tokens (id, user_id, name, token_hash, token_prefix, scopes, key_class)
+            VALUES ($1, $2, 'self', $3, 'akb_secret_', ARRAY['read','write','admin'], 'service')
+            """,
+            self_token,
+            uuid.UUID(provisioned["user_id"]),
+            uuid.uuid4().hex,
+        )
+
+    with pytest.raises(RecoveryAdminCredentialAuthorizationError):
+        await service.issue_recovery_admin_credential(
+            expected_username="recovery-admin",
+            expected_email="recovery-admin@example.com",
+            method="recovery_admin_api",
+            actor_user_id=provisioned["user_id"],
+            actor_token_id=str(self_token),
+        )
+
+    async with pool.acquire() as conn:
+        after = await conn.fetchval(
+            "SELECT password_hash FROM users WHERE id = $1",
+            uuid.UUID(provisioned["user_id"]),
+        )
+    assert after == before
+
+
+async def test_credential_issue_refuses_an_inexact_expected_identity(services, monkeypatch):
+    pool, _, service, _, _, _ = services
+    from app.config import settings
+    from app.exceptions import RecoveryAdminCredentialConflictError
+
+    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+    provisioned = await service.provision_local_recovery_admin(
+        username="recovery-admin",
+        email="recovery-admin@example.com",
+        password=_LOCAL_PASSWORD,
+    )
+    actor_id, token_id = await _create_retirement_actor(pool)
+    async with pool.acquire() as conn:
+        before = await conn.fetchval(
+            "SELECT password_hash FROM users WHERE id = $1",
+            uuid.UUID(provisioned["user_id"]),
+        )
+
+    for username, email in (
+        ("recovery-admin", "someone-else@example.com"),
+        ("someone-else", "recovery-admin@example.com"),
+    ):
+        with pytest.raises(RecoveryAdminCredentialConflictError):
+            await service.issue_recovery_admin_credential(
+                expected_username=username,
+                expected_email=email,
+                method="recovery_admin_api",
+                actor_user_id=str(actor_id),
+                actor_token_id=str(token_id),
+            )
+
+    async with pool.acquire() as conn:
+        after = await conn.fetchval(
+            "SELECT password_hash FROM users WHERE id = $1",
+            uuid.UUID(provisioned["user_id"]),
+        )
+    assert after == before
+
+
+async def test_credential_issue_refuses_a_retired_recovery_administrator(services, monkeypatch):
+    pool, _, service, _, _, _ = services
+    from app.config import settings
+    from app.exceptions import RecoveryAdminCredentialConflictError
+    from app.services.account_markers import RETIRED_RECOVERY_ADMIN_PASSWORD_SENTINEL
+
+    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+    provisioned = await service.provision_local_recovery_admin(
+        username="recovery-admin",
+        email="recovery-admin@example.com",
+        password=_LOCAL_PASSWORD,
+    )
+    actor_id, token_id = await _create_retirement_actor(pool)
+    # Exactly the durable state retirement leaves behind.
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE users
+               SET is_recovery_admin = false, is_admin = false,
+                   account_status = 'suspended', password_hash = $2
+             WHERE id = $1
+            """,
+            uuid.UUID(provisioned["user_id"]),
+            RETIRED_RECOVERY_ADMIN_PASSWORD_SENTINEL,
+        )
+
+    with pytest.raises(RecoveryAdminCredentialConflictError):
+        await service.issue_recovery_admin_credential(
+            expected_username="recovery-admin",
+            expected_email="recovery-admin@example.com",
+            method="recovery_admin_api",
+            actor_user_id=str(actor_id),
+            actor_token_id=str(token_id),
+        )
+
+    async with pool.acquire() as conn:
+        unchanged = await conn.fetchval(
+            "SELECT password_hash FROM users WHERE id = $1",
+            uuid.UUID(provisioned["user_id"]),
+        )
+    assert unchanged == RETIRED_RECOVERY_ADMIN_PASSWORD_SENTINEL
+
+
+async def test_break_glass_cli_issue_carries_no_actor_and_is_audited_apart(services, monkeypatch):
+    pool, _, service, _, _, auth_service = services
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+    provisioned = await service.provision_local_recovery_admin(
+        username="recovery-admin",
+        email="recovery-admin@example.com",
+        password=_LOCAL_PASSWORD,
+    )
+
+    issued = await service.issue_recovery_admin_credential(
+        expected_username="recovery-admin",
+        expected_email="recovery-admin@example.com",
+        method="recovery_admin_cli",
+    )
+
+    async with pool.acquire() as conn:
+        stored = await conn.fetchval(
+            "SELECT password_hash FROM users WHERE id = $1",
+            uuid.UUID(provisioned["user_id"]),
+        )
+        events = await conn.fetch(
+            """
+            SELECT kind, actor_id, payload::text AS body
+              FROM events
+             WHERE kind IN ('auth.recovery_admin_credential_issued', 'auth.password_reset')
+             ORDER BY kind
+            """
+        )
+    assert auth_service.verify_password(issued["credential"], stored)
+    by_type = {record["kind"]: record for record in events}
+    # Shell access is the authority, so there is no authenticated principal.
+    assert by_type["auth.recovery_admin_credential_issued"]["actor_id"] is None
+    assert "recovery_admin_cli" in by_type["auth.recovery_admin_credential_issued"]["body"]
+    # The delegated local reset stays visible and carries the same discriminator.
+    assert "recovery_admin_cli" in by_type["auth.password_reset"]["body"]
+
+
+async def test_break_glass_cli_method_refuses_a_supplied_actor(services, monkeypatch):
+    pool, _, service, _, _, _ = services
+    from app.config import settings
+    from app.exceptions import RecoveryAdminCredentialAuthorizationError
+
+    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+    await service.provision_local_recovery_admin(
+        username="recovery-admin",
+        email="recovery-admin@example.com",
+        password=_LOCAL_PASSWORD,
+    )
+    actor_id, token_id = await _create_retirement_actor(pool)
+
+    # The break-glass path has no authenticated principal by construction.
+    # Accepting one would let an API caller borrow the unauthenticated route.
+    with pytest.raises(RecoveryAdminCredentialAuthorizationError):
+        await service.issue_recovery_admin_credential(
+            expected_username="recovery-admin",
+            expected_email="recovery-admin@example.com",
+            method="recovery_admin_cli",
+            actor_user_id=str(actor_id),
+            actor_token_id=str(token_id),
+        )
+
+
+async def test_credential_issue_advances_the_session_revocation_cutoff(services, monkeypatch):
+    pool, _, service, _, _, auth_service = services
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+    provisioned = await service.provision_local_recovery_admin(
+        username="recovery-admin",
+        email="recovery-admin@example.com",
+        password=_LOCAL_PASSWORD,
+    )
+    actor_id, token_id = await _create_retirement_actor(pool)
+    async with pool.acquire() as conn:
+        before = await conn.fetchval(
+            "SELECT tokens_revoked_before FROM users WHERE id = $1",
+            uuid.UUID(provisioned["user_id"]),
+        )
+
+    await service.issue_recovery_admin_credential(
+        expected_username="recovery-admin",
+        expected_email="recovery-admin@example.com",
+        method="recovery_admin_api",
+        actor_user_id=str(actor_id),
+        actor_token_id=str(token_id),
+    )
+
+    async with pool.acquire() as conn:
+        after = await conn.fetchval(
+            "SELECT tokens_revoked_before FROM users WHERE id = $1",
+            uuid.UUID(provisioned["user_id"]),
+        )
+    # The mechanism behind the rejection asserted end-to-end in
+    # test_credential_issue_replaces_the_credential_the_account_already_had.
+    # Kept separately because a cutoff that stops advancing is a different
+    # failure from a resolver that stops accepting anything.
+    assert after > before
+
+
+async def test_sso_credential_issue_fails_closed_without_a_minting_authority(services, monkeypatch):
+    pool, _, service, _, _, _ = services
+    from app.config import settings
+    from app.exceptions import RecoveryAdminCredentialUnavailableError
+
+    monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+    provisioned = await _create_sso_recovery_successor(service)
+    actor_id, token_id = await _create_retirement_actor(pool)
+
+    # A running AKB holds no authority that can mint a Keycloak credential:
+    # the management client has no manage-users, and the bootstrap client is
+    # deleted and proven dead before the install writes its receipt.
+    with pytest.raises(RecoveryAdminCredentialUnavailableError) as captured:
+        await service.issue_recovery_admin_credential(
+            expected_username="sso-recovery-admin",
+            expected_email="sso-recovery-admin@example.com",
+            method="recovery_admin_api",
+            actor_user_id=str(actor_id),
+            actor_token_id=str(token_id),
+        )
+
+    # The code and status are what an API caller sees, so pin them rather than
+    # only the class: renaming either is a contract change, not a refactor.
+    assert captured.value.code == "recovery_admin_credential_rotation_unavailable"
+    assert captured.value.status_code == 503
+
+    from app.services.recovery_admin_service import _SSO_PASSWORD_SENTINEL
+
+    async with pool.acquire() as conn:
+        unchanged = await conn.fetchval(
+            "SELECT password_hash FROM users WHERE id = $1",
+            uuid.UUID(provisioned["user_id"]),
+        )
+        issued = await conn.fetchval(
+            "SELECT COUNT(*) FROM events WHERE kind = 'auth.recovery_admin_credential_issued'"
+        )
+    assert unchanged == _SSO_PASSWORD_SENTINEL
+    assert issued == 0
+
+
+async def test_sso_credential_issue_still_refuses_an_unauthorized_caller_first(services, monkeypatch):
+    pool, _, service, _, _, _ = services
+    from app.config import settings
+    from app.exceptions import RecoveryAdminCredentialAuthorizationError
+
+    monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+    await _create_sso_recovery_successor(service)
+
+    # Authorization is decided before capability, so an unauthorized caller
+    # never learns which modes can mint.
+    with pytest.raises(RecoveryAdminCredentialAuthorizationError):
+        await service.issue_recovery_admin_credential(
+            expected_username="sso-recovery-admin",
+            expected_email="sso-recovery-admin@example.com",
+            method="recovery_admin_api",
+            actor_user_id=str(uuid.uuid4()),
+            actor_token_id=str(uuid.uuid4()),
+        )
+
+
+@pytest.mark.parametrize(
+    "column, value",
+    [
+        # Still the designated administrator, but not in a state we may issue
+        # for. Retirement clears `is_recovery_admin`, so these are the states
+        # the designated-row lookup itself cannot filter out.
+        ("account_status", "suspended"),
+        ("account_kind", "service"),
+        ("password_hash", "!some-other-marker!"),
+    ],
+)
+async def test_credential_issue_refuses_a_designated_row_in_a_bad_state(
+    services,
+    monkeypatch,
+    column,
+    value,
+):
+    pool, _, service, _, _, _ = services
+    from app.config import settings
+    from app.exceptions import RecoveryAdminCredentialConflictError
+
+    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+    provisioned = await service.provision_local_recovery_admin(
+        username="recovery-admin",
+        email="recovery-admin@example.com",
+        password=_LOCAL_PASSWORD,
+    )
+    actor_id, token_id = await _create_retirement_actor(pool)
+    async with pool.acquire() as conn:
+        before = await conn.fetchval(
+            "SELECT password_hash FROM users WHERE id = $1",
+            uuid.UUID(provisioned["user_id"]),
+        )
+    async with pool.acquire() as conn:
+        await conn.execute(
+            f"UPDATE users SET {column} = $2 WHERE id = $1",  # noqa: S608 - fixed test vocabulary
+            uuid.UUID(provisioned["user_id"]),
+            value,
+        )
+        assert await conn.fetchval(
+            "SELECT is_recovery_admin FROM users WHERE id = $1",
+            uuid.UUID(provisioned["user_id"]),
+        )
+
+    with pytest.raises(RecoveryAdminCredentialConflictError):
+        await service.issue_recovery_admin_credential(
+            expected_username="recovery-admin",
+            expected_email="recovery-admin@example.com",
+            method="recovery_admin_api",
+            actor_user_id=str(actor_id),
+            actor_token_id=str(token_id),
+        )
+
+    async with pool.acquire() as conn:
+        after = await conn.fetchval(
+            "SELECT password_hash FROM users WHERE id = $1",
+            uuid.UUID(provisioned["user_id"]),
+        )
+        issued = await conn.fetchval(
+            "SELECT COUNT(*) FROM events WHERE kind = 'auth.recovery_admin_credential_issued'"
+        )
+    assert after == (value if column == "password_hash" else before)
+    assert issued == 0

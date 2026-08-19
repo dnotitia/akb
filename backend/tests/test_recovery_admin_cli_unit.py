@@ -299,3 +299,110 @@ async def test_sso_profile_accepts_only_external_identity_and_usage_errors_hide_
     captured = capsys.readouterr()
     assert _SECRET not in captured.out
     assert _SECRET not in captured.err
+
+
+async def test_break_glass_issue_calls_the_shared_service_and_reveals_once(monkeypatch, capsys):
+    from app import cli
+    from app.services import recovery_admin_service
+
+    _patch_database(monkeypatch)
+    observed = {}
+
+    async def _issue(**kwargs):
+        observed.update(kwargs)
+        return {
+            "user_id": "11111111-1111-4111-8111-111111111111",
+            "username": "recovery-admin",
+            "email": "recovery-admin@example.com",
+            "auth_mode": "local",
+            "credential": _SECRET,
+        }
+
+    monkeypatch.setattr(
+        recovery_admin_service,
+        "issue_recovery_admin_credential",
+        _issue,
+    )
+
+    exit_code = await cli._issue_recovery_admin_credential(
+        [
+            "--expected-username",
+            "recovery-admin",
+            "--expected-email",
+            "recovery-admin@example.com",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    # Same service function as the endpoint, distinguished only by method,
+    # and with no authenticated principal.
+    assert observed == {
+        "expected_username": "recovery-admin",
+        "expected_email": "recovery-admin@example.com",
+        "method": "recovery_admin_cli",
+    }
+    # The one-time reveal is the whole point of the command, so it is on
+    # stdout — but it must not be in the machine-readable report, which is
+    # what a caller piping stdout into a log or a file will keep.
+    assert _SECRET in captured.out
+    lines = captured.out.splitlines()
+    report = json.loads(lines[0])
+    assert report == {
+        "user_id": "11111111-1111-4111-8111-111111111111",
+        "username": "recovery-admin",
+        "email": "recovery-admin@example.com",
+        "auth_mode": "local",
+    }
+    assert _SECRET not in lines[0]
+    assert any(_SECRET in line for line in lines[1:])
+
+
+async def test_break_glass_issue_hides_values_on_usage_and_service_errors(monkeypatch, capsys):
+    from app import cli
+    from app.exceptions import RecoveryAdminCredentialConflictError
+    from app.services import recovery_admin_service
+
+    _patch_database(monkeypatch)
+
+    async def _refuse(**_kwargs):
+        raise RecoveryAdminCredentialConflictError()
+
+    monkeypatch.setattr(
+        recovery_admin_service,
+        "issue_recovery_admin_credential",
+        _refuse,
+    )
+
+    assert await cli._issue_recovery_admin_credential(
+        [
+            "--expected-username",
+            "recovery-admin",
+            "--expected-email",
+            "recovery-admin@example.com",
+        ]
+    ) == 1
+    captured = capsys.readouterr()
+    assert "recovery_admin_credential_conflict" in captured.err
+    assert _SECRET not in captured.out + captured.err
+
+    assert await cli._issue_recovery_admin_credential(["--expected-username", "only"]) == 2
+    captured = capsys.readouterr()
+    assert _SECRET not in captured.out + captured.err
+
+
+async def test_break_glass_issue_is_registered_as_a_subcommand(capsys):
+    import asyncio
+
+    from app import cli
+
+    # `main` runs its own event loop, so drive it off this test's loop.
+    # It also returns 2 for an unknown subcommand, so the exit code alone
+    # cannot tell "registered but misused" from "not registered at all".
+    assert await asyncio.to_thread(cli.main, ["issue-recovery-admin-credential"]) == 2
+    captured = capsys.readouterr()
+    assert "Unknown subcommand" not in captured.err
+    assert "--expected-username" in captured.err
+
+    assert await asyncio.to_thread(cli.main, ["issue-recovery-admin-credentials"]) == 2
+    assert "Unknown subcommand" in capsys.readouterr().err
