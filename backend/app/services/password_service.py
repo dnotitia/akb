@@ -44,7 +44,16 @@ async def reset_password(
     *,
     username: str,
     actor_id: str | None,
-    method: Literal["admin_ui", "cli"],
+    method: Literal[
+        "admin_ui",
+        "cli",
+        # Recovery-administrator credential issue, which delegates here rather
+        # than reimplementing the reset. The discriminator keeps the two
+        # authorities apart in the audit trail: an independent service
+        # administrator token, or workspace shell access.
+        "recovery_admin_api",
+        "recovery_admin_cli",
+    ],
 ) -> tuple[str, str]:
     """Generate a temp password, replace the user's password_hash, emit audit.
 

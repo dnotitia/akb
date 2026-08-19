@@ -178,6 +178,40 @@ class RecoveryAdminRetirementConflictError(AKBError):
         )
 
 
+class RecoveryAdminCredentialAuthorizationError(AKBError):
+    """The credential-issue caller is not an independent service administrator."""
+
+    def __init__(self):
+        super().__init__(
+            "Recovery administrator credential issue requires an independent service administrator token",
+            status_code=403,
+            code="recovery_admin_credential_requires_service_admin",
+        )
+
+
+class RecoveryAdminCredentialConflictError(AKBError):
+    """The expected recovery identity is not one that can be issued a credential."""
+
+    def __init__(self):
+        super().__init__(
+            "Recovery administrator does not match the credential-issue contract",
+            status_code=409,
+            code="recovery_admin_credential_conflict",
+        )
+
+
+class RecoveryAdminCredentialUnavailableError(AKBError):
+    """No authority in this installation can replace the stored credential."""
+
+    def __init__(self):
+        super().__init__(
+            "Cannot rotate the recovery administrator credential in the configured auth mode: "
+            "the identity provider holds it and nothing in a running AKB can replace it",
+            status_code=503,
+            code="recovery_admin_credential_rotation_unavailable",
+        )
+
+
 class ExternalAuthDisabledError(AKBError):
     """External authentication is disabled by deployment policy."""
 

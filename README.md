@@ -332,6 +332,26 @@ command stores no usable local password and does not contact the identity
 provider. Generated output files are create-only and never overwritten; for a
 retry after the file exists, pass that file back with `--password-file`.
 
+If that credential later leaks, is lost, or has to be taken back, rotate it
+rather than reprovisioning the account:
+
+```bash
+# Break-glass: replace the credential and print the new one once. Nothing
+# stores or logs the value, and the machine-readable report omits it.
+python -m app.cli issue-recovery-admin-credential \
+  --expected-username recovery-admin \
+  --expected-email recovery-admin@example.com
+```
+
+Rotation names the account it expects and refuses any mismatch, so it cannot
+act on the wrong one. The credential it replaces stops working immediately,
+including one currently in use, and sessions held before the rotation are
+revoked — both are what a compromise response requires. The same operation is
+available at `POST /admin/recovery-admin/issue-credential`, which requires an
+independent service-administrator token rather than a human session. Rotation
+is not available in `sso` mode: the identity provider holds the credential,
+and nothing in a running AKB can replace it.
+
 Open `/admin` for the separate product-administration surface. In `local`
 mode it accepts the provisioned local administrator and returns the same
 `local-session-rs256-v2` profile used by local human authentication, but it

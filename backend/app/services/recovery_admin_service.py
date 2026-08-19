@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import re
 import uuid
 from typing import Literal
@@ -11,7 +12,11 @@ import asyncpg
 from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import (
+    AKBError,
     RecoveryAdminConflictError,
+    RecoveryAdminCredentialAuthorizationError,
+    RecoveryAdminCredentialConflictError,
+    RecoveryAdminCredentialUnavailableError,
     RecoveryAdminModeError,
     RecoveryAdminRetirementAuthorizationError,
     RecoveryAdminRetirementConflictError,
@@ -21,6 +26,7 @@ from app.repositories.events_repo import emit_event
 from app.services.account_markers import RETIRED_RECOVERY_ADMIN_PASSWORD_SENTINEL
 from app.services.account_service import cleanup_token_roles
 from app.services.auth_service import hash_password_async
+from app.services.password_service import reset_password
 from app.services.external_identity_contract import (
     OIDC_SUBJECT_MAX_LENGTH,
     bounded_nonempty_claim,
@@ -324,17 +330,24 @@ def _retirement_proof(row) -> dict:
     }
 
 
-async def _require_retirement_actor(
+async def _require_independent_service_admin(
     conn,
     *,
     actor_user_id: str,
     actor_token_id: str,
+    refusal: Callable[[], AKBError],
 ) -> uuid.UUID:
+    """Resolve the caller as an independent service administrator, or refuse.
+
+    Independent means it is not the designated recovery administrator and
+    holds no external identity: the one account that can recover the
+    installation must never be the authority over its own recovery.
+    """
     try:
         user_id = uuid.UUID(actor_user_id)
         token_id = uuid.UUID(actor_token_id)
     except (AttributeError, TypeError, ValueError):
-        raise RecoveryAdminRetirementAuthorizationError() from None
+        raise refusal() from None
 
     row = await conn.fetchrow(
         """
@@ -364,7 +377,7 @@ async def _require_retirement_actor(
         or not row["has_no_external_identity"]
         or not scopes.intersection({"write", "admin"})
     ):
-        raise RecoveryAdminRetirementAuthorizationError()
+        raise refusal()
     return user_id
 
 
@@ -534,10 +547,11 @@ async def retire_local_recovery_admin(
 
     async with pool.acquire() as conn:
         async with conn.transaction():
-            actor_id = await _require_retirement_actor(
+            actor_id = await _require_independent_service_admin(
                 conn,
                 actor_user_id=actor_user_id,
                 actor_token_id=actor_token_id,
+                refusal=RecoveryAdminRetirementAuthorizationError,
             )
             await _lock_provisioning(conn)
             sso_identities = await _locked_sso_recovery_identities(conn)
@@ -640,3 +654,130 @@ async def retire_local_recovery_admin(
 
     await cleanup_token_roles(pool, retired["id"], pending_token_ids)
     return _retirement_proof(retired)
+
+
+CredentialIssueMethod = Literal["recovery_admin_api", "recovery_admin_cli"]
+
+
+def _is_issuable_local_recovery(row, *, expected_username: str, expected_email: str) -> bool:
+    """Return whether this row is the exact live account we may rotate.
+
+    A retired administrator fails every clause: retirement clears both admin
+    flags, suspends the account, and leaves its own tombstone marker, so it
+    can never be re-entered through this path.
+    """
+    return bool(
+        row is not None
+        and row["username"] == expected_username
+        and (row["email"] or "").lower() == expected_email
+        and row["is_admin"]
+        and row["is_recovery_admin"]
+        and row["auth_provider"] == "local"
+        and row["account_status"] == "active"
+        and row["account_kind"] == "human"
+        and _is_local_recovery_credential(row["password_hash"])
+    )
+
+
+async def issue_recovery_admin_credential(
+    *,
+    expected_username: str,
+    expected_email: str,
+    method: CredentialIssueMethod,
+    actor_user_id: str | None = None,
+    actor_token_id: str | None = None,
+) -> dict:
+    """Replace the credential of the exact designated recovery administrator.
+
+    Installation leaves the account holding a credential, so this is rotation:
+    the response to one that leaked, was lost, or must be taken back. The
+    previous credential stops working, including one currently in use — that
+    is what a compromise response requires. The returned credential is the
+    only copy: it is bcrypt-hashed into the account and never stored, logged,
+    or placed in an audit payload. Audit records that a rotation happened, by
+    whom, and for which account.
+
+    ``method`` selects the authority. ``recovery_admin_api`` requires an
+    independent service administrator token and is re-validated here rather
+    than trusted from the route. ``recovery_admin_cli`` is the break-glass
+    path, whose authority is workspace shell access and which therefore has
+    no authenticated principal at all — supplying one is refused so an API
+    caller cannot borrow the unauthenticated route.
+    """
+    expected_username = _exact_expected(expected_username, "expected_username")
+    expected_email = _exact_expected(expected_email, "expected_email").lower()
+    if method == "recovery_admin_cli":
+        if actor_user_id is not None or actor_token_id is not None:
+            raise RecoveryAdminCredentialAuthorizationError()
+    elif actor_user_id is None or actor_token_id is None:
+        raise RecoveryAdminCredentialAuthorizationError()
+
+    mode = settings.require_auth_mode()
+    pool = await get_pool()
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            actor_id: uuid.UUID | None = None
+            if actor_user_id is not None and actor_token_id is not None:
+                actor_id = await _require_independent_service_admin(
+                    conn,
+                    actor_user_id=actor_user_id,
+                    actor_token_id=actor_token_id,
+                    refusal=RecoveryAdminCredentialAuthorizationError,
+                )
+            await _lock_provisioning(conn)
+            row = await _designated_user(
+                conn,
+                auth_provider="local" if mode == "local" else "keycloak",
+            )
+            if mode != "local":
+                # The account is reachable — installation wrote a credential
+                # into the identity provider and handed it over — but nothing
+                # in a running AKB can replace that credential. The permanent
+                # management client is deliberately without `manage-users`,
+                # and the temporary bootstrap client that created the product
+                # administrator is deleted and proven dead before the install
+                # writes its retirement receipt. Rotating here needs an
+                # authority an operator creates and destroys, which does not
+                # exist yet.
+                raise RecoveryAdminCredentialUnavailableError()
+            if not _is_issuable_local_recovery(
+                row,
+                expected_username=expected_username,
+                expected_email=expected_email,
+            ):
+                raise RecoveryAdminCredentialConflictError()
+            user_id = row["id"]
+            username = row["username"]
+            email = row["email"]
+
+    # The delegate opens its own transaction and takes its own row lock, so
+    # the verification above must have committed first. The window is safe:
+    # `users.username` is unique and retirement does not release it, and the
+    # delegate refuses a suspended account — which is exactly what a
+    # retirement landing in the window would have produced.
+    credential, issued_username = await reset_password(
+        username=username,
+        actor_id=str(actor_id) if actor_id is not None else None,
+        method=method,
+    )
+
+    async with pool.acquire() as conn:
+        await emit_event(
+            conn,
+            "auth.recovery_admin_credential_issued",
+            actor_id=str(actor_id) if actor_id is not None else None,
+            payload={
+                "user_id": str(user_id),
+                "username": issued_username,
+                "auth_mode": mode,
+                "method": method,
+            },
+        )
+    return {
+        "user_id": str(user_id),
+        "username": issued_username,
+        "email": email,
+        "auth_mode": mode,
+        "credential": credential,
+    }
