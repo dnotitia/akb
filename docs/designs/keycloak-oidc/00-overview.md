@@ -15,7 +15,10 @@ Human REST and delegated-human routes select exactly one verifier from the
 canonical `auth_mode`:
 
 - `local` selects `local-session-rs256-v2` only;
-- `sso` selects `keycloak-access-v1` only.
+- `sso` selects `keycloak-access-v1`, or — for the one configured non-human
+  client, and only when one is configured — `keycloak-service-authority-v1`.
+  The two are disjoint by authorized party and neither is a fallback for the
+  other; see [Non-human service authority](#non-human-service-authority).
 
 `keycloak-access-v1` is a Keycloak 26-compatible RS256 access-token profile.
 It pins the configured issuer and that issuer's JWKS, requires the selected
@@ -44,6 +47,67 @@ profile/token-use claims, `jti`, and numeric lifetime claims. The public-only
 keyset is available from `/api/v1/auth/jwks` in local mode. The Phase 2 cutover
 uses immediate reauthentication: the legacy HS256 verifier and issuance path
 are absent, so an old session fails rather than trying another profile.
+
+## Non-human service authority
+
+A workspace whose accounts all come from an identity provider has no way to
+hand a control plane a first credential: every administrative call needs a
+bearer, and obtaining one needs an account. `keycloak-service-authority-v1`
+closes that circle with the one credential such a workspace already owns — a
+client-credentials token from its own realm.
+
+`keycloak_service_admin_client_id` names the exact OIDC client whose service
+account is admitted. Blank, the default, keeps the profile inert: no
+service-account token authorizes anything. Naming a client is a deliberate
+grant, separate from `keycloak_management_client_id`, because it turns
+possession of that client's secret into administrative authority over this AKB.
+A client that is also an ordinary, companion, or `/admin` client is rejected at
+configuration load, and rejected again at verification time.
+
+It is a separate profile rather than a relaxation of `keycloak-access-v1`
+because a client-credentials token is a different object. Measured against
+Keycloak 26.0 and 26.4, the token this grant produces carries `iss`, `sub`,
+`iat`, `exp`, `jti`, `typ`, `azp`, an empty `scope`, and Keycloak's `client_id`
+/ `clientHost` / `clientAddress` markers — and **no `aud`, no `sid`, and no
+profile claim at all**. Admitting it through the human profile would mean
+dropping three requirements every human bearer must keep.
+
+So the authority is pinned to what such a grant does establish: the pinned
+realm signed it, and the named client obtained it. `aud` is not required —
+Keycloak cannot put one on a client-credentials token without an operator
+adding an audience mapper, and neither the `audience` nor the `scope` request
+parameter changes that. A token that does carry an audience is still refused if
+it carries the MCP route's. The profile further requires the `client_id` marker
+to name the same client as `azp`, admits `preferred_username` only in the exact
+`service-account-<client>` form, and refuses any token carrying `email`,
+`email_verified`, or `name`: a machine principal has no person behind it, so a
+bearer that describes one came from some other flow.
+
+Selection between the two SSO profiles is by authorized party, and is not a
+fallback: exactly one profile is tried, and its refusal is final. The peek that
+selects is unverified and never an authorization input — each profile proves
+signature, issuer, and its own exact `azp` before returning a principal.
+
+The principal is resolved by `service_identities`, a table deliberately
+separate from `external_identities`. That table means "an identity provider
+identity belonging to a person here", and enrollment policy, email snapshots,
+profile refresh, the browser-session surface, and the product-admin surface all
+read it that way; a machine row there would make every one of them a place
+where the invariant has to be re-established. One `service_identities` row is
+one authority — an exact (issuer, client) pair — resolved to one AKB account
+with `account_kind = 'service'`, `auth_provider = 'service'`, an unusable
+password sentinel, and administrator status granted at creation. The realm
+subject is recorded and refreshed for audit; keying on the client is what makes
+a deleted-and-recreated client a refreshed binding rather than a second
+administrator. A later demotion or suspension by an operator is respected on
+the next request rather than silently re-granted.
+
+Nothing about the human paths moves for this. The product administrator's exact
+prebound identity, the no-just-in-time rule under `invite_only`, and the human
+assertion are unchanged, and the named client can never authorize a human
+route on either profile. The principal holds no token-store credential, so it
+is also not the independent service administrator that recovery-administrator
+retirement requires.
 
 ## Exact AKB account projection
 

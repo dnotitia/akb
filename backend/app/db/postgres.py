@@ -303,6 +303,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "078_recovery_admin_authority_handover.py",  # provider-scoped recovery authority during local-to-SSO cutover
         "079_worker_claim_lifecycle.py",  # attempt-at-claim + explicit claimed/abandoned timestamps for durable queues
         "080_local_forced_credential_change.py",  # local parity for the identity provider's UPDATE_PASSWORD: a delivered credential is owed a replacement until its holder changes it
+        "081_service_identities.py",  # non-human (issuer, client) → AKB service account bindings, kept out of the human external_identities population
     ):
         if filename in applied:
             continue

@@ -35,6 +35,7 @@ from app.db.postgres import get_pool
 from app.exceptions import AKBError, AuthenticationError
 from app.services.auth_verifier_profiles import (
     KEYCLOAK_ACCESS_V1,
+    KEYCLOAK_SERVICE_AUTHORITY_V1,
     KeycloakRouteProfile,
     VerifiedPrincipal,
 )
@@ -46,6 +47,9 @@ logger = logging.getLogger("akb.keycloak")
 _SCOPE = "openid profile email"
 _TOKEN_SUPPLIED_KEY_HEADERS = frozenset({"jku", "x5u", "jwk", "x5c"})
 _SERVICE_ACCOUNT_CLAIMS = frozenset({"client_id", "clientId", "clientHost", "clientAddress"})
+# Claims that describe a person. A client-credentials token has none of them,
+# so their presence means the bearer came from some other flow on the client.
+_HUMAN_PROFILE_CLAIMS = frozenset({"email", "email_verified", "name"})
 _JWKS_REFRESH_COOLDOWN_SECONDS = 30.0
 _BACKCHANNEL_LOGOUT_EVENT = "http://schemas.openid.net/event/backchannel-logout"
 
@@ -906,6 +910,13 @@ class KeycloakOIDC:
         # even on the MCP profile where dynamic client IDs are otherwise valid.
         if claims["azp"] == settings.keycloak_admin_client_id:
             return None
+        # A client an operator named as the non-human service authority is
+        # never a human client, on either route, even if a misconfiguration
+        # also lists it among the human clients. The canonical loader refuses
+        # that combination; this is the runtime half of the same refusal.
+        service_admin_client_id = settings.keycloak_service_admin_client_id.strip()
+        if service_admin_client_id and claims["azp"] == service_admin_client_id:
+            return None
         if route_profile == "api" and claims["azp"] not in settings.keycloak_human_client_ids:
             return None
         if type(claims.get("iat")) is not int or type(claims.get("exp")) is not int:
@@ -937,6 +948,112 @@ class KeycloakOIDC:
             credential_type="access_token",
             claims=claims,
             audience=audience,
+        )
+
+    # ── Non-human service-authority verification ─────────────────────
+    async def verify_service_authority_token(self, token: str) -> VerifiedPrincipal | None:
+        """Verify the one configured non-human administrative credential.
+
+        This is a separate profile, not a relaxation of the human one. Keycloak
+        issues a client-credentials token with no ``aud``, no ``sid``, and an
+        empty ``scope``, so admitting it through ``keycloak-access-v1`` would
+        mean dropping three requirements every human bearer must keep. The
+        authority is instead pinned to what such a grant does establish: the
+        realm that signed the token and the exact client that obtained it.
+
+        ``keycloak_service_admin_client_id`` is what names that client. Blank
+        keeps the whole profile inert.
+        """
+        service_admin_client_id = settings.keycloak_service_admin_client_id_effective
+        if not service_admin_client_id:
+            return None
+        if not isinstance(token, str) or not 1 <= len(token) <= 16_384:
+            return None
+        try:
+            header = jwt.get_unverified_header(token)
+        except jwt.InvalidTokenError as e:
+            logger.debug("Keycloak service-authority token: malformed header (%s)", e)
+            return None
+
+        if header.get("alg") != "RS256" or header.get("typ") != "JWT":
+            return None
+        if _TOKEN_SUPPLIED_KEY_HEADERS.intersection(header):
+            return None
+        kid = header.get("kid")
+        if not isinstance(kid, str) or not kid:
+            return None
+        if not self._has_pinned_unverified_issuer(token):
+            return None
+
+        key = await self._resolve_signing_key(kid)
+        if key is None:
+            return None
+        if key.get("kty") != "RSA" or key.get("use") != "sig" or key.get("alg") != "RS256":
+            return None
+
+        try:
+            public_key = RSAAlgorithm.from_jwk(json.dumps(key))
+            claims = jwt.decode(
+                token,
+                cast(Any, public_key),
+                algorithms=["RS256"],
+                issuer=settings.keycloak_issuer,
+                options={
+                    "verify_aud": False,
+                    "require": ["exp", "iat", "jti", "iss", "sub", "typ", "azp"],
+                },
+            )
+        except (jwt.PyJWTError, TypeError, ValueError) as e:
+            logger.debug("Keycloak service-authority token verification failed: %s", e)
+            return None
+
+        required_strings = ("iss", "sub", "jti", "typ", "azp")
+        if any(not isinstance(claims.get(name), str) or not claims[name].strip() for name in required_strings):
+            return None
+        if claims["typ"] != "Bearer":
+            return None
+        if claims["azp"] != service_admin_client_id:
+            return None
+        if type(claims.get("iat")) is not int or type(claims.get("exp")) is not int:
+            return None
+        if claims["exp"] <= claims["iat"]:
+            return None
+        # Keycloak's own machine marker, and it must name the same client that
+        # obtained the token — an `azp` alone is not proof of the grant type.
+        if claims.get("client_id") != service_admin_client_id:
+            return None
+        preferred_username = claims.get("preferred_username")
+        if preferred_username is not None and preferred_username != f"service-account-{service_admin_client_id}":
+            return None
+        # No person is behind this principal, and nothing downstream may
+        # project a profile claim onto an account from it.
+        if not _HUMAN_PROFILE_CLAIMS.isdisjoint(claims):
+            return None
+        scope = claims.get("scope")
+        if scope is not None and not isinstance(scope, str):
+            return None
+        # A client-credentials token carries no audience unless an operator
+        # adds a mapper. Whatever it does carry must not be another AKB
+        # route's credential.
+        raw_audience = claims.get("aud")
+        if raw_audience is not None:
+            if isinstance(raw_audience, str):
+                audiences = {raw_audience}
+            elif isinstance(raw_audience, list) and all(isinstance(item, str) and item for item in raw_audience):
+                audiences = set(raw_audience)
+            else:
+                return None
+            mcp_audience = settings.mcp_oauth_audience_effective
+            if mcp_audience and mcp_audience in audiences:
+                return None
+
+        return VerifiedPrincipal(
+            profile_id=KEYCLOAK_SERVICE_AUTHORITY_V1,
+            issuer=claims["iss"],
+            subject=claims["sub"],
+            credential_type="access_token",
+            claims=claims,
+            audience=None,
         )
 
     # ── Logout URL construction ──────────────────────────────────────

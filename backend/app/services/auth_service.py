@@ -41,13 +41,16 @@ from app.repositories.events_repo import emit_event
 from app.services.auth_policy import require_local_auth_enabled
 from app.services.auth_verifier_profiles import (
     KEYCLOAK_ACCESS_V1,
+    KEYCLOAK_SERVICE_AUTHORITY_V1,
     LOCAL_SESSION_RS256_V2,
     KeycloakRouteProfile,
     VerifiedPrincipal,
     verify_keycloak_access_v1,
+    verify_keycloak_service_authority_v1,
     verify_local_session_rs256_v2,
 )
 from app.services.role_sync import get_role_sync
+from app.services.service_authority_service import resolve_service_authority
 
 TOKEN_KEY_CLASSES = frozenset({"pat", "service", "publishable"})
 ISSUABLE_TOKEN_KEY_CLASSES = frozenset({"pat", "service"})
@@ -600,6 +603,45 @@ async def _project_keycloak_principal(
     )
 
 
+async def _project_service_authority_principal(
+    principal: VerifiedPrincipal,
+) -> AuthenticatedUser | None:
+    """Project the verified non-human authority onto its own AKB account.
+
+    Deliberately not routed through the human account path: no enrollment
+    decision, no external identity, and no profile claim is read here. The
+    verified ``azp`` is re-checked against configuration so a principal minted
+    while one client was named cannot be projected after the operator named a
+    different one.
+    """
+    claims = dict(principal.claims)
+    client_id = settings.keycloak_service_admin_client_id_effective
+    if not client_id or claims.get("azp") != client_id:
+        return None
+    try:
+        resolved = await resolve_service_authority(
+            issuer=principal.issuer,
+            client_id=client_id,
+            subject=principal.subject,
+        )
+    except AKBError as e:
+        logging.getLogger("akb.auth").info("Keycloak service authority: account projection rejected (%s)", e)
+        return None
+
+    scope_claim = claims.get("scope")
+    scopes = [scope for scope in scope_claim.split(" ") if scope] if isinstance(scope_claim, str) else []
+    return AuthenticatedUser(
+        user_id=str(resolved["user_id"]),
+        username=resolved["username"],
+        email=resolved["email"] or "",
+        display_name=resolved["display_name"],
+        is_admin=resolved["is_admin"],
+        auth_method="oauth",
+        account_kind="service",
+        oauth_scopes=scopes,
+    )
+
+
 async def project_verified_principal(
     principal: VerifiedPrincipal,
     *,
@@ -620,6 +662,8 @@ async def project_verified_principal(
         )
     if principal.profile_id == KEYCLOAK_ACCESS_V1:
         return await _project_keycloak_principal(principal)
+    if principal.profile_id == KEYCLOAK_SERVICE_AUTHORITY_V1:
+        return await _project_service_authority_principal(principal)
     return None
 
 
@@ -1058,13 +1102,50 @@ async def _resolve_rest_authorization(
     if settings.require_auth_mode() == "local":
         principal = verify_local_session_rs256_v2(token)
     else:
-        principal = await verify_keycloak_access_v1(token, "api")
+        principal = await _verify_sso_rest_bearer(token)
     if principal is None:
         return None
     return await project_verified_principal(
         principal,
         for_credential_change=for_credential_change,
     )
+
+
+def _unverified_authorized_party(token: str) -> str | None:
+    value = _unverified_claim(token, "azp")
+    return value if isinstance(value, str) else None
+
+
+def _unverified_claim(token: str, name: str):
+    try:
+        claims = jwt.decode(
+            token,
+            options={
+                "verify_signature": False,
+                "verify_exp": False,
+                "verify_aud": False,
+            },
+        )
+    except (jwt.PyJWTError, TypeError, ValueError):
+        return None
+    return claims.get(name) if isinstance(claims, dict) else None
+
+
+async def _verify_sso_rest_bearer(token: str) -> VerifiedPrincipal | None:
+    """Select exactly one SSO profile for a REST bearer — never a fallback.
+
+    The two profiles are disjoint by authorized party: the human profile pins
+    ``azp`` to a human client, the service-authority profile to the single
+    configured non-human client. The peek that selects between them is
+    unverified and is never an authorization input — whichever profile it
+    selects proves signature, issuer, and its own exact ``azp`` before
+    returning a principal, so a lying ``azp`` only picks the profile that will
+    refuse it. Exactly one profile is tried, and a refusal is final.
+    """
+    service_admin_client_id = settings.keycloak_service_admin_client_id_effective
+    if service_admin_client_id and _unverified_authorized_party(token) == service_admin_client_id:
+        return await verify_keycloak_service_authority_v1(token)
+    return await verify_keycloak_access_v1(token, "api")
 
 
 async def resolve_mcp_authorization(authorization: str) -> AuthenticatedUser | None:

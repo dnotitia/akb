@@ -814,6 +814,19 @@ class Settings(BaseModel):
     # the platform owns IdP changes out of band.
     keycloak_management_client_id: str = "akb-sso-manager"
     keycloak_management_client_secret: str = ""
+    # Exact OIDC client whose client-credentials service account is admitted as
+    # a non-human AKB administrator. This is a separate grant from managing the
+    # identity provider: naming a client here is what turns possession of its
+    # client secret into administrative authority over this AKB, so it must be
+    # stated deliberately rather than inherited from
+    # `keycloak_management_client_id`.
+    #
+    # Blank (the default) keeps the capability inert — no service-account token
+    # authorizes any route. A named client is verified by the separate
+    # `keycloak-service-authority-v1` profile and may never authorize a human
+    # route, so it is rejected outright when it collides with a browser,
+    # companion, or product-admin client.
+    keycloak_service_admin_client_id: str = ""
     admin_browser_session_ttl_secs: int = Field(default=900, ge=60, le=3600)
     # Installation-owned SSO authority epoch. Every ordinary and admin
     # browser session, plus each back-channel logout fence, is bound to this
@@ -1067,6 +1080,29 @@ class Settings(BaseModel):
     tool_usage: ToolUsageSettings = Field(default_factory=ToolUsageSettings)
 
     @model_validator(mode="after")
+    def validate_service_admin_client(self) -> "Settings":
+        """Refuse a service-authority client that is not exactly one non-human client."""
+        client_id = self.keycloak_service_admin_client_id.strip()
+        if not client_id:
+            return self
+        if not self.keycloak_enabled:
+            raise AuthModeConfigurationError(
+                "keycloak_service_admin_client_id requires keycloak_enabled=true; a "
+                "service-authority client is verified against the configured OIDC authority"
+            )
+        if client_id in self.keycloak_human_client_ids:
+            raise AuthModeConfigurationError(
+                "keycloak_service_admin_client_id must not name a human browser or "
+                "companion client; a machine principal is never reachable through a human route"
+            )
+        if client_id == self.keycloak_admin_client_id.strip():
+            raise AuthModeConfigurationError(
+                "keycloak_service_admin_client_id must not name the product-admin browser "
+                "client; that client is an authentication proof for a person"
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_sso_browser_session_lifetimes(self) -> "Settings":
         if self.sso_browser_session_idle_ttl_secs > self.sso_browser_session_absolute_ttl_secs:
             raise ValueError("sso_browser_session_idle_ttl_secs must be <= sso_browser_session_absolute_ttl_secs")
@@ -1157,6 +1193,22 @@ class Settings(BaseModel):
             )
             if client_id.strip()
         )
+
+    @property
+    def keycloak_service_admin_client_id_effective(self) -> str:
+        """The one non-human client admitted as an AKB administrator, or ''.
+
+        Blank means the capability is inert. The disjointness from every human
+        client is re-derived here rather than trusted from load time, so a
+        Settings object assembled outside the canonical loader still fails
+        closed instead of admitting a machine through a human client id.
+        """
+        client_id = self.keycloak_service_admin_client_id.strip()
+        if not client_id or not self.keycloak_enabled:
+            return ""
+        if client_id in self.keycloak_human_client_ids or client_id == self.keycloak_admin_client_id.strip():
+            return ""
+        return client_id
 
     @property
     def keycloak_end_session_endpoint(self) -> str:

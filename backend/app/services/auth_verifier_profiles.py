@@ -14,6 +14,7 @@ from app.config import AuthModeConfigurationError, settings
 
 LOCAL_SESSION_RS256_V2 = "local-session-rs256-v2"
 KEYCLOAK_ACCESS_V1 = "keycloak-access-v1"
+KEYCLOAK_SERVICE_AUTHORITY_V1 = "keycloak-service-authority-v1"
 
 CredentialType = Literal["session", "access_token"]
 KeycloakRouteProfile = Literal["api", "mcp"]
@@ -194,3 +195,28 @@ async def verify_keycloak_access_v1(
         audience,
         route_profile=route_profile,
     )
+
+
+async def verify_keycloak_service_authority_v1(token: str) -> VerifiedPrincipal | None:
+    """Verify the one configured non-human administrative credential.
+
+    Deliberately not a route profile: there is exactly one authority and one
+    route class (REST) that may present it. It carries no route audience, so
+    there is nothing for a route selector to choose between, and adding one
+    would only create a second way to reach the same principal.
+    """
+    if not settings.keycloak_enabled:
+        return None
+    if not settings.keycloak_service_admin_client_id_effective:
+        return None
+    try:
+        if not settings.sso_human_auth_enabled:
+            # The capability lives on the human REST surface. `local` mode
+            # resolves that surface with the local-session profile only.
+            return None
+    except AuthModeConfigurationError:
+        return None
+
+    from app.services.keycloak_oidc import get_keycloak_oidc
+
+    return await get_keycloak_oidc().verify_service_authority_token(token)
