@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 import time
 import uuid
@@ -68,6 +69,8 @@ from mcp_server.help import _resolve_help
 from mcp_server.instructions import INSTRUCTIONS
 from mcp_server.vault_contract import project_accessible_vault
 from app.services import audit_log, tool_usage
+
+logger = logging.getLogger("akb.mcp")
 
 
 async def _find_doc(vault_name: str, doc_ref: str) -> dict | None:
@@ -1532,6 +1535,22 @@ async def call_tool(name: str, arguments: dict):
             is_write=is_write,
         )
         recorded = True
+        # Vault-skill auto-injection: first touch of a vault in this session
+        # (or a skill change since last touch) attaches the owner's guide.
+        # Additive key; never fails the call (contract matches tool_usage).
+        try:
+            from app.services.tool_usage import vault_of_call
+            from app.services import vault_skill_service
+            if isinstance(result, dict) and result.get("error") is None:
+                target_vault = vault_of_call(name, arguments)
+                if target_vault:
+                    payload = await vault_skill_service.injection_payload(
+                        _session_id(), target_vault,
+                    )
+                    if payload:
+                        result["vault_skill"] = payload
+        except Exception as e:  # noqa: BLE001 — injection must never fail a call
+            logger.debug("vault_skill attach skipped: %s", e)
         # Serialise with json.dumps(default=str) — UNCHANGED from pre-hardening
         # so the MCP wire format stays byte-identical for every tool (datetime →
         # `str()` space form, Enum → `str()`, unknown → stringified). The

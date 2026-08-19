@@ -277,7 +277,7 @@ def record(
             actor_id=_clip(getattr(user, "user_id", None)),
             actor=_clip(getattr(user, "username", None)),
             session_id=_clip(session_id),
-            vault=_clip(_vault_of(name, args)),
+            vault=_clip(vault_of_call(name, args)),
             outcome=outcome,
             code=_clip(code),
             duration_ms=duration_ms,
@@ -363,8 +363,13 @@ def _scalar_vault(args: dict) -> str | None:
     return v if isinstance(v, str) and v else None
 
 
-def _vault_of(name: str, args: Any) -> str | None:
+def vault_of_call(name: str, args: Any) -> str | None:
     """The vault the handler will actually operate on.
+
+    Public because the vault-skill injector in `mcp_server/server.py` needs the
+    SAME attribution this module records: the injection and the usage row must
+    agree on which vault a call touched, so they share one implementation
+    rather than two that can drift.
 
     Attribution has to follow each tool's own precedence, not one global rule,
     or the row names a vault the call never touched:
@@ -407,6 +412,11 @@ def _vault_of(name: str, args: Any) -> str | None:
             if found:
                 return found
     return _scalar_vault(args)
+
+
+# Back-compat alias: the helper was private until the vault-skill injector
+# needed it. Existing references (tests included) keep working.
+_vault_of = vault_of_call
 
 
 async def flush_once() -> int:

@@ -402,3 +402,19 @@ redis_stream_maxlen: 100000
 #   rollup_interval_secs: 3600    # rollup + purge cadence
 #   maintenance_batch: 5000       # rows claimed/deleted per maintenance statement
 #   shutdown_deadline_secs: 8     # drain + worker stop budget; must fit the termination grace
+
+# ── Vault skill auto-injection ────────────────────────────────
+# The first tool call a session makes against a vault gets that vault's
+# `overview/vault-skill.md` attached to the response under `vault_skill`, so an
+# agent picks up the vault's conventions without being told to go read them.
+# Re-attached only when the doc changes; mirror (external-git) vaults are
+# excluded, because auto-injecting upstream-controlled markdown into every
+# session would be an instruction-injection vector.
+#
+# On by default. `enabled: false` is the operator kill switch — it stops the
+# automatic channel only; akb_help(topic="vault-skill") still serves the doc.
+# vault_skill:
+#   enabled: true
+#   body_max_bytes: 16384         # injected body ceiling; past this it is clipped with truncated=true
+#   cache_ttl_secs: 60            # per-vault version/body cache; write-through invalidation covers one replica
+#   session_map_max: 10000        # bound on the (session, vault) tracking map; eviction just re-injects once
