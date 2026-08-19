@@ -189,134 +189,15 @@ async def test_local_provisioning_empty_database_and_exact_repeat_converge(servi
     assert identity_count == 0
 
 
-async def test_local_provisioning_without_a_password_cannot_authenticate(services, monkeypatch):
-    pool, role_sync, service, _, _, auth_service = services
-    from app.config import settings
-    from app.exceptions import AuthenticationError
-    from app.services.account_markers import (
-        UNISSUED_RECOVERY_ADMIN_PASSWORD_SENTINEL,
-    )
-
-    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
-
-    provisioned = await service.provision_local_recovery_admin(
-        username="recovery-admin",
-        email="recovery-admin@example.com",
-    )
-
-    assert provisioned["created"] is True
-    assert provisioned["is_admin"] is True
-    assert provisioned["is_recovery_admin"] is True
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT password_hash, is_admin, is_recovery_admin, auth_provider,
-                   account_status, account_kind
-              FROM users WHERE id = $1
-            """,
-            uuid.UUID(provisioned["user_id"]),
-        )
-        identity_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM external_identities WHERE user_id = $1",
-            uuid.UUID(provisioned["user_id"]),
-        )
-    assert row["password_hash"] == UNISSUED_RECOVERY_ADMIN_PASSWORD_SENTINEL
-    assert row["is_admin"] is True
-    assert row["is_recovery_admin"] is True
-    assert row["auth_provider"] == "local"
-    assert row["account_status"] == "active"
-    assert row["account_kind"] == "human"
-    assert identity_count == 0
-    assert role_sync.created == [uuid.UUID(provisioned["user_id"])]
-
-    # The stored marker is not a bcrypt hash, so no candidate can verify
-    # against it: the account is created already unable to authenticate.
-    assert auth_service.verify_password("", row["password_hash"]) is False
-    assert (
-        auth_service.verify_password(
-            UNISSUED_RECOVERY_ADMIN_PASSWORD_SENTINEL,
-            row["password_hash"],
-        )
-        is False
-    )
-    with pytest.raises(AuthenticationError):
-        await auth_service.login("recovery-admin", UNISSUED_RECOVERY_ADMIN_PASSWORD_SENTINEL)
-    with pytest.raises(AuthenticationError):
-        await auth_service.login("recovery-admin", _LOCAL_PASSWORD)
-
-
-async def test_local_provisioning_without_a_password_converges_without_issuing_one(
-    services,
-    monkeypatch,
-):
-    pool, role_sync, service, _, _, _ = services
-    from app.config import settings
-    from app.services.account_markers import (
-        UNISSUED_RECOVERY_ADMIN_PASSWORD_SENTINEL,
-    )
-
-    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
-    kwargs = {"username": "recovery-admin", "email": "recovery-admin@example.com"}
-
-    first = await service.provision_local_recovery_admin(**kwargs)
-    repeated = await service.provision_local_recovery_admin(**kwargs)
-
-    assert first["created"] is True
-    assert repeated["created"] is False
-    assert repeated["user_id"] == first["user_id"]
-    assert len(role_sync.created) == 1
-    async with pool.acquire() as conn:
-        assert (
-            await conn.fetchval(
-                "SELECT password_hash FROM users WHERE id = $1",
-                uuid.UUID(first["user_id"]),
-            )
-            == UNISSUED_RECOVERY_ADMIN_PASSWORD_SENTINEL
-        )
-        assert await conn.fetchval("SELECT COUNT(*) FROM users") == 1
-
-
-async def test_local_provisioning_converges_over_an_issued_credential(services, monkeypatch):
-    pool, _, service, _, _, auth_service = services
-    from app.config import settings
-
-    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
-    issued = await service.provision_local_recovery_admin(
-        username="recovery-admin",
-        email="recovery-admin@example.com",
-        password=_LOCAL_PASSWORD,
-    )
-    async with pool.acquire() as conn:
-        before = await conn.fetchval(
-            "SELECT password_hash FROM users WHERE id = $1",
-            uuid.UUID(issued["user_id"]),
-        )
-
-    # A later passwordless run must converge on the same row: provisioning is
-    # create-or-converge and never resets an issued credential.
-    converged = await service.provision_local_recovery_admin(
-        username="recovery-admin",
-        email="recovery-admin@example.com",
-    )
-
-    assert converged["created"] is False
-    assert converged["user_id"] == issued["user_id"]
-    async with pool.acquire() as conn:
-        after = await conn.fetchval(
-            "SELECT password_hash FROM users WHERE id = $1",
-            uuid.UUID(issued["user_id"]),
-        )
-    assert after == before
-    assert auth_service.verify_password(_LOCAL_PASSWORD, after)
-    assert (await auth_service.login("recovery-admin", _LOCAL_PASSWORD))["user"]["id"] == issued["user_id"]
-
-
 async def test_local_provisioning_rejects_an_unrecognised_credential_marker(services, monkeypatch):
     pool, _, service, _, _, _ = services
     from app.config import settings
     from app.exceptions import RecoveryAdminConflictError
 
     monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+    # A designated row whose credential column holds something this service
+    # never wrote. Converging on it would adopt an account of unknown
+    # provenance as the one that can recover the installation.
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -332,6 +213,7 @@ async def test_local_provisioning_rejects_an_unrecognised_credential_marker(serv
         await service.provision_local_recovery_admin(
             username="recovery-admin",
             email="recovery-admin@example.com",
+            password=_LOCAL_PASSWORD,
         )
 
 

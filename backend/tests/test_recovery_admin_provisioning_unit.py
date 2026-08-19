@@ -66,3 +66,26 @@ async def test_first_local_registration_is_never_implicitly_admin(monkeypatch):
     )
 
     assert result["is_admin"] is False
+
+
+async def test_local_provisioning_cannot_create_an_account_without_a_credential(monkeypatch):
+    """No credential, no account — refused before any database access.
+
+    The account exists to recover an installation, so it must never be created
+    in a state where nothing can authenticate as it and nothing has been handed
+    to an operator.
+    """
+    from app.services import recovery_admin_service
+
+    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+
+    async def _unreachable_pool():
+        raise AssertionError("provisioning reached the database without a credential")
+
+    monkeypatch.setattr(recovery_admin_service, "get_pool", _unreachable_pool)
+
+    with pytest.raises(TypeError):
+        await recovery_admin_service.provision_local_recovery_admin(
+            username="recovery-admin",
+            email="recovery-admin@example.com",
+        )

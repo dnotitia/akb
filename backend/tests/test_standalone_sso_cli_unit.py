@@ -156,7 +156,7 @@ async def test_bootstrap_cli_reads_only_secret_files_and_emits_allowlisted_repor
     assert spec.bootstrap_client_secret == _BOOTSTRAP_SECRET
     assert spec.upgrade_client_id == "akb-bootstrap-upgrade-v2"
     assert spec.upgrade_client_secret == _UPGRADE_SECRET
-    assert not hasattr(spec, "product_admin_password")
+    assert spec.product_admin_password == _PRODUCT_PASSWORD
     assert spec.management_client_secret == _MANAGEMENT_SECRET
     assert spec.api_client_secret == _API_SECRET
     assert spec.admin_client_secret == _ADMIN_SECRET
@@ -250,6 +250,7 @@ async def test_bootstrap_cli_rerun_allows_removed_one_time_secret_files(
 
     async def _readback(spec, **_kwargs):
         observed["bootstrap_secret"] = spec.bootstrap_client_secret
+        observed["product_password"] = spec.product_admin_password
         return {
             "mode": "readback",
             "keycloak_mutated": False,
@@ -272,7 +273,7 @@ async def test_bootstrap_cli_rerun_allows_removed_one_time_secret_files(
     assert await cli._bootstrap_standalone_sso(
         _arguments(str(missing_bootstrap), str(missing_password))
     ) == 0
-    assert observed == {"bootstrap_secret": ""}
+    assert observed == {"bootstrap_secret": "", "product_password": ""}
     assert json.loads(capsys.readouterr().out)["mode"] == "readback"
 
 
@@ -316,112 +317,3 @@ def _all_secrets() -> tuple[str, ...]:
         _API_SECRET,
         _ADMIN_SECRET,
     )
-
-
-async def test_bootstrap_cli_accepts_but_ignores_a_supplied_product_admin_password(
-    monkeypatch,
-    tmp_path,
-    capsys,
-    caplog,
-):
-    """The deployed init container still passes the retired flag.
-
-    Accepting it and discarding the value is what lets the current manifests
-    be redeployed unchanged: honouring it would put a stored credential back
-    on the account this change is meant to leave un-enterable.
-    """
-    from app import cli
-    from app.services import standalone_sso_bootstrap, standalone_sso_keycloak
-
-    _patch_database(monkeypatch)
-    _patch_sso_settings(monkeypatch)
-    bootstrap_file = tmp_path / "bootstrap-client-secret"
-    product_password_file = tmp_path / "product-admin-password"
-    bootstrap_file.write_text(f"{_BOOTSTRAP_SECRET}\n")
-    product_password_file.write_text(f"{_PRODUCT_PASSWORD}\n")
-    observed: dict[str, object] = {}
-
-    class _Control:
-        def __init__(self, *, verify_ssl: bool) -> None:
-            assert verify_ssl is True
-
-        async def aclose(self) -> None:
-            return None
-
-    async def _bootstrap(spec, **_kwargs):
-        observed["spec"] = spec
-        return {"mode": "fresh", "bootstrap_admin_retired": True}
-
-    monkeypatch.setattr(
-        standalone_sso_keycloak,
-        "KeycloakStandaloneSSOControl",
-        _Control,
-    )
-    monkeypatch.setattr(
-        standalone_sso_bootstrap,
-        "bootstrap_standalone_sso",
-        _bootstrap,
-    )
-
-    exit_code = await cli._bootstrap_standalone_sso(
-        _arguments(str(bootstrap_file), str(product_password_file))
-    )
-
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    spec = observed["spec"]
-    assert not hasattr(spec, "product_admin_password")
-    assert _PRODUCT_PASSWORD not in repr(spec)
-    rendered = captured.out + captured.err + caplog.text
-    assert all(secret not in rendered for secret in _all_secrets())
-
-
-async def test_bootstrap_cli_accepts_an_omitted_product_admin_password_flag(
-    monkeypatch,
-    tmp_path,
-    capsys,
-):
-    from app import cli
-    from app.services import standalone_sso_bootstrap, standalone_sso_keycloak
-
-    _patch_database(monkeypatch)
-    _patch_sso_settings(monkeypatch)
-    bootstrap_file = tmp_path / "bootstrap-client-secret"
-    bootstrap_file.write_text(f"{_BOOTSTRAP_SECRET}\n")
-
-    class _Control:
-        def __init__(self, *, verify_ssl: bool) -> None:
-            assert verify_ssl is True
-
-        async def aclose(self) -> None:
-            return None
-
-    async def _bootstrap(_spec, **_kwargs):
-        return {"mode": "fresh", "bootstrap_admin_retired": True}
-
-    monkeypatch.setattr(
-        standalone_sso_keycloak,
-        "KeycloakStandaloneSSOControl",
-        _Control,
-    )
-    monkeypatch.setattr(
-        standalone_sso_bootstrap,
-        "bootstrap_standalone_sso",
-        _bootstrap,
-    )
-
-    exit_code = await cli._bootstrap_standalone_sso(
-        [
-            "--bootstrap-client-id",
-            "akb-bootstrap-temporary",
-            "--bootstrap-client-secret-file",
-            str(bootstrap_file),
-            "--product-admin-username",
-            "product-admin",
-            "--product-admin-email",
-            "product-admin@example.com",
-        ]
-    )
-
-    assert exit_code == 0
-    assert json.loads(capsys.readouterr().out)["mode"] == "fresh"

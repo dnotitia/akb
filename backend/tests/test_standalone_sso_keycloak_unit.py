@@ -25,6 +25,7 @@ _SECRETS = (
     "permanent-management-secret-must-not-leak",  # pragma: allowlist secret
     "api-browser-secret-must-not-leak",  # pragma: allowlist secret
     "admin-browser-secret-must-not-leak",  # pragma: allowlist secret
+    "one-time-product-admin-password",  # pragma: allowlist secret
     "one-time-upgrade-secret-must-not-leak",  # pragma: allowlist secret
 )
 
@@ -45,6 +46,7 @@ def _spec() -> StandaloneSSOBootstrapSpec:
         admin_client_secret=_SECRETS[3],
         product_admin_username="product-admin",
         product_admin_email="product-admin@example.com",
+        product_admin_password=_SECRETS[4],
     )
 
 
@@ -98,7 +100,7 @@ async def test_upgrade_authority_authenticates_only_against_master_realm():
         return httpx.Response(200, json={"access_token": "opaque-upgrade-token"})
 
     control, spec = _control(httpx.MockTransport(handler))
-    spec = replace(spec, upgrade_client_secret=_SECRETS[4])
+    spec = replace(spec, upgrade_client_secret=_SECRETS[5])
     try:
         assert await control.acquire_upgrade(spec) == "opaque-upgrade-token"
     finally:
@@ -110,7 +112,7 @@ async def test_legacy_upgrade_updates_api_client_and_signed_provider_mapper(monk
     spec = replace(
         _spec(),
         backchannel_logout_uri=("http://backend:8000/api/v1/auth/keycloak/backchannel-logout"),
-        upgrade_client_secret=_SECRETS[4],
+        upgrade_client_secret=_SECRETS[5],
     )
     events: list[tuple[str, object]] = []
     expected_readback = object()
@@ -175,7 +177,7 @@ async def test_callback_upgrade_accepts_only_exact_receipt_source_or_target(
     spec = replace(
         _spec(),
         backchannel_logout_uri=("http://backend:8000/api/v1/auth/keycloak/backchannel-logout"),
-        upgrade_client_secret=_SECRETS[4],
+        upgrade_client_secret=_SECRETS[5],
     )
     reconciled: list[dict[str, object]] = []
     expected_readback = object()
@@ -219,7 +221,7 @@ async def test_callback_upgrade_rejects_callback_outside_receipt_transition(monk
     spec = replace(
         _spec(),
         backchannel_logout_uri=("http://backend:8000/api/v1/auth/keycloak/backchannel-logout"),
-        upgrade_client_secret=_SECRETS[4],
+        upgrade_client_secret=_SECRETS[5],
     )
 
     async def _exact_client(_spec, _realm, _client_id, *, token):
@@ -430,7 +432,7 @@ async def test_upgrade_retirement_deletes_only_exact_master_client_and_reauth_de
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
 
     control, spec = _control(httpx.MockTransport(handler))
-    spec = replace(spec, upgrade_client_secret=_SECRETS[4])
+    spec = replace(spec, upgrade_client_secret=_SECRETS[5])
     try:
         await control.retire_upgrade(
             spec,
@@ -446,18 +448,39 @@ async def test_upgrade_retirement_deletes_only_exact_master_client_and_reauth_de
     assert deleted_paths == ["/admin/realms/master/clients/upgrade-client-uuid"]
 
 
-async def test_created_product_admin_carries_no_credential_and_no_required_action():
+async def test_missing_one_time_password_cannot_create_product_admin():
     requests: list[str] = []
-    created: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(f"{request.method} {request.url.path}")
+        assert request.method == "GET"
+        assert request.url.path == "/admin/realms/akb/users"
+        return httpx.Response(200, json=[])
+
+    control, spec = _control(httpx.MockTransport(handler))
+    spec = replace(spec, product_admin_password="")
+    try:
+        with pytest.raises(StandaloneSSOBootstrapError) as captured:
+            await control._reconcile_product_admin(  # noqa: SLF001
+                spec,
+                token="opaque-token",  # pragma: allowlist secret
+            )
+    finally:
+        await control.aclose()
+
+    assert captured.value.code == "keycloak_product_admin_password_unavailable"
+    assert requests == ["GET /admin/realms/akb/users"]
+
+
+async def test_existing_product_admin_password_is_reset_to_the_operator_input():
+    requests: list[str] = []
     user_reads = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal user_reads
         requests.append(f"{request.method} {request.url.path}")
-        if request.url.path == "/admin/realms/akb/users" and request.method == "GET":
+        if request.url.path == "/admin/realms/akb/users":
             user_reads += 1
-            if user_reads == 1:
-                return httpx.Response(200, json=[])
             return httpx.Response(
                 200,
                 json=[
@@ -467,15 +490,22 @@ async def test_created_product_admin_carries_no_credential_and_no_required_actio
                         "email": "product-admin@example.com",
                         "enabled": True,
                         "emailVerified": True,
-                        "requiredActions": [],
+                        "requiredActions": (["UPDATE_PASSWORD"] if user_reads > 1 else []),
                     }
                 ],
             )
-        if request.url.path == "/admin/realms/akb/users" and request.method == "POST":
-            created.update(json.loads(request.content))
-            return httpx.Response(201)
-        if request.url.path.endswith("/credentials"):
+        if request.url.path.endswith("/reset-password"):
+            assert request.method == "PUT"
+            assert json.loads(request.content) == {
+                "type": "password",
+                "value": _SECRETS[4],
+                "temporary": True,
+            }
+            return httpx.Response(204)
+        if request.url.path.endswith("/federated-identity"):
             return httpx.Response(200, json=[])
+        if request.url.path.endswith("/credentials"):
+            return httpx.Response(200, json=[{"type": "password"}])
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
 
     control, spec = _control(httpx.MockTransport(handler))
@@ -488,30 +518,18 @@ async def test_created_product_admin_carries_no_credential_and_no_required_actio
         await control.aclose()
 
     assert user["id"] == "product-admin-uuid"
-    assert "credentials" not in created
-    assert created["requiredActions"] == []
-    assert created["enabled"] is True
-    assert created["emailVerified"] is True
-    assert created["username"] == "product-admin"
-    assert created["email"] == "product-admin@example.com"
     assert requests == [
         "GET /admin/realms/akb/users",
-        "POST /admin/realms/akb/users",
+        "GET /admin/realms/akb/users/product-admin-uuid/federated-identity",
+        "PUT /admin/realms/akb/users/product-admin-uuid/reset-password",
         "GET /admin/realms/akb/users",
         "GET /admin/realms/akb/users/product-admin-uuid/credentials",
     ]
-    assert all(secret not in json.dumps(created) for secret in _SECRETS)
 
 
-async def test_created_product_admin_readback_rejects_a_present_password_credential():
-    user_reads = 0
-
+async def test_product_admin_password_change_requirement_must_read_back():
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal user_reads
-        if request.url.path == "/admin/realms/akb/users" and request.method == "GET":
-            user_reads += 1
-            if user_reads == 1:
-                return httpx.Response(200, json=[])
+        if request.url.path == "/admin/realms/akb/users":
             return httpx.Response(
                 200,
                 json=[
@@ -525,8 +543,10 @@ async def test_created_product_admin_readback_rejects_a_present_password_credent
                     }
                 ],
             )
-        if request.url.path == "/admin/realms/akb/users" and request.method == "POST":
-            return httpx.Response(201)
+        if request.url.path.endswith("/federated-identity"):
+            return httpx.Response(200, json=[])
+        if request.url.path.endswith("/reset-password"):
+            return httpx.Response(204)
         if request.url.path.endswith("/credentials"):
             return httpx.Response(200, json=[{"type": "password"}])
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
@@ -541,35 +561,31 @@ async def test_created_product_admin_readback_rejects_a_present_password_credent
     finally:
         await control.aclose()
 
-    assert captured.value.code == "keycloak_product_admin_password_present"
+    assert captured.value.code == "keycloak_product_admin_update_password_missing"
 
 
-async def test_created_product_admin_readback_rejects_an_unexpected_required_action():
+async def test_product_admin_federation_race_after_password_reset_is_rejected():
     user_reads = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal user_reads
-        if request.url.path == "/admin/realms/akb/users" and request.method == "GET":
+        if request.url.path == "/admin/realms/akb/users":
             user_reads += 1
-            if user_reads == 1:
-                return httpx.Response(200, json=[])
-            return httpx.Response(
-                200,
-                json=[
-                    {
-                        "id": "product-admin-uuid",
-                        "username": "product-admin",
-                        "email": "product-admin@example.com",
-                        "enabled": True,
-                        "emailVerified": True,
-                        "requiredActions": ["UPDATE_PASSWORD"],
-                    }
-                ],
-            )
-        if request.url.path == "/admin/realms/akb/users" and request.method == "POST":
-            return httpx.Response(201)
-        if request.url.path.endswith("/credentials"):
+            user = {
+                "id": "product-admin-uuid",
+                "username": "product-admin",
+                "email": "product-admin@example.com",
+                "enabled": True,
+                "emailVerified": True,
+                "requiredActions": ["UPDATE_PASSWORD"],
+            }
+            if user_reads > 1:
+                user["federationLink"] = "racing-storage-provider"
+            return httpx.Response(200, json=[user])
+        if request.url.path.endswith("/federated-identity"):
             return httpx.Response(200, json=[])
+        if request.url.path.endswith("/reset-password"):
+            return httpx.Response(204)
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
 
     control, spec = _control(httpx.MockTransport(handler))
@@ -582,52 +598,44 @@ async def test_created_product_admin_readback_rejects_an_unexpected_required_act
     finally:
         await control.aclose()
 
-    assert captured.value.code == "keycloak_product_admin_required_action_unexpected"
+    assert captured.value.code == "keycloak_admin_identity_is_federated"
 
 
-async def test_existing_product_admin_credentials_are_never_written_or_removed():
+async def test_existing_product_admin_cannot_be_adopted_without_one_time_password():
     requests: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(f"{request.method} {request.url.path}")
-        if request.url.path == "/admin/realms/akb/users":
-            assert request.method == "GET"
-            return httpx.Response(
-                200,
-                json=[
-                    {
-                        "id": "product-admin-uuid",
-                        "username": "product-admin",
-                        "email": "product-admin@example.com",
-                        "enabled": True,
-                        "emailVerified": True,
-                        "requiredActions": ["UPDATE_PASSWORD"],
-                    }
-                ],
-            )
-        if request.url.path.endswith("/federated-identity"):
-            return httpx.Response(200, json=[])
-        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+        assert request.url.path == "/admin/realms/akb/users"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": "product-admin-uuid",
+                    "username": "product-admin",
+                    "email": "product-admin@example.com",
+                    "enabled": True,
+                    "emailVerified": True,
+                }
+            ],
+        )
 
     control, spec = _control(httpx.MockTransport(handler))
+    spec = replace(spec, product_admin_password="")
     try:
-        user = await control._reconcile_product_admin(  # noqa: SLF001
-            spec,
-            token="opaque-token",  # pragma: allowlist secret
-        )
+        with pytest.raises(StandaloneSSOBootstrapError) as captured:
+            await control._reconcile_product_admin(  # noqa: SLF001
+                spec,
+                token="opaque-token",  # pragma: allowlist secret
+            )
     finally:
         await control.aclose()
 
-    # An account an operator is already using keeps whatever credential state
-    # it holds: convergence never resets it and never takes it away.
-    assert user["id"] == "product-admin-uuid"
-    assert requests == [
-        "GET /admin/realms/akb/users",
-        "GET /admin/realms/akb/users/product-admin-uuid/federated-identity",
-    ]
+    assert captured.value.code == "keycloak_product_admin_password_unavailable"
+    assert requests == ["GET /admin/realms/akb/users"]
 
 
-async def test_readback_tolerates_a_product_admin_credential_issued_on_demand(monkeypatch):
+async def test_readback_does_not_inspect_the_product_admin_credential_list(monkeypatch):
     requests: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -694,8 +702,8 @@ async def test_readback_tolerates_a_product_admin_credential_issued_on_demand(mo
         return mappers[client_uuid]
 
     async def _exact_user(_spec, *, token):
-        # A recovery credential was issued on demand after installation, so
-        # the realm now reports a password for the product admin.
+        # An installed realm whose administrator has since completed the
+        # forced password change, or had the credential reset.
         return {
             "id": "product-admin-uuid",
             "username": "product-admin",
@@ -737,11 +745,59 @@ async def test_readback_tolerates_a_product_admin_credential_issued_on_demand(mo
     assert readback.product_admin_subject == "product-admin-uuid"
     assert readback.product_admin_federated_identities == 0
     # Steady-state readback proves the account is realm-native. Whether a
-    # credential currently exists is not its business — one may have been
-    # issued on demand since installation.
+    # credential currently exists is not its business, and asking would refuse
+    # a converged realm on the next redeploy.
     assert requests == [
         "GET /admin/realms/akb/users/product-admin-uuid/federated-identity",
     ]
+
+
+async def test_created_product_admin_must_read_back_holding_a_credential():
+    """The install must prove its own write, not assume it.
+
+    Nothing else covers this: with the read-back removed, an install that
+    silently failed to attach the credential still reports success, and the
+    account is left unreachable.
+    """
+    user_reads = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal user_reads
+        if request.url.path == "/admin/realms/akb/users" and request.method == "GET":
+            user_reads += 1
+            if user_reads == 1:
+                return httpx.Response(200, json=[])
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "product-admin-uuid",
+                        "username": "product-admin",
+                        "email": "product-admin@example.com",
+                        "enabled": True,
+                        "emailVerified": True,
+                        "requiredActions": ["UPDATE_PASSWORD"],
+                    }
+                ],
+            )
+        if request.url.path == "/admin/realms/akb/users" and request.method == "POST":
+            return httpx.Response(201)
+        if request.url.path.endswith("/credentials"):
+            # The realm accepted the create but holds no password for it.
+            return httpx.Response(200, json=[])
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    control, spec = _control(httpx.MockTransport(handler))
+    try:
+        with pytest.raises(StandaloneSSOBootstrapError) as captured:
+            await control._reconcile_product_admin(  # noqa: SLF001
+                spec,
+                token="opaque-token",  # pragma: allowlist secret
+            )
+    finally:
+        await control.aclose()
+
+    assert captured.value.code == "keycloak_product_admin_password_missing"
 
 
 async def test_existing_federated_identity_is_rejected_before_password_mutation():

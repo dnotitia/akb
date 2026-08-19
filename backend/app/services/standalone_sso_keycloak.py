@@ -978,6 +978,8 @@ class KeycloakStandaloneSSOControl:
         token: str,
     ) -> dict[str, Any]:
         existing = await self._exact_user(spec, token=token)
+        if not spec.product_admin_password:
+            raise _fail("keycloak_product_admin_password_unavailable")
         if existing is None:
             desired = {
                 "username": spec.product_admin_username,
@@ -986,14 +988,14 @@ class KeycloakStandaloneSSOControl:
                 "emailVerified": True,
                 "firstName": "AKB",
                 "lastName": "Product Administrator",
-                # No credential, and therefore no required action. Keycloak
-                # evaluates required actions at the end of a successful
-                # authentication; on an account nobody can authenticate to,
-                # UPDATE_PASSWORD can never fire, and asking for it would
-                # advertise a password that does not exist. Requiring a change
-                # belongs to whatever issues the credential later, which is
-                # also the moment the action first becomes reachable.
-                "requiredActions": [],
+                "requiredActions": ["UPDATE_PASSWORD"],
+                "credentials": [
+                    {
+                        "type": "password",
+                        "value": spec.product_admin_password,
+                        "temporary": True,
+                    }
+                ],
             }
             await self._request(
                 spec,
@@ -1013,27 +1015,43 @@ class KeycloakStandaloneSSOControl:
             raise _fail("keycloak_admin_identity_is_federated")
         if not self._product_admin_matches(spec, user):
             raise _fail("keycloak_product_admin_readback_failed")
-        if existing is None:
-            # Read back the account we just created: it must be un-enterable.
-            if user.get("requiredActions"):
-                raise _fail("keycloak_product_admin_required_action_unexpected")
-            await self._require_product_admin_has_no_password(spec, user, token=token)
-            return user
-        # An account an operator already installed keeps whatever credential
-        # state it holds; convergence neither writes nor removes one.
-        user_id = _required_string(
-            user,
-            "id",
-            "keycloak_product_admin_readback_failed",
-        )
-        if await self._federated_identity_count(
-            spec,
-            user_id,
-            token=token,
-        ):
-            # Never add a local recovery credential to a brokered user.
-            # The dedicated product admin must remain realm-native.
-            raise _fail("keycloak_admin_identity_is_federated")
+        if existing is not None:
+            user_id = _required_string(
+                user,
+                "id",
+                "keycloak_product_admin_readback_failed",
+            )
+            if await self._federated_identity_count(
+                spec,
+                user_id,
+                token=token,
+            ):
+                # Never add a local recovery credential to a brokered user.
+                # The dedicated product admin must remain realm-native.
+                raise _fail("keycloak_admin_identity_is_federated")
+            await self._request(
+                spec,
+                "PUT",
+                (f"/admin/realms/{_path(spec.realm)}/users/{_path(user_id)}/reset-password"),
+                token=token,
+                json_body={
+                    "type": "password",
+                    "value": spec.product_admin_password,
+                    "temporary": True,
+                },
+                expected=frozenset({204}),
+                code="keycloak_product_admin_password_reset_failed",
+            )
+            user = await self._exact_user(spec, token=token)
+            if user is None:
+                raise _fail("keycloak_product_admin_readback_failed")
+            if not self._product_admin_is_native(user):
+                raise _fail("keycloak_admin_identity_is_federated")
+            if not self._product_admin_matches(spec, user):
+                raise _fail("keycloak_product_admin_readback_failed")
+        if user.get("requiredActions") != ["UPDATE_PASSWORD"]:
+            raise _fail("keycloak_product_admin_update_password_missing")
+        await self._require_product_admin_password(spec, user, token=token)
         return user
 
     @staticmethod
@@ -1051,18 +1069,13 @@ class KeycloakStandaloneSSOControl:
             and user.get("emailVerified") is True
         )
 
-    async def _require_product_admin_has_no_password(
+    async def _require_product_admin_password(
         self,
         spec: StandaloneSSOBootstrapSpec,
         user: Mapping[str, object],
         *,
         token: str,
     ) -> None:
-        """Prove a freshly created product admin holds no password credential.
-
-        This is a read-back of our own create, not a standing realm invariant:
-        a recovery credential issued later is expected to show up here.
-        """
         user_id = _required_string(user, "id", "keycloak_product_admin_readback_failed")
         credentials = _objects(
             await self._json(
@@ -1073,8 +1086,8 @@ class KeycloakStandaloneSSOControl:
             ),
             "keycloak_product_admin_credential_read_failed",
         )
-        if any(item.get("type") == "password" for item in credentials):
-            raise _fail("keycloak_product_admin_password_present")
+        if not any(item.get("type") == "password" for item in credentials):
+            raise _fail("keycloak_product_admin_password_missing")
 
     async def _federated_identity_count(
         self,
@@ -1382,9 +1395,11 @@ class KeycloakStandaloneSSOControl:
         ):
             raise _fail("keycloak_product_admin_readback_failed")
         # Steady-state read-back deliberately does not inspect the credential
-        # list. It runs on every re-install, and by then a recovery credential
-        # may have been issued on demand; whether one exists is not evidence
-        # about this installation's shape.
+        # list. It runs on every re-install, and by then the administrator may
+        # have completed the forced password change or had the credential
+        # reset; whether one is present now is not evidence about this
+        # installation's shape, and requiring it here would refuse a converged
+        # realm on the next redeploy.
         product_admin_id = _required_string(
             product_admin,
             "id",

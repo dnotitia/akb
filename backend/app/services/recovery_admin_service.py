@@ -18,11 +18,7 @@ from app.exceptions import (
     ValidationError,
 )
 from app.repositories.events_repo import emit_event
-from app.services.account_markers import (
-    RETIRED_RECOVERY_ADMIN_PASSWORD_SENTINEL,
-    UNISSUED_RECOVERY_ADMIN_PASSWORD_SENTINEL,
-    is_unissued_recovery_admin_password,
-)
+from app.services.account_markers import RETIRED_RECOVERY_ADMIN_PASSWORD_SENTINEL
 from app.services.account_service import cleanup_token_roles
 from app.services.auth_service import hash_password_async
 from app.services.external_identity_contract import (
@@ -59,16 +55,17 @@ def _require_mode(expected: Literal["local", "sso"]) -> None:
 
 
 def _is_local_recovery_credential(password_hash: str | None) -> bool:
-    """Return whether a local recovery admin holds a credential state we set.
+    """Return whether a local recovery admin holds a credential we wrote.
 
-    Exactly two are legitimate: a bcrypt hash (a credential has been issued)
-    and the unissued marker (none has). Anything else is an account state this
+    Only a bcrypt hash is legitimate. Anything else is an account state this
     service did not produce, so converging on it would adopt an identity of
-    unknown provenance as the one account that can recover the installation.
+    unknown provenance as the one account that can recover the installation —
+    including either of the deliberate tombstones, which mark accounts that
+    must never be re-adopted as the live recovery administrator.
     """
     if password_hash is None:
         return False
-    return bool(_BCRYPT_HASH_PREFIX.match(password_hash)) or is_unissued_recovery_admin_password(password_hash)
+    return bool(_BCRYPT_HASH_PREFIX.match(password_hash))
 
 
 def _validate_password(password: str) -> None:
@@ -123,22 +120,14 @@ async def provision_local_recovery_admin(
     *,
     username: str,
     email: str,
-    password: str | None = None,
+    password: str,
 ) -> dict:
-    """Create the one local recovery admin, or converge on its exact identity.
-
-    Without ``password`` the account is created holding the unissued marker
-    instead of a hash, so it exists and carries recovery authority but cannot
-    be authenticated until a credential is issued for it.
-    """
+    """Create the one local recovery admin, or converge on its exact identity."""
     _require_mode("local")
     username = _required(username, "username")
     email = _email(email)
-    if password is None:
-        password_hash = UNISSUED_RECOVERY_ADMIN_PASSWORD_SENTINEL
-    else:
-        _validate_password(password)
-        password_hash = await hash_password_async(password)
+    _validate_password(password)
+    password_hash = await hash_password_async(password)
     pool = await get_pool()
     created = False
 
