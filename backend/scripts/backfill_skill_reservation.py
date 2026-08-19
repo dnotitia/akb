@@ -9,6 +9,12 @@ so are ARCHIVED vaults unless `--include-archived` is passed; the dry run's
 DEFAULT IS A DRY RUN: it only scans and prints per-class counts. Pass
 `--execute` to apply the repairs.
 
+Two classes are REPORT-ONLY because no automated treatment exists:
+`resource_violations` (files/tables under overview/) and
+`reserved_subcollections`. An execute run with a non-zero
+`resource_violations` exits 1 — they still need operator handling, and a
+document-only repair must not read as full compliance.
+
 The stdout summary is COUNTS ONLY, deliberately: it gets pasted into a public
 repo's PRs/issues, so no vault name or document path may appear there. Per-item
 detail goes to logging.
@@ -64,10 +70,24 @@ async def main() -> int:
         print(result)
         return 0
     errors = result["errors"]
+    resources = result["resource_violations"]
     # Redacted summary: counts + an error COUNT. The error entries carry
     # vault/path detail and were already logged; they never go to stdout.
-    print({"dry_run": False, "done": result["done"], "errors": len(errors)})
-    return 1 if errors else 0
+    print({
+        "dry_run": False,
+        "done": result["done"],
+        "errors": len(errors),
+        "resource_violations": resources,
+        "reserved_subcollections": result["reserved_subcollections"],
+    })
+    # Files/tables inside the reserved namespace have no automated treatment
+    # (no move operation exists for either), so they are counted, not fixed.
+    # A non-zero count therefore has to fail the run: exiting 0 here would let
+    # a document-only repair be read as "the namespace is now compliant".
+    # Reserved sub-collections are excluded from this gate deliberately —
+    # they are trapped by the delete guard and need a schema-level decision,
+    # not an operator scramble on every run.
+    return 1 if errors or any(resources.values()) else 0
 
 
 if __name__ == "__main__":

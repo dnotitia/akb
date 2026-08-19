@@ -39,9 +39,9 @@ from app.services.search_service import SearchService
 from app.services.kg_service import get_resource_relations, get_graph, get_provenance, link_resources, unlink_resources
 from app.services.uri_service import doc_uri, parse_uri, split_uri
 from app.services.access_service import (
-    check_vault_access, check_vault_scope, grant_access, revoke_access,
-    list_vault_members, list_accessible_vaults, get_vault_info, search_users,
-    transfer_ownership, archive_vault,
+    authorized_vault, check_vault_access, check_vault_scope, grant_access,
+    revoke_access, list_vault_members, list_accessible_vaults, get_vault_info,
+    reset_authorized_vault, search_users, transfer_ownership, archive_vault,
 )
 from app.services.auth_service import resolve_mcp_authorization, token_has_scope
 from app.util.errors import (
@@ -381,6 +381,15 @@ async def _handle_help(args: dict, uid: str, user: _MCPUser) -> dict:
     topic = args.get("topic")
     vault = args.get("vault")
     if topic == "vault-skill" and vault:
+        # This branch serves a vault's authored content, so it is a vault READ
+        # and needs the same gate every other read has. Without it the branch
+        # was a read-anything channel plus a vault-existence oracle (a
+        # non-member could tell "exists but I can't see it" from "absent" only
+        # because the absent case renders the mirror fallback). The raised
+        # ForbiddenError/NotFoundError flows to `call_tool`'s canonical
+        # envelope — permission_denied / not_found, same as akb_get.
+        # The REST twin (`app/api/routes/help.py`) already checked reader.
+        await check_vault_access(uid, vault, required_role="reader")
         from mcp_server.help import render_vault_skill_response
         async def _fetch(v, doc_id):
             from app.exceptions import NotFoundError
@@ -1507,6 +1516,11 @@ async def list_tools():
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
+    # FIRST thing, before anything can dispatch: drop any authorized-vault
+    # marker this task context may still carry. Streamable-HTTP sessions can
+    # reuse a task context across calls, and a stale marker would let this
+    # call's injection ride on the PREVIOUS call's authorization.
+    reset_authorized_vault()
     # Resolve the actor once and reuse it for both dispatch and the audit
     # line so the two can't disagree on who made the call.
     user = await _get_user()
@@ -1541,12 +1555,22 @@ async def call_tool(name: str, arguments: dict):
         # Vault-skill auto-injection: first touch of a vault in this session
         # (or a skill change since last touch) attaches the owner's guide.
         # Additive key; never fails the call (contract matches tool_usage).
+        #
+        # TWO conditions, and the second is the authorization one. Attribution
+        # (`vault_of_call`) only says which vault the ARGUMENTS name; it is an
+        # analytics helper and a handler is free to never look at that
+        # argument (akb_help's static topics) or to act on a different vault.
+        # `authorized_vault()` is set only by a check_vault_access that
+        # SUCCEEDED during this call, so requiring the two to agree means a
+        # payload can never reach a caller the server did not authorize for
+        # that exact vault — and a non-member cannot use the presence of the
+        # key as a vault-existence oracle either. Fail-closed on None.
         try:
             from app.services.tool_usage import vault_of_call
             from app.services import vault_skill_service
             if isinstance(result, dict) and result.get("error") is None:
                 target_vault = vault_of_call(name, arguments)
-                if target_vault:
+                if target_vault is not None and target_vault == authorized_vault():
                     payload = await vault_skill_service.injection_payload(
                         _session_id(), target_vault,
                     )

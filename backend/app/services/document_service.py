@@ -1425,12 +1425,23 @@ class DocumentService:
                     f"current_commit moved: expected {base_commit}, "
                     f"actual {row['current_commit']}"
                 )
-            return await self._edit_locked(
+            response = await self._edit_locked(
                 vault=vault, vault_id=vault_id, row=row, doc_repo=doc_repo,
                 old_string=old_string, new_string=new_string,
                 replace_all=replace_all, message=message, agent_id=agent_id,
                 conn=conn,
             )
+
+        # POST-COMMIT, for the same reason and with the same placement as
+        # `update()`: `_path_lock` owns the transaction and commits only as the
+        # `async with` above exits, so invalidating any earlier leaves a window
+        # where a concurrent reader re-caches the pre-commit body for a full
+        # TTL. `edit` reaches the canonical document through its own lane, so
+        # it needs its own hook — update()'s does not cover it.
+        if file_path == skill_policy.VAULT_SKILL_PATH:
+            from app.services import vault_skill_service
+            vault_skill_service.invalidate(vault)
+        return response
 
     async def _edit_locked(
         self, *, vault, vault_id, row, doc_repo,
@@ -2148,6 +2159,16 @@ class DocumentService:
             except Exception as rb_err:  # noqa: BLE001 — defense in depth; _rollback logs its own failures
                 logger.error("create_vault rollback itself failed for %s: %s", name, rb_err)
             raise
+        # Post-success, so the vault row and its seed are committed. A name
+        # PROBED before it existed left a negative (None, None) entry behind,
+        # which would suppress first-touch injection for up to a full TTL on a
+        # brand-new vault. A dict pop cannot fail, but it stays inside the
+        # never-fail posture: vault creation must not break over a cache hint.
+        try:
+            from app.services import vault_skill_service
+            vault_skill_service.invalidate(name)
+        except Exception as e:  # noqa: BLE001 — cache hygiene, never a failure
+            logger.warning("vault_skill invalidate skipped for %s: %s", name, e)
         logger.info("Vault created: %s (owner: %s, template: %s)", name, owner_id, template)
         return str(vault_id)
 

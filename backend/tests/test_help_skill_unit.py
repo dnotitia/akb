@@ -69,3 +69,62 @@ def test_render_without_vault_arg():
     """When no vault arg, returns just the static topic body."""
     out = asyncio.run(render_vault_skill_response(vault=None, fetch_fn=None))
     assert out == VAULT_SKILL_TOPIC_BODY
+
+
+# ── Access gate on the vault-specific branch ──────────────────────────
+# The branch serves a vault's authored content, so it is a vault read. Before
+# the gate it served any vault's skill to any authenticated caller.
+
+
+@pytest.mark.asyncio
+async def test_vault_branch_requires_reader(monkeypatch):
+    import tempfile
+
+    from app.config import settings
+    settings.git_storage_path = tempfile.mkdtemp(prefix="akb-help-skill-test-")
+    from app.exceptions import ForbiddenError
+    from mcp_server import server as server_mod
+
+    checked: list[tuple] = []
+
+    async def deny(uid, vault, required_role="reader", **kw):
+        checked.append((uid, vault, required_role))
+        raise ForbiddenError("nope")
+
+    async def _never(*a, **k):
+        raise AssertionError("access check must fire before the document read")
+
+    monkeypatch.setattr(server_mod, "check_vault_access", deny)
+    monkeypatch.setattr(server_mod.doc_service, "get", _never)
+
+    handler = server_mod._HANDLERS["akb_help"]
+    with pytest.raises(ForbiddenError):
+        await handler(
+            {"topic": "vault-skill", "vault": "not-mine"},
+            "u1",
+            server_mod._MCPUser(),
+        )
+    assert checked == [("u1", "not-mine", "reader")]
+
+
+@pytest.mark.asyncio
+async def test_static_topic_never_access_checks(monkeypatch):
+    """No vault argument is consulted, so no vault is authorized either —
+    which is what keeps `akb_help(topic="quickstart", vault=X)` from
+    arming the injector."""
+    import tempfile
+
+    from app.config import settings
+    settings.git_storage_path = tempfile.mkdtemp(prefix="akb-help-skill-test-")
+    from mcp_server import server as server_mod
+
+    async def _never(*a, **k):
+        raise AssertionError("static topics must not access-check a vault")
+
+    monkeypatch.setattr(server_mod, "check_vault_access", _never)
+
+    handler = server_mod._HANDLERS["akb_help"]
+    out = await handler(
+        {"topic": "quickstart", "vault": "someone-elses"}, "u1", server_mod._MCPUser(),
+    )
+    assert "help" in out

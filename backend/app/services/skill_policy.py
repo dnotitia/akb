@@ -93,6 +93,20 @@ def check_delete(path: str, *, internal: bool = False) -> None:
         )
 
 
+def check_collection_create(path: str) -> None:
+    """Symmetric partner to `check_collection_delete`.
+
+    Without this, `akb_create_collection(path="overview/junk")` succeeded and
+    the delete guard then refused to remove it — the reservation turned a
+    stray row into permanent, undeletable litter.
+    """
+    if is_reserved_collection(path):
+        raise ForbiddenError(
+            "Creating collections inside the reserved 'overview' system "
+            "namespace is not allowed."
+        )
+
+
 def check_collection_delete(path: str) -> None:
     if is_reserved_collection(path):
         raise ForbiddenError(

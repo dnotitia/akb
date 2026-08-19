@@ -1,16 +1,20 @@
 """Vault-skill auto-injection at the MCP dispatch chokepoint.
 
-Covers the shared attribution helper and the four paths through `call_tool`
+Covers the shared attribution helper and the paths through `call_tool`
 that decide whether a `vault_skill` payload is attached:
 
-- success + attributable vault  → attached
+- success + attributable vault + a COMPLETED access check on that vault → attached
 - handler returned an error dict → not attached
 - handler raised (error envelope) → not attached
 - no attributable vault          → injector never awaited
+- handler never access-checked   → not attached
+- handler authorized a DIFFERENT vault than the args name → not attached
 
-The last two matter most: a failing call is the wrong moment to teach
-conventions, and the common multi-vault/no-vault call must not pay for a
-lookup it cannot use.
+The last two are the authorization coupling: attribution (`vault_of_call`)
+is an ANALYTICS helper over raw caller args, so it alone can name a vault the
+caller has no right to read. The injector follows `access_service`'s
+authorized-vault contextvar instead, which only a successful
+`check_vault_access` sets — fail-closed on absence and on mismatch.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ from app.services.tool_usage import vault_of_call
 # never write documents; this just keeps the lazy import off `/data/vaults`.
 settings.git_storage_path = tempfile.mkdtemp(prefix="akb-skill-inject-test-vaults-")
 
+from app.services import access_service  # noqa: E402
 from app.services import vault_skill_service  # noqa: E402
 from mcp_server import server as server_mod  # noqa: E402
 
@@ -85,17 +90,63 @@ async def _run(name: str, args: dict) -> dict:
     return json.loads(out[0].text)
 
 
-async def test_success_path_attaches_payload(wired):
-    async def ok(name, args, user):
-        return {"ok": 1}
+def _authorizing(vault: str | None, result: dict | None = None):
+    """A dispatch stub standing in for a handler that ran an access check.
 
-    wired["dispatch"](ok)
+    `vault=None` is the handler that never checked anything (e.g. akb_help's
+    static-topic branch), which must leave the contextvar at its reset value.
+    """
+    async def handler(name, args, user):
+        if vault is not None:
+            access_service._authorized_vault.set(vault)
+        return dict(result or {"ok": 1})
+    return handler
+
+
+async def test_success_path_attaches_payload(wired):
+    wired["dispatch"](_authorizing("v1"))
 
     body = await _run("akb_get", {"uri": "akb://v1/doc/notes/a.md"})
 
     assert body["ok"] == 1
     assert body["vault_skill"] == _SENTINEL
     assert wired["calls"] == [("sess-1", "v1")]
+
+
+async def test_no_access_check_means_no_injection(wired):
+    """The `akb_help(topic="quickstart", vault=X)` shape.
+
+    Attribution names X, but the handler authorized nothing — so the injector
+    is never consulted and no payload (nor a vault-existence signal) escapes.
+    """
+    wired["dispatch"](_authorizing(None, {"help": "..."}))
+
+    body = await _run("akb_help", {"topic": "quickstart", "vault": "v1"})
+
+    assert "vault_skill" not in body
+    assert wired["calls"] == []
+
+
+async def test_authorized_vault_mismatch_blocks_injection(wired):
+    """Fail-closed: the args name v2, the completed check covered v1."""
+    wired["dispatch"](_authorizing("v1"))
+
+    body = await _run("akb_get", {"uri": "akb://v2/doc/notes/a.md"})
+
+    assert "vault_skill" not in body
+    assert wired["calls"] == []
+
+
+async def test_stale_authorization_does_not_leak_into_the_next_call(wired):
+    """A reused task context must not carry a previous call's authorization."""
+    wired["dispatch"](_authorizing("v1"))
+    await _run("akb_get", {"uri": "akb://v1/doc/notes/a.md"})
+
+    wired["dispatch"](_authorizing(None, {"help": "..."}))
+    body = await _run("akb_help", {"topic": "quickstart", "vault": "v1"})
+
+    assert "vault_skill" not in body
+    assert wired["calls"] == [("sess-1", "v1")]  # only the first call's
 
 
 async def test_raised_exception_gets_envelope_without_injection(wired):
@@ -126,13 +177,11 @@ async def test_handler_error_dict_gets_no_injection(wired):
 
 
 async def test_no_attributable_vault_never_awaits_injector(wired):
-    async def ok(name, args, user):
-        return {"vaults": [], "total": 0}
+    # akb_sql access-checks every listed vault, so an authorization IS in
+    # place — but multi-vault attribution yields None, and the hot path must
+    # skip the lookup entirely rather than fall back to the checked vault.
+    wired["dispatch"](_authorizing("b", {"vaults": [], "total": 0}))
 
-    wired["dispatch"](ok)
-
-    # Multi-vault akb_sql has no single target, so attribution yields None and
-    # the hot path must skip the lookup entirely.
     body = await _run("akb_sql", {"vaults": ["a", "b"], "query": "SELECT 1"})
 
     assert "vault_skill" not in body
@@ -141,13 +190,10 @@ async def test_no_attributable_vault_never_awaits_injector(wired):
 
 async def test_injector_failure_never_fails_the_call(monkeypatch, wired):
     """The attach is best-effort: a raising injector still returns the result."""
-    async def ok(name, args, user):
-        return {"ok": 1}
-
     async def exploding(session_id, vault):
         raise RuntimeError("cache backend down")
 
-    wired["dispatch"](ok)
+    wired["dispatch"](_authorizing("v1"))
     monkeypatch.setattr(vault_skill_service, "injection_payload", exploding)
 
     body = await _run("akb_get", {"uri": "akb://v1/doc/notes/a.md"})

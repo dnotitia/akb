@@ -31,6 +31,24 @@ async def test_collection_delete_overview_forbidden(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_collection_create_under_overview_forbidden(monkeypatch):
+    """Creation must be refused too, or the delete guard traps the result.
+
+    `akb_create_collection(path="overview/junk")` used to succeed, and
+    `check_collection_delete` then made the row permanently undeletable.
+    """
+    svc = CollectionService.__new__(CollectionService)
+
+    async def _boom(*a, **k):
+        raise AssertionError("guard must fire before repo access")
+
+    monkeypatch.setattr(svc, "_repos", _boom, raising=False)
+    for path in ("overview", "overview/junk", "/overview/", "overview/a/b"):
+        with pytest.raises(ForbiddenError):
+            await svc.create(vault="v", path=path, summary=None, agent_id=None)
+
+
+@pytest.mark.asyncio
 async def test_create_table_under_overview_forbidden():
     from app.services.table_service import create_table
     with pytest.raises(ForbiddenError):

@@ -234,8 +234,14 @@ class TestExistingSurfacesUnchanged:
 
         from app.services import access_service
 
-        src = inspect.getsource(access_service.check_vault_access)
+        # The body moved into `_check_vault_access_impl` when the public name
+        # became the authorized-vault recording wrapper; the predicate call is
+        # what this asserts, so follow it there.
+        src = inspect.getsource(access_service._check_vault_access_impl)
         assert "check_vault_scope(vault_name, required_role)" in src
+        assert "_check_vault_access_impl(" in inspect.getsource(
+            access_service.check_vault_access
+        )
 
     def test_scope_gate_still_covers_exactly_the_mutating_roles(self, scoped) -> None:
         from app.services.access_service import _MUTATING_ROLES

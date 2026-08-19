@@ -8,6 +8,7 @@ constructs a Git service nor writes the legacy document projection.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from datetime import UTC, datetime
 from typing import NoReturn
@@ -1079,6 +1080,17 @@ class NativeDocumentService(DocumentService):
                 raise ConflictError(f"Vault already exists: {name}") from exc
             raise
         assert vault_id is not None
+        # POST-COMMIT (the transaction above has exited). Drops any negative
+        # cache entry left by a probe of this name before the vault existed —
+        # otherwise first-touch injection stays suppressed for up to a TTL on
+        # a vault that was just seeded with a skill.
+        try:
+            from app.services import vault_skill_service
+            vault_skill_service.invalidate(name)
+        except Exception as e:  # noqa: BLE001 — cache hygiene, never a failure
+            logging.getLogger("akb.native_documents").warning(
+                "vault_skill invalidate skipped for %s: %s", name, e,
+            )
         return str(vault_id)
 
     async def list_vaults(self) -> list[dict]:

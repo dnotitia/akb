@@ -129,6 +129,11 @@ class CollectionService:
         decide whether to surface the event externally.
         """
         norm = _normalize_path(path)
+        # On the NORMALIZED path, same as the delete guard, so `/overview/`
+        # and `overview` are one case. The vault-skill seed does not come
+        # through here (it goes through put() → coll_repo.get_or_create), so
+        # this cannot block vault creation.
+        skill_policy.check_collection_create(norm)
         vault_repo, coll_repo = await self._repos()
         vault_id = await vault_repo.get_id_by_name(vault)
         if not vault_id:

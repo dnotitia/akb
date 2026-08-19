@@ -84,3 +84,64 @@ async def test_delete_canonical_forbidden(svc, monkeypatch):
     monkeypatch.setattr(svc, "_repos", _repos, raising=False)
     with pytest.raises(ForbiddenError):
         await svc.delete("v", "overview/vault-skill.md")
+
+
+# ── Version-cache invalidation on the legacy edit path ────────────────
+# `update()` invalidates post-commit; `edit()` reaches the same document
+# through a different lane (`_edit_locked`) and used to skip it entirely, so a
+# skill authored with akb_edit stayed stale in every session for a full TTL.
+
+
+def _edit_harness(monkeypatch, path: str):
+    """A DocumentService whose edit() lane is stubbed down to the seam:
+    resolve → lock → _edit_locked → (post-commit hook). Returns the spy list."""
+    from contextlib import asynccontextmanager
+
+    from app.services import vault_skill_service
+
+    svc = DocumentService.__new__(DocumentService)
+    seen: list[str] = []
+
+    class FakeVaultRepo:
+        async def get_id_by_name(self, name):
+            return "11111111-1111-1111-1111-111111111111"
+
+    class FakeDocRepo:
+        async def find_by_ref(self, vault_id, ref):
+            return {"path": path, "current_commit": "c0"}
+
+        async def find_by_ref_with_conn(self, conn, vault_id, ref, for_update=False):
+            return {"path": path, "current_commit": "c0"}
+
+    async def _repos():
+        return FakeVaultRepo(), FakeDocRepo(), None
+
+    @asynccontextmanager
+    async def _lock(vault_id, file_path, *, vault_name):
+        # The invalidation must land AFTER this context exits (that is where
+        # the transaction commits), never inside it.
+        assert not seen, "invalidated before the commit"
+        yield None
+
+    async def _edit_locked(**kwargs):
+        return "RESPONSE"
+
+    monkeypatch.setattr(svc, "_repos", _repos, raising=False)
+    monkeypatch.setattr(svc, "_path_lock", _lock, raising=False)
+    monkeypatch.setattr(svc, "_edit_locked", _edit_locked, raising=False)
+    monkeypatch.setattr(vault_skill_service, "invalidate", seen.append)
+    return svc, seen
+
+
+@pytest.mark.asyncio
+async def test_edit_on_canonical_path_invalidates_version_cache(monkeypatch):
+    svc, seen = _edit_harness(monkeypatch, "overview/vault-skill.md")
+    assert await svc.edit("v", "overview/vault-skill.md", "a", "b") == "RESPONSE"
+    assert seen == ["v"]
+
+
+@pytest.mark.asyncio
+async def test_edit_elsewhere_does_not_invalidate(monkeypatch):
+    svc, seen = _edit_harness(monkeypatch, "notes/a.md")
+    assert await svc.edit("v", "notes/a.md", "a", "b") == "RESPONSE"
+    assert seen == []

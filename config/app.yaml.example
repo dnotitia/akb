@@ -418,3 +418,5 @@ redis_stream_maxlen: 100000
 #   body_max_bytes: 16384         # injected body ceiling; past this it is clipped with truncated=true
 #   cache_ttl_secs: 60            # per-vault version/body cache; write-through invalidation covers one replica
 #   session_map_max: 10000        # bound on the (session, vault) tracking map; eviction just re-injects once
+#   vault_cache_max: 4096         # LRU bound on the per-vault cache; the TTL governs freshness, not size
+#   fetch_timeout_secs: 3.0       # ceiling on one cache-miss lookup; on timeout the call ships without a payload

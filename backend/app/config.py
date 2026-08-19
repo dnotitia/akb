@@ -329,6 +329,14 @@ class VaultSkillSettings(BaseModel):
     # Bound on the (session, vault) tracking map. Eviction's only cost is one
     # harmless re-injection.
     session_map_max: int = Field(default=10_000, ge=1, le=1_000_000)
+    # Bound on the per-vault version/body cache. The TTL governs freshness and
+    # evicts nothing, so without this the map grows with the number of distinct
+    # vault names ever touched. Eviction's only cost is one re-fetch.
+    vault_cache_max: int = Field(default=4096, ge=1, le=1_000_000)
+    # Ceiling on ONE cache-miss fetch (several DB round trips plus a git read)
+    # before injection gives up for this call. A stalled lookup must not hold
+    # a tool response hostage; the caller's own result is already computed.
+    fetch_timeout_secs: float = Field(default=3.0, gt=0, le=60)
 
 
 class ExternalGitHostRule(BaseModel):

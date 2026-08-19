@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from app.services import vault_skill_service as vss
@@ -122,3 +124,79 @@ async def test_session_map_bounded(monkeypatch):
     for i in range(5):
         await vss.injection_payload(f"s{i}", "v1")
     assert len(vss._session_map) <= 3
+
+
+@pytest.mark.asyncio
+async def test_vault_cache_bounded(monkeypatch):
+    """Negative entries are the cheap ones to create, so bound on those."""
+    async def absent(vault):
+        return None
+    monkeypatch.setattr(vss, "_fetch_skill", absent)
+    monkeypatch.setattr(vss, "_VAULT_CACHE_MAX", 3)
+    for i in range(20):
+        await vss.injection_payload("s", f"v{i}")
+    assert len(vss._vault_cache) <= 3
+    # LRU, not "clear when full": the most recent misses are what survives.
+    assert "v19" in vss._vault_cache
+
+
+@pytest.mark.asyncio
+async def test_overlong_vault_name_never_reaches_the_cache(monkeypatch):
+    """The clamp must not depend on the authorization coupling upstream."""
+    calls: list[str] = []
+
+    async def counting(vault):
+        calls.append(vault)
+        return {"content": "x", "version": "v"}
+
+    monkeypatch.setattr(vss, "_fetch_skill", counting)
+    assert await vss.injection_payload("s", "n" * 257) is None
+    assert calls == []
+    assert vss._vault_cache == {}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_misses_single_flight(monkeypatch):
+    """N concurrent first-touches on one vault produce ONE fetch."""
+    started = 0
+    release = asyncio.Event()
+
+    async def slow(vault):
+        nonlocal started
+        started += 1
+        await release.wait()
+        return {"content": "# body", "version": "abc12345"}
+
+    monkeypatch.setattr(vss, "_fetch_skill", slow)
+
+    tasks = [
+        asyncio.create_task(vss.injection_payload(f"s{i}", "v1")) for i in range(8)
+    ]
+    await asyncio.sleep(0)  # let every task reach the fetch
+    release.set()
+    results = await asyncio.gather(*tasks)
+
+    assert started == 1
+    # Distinct sessions, so every waiter still gets its own first-touch payload.
+    assert sum(1 for r in results if r is not None) == 8
+
+
+@pytest.mark.asyncio
+async def test_fetch_timeout_yields_none_and_caches_nothing(monkeypatch):
+    """A transient stall must not become a TTL-long negative entry."""
+    monkeypatch.setattr(vss, "_FETCH_TIMEOUT", 0.01)
+    hung = asyncio.Event()
+
+    async def hang(vault):
+        await hung.wait()
+        return {"content": "# body", "version": "abc12345"}
+
+    monkeypatch.setattr(vss, "_fetch_skill", hang)
+    assert await vss.injection_payload("s", "v1") is None
+    assert vss._vault_cache == {}
+    assert vss._pending == {}
+    hung.set()
+
+    # The next call is a fresh attempt, not a cache hit on the failure.
+    monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch())
+    assert await vss.injection_payload("s", "v1") is not None

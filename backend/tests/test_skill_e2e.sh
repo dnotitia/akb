@@ -141,37 +141,24 @@ echo "$H2" | grep -q "Document types" \
   && pass "Body content is included verbatim" \
   || fail "T3.4" "vault-skill.md body not embedded"
 
-# ── 3b. No skill → mirror-oriented fallback ─────────────────
-echo "▸ 3b. akb_help(topic='vault-skill', vault=<no skill>)"
+# ── 3b. Unknown vault is refused, not rendered ──────────────
+echo "▸ 3b. akb_help(topic='vault-skill', vault=<absent>)"
 
-# The canonical doc can no longer be deleted to fabricate this case (see T4c),
-# so the branch is driven with a vault name that does not exist: the handler's
-# _fetch maps NotFoundError → None for a missing vault exactly as it does for a
-# mirror vault that carries no skill, which is the render path under test.
+# The branch now runs a reader-role check FIRST, so a vault name that does not
+# exist is a not_found — it no longer reaches the renderer at all. The
+# mirror-vault fallback render (the only remaining way in: a vault the caller
+# CAN read that carries no skill doc) is covered in test_help_skill_unit.py,
+# since creating a mirror vault needs a reachable external git remote.
 ABSENT_VAULT="skill-e2e-absent-$(date +%s)"
 H3=$(mcp akb_help "{\"topic\":\"vault-skill\",\"vault\":\"$ABSENT_VAULT\"}" | mcp_text)
 
+echo "$H3" | grep -q '"code": *"not_found"' \
+  && pass "Unknown vault refused with not_found" \
+  || fail "T3b.1" "expected not_found; got: $(echo $H3 | head -c 200)"
+
 echo "$H3" | grep -q "# Vault skill for $ABSENT_VAULT" \
-  && pass "Fallback still names the vault" \
-  || fail "T3b.1" "header missing"
-
-echo "$H3" | grep -q 'This vault has no `overview/vault-skill.md`' \
-  && pass "Missing notice rendered" \
-  || fail "T3b.2" "missing notice not shown"
-
-echo "$H3" | grep -q 'read-only external' \
-  && pass "Notice points at the mirror-vault explanation" \
-  || fail "T3b.3" "mirror explanation missing"
-
-# No akb_put recipe: `overview` is reserved now, so telling an agent to author
-# the doc itself would hand it a call the server rejects.
-echo "$H3" | grep -q 'akb_put(' \
-  && fail "T3b.4" "fallback still hands out an akb_put recipe for a reserved path" \
-  || pass "No akb_put recipe in the fallback"
-
-echo "$H3" | grep -q '\${{secrets.X}}' \
-  && pass "Fallback rules included" \
-  || fail "T3b.5" "fallback rules missing"
+  && fail "T3b.2" "renderer still ran for a vault the caller has no access to" \
+  || pass "No skill body rendered for an unauthorized vault"
 
 # ── 4. Reserved-namespace guards ────────────────────────────
 echo "▸ 4. Reservation guards reject writes that break the pair"
@@ -211,6 +198,18 @@ R4E=$(mcp akb_delete_collection "{\"vault\":\"$VAULT\",\"path\":\"overview\",\"r
 echo "$R4E" | grep -q "$FORBIDDEN" \
   && pass "akb_delete_collection on overview rejected" \
   || fail "T4e" "expected permission_denied; got: $(echo $R4E | head -c 200)"
+
+# Symmetric with T4e: without a create guard the delete guard would turn any
+# stray sub-collection into permanently undeletable litter.
+R4F=$(mcp akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"overview/junk\"}" | mcp_text)
+echo "$R4F" | grep -q "$FORBIDDEN" \
+  && pass "akb_create_collection under overview rejected" \
+  || fail "T4f" "expected permission_denied; got: $(echo $R4F | head -c 200)"
+
+R4G=$(mcp akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"overview\"}" | mcp_text)
+echo "$R4G" | grep -q "$FORBIDDEN" \
+  && pass "akb_create_collection on overview itself rejected" \
+  || fail "T4g" "expected permission_denied; got: $(echo $R4G | head -c 200)"
 
 # ── 5. Author workflow: edit vault-skill, re-fetch ──────────
 echo "▸ 5. Owner can edit vault-skill, akb_help returns updated body"
@@ -313,6 +312,108 @@ INJ4=$(mcp akb_browse "{\"vault\":\"$INJECT_VAULT\"}" | mcp_text)
 [ -z "$(echo "$INJ4" | skill_field reason)" ] \
   && pass "Injection goes quiet again once the new version is delivered" \
   || fail "T7.8" "payload re-attached after the update was already delivered"
+
+# ── 8. Non-member sees no skill, through any channel ────────
+echo "▸ 8. Cross-vault disclosure is closed (second user)"
+
+# The single-owner sections above exercise no authorization path at all, so
+# this block provisions a second account (same shape as
+# test_security_edge_e2e.sh) that is a member of NOTHING.
+E2E_USER2="skill-user2-$(date +%s)"
+curl -sk -X POST "$BASE_URL/api/v1/auth/register" \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$E2E_USER2\",\"email\":\"$E2E_USER2@test.dev\",\"password\":\"test1234\"}" >/dev/null 2>&1
+
+JWT2=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$E2E_USER2\",\"password\":\"test1234\"}" | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+
+PAT2=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
+  -H "Authorization: Bearer $JWT2" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"skill-e2e-2"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+
+INIT2=$(curl -sk -i -X POST "$BASE_URL/mcp/" \
+  -H "Authorization: Bearer $PAT2" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"skill-e2e-2","version":"1.0"}}}' 2>&1)
+SID2=$(echo "$INIT2" | grep -i "mcp-session-id" | tr -d '\r' | awk '{print $2}')
+
+curl -sk -X POST "$BASE_URL/mcp/" \
+  -H "Authorization: Bearer $PAT2" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "mcp-session-id: $SID2" \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null 2>&1
+
+mcp2() {
+  local tool="$1"; local args="$2"
+  MCP_ID=$((MCP_ID+1))
+  curl -sk -X POST "$BASE_URL/mcp/" \
+    -H "Authorization: Bearer $PAT2" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -H "mcp-session-id: $SID2" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":$MCP_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}"
+}
+
+[ -n "$PAT2" ] && [ -n "$SID2" ] \
+  && pass "Second (non-member) user session ready" \
+  || fail "T8.0" "could not provision the second user"
+
+# Marker the non-member must never see, planted by the owner.
+MARKER="LEAK-CANARY-$(date +%s)"
+mcp akb_update "{\"uri\":\"akb://$INJECT_VAULT/doc/overview/vault-skill.md\",\"content\":\"# Private\\n\\n$MARKER\"}" >/dev/null
+
+# 8.1 The promoted channel itself.
+N1=$(mcp2 akb_help "{\"topic\":\"vault-skill\",\"vault\":\"$INJECT_VAULT\"}" | mcp_text)
+echo "$N1" | grep -q '"code": *"permission_denied"' \
+  && pass "Non-member akb_help(vault-skill) → permission_denied" \
+  || fail "T8.1" "expected permission_denied; got: $(echo $N1 | head -c 200)"
+
+echo "$N1" | grep -q "$MARKER" \
+  && fail "T8.2" "skill body leaked to a non-member through akb_help" \
+  || pass "No skill body in the refusal"
+
+# 8.3 The auto-injection channel. A STATIC topic runs no access check, so the
+# injector must stay silent even though the arguments name the vault — this is
+# the exact cross-vault disclosure the final review reproduced.
+N2=$(mcp2 akb_help "{\"topic\":\"quickstart\",\"vault\":\"$INJECT_VAULT\"}" | mcp_text)
+[ -z "$(echo "$N2" | skill_field vault)" ] \
+  && pass "Non-member static-topic call carries NO vault_skill key" \
+  || fail "T8.3" "injection attached without an access check: $(echo $N2 | head -c 200)"
+
+echo "$N2" | grep -q "$MARKER" \
+  && fail "T8.4" "skill body leaked through the injection channel" \
+  || pass "No skill body in the static-topic response"
+
+# 8.5 A denied vault call carries nothing either (belt and braces: the error
+# path already skips injection, but this is the shape an attacker would probe).
+N3=$(mcp2 akb_browse "{\"vault\":\"$INJECT_VAULT\"}" | mcp_text)
+echo "$N3" | grep -q '"code": *"permission_denied"' \
+  && pass "Non-member akb_browse → permission_denied" \
+  || fail "T8.5" "expected permission_denied; got: $(echo $N3 | head -c 200)"
+
+[ -z "$(echo "$N3" | skill_field vault)" ] \
+  && pass "Denied vault call carries NO vault_skill key" \
+  || fail "T8.6" "injection attached to a denied call"
+
+# 8.7 The gate is a role check, not a blanket deny: a granted reader gets it
+# through BOTH channels. Order matters — the injection channel is per-session
+# first-touch, and akb_help is itself an access-checked, vault-attributed call,
+# so it would consume the first touch if it ran first.
+mcp akb_grant "{\"vault\":\"$INJECT_VAULT\",\"user\":\"$E2E_USER2\",\"role\":\"reader\"}" >/dev/null 2>&1
+
+N4=$(mcp2 akb_browse "{\"vault\":\"$INJECT_VAULT\"}" | mcp_text)
+[ "$(echo "$N4" | skill_field reason)" = "first_touch" ] \
+  && pass "Granted reader's first touch carries the payload" \
+  || fail "T8.7" "authorized member lost injection: $(echo $N4 | head -c 200)"
+
+N5=$(mcp2 akb_help "{\"topic\":\"vault-skill\",\"vault\":\"$INJECT_VAULT\"}" | mcp_text_noskill)
+echo "$N5" | grep -q "$MARKER" \
+  && pass "Granted reader receives the skill through akb_help" \
+  || fail "T8.8" "reader denied after grant: $(echo $N5 | head -c 200)"
 
 # ── Cleanup ──────────────────────────────────────────────────
 # The reserved-namespace guards do not block vault deletion (the vault delete

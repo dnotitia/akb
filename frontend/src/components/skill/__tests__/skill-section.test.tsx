@@ -27,7 +27,7 @@ function wrap(ui: React.ReactNode) {
 const DOC = {
   content: "# my-v Guide\n\nStored body",
   updated_at: "2026-05-18T10:00:00Z",
-  current_commit: "abc123def456",
+  current_commit: "abc123def456", // pragma: allowlist secret — synthetic Git commit
 };
 
 beforeEach(() => {

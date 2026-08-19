@@ -90,9 +90,16 @@ class _FakeDocService:
         return SimpleNamespace(path=f"{req.collection}/{req.slug}.md")
 
 
+_NO_RESOURCES = {
+    "resource_violations": {"files": 0, "tables": 0},
+    "reserved_subcollections": 0,
+}
+
+
 def _patch_scans(monkeypatch, *, rows=(), missing=(),
-                 archived_rows=(), archived_missing=()):
-    """Route both scans by vault-status scope, so the archived-vault exclusion
+                 archived_rows=(), archived_missing=(),
+                 files=0, tables=0, subcollections=0):
+    """Route every scan by vault-status scope, so the archived-vault exclusion
     is exercised through the real dispatch rather than stubbed away."""
     async def fake_violations(scope):
         source = archived_rows if scope == backfill._ARCHIVED_ONLY else rows
@@ -102,8 +109,16 @@ def _patch_scans(monkeypatch, *, rows=(), missing=(),
         source = archived_missing if scope == backfill._ARCHIVED_ONLY else missing
         return list(source)
 
+    async def fake_resources(scope):
+        return {"files": files, "tables": tables}
+
+    async def fake_subcollections(scope):
+        return subcollections
+
     monkeypatch.setattr(backfill, "_scan_violations", fake_violations)
     monkeypatch.setattr(backfill, "_scan_missing", fake_missing)
+    monkeypatch.setattr(backfill, "_count_reserved_resources", fake_resources)
+    monkeypatch.setattr(backfill, "_count_reserved_subcollections", fake_subcollections)
 
 
 async def test_execute_move_out_uses_bypass_and_root_or_nested_collection(monkeypatch):
@@ -231,7 +246,7 @@ async def test_dry_run_reports_counts_and_mutates_nothing(monkeypatch):
     # The healthy canonical rows count toward nothing, in either scope.
     assert result == {
         "dry_run": True, "move_out": 1, "retype": 1, "restore_type": 1,
-        "reseed": 1, "archived_excluded": 2,
+        "reseed": 1, "archived_excluded": 2, **_NO_RESOURCES,
     }
     assert svc.calls == []
 
@@ -249,5 +264,49 @@ async def test_include_archived_widens_scope_and_zeroes_the_excluded_count(monke
 
     assert result == {
         "dry_run": True, "move_out": 1, "retype": 0, "restore_type": 0,
-        "reseed": 0, "archived_excluded": 0,
+        "reseed": 0, "archived_excluded": 0, **_NO_RESOURCES,
     }
+
+
+# ── Resource violations (report-only) ─────────────────────────────────
+# Files and tables under overview/ have no move operation, so the backfill
+# can only COUNT them. Reporting the count is what stops a clean doc run from
+# reading as "the namespace is clean".
+
+
+async def test_dry_run_reports_files_and_tables_under_overview(monkeypatch):
+    _patch_scans(monkeypatch, files=3, tables=2, subcollections=4)
+    svc = _FakeDocService()
+
+    result = await backfill.run(svc, execute=False)
+
+    assert result["resource_violations"] == {"files": 3, "tables": 2}
+    assert result["reserved_subcollections"] == 4
+    assert svc.calls == []  # counted, never treated
+
+
+async def test_execute_reports_resource_violations_without_treating_them(monkeypatch):
+    _patch_scans(
+        monkeypatch,
+        rows=[{"path": "overview/x.md", "doc_type": "note", "vault_name": "v1"}],
+        files=1, tables=0, subcollections=2,
+    )
+    svc = _FakeDocService()
+
+    result = await backfill.run(svc, execute=True)
+
+    assert result["done"]["move_out"] == 1
+    assert result["resource_violations"] == {"files": 1, "tables": 0}
+    assert result["reserved_subcollections"] == 2
+    # Only the document move — no file/table/collection mutation exists.
+    assert [c[0] for c in svc.calls] == ["move"]
+
+
+async def test_execute_clean_run_reports_zero_resource_violations(monkeypatch):
+    _patch_scans(monkeypatch)
+    svc = _FakeDocService()
+
+    result = await backfill.run(svc, execute=True)
+
+    assert result["resource_violations"] == {"files": 0, "tables": 0}
+    assert result["reserved_subcollections"] == 0
