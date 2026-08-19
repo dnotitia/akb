@@ -414,11 +414,6 @@ def vault_of_call(name: str, args: Any) -> str | None:
     return _scalar_vault(args)
 
 
-# Back-compat alias: the helper was private until the vault-skill injector
-# needed it. Existing references (tests included) keep working.
-_vault_of = vault_of_call
-
-
 async def flush_once() -> int:
     """Drain up to ``flush_batch`` records into PG in one round trip.
 
