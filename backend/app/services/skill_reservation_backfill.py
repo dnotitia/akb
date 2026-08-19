@@ -2,7 +2,10 @@
 
 Service-layer only — doc moves must keep git + PG + aliases + indexes
 consistent, so this NEVER touches SQL for mutations. Raw SQL is used only
-to SCAN for violations. Mirror (external-git) vaults are excluded entirely.
+to SCAN for violations. Mirror (external-git) vaults are excluded entirely,
+and ARCHIVED vaults are excluded by default (see `run`) — the archived
+read-only guard lives in `access_service`, not in `DocumentService`, so
+nothing below would otherwise stop a write into a frozen vault.
 
 Violation classes → treatment:
   move_out      ordinary doc under overview/  → move() to path minus prefix
@@ -52,13 +55,20 @@ _ACTOR = "akb-skill-backfill"
 
 _CLASSES = ("move_out", "retype", "restore_type", "reseed")
 
+# Vault-status scope fragments spliced into the scans below. FIXED literals,
+# never caller input — the same "literal status, no bind param" shape
+# `document_repo._browse` uses for its archived filter.
+_LIVE_ONLY = "\n   AND v.status <> 'archived'"
+_ARCHIVED_ONLY = "\n   AND v.status = 'archived'"
+_ANY_STATUS = ""
+
 # Scan only. Every mutation below goes through DocumentService.
 _SCAN_VIOLATIONS_SQL = """
 SELECT d.id, d.path, d.doc_type, v.name AS vault_name
   FROM documents d
   JOIN vaults v ON v.id = d.vault_id
  WHERE v.id NOT IN (SELECT vault_id FROM vault_external_git)
-   AND (d.path LIKE 'overview/%' OR d.doc_type = 'skill')
+   AND (d.path LIKE 'overview/%' OR d.doc_type = 'skill'){scope}
  ORDER BY v.name, d.path
 """
 
@@ -69,7 +79,7 @@ SELECT v.name AS vault_name
    AND NOT EXISTS (
        SELECT 1 FROM documents d
         WHERE d.vault_id = v.id AND d.path = $1
-   )
+   ){scope}
  ORDER BY v.name
 """
 
@@ -95,17 +105,38 @@ def _move_target(path: str) -> tuple[str | None, str]:
     return None, rest
 
 
-async def _scan() -> tuple[list[dict], list[str]]:
-    """Read-only violation scan. Returns (violation rows, vaults missing seed)."""
+async def _scan_violations(scope: str) -> list[dict]:
+    """Read-only. `scope` is one of the module's fixed vault-status fragments."""
     from app.db.postgres import get_pool
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch(_SCAN_VIOLATIONS_SQL)
-        missing = await conn.fetch(
-            _SCAN_MISSING_SQL, skill_policy.VAULT_SKILL_PATH
+        rows = await conn.fetch(_SCAN_VIOLATIONS_SQL.format(scope=scope))
+    return [dict(r) for r in rows]
+
+
+async def _scan_missing(scope: str) -> list[str]:
+    """Read-only. Vault names with no document at the canonical path."""
+    from app.db.postgres import get_pool
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            _SCAN_MISSING_SQL.format(scope=scope), skill_policy.VAULT_SKILL_PATH
         )
-    return [dict(r) for r in rows], [r["vault_name"] for r in missing]
+    return [r["vault_name"] for r in rows]
+
+
+async def _count_archived_excluded() -> int:
+    """How many violations the archived-vault exclusion is leaving behind.
+
+    Reported so an operator sees the residue rather than reading a clean run
+    as "no violations anywhere". Classified, not raw-counted: a healthy
+    canonical doc matches the scan predicate without being a violation.
+    """
+    rows = await _scan_violations(_ARCHIVED_ONLY)
+    missing = await _scan_missing(_ARCHIVED_ONLY)
+    return sum(1 for r in rows if classify_violation(r)) + len(missing)
 
 
 def _retype_request(new_type: str, what: str):
@@ -120,9 +151,14 @@ async def _apply_move_out(doc_service, row: dict) -> None:
     """Move a doc out of the reserved namespace, keeping its identity.
 
     An explicit slug makes `move` REJECT a collision instead of silently
-    suffixing, so a taken target surfaces as ConflictError; retry ONCE under a
-    disambiguated slug. A second collision is left to the caller's error list —
-    the doc stays where it is and an operator resolves it by hand.
+    suffixing, so an unavailable target surfaces as ConflictError; retry ONCE
+    under a disambiguated slug. The retry is on ANY ConflictError, not just the
+    "already exists" one: `move` also refuses a destination claimed by an
+    ORPHAN PUBLICATION, and both refusals name a specific unavailable PATH — a
+    differently-named destination is definitionally not that path, so the retry
+    is safe for either and resolves more violations unattended. A second
+    ConflictError is left to the caller's error list — the doc stays where it
+    is and an operator resolves it by hand.
     """
     from app.exceptions import ConflictError
 
@@ -136,9 +172,7 @@ async def _apply_move_out(doc_service, row: dict) -> None:
     }
     try:
         res = await doc_service.move(vault, path, slug=slug, **kwargs)
-    except ConflictError as e:
-        if "already exists" not in str(e):
-            raise
+    except ConflictError:
         res = await doc_service.move(
             vault, path, slug=f"{slug}-from-overview", **kwargs
         )
@@ -175,9 +209,20 @@ async def _apply_reseed(doc_service, vault: str) -> None:
     )
 
 
-async def run(doc_service, *, execute: bool = False) -> dict:
-    """Scan, then (with `execute`) repair. Default is a counts-only dry run."""
-    rows, missing = await _scan()
+async def run(
+    doc_service, *, execute: bool = False, include_archived: bool = False
+) -> dict:
+    """Scan, then (with `execute`) repair. Default is a counts-only dry run.
+
+    Archived vaults are EXCLUDED by default: archived is a user-facing
+    read-only promise, and rewriting a frozen vault's git history would break
+    it. The dry run reports how many violations that exclusion leaves behind
+    (`archived_excluded`) so the residue is visible, and `include_archived`
+    is the PM-sanctioned opt-in for a second pass over them.
+    """
+    scope = _ANY_STATUS if include_archived else _LIVE_ONLY
+    rows = await _scan_violations(scope)
+    missing = await _scan_missing(scope)
 
     plan: dict[str, list] = {name: [] for name in _CLASSES}
     plan["reseed"] = list(missing)
@@ -187,7 +232,12 @@ async def run(doc_service, *, execute: bool = False) -> dict:
             plan[violation].append(row)
 
     if not execute:
-        return {"dry_run": True, **{name: len(plan[name]) for name in _CLASSES}}
+        excluded = 0 if include_archived else await _count_archived_excluded()
+        return {
+            "dry_run": True,
+            **{name: len(plan[name]) for name in _CLASSES},
+            "archived_excluded": excluded,
+        }
 
     done = {name: 0 for name in _CLASSES}
     errors: list[dict] = []

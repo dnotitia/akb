@@ -2,7 +2,9 @@
 """Backfill existing violations of the overview/skill reservation.
 
 Thin runner around `app.services.skill_reservation_backfill.run` — all logic
-(and the service-layer-only rule) lives there. Mirror vaults are excluded.
+(and the service-layer-only rule) lives there. Mirror vaults are excluded, and
+so are ARCHIVED vaults unless `--include-archived` is passed; the dry run's
+`archived_excluded` count shows what that exclusion leaves behind.
 
 DEFAULT IS A DRY RUN: it only scans and prints per-class counts. Pass
 `--execute` to apply the repairs.
@@ -14,6 +16,7 @@ detail goes to logging.
 Usage:
     python -m scripts.backfill_skill_reservation             # dry run (counts)
     python -m scripts.backfill_skill_reservation --execute   # apply
+    python -m scripts.backfill_skill_reservation --execute --include-archived
 """
 from __future__ import annotations
 
@@ -38,6 +41,11 @@ async def main() -> int:
         "--execute", action="store_true",
         help="apply the repairs (default: dry run, counts only)",
     )
+    ap.add_argument(
+        "--include-archived", action="store_true",
+        help="also repair archived (read-only) vaults; requires a PM decision, "
+             "since it rewrites a frozen vault's git history",
+    )
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
@@ -45,7 +53,9 @@ async def main() -> int:
     await init_db()
     try:
         result = await skill_reservation_backfill.run(
-            get_document_service(), execute=args.execute
+            get_document_service(),
+            execute=args.execute,
+            include_archived=args.include_archived,
         )
     finally:
         await close_pool()
