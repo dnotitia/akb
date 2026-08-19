@@ -64,7 +64,7 @@ commit their values.
 | `akb-secret-config` | `secret.yaml` | durable |
 | `akb-keycloak-bootstrap` | `client-secret` | one-time |
 | `akb-keycloak-upgrade` | `client-secret` | optional; one-time legacy-profile upgrade only |
-| `akb-product-admin-bootstrap` | `password` | unused; kept because the current init container still mounts it |
+| `akb-product-admin-bootstrap` | `password` | one-time |
 
 The mounted `secret.yaml` must include the AKB database password, an
 independent browser-session encryption key, and three independently generated
@@ -81,14 +81,11 @@ keycloak_management_client_secret: <akb-sso-manager secret>
 embed_api_key: <provider key, if required>
 ```
 
-Generate each credential independently. Installation does not create a
-product-admin password. The account is created holding no credential at all,
-so nobody can sign in as it until one is issued, and nothing about it is
-stored ahead of that. The realm keeps its lean policy — at least 12
-characters, and different from the username and email — for whatever
-credential is issued later. The `akb-product-admin-bootstrap` value is read by
-nothing; the init container still mounts it, and still accepts
-`--product-admin-password-file`, only so the current manifests keep starting.
+Generate each credential independently. The product-admin password is
+temporary, must be at least 12 characters, must differ from its username and
+email, and Keycloak forces `UPDATE_PASSWORD` on first login. The realm enforces
+the same lean policy for the replacement password. The bootstrap client secret
+is not the product-admin password.
 
 `sso_session_epoch` is not a credential. Generate it once with
 `python -c 'import uuid; print(uuid.uuid4())'` and keep it stable across normal
@@ -227,9 +224,8 @@ durable recovery paths and the AKB administrator projection have been read
 back. Its successful report also means the exact retirement receipt was
 written and read back from AKB PostgreSQL. After that report succeeds:
 
-1. There is no product-admin password to hand over. The account exists with
-   recovery authority and no credential; one is issued when an administrator
-   actually needs to sign in.
+1. Preserve the product-admin password through an approved installer handoff;
+   the administrator needs it for the forced first-login password change.
 2. Replace both first-install Secret values with fresh, unrelated retirement
    sentinels. Keep
    the Secret objects because the default first-boot manifest deliberately

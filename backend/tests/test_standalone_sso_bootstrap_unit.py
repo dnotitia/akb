@@ -13,6 +13,7 @@ _BOOTSTRAP_SECRET = "temporary-bootstrap-secret-must-not-leak"  # pragma: allowl
 _UPGRADE_SECRET = "temporary-upgrade-secret-must-not-leak"  # pragma: allowlist secret
 _MANAGEMENT_SECRET = "permanent-management-secret-must-not-leak"  # pragma: allowlist secret
 _ADMIN_CLIENT_SECRET = "admin-browser-secret-must-not-leak"  # pragma: allowlist secret
+_PRODUCT_ADMIN_PASSWORD = "one-time-product-admin-password"  # pragma: allowlist secret
 
 
 def _spec():
@@ -33,6 +34,7 @@ def _spec():
         admin_client_secret=_ADMIN_CLIENT_SECRET,
         product_admin_username="product-admin",
         product_admin_email="product-admin@example.com",
+        product_admin_password=_PRODUCT_ADMIN_PASSWORD,
         upgrade_client_id="akb-bootstrap-upgrade-v2",
         upgrade_client_secret="",
     )
@@ -290,6 +292,7 @@ async def test_fresh_bootstrap_retires_temporary_admin_only_after_akb_projection
         _BOOTSTRAP_SECRET,
         _MANAGEMENT_SECRET,
         _ADMIN_CLIENT_SECRET,
+        _PRODUCT_ADMIN_PASSWORD,
         "api-browser-secret-must-not-leak",
     ):
         assert secret not in serialized
@@ -311,7 +314,7 @@ async def test_completed_bootstrap_rerun_is_read_only_and_does_not_need_temp_adm
         }
 
     report = await bootstrap_standalone_sso(
-        replace(_spec(), bootstrap_client_secret=""),
+        replace(_spec(), bootstrap_client_secret="", product_admin_password=""),
         control=control,
         provision_admin=_provision,
         load_retirement_receipt=receipts.load,
@@ -361,6 +364,7 @@ async def test_legacy_v1_receipt_uses_one_time_upgrade_authority_then_retires_it
         replace(
             _spec(),
             bootstrap_client_secret="",
+            product_admin_password="",
             upgrade_client_secret=_UPGRADE_SECRET,
         ),
         control=control,
@@ -415,7 +419,7 @@ async def test_legacy_v2_public_callback_promotes_receipt_without_mutation_autho
         }
 
     report = await bootstrap_standalone_sso(
-        replace(_spec(), bootstrap_client_secret=""),
+        replace(_spec(), bootstrap_client_secret="", product_admin_password=""),
         control=control,
         provision_admin=_provision,
         load_retirement_receipt=receipts.load,
@@ -463,7 +467,7 @@ async def test_v2_readback_promotion_preserves_later_exact_callback_migration_re
         }
 
     promoted = await bootstrap_standalone_sso(
-        replace(_spec(), bootstrap_client_secret=""),
+        replace(_spec(), bootstrap_client_secret="", product_admin_password=""),
         control=control,
         provision_admin=_provision,
         load_retirement_receipt=receipts.load,
@@ -476,6 +480,7 @@ async def test_v2_readback_promotion_preserves_later_exact_callback_migration_re
     migration_spec = replace(
         _spec(),
         bootstrap_client_secret="",
+        product_admin_password="",
         backchannel_logout_uri=internal_uri,
         upgrade_client_secret=_UPGRADE_SECRET,
     )
@@ -538,6 +543,7 @@ async def test_v3_callback_migration_without_one_time_authority_fails_closed():
             replace(
                 _spec(),
                 bootstrap_client_secret="",
+                product_admin_password="",
                 backchannel_logout_uri=("http://backend:8000/api/v1/auth/keycloak/backchannel-logout"),
             ),
             control=control,
@@ -579,6 +585,7 @@ async def test_legacy_v2_internal_callback_uses_bounded_upgrade_authority():
         replace(
             _spec(),
             bootstrap_client_secret="",
+            product_admin_password="",
             backchannel_logout_uri=("http://backend:8000/api/v1/auth/keycloak/backchannel-logout"),
             upgrade_client_secret=_UPGRADE_SECRET,
         ),
@@ -617,6 +624,7 @@ async def test_legacy_v2_internal_callback_without_authority_fails_before_projec
             replace(
                 _spec(),
                 bootstrap_client_secret="",
+                product_admin_password="",
                 backchannel_logout_uri=("http://backend:8000/api/v1/auth/keycloak/backchannel-logout"),
             ),
             control=control,
@@ -651,6 +659,7 @@ async def test_legacy_v1_receipt_without_upgrade_authority_fails_before_mutation
             replace(
                 _spec(),
                 bootstrap_client_secret="",
+                product_admin_password="",
                 upgrade_client_secret="",
             ),
             control=control,
@@ -822,7 +831,7 @@ async def test_removed_bootstrap_secret_without_retirement_receipt_fails_closed(
 
     control = _Control(manager_available=True, bootstrap_available=False)
     receipts = _ReceiptStore(control.events)
-    spec = replace(_spec(), bootstrap_client_secret="")
+    spec = replace(_spec(), bootstrap_client_secret="", product_admin_password="")
 
     async def _should_not_run(**_kwargs):
         raise AssertionError("AKB projection must not run without retirement evidence")
@@ -844,36 +853,62 @@ async def test_removed_bootstrap_secret_without_retirement_receipt_fails_closed(
     ]
 
 
-async def test_fresh_bootstrap_reconciles_without_any_product_admin_password():
-    from app.services.standalone_sso_bootstrap import bootstrap_standalone_sso
+async def test_missing_product_admin_password_stops_before_keycloak_mutation():
+    from app.services.standalone_sso_bootstrap import (
+        StandaloneSSOBootstrapError,
+        bootstrap_standalone_sso,
+    )
 
     control = _Control(manager_available=False, bootstrap_available=True)
     receipts = _ReceiptStore(control.events)
-    spec = _spec()
 
-    # The installation never carries a product-admin password: the account is
-    # created unable to authenticate and a credential is issued later.
-    assert not hasattr(spec, "product_admin_password")
+    async def _should_not_run(**_kwargs):
+        raise AssertionError("projection must not run without the one-time password")
 
-    async def _provision(**_kwargs):
-        return {
-            "user_id": "11111111-1111-4111-8111-111111111111",
-            "created": True,
-            "is_admin": True,
-            "is_recovery_admin": True,
-        }
+    with pytest.raises(StandaloneSSOBootstrapError) as captured:
+        await bootstrap_standalone_sso(
+            replace(_spec(), product_admin_password=""),
+            control=control,
+            provision_admin=_should_not_run,
+            load_retirement_receipt=receipts.load,
+            record_retirement_receipt=receipts.record,
+        )
 
-    report = await bootstrap_standalone_sso(
-        spec,
-        control=control,
-        provision_admin=_provision,
-        load_retirement_receipt=receipts.load,
-        record_retirement_receipt=receipts.record,
+    assert captured.value.code == "keycloak_product_admin_password_unavailable"
+    assert control.events == [
+        "load-retirement-receipt",
+        "acquire-management",
+        "acquire-bootstrap",
+    ]
+
+
+@pytest.mark.parametrize(
+    "password",
+    ["short", "product-admin", "product-admin@example.com"],
+)
+async def test_invalid_product_admin_password_stops_before_keycloak_mutation(password):
+    from app.services.standalone_sso_bootstrap import (
+        StandaloneSSOBootstrapError,
+        bootstrap_standalone_sso,
     )
 
-    assert report["mode"] == "fresh"
-    assert report["keycloak_mutated"] is True
-    assert "reconcile-keycloak" in control.events
+    control = _Control(manager_available=False, bootstrap_available=True)
+    receipts = _ReceiptStore(control.events)
+
+    async def _should_not_run(**_kwargs):
+        raise AssertionError("invalid password must fail before reconciliation")
+
+    with pytest.raises(StandaloneSSOBootstrapError) as captured:
+        await bootstrap_standalone_sso(
+            replace(_spec(), product_admin_password=password),
+            control=control,
+            provision_admin=_should_not_run,
+            load_retirement_receipt=receipts.load,
+            record_retirement_receipt=receipts.record,
+        )
+
+    assert captured.value.code == "keycloak_product_admin_password_policy"
+    assert "reconcile-keycloak" not in control.events
 
 
 async def test_readback_rejects_receipt_bound_to_another_installation():
@@ -899,7 +934,7 @@ async def test_readback_rejects_receipt_bound_to_another_installation():
 
     with pytest.raises(StandaloneSSOBootstrapError) as captured:
         await bootstrap_standalone_sso(
-            replace(_spec(), bootstrap_client_secret=""),
+            replace(_spec(), bootstrap_client_secret="", product_admin_password=""),
             control=control,
             provision_admin=_provision,
             load_retirement_receipt=receipts.load,
@@ -975,6 +1010,7 @@ async def test_spec_repr_and_mapping_never_expose_secret_values():
         _UPGRADE_SECRET,
         _MANAGEMENT_SECRET,
         _ADMIN_CLIENT_SECRET,
+        _PRODUCT_ADMIN_PASSWORD,
         "api-browser-secret-must-not-leak",
     ):
         assert secret not in rendered
