@@ -67,7 +67,7 @@ New module `backend/app/services/skill_policy.py` owns:
   `mcp_server/help.py:1871`; help.py imports it),
   `SKILL_COLLECTION = "overview"`, `SKILL_DOC_TYPE = "skill"`.
 - Guard functions raising the canonical `ForbiddenError` (existing error
-  envelope, code `FORBIDDEN`, message naming the reserved namespace and the
+  envelope, code `permission_denied`, message naming the reserved namespace and the
   supported alternative).
 - An internal-bypass parameter used only by the seed, the reset operation, and
   the migration backfill.
@@ -196,7 +196,8 @@ repo.
 - `akb_put`'s `type` stays free-form with `skill` documented as reserved
   (`tools.py` description update — an agent-facing contract change).
 - The only breaking change: writes into the reserved namespace and
-  retype/move/delete of the canonical doc return `FORBIDDEN` with guidance.
+  retype/move/delete of the canonical doc return `permission_denied` with
+  guidance (the envelope code `ForbiddenError` maps to — verified in e2e).
 - Export keeps including the skill doc; import skips reserved records
   per-record.
 - Rollback-safe: guards lift with a code rollback; migrated docs keep working
