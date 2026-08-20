@@ -12,6 +12,131 @@ cd "${REPO_ROOT}"
 
 step() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 
+# ─── preflight: this gate's own prerequisites ─────────────────────
+# Both classes below used to fail as something other than "you are missing
+# a prerequisite", which is the most expensive way for a gate to be wrong.
+step "preflight (analyzer parsers, node deps)"
+
+PREFLIGHT_TMP="$(mktemp -d)"
+trap 'rm -rf "${PREFLIGHT_TMP}"' EXIT
+
+# 1. The Python analyzers must be able to PARSE this repo.
+#
+# mypy and bandit both build their AST with the interpreter they are running
+# on, so the `--python-version 3.14` passed to mypy below selects typing
+# semantics — it is not a parser selector. An analyzer installed against an
+# older interpreter therefore cannot read a repo that uses newer syntax, and
+# the two fail in opposite, equally unhelpful ways:
+#
+#   mypy    stops at the first unparseable file with a `[syntax]` error that
+#           reads like a defect in the source. "errors prevented further
+#           checking" is the important half: on Python 3.13 that was 1 file
+#           reported and the other 316 never examined.
+#   bandit  skips the file, lists it under "Files skipped", and exits 0.
+#           `-q` suppressed that list, so the security scan reported success
+#           having silently skipped 11 files — among them auth_service,
+#           admin_auth_service, keycloak_oidc, local_session_keys and
+#           sso_browser_session_crypto. Exactly the surface it exists for.
+#
+# CI gets this right by construction (setup-python, then pip install into
+# it). Nothing asserted it locally, so whichever interpreter a contributor's
+# `mypy` happened to be installed against silently decided how much of the
+# repo got analysed. Assert it here instead, before any analyzer runs, so
+# the gate names the interpreter rather than blaming the source.
+#
+# The canary is the newest syntax this repo actually relies on. It is a
+# behavioural assertion on purpose: a version-string comparison would still
+# pass for a tool that cannot parse us, and this one cannot.
+cat >"${PREFLIGHT_TMP}/canary.py" <<'CANARY'
+def _canary() -> None:
+    try:
+        pass
+    except ValueError, TypeError:  # PEP 758 — Python 3.14
+        pass
+CANARY
+
+REQUIRED_PYTHON="$(sed -n 's/^requires-python *= *">=\([0-9.]*\)".*/\1/p' backend/pyproject.toml)"
+: "${REQUIRED_PYTHON:=3.14}"
+
+# Best effort, for the error message only: a pip/uv/pipx console script names
+# its interpreter in its shebang.
+analyzer_interpreter() {
+  local bin shebang
+  bin="$(command -v "$1" 2>/dev/null)" || return 0
+  shebang="$(head -c 256 "$bin" 2>/dev/null | sed -n '1s/^#!//p')" || return 0
+  [ -n "$shebang" ] || return 0
+  "${shebang%% *}" -c 'import sys; print("%d.%d.%d at %s" % (sys.version_info[:3] + (sys.executable,)))' 2>/dev/null
+}
+
+preflight_parser_fail() {
+  local tool="$1" running
+  running="$(analyzer_interpreter "$tool")"
+  echo >&2
+  echo "  ✗ ${tool} cannot parse Python ${REQUIRED_PYTHON} syntax." >&2
+  echo >&2
+  echo "    backend/pyproject.toml declares requires-python = \">=${REQUIRED_PYTHON}\" and this" >&2
+  echo "    repo uses syntax older interpreters cannot parse. ${tool} parses with the" >&2
+  echo "    interpreter it runs on, so --python-version does not help." >&2
+  echo "    Running on: ${running:-could not determine}" >&2
+  echo >&2
+  echo "    Reinstall it against Python ${REQUIRED_PYTHON} — the versions CI pins are in" >&2
+  echo "    .github/workflows/check.yml and backend/pyproject.toml [dev]:" >&2
+  echo "      uv tool install --python ${REQUIRED_PYTHON} --force mypy==2.1.0" >&2
+  echo "      uv tool install --python ${REQUIRED_PYTHON} --force 'bandit[toml]==1.9.4'" >&2
+  echo >&2
+  echo "    Refusing to run: on the wrong interpreter mypy examines one file and" >&2
+  echo "    bandit exits 0 having read nothing." >&2
+  exit 1
+}
+
+mypy --python-version "${REQUIRED_PYTHON}" --no-error-summary \
+  "${PREFLIGHT_TMP}/canary.py" >/dev/null 2>&1 || preflight_parser_fail mypy
+
+# bandit reports an unreadable file as a skip and still exits 0, so its
+# canary has to be read from the report, not the exit code.
+if ! bandit "${PREFLIGHT_TMP}/canary.py" 2>&1 | grep -q '^Files skipped (0):'; then
+  preflight_parser_fail bandit
+fi
+
+echo "  mypy + bandit parse Python ${REQUIRED_PYTHON}"
+
+# 2. Node deps must be installed in BOTH pnpm projects.
+#
+# frontend/ and packages/akb-client/ are separate pnpm projects with separate
+# lockfiles and separate node_modules, and this gate runs steps in each.
+# Installing only one died six steps later, inside the other, as:
+#
+#     undefined
+#      ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL  Command "vitest" not found
+#
+# — which names neither the package nor the missing install, and has already
+# been misread once. Worse, the two steps before it can PASS out of a global
+# tsc on PATH, so the run appears to get further than it did and to have
+# typechecked against a compiler nobody pinned. CI installs both explicitly
+# (.github/workflows/check.yml); nothing else said so, so a fresh clone could
+# not run this script. Say it here and in CONTRIBUTING.md.
+missing_installs=()
+for pnpm_project in frontend packages/akb-client; do
+  [ -d "${pnpm_project}/node_modules" ] || missing_installs+=("${pnpm_project}")
+done
+if [ "${#missing_installs[@]}" -ne 0 ]; then
+  echo >&2
+  echo "  ✗ node_modules missing in ${#missing_installs[@]} of the 2 pnpm projects this gate runs in:" >&2
+  for pnpm_project in "${missing_installs[@]}"; do
+    echo "      ${pnpm_project}" >&2
+  done
+  echo >&2
+  echo "    Both are required — they are separate projects with separate lockfiles:" >&2
+  for pnpm_project in "${missing_installs[@]}"; do
+    echo "      (cd ${pnpm_project} && pnpm install --frozen-lockfile)" >&2
+  done
+  echo >&2
+  echo "    Refusing to run: without them eslint/tsc/vitest either fail without" >&2
+  echo "    naming their package or silently resolve to a global toolchain." >&2
+  exit 1
+fi
+echo "  node deps present in frontend + packages/akb-client"
+
 # ─── E2E suite manifest ───────────────────────────────────────────
 # Fails fast when a new shell E2E suite is neither run by the hosted gate nor
 # deliberately deferred with a reviewed reason.
@@ -23,14 +148,17 @@ step "ruff (backend)"
 ruff check backend/
 
 # ─── backend: mypy (types) ─────────────────────────────────────────
-# `--python-version 3.11` matches both pyproject.toml's `requires-python`
-# and the CI runner's `actions/setup-python` pin. Without it the analyzer
-# picks up whatever Python the dev's `mypy` binary was installed against
-# (3.11 / 3.13 / 3.14 all currently in flight on team machines), and
-# different runtimes' typing modules can disagree on third-party stubs —
-# which is the bug shape we hit in 0.6.4 (local: 18 errors, CI: green).
-# Setting it explicitly here keeps `bash scripts/check.sh` deterministic
-# regardless of which venv is active.
+# `--python-version 3.14` matches pyproject.toml's `requires-python` and the
+# CI runner's `actions/setup-python` pin, so the typing semantics analysed
+# here are the ones we ship against — third-party stubs can otherwise
+# disagree between runtimes, which is the bug shape we hit in 0.6.4 (local:
+# 18 errors, CI: green).
+#
+# It does NOT make this step independent of the active interpreter, and the
+# comment that used to claim it did is why that went unnoticed for so long:
+# mypy parses with the running interpreter's `ast`, so on an older one this
+# flag is accepted and the file still fails to parse. The preflight above is
+# what actually pins the parser; this flag pins the type system.
 step "mypy (backend)"
 (cd backend && mypy --python-version 3.14 app/ mcp_server/)
 
@@ -38,8 +166,28 @@ step "mypy (backend)"
 # Gate at medium severity — low-level findings on `random`, `try/except
 # pass`, etc. would drown out the real signals. The pyproject [tool.bandit]
 # section explains the two skipped tests (B104, B608).
+#
+# Run without `-q` and assert the skip list is empty, rather than trusting
+# the exit code. bandit exits 0 for a file it could not read, so "found no
+# issues" and "read no files" are indistinguishable by status alone — and
+# `-q` suppressed the "Files skipped" line that was the only evidence. The
+# preflight above removes the syntax cause specifically; this removes the
+# whole class, because a file skipped for permissions or encoding is just
+# as unscanned. Any skip is a failure here: unscanned is not clean.
 step "bandit (backend)"
-(cd backend && bandit -r app/ mcp_server/ -c pyproject.toml --severity-level medium -q)
+bandit_report="$(cd backend && bandit -r app/ mcp_server/ -c pyproject.toml --severity-level medium 2>&1)" || {
+  printf '%s\n' "${bandit_report}" >&2
+  exit 1
+}
+bandit_skipped="$(printf '%s\n' "${bandit_report}" | sed -n 's/^Files skipped (\([0-9]*\)):.*/\1/p')"
+if [ "${bandit_skipped:-0}" != "0" ]; then
+  printf '%s\n' "${bandit_report}" >&2
+  echo >&2
+  echo "  ✗ bandit skipped ${bandit_skipped} file(s) and still exited 0 — listed above." >&2
+  echo "    A skipped file is unscanned, not clean." >&2
+  exit 1
+fi
+echo "  0 files skipped,$(printf '%s\n' "${bandit_report}" | sed -n 's/^[[:space:]]*Total lines of code:\(.*\)/\1/p') lines scanned"
 
 # ─── frontend: eslint (lint) ──────────────────────────────────────
 step "eslint (frontend)"
