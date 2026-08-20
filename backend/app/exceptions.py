@@ -128,6 +128,29 @@ class ExternalIdentityConflictError(AKBError):
         )
 
 
+class ExternalIdentityIssuerMismatchError(AKBError):
+    """A prelink named an issuer this runtime does not present.
+
+    The binding a control plane writes is only usable if its issuer is the one
+    this AKB will actually see on a token. Nothing downstream re-checks that:
+    ``invite_only`` matches an exact ``(issuer, subject)`` pair, so a binding
+    written under any other issuer is created successfully, reported as
+    success, and refuses its owner at sign-in with nothing recording why.
+
+    The expected issuer is included because it is public — it is the ``iss``
+    claim this deployment stamps and is published in its discovery document —
+    and because a caller that cannot see it cannot correct the call.
+    """
+
+    def __init__(self, expected: str):
+        super().__init__(
+            "External identity issuer does not match the one this AKB presents",
+            status_code=422,
+            code="external_identity_issuer_mismatch",
+            details={"expected_issuer": expected},
+        )
+
+
 class ServiceIdentityAdoptionError(AKBError):
     """A local bootstrap administrator cannot be safely adopted in place."""
 

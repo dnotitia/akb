@@ -11,7 +11,9 @@ from app.db.postgres import get_pool
 from app.exceptions import (
     AccountSuspendedError,
     CredentialCleanupIncompleteError,
+    ExternalAuthDisabledError,
     ExternalIdentityConflictError,
+    ExternalIdentityIssuerMismatchError,
     NotFoundError,
     RecoveryAdminProtectedError,
     ServiceIdentityAdoptionError,
@@ -29,6 +31,31 @@ from app.services.auth_service import (
     _unique_username,
 )
 from app.services.role_sync import get_role_sync
+
+
+def _presented_issuer(issuer: str) -> str:
+    """Refuse a binding under an issuer this runtime will never present.
+
+    ``get_managed_account_state`` already compares an issuer it is *given*
+    against ``settings.keycloak_issuer`` before it will read anything. The
+    write path had no such comparison, and that asymmetry is the whole defect:
+    a control plane could create an exact binding under its own issuer, be told
+    it succeeded, and leave the person it named unable to sign in — because
+    ``invite_only`` matches the exact pair and theirs is stored under an issuer
+    that never appears on a token here.
+
+    In local mode the answer is not "some other issuer" but "none". Writing an
+    external binding there is worse than inert: the same call sets
+    ``auth_provider = 'keycloak'``, and local sign-in requires ``'local'``, so
+    it locks the account out of the only credential it has.
+    """
+
+    if settings.require_auth_mode() != "sso" or not settings.keycloak_enabled:
+        raise ExternalAuthDisabledError()
+    expected = settings.keycloak_issuer
+    if issuer != expected:
+        raise ExternalIdentityIssuerMismatchError(expected)
+    return issuer
 
 
 _HUMAN_SENTINEL_HASH = "!keycloak-sso:no-local-login!"
@@ -83,7 +110,7 @@ async def ensure_human_external_identity(
     existing_user_id: str | None = None,
     prepare_suspended: bool = False,
 ) -> dict:
-    issuer = _required(issuer, "issuer")
+    issuer = _presented_issuer(_required(issuer, "issuer"))
     subject = _required(subject, "subject")
     email = _required(email, "email").lower()
     existing_user_uuid = _uuid(existing_user_id, "existing_user_id") if existing_user_id is not None else None
