@@ -208,13 +208,13 @@ CODE=$(rdel_code "$PAT1" "$COLL_URI" "$URI_B" "references")
 CODE=$(rdel_code "$PAT1" "$URI_A" "$URI_B" "bogus_rel")
 [ "$CODE" = "422" ] && pass "unlink with bad relation enum → 422" || fail "DELETE bad relation" "got $CODE"
 
-# relation omitted → remove ALL edges between the two
+# relation omitted → remove all explicit edges between the two
 rpost "$PAT1" "{\"source\":\"$URI_A\",\"target\":\"$URI_B\",\"relation\":\"references\"}" >/dev/null
 rpost "$PAT1" "{\"source\":\"$URI_A\",\"target\":\"$URI_B\",\"relation\":\"related_to\"}" >/dev/null
 BEFORE=$(rel_count "$PAT1" "$URI_A")
 rdel "$PAT1" "$URI_A" "$URI_B" >/dev/null   # no relation → wipe both
 AFTER=$(rel_count "$PAT1" "$URI_A")
-[ "$BEFORE" = "2" ] && [ "$AFTER" = "0" ] && pass "unlink w/o relation removes all edges (2→0)" || fail "unlink-all" "before=$BEFORE after=$AFTER"
+[ "$BEFORE" = "2" ] && [ "$AFTER" = "0" ] && pass "unlink w/o relation removes all explicit edges (2→0)" || fail "unlink-all" "before=$BEFORE after=$AFTER"
 
 # ── 4. Canonicalization parity (link/unlink resolve URIs identically) ─
 # link_resources canonicalizes on write; unlink_resources must too, or a

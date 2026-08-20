@@ -20,9 +20,16 @@ import uuid
 from itertools import zip_longest
 from typing import Literal, get_args
 
+from app.exceptions import ValidationError
 from app.db.postgres import get_pool
 from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.services.asset_service import ASSET_URL_PREFIX
+from app.services.edge_boundary import (
+    LINKABLE_RESOURCE_TYPES,
+    edge_scope_sql,
+    uri_is_in_vault,
+    vault_uri_prefix,
+)
 from app.services.uri_service import parse_uri, doc_uri, table_uri, file_uri
 from app.util.errors import (
     err,
@@ -58,6 +65,31 @@ LinkRelationType = Literal[
     "derived_from",
 ]
 LINK_RELATION_TYPES: tuple[str, ...] = get_args(LinkRelationType)
+
+
+def validate_new_structured_relation_refs(
+    vault: str,
+    refs: list[str],
+    *,
+    existing_refs: list[str] | None = None,
+) -> None:
+    """Reject newly introduced structured references outside ``vault``.
+
+    Existing values are accepted so an unrelated edit does not make a legacy
+    document unwritable. They are inert in the graph because extraction skips
+    cross-vault targets. New values fail before Git or PostgreSQL mutation and
+    before any target-vault catalog lookup, so target existence is not exposed.
+    """
+    existing = set(existing_refs or [])
+    for ref in refs:
+        if ref in existing:
+            continue
+        parsed = parse_uri(ref)
+        if parsed is not None and parsed.vault != vault:
+            raise ValidationError(
+                "Structured relations must stay within the document's vault; "
+                "use an ordinary Markdown link for a cross-vault reference."
+            )
 
 # Matches markdown links and image destinations. Relative images can represent
 # document-to-document references in imported Markdown; generated editor asset
@@ -274,24 +306,31 @@ async def link_resources(
         return err(f"Invalid source URI: {source_uri}", code=INVALID_URI)
     if not target_parsed:
         return err(f"Invalid target URI: {target_uri}", code=INVALID_URI)
-    _LINKABLE = ("doc", "table", "file")
-    if source_parsed.kind not in _LINKABLE:
+    if source_parsed.kind not in LINKABLE_RESOURCE_TYPES:
         return err(
             f"Cannot link from a {source_parsed.kind} URI ({source_uri}). "
-            f"Linkable kinds: {_LINKABLE}.",
+            f"Linkable kinds: {LINKABLE_RESOURCE_TYPES}.",
             code=INVALID_ARGUMENT,
         )
-    if target_parsed.kind not in _LINKABLE:
+    if target_parsed.kind not in LINKABLE_RESOURCE_TYPES:
         return err(
             f"Cannot link to a {target_parsed.kind} URI ({target_uri}). "
-            f"Linkable kinds: {_LINKABLE}.",
+            f"Linkable kinds: {LINKABLE_RESOURCE_TYPES}.",
             code=INVALID_ARGUMENT,
         )
 
-    source_vault_name = source_parsed.vault
+    # Enforce the boundary before any vault or resource lookup. The requested
+    # graph owner, source authority, and target authority must all agree; this
+    # also prevents a direct service caller from assigning a valid edge to an
+    # unrelated vault container.
+    if not source_parsed.vault == target_parsed.vault == vault_name:
+        return err(
+            "source and target must belong to the requested vault",
+            code=INVALID_ARGUMENT,
+        )
+
     source_type = source_parsed.kind
     source_id = source_parsed.identifier
-    target_vault_name = target_parsed.vault
     target_type = target_parsed.kind
     target_id = target_parsed.identifier
 
@@ -323,17 +362,6 @@ async def link_resources(
                 return err(f"Vault not found: {vault_name}", code=NOT_FOUND)
             vault_id = vault["id"]
 
-            source_vault = await conn.fetchrow(
-                "SELECT id FROM vaults WHERE name = $1", source_vault_name,
-            )
-            if not source_vault:
-                return err(f"Source vault not found: {source_vault_name}", code=NOT_FOUND)
-            target_vault = await conn.fetchrow(
-                "SELECT id FROM vaults WHERE name = $1", target_vault_name,
-            )
-            if not target_vault:
-                return err(f"Target vault not found: {target_vault_name}", code=NOT_FOUND)
-
             # Acquire the same path advisory lock the doc write paths use so
             # akb_link serialises with akb_delete / akb_update on either
             # endpoint. Doc endpoints only — table/file lifecycle is keyed by
@@ -342,20 +370,20 @@ async def link_resources(
             from app.repositories.document_repo import acquire_path_lock
             doc_endpoints: list[tuple[uuid.UUID, str]] = []
             if source_type == "doc":
-                doc_endpoints.append((source_vault["id"], source_id))
+                doc_endpoints.append((vault_id, source_id))
             if target_type == "doc":
-                doc_endpoints.append((target_vault["id"], target_id))
+                doc_endpoints.append((vault_id, target_id))
             for vid, ident in sorted(
                 doc_endpoints, key=lambda x: (str(x[0]), x[1]),
             ):
                 await acquire_path_lock(conn, vid, ident)
 
             if not await _resource_exists(
-                conn, source_vault["id"], source_type, source_id,
+                conn, vault_id, source_type, source_id,
             ):
                 return err(f"Source resource not found: {source_uri}", code=NOT_FOUND)
             if not await _resource_exists(
-                conn, target_vault["id"], target_type, target_id,
+                conn, vault_id, target_type, target_id,
             ):
                 return err(f"Target resource not found: {target_uri}", code=NOT_FOUND)
 
@@ -380,7 +408,7 @@ async def unlink_resources(
     target_uri: str,
     relation_type: str | None = None,
     *,
-    vault_id: uuid.UUID | None = None,
+    vault_id: uuid.UUID,
 ) -> dict:
     """Remove an edge between two resources.
 
@@ -413,6 +441,11 @@ async def unlink_resources(
         return err(f"Invalid source URI: {source_uri}", code=INVALID_URI)
     if not tgt_parsed:
         return err(f"Invalid target URI: {target_uri}", code=INVALID_URI)
+    if src_parsed.vault != tgt_parsed.vault:
+        return err(
+            "source and target must belong to the same vault",
+            code=INVALID_ARGUMENT,
+        )
     src_canon = canonicalize_resource_uri(src_parsed)
     tgt_canon = canonicalize_resource_uri(tgt_parsed)
     if src_canon is None:
@@ -432,14 +465,26 @@ async def unlink_resources(
 
     pool = await get_pool()
     async with pool.acquire() as conn:
+        owner_vault = await conn.fetchval(
+            "SELECT name FROM vaults WHERE id = $1", vault_id,
+        )
+        if owner_vault is None:
+            return err("Vault not found", code=NOT_FOUND)
+        if owner_vault != src_parsed.vault:
+            return err(
+                "source and target must belong to the authorized vault",
+                code=INVALID_ARGUMENT,
+            )
         params: list = [source_uri, target_uri]
-        where = "source_uri = $1 AND target_uri = $2"
+        # Implicit edges are owned by document metadata/body extraction. They
+        # must be removed by editing that source content, not by the explicit
+        # relation API (which would only make them reappear on the next save).
+        where = "source_uri = $1 AND target_uri = $2 AND kind = 'explicit'"
         if relation_type:
             where += " AND relation_type = $3"
             params.append(relation_type)
-        if vault_id is not None:
-            where += f" AND vault_id = ${len(params) + 1}"
-            params.append(vault_id)
+        where += f" AND vault_id = ${len(params) + 1}"
+        params.append(vault_id)
         result = await conn.execute(
             f"DELETE FROM edges WHERE {where}", *params,
         )
@@ -461,78 +506,87 @@ async def get_resource_relations(
 ) -> list[dict]:
     """Get direct (1-hop) relations for any resource.
 
-    `vault_id` scopes both the edge fetch and the name resolution to a
-    single vault. Cross-vault edges (an edge whose endpoint URI lives in
-    another vault) are returned only as opaque URIs — the endpoint name
-    is NOT resolved unless the resource also exists in this vault. This
-    is the security boundary: a caller authorized for vault A cannot
-    learn the title/description/filename of a doc/table/file in vault B
-    even if A holds an edge pointing at B.
+    ``vault_id`` and both endpoint URI authorities must identify ``vault``.
+    Legacy cross-vault rows are omitted completely: neither their raw URI nor
+    their contribution to a count is part of the reader-visible graph.
     """
+    if not uri_is_in_vault(resource_uri, vault):
+        return []
+
     pool = await get_pool()
     results = []
     uris_to_resolve: list[tuple[str, str]] = []
+    prefix = vault_uri_prefix(vault)
+    scoped = edge_scope_sql(alias="e", vault_param=2, prefix_param=3)
 
     async with pool.acquire() as conn:
         if direction in ("outgoing", "both"):
-            base_params: list = [resource_uri, vault_id]
+            base_params: list = [resource_uri, vault_id, prefix]
             if relation_type:
                 rows = await conn.fetch(
-                    """
-                    SELECT e.relation_type, e.target_uri, e.target_type
+                    f"""
+                    SELECT e.relation_type, e.target_uri, e.target_type, e.kind
                     FROM edges e
-                    WHERE e.source_uri = $1 AND e.vault_id = $2 AND e.relation_type = $3
+                    WHERE e.source_uri = $1 AND {scoped} AND e.relation_type = $4
                     """,
                     *base_params, relation_type,
                 )
             else:
                 rows = await conn.fetch(
-                    """
-                    SELECT e.relation_type, e.target_uri, e.target_type
+                    f"""
+                    SELECT e.relation_type, e.target_uri, e.target_type, e.kind
                     FROM edges e
-                    WHERE e.source_uri = $1 AND e.vault_id = $2
+                    WHERE e.source_uri = $1 AND {scoped}
                     """,
                     *base_params,
                 )
             for r in rows:
+                if not uri_is_in_vault(r["target_uri"], vault):
+                    continue
                 results.append({
                     "direction": "outgoing",
                     "relation": r["relation_type"],
                     "uri": r["target_uri"],
                     "resource_type": r["target_type"],
+                    "kind": r["kind"],
                 })
                 uris_to_resolve.append((r["target_uri"], r["target_type"]))
 
         if direction in ("incoming", "both"):
-            base_params = [resource_uri, vault_id]
+            base_params = [resource_uri, vault_id, prefix]
             if relation_type:
                 rows = await conn.fetch(
-                    """
-                    SELECT e.relation_type, e.source_uri, e.source_type
+                    f"""
+                    SELECT e.relation_type, e.source_uri, e.source_type, e.kind
                     FROM edges e
-                    WHERE e.target_uri = $1 AND e.vault_id = $2 AND e.relation_type = $3
+                    WHERE e.target_uri = $1 AND {scoped} AND e.relation_type = $4
                     """,
                     *base_params, relation_type,
                 )
             else:
                 rows = await conn.fetch(
-                    """
-                    SELECT e.relation_type, e.source_uri, e.source_type
+                    f"""
+                    SELECT e.relation_type, e.source_uri, e.source_type, e.kind
                     FROM edges e
-                    WHERE e.target_uri = $1 AND e.vault_id = $2
+                    WHERE e.target_uri = $1 AND {scoped}
                     """,
                     *base_params,
                 )
             for r in rows:
+                if not uri_is_in_vault(r["source_uri"], vault):
+                    continue
                 results.append({
                     "direction": "incoming",
                     "relation": r["relation_type"],
                     "uri": r["source_uri"],
                     "resource_type": r["source_type"],
+                    "kind": r["kind"],
                 })
                 uris_to_resolve.append((r["source_uri"], r["source_type"]))
 
-        names = await _batch_resolve_names(conn, uris_to_resolve, vault_id=vault_id)
+        names = await _batch_resolve_names(
+            conn, uris_to_resolve, vault_id=vault_id, vault_name=vault,
+        )
         for entry in results:
             name = names.get(entry["uri"])
             if name:
@@ -575,6 +629,8 @@ async def get_graph(
     """
     if not resource_uri:
         return await get_overview(vault, vault_id=vault_id, top_k=limit)
+    if not uri_is_in_vault(resource_uri, vault):
+        return {"nodes": [], "edges": []}
 
     pool = await get_pool()
     nodes: dict[str, dict] = {}
@@ -708,17 +764,23 @@ async def get_overview(
                 return empty
             vault_id = vault_row["id"]
 
+        prefix = vault_uri_prefix(vault)
+        scoped = edge_scope_sql(vault_param=1, prefix_param=2)
+
         totals = await conn.fetchrow(
-            """
-            WITH endpoints AS (
-                SELECT source_uri AS uri FROM edges WHERE vault_id = $1
+            f"""
+            WITH scoped_edges AS (
+                SELECT * FROM edges WHERE {scoped}
+            ),
+            endpoints AS (
+                SELECT source_uri AS uri FROM scoped_edges
                 UNION ALL
-                SELECT target_uri FROM edges WHERE vault_id = $1
+                SELECT target_uri FROM scoped_edges
             )
-            SELECT (SELECT count(*) FROM edges WHERE vault_id = $1) AS edges_total,
+            SELECT (SELECT count(*) FROM scoped_edges) AS edges_total,
                    (SELECT count(DISTINCT uri) FROM endpoints) AS nodes_total
             """,
-            vault_id,
+            vault_id, prefix,
         )
         nodes_total = totals["nodes_total"] if totals else 0
         edges_total = totals["edges_total"] if totals else 0
@@ -736,19 +798,22 @@ async def get_overview(
         # max(rtype) just picks that single value. The `uri` tie-break makes the
         # cut deterministic when several nodes share the boundary degree.
         top_rows = await conn.fetch(
-            """
-            WITH endpoints AS (
-                SELECT source_uri AS uri, source_type AS rtype FROM edges WHERE vault_id = $1
+            f"""
+            WITH scoped_edges AS (
+                SELECT * FROM edges WHERE {scoped}
+            ),
+            endpoints AS (
+                SELECT source_uri AS uri, source_type AS rtype FROM scoped_edges
                 UNION ALL
-                SELECT target_uri, target_type FROM edges WHERE vault_id = $1
+                SELECT target_uri, target_type FROM scoped_edges
             )
             SELECT uri, max(rtype) AS rtype, count(*) AS degree
             FROM endpoints
             GROUP BY uri
             ORDER BY degree DESC, uri
-            LIMIT $2
+            LIMIT $3
             """,
-            vault_id, top_k,
+            vault_id, prefix, top_k,
         )
 
         nodes: dict[str, dict] = {}
@@ -767,14 +832,14 @@ async def get_overview(
             # top-K set — so the overview never paints a dangling stub to a
             # node it didn't include.
             edge_rows = await conn.fetch(
-                """
+                f"""
                 SELECT source_uri, target_uri, relation_type, kind
                 FROM edges
-                WHERE vault_id = $1
-                  AND source_uri = ANY($2::text[])
-                  AND target_uri = ANY($2::text[])
+                WHERE {scoped}
+                  AND source_uri = ANY($3::text[])
+                  AND target_uri = ANY($3::text[])
                 """,
-                vault_id, top_uris,
+                vault_id, prefix, top_uris,
             )
             for r in edge_rows:
                 edge_list.append({
@@ -785,7 +850,8 @@ async def get_overview(
                 })
 
         names = await _batch_resolve_names(
-            conn, [(u, n["resource_type"]) for u, n in nodes.items()], vault_id=vault_id
+            conn, [(u, n["resource_type"]) for u, n in nodes.items()],
+            vault_id=vault_id, vault_name=vault,
         )
         for uri, node in nodes.items():
             node["name"] = names.get(uri) or uri
@@ -807,9 +873,9 @@ async def get_overview(
             file_ids: set[str] = set()
             if nodes_total:
                 conn_rows = await conn.fetch(
-                    "SELECT source_uri AS uri FROM edges WHERE vault_id = $1 "
-                    "UNION ALL SELECT target_uri FROM edges WHERE vault_id = $1",
-                    vault_id,
+                    f"SELECT source_uri AS uri FROM edges WHERE {scoped} "
+                    f"UNION ALL SELECT target_uri FROM edges WHERE {scoped}",
+                    vault_id, prefix,
                 )
                 for r in conn_rows:
                     p = parse_uri(r["uri"])
@@ -886,31 +952,37 @@ async def get_health(
                 return {"hubs": [], "orphans": {"count": 0, "sample": []}}
             vault_id = vault_row["id"]
 
+        prefix = vault_uri_prefix(vault)
+        scoped = edge_scope_sql(vault_param=1, prefix_param=2)
+
         hub_rows = await conn.fetch(
-            """
-            WITH endpoints AS (
-                SELECT source_uri AS uri, source_type AS rtype FROM edges WHERE vault_id = $1
+            f"""
+            WITH scoped_edges AS (
+                SELECT * FROM edges WHERE {scoped}
+            ),
+            endpoints AS (
+                SELECT source_uri AS uri, source_type AS rtype FROM scoped_edges
                 UNION ALL
-                SELECT target_uri, target_type FROM edges WHERE vault_id = $1
+                SELECT target_uri, target_type FROM scoped_edges
             )
             SELECT uri, max(rtype) AS rtype, count(*) AS degree
             FROM endpoints
             GROUP BY uri
-            HAVING count(*) >= $2
+            HAVING count(*) >= $3
             ORDER BY degree DESC, uri
-            LIMIT $3
+            LIMIT $4
             """,
-            vault_id, hub_threshold, limit,
+            vault_id, prefix, hub_threshold, limit,
         )
 
         # Every URI that appears on either end of an edge → "connected".
         connected_rows = await conn.fetch(
-            """
-            SELECT source_uri AS uri FROM edges WHERE vault_id = $1
+            f"""
+            SELECT source_uri AS uri FROM edges WHERE {scoped}
             UNION
-            SELECT target_uri FROM edges WHERE vault_id = $1
+            SELECT target_uri FROM edges WHERE {scoped}
             """,
-            vault_id,
+            vault_id, prefix,
         )
         connected = {r["uri"] for r in connected_rows}
 
@@ -936,7 +1008,8 @@ async def get_health(
         hubs: list[dict] = []
         if hub_rows:
             hub_names = await _batch_resolve_names(
-                conn, [(r["uri"], r["rtype"]) for r in hub_rows], vault_id=vault_id
+                conn, [(r["uri"], r["rtype"]) for r in hub_rows],
+                vault_id=vault_id, vault_name=vault,
             )
             hubs = [
                 {
@@ -1000,15 +1073,13 @@ async def _batch_resolve_names(
     conn, uris: list[tuple[str, str]],
     *,
     vault_id: uuid.UUID,
+    vault_name: str,
 ) -> dict[str, str]:
     """Resolve multiple URIs to display names in batch (3 queries max, not N).
 
-    Scoped to `vault_id`. URIs whose underlying resource lives in a
-    different vault won't get a resolved title/description/name —
-    they fall back to the identifier from the URI itself. This is a
-    privacy boundary: callers authorized for one vault shouldn't learn
-    the human-readable names of resources in another vault, even if
-    they can see the raw URI through a cross-vault edge.
+    Scoped to both ``vault_id`` and ``vault_name``. A URI from another vault is
+    ignored rather than receiving an identifier fallback; callers must not be
+    able to project even the raw foreign endpoint through this helper.
     """
     if not uris:
         return {}
@@ -1023,7 +1094,7 @@ async def _batch_resolve_names(
 
     for uri, rtype in uris:
         parsed = parse_uri(uri)
-        if not parsed:
+        if not parsed or parsed.vault != vault_name:
             continue
         identifier = parsed.identifier
         if identifier is None:
@@ -1139,19 +1210,16 @@ async def _store_edge(
                 target_ref, parsed.kind,
             )
             return False
-        target_type = parsed.kind
-        ident = parsed.identifier or ""
-        # Resolve the target's vault (edges may cross vaults) so existence
-        # is checked against the right catalog.
-        target_vault_id = await conn.fetchval(
-            "SELECT id FROM vaults WHERE name = $1", parsed.vault,
-        )
-        if target_vault_id is None:
+        if parsed.vault != vault_name:
+            # Cross-vault Markdown links remain authored content, but are not
+            # graph edges. Rejecting before any vault lookup also prevents the
+            # extraction result from revealing whether the target exists.
             logger.debug(
-                "Skipping edge to %r: target vault %r not found",
-                target_ref, parsed.vault,
+                "Skipping cross-vault implicit edge from vault %r", vault_name,
             )
             return False
+        target_type = parsed.kind
+        ident = parsed.identifier or ""
         # Validate the target EXISTS before storing — via the SAME
         # `_resource_exists` primitive the explicit akb_link path uses, so
         # the two link paths validate identically (they differ only in
@@ -1161,7 +1229,7 @@ async def _store_edge(
         # the path (`…/x.md|Label`), or a forward reference to a doc never
         # created. The extraction path used to skip this check, which is how
         # the malformed targets got persisted.
-        if not await _resource_exists(conn, target_vault_id, parsed.kind, ident):
+        if not await _resource_exists(conn, vault_id, parsed.kind, ident):
             logger.debug(
                 "Skipping edge to nonexistent %s %r", parsed.kind, target_ref,
             )
@@ -1253,17 +1321,17 @@ async def _bfs_collect(
 ) -> None:
     """BFS traversal from a starting resource URI, scoped to one vault.
 
-    Both edge fetches gate on `edges.vault_id` so the traversal cannot
-    follow cross-vault links into vaults the caller wasn't authorized
-    on. Endpoints whose URI lives in another vault still appear as
-    leaf nodes (with the URI as the only signal) but are never used as
-    seeds for the next BFS layer's name resolution.
+    Edge ownership and both endpoint URI authorities must match the requested
+    vault. A legacy cross-vault edge therefore contributes no node, row, or
+    traversal seed.
     """
     queue = [start_uri]
     visited: set[str] = set()
     # Track emitted edges so an edge A→B doesn't appear twice when both
     # A and B are processed in the same BFS wave.
     emitted: set[tuple[str, str, str]] = set()
+    prefix = vault_uri_prefix(vault_name)
+    scoped = edge_scope_sql(vault_param=2, prefix_param=3)
 
     for current_depth in range(depth + 1):
         if not queue or len(nodes) >= limit:
@@ -1277,14 +1345,24 @@ async def _bfs_collect(
 
         outgoing = await conn.fetch(
             "SELECT source_uri, target_uri, target_type, relation_type, kind "
-            "FROM edges WHERE source_uri = ANY($1::text[]) AND vault_id = $2",
-            unvisited, vault_id,
+            f"FROM edges WHERE source_uri = ANY($1::text[]) AND {scoped}",
+            unvisited, vault_id, prefix,
         )
         incoming = await conn.fetch(
             "SELECT source_uri, source_type, target_uri, relation_type, kind "
-            "FROM edges WHERE target_uri = ANY($1::text[]) AND vault_id = $2",
-            unvisited, vault_id,
+            f"FROM edges WHERE target_uri = ANY($1::text[]) AND {scoped}",
+            unvisited, vault_id, prefix,
         )
+        outgoing = [
+            row for row in outgoing
+            if uri_is_in_vault(row["source_uri"], vault_name)
+            and uri_is_in_vault(row["target_uri"], vault_name)
+        ]
+        incoming = [
+            row for row in incoming
+            if uri_is_in_vault(row["source_uri"], vault_name)
+            and uri_is_in_vault(row["target_uri"], vault_name)
+        ]
 
         # Index edges by source/target for quick lookup
         out_by_uri: dict[str, list] = {}
@@ -1350,7 +1428,9 @@ async def _bfs_collect(
     edges[:] = [e for e in edges if e["source"] in nodes and e["target"] in nodes]
 
     uris_to_resolve = [(uri, n["resource_type"]) for uri, n in nodes.items()]
-    names = await _batch_resolve_names(conn, uris_to_resolve, vault_id=vault_id)
+    names = await _batch_resolve_names(
+        conn, uris_to_resolve, vault_id=vault_id, vault_name=vault_name,
+    )
     for uri, node in nodes.items():
         node["name"] = names.get(uri) or uri
 

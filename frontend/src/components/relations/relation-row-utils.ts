@@ -5,6 +5,11 @@ import { parseUri } from "@/lib/uri";
 // branchy bits (edge direction, URI routing) are unit-testable. A relation row
 // from GET /relations carries only the "other side" (`uri`) plus a `direction`.
 
+/** Fail-closed visibility check shared by the panel and its outer count badge. */
+export function relationIsInVault(row: RelationRow, vault: string): boolean {
+  return parseUri(row.uri)?.vault === vault;
+}
+
 /**
  * Rebuild the (source, target) pair the unlink endpoint wants, from this
  * document's vantage point. An outgoing edge has this doc as the source; an

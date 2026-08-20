@@ -1313,6 +1313,7 @@ export interface RelationRow {
   relation: string;
   uri: string;          // the "other" side
   resource_type?: string;
+  kind: "implicit" | "explicit";
   name?: string;
 }
 export const getRelations = (vault: string, docPath: string) => {

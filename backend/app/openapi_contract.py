@@ -542,7 +542,7 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
         },
         "AkbRelation": {
             "type": "object",
-            "required": ["direction", "relation", "uri", "resource_type"],
+            "required": ["direction", "relation", "uri", "resource_type", "kind"],
             "properties": {
                 "direction": {"type": "string", "enum": ["incoming", "outgoing"]},
                 "relation": {
@@ -559,6 +559,7 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                 },
                 "uri": {"type": "string"},
                 "resource_type": {"type": "string", "enum": ["doc", "table", "file"]},
+                "kind": {"type": "string", "enum": ["implicit", "explicit"]},
                 "name": _nullable_string(),
             },
             "additionalProperties": {"$ref": "#/components/schemas/AkbJsonValue"},

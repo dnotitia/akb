@@ -57,6 +57,7 @@ class RelationItem(KnowledgeResponse):
     relation: ReadRelationType
     uri: str
     resource_type: ResourceType
+    kind: EdgeKind
     name: str | None = None
 
 

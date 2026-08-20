@@ -144,6 +144,33 @@ describe("DocumentPage view toggle", () => {
     );
   });
 
+  it("does not include a foreign endpoint in the outer relation count", async () => {
+    getRelationsMock.mockResolvedValue({
+      relations: [
+        {
+          direction: "outgoing",
+          relation: "references",
+          uri: "akb://v/coll/notes/doc/local.md",
+          resource_type: "doc",
+          kind: "explicit",
+        },
+        {
+          direction: "outgoing",
+          relation: "references",
+          uri: "akb://private/coll/notes/doc/hidden.md",
+          resource_type: "doc",
+          kind: "explicit",
+        },
+      ],
+    });
+
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    const relationsTab = await screen.findByRole("tab", { name: /^Relations/ });
+    expect(relationsTab).toHaveTextContent(/^Relations1$/);
+    expect(relationsTab).not.toHaveTextContent("2");
+  });
+
   it("?view=raw renders the raw markdown inside <pre>", async () => {
     renderAt("/vault/v/doc/notes%2Fhello.md?view=raw");
     const pre = await screen.findByTestId("doc-raw");

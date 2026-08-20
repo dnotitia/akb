@@ -591,7 +591,7 @@ CREATE INDEX IF NOT EXISTS idx_vault_migrations_vault_applied
 
 -- ============================================================
 -- Edges (unified cross-type relation graph via URI scheme)
--- Replaces document-only 'relations' for cross-type connections.
+-- Replaces document-only 'relations' for cross-type, same-vault connections.
 -- URI format: akb://{vault}/doc/{path}
 --             akb://{vault}/table/{name}
 --             akb://{vault}/file/{id}

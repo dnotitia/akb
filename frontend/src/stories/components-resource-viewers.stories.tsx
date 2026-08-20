@@ -80,6 +80,7 @@ const relations: RelationRow[] = [
   {
     direction: "outgoing",
     relation: "depends_on",
+    kind: "explicit",
     uri: "akb://akb/doc/runbooks/deploy.md",
     resource_type: "document",
     name: "runbooks/deploy.md",
@@ -87,6 +88,7 @@ const relations: RelationRow[] = [
   {
     direction: "incoming",
     relation: "implements",
+    kind: "explicit",
     uri: "akb://akb/doc/decisions/storybook-rollout.md",
     resource_type: "document",
     name: "decisions/storybook-rollout.md",
@@ -94,6 +96,7 @@ const relations: RelationRow[] = [
   {
     direction: "outgoing",
     relation: "links_to",
+    kind: "implicit",
     uri: "akb://akb/file/f-123",
     resource_type: "file",
     name: "figures/storybook.png",
@@ -258,6 +261,7 @@ export const RelationsLinked: Story = {
             sourceUri="akb://akb/doc/overview/storybook.md"
             relations={relations}
             relationsError={false}
+            canWrite
             graphHref="/vault/akb/graph?uri=akb%3A%2F%2Fakb%2Fdoc%2Foverview%2Fstorybook.md"
             onReload={() => {}}
           />
@@ -284,6 +288,7 @@ export const RelationsEmptyAndError: Story = {
               sourceUri="akb://akb/doc/overview/empty.md"
               relations={[]}
               relationsError={false}
+              canWrite
               graphHref="/vault/akb/graph"
               onReload={() => {}}
             />
@@ -297,6 +302,7 @@ export const RelationsEmptyAndError: Story = {
               sourceUri="akb://akb/doc/overview/error.md"
               relations={[]}
               relationsError
+              canWrite
               graphHref="/vault/akb/graph"
               onReload={() => {}}
             />

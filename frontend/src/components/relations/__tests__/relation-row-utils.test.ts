@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { edgeFor, hrefFor } from "@/components/relations/relation-row-utils";
+import { edgeFor, hrefFor, relationIsInVault } from "@/components/relations/relation-row-utils";
 import type { RelationRow } from "@/lib/api";
 
 const SRC = "akb://v1/coll/notes/doc/alpha.md";
 
 function row(partial: Partial<RelationRow> & { uri: string }): RelationRow {
-  return { direction: "outgoing", relation: "references", ...partial };
+  return { direction: "outgoing", relation: "references", kind: "explicit", ...partial };
 }
 
 describe("edgeFor", () => {
@@ -29,6 +29,14 @@ describe("edgeFor", () => {
     // Defensive: the type is required, but a stray value must not invert the edge.
     const r = { direction: "both", relation: "references", uri: other } as unknown as RelationRow;
     expect(edgeFor(r, SRC)).toEqual({ source: SRC, target: other });
+  });
+});
+
+describe("relationIsInVault", () => {
+  it("accepts only a parseable endpoint in the requested vault", () => {
+    expect(relationIsInVault(row({ uri: "akb://v1/coll/notes/doc/a.md" }), "v1")).toBe(true);
+    expect(relationIsInVault(row({ uri: "akb://v2/coll/private/doc/a.md" }), "v1")).toBe(false);
+    expect(relationIsInVault(row({ uri: "not-an-akb-uri" }), "v1")).toBe(false);
   });
 });
 
