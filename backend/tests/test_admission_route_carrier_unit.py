@@ -17,6 +17,7 @@ calling its handler is not proved reachable by its caller.
 
 from __future__ import annotations
 
+import pathlib
 import tempfile
 
 import pytest
@@ -40,10 +41,21 @@ from app.main import app  # noqa: E402
 
 
 def test_the_import_did_not_write_into_the_deployed_storage_path():
-    # Asserted rather than trusted: if the redirect stops working this file goes
-    # back to mkdir'ing a real deployment directory, and the only symptom would
-    # be a CI job that fails somewhere else entirely.
-    assert settings.git_storage_path == _STORAGE
+    """The import's filesystem effect landed in the temp directory.
+
+    Asserted rather than trusted: without the redirect this file mkdir's a real
+    deployment directory, and on a machine that HAS one the only symptom is
+    nothing at all — it wrote into `/data/vaults` here at 07:16 with every test
+    green, and failed only on a runner that cannot create `/data`.
+
+    The assertion is on the directories the import created, not on
+    `settings.git_storage_path`: `settings` is process-global and other tests in
+    the same session repoint it, so comparing the current value asserts
+    something about whoever ran last rather than about this import.
+    """
+    assert (pathlib.Path(_STORAGE) / "_worktrees").is_dir(), (
+        "the import did not create its storage under the temp directory"
+    )
 
 
 _ADMISSION_PATHS = {
