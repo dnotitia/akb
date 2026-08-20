@@ -332,6 +332,36 @@ command stores no usable local password and does not contact the identity
 provider. Generated output files are create-only and never overwritten; for a
 retry after the file exists, pass that file back with `--password-file`.
 
+The two local forms differ in one further way. `--generate-password-file` is
+AKB producing a credential and handing it over, so the account it creates owes
+a replacement for it: the first session that credential opens can reach the
+password change and nothing else, exactly as a password reset behaves.
+`--password-file` installs a value the caller already holds — AKB delivers it
+to nobody — so it arms nothing, and an installation that signs in as this
+account to bootstrap its own service identity keeps working. To force a
+replacement for a credential supplied that way, rotate it afterwards with the
+command below; rotation always leaves the account owing a change.
+
+If that credential later leaks, is lost, or has to be taken back, rotate it
+rather than reprovisioning the account:
+
+```bash
+# Break-glass: replace the credential and print the new one once. Nothing
+# stores or logs the value, and the machine-readable report omits it.
+python -m app.cli issue-recovery-admin-credential \
+  --expected-username recovery-admin \
+  --expected-email recovery-admin@example.com
+```
+
+Rotation names the account it expects and refuses any mismatch, so it cannot
+act on the wrong one. The credential it replaces stops working immediately,
+including one currently in use, and sessions held before the rotation are
+revoked — both are what a compromise response requires. The same operation is
+available at `POST /admin/recovery-admin/issue-credential`, which requires an
+independent service-administrator token rather than a human session. Rotation
+is not available in `sso` mode: the identity provider holds the credential,
+and nothing in a running AKB can replace it.
+
 Open `/admin` for the separate product-administration surface. In `local`
 mode it accepts the provisioned local administrator and returns the same
 `local-session-rs256-v2` profile used by local human authentication, but it

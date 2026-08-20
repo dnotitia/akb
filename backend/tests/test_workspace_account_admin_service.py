@@ -10,6 +10,12 @@ import uuid
 import asyncpg
 import pytest
 
+from app.config import settings
+from app.exceptions import (
+    ExternalAuthDisabledError,
+    ExternalIdentityIssuerMismatchError,
+)
+
 
 pytestmark = pytest.mark.asyncio
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
@@ -79,6 +85,16 @@ async def services(monkeypatch):
 
     async def _get_pool():
         return pool
+
+    # The prelink write path now refuses an issuer this runtime would never
+    # present, so a fixture has to say what it presents. Until it did, every
+    # test here passed an issuer nobody had claimed was ours — which is the
+    # shape the defect hid in.
+    monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+    monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "keycloak_server_url", "https://id.example.com", raising=False)
+    monkeypatch.setattr(settings, "keycloak_realm", "akb", raising=False)
+    assert settings.keycloak_issuer == _ISSUER
 
     monkeypatch.setattr(account_service, "get_pool", _get_pool)
     monkeypatch.setattr(auth_service, "get_pool", _get_pool)
@@ -297,19 +313,29 @@ async def test_concurrent_human_ensure_converges_to_one_user(services):
         )
 
 
-async def test_explicit_user_id_allows_reviewed_issuer_migration(services):
+async def test_explicit_user_id_still_pins_the_account_on_a_second_binding(services):
+    """`existing_user_id` keeps its job: a second exact binding, same account.
+
+    This used to be written with two different issuers, because this route
+    would take any issuer at all. Crossing issuers now belongs to the
+    identity-migration API, which makes the caller name the exact old pair and
+    offers a preflight and a rollback. What must survive here is the narrower
+    property that route still owns — naming an existing user attaches the new
+    binding to that user rather than resolving one by email.
+    """
+
     pool, _, service = services
     email = f"governance-issuer-migration-{uuid.uuid4().hex[:10]}@example.com"
     first = await service.ensure_human_external_identity(
-        issuer="https://old-id.example.com/realms/akb",
+        issuer=_ISSUER,
         subject="stable-old-subject",
         email=email,
         display_name="Migrating member",
         actor_id="platform-service",
     )
 
-    migrated = await service.ensure_human_external_identity(
-        issuer="https://new-id.example.com/realms/akb",
+    rebound = await service.ensure_human_external_identity(
+        issuer=_ISSUER,
         subject="stable-new-subject",
         email=email,
         display_name="Migrating member",
@@ -317,13 +343,96 @@ async def test_explicit_user_id_allows_reviewed_issuer_migration(services):
         existing_user_id=first["user_id"],
     )
 
-    assert migrated["user_id"] == first["user_id"]
+    assert rebound["user_id"] == first["user_id"]
     async with pool.acquire() as conn:
         bindings = await conn.fetchval(
             "SELECT COUNT(*) FROM external_identities WHERE user_id = $1",
             uuid.UUID(first["user_id"]),
         )
     assert bindings == 2
+
+
+async def test_a_binding_under_an_issuer_we_do_not_present_is_refused(services):
+    """The shape a control plane's member invitation actually sends.
+
+    It resolves the person in its own directory and posts that directory's
+    issuer here. Nothing downstream re-checks it: `invite_only` matches the
+    exact pair, so such a binding is written, reported as success, and refuses
+    its owner at sign-in with nothing recording why.
+    """
+
+    pool, _, service = services
+    email = f"governance-foreign-issuer-{uuid.uuid4().hex[:10]}@example.com"
+    with pytest.raises(ExternalIdentityIssuerMismatchError) as refused:
+        await service.ensure_human_external_identity(
+            issuer="https://control-plane.example.com/realms/platform",
+            subject="subject-from-another-directory",
+            email=email,
+            display_name="Invited member",
+            actor_id="platform-service",
+        )
+
+    # The caller cannot correct the call without being told what we present,
+    # and the issuer is public — it is the claim we stamp on every token.
+    assert refused.value.details == {"expected_issuer": _ISSUER}
+
+    async with pool.acquire() as conn:
+        written = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE email = $1",
+            email,
+        )
+    assert written == 0
+
+
+async def test_an_explicit_user_id_does_not_buy_a_foreign_issuer(services):
+    """Deliberateness is not the missing property — usability is.
+
+    A binding under an issuer that never appears on a token here is unusable
+    whether or not the caller meant it, so naming an existing user must not
+    unlock writing one.
+    """
+
+    _, _, service = services
+    email = f"governance-foreign-explicit-{uuid.uuid4().hex[:10]}@example.com"
+    existing = await service.ensure_human_external_identity(
+        issuer=_ISSUER,
+        subject="stable-subject-we-present",
+        email=email,
+        display_name="Existing member",
+        actor_id="platform-service",
+    )
+
+    with pytest.raises(ExternalIdentityIssuerMismatchError):
+        await service.ensure_human_external_identity(
+            issuer="https://control-plane.example.com/realms/platform",
+            subject="subject-from-another-directory",
+            email=email,
+            display_name="Existing member",
+            actor_id="platform-service",
+            existing_user_id=existing["user_id"],
+        )
+
+
+async def test_local_mode_refuses_an_external_binding_outright(services, monkeypatch):
+    """In local mode the answer is not another issuer but none at all.
+
+    Writing the binding there is worse than inert: the same call sets
+    `auth_provider = 'keycloak'`, and local sign-in requires `'local'`, so it
+    would lock the account out of the only credential it has.
+    """
+
+    _, _, service = services
+    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+    monkeypatch.setattr(settings, "keycloak_enabled", False, raising=False)
+
+    with pytest.raises(ExternalAuthDisabledError):
+        await service.ensure_human_external_identity(
+            issuer=_ISSUER,
+            subject="subject-that-cannot-apply-here",
+            email=f"governance-local-{uuid.uuid4().hex[:10]}@example.com",
+            display_name="Local member",
+            actor_id="platform-service",
+        )
 
 
 async def test_ensure_service_user_is_noninteractive_idempotent_and_non_admin(
@@ -372,6 +481,14 @@ async def test_ensure_service_user_is_noninteractive_idempotent_and_non_admin(
     assert row["account_status"] == "active"
     assert row["password_hash"].startswith("!service-account:")
 
+    # The refusals below are local-mode properties: they assert that a service
+    # account cannot use the password lifecycle that exists only in that mode.
+    # The fixture declares sso, so say so here rather than letting the refusal
+    # arrive from the mode instead of from the account kind — a test that
+    # passes because the whole path is switched off is not testing the account.
+    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+    monkeypatch.setattr(settings, "keycloak_enabled", False, raising=False)
+
     from app.exceptions import AuthenticationError
     from app.services.auth_service import change_password, login
 
@@ -403,7 +520,6 @@ async def test_ensure_service_user_is_noninteractive_idempotent_and_non_admin(
         key_class="service",
         scopes=["read", "write"],
     )
-    from app.config import settings
 
     monkeypatch.setattr(settings, "local_auth_enabled", False, raising=False)
     resolved = await resolve_token(f"Bearer {credential['token']}")

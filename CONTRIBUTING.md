@@ -105,6 +105,43 @@ cleans child processes and dependency resources on exit, but leaves the
 private `RUNTIME_ROOT` and its logs for inspection; the caller owns removing
 that explicit temporary directory after collecting what it needs.
 
+## Static Analysis Gate
+
+`scripts/check.sh` is the single entry point CI runs (`.github/workflows/check.yml`)
+and the one to run before opening a PR. It has two prerequisites it now
+checks for itself and refuses to start without — both used to fail as
+something other than "you are missing a prerequisite":
+
+**1. Python analyzers on the version this repo requires.** `backend/pyproject.toml`
+declares `requires-python = ">=3.14"` and the code uses syntax older
+interpreters cannot parse. mypy and bandit build their AST with the
+interpreter they run on, so `--python-version` does not help: on an older
+one mypy stops after the first file it cannot parse and reports the other
+few hundred as unchecked, while bandit skips the file and still exits 0.
+Install them against the required version, at the versions CI pins:
+
+```bash
+uv tool install --python 3.14 --force 'mypy==2.1.0'
+uv tool install --python 3.14 --force 'bandit[toml]==1.9.4'
+uv tool install --python 3.14 --force 'ruff==0.15.16'
+uv tool install --python 3.14 --force 'detect-secrets==1.5.0'
+```
+
+**2. Node deps in both pnpm projects.** `frontend/` and `packages/akb-client/`
+are separate projects with separate lockfiles and separate `node_modules`,
+and the gate runs steps in each. Installing only one is the common mistake:
+
+```bash
+(cd frontend && pnpm install --frozen-lockfile)
+(cd packages/akb-client && pnpm install --frozen-lockfile)
+```
+
+Then:
+
+```bash
+bash scripts/check.sh
+```
+
 ## Code Style
 
 - **Python**: ruff (configured in `backend/pyproject.toml`, line length 120).
@@ -114,6 +151,7 @@ that explicit temporary directory after collecting what it needs.
 
 ## Pull Request Checklist
 
+- [ ] `bash scripts/check.sh` passes (see Static Analysis Gate above).
 - [ ] All E2E suites pass against your local stack.
 - [ ] Changes to the E2E runtime/bootstrap also pass the isolated full gate;
       see [`backend/scripts/ci/README.md`](backend/scripts/ci/README.md).

@@ -101,6 +101,22 @@ class AccountSuspendedError(AKBError):
         )
 
 
+class CredentialChangeRequiredError(AKBError):
+    """A delivered local credential has not been replaced by its holder yet.
+
+    Local mode's counterpart to the identity provider's ``UPDATE_PASSWORD``
+    required action. The account authenticates, but the only thing the
+    resulting session may do is replace the credential it was issued.
+    """
+
+    def __init__(self):
+        super().__init__(
+            "This account must change its password before doing anything else",
+            status_code=403,
+            code="credential_change_required",
+        )
+
+
 class ExternalIdentityConflictError(AKBError):
     """Verified external claims conflict with an existing stable binding."""
 
@@ -109,6 +125,29 @@ class ExternalIdentityConflictError(AKBError):
             "External identity conflicts with an existing AKB account",
             status_code=409,
             code="identity_conflict",
+        )
+
+
+class ExternalIdentityIssuerMismatchError(AKBError):
+    """A prelink named an issuer this runtime does not present.
+
+    The binding a control plane writes is only usable if its issuer is the one
+    this AKB will actually see on a token. Nothing downstream re-checks that:
+    ``invite_only`` matches an exact ``(issuer, subject)`` pair, so a binding
+    written under any other issuer is created successfully, reported as
+    success, and refuses its owner at sign-in with nothing recording why.
+
+    The expected issuer is included because it is public — it is the ``iss``
+    claim this deployment stamps and is published in its discovery document —
+    and because a caller that cannot see it cannot correct the call.
+    """
+
+    def __init__(self, expected: str):
+        super().__init__(
+            "External identity issuer does not match the one this AKB presents",
+            status_code=422,
+            code="external_identity_issuer_mismatch",
+            details={"expected_issuer": expected},
         )
 
 
@@ -175,6 +214,40 @@ class RecoveryAdminRetirementConflictError(AKBError):
             "Recovery administrator does not match the retirement contract",
             status_code=409,
             code="recovery_admin_retirement_conflict",
+        )
+
+
+class RecoveryAdminCredentialAuthorizationError(AKBError):
+    """The credential-issue caller is not an independent service administrator."""
+
+    def __init__(self):
+        super().__init__(
+            "Recovery administrator credential issue requires an independent service administrator token",
+            status_code=403,
+            code="recovery_admin_credential_requires_service_admin",
+        )
+
+
+class RecoveryAdminCredentialConflictError(AKBError):
+    """The expected recovery identity is not one that can be issued a credential."""
+
+    def __init__(self):
+        super().__init__(
+            "Recovery administrator does not match the credential-issue contract",
+            status_code=409,
+            code="recovery_admin_credential_conflict",
+        )
+
+
+class RecoveryAdminCredentialUnavailableError(AKBError):
+    """No authority in this installation can replace the stored credential."""
+
+    def __init__(self):
+        super().__init__(
+            "Cannot rotate the recovery administrator credential in the configured auth mode: "
+            "the identity provider holds it and nothing in a running AKB can replace it",
+            status_code=503,
+            code="recovery_admin_credential_rotation_unavailable",
         )
 
 

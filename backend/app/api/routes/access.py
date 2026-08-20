@@ -12,7 +12,10 @@ from app.services.auth_service import (
     revoke_all_sessions,
 )
 from app.services.auth_policy import require_local_auth_enabled
-from app.services.recovery_admin_service import retire_local_recovery_admin
+from app.services.recovery_admin_service import (
+    issue_recovery_admin_credential,
+    retire_local_recovery_admin,
+)
 from app.services.account_service import (
     activate_user,
     adopt_current_admin_as_service,
@@ -179,6 +182,25 @@ class RetireRecoveryAdminResponse(NFCModel):
     is_recovery_admin: Literal[False]
     account_kind: Literal["human"]
     auth_provider: Literal["local"]
+
+
+class IssueRecoveryAdminCredentialRequest(NFCModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_username: str = Field(min_length=1, max_length=255)
+    expected_email: str = Field(min_length=1, max_length=320)
+
+
+class IssueRecoveryAdminCredentialResponse(NFCModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str
+    username: str
+    email: str
+    auth_mode: Literal["local", "sso"]
+    # The only copy of the replacement. Nothing stores, logs, or audits it,
+    # and the credential it replaced no longer works.
+    credential: str
 
 
 @router.get("/my/vaults", summary="List vaults accessible to me")
@@ -399,6 +421,40 @@ async def admin_retire_recovery_admin(
     return await retire_local_recovery_admin(
         expected_username=req.expected_username,
         expected_email=req.expected_email,
+        actor_user_id=user.user_id,
+        actor_token_id=user.token_id,
+    )
+
+
+@router.post(
+    "/admin/recovery-admin/issue-credential",
+    summary="[admin] Replace the designated recovery administrator's credential",
+    response_model=IssueRecoveryAdminCredentialResponse,
+)
+async def admin_issue_recovery_admin_credential(
+    req: IssueRecoveryAdminCredentialRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    if not (
+        user.is_admin
+        and user.account_kind == "service"
+        and user.auth_method == "pat"
+        and user.token_id is not None
+        and user.key_class in {"pat", "service"}
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "message": "Recovery administrator credential issue requires an independent service administrator token",
+                "code": "recovery_admin_credential_requires_service_admin",
+            },
+        )
+    # `method` is fixed by the route. The break-glass discriminator belongs to
+    # the unauthenticated CLI path and must not be reachable over HTTP.
+    return await issue_recovery_admin_credential(
+        expected_username=req.expected_username,
+        expected_email=req.expected_email,
+        method="recovery_admin_api",
         actor_user_id=user.user_id,
         actor_token_id=user.token_id,
     )

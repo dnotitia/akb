@@ -1394,11 +1394,12 @@ class KeycloakStandaloneSSOControl:
             product_admin,
         ):
             raise _fail("keycloak_product_admin_readback_failed")
-        await self._require_product_admin_password(
-            spec,
-            product_admin,
-            token=management_token,
-        )
+        # Steady-state read-back deliberately does not inspect the credential
+        # list. It runs on every re-install, and by then the administrator may
+        # have completed the forced password change or had the credential
+        # reset; whether one is present now is not evidence about this
+        # installation's shape, and requiring it here would refuse a converged
+        # realm on the next redeploy.
         product_admin_id = _required_string(
             product_admin,
             "id",

@@ -62,7 +62,16 @@ openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 1 \
   -subj "/CN=AKB SSO broker-chain fixture" \
   -addext "subjectAltName=DNS:broker.localhost,DNS:upstream.localhost" \
   -keyout "$cert_dir/tls.key" -out "$cert_dir/tls.crt" >/dev/null 2>&1
-chmod 600 "$cert_dir/tls.key"
+# Keycloak runs as uid 1000 and reads both files through the bind mount, so
+# `mktemp -d`'s 0700 directory silently fails the fixture on every host whose
+# invoking user is not uid 1000 -- the server refuses to start with
+# "Failed to initialize truststore ... Permission denied" and the runner reports
+# only that Keycloak never became ready. 0711 lets the container traverse
+# without letting anyone list the directory; the files themselves are a one-day
+# self-signed certificate generated per run and destroyed on teardown, and the
+# runner already refuses to reuse them anywhere else.
+chmod 711 "$cert_dir"
+chmod 644 "$cert_dir/tls.key" "$cert_dir/tls.crt"
 
 mkdir -p "$fixture_run_dir/config"
 sso_session_epoch="$(python3 -c 'import uuid; print(uuid.uuid4())')"
@@ -122,6 +131,39 @@ if [[ "$postgres_ready" != true ]]; then
   exit 1
 fi
 
+# The transient authority the rotation phase uses is created the way a
+# deployment creates one: Keycloak's own `bootstrap-admin service` command, in a
+# separate short-lived process against the running broker's database. Nothing
+# standing in the realm can create it -- that is the boundary the phase exists
+# to prove -- so it cannot be minted through the Admin REST API here either.
+#
+# The client id carries a per-run nonce so a repeated run never inherits a
+# previous one, and the secret is generated here and never written to disk.
+rotation_nonce="$(openssl rand -hex 6)"
+rotation_client_id="akb-rotation-$rotation_nonce"
+rotation_client_secret="$(openssl rand -base64 32 | tr -d '\n')"
+if ! AKB_SSO_FIXTURE_CERT_DIR="$cert_dir" docker compose \
+  --project-name "$project_name" --file "$compose_file" \
+  run --rm --no-deps \
+  --env "AKB_FIXTURE_ROTATION_SECRET=$rotation_client_secret" \
+  broker bootstrap-admin service \
+  --client-id "$rotation_client_id" \
+  --client-secret:env=AKB_FIXTURE_ROTATION_SECRET \
+  --no-prompt >/dev/null 2>&1
+then
+  echo "Transient rotation authority could not be created" >&2
+  exit 1
+fi
+
 cd "$fixture_run_dir"
+# Every endpoint this fixture talks to is loopback. On a host with a proxy
+# configured, an HTTP client that honours the environment sends
+# broker.localhost through it and the run fails as "unreachable" -- a proxy's
+# 403 wearing the fixture's error message. Name the hosts explicitly rather
+# than relying on the ambient no_proxy list to already contain them.
+NO_PROXY="broker.localhost,upstream.localhost,localhost,127.0.0.1,::1${NO_PROXY:+,$NO_PROXY}" \
+no_proxy="broker.localhost,upstream.localhost,localhost,127.0.0.1,::1${no_proxy:+,$no_proxy}" \
+AKB_FIXTURE_ROTATION_CLIENT_ID="$rotation_client_id" \
+AKB_FIXTURE_ROTATION_CLIENT_SECRET="$rotation_client_secret" \
 PYTHONPATH="$repo_root/backend" uv run --project "$repo_root/backend" \
   --locked python "$fixture_root/exercise.py"

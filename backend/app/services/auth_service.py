@@ -27,6 +27,7 @@ from app.exceptions import (
     AccountSuspendedError,
     AuthenticationError,
     ConflictError,
+    CredentialChangeRequiredError,
     ExternalAuthDisabledError,
     ExternalIdentityConflictError,
     ExternalProfileReadOnlyError,
@@ -40,13 +41,16 @@ from app.repositories.events_repo import emit_event
 from app.services.auth_policy import require_local_auth_enabled
 from app.services.auth_verifier_profiles import (
     KEYCLOAK_ACCESS_V1,
+    KEYCLOAK_SERVICE_AUTHORITY_V1,
     LOCAL_SESSION_RS256_V2,
     KeycloakRouteProfile,
     VerifiedPrincipal,
     verify_keycloak_access_v1,
+    verify_keycloak_service_authority_v1,
     verify_local_session_rs256_v2,
 )
 from app.services.role_sync import get_role_sync
+from app.services.service_authority_service import resolve_service_authority
 
 TOKEN_KEY_CLASSES = frozenset({"pat", "service", "publishable"})
 ISSUABLE_TOKEN_KEY_CLASSES = frozenset({"pat", "service"})
@@ -263,6 +267,11 @@ async def register(username: str, email: str, password: str, display_name: str |
         if existing:
             raise ConflictError("Username or email already exists")
 
+        # Self-service signup deliberately leaves credential_change_required
+        # at its false default: this password was chosen by the person who
+        # will use it, never delivered to them, so there is nothing to
+        # replace. Arming it here would force a change on an account that
+        # was never issued a credential.
         is_admin = await conn.fetchval(
             """
             INSERT INTO users (id, username, email, password_hash, display_name, is_admin)
@@ -594,14 +603,67 @@ async def _project_keycloak_principal(
     )
 
 
-async def project_verified_principal(
+async def _project_service_authority_principal(
     principal: VerifiedPrincipal,
 ) -> AuthenticatedUser | None:
-    """Common verified-human boundary before existing AKB authorization."""
+    """Project the verified non-human authority onto its own AKB account.
+
+    Deliberately not routed through the human account path: no enrollment
+    decision, no external identity, and no profile claim is read here. The
+    verified ``azp`` is re-checked against configuration so a principal minted
+    while one client was named cannot be projected after the operator named a
+    different one.
+    """
+    claims = dict(principal.claims)
+    client_id = settings.keycloak_service_admin_client_id_effective
+    if not client_id or claims.get("azp") != client_id:
+        return None
+    try:
+        resolved = await resolve_service_authority(
+            issuer=principal.issuer,
+            client_id=client_id,
+            subject=principal.subject,
+        )
+    except AKBError as e:
+        logging.getLogger("akb.auth").info("Keycloak service authority: account projection rejected (%s)", e)
+        return None
+
+    scope_claim = claims.get("scope")
+    scopes = [scope for scope in scope_claim.split(" ") if scope] if isinstance(scope_claim, str) else []
+    return AuthenticatedUser(
+        user_id=str(resolved["user_id"]),
+        username=resolved["username"],
+        email=resolved["email"] or "",
+        display_name=resolved["display_name"],
+        is_admin=resolved["is_admin"],
+        auth_method="oauth",
+        account_kind="service",
+        oauth_scopes=scopes,
+    )
+
+
+async def project_verified_principal(
+    principal: VerifiedPrincipal,
+    *,
+    for_credential_change: bool = False,
+) -> AuthenticatedUser | None:
+    """Common verified-human boundary before existing AKB authorization.
+
+    ``for_credential_change`` is the single exemption from the local
+    forced-credential-change refusal, and belongs to the change-password
+    route alone. Defaulting it to False is what keeps the refusal
+    fail-closed: a future caller of this boundary is gated unless it
+    deliberately asks not to be.
+    """
     if principal.profile_id == LOCAL_SESSION_RS256_V2:
-        return await _project_local_session_principal(principal)
+        return await _project_local_session_principal(
+            principal,
+            for_credential_change=for_credential_change,
+        )
     if principal.profile_id == KEYCLOAK_ACCESS_V1:
         return await _project_keycloak_principal(principal)
+    if principal.profile_id == KEYCLOAK_SERVICE_AUTHORITY_V1:
+        return await _project_service_authority_principal(principal)
     return None
 
 
@@ -655,8 +717,17 @@ async def change_password(user_id: str, current: str, new: str) -> None:
             if await verify_password_async(new, row["password_hash"]):
                 raise BadPasswordChange("New password must differ from current")
 
+            # Clearing the marker belongs in the same statement as the new
+            # hash: the marker describes the credential in that column, so
+            # the two can never be observed disagreeing.
             await conn.execute(
-                "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
+                """
+                UPDATE users
+                   SET password_hash = $1,
+                       credential_change_required = false,
+                       updated_at = NOW()
+                 WHERE id = $2
+                """,
                 await hash_password_async(new),
                 uuid.UUID(user_id),
             )
@@ -996,6 +1067,31 @@ async def resolve_rest_user_authorization(
     authorization: str,
 ) -> AuthenticatedUser | None:
     """Resolve the REST capability without token-directed verifier dispatch."""
+    return await _resolve_rest_authorization(authorization)
+
+
+async def resolve_rest_credential_change_authorization(
+    authorization: str,
+) -> AuthenticatedUser | None:
+    """Resolve the REST capability for the forced credential change alone.
+
+    Identical to ``resolve_rest_user_authorization`` except that this is the
+    one entry point exempt from the forced-credential-change refusal. A
+    separate name rather than a flag is what makes the exemption narrow:
+    the resolver every other route reaches cannot be asked to skip the
+    refusal at all.
+    """
+    return await _resolve_rest_authorization(
+        authorization,
+        for_credential_change=True,
+    )
+
+
+async def _resolve_rest_authorization(
+    authorization: str,
+    *,
+    for_credential_change: bool = False,
+) -> AuthenticatedUser | None:
     _reset_request_credential_context()
     token = _bearer_token(authorization)
     if token is None:
@@ -1006,10 +1102,50 @@ async def resolve_rest_user_authorization(
     if settings.require_auth_mode() == "local":
         principal = verify_local_session_rs256_v2(token)
     else:
-        principal = await verify_keycloak_access_v1(token, "api")
+        principal = await _verify_sso_rest_bearer(token)
     if principal is None:
         return None
-    return await project_verified_principal(principal)
+    return await project_verified_principal(
+        principal,
+        for_credential_change=for_credential_change,
+    )
+
+
+def _unverified_authorized_party(token: str) -> str | None:
+    value = _unverified_claim(token, "azp")
+    return value if isinstance(value, str) else None
+
+
+def _unverified_claim(token: str, name: str):
+    try:
+        claims = jwt.decode(
+            token,
+            options={
+                "verify_signature": False,
+                "verify_exp": False,
+                "verify_aud": False,
+            },
+        )
+    except (jwt.PyJWTError, TypeError, ValueError):
+        return None
+    return claims.get(name) if isinstance(claims, dict) else None
+
+
+async def _verify_sso_rest_bearer(token: str) -> VerifiedPrincipal | None:
+    """Select exactly one SSO profile for a REST bearer — never a fallback.
+
+    The two profiles are disjoint by authorized party: the human profile pins
+    ``azp`` to a human client, the service-authority profile to the single
+    configured non-human client. The peek that selects between them is
+    unverified and is never an authorization input — whichever profile it
+    selects proves signature, issuer, and its own exact ``azp`` before
+    returning a principal, so a lying ``azp`` only picks the profile that will
+    refuse it. Exactly one profile is tried, and a refusal is final.
+    """
+    service_admin_client_id = settings.keycloak_service_admin_client_id_effective
+    if service_admin_client_id and _unverified_authorized_party(token) == service_admin_client_id:
+        return await verify_keycloak_service_authority_v1(token)
+    return await verify_keycloak_access_v1(token, "api")
 
 
 async def resolve_mcp_authorization(authorization: str) -> AuthenticatedUser | None:
@@ -1057,6 +1193,8 @@ async def resolve_token(authorization: str) -> AuthenticatedUser | None:
 
 async def _project_local_session_principal(
     principal: VerifiedPrincipal,
+    *,
+    for_credential_change: bool = False,
 ) -> AuthenticatedUser | None:
     """Project a verified local session onto its active AKB account."""
     iat = principal.claims["iat"]
@@ -1066,6 +1204,7 @@ async def _project_local_session_principal(
             row = await conn.fetchrow(
                 """
                 SELECT id, username, email, display_name, is_admin,
+                       credential_change_required,
                        CEIL(EXTRACT(EPOCH FROM tokens_revoked_before))::bigint
                            AS revoked_epoch_ceil
                   FROM users
@@ -1094,6 +1233,16 @@ async def _project_local_session_principal(
             # issued in the same second as revoke would survive.
             if int(iat) < int(row["revoked_epoch_ceil"]):
                 return None
+
+            # A credential this account was handed, and has not replaced,
+            # buys exactly one capability: replacing it. The refusal is
+            # here rather than at each route because this is the only
+            # place a local password becomes request authority, so a route
+            # added later is covered without being told about it. It is a
+            # raise, not a None, so the caller can be told what to do
+            # instead of being told its credential is invalid.
+            if row["credential_change_required"] and not for_credential_change:
+                raise CredentialChangeRequiredError()
 
             return AuthenticatedUser(
                 user_id=str(row["id"]),

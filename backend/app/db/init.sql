@@ -54,6 +54,15 @@ CREATE TABLE IF NOT EXISTS users (
     account_kind TEXT NOT NULL DEFAULT 'human'
         CONSTRAINT users_account_kind_check
         CHECK (account_kind IN ('human', 'service')),
+    -- Local counterpart to the identity provider's UPDATE_PASSWORD required
+    -- action. TRUE while a credential that was issued to this account and
+    -- handed over out-of-band has not yet been replaced by its holder; a
+    -- session projected from it may do nothing but change the password.
+    -- Set by password reset and local recovery-admin provisioning, cleared
+    -- by change_password. Self-service registration never sets it, so every
+    -- account that has never had a credential issued keeps this default.
+    -- See migration 080.
+    credential_change_required BOOLEAN NOT NULL DEFAULT false,
     CONSTRAINT users_recovery_admin_requires_admin
         CHECK (NOT is_recovery_admin OR is_admin),
     CONSTRAINT users_recovery_admin_provider_check
@@ -95,6 +104,27 @@ CREATE INDEX IF NOT EXISTS idx_external_identities_user
     ON external_identities(user_id);
 CREATE UNIQUE INDEX IF NOT EXISTS external_identities_id_user_key
     ON external_identities(id, user_id);
+
+-- Non-human counterpart, deliberately a separate population: the table above
+-- means "an identity provider identity belonging to a person here", and the
+-- human resolution path reads it that way. One row is one configured
+-- authority — an exact (issuer, client) pair resolved to one AKB service
+-- account. `subject` is that client's service-account user, recorded for
+-- audit rather than consulted as an authorization input. See migration 081.
+CREATE TABLE IF NOT EXISTS service_identities (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    issuer TEXT NOT NULL,
+    client_id TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT service_identities_issuer_client_key UNIQUE (issuer, client_id),
+    CONSTRAINT service_identities_issuer_subject_key UNIQUE (issuer, subject)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS service_identities_user_key
+    ON service_identities(user_id);
 
 -- Singleton authority for the last accepted runtime auth boundary. The
 -- installation generation is monotonic: an exact restart is accepted, a

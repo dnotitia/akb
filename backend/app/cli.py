@@ -16,6 +16,11 @@ Subcommands:
                                SSO recovery administrator. Password material
                                is accepted only by file/stdin and is never
                                printed.
+    issue-recovery-admin-credential
+                               Break-glass: replace the exact designated
+                               recovery administrator's credential and print
+                               the new one once. The credential it replaces
+                               stops working. Nothing stores or logs the value.
     bootstrap-standalone-sso   Converge the bundled Keycloak realm, clients,
                                signing profile, and exact AKB recovery-admin
                                projection; then retire the temporary bootstrap
@@ -54,6 +59,11 @@ PROVISION_RECOVERY_ADMIN_USAGE = (
 GENERATE_LOCAL_SESSION_KEYSET_USAGE = (
     "Usage: python -m app.cli generate-local-session-keyset "
     "--output-dir DIR [--retain-jwks PATH ...]"
+)
+
+ISSUE_RECOVERY_ADMIN_CREDENTIAL_USAGE = (
+    "Usage: python -m app.cli issue-recovery-admin-credential "
+    "--expected-username USER --expected-email EMAIL"
 )
 
 STANDALONE_SSO_BOOTSTRAP_USAGE = (
@@ -247,6 +257,12 @@ async def _provision_recovery_admin(args: list[str]) -> int:
                 username=parsed.username,
                 email=parsed.email,
                 password=password,
+                # True for exactly the branch above that produced the value
+                # and wrote it into an operator-owned file: that is AKB
+                # handing a credential to a person, so the account it creates
+                # owes a replacement for it. A caller-supplied password was
+                # never handed over by AKB.
+                credential_issued_by_akb=generated_path is not None,
             )
         else:
             report = await provision_sso_recovery_admin(
@@ -300,6 +316,78 @@ async def _provision_recovery_admin(args: list[str]) -> int:
         "password_file_written": keep_generated,
     }
     print(json.dumps(public_report, sort_keys=True))
+    return 0
+
+
+async def _issue_recovery_admin_credential(args: list[str]) -> int:
+    parser = _SafeArgumentParser(add_help=False)
+    parser.add_argument("--expected-username", required=True)
+    parser.add_argument("--expected-email", required=True)
+    try:
+        parsed = parser.parse_args(args)
+    except _CLIUsageError:
+        print(ISSUE_RECOVERY_ADMIN_CREDENTIAL_USAGE, file=sys.stderr)
+        return 2
+
+    from app.config import AuthModeConfigurationError
+    from app.db.postgres import close_pool
+    from app.exceptions import AKBError
+    from app.services.recovery_admin_service import issue_recovery_admin_credential
+
+    report: dict | None = None
+    error: tuple[str, str] | None = None
+    try:
+        await _initialize_operator_database()
+        # Same service function as the endpoint. Workspace shell access is the
+        # authority here, so there is no authenticated principal to pass. This
+        # replaces a credential the account already has; it is not a way in for
+        # an account that never had one.
+        report = await issue_recovery_admin_credential(
+            expected_username=parsed.expected_username,
+            expected_email=parsed.expected_email,
+            method="recovery_admin_cli",
+        )
+    except AKBError as exc:
+        error = (exc.code or "recovery_admin_credential_issue_failed", exc.message)
+    except AuthModeConfigurationError as exc:
+        error = ("recovery_admin_credential_mode_configuration", str(exc))
+    except Exception:
+        # Never render an unexpected exception: driver and HTTP libraries can
+        # retain request bodies, and this command handles credential material.
+        error = (
+            "recovery_admin_credential_issue_failed",
+            "Recovery administrator credential issue failed",
+        )
+    finally:
+        try:
+            await close_pool()
+        except Exception:
+            if error is None:
+                error = (
+                    "recovery_admin_credential_database_cleanup_failed",
+                    "Database connection cleanup failed",
+                )
+
+    if error is not None:
+        print(f"{error[0]}: {error[1]}", file=sys.stderr)
+        return 1
+    assert report is not None
+    # The one-time reveal of the replacement. It is deliberately not part of
+    # the JSON report so a caller piping stdout into a log or a file captures
+    # the identity, not the credential.
+    print(
+        json.dumps(
+            {
+                "user_id": report["user_id"],
+                "username": report["username"],
+                "email": report["email"],
+                "auth_mode": report["auth_mode"],
+            },
+            sort_keys=True,
+        )
+    )
+    print(f"Credential for {report['username']}: {report['credential']}")
+    print("Share this out-of-band. It cannot be retrieved again.")
     return 0
 
 
@@ -650,6 +738,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "Subcommands: generate-local-session-keyset, "
             "provision-recovery-admin {local|sso}, "
+            "issue-recovery-admin-credential, "
             "bootstrap-standalone-sso, "
             "reset-password <username>, repair-resource-hashes, "
             "initialize-postgres-native, okf-validate <dir>, "
@@ -662,6 +751,8 @@ def main(argv: list[str] | None = None) -> int:
         return _generate_local_session_keyset(argv[1:])
     if cmd == "provision-recovery-admin":
         return asyncio.run(_provision_recovery_admin(argv[1:]))
+    if cmd == "issue-recovery-admin-credential":
+        return asyncio.run(_issue_recovery_admin_credential(argv[1:]))
     if cmd == "bootstrap-standalone-sso":
         return asyncio.run(_bootstrap_standalone_sso(argv[1:]))
     if cmd == "reset-password":
