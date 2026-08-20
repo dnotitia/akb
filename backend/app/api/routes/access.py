@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import ConfigDict, Field, SecretStr
 
 from app.api.deps import get_current_user
+from app.config import settings
 from app.services.auth_service import (
     AuthenticatedUser,
     REVOKE_REASON_ADMIN,
@@ -49,6 +50,11 @@ from app.services.access_service import (
     transfer_ownership,
     unarchive_vault,
     update_vault_metadata,
+)
+from app.services.admission_service import (
+    approve_pending_admission,
+    dismiss_pending_admission,
+    list_pending_admissions,
 )
 from app.util.text import NFCModel
 
@@ -524,6 +530,79 @@ async def admin_get_human_user_by_email(
 ):
     _require_admin(user)
     return await get_human_user_by_email(email)
+
+
+class ApprovePendingAdmissionRequest(NFCModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Deliberately absent: issuer and subject. Approval names a row, and the
+    # row carries the identity. A caller able to supply a subject alongside a
+    # row id could approve one arrival and bind a different one.
+    existing_user_id: str | None = Field(default=None, max_length=64)
+    email: str | None = Field(default=None, max_length=320)
+    display_name: str | None = Field(default=None, max_length=255)
+    prepare_suspended: bool = False
+
+
+def _require_admission_surface() -> None:
+    """Pending admissions exist only where `invite_only` produces them.
+
+    Enrollment policy is what creates the arrivals, so a deployment that is not
+    admitting by exact binding has no such list — and saying "not here" is more
+    useful than an empty array that reads as "nobody has arrived".
+    """
+    if settings.keycloak_enrollment_mode != "invite_only":
+        raise HTTPException(
+            status_code=404,
+            detail="Pending admissions exist only under invite-only enrollment",
+        )
+
+
+@router.get(
+    "/admin/pending-admissions",
+    summary="[admin] List identities that arrived and were refused by invite-only",
+)
+async def admin_list_pending_admissions(
+    limit: int = Query(200, ge=1, le=1000),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    _require_admission_surface()
+    return await list_pending_admissions(limit=limit)
+
+
+@router.post(
+    "/admin/pending-admissions/{admission_id}/approve",
+    summary="[admin] Bind one recorded arrival to an AKB user",
+)
+async def admin_approve_pending_admission(
+    admission_id: str,
+    req: ApprovePendingAdmissionRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    _require_admission_surface()
+    return await approve_pending_admission(
+        admission_id,
+        actor_id=user.user_id,
+        existing_user_id=req.existing_user_id,
+        email=req.email,
+        display_name=req.display_name,
+        prepare_suspended=req.prepare_suspended,
+    )
+
+
+@router.delete(
+    "/admin/pending-admissions/{admission_id}",
+    summary="[admin] Forget one recorded arrival without admitting it",
+)
+async def admin_dismiss_pending_admission(
+    admission_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    _require_admission_surface()
+    return await dismiss_pending_admission(admission_id, actor_id=user.user_id)
 
 
 @router.get(
