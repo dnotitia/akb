@@ -105,12 +105,16 @@ upstream markdown is never attributed to the vault owner.
 
 Injection lives at the dispatch chokepoint (`mcp_server/server.py
 call_tool()`, next to audit/tool-usage recording). A client that advertises
-the experimental `io.dnotitia.akb/vault-skill-preflight` version 1 capability
-opts into the retry contract. Its reader-authorized writes perform a
+the experimental `io.dnotitia.akb/vault-skill-preflight` version 2 capability
+opts into the acknowledged retry contract. Its reader-authorized writes perform a
 non-mutating preflight first: if the guide is new or changed, the server
 returns `vault_skill_required` with the payload and does not dispatch the
-mutation; the agent applies the guide and retries with the same OCC/idempotency
-inputs. Clients that do not advertise the capability retain the compatible
+mutation. The payload carries an opaque token bound to the MCP session, vault
+identity, and current guide version. The agent applies the guide and retries
+the unchanged operation with that acknowledgement (the bundled proxy attaches
+it automatically). Every concurrent request without the token remains
+non-mutating. Version 1 retains its legacy sequential retry behavior during
+rollout. Clients that do not advertise the capability retain the compatible
 post-dispatch additive payload. Successful reads attach it in both modes.
 
 1. Resolves the single vault the call touched by promoting
@@ -120,9 +124,11 @@ post-dispatch additive payload. Successful reads attach it in both modes.
 2. Requires explicit read scope plus reader ACL and pins the immutable vault
    UUID returned by that authorization. Write-only credentials may continue
    writing but never receive stored guide content.
-3. Consults an in-process map
-   `{(session_id, vault_name, vault_id): injected_version}`.
-   Version = skill content hash. On miss or mismatch, attaches to the result
+3. Keeps additive delivery, strict acknowledgement, and pending challenge in
+   separate bounded in-process maps keyed by
+   `{(session_id, vault_name, vault_id)}`. Version = skill content hash. Merely
+   constructing a response never acknowledges a guide; only a matching v2
+   token advances strict write state.
    dict:
 
 ```json
@@ -218,8 +224,10 @@ repo.
 - `vault_skill` response key is additive; the stdio proxy passes it through
   unchanged.
 - `vault_skill_required` is capability-negotiated. `akb-mcp` 2.2.1 advertises
-  support to the backend; direct and older clients keep successful writes and
-  receive `vault_skill` additively instead of being required to retry.
+  version 2 support to the backend and binds the returned acknowledgement to
+  an exact retry. Version 1 remains accepted for rolling compatibility; direct
+  and older clients without the capability keep successful writes and receive
+  `vault_skill` additively instead of being required to retry.
 - `akb_put`'s `type` stays free-form with `skill` documented as reserved
   (`tools.py` description update — an agent-facing contract change).
 - The only breaking change: writes into the reserved namespace and

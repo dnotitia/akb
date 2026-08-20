@@ -50,6 +50,7 @@ export function SkillSection({ vault, doc, loading, isMirror, canManage }: Props
   const [draft, setDraft] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
+  const [saveConflict, setSaveConflict] = useState(false);
   const [resetOpen, setResetOpen] = useState(false);
   const [baseCommit, setBaseCommit] = useState<string | null>(null);
   const [resetBaseCommit, setResetBaseCommit] = useState<string | null>(null);
@@ -67,6 +68,7 @@ export function SkillSection({ vault, doc, loading, isMirror, canManage }: Props
       setDraft(doc?.content || "");
       setBaseCommit(doc?.current_commit || null);
       setSaveError("");
+      setSaveConflict(false);
     }
     setTab(next);
   }
@@ -74,6 +76,7 @@ export function SkillSection({ vault, doc, loading, isMirror, canManage }: Props
   async function handleSave() {
     setSaving(true);
     setSaveError("");
+    setSaveConflict(false);
     try {
       await updateDocument(vault, VAULT_SKILL_PATH, {
         content: draft,
@@ -81,8 +84,20 @@ export function SkillSection({ vault, doc, loading, isMirror, canManage }: Props
       });
       invalidate();
       setTab("preview");
-    } catch (e: any) {
-      setSaveError(e?.message || "Save failed");
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : "Save failed";
+      if (/^current_commit moved:/i.test(message)) {
+        // Keep the local buffer and stale OCC pin intact: silently rebasing a
+        // full-body save would overwrite the other editor's changes. Refresh
+        // the read surfaces so History points at the newest commit instead.
+        invalidate();
+        setSaveConflict(true);
+        setSaveError(
+          "The guide changed in another session. Your draft is still here and was not saved. Compare it with History, then reopen Edit from the latest version before applying your changes.",
+        );
+      } else {
+        setSaveError(message);
+      }
     } finally {
       setSaving(false);
     }
@@ -204,7 +219,11 @@ export function SkillSection({ vault, doc, loading, isMirror, canManage }: Props
                 spellCheck={false}
               />
               {saveError && (
-                <Alert variant="destructive" className="mt-3">
+                <Alert
+                  variant={saveConflict ? "warning" : "destructive"}
+                  title={saveConflict ? "Guide changed elsewhere" : undefined}
+                  className="mt-3"
+                >
                   {saveError}
                 </Alert>
               )}

@@ -15,6 +15,12 @@ experimental capability map. Direct and older MCP clients do not advertise it,
 so their writes remain compatible and receive the guide as an additive result
 field instead.
 
+The negotiated contract is version 2: every unacknowledged concurrent write is
+non-mutating, and the server returns an opaque acknowledgement bound to the MCP
+session, vault identity, and current guide. The proxy attaches it only when the
+agent retries the unchanged operation; unrelated queued writes cannot consume
+that acknowledgement.
+
 Deploy the matching backend before publishing this proxy version. Existing
 MCP processes must restart (or otherwise re-resolve the package) to load the
 new proxy behavior.

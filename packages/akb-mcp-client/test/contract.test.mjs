@@ -447,6 +447,48 @@ itAsync("proxy-local first write returns the vault guide before side effects", a
   assert.deepEqual(body.vault_skill, guide);
 });
 
+itAsync("proxy-local exact retry acknowledges the guide before writing", async () => {
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  const guide = {
+    vault: "myvault", version: "abc123", reason: "first_touch",
+    body: "# Owner guide", truncated: false,
+  };
+  let helpCalls = 0;
+  proxy._ensureBackend = async () => true;
+  proxy._rpc = async () => ({
+    content: [{
+      type: "text",
+      text: JSON.stringify(
+        helpCalls++ === 0 ? { help: "guide", vault_skill: guide } : { help: "guide" },
+      ),
+    }],
+  });
+  let writes = 0;
+  proxy._putImage = async () => {
+    writes++;
+    return { kind: "document_image", url: "/api/assets/test" };
+  };
+  const params = {
+    name: "akb_put_image",
+    arguments: { vault: "myvault", file_path: "/tmp/example.png" },
+  };
+
+  const first = await proxy._handle({
+    jsonrpc: "2.0", id: 1, method: "tools/call", params,
+  });
+  const firstBody = JSON.parse(first.result.content[0].text);
+  assert.equal(firstBody.code, "vault_skill_required");
+  assert.equal(typeof firstBody.vault_skill.ack_token, "string");
+  assert.equal(writes, 0);
+
+  const second = await proxy._handle({
+    jsonrpc: "2.0", id: 2, method: "tools/call", params,
+  });
+  const secondBody = JSON.parse(second.result.content[0].text);
+  assert.equal(secondBody.kind, "document_image");
+  assert.equal(writes, 1);
+});
+
 itAsync("proxy-local read attaches the guide to the successful result", async () => {
   const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
   const guide = {

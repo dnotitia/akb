@@ -87,7 +87,10 @@ describe("SkillSection", () => {
     await u.type(editor, " local draft");
     await u.click(screen.getByRole("button", { name: /save guide/i }));
 
-    expect(await screen.findByText(/current_commit moved/i)).toBeTruthy();
+    expect(await screen.findByText(/guide changed elsewhere/i)).toBeTruthy();
+    expect(screen.getByText(/your draft is still here/i)).toBeTruthy();
+    expect(screen.queryByText(/current_commit moved/i)).toBeNull();
+    expect(screen.queryByText(/abc123|def456/i)).toBeNull();
     expect(editor.value).toBe(`${DOC.content} local draft`);
     expect(screen.getByRole("tab", { name: /^edit$/i }).getAttribute("data-state"))
       .toBe("active");

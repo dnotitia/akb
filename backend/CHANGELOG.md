@@ -7,6 +7,14 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Made vault-guide write preflight concurrency-safe
+
+MCP clients can negotiate vault-guide preflight version 2. The server now
+returns an opaque, session-and-vault-bound acknowledgement and leaves every
+parallel unacknowledged write non-mutating. The bundled proxy applies the
+acknowledgement only to an unchanged retry; version 1 and non-negotiating
+clients retain their existing compatibility paths.
+
 ### Added a non-human service authority for identity-provider-only workspaces
 
 An installation whose accounts all come from an identity provider had no way to

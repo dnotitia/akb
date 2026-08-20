@@ -37,6 +37,84 @@ async def test_same_version_not_reinjected(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_same_session_concurrent_legacy_first_touch_all_receive_guide(monkeypatch):
+    """A v1 arrival cohort must not let its first waiter release the rest."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow(vault, vault_id=None):
+        started.set()
+        await release.wait()
+        return {"content": "# body", "version": "abc12345"}
+
+    monkeypatch.setattr(vss, "_fetch_skill", slow)
+    tasks = [
+        asyncio.create_task(vss.injection_payload("same-session", "v1"))
+        for _ in range(12)
+    ]
+    await started.wait()
+    await asyncio.sleep(0)
+    release.set()
+    results = await asyncio.gather(*tasks)
+
+    assert all(result is not None for result in results)
+    assert {result["version"] for result in results} == {"abc12345"}
+    # A genuinely later retry keeps the legacy sequential contract.
+    assert await vss.injection_payload("same-session", "v1") is None
+
+
+@pytest.mark.asyncio
+async def test_strict_preflight_blocks_parallel_writes_until_matching_ack(monkeypatch):
+    monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch())
+
+    challenges = await asyncio.gather(*[
+        vss.preflight_payload("same-session", "v1", "vault-id")
+        for _ in range(12)
+    ])
+
+    assert all(challenge is not None for challenge in challenges)
+    assert len({challenge["ack_token"] for challenge in challenges}) == 1
+    token = challenges[0]["ack_token"]
+
+    # Missing, malformed, and unrelated acknowledgements remain fail-closed.
+    assert await vss.preflight_payload("same-session", "v1", "vault-id") is not None
+    assert await vss.preflight_payload(
+        "same-session", "v1", "vault-id", acknowledgement="wrong"
+    ) is not None
+    assert await vss.preflight_payload(
+        "same-session", "v1", "vault-id", acknowledgement=object()  # type: ignore[arg-type]
+    ) is not None
+
+    assert await vss.preflight_payload(
+        "same-session", "v1", "vault-id", acknowledgement=token
+    ) is None
+    assert await vss.preflight_payload("same-session", "v1", "vault-id") is None
+
+
+@pytest.mark.asyncio
+async def test_strict_ack_is_bound_to_session_vault_identity_and_version(monkeypatch):
+    monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch(version="v-old"))
+    challenge = await vss.preflight_payload("s", "v1", "id-1")
+    token = challenge["ack_token"]
+
+    assert await vss.preflight_payload(
+        "other-session", "v1", "id-1", acknowledgement=token
+    ) is not None
+    assert await vss.preflight_payload(
+        "s", "v1", "id-2", acknowledgement=token
+    ) is not None
+
+    monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch(version="v-new"))
+    vss.invalidate("v1")
+    updated = await vss.preflight_payload(
+        "s", "v1", "id-1", acknowledgement=token
+    )
+    assert updated is not None
+    assert updated["version"] == "v-new"
+    assert updated["ack_token"] != token
+
+
+@pytest.mark.asyncio
 async def test_version_change_reinjects(monkeypatch):
     monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch(version="v-old"))
     assert (await vss.injection_payload("s", "v1"))["reason"] == "first_touch"

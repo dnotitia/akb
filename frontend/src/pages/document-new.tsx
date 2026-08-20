@@ -1,7 +1,7 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { ArrowLeft, ArrowRight, Check, ChevronRight, FolderPlus } from "lucide-react";
+import { AlertCircle, ArrowLeft, ArrowRight, Check, ChevronRight, FolderPlus } from "lucide-react";
 import { ApiError, putDocument } from "@/lib/api";
 import { DOC_TYPES, type DocType } from "@/lib/doc-constants";
 import { isReservedCollection } from "@/lib/skill";
@@ -77,6 +77,7 @@ export default function DocumentNewPage() {
   // say plainly whether the typed path is existing or about to be created.
   const collectionTrimmed = collection.trim();
   const isExistingCollection = collectionOptions.includes(collectionTrimmed);
+  const isReservedCollectionPath = isReservedCollection(collectionTrimmed);
   const matchingCollections = collectionOptions
     .filter(
       (c) =>
@@ -216,6 +217,7 @@ export default function DocumentNewPage() {
     title.trim() !== "" &&
     collection.trim() !== "" &&
     body.trim() !== "" &&
+    !isReservedCollectionPath &&
     !uploadingImage;
 
   return (
@@ -287,7 +289,9 @@ export default function DocumentNewPage() {
               maxLength={120}
               required
               aria-required="true"
-              aria-invalid={invalidField === "collection" || undefined}
+              aria-invalid={
+                invalidField === "collection" || isReservedCollectionPath || undefined
+              }
               aria-describedby="doc-collection-status"
               autoComplete="off"
             />
@@ -312,9 +316,17 @@ export default function DocumentNewPage() {
             <p
               id="doc-collection-status"
               className="flex items-center gap-1.5 text-xs text-foreground-muted"
+              aria-live="polite"
             >
               {collectionTrimmed === "" ? (
                 "Pick an existing folder, or type a new path to create one."
+              ) : isReservedCollectionPath ? (
+                <>
+                  <AlertCircle className="h-3 w-3 text-destructive" aria-hidden />
+                  <span className="text-destructive">
+                    System collection reserved for the vault guide. Pick a different collection.
+                  </span>
+                </>
               ) : isExistingCollection ? (
                 <>
                   <Check className="h-3 w-3 text-success" aria-hidden />

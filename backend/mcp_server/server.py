@@ -78,17 +78,26 @@ logger = logging.getLogger("akb.mcp")
 # capability negotiation so older clients continue to receive the additive
 # post-dispatch ``vault_skill`` field they already tolerate.
 VAULT_SKILL_PREFLIGHT_CAPABILITY = "io.dnotitia.akb/vault-skill-preflight"
+VAULT_SKILL_ACK_ARGUMENT = "_vault_skill_ack"
 
 
-def _supports_vault_skill_preflight() -> bool:
-    """Whether this MCP session explicitly supports the retry contract."""
+def _vault_skill_preflight_version() -> int | None:
+    """Negotiated retry-contract version for this MCP session, if any."""
     try:
         params = server.request_context.session.client_params
         experimental = params.capabilities.experimental if params else None
         advertised = (experimental or {}).get(VAULT_SKILL_PREFLIGHT_CAPABILITY)
-        return isinstance(advertised, dict) and advertised.get("version") == 1
+        if not isinstance(advertised, dict):
+            return None
+        version = advertised.get("version")
+        return version if version in (1, 2) else None
     except (AttributeError, LookupError):
-        return False
+        return None
+
+
+def _supports_vault_skill_preflight() -> bool:
+    """Compatibility helper retained for callers/tests that need a boolean."""
+    return _vault_skill_preflight_version() is not None
 
 
 async def _find_doc(vault_name: str, doc_ref: str) -> dict | None:
@@ -1541,11 +1550,46 @@ async def _handle_set_public(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @server.list_tools()
 async def list_tools():
-    return TOOLS
+    if _vault_skill_preflight_version() != 2:
+        return TOOLS
+
+    # Capability v2 makes acknowledgement explicit.  Advertise the reserved
+    # retry argument only to clients that negotiated that contract; older
+    # clients keep the byte-for-byte schemas they already understand.
+    decorated = []
+    for tool in TOOLS:
+        may_write = (
+            _TOOL_SCOPES.get(tool.name, _WRITE_SCOPE) == _WRITE_SCOPE
+            or tool.name in _ARG_WRITE_TRIGGERS
+        )
+        if not may_write:
+            decorated.append(tool)
+            continue
+        copied = tool.model_copy(deep=True)
+        copied.inputSchema.setdefault("properties", {})[
+            VAULT_SKILL_ACK_ARGUMENT
+        ] = {
+            "type": "string",
+            "maxLength": 128,
+            "description": (
+                "Opaque acknowledgement returned as vault_skill.ack_token. "
+                "After applying that guide, retry the unchanged operation with "
+                "this value. The bundled proxy supplies it automatically."
+            ),
+        }
+        decorated.append(copied)
+    return decorated
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
+    # Capability-v2 acknowledgement is transport metadata expressed as a
+    # reserved tool argument so generic MCP clients can send it through their
+    # schema-validated call surface.  Remove it before scope checks, auditing,
+    # unknown-argument validation, and business handlers: it is neither domain
+    # input nor safe to persist in logs.
+    arguments = dict(arguments or {})
+    vault_skill_ack = arguments.pop(VAULT_SKILL_ACK_ARGUMENT, None)
     # FIRST thing, before anything can dispatch: drop any authorized-vault
     # marker this task context may still carry. Streamable-HTTP sessions can
     # reuse a task context across calls, and a stale marker would let this
@@ -1572,7 +1616,8 @@ async def call_tool(name: str, arguments: dict):
         # guide changes), return the guide without dispatching the mutation;
         # the agent applies it and retries the same idempotency/OCC-aware call.
         # Write-only credentials proceed without disclosure.
-        if is_write and _supports_vault_skill_preflight():
+        preflight_version = _vault_skill_preflight_version()
+        if is_write and preflight_version is not None:
             try:
                 from app.services.tool_usage import vault_of_call
                 from app.services import vault_skill_service
@@ -1581,12 +1626,29 @@ async def call_tool(name: str, arguments: dict):
                 if target_vault and await _can_read_vault(
                     user, user.user_id, target_vault
                 ):
-                    payload = await vault_skill_service.injection_payload(
-                        _session_id(), target_vault, authorized_vault_id(),
-                    )
+                    if preflight_version == 2:
+                        payload = await vault_skill_service.preflight_payload(
+                            _session_id(),
+                            target_vault,
+                            authorized_vault_id(),
+                            acknowledgement=(
+                                vault_skill_ack
+                                if isinstance(vault_skill_ack, str)
+                                else None
+                            ),
+                        )
+                    else:
+                        payload = await vault_skill_service.injection_payload(
+                            _session_id(), target_vault, authorized_vault_id(),
+                        )
                     if payload:
                         result = err(
-                            "Apply the vault instructions, then retry this write.",
+                            (
+                                "Apply the vault instructions, then retry this write "
+                                "with its acknowledgement."
+                                if preflight_version == 2
+                                else "Apply the vault instructions, then retry this write."
+                            ),
                             code=VAULT_SKILL_REQUIRED,
                             retryable=True,
                         )

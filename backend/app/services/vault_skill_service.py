@@ -44,7 +44,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import logging
+import secrets
 import time
 from collections import OrderedDict
 
@@ -79,8 +81,19 @@ _last_timeout_log = 0.0
 # ever touched and never shrink.
 _CacheKey = tuple[str, str | None]
 _vault_cache: OrderedDict[_CacheKey, tuple[float, str | None, str | None]] = OrderedDict()
-# (session_id, vault, immutable vault id) → injected version. OrderedDict as LRU.
+# (session_id, vault, immutable vault id) → additively injected version.
+# OrderedDict as LRU.  This is intentionally separate from strict write
+# acknowledgement: putting a guide in a read response does not prove that the
+# client applied it before a concurrently submitted write.
 _session_map: OrderedDict[tuple[str, str, str | None], str] = OrderedDict()
+# Strict preflight state.  Acknowledgement is explicit in capability v2, so all
+# concurrent writes that arrived without the challenge token remain
+# non-mutating.  Challenges are opaque and bound by their map key to the MCP
+# session, vault name, and immutable vault id.
+_acknowledged_map: OrderedDict[tuple[str, str, str | None], str] = OrderedDict()
+_challenge_map: OrderedDict[
+    tuple[str, str, str | None], tuple[str, str]
+] = OrderedDict()
 # vault → in-flight fetch. Single-flight: a cache miss costs several DB round
 # trips plus a git read, so N concurrent first-touches of one vault must not
 # become N stampeding fetches. Entries are removed in the leader's `finally`,
@@ -112,6 +125,8 @@ def reset() -> None:
     _invalidation_epoch = 0
     _vault_cache.clear()
     _session_map.clear()
+    _acknowledged_map.clear()
+    _challenge_map.clear()
     _pending.clear()
 
 
@@ -120,8 +135,63 @@ def invalidate(vault: str) -> None:
     itself was deleted. Callers MUST be past their commit — see module docs."""
     global _invalidation_epoch
     _invalidation_epoch += 1
-    for key in [key for key in _vault_cache if key[0] == vault]:
-        _vault_cache.pop(key, None)
+    for cache_key in [key for key in _vault_cache if key[0] == vault]:
+        _vault_cache.pop(cache_key, None)
+    # A challenge for the previous body must not remain usable after a write,
+    # delete, or same-name recreation.  Acknowledged versions are harmless
+    # because the next strict preflight compares them with the fresh version.
+    for challenge_key in [key for key in _challenge_map if key[1] == vault]:
+        _challenge_map.pop(challenge_key, None)
+
+
+def _remember(
+    mapping: OrderedDict[tuple[str, str, str | None], str],
+    key: tuple[str, str, str | None],
+    value: str,
+) -> None:
+    """Store one per-session value and preserve the configured LRU bound."""
+    mapping[key] = value
+    mapping.move_to_end(key)
+    while len(mapping) > _SESSION_MAP_MAX:
+        mapping.popitem(last=False)
+
+
+def _remember_challenge(
+    key: tuple[str, str, str | None], version: str, token: str
+) -> None:
+    _challenge_map[key] = (version, token)
+    _challenge_map.move_to_end(key)
+    while len(_challenge_map) > _SESSION_MAP_MAX:
+        _challenge_map.popitem(last=False)
+
+
+def _format_payload(
+    vault: str,
+    version: str,
+    body: str,
+    *,
+    updated: bool,
+    ack_token: str | None = None,
+) -> dict:
+    truncated = len(body.encode("utf-8")) > _BODY_MAX
+    if truncated:
+        clipped = body.encode("utf-8")[:_BODY_MAX].decode("utf-8", "ignore")
+        body = (
+            clipped
+            + "\n\n[truncated — call akb_help(topic=\"vault-skill\", vault=\""
+            + vault
+            + "\") for the full text]"
+        )
+    payload = {
+        "vault": vault,
+        "version": version,
+        "reason": "updated" if updated else "first_touch",
+        "body": body,
+        "truncated": truncated,
+    }
+    if ack_token is not None:
+        payload["ack_token"] = ack_token
+    return payload
 
 
 async def _fetch_skill(
@@ -261,7 +331,14 @@ async def _current(
 async def injection_payload(
     session_id: str | None, vault: str, vault_id: str | None = None
 ) -> dict | None:
-    """The `vault_skill` payload to attach, or None. Never raises."""
+    """The additive/legacy ``vault_skill`` payload, or ``None``.
+
+    The state snapshot is taken before the potentially blocking fetch.  Thus a
+    cohort of concurrent legacy-v1 first writes all receives the guide instead
+    of the first waiter marking it delivered for the rest.  A later sequential
+    retry sees the stored version and proceeds under the v1 compatibility
+    contract.  Capability v2 uses :func:`preflight_payload` instead.
+    """
     try:
         if not settings.vault_skill.enabled:
             return None
@@ -272,34 +349,84 @@ async def injection_payload(
         # Stdio/CLI callers have no session id; treat them as one
         # per-process pseudo-session (a stdio proxy is one conversation).
         key = (session_id or "no-session", vault, vault_id)
+        # Capture before `_current()` awaits.  Do not re-read after the fetch:
+        # another request from this same arrival cohort may have completed in
+        # the meantime, but this request still has not delivered a guide.
+        prev = _session_map.get(key)
         version, body = await _current(vault, vault_id)
         if version is None or body is None:
             return None
-        prev = _session_map.get(key)
         if prev == version:
             _session_map.move_to_end(key)
             return None
-        _session_map[key] = version
-        _session_map.move_to_end(key)
-        while len(_session_map) > _SESSION_MAP_MAX:
-            _session_map.popitem(last=False)
-        truncated = len(body.encode("utf-8")) > _BODY_MAX
-        if truncated:
-            clipped = body.encode("utf-8")[:_BODY_MAX].decode("utf-8", "ignore")
-            body = (
-                clipped
-                + "\n\n[truncated — call akb_help(topic=\"vault-skill\", vault=\""
-                + vault + "\") for the full text]"
-            )
-        return {
-            "vault": vault,
-            "version": version,
-            "reason": "updated" if prev is not None else "first_touch",
-            "body": body,
-            "truncated": truncated,
-        }
+        _remember(_session_map, key, version)
+        return _format_payload(
+            vault, version, body, updated=prev is not None
+        )
     except Exception as e:  # noqa: BLE001 — injection must never fail a tool call
         logger.warning("vault_skill injection skipped for %s: %s", vault, e)
+        return None
+
+
+async def preflight_payload(
+    session_id: str | None,
+    vault: str,
+    vault_id: str | None = None,
+    *,
+    acknowledgement: str | None = None,
+) -> dict | None:
+    """Return a strict write challenge until the current guide is acknowledged.
+
+    No state is advanced merely because a response was constructed.  That is
+    the concurrency invariant: every parallel first write without the opaque
+    token remains non-mutating.  A token is valid only for the session/vault/id
+    key that issued it and for the guide version that is still current.
+
+    ``None`` means the session already acknowledged this version, or that the
+    optional guide could not be projected.  Like additive injection, this
+    helper never raises and performs no authorization itself.
+    """
+    try:
+        if not settings.vault_skill.enabled:
+            return None
+        if len(vault) > _VAULT_NAME_MAX:
+            return None
+        key = (session_id or "no-session", vault, vault_id)
+        version, body = await _current(vault, vault_id)
+        if version is None or body is None:
+            return None
+
+        acknowledged = _acknowledged_map.get(key)
+        if acknowledged == version:
+            _acknowledged_map.move_to_end(key)
+            return None
+
+        challenge = _challenge_map.get(key)
+        if challenge is None or challenge[0] != version:
+            challenge = (version, secrets.token_urlsafe(24))
+            _remember_challenge(key, challenge[0], challenge[1])
+        else:
+            _challenge_map.move_to_end(key)
+
+        if (
+            isinstance(acknowledgement, str)
+            and len(acknowledgement) == len(challenge[1])
+            and hmac.compare_digest(acknowledgement, challenge[1])
+        ):
+            _remember(_acknowledged_map, key, version)
+            _remember(_session_map, key, version)
+            _challenge_map.pop(key, None)
+            return None
+
+        return _format_payload(
+            vault,
+            version,
+            body,
+            updated=acknowledged is not None,
+            ack_token=challenge[1],
+        )
+    except Exception as e:  # noqa: BLE001 — preflight must never fail a tool call
+        logger.warning("vault_skill preflight skipped for %s: %s", vault, e)
         return None
 
 

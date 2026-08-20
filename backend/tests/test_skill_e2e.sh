@@ -423,7 +423,7 @@ INIT3=$(curl -sk -i -X POST "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $PAT2" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{"experimental":{"io.dnotitia.akb/vault-skill-preflight":{"version":1}}},"clientInfo":{"name":"skill-e2e-writer","version":"1.0"}}}' 2>&1)
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{"experimental":{"io.dnotitia.akb/vault-skill-preflight":{"version":2}}},"clientInfo":{"name":"skill-e2e-writer","version":"1.0"}}}' 2>&1)
 SID3=$(echo "$INIT3" | grep -i "mcp-session-id" | tr -d '\r' | awk '{print $2}')
 curl -sk -X POST "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $PAT2" \
@@ -443,31 +443,60 @@ mcp3() {
     -d "{\"jsonrpc\":\"2.0\",\"id\":$MCP_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}"
 }
 
-PUT_ARGS="{\"vault\":\"$INJECT_VAULT\",\"collection\":\"notes\",\"title\":\"Preflight probe\",\"slug\":\"preflight-probe\",\"content\":\"body\"}"
-W1=$(mcp3 akb_put "$PUT_ARGS" | mcp_text)
-echo "$W1" | grep -q '"code": *"vault_skill_required"' \
-  && pass "Fresh writer receives guide before the first mutation" \
-  || fail "T8.9" "first write was not preflighted: $(echo $W1 | head -c 200)"
+# Fire a true first-touch cohort at one Streamable-HTTP session. Every request
+# lacks acknowledgement and therefore must return the same challenge without
+# mutating. This keeps the shared-session arrival cohort within one contract.
+PREFLIGHT_DIR=$(mktemp -d)
+for i in $(seq 1 12); do
+  curl -sk -X POST "$BASE_URL/mcp/" \
+    -H "Authorization: Bearer $PAT2" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -H "mcp-session-id: $SID3" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":$((700+i)),\"method\":\"tools/call\",\"params\":{\"name\":\"akb_put\",\"arguments\":{\"vault\":\"$INJECT_VAULT\",\"collection\":\"notes\",\"title\":\"Parallel preflight $i\",\"slug\":\"parallel-preflight-$i\",\"content\":\"body\"}}}" \
+    >"$PREFLIGHT_DIR/$i.json" &
+done
+wait
 
-BEFORE_RETRY=$(mcp akb_get "{\"uri\":\"akb://$INJECT_VAULT/doc/notes/preflight-probe.md\"}" | mcp_text_noskill)
-echo "$BEFORE_RETRY" | grep -q '"code": *"not_found"' \
-  && pass "Preflight response leaves the document absent" \
-  || fail "T8.10" "first write produced a document before retry"
+PREFLIGHT_COUNT=0
+for i in $(seq 1 12); do
+  BODY=$(mcp_text <"$PREFLIGHT_DIR/$i.json")
+  echo "$BODY" | grep -q '"code": *"vault_skill_required"' \
+    && PREFLIGHT_COUNT=$((PREFLIGHT_COUNT+1))
+done
+[ "$PREFLIGHT_COUNT" -eq 12 ] \
+  && pass "All 12 parallel first writes stop at acknowledged preflight" \
+  || fail "T8.9" "$PREFLIGHT_COUNT/12 writes were preflighted"
 
+W1=$(mcp_text <"$PREFLIGHT_DIR/1.json")
+ACK=$(echo "$W1" | skill_field ack_token)
+[ -n "$ACK" ] \
+  && pass "Strict preflight returns an acknowledgement token" \
+  || fail "T8.10" "v2 challenge omitted ack_token"
+
+BEFORE_RETRY=$(mcp akb_browse "{\"vault\":\"$INJECT_VAULT\",\"collection\":\"notes\"}" | mcp_text_noskill)
+if echo "$BEFORE_RETRY" | grep -q 'parallel-preflight-'; then
+  fail "T8.11" "parallel preflight cohort mutated a document"
+else
+  pass "Parallel preflight cohort leaves every document absent"
+fi
+
+PUT_ARGS="{\"vault\":\"$INJECT_VAULT\",\"collection\":\"notes\",\"title\":\"Parallel preflight 1\",\"slug\":\"parallel-preflight-1\",\"content\":\"body\",\"_vault_skill_ack\":\"$ACK\"}"
 W2=$(mcp3 akb_put "$PUT_ARGS" | mcp_text_noskill)
 echo "$W2" | grep -q '"action": *"created"' \
-  && pass "Retry performs the writer's document mutation" \
-  || fail "T8.11" "retry did not create the document: $(echo $W2 | head -c 200)"
+  && pass "Acknowledged exact retry performs the document mutation" \
+  || fail "T8.12" "acknowledged retry did not create the document: $(echo $W2 | head -c 200)"
+rm -rf "$PREFLIGHT_DIR"
 
 W3=$(mcp3 akb_update "{\"uri\":\"akb://$INJECT_VAULT/doc/overview/vault-skill.md\",\"content\":\"writer replacement\"}" | mcp_text)
 echo "$W3" | grep -q '"code": *"permission_denied"' \
   && pass "Generic writer cannot alter owner-authored vault instructions" \
-  || fail "T8.12" "writer skill update was not denied: $(echo $W3 | head -c 200)"
+  || fail "T8.13" "writer skill update was not denied: $(echo $W3 | head -c 200)"
 
 OWNER_READ=$(mcp akb_get "{\"uri\":\"akb://$INJECT_VAULT/doc/overview/vault-skill.md\"}" | mcp_text_noskill)
 echo "$OWNER_READ" | grep -q "$MARKER" \
   && pass "Denied writer update leaves the guide unchanged" \
-  || fail "T8.13" "guide changed after the denied writer update"
+  || fail "T8.14" "guide changed after the denied writer update"
 
 # ── Cleanup ──────────────────────────────────────────────────
 # The reserved-namespace guards do not block vault deletion (the vault delete
