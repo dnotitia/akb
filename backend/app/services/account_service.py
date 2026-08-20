@@ -287,6 +287,16 @@ async def ensure_human_external_identity(
             raise ExternalIdentityConflictError() from None
 
         row = await _fetch_user(conn, user_id)
+        # This identity now has a binding, so the note `invite_only` took when
+        # it refused them has been answered. Clearing it here rather than only
+        # in the approval path covers every writer of an exact binding —
+        # including a control plane that prelinks someone who had already
+        # arrived and been turned away.
+        await conn.execute(
+            "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
+            issuer,
+            subject,
+        )
 
     if new_user_id is not None:
         await get_role_sync().on_user_create(new_user_id)

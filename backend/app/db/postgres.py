@@ -304,6 +304,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "079_worker_claim_lifecycle.py",  # attempt-at-claim + explicit claimed/abandoned timestamps for durable queues
         "080_local_forced_credential_change.py",  # local parity for the identity provider's UPDATE_PASSWORD: a delivered credential is owed a replacement until its holder changes it
         "081_service_identities.py",  # non-human (issuer, client) → AKB service account bindings, kept out of the human external_identities population
+        "082_pending_admissions.py",  # the arrival invite_only refuses, kept so an administrator can approve that exact identity instead of guessing a subject in advance
     ):
         if filename in applied:
             continue

@@ -862,6 +862,17 @@ class Settings(BaseModel):
     # user plus exact binding. `invite_only` accepts only an exact prebound
     # (issuer, subject) identity. `disabled` rejects external login entirely.
     keycloak_enrollment_mode: Literal["open", "invite_only", "disabled"] = "open"
+    # `invite_only` records the arrival it refuses so an administrator can
+    # approve that exact identity. Both bounds are on the RECORD, never on the
+    # refusal: eviction changes what an administrator can still see, and never
+    # what a token is allowed to do.
+    #
+    # An arrival costs an authenticated session at the upstream identity
+    # provider, so this table is not reachable by anyone who merely reaches the
+    # login page. The bounds exist because "unbounded, but hard to fill" is
+    # still unbounded.
+    keycloak_pending_admission_retention_hours: int = Field(default=336, ge=1, le=8760)
+    keycloak_pending_admission_cap: int = Field(default=500, ge=1, le=100000)
     # Deprecated migration input retained so Phase 3 readiness tooling can
     # identify legacy installations. Canonical config loading rejects true,
     # and the projection service repeats that guard for directly constructed
