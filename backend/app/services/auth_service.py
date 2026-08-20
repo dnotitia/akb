@@ -38,6 +38,7 @@ from app.exceptions import (
 )
 from app.models.vault_scope import VaultScope
 from app.repositories.events_repo import emit_event
+from app.services.admission_service import record_arrival
 from app.services.auth_policy import require_local_auth_enabled
 from app.services.auth_verifier_profiles import (
     KEYCLOAK_ACCESS_V1,
@@ -494,6 +495,13 @@ async def _resolve_or_provision_keycloak_user(claims: dict) -> dict:
             return _resolved_external_user(refreshed, newly_provisioned=False)
 
         if settings.keycloak_enrollment_mode == "invite_only":
+            # The broker has just verified this person and minted them a stable
+            # subject in this realm. That subject is the one value an exact
+            # binding needs and the one value nobody could name in advance, so
+            # it is written down here rather than discarded with the refusal.
+            # Recording never changes the answer: the refusal below is raised
+            # whether or not the note was taken.
+            await record_arrival(conn, issuer=issuer, subject=subject, claims=claims)
             raise MembershipRequiredError()
 
         email = (_optional_external_string(claims, "email") or "").strip().lower()

@@ -15,7 +15,13 @@ from app.api.routes.admin_auth import (
     get_product_admin_mutation,
 )
 from app.config import settings
+from app.exceptions import AKBError
 from app.services import audit_log
+from app.services.admission_service import (
+    approve_pending_admission,
+    dismiss_pending_admission,
+    list_pending_admissions,
+)
 from app.sso.keycloak_admin import (
     ProviderControlError,
     get_keycloak_provider_control,
@@ -604,3 +610,97 @@ async def rollback_sso_identity_migration(
         actor,
         operation="rollback",
     )
+
+
+class ApprovePendingAdmissionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Deliberately absent: issuer and subject. Approval names a row, and the
+    # row carries the identity. A caller able to supply a subject alongside a
+    # row id could approve one arrival and bind a different one.
+    existing_user_id: str | None = Field(default=None, max_length=64)
+    email: str | None = Field(default=None, max_length=320)
+    display_name: str | None = Field(default=None, max_length=255)
+    prepare_suspended: bool = False
+
+
+def _admission_audit_meta(admission: dict[str, object]) -> dict[str, object]:
+    return {
+        "issuer": admission.get("issuer"),
+        "subject_sha256": _subject_digest(admission.get("subject")),
+        "arrivals": admission.get("arrivals"),
+    }
+
+
+@router.get(
+    "/admin/sso/pending-admissions",
+    summary="List identities that arrived and were refused by invite-only",
+)
+async def list_sso_pending_admissions(
+    limit: int = 200,
+    actor: ProductAdminActor = Depends(get_current_product_admin),
+):
+    del actor  # authorization only; reading the list is not an event
+    return await list_pending_admissions(limit=limit)
+
+
+@router.post(
+    "/admin/sso/pending-admissions/{admission_id}/approve",
+    summary="Bind one recorded arrival to an AKB user",
+)
+async def approve_sso_pending_admission(
+    admission_id: str,
+    request: ApprovePendingAdmissionRequest,
+    actor: ProductAdminActor = Depends(get_product_admin_mutation),
+):
+    try:
+        result = await approve_pending_admission(
+            admission_id,
+            actor_id=str(actor.user_id),
+            existing_user_id=request.existing_user_id,
+            email=request.email,
+            display_name=request.display_name,
+            prepare_suspended=request.prepare_suspended,
+        )
+    except AKBError as error:
+        audit_log.record(
+            action="sso.pending_admission.approve",
+            actor=actor.username,
+            actor_id=str(actor.user_id),
+            target=f"pending_admission={_canonical_user_id(admission_id)}",
+            outcome="error",
+            code=getattr(error, "code", None) or str(error.status_code),
+            meta={"existing_user_id": _canonical_user_id(request.existing_user_id)},
+        )
+        raise
+    approved = result["approved"]
+    meta = _admission_audit_meta(approved)
+    meta["user_id"] = _canonical_user_id(result["user"].get("user_id"))
+    audit_log.record(
+        action="sso.pending_admission.approve",
+        actor=actor.username,
+        actor_id=str(actor.user_id),
+        target=f"pending_admission={approved['id']}",
+        outcome="ok",
+        meta=meta,
+    )
+    return result
+
+
+@router.delete(
+    "/admin/sso/pending-admissions/{admission_id}",
+    summary="Forget one recorded arrival without admitting it",
+)
+async def dismiss_sso_pending_admission(
+    admission_id: str,
+    actor: ProductAdminActor = Depends(get_product_admin_mutation),
+):
+    result = await dismiss_pending_admission(admission_id)
+    audit_log.record(
+        action="sso.pending_admission.dismiss",
+        actor=actor.username,
+        actor_id=str(actor.user_id),
+        target=f"pending_admission={result['dismissed']}",
+        outcome="ok",
+    )
+    return result
