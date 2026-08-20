@@ -184,6 +184,14 @@ jobs:
         # since-renumbered migration tuple, so it silently self-skipped in
         # both jobs.
         #
+        # Pending admissions are a row with a uniqueness constraint, a
+        # retention window, and a cap that evicts — three database facts a mock
+        # would agree with rather than test. The two files beside it are the
+        # exact-identity contract the approval writes into, and both were
+        # absent from this list: they need a DSN, so they skipped in the unit
+        # job, and off this list they skipped here too. Enrollment policy and
+        # the whole administrative projection surface were gating nothing.
+        #
         # Recovery-admin provisioning and the dedicated admin browser-session
         # contract are also database guarantees.  Their ordinary unit-job
         # collection intentionally skips without Postgres, so keep both files
@@ -214,6 +222,9 @@ jobs:
           tests/test_recovery_admin_provisioning_postgres.py
           tests/test_admin_auth_postgres.py
           tests/test_sso_identity_migration_postgres.py
+          tests/test_pending_admission_postgres.py
+          tests/test_workspace_external_identity.py
+          tests/test_workspace_account_admin_service.py
           tests/test_sso_browser_session_postgres.py
           tests/test_sso_session_epoch_upgrade_postgres.py
           tests/test_tool_usage_e2e.py
