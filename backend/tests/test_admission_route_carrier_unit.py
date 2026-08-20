@@ -17,14 +17,33 @@ calling its handler is not proved reachable by its caller.
 
 from __future__ import annotations
 
+import tempfile
+
 import pytest
 
-from app.api.deps import get_current_user
-from app.api.routes.admin_auth import (
+from app.config import settings
+
+# Importing `app.main` builds the shared GitService, whose __init__ mkdir's
+# `git_storage_path` — an import-time filesystem side effect this repo already
+# documents (see external_git_poller). Left alone it writes into the deployed
+# `/data/vaults` on a developer machine and fails outright on a CI runner that
+# cannot create `/data`. Redirect first, then import.
+_STORAGE = tempfile.mkdtemp(prefix="admission-route-carrier-")
+object.__setattr__(settings, "git_storage_path", _STORAGE)
+
+from app.api.deps import get_current_user  # noqa: E402
+from app.api.routes.admin_auth import (  # noqa: E402
     get_current_product_admin,
     get_product_admin_mutation,
 )
-from app.main import app
+from app.main import app  # noqa: E402
+
+
+def test_the_import_did_not_write_into_the_deployed_storage_path():
+    # Asserted rather than trusted: if the redirect stops working this file goes
+    # back to mkdir'ing a real deployment directory, and the only symptom would
+    # be a CI job that fails somewhere else entirely.
+    assert settings.git_storage_path == _STORAGE
 
 
 _ADMISSION_PATHS = {
