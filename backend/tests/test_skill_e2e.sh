@@ -47,7 +47,7 @@ INIT_RESP=$(curl -sk -i -X POST "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $PAT" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"skill-e2e","version":"1.0"}}}' 2>&1)
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{"experimental":{"io.dnotitia.akb/vault-skill-preflight":{"version":1}}},"clientInfo":{"name":"skill-e2e","version":"1.0"}}}' 2>&1)
 
 SID=$(echo "$INIT_RESP" | grep -i "mcp-session-id" | tr -d '\r' | awk '{print $2}')
 [ -n "$SID" ] && pass "Session initialized ($SID)" || { fail "init" "no session"; exit 1; }
@@ -337,7 +337,7 @@ INIT2=$(curl -sk -i -X POST "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $PAT2" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"skill-e2e-2","version":"1.0"}}}' 2>&1)
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{"experimental":{"io.dnotitia.akb/vault-skill-preflight":{"version":1}}},"clientInfo":{"name":"skill-e2e-2","version":"1.0"}}}' 2>&1)
 SID2=$(echo "$INIT2" | grep -i "mcp-session-id" | tr -d '\r' | awk '{print $2}')
 
 curl -sk -X POST "$BASE_URL/mcp/" \
@@ -423,7 +423,7 @@ INIT3=$(curl -sk -i -X POST "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $PAT2" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"skill-e2e-writer","version":"1.0"}}}' 2>&1)
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{"experimental":{"io.dnotitia.akb/vault-skill-preflight":{"version":1}}},"clientInfo":{"name":"skill-e2e-writer","version":"1.0"}}}' 2>&1)
 SID3=$(echo "$INIT3" | grep -i "mcp-session-id" | tr -d '\r' | awk '{print $2}')
 curl -sk -X POST "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $PAT2" \

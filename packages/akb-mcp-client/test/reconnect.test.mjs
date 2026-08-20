@@ -73,6 +73,41 @@ itAsync("initialize falls back to a default protocol version when omitted", asyn
   assert.match(res.result.protocolVersion, /^\d{4}-\d{2}-\d{2}$/);
 });
 
+itAsync("backend initialize negotiates vault-guide preflight without dropping client capabilities", async () => {
+  const proxy = newProxy();
+  const original = {
+    protocolVersion: "2025-06-18",
+    capabilities: {
+      roots: { listChanged: true },
+      experimental: { "example.test/feature": { version: 2 } },
+    },
+    clientInfo: { name: "client", version: "1" },
+  };
+  proxy._clientInitParams = original;
+  let forwarded;
+  proxy._rpc = async (method, params) => {
+    assert.equal(method, "initialize");
+    forwarded = params;
+    return {};
+  };
+
+  assert.equal(await proxy._ensureBackend(), true);
+  assert.deepEqual(forwarded.capabilities.roots, { listChanged: true });
+  assert.deepEqual(
+    forwarded.capabilities.experimental["example.test/feature"],
+    { version: 2 },
+  );
+  assert.deepEqual(
+    forwarded.capabilities.experimental["io.dnotitia.akb/vault-skill-preflight"],
+    { version: 1 },
+  );
+  assert.equal(
+    original.capabilities.experimental["io.dnotitia.akb/vault-skill-preflight"],
+    undefined,
+    "client initialize params are not mutated",
+  );
+});
+
 // ── tools/list degrades to file tools when the backend is unreachable ─
 
 itAsync("tools/list serves file tools only when backend is down and nothing cached", async () => {

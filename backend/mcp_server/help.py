@@ -1887,10 +1887,11 @@ reserved for it.
 
 Agents do not have to ask for it: the first touch in a session carries the
 skill as a `vault_skill` payload, re-attached whenever the skill changes. A
-first write returns `vault_skill_required` before performing the mutation;
-apply the payload and retry with the same OCC/idempotency inputs. Read-only
-external git mirror vaults have no skill and never emit the payload, including
-through explicit vault help.
+client that negotiated write preflight receives `vault_skill_required` before
+performing the mutation; apply the payload and retry with the same
+OCC/idempotency inputs. Other clients receive the payload additively without a
+breaking result change. Read-only external git mirror vaults have no skill and
+never emit the payload, including through explicit vault help.
 
 For the full text (the payload may be truncated) call:
 

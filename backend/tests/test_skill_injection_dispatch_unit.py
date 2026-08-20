@@ -79,6 +79,7 @@ def wired(monkeypatch):
     monkeypatch.setattr(server_mod, "_get_user", fake_get_user)
     monkeypatch.setattr(server_mod, "_can_read_vault", fake_can_read)
     monkeypatch.setattr(server_mod, "_session_id", lambda: "sess-1")
+    monkeypatch.setattr(server_mod, "_supports_vault_skill_preflight", lambda: True)
 
     state = {"calls": calls}
 
@@ -237,6 +238,36 @@ async def test_first_write_returns_guide_before_dispatch(monkeypatch, wired):
     second = await _run("akb_update", args)
     assert second == {"updated": True}
     assert dispatched == 1
+
+
+async def test_legacy_client_write_succeeds_and_gets_additive_guide(
+    monkeypatch, wired
+):
+    """Clients that did not negotiate retries keep the pre-feature contract."""
+    dispatched = 0
+
+    async def dispatch(name, args, user):
+        nonlocal dispatched
+        dispatched += 1
+        access_service._authorized_vault.set("v1")
+        access_service._authorized_vault_id.set("id-v1")
+        return {"updated": True}
+
+    monkeypatch.setattr(
+        server_mod, "_supports_vault_skill_preflight", lambda: False
+    )
+    wired["dispatch"](dispatch)
+
+    body = await _run(
+        "akb_update", {"uri": "akb://v1/doc/notes/a.md", "content": "new"}
+    )
+
+    assert body == {"updated": True, "vault_skill": _SENTINEL}
+    assert dispatched == 1
+
+
+def test_preflight_capability_is_fail_closed_without_request_context():
+    assert server_mod._supports_vault_skill_preflight() is False
 
 
 async def test_write_only_caller_executes_without_skill_disclosure(monkeypatch, wired):

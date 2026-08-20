@@ -73,6 +73,23 @@ from app.services import audit_log, tool_usage
 
 logger = logging.getLogger("akb.mcp")
 
+# A non-mutating write preflight changes the result shape and requires the
+# client to retry the original operation.  Keep it behind MCP's experimental
+# capability negotiation so older clients continue to receive the additive
+# post-dispatch ``vault_skill`` field they already tolerate.
+VAULT_SKILL_PREFLIGHT_CAPABILITY = "io.dnotitia.akb/vault-skill-preflight"
+
+
+def _supports_vault_skill_preflight() -> bool:
+    """Whether this MCP session explicitly supports the retry contract."""
+    try:
+        params = server.request_context.session.client_params
+        experimental = params.capabilities.experimental if params else None
+        advertised = (experimental or {}).get(VAULT_SKILL_PREFLIGHT_CAPABILITY)
+        return isinstance(advertised, dict) and advertised.get("version") == 1
+    except (AttributeError, LookupError):
+        return False
+
 
 async def _find_doc(vault_name: str, doc_ref: str) -> dict | None:
     """Find a document by reference (path within the vault, or the legacy
@@ -1555,7 +1572,7 @@ async def call_tool(name: str, arguments: dict):
         # guide changes), return the guide without dispatching the mutation;
         # the agent applies it and retries the same idempotency/OCC-aware call.
         # Write-only credentials proceed without disclosure.
-        if is_write:
+        if is_write and _supports_vault_skill_preflight():
             try:
                 from app.services.tool_usage import vault_of_call
                 from app.services import vault_skill_service

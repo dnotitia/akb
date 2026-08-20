@@ -10,6 +10,11 @@ guide and asks the agent to retry. Reads attach the guide to their successful
 result. Write-only credentials receive no guide content and retain their
 existing write behavior.
 
+The proxy advertises this retry behavior through the backend MCP session's
+experimental capability map. Direct and older MCP clients do not advertise it,
+so their writes remain compatible and receive the guide as an additive result
+field instead.
+
 Deploy the matching backend before publishing this proxy version. Existing
 MCP processes must restart (or otherwise re-resolve the package) to load the
 new proxy behavior.

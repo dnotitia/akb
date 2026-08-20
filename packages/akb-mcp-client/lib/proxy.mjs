@@ -349,6 +349,8 @@ const FILE_CONTENT_TOOLS = new Set(["akb_put", "akb_update"]);
 // behaviour change. There is no import of package.json here to keep lib/
 // zero-dependency and load-safe across Node versions.
 const PROXY_VERSION = "2.2.1";
+const VAULT_SKILL_PREFLIGHT_CAPABILITY =
+  "io.dnotitia.akb/vault-skill-preflight";
 const PROXY_INSTRUCTIONS =
   "This akb-mcp proxy provides local-file tools in addition to the AKB backend. " +
   "A first write may return vault_skill_required before any mutation; apply its " +
@@ -1170,10 +1172,26 @@ export class AKBProxy {
     if (this._connecting) return this._connecting;
     this._connecting = (async () => {
       try {
-        const initParams = this._clientInitParams || {
+        const sourceParams = this._clientInitParams || {
           protocolVersion: MCP_PROTOCOL_VERSION,
           capabilities: {},
           clientInfo: { name: "akb-mcp-client", version: PROXY_VERSION },
+        };
+        // Strict vault-guide preflight changes a successful write into a
+        // retry envelope. Advertise support on behalf of this proxy version;
+        // raw/older MCP clients that do not opt in retain additive injection.
+        // Merge rather than replace client capabilities so roots/sampling and
+        // unrelated experimental features survive the bridge unchanged.
+        const sourceCapabilities = sourceParams.capabilities || {};
+        const initParams = {
+          ...sourceParams,
+          capabilities: {
+            ...sourceCapabilities,
+            experimental: {
+              ...(sourceCapabilities.experimental || {}),
+              [VAULT_SKILL_PREFLIGHT_CAPABILITY]: { version: 1 },
+            },
+          },
         };
         await this._rpc("initialize", initParams, { timeoutMs: this._probeTimeoutMs() });
         this._backendReady = true;

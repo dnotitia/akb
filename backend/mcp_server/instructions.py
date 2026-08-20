@@ -9,7 +9,7 @@ INSTRUCTIONS = """AKB stores documents, tables, files, and publications in vault
 
 Priority of guidance (highest first):
 1. User-defined rules — CLAUDE.md / AGENTS.md / GEMINI.md / loaded skills / explicit user requests in this conversation. These ALWAYS win.
-2. Vault conventions — attached on first touch as `vault_skill` and again when changed. A first write may return `vault_skill_required` without mutating; apply it and retry. Fetch full text with akb_help(topic="vault-skill", vault="<vault>").
+2. Vault conventions — attached on first touch as `vault_skill` and again when changed. Clients that negotiate write preflight may receive `vault_skill_required` without mutation; apply it and retry. Other clients receive the guide additively. Fetch full text with akb_help(topic="vault-skill", vault="<vault>").
 3. AKB default conventions — the numbered rules below. Fallback when 1 and 2 are silent.
 
 When writing into a vault:

@@ -41,7 +41,7 @@ the three things v1 left out:
 | 4 | Survival invariant | Canonical doc cannot be deleted; reset-to-template only |
 | 5 | Existing violations | Automatic migration (service-layer backfill), prod count taken first |
 | 6 | Guide authorship | Vault owner only; readers may consume it, generic writers cannot alter trusted instructions |
-| 7 | First-write behavior | Return `vault_skill_required` before mutation, then retry after applying the guide |
+| 7 | First-write behavior | For clients that negotiate the retry capability, return `vault_skill_required` before mutation; legacy clients retain additive injection |
 
 Decision log with alternatives: `rounds/2026-08-19-brainstorm-decisions.md`.
 
@@ -104,11 +104,14 @@ upstream markdown is never attributed to the vault owner.
 ### Auto-injection flow
 
 Injection lives at the dispatch chokepoint (`mcp_server/server.py
-call_tool()`, next to audit/tool-usage recording). A reader-authorized write
-performs a non-mutating preflight first. If the guide is new or changed, the
-server returns `vault_skill_required` with the payload and does not dispatch
-the mutation; the agent applies the guide and retries with the same
-OCC/idempotency inputs. Successful reads attach the payload to their result.
+call_tool()`, next to audit/tool-usage recording). A client that advertises
+the experimental `io.dnotitia.akb/vault-skill-preflight` version 1 capability
+opts into the retry contract. Its reader-authorized writes perform a
+non-mutating preflight first: if the guide is new or changed, the server
+returns `vault_skill_required` with the payload and does not dispatch the
+mutation; the agent applies the guide and retries with the same OCC/idempotency
+inputs. Clients that do not advertise the capability retain the compatible
+post-dispatch additive payload. Successful reads attach it in both modes.
 
 1. Resolves the single vault the call touched by promoting
    `tool_usage._vault_of()` to a shared helper (it already handles URI args
@@ -214,6 +217,9 @@ repo.
 
 - `vault_skill` response key is additive; the stdio proxy passes it through
   unchanged.
+- `vault_skill_required` is capability-negotiated. `akb-mcp` 2.2.1 advertises
+  support to the backend; direct and older clients keep successful writes and
+  receive `vault_skill` additively instead of being required to retry.
 - `akb_put`'s `type` stays free-form with `skill` documented as reserved
   (`tools.py` description update — an agent-facing contract change).
 - The only breaking change: writes into the reserved namespace and
