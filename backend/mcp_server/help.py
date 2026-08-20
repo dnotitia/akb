@@ -495,7 +495,7 @@ akb_graph(uri="akb://eng/doc/specs/api.md", hops=2)
 ## Provenance
 ```
 akb_provenance(uri="akb://eng/doc/specs/api.md")
-→ who created it, when, all relations (including cross-type)
+→ who created it, when, and visible same-vault relations (including cross-type)
 ```""",
 
     # ── Workflows ─────────────────────────────────────────────
@@ -1164,12 +1164,13 @@ Pass either `vault` (full vault graph) or `uri` (graph anchored on one resource)
 ```
 akb_graph(vault="eng")                                            # Full vault graph
 akb_graph(uri="akb://eng/table/experiments", hops=2)              # From a table
-akb_graph(uri="akb://eng/doc/specs/api.md", depth=3)              # 3-hop from doc
+akb_graph(uri="akb://eng/doc/specs/api.md", hops=3)               # 3-hop from doc
 ```""",
 
     "akb_provenance": """# akb_provenance — Document Provenance
 
-Shows who created a document, when, and all its relations (including cross-type).
+Shows who created a document, when, and its visible same-vault relations
+(including cross-type).
 
 ## Parameters
 | Param | Required | Description |
