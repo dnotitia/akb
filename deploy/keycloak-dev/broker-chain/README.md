@@ -15,6 +15,20 @@ the AKB API audience and still must be rejected. Finally, the provider is
 disabled, the AKB identity binding is rolled back, the operator removes the
 Keycloak prelink/user, and a secret-free JSON receipt is printed.
 
+It also asks a separate question about a differently shaped account. The
+prelink above is an operator's: marked verified, and linked to the upstream
+subject by hand. An account created by member invitation is neither — it is
+enabled, carries no credential and no required action, its address is
+unverified, and nothing is linked to it — so whether the invited person's first
+login through the broker lands on THAT account is a claim about Keycloak's
+first-broker-login rather than about this codebase. The phase creates the
+seeded shape, checks every property of it rather than assuming it, supplies the
+invited person's upstream credential and nothing else, and records which
+account the login landed on, what became of the address's verified flag, and
+every page demanded along the way. It stops at the first page beyond the
+credential rather than answering it, because a step the invited person cannot
+complete is a failure and not a slow success.
+
 It also measures where the authority to mint the product administrator's
 credential actually lives, against the same realm. Three facts in one phase: the
 permanent management account is refused `403` when it tries to reset that

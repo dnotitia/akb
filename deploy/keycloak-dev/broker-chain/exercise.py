@@ -89,6 +89,7 @@ class _FormParser(HTMLParser):
                 "action": values.get("action", ""),
                 "method": (values.get("method") or "get").lower(),
                 "inputs": {},
+                "buttons": [],
             }
         elif tag == "input" and self._form is not None:
             name = values.get("name")
@@ -96,6 +97,15 @@ class _FormParser(HTMLParser):
                 inputs = self._form["inputs"]
                 assert isinstance(inputs, dict)
                 inputs[name] = values.get("value") or ""
+        elif tag == "button" and self._form is not None:
+            # The confirm-link page carries no inputs at all -- its two choices
+            # are submit buttons -- so a parser that reads only inputs sees an
+            # empty form and cannot tell that page from a redirect.
+            name = values.get("name")
+            if name:
+                buttons = self._form["buttons"]
+                assert isinstance(buttons, list)
+                buttons.append(name)
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "form" and self._form is not None:
@@ -825,6 +835,399 @@ async def _assert_continuity(
         raise _fail("fixture_vault_access_continuity_failed")
 
 
+# The account member invitation seeds into a workspace's own realm, reproduced
+# exactly. `_operator_prelink` above is deliberately NOT this shape: it marks
+# the address verified and writes an explicit federated identity link, because
+# it is measuring identity continuity for someone an operator already linked by
+# hand. The invitation ceremony creates neither, and a case that keeps either
+# property proves nothing about invitation -- it proves only that a linked
+# account logs in, which was never in doubt.
+INVITED_EMAIL = "invitee@example.com"
+INVITED_UPSTREAM_USERNAME = "invitee"
+INVITED_UPSTREAM_PASSWORD = "fixture-only-invitee-password"  # pragma: allowlist secret
+
+
+def _seeded_account_payload() -> dict[str, Any]:
+    """The invited person's realm account, field for field.
+
+    Username and email are the same value because Keycloak's first-broker-login
+    detects a collision with an existing account on either key. No credential
+    and no required action, so nothing can sign into it directly. Not marked
+    verified, because verification is a statement about what THIS realm has
+    proved and this realm has proved nothing about this address.
+    """
+    return {
+        "username": INVITED_EMAIL,
+        "email": INVITED_EMAIL,
+        "enabled": True,
+        "emailVerified": False,
+    }
+
+
+def _evidence(code: str, evidence: object) -> RuntimeError:
+    """A failure that says what was on screen, not just that something failed.
+
+    The codes in this fixture are normally enough because the step that raises
+    them is the whole story. This phase is measuring an unproven claim about
+    another system's behaviour, so a bare code would report that the claim is
+    false without reporting what Keycloak actually did instead.
+    """
+    return RuntimeError(f"{code} {json.dumps(evidence, sort_keys=True)}")
+
+
+def _page_shape(response: httpx.Response) -> dict[str, object]:
+    """Name the page a browser is being shown, in fields rather than prose.
+
+    The rendered text is theme markup and inline script; the form fields are
+    the meaning. A username/password pair on the upstream host is the invited
+    person's own credential. The same pair on the broker host is Keycloak
+    demanding that they re-authenticate as the account being linked to -- which
+    for a seeded account means proving a credential that was never created. A
+    `submitAction` button is Keycloak asking which account this login belongs
+    to.
+
+    Nothing recorded here includes the action URL: it carries a single-use
+    session code, and the receipt is secret-free.
+    """
+    parser = _FormParser()
+    parser.feed(response.text)
+    split = urlsplit(str(response.url))
+    fields: set[str] = set()
+    buttons: set[str] = set()
+    for form in parser.forms:
+        inputs = form.get("inputs")
+        if isinstance(inputs, dict):
+            fields.update(key for key in inputs if isinstance(key, str))
+        names = form.get("buttons")
+        if isinstance(names, list):
+            buttons.update(name for name in names if isinstance(name, str))
+    if "submitAction" in buttons:
+        kind = "confirm-link"
+    elif {"username", "password"} <= fields:
+        kind = (
+            "upstream-credential-form"
+            if split.netloc == urlsplit(UPSTREAM).netloc
+            else "existing-account-reauthentication"
+        )
+    elif {"password-new", "password-confirm"} & fields:
+        kind = "forced-credential-change"
+    elif {"firstName", "lastName", "email"} & fields:
+        kind = "review-profile"
+    else:
+        kind = "other"
+    return {
+        "kind": kind,
+        "host": split.netloc,
+        "path": split.path,
+        "fields": sorted(fields),
+        "buttons": sorted(buttons),
+    }
+
+
+async def _invited_broker_login() -> dict[str, object]:
+    """Drive the invited person's login, supplying only what they have.
+
+    An invited person holds exactly one thing: their credential in the
+    workspace's upstream directory. So this supplies exactly that, exactly
+    once, and stops at the next page that asks for anything else -- because
+    "the first accepted login sets the flag" is a claim that there is no next
+    page. Whatever it stops at is the evidence.
+    """
+    verifier, challenge = _pkce()
+    redirect_uri = "https://client.localhost/callback"
+    params = {
+        "client_id": "fixture-browser",
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": "openid profile email",
+        "state": secrets.token_urlsafe(24),
+        "nonce": secrets.token_urlsafe(24),
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "kc_idp_hint": "workforce",
+    }
+    pages: list[dict[str, object]] = []
+    code: str | None = None
+    supplied_credential = False
+    async with httpx.AsyncClient(
+        verify=False,
+        follow_redirects=False,
+        timeout=httpx.Timeout(20.0, connect=10.0),
+    ) as client:
+        response = await client.get(
+            f"{BROKER_ISSUER}/protocol/openid-connect/auth",
+            params=params,
+        )
+        for _ in range(30):
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = response.headers.get("location")
+                if not location:
+                    raise _fail("fixture_invited_authorization_redirect_invalid")
+                target = urljoin(str(response.url), location)
+                if target.startswith(redirect_uri):
+                    query = parse_qs(urlsplit(target).query)
+                    if "error" in query:
+                        return {"pages": pages, "code": None, "rejected": True}
+                    values = query.get("code", [])
+                    if len(values) != 1 or not values[0]:
+                        raise _fail("fixture_invited_authorization_code_missing")
+                    code = values[0]
+                    break
+                response = await client.get(target)
+                continue
+            if response.status_code != 200:
+                raise _fail("fixture_invited_authorization_flow_failed")
+            page = _page_shape(response)
+            pages.append(page)
+            if page["kind"] != "upstream-credential-form" or supplied_credential:
+                break
+            action, data = _login_form(response)
+            data.update(
+                {
+                    "username": INVITED_UPSTREAM_USERNAME,
+                    "password": INVITED_UPSTREAM_PASSWORD,
+                    "login": data.get("login") or "Sign In",
+                }
+            )
+            response = await client.post(action, data=data)
+            supplied_credential = True
+        if code is None:
+            return {"pages": pages, "code": None}
+        token_response = await client.post(
+            f"{BROKER_ISSUER}/protocol/openid-connect/token",
+            data={
+                "grant_type": "authorization_code",
+                "client_id": "fixture-browser",
+                "redirect_uri": redirect_uri,
+                "code": code,
+                "code_verifier": verifier,
+            },
+        )
+    if token_response.status_code != 200:
+        raise _fail("fixture_invited_authorization_code_exchange_failed")
+    tokens = _require_object(token_response.json(), "fixture_invited_token_invalid")
+    access_token = tokens.get("access_token")
+    if not isinstance(access_token, str):
+        raise _fail("fixture_invited_token_invalid")
+    return {"pages": pages, "code": code, "access_token": access_token}
+
+
+async def _invited_accounts(
+    client: httpx.AsyncClient,
+    *,
+    admin_token: str,
+) -> list[dict[str, Any]]:
+    """Every broker-realm account holding the invited address, with its shape.
+
+    Read by address rather than by id on purpose. The id is what the invitation
+    binds AKB to, so asking Keycloak "which accounts answer to this address"
+    is the only question that can reveal a second one.
+    """
+    headers = {"Authorization": f"Bearer {admin_token}"}
+    response = await client.get(
+        f"{BROKER}/admin/realms/akb/users",
+        params={"email": INVITED_EMAIL, "exact": "true"},
+        headers=headers,
+    )
+    if response.status_code != 200:
+        raise _fail("fixture_invited_account_read_failed")
+    accounts: list[dict[str, Any]] = []
+    for user in _require_objects(response.json(), "fixture_invited_account_read_failed"):
+        subject = user.get("id")
+        if not isinstance(subject, str):
+            raise _fail("fixture_invited_account_read_failed")
+        credentials = await client.get(
+            f"{BROKER}/admin/realms/akb/users/{subject}/credentials",
+            headers=headers,
+        )
+        links = await client.get(
+            f"{BROKER}/admin/realms/akb/users/{subject}/federated-identity",
+            headers=headers,
+        )
+        if credentials.status_code != 200 or links.status_code != 200:
+            raise _fail("fixture_invited_account_read_failed")
+        accounts.append(
+            {
+                "subject": subject,
+                "email_verified": user.get("emailVerified"),
+                "enabled": user.get("enabled"),
+                "required_actions": user.get("requiredActions") or [],
+                "federation_link": user.get("federationLink"),
+                "credential_types": sorted(
+                    str(item.get("type"))
+                    for item in _require_objects(
+                        credentials.json(),
+                        "fixture_invited_account_read_failed",
+                    )
+                ),
+                "federated_identities": sorted(
+                    str(item.get("identityProvider"))
+                    for item in _require_objects(
+                        links.json(),
+                        "fixture_invited_account_read_failed",
+                    )
+                ),
+            }
+        )
+    return accounts
+
+
+async def _prove_invitation_seeded_account_links() -> dict[str, object]:
+    """Does the account invitation seeds actually receive the invited person?
+
+    Everything else about member invitation is settled by construction: the
+    ceremony creates the account, reads its id back, and binds AKB to that id.
+    What is not settled is the step after it, which belongs to Keycloak. The
+    invitation deliberately leaves the seeded account with no credential, no
+    required action, an unverified address, and no federated identity link, on
+    the stated ground that the first accepted login through the broker will
+    find it and set the flag from the upstream's signed proof.
+
+    That is a claim about first-broker-login. This phase supplies the invited
+    person's upstream credential and nothing else, then asks Keycloak three
+    questions whose answers are independent:
+
+      * which account did the login land on -- the seeded one, or a second one
+        Keycloak created, which would leave the AKB binding naming a row nobody
+        ever signs in as;
+      * what became of `emailVerified` on it;
+      * what, if anything, was demanded beyond that credential.
+
+    An account that eventually links after a step the invited person cannot
+    complete is a failure, not a slow success, so the driver stops at the first
+    such step rather than answering it.
+    """
+    async with httpx.AsyncClient(verify=False, timeout=20.0) as client:
+        upstream_admin = await _admin_token(client, UPSTREAM)
+        created_upstream = await client.post(
+            f"{UPSTREAM}/admin/realms/workforce/users",
+            headers={"Authorization": f"Bearer {upstream_admin}"},
+            json={
+                "username": INVITED_UPSTREAM_USERNAME,
+                "email": INVITED_EMAIL,
+                "emailVerified": True,
+                "enabled": True,
+                "firstName": "Invited",
+                "lastName": "Person",
+                "credentials": [
+                    {
+                        "type": "password",
+                        "value": INVITED_UPSTREAM_PASSWORD,
+                        "temporary": False,
+                    }
+                ],
+            },
+        )
+        if created_upstream.status_code != 201:
+            raise _fail("fixture_invited_upstream_create_failed")
+        upstream_subject = urlsplit(
+            created_upstream.headers.get("location") or ""
+        ).path.rsplit("/", 1)[-1]
+        if not upstream_subject:
+            raise _fail("fixture_invited_upstream_location_invalid")
+
+        broker_admin = await _admin_token(client, BROKER)
+        seeded = await client.post(
+            f"{BROKER}/admin/realms/akb/users",
+            headers={"Authorization": f"Bearer {broker_admin}"},
+            json=_seeded_account_payload(),
+        )
+        if seeded.status_code != 201:
+            raise _fail("fixture_invited_seed_failed")
+        seeded_subject = urlsplit(seeded.headers.get("location") or "").path.rsplit(
+            "/", 1
+        )[-1]
+        if not seeded_subject:
+            raise _fail("fixture_invited_seed_location_invalid")
+
+        # The shape is the precondition, and it is checked rather than assumed.
+        # Every one of these properties is a way for a later pass to be true
+        # for a reason that has nothing to do with invitation: a credential
+        # would let the person answer a re-authentication demand, and a
+        # federated identity link would skip first-broker-login altogether.
+        before = await _invited_accounts(client, admin_token=broker_admin)
+        if [item["subject"] for item in before] != [seeded_subject]:
+            raise _evidence("fixture_seeded_account_not_exact", before)
+        seeded_shape = before[0]
+        if seeded_shape["enabled"] is not True:
+            raise _evidence("fixture_seeded_account_not_enabled", seeded_shape)
+        if seeded_shape["email_verified"] is not False:
+            raise _evidence("fixture_seeded_account_email_verified", seeded_shape)
+        if seeded_shape["credential_types"]:
+            raise _evidence("fixture_seeded_account_carries_credential", seeded_shape)
+        if seeded_shape["required_actions"]:
+            raise _evidence("fixture_seeded_account_has_required_action", seeded_shape)
+        if seeded_shape["federated_identities"] or seeded_shape["federation_link"]:
+            raise _evidence("fixture_seeded_account_is_prelinked", seeded_shape)
+
+    login = await _invited_broker_login()
+    pages = login["pages"]
+    assert isinstance(pages, list)
+    demanded = [page for page in pages if page["kind"] != "upstream-credential-form"]
+    if demanded or len(pages) != 1:
+        raise _evidence(
+            "fixture_invited_login_needs_more_than_the_upstream_credential",
+            pages,
+        )
+    access_token = login.get("access_token")
+    if not isinstance(access_token, str):
+        raise _evidence("fixture_invited_login_produced_no_token", pages)
+
+    # The subject is read out of a token this runtime's own verifier accepted,
+    # not out of an admin read, because the binding written at invitation is
+    # matched against exactly this claim.
+    principal = await verify_keycloak_access_v1(access_token, "api")
+    if principal is None:
+        raise _fail("fixture_invited_token_verification_failed")
+    if principal.claims.get("identity_provider") != "workforce":
+        raise _fail("fixture_invited_token_provider_not_signed")
+    if principal.subject != seeded_subject:
+        raise _evidence(
+            "fixture_invited_login_landed_on_a_second_account",
+            {"seeded": seeded_subject, "signed_in_as": principal.subject},
+        )
+
+    async with httpx.AsyncClient(verify=False, timeout=20.0) as client:
+        broker_admin = await _admin_token(client, BROKER)
+        after = await _invited_accounts(client, admin_token=broker_admin)
+        if [item["subject"] for item in after] != [seeded_subject]:
+            raise _evidence("fixture_invited_login_created_a_second_account", after)
+        linked_shape = after[0]
+        if linked_shape["federated_identities"] != ["workforce"]:
+            raise _evidence("fixture_invited_login_left_the_account_unlinked", linked_shape)
+        if linked_shape["email_verified"] is not True:
+            raise _evidence(
+                "fixture_invited_login_left_the_address_unproven",
+                linked_shape,
+            )
+        if linked_shape["credential_types"]:
+            raise _evidence("fixture_invited_login_installed_a_credential", linked_shape)
+
+        headers = {"Authorization": f"Bearer {broker_admin}"}
+        removed = await client.delete(
+            f"{BROKER}/admin/realms/akb/users/{seeded_subject}",
+            headers=headers,
+        )
+        if removed.status_code != 204:
+            raise _fail("fixture_invited_seed_remove_failed")
+        upstream_removed = await client.delete(
+            f"{UPSTREAM}/admin/realms/workforce/users/{upstream_subject}",
+            headers={"Authorization": f"Bearer {await _admin_token(client, UPSTREAM)}"},
+        )
+        if upstream_removed.status_code != 204:
+            raise _fail("fixture_invited_upstream_remove_failed")
+        if await _invited_accounts(client, admin_token=broker_admin):
+            raise _fail("fixture_invited_cleanup_not_observed")
+
+    return {
+        "seeded_account": "no-credential-no-required-action-unverified-unlinked",
+        "pages_beyond_the_upstream_credential": 0,
+        "signed_in_as": "the-seeded-account",
+        "email_verified_after_first_login": True,
+        "cleanup": "seed-and-upstream-removed",
+    }
+
+
 async def main() -> None:
     control = KeycloakProviderControl(
         KeycloakAdminConfig(
@@ -956,6 +1359,11 @@ async def main() -> None:
         expect_broker_binding=True,
     )
 
+    # Everything above measures someone an operator linked by hand. This
+    # measures someone an invitation seeded and nobody linked, which is the
+    # only shape member invitation actually produces.
+    invitation = await _prove_invitation_seeded_account_links()
+
     upstream_tokens = await _authorization_code_tokens(
         issuer=UPSTREAM_ISSUER,
         client_id="upstream-probe",
@@ -1021,7 +1429,7 @@ async def main() -> None:
     print(
         json.dumps(
             {
-                "schema_version": 3,
+                "schema_version": 4,
                 "provider_type": enabled.provider_type,
                 "alias": enabled.alias,
                 "configure_state": configured.state,
@@ -1036,6 +1444,7 @@ async def main() -> None:
                 "upstream_token_rejected": True,
                 "rollback": "binding-and-operator-cleanup-verified",
                 "authority_boundary": authority_boundary,
+                "invitation_seeded_account": invitation,
                 "client_secret_exposed": False,
             },
             sort_keys=True,
