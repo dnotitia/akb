@@ -15,6 +15,7 @@ import pytest
 
 from app.config import settings
 from app.exceptions import (
+    ExternalIdentityAdoptionNotRequestedError,
     ExternalIdentityConflictError,
     ExternalIdentityIssuerMismatchError,
     MembershipRequiredError,
@@ -265,6 +266,36 @@ async def test_the_cap_evicts_the_least_recent_and_never_the_newest(services):
     assert subjects[0] not in remaining
 
 
+async def test_an_evicted_arrival_comes_back_by_arriving_again(services):
+    """Why eviction is the safe side of the capacity question.
+
+    Refusing to record at capacity would be unrecoverable — one flood and no
+    new arrival could ever be noted until a human pruned, so admission itself
+    would be denied. Eviction loses only what re-arriving restores, and this
+    asserts that it does.
+    """
+    pool, auth_service, _, _ = services
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM pending_admissions")
+    evicted = f"evicted-{uuid.uuid4().hex}"
+    object.__setattr__(settings, "keycloak_pending_admission_cap", 2)
+    try:
+        for subject in (evicted, f"later-a-{uuid.uuid4().hex[:8]}", f"later-b-{uuid.uuid4().hex[:8]}"):
+            with pytest.raises(MembershipRequiredError):
+                await auth_service._resolve_or_provision_keycloak_user(_claims(subject))
+        assert await _arrival(pool, evicted) is None
+
+        with pytest.raises(MembershipRequiredError):
+            await auth_service._resolve_or_provision_keycloak_user(_claims(evicted))
+        assert await _arrival(pool, evicted) is not None
+    finally:
+        object.__setattr__(
+            settings,
+            "keycloak_pending_admission_cap",
+            type(settings).model_fields["keycloak_pending_admission_cap"].default,
+        )
+
+
 # ── approval ─────────────────────────────────────────────────────────────────
 
 
@@ -327,14 +358,91 @@ async def test_approval_can_attach_the_arrival_to_the_account_they_already_had(s
 
 
 async def test_approval_cannot_name_a_subject_only_a_row(services):
-    """The request model is the guard: naming a row IS the act of approval."""
+    """The request model is the guard: naming a row IS the act of approval.
+
+    Asserted as an exact field set rather than as two absences, so a later
+    `issuer` or `subject` cannot appear here without this failing.
+    """
     from app.api.routes.admin_sso import ApprovePendingAdmissionRequest
 
     with pytest.raises(Exception) as rejected:
         ApprovePendingAdmissionRequest(subject="someone-elses-subject")
     assert "extra" in str(rejected.value).lower()
-    fields = set(ApprovePendingAdmissionRequest.model_fields)
-    assert "subject" not in fields and "issuer" not in fields
+    assert set(ApprovePendingAdmissionRequest.model_fields) == {
+        "existing_user_id",
+        "email",
+        "display_name",
+        "prepare_suspended",
+    }
+
+
+async def test_approval_never_picks_an_account_by_address(services):
+    """The address on an arrival is a claim out of the person's own token.
+
+    Letting it select an existing account would make approval an adoption by
+    address at the one step that exists to prevent that. The refusal names the
+    candidate, so an administrator who does mean that account can say so.
+    """
+    pool, _, admission_service, _ = services
+    subject = f"noadopt-{uuid.uuid4().hex}"
+    email = f"adm-{uuid.uuid4().hex[:10]}@example.com"
+    squatter = uuid.uuid4()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (id, username, email, password_hash, auth_provider,
+                               account_status, account_kind)
+            VALUES ($1, $2, $3, '!keycloak-sso:no-local-login!', 'keycloak', 'active', 'human')
+            """,
+            squatter,
+            f"adm-{uuid.uuid4().hex[:12]}",
+            email,
+        )
+    arrival = await _record_and_read(services, subject, email)
+
+    with pytest.raises(ExternalIdentityAdoptionNotRequestedError) as refused:
+        await admission_service.approve_pending_admission(
+            arrival["id"], actor_id="adm-actor"
+        )
+    assert refused.value.status_code == 409
+    assert refused.value.details["candidate_user_id"] == str(squatter)
+
+    # The arrival survives, and naming the account deliberately is allowed.
+    assert await _arrival(pool, subject) is not None
+    result = await admission_service.approve_pending_admission(
+        arrival["id"], actor_id="adm-actor", existing_user_id=str(squatter)
+    )
+    assert result["user"]["user_id"] == str(squatter)
+
+
+async def test_the_control_plane_path_still_adopts_an_unbound_address(services):
+    """The default is unchanged: a caller that already identified the person.
+
+    Only approval opts out. Asserting this here keeps the opt-out from being
+    quietly widened into every caller.
+    """
+    pool, _, _, account_service = services
+    email = f"adm-{uuid.uuid4().hex[:10]}@example.com"
+    existing = uuid.uuid4()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (id, username, email, password_hash, auth_provider,
+                               account_status, account_kind)
+            VALUES ($1, $2, $3, '!keycloak-sso:no-local-login!', 'keycloak', 'active', 'human')
+            """,
+            existing,
+            f"adm-{uuid.uuid4().hex[:12]}",
+            email,
+        )
+    result = await account_service.ensure_human_external_identity(
+        issuer=_ISSUER,
+        subject=f"cp-{uuid.uuid4().hex}",
+        email=email,
+        display_name=None,
+        actor_id="adm-actor",
+    )
+    assert result["user_id"] == str(existing)
 
 
 async def test_an_arrival_under_a_foreign_issuer_is_refused_and_survives(services):

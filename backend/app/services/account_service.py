@@ -13,6 +13,7 @@ from app.exceptions import (
     CredentialCleanupIncompleteError,
     ExternalAuthDisabledError,
     ExternalIdentityConflictError,
+    ExternalIdentityAdoptionNotRequestedError,
     ExternalIdentityIssuerMismatchError,
     NotFoundError,
     RecoveryAdminProtectedError,
@@ -109,7 +110,19 @@ async def ensure_human_external_identity(
     actor_id: str,
     existing_user_id: str | None = None,
     prepare_suspended: bool = False,
+    adopt_unbound_email: bool = True,
 ) -> dict:
+    """Bind one exact ``(issuer, subject)`` to an AKB human account.
+
+    ``adopt_unbound_email`` decides what happens when no account is bound to
+    that pair, the caller named none, and an unbound human account already
+    holds the address. A control plane that is provisioning a person it already
+    identified wants that account — that is the default, and the behaviour every
+    existing caller has. Approving a recorded arrival does not: there the
+    address is a claim out of the token, so letting it select the account turns
+    the approval into an adoption by address. Those callers pass ``False`` and
+    get a refusal that names the candidate instead.
+    """
     issuer = _presented_issuer(_required(issuer, "issuer"))
     subject = _required(subject, "subject")
     email = _required(email, "email").lower()
@@ -213,6 +226,10 @@ async def ensure_human_external_identity(
                         )
                         if len(rows) > 1:
                             raise ExternalIdentityConflictError()
+                        if rows and not adopt_unbound_email:
+                            raise ExternalIdentityAdoptionNotRequestedError(
+                                str(rows[0]["id"])
+                            )
                         if rows:
                             user_id = rows[0]["id"]
                             if is_retired_recovery_admin_password(rows[0]["password_hash"]):

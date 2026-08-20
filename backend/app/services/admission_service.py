@@ -205,6 +205,11 @@ async def approve_pending_admission(
     binding gets. In particular an arrival recorded under an issuer this
     runtime does not present is refused here rather than written.
 
+    Nothing is adopted by address: if an unbound account already holds the
+    arrival's email, approval refuses and names it rather than attaching to it.
+    An administrator who means that account passes it as ``existing_user_id``,
+    which is a different act from having it chosen for them.
+
     The row is removed only after the binding succeeds. A failed approval
     leaves the arrival exactly where it was.
     """
@@ -229,5 +234,10 @@ async def approve_pending_admission(
         existing_user_id=existing_user_id,
         prepare_suspended=prepare_suspended,
         actor_id=actor_id,
+        # The address on an arrival is a claim out of the person's token. If it
+        # were allowed to select an existing account, approving would be an
+        # adoption by address at the one step whose purpose is to stop that.
+        # An administrator who does mean that account names it.
+        adopt_unbound_email=False,
     )
     return {"approved": arrival, "user": result}

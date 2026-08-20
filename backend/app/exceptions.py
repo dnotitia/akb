@@ -128,6 +128,31 @@ class ExternalIdentityConflictError(AKBError):
         )
 
 
+class ExternalIdentityAdoptionNotRequestedError(AKBError):
+    """A binding would have attached to an account chosen by email address.
+
+    ``ensure_human_external_identity`` may attach a new identity to an existing
+    unbound account holding the same address. For a control plane that already
+    knows which person it is provisioning, that is a convenience. For approving
+    a recorded arrival it is not: the address there is a claim out of the
+    token, so letting it select the account makes the approval an adoption by
+    address at exactly the step that exists to stop it.
+
+    The candidate account is named because an administrator who *does* mean to
+    attach the arrival to it can then say so deliberately, by passing it back as
+    ``existing_user_id`` — which is a different act from having it chosen for
+    them.
+    """
+
+    def __init__(self, candidate_user_id: str):
+        super().__init__(
+            "An account already holds this email address; name it explicitly to attach this identity to it",
+            status_code=409,
+            code="external_identity_adoption_not_requested",
+            details={"candidate_user_id": candidate_user_id},
+        )
+
+
 class ExternalIdentityIssuerMismatchError(AKBError):
     """A prelink named an issuer this runtime does not present.
 
