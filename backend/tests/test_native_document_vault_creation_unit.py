@@ -162,16 +162,16 @@ async def test_create_vault_drops_a_stale_negative_skill_cache_entry(monkeypatch
 
     async def _seed(_service, conn, *, vault_id, vault_name, owner_id) -> None:
         # Still inside the transaction: invalidating here would be premature.
-        assert "probed-name" in vss._vault_cache
+        assert ("probed-name", None) in vss._vault_cache
 
     monkeypatch.setattr(native_documents, "VaultRepository", _VaultRepository, raising=False)
     monkeypatch.setattr(native_documents, "get_role_sync", lambda: _RoleSync(), raising=False)
     monkeypatch.setattr(NativeDocumentService, "_seed_native_vault_skill", _seed)
 
     vss.reset()
-    vss._vault_cache["probed-name"] = (0.0, None, None)
+    vss._vault_cache[("probed-name", None)] = (0.0, None, None)
     try:
         await NativeDocumentService(pool=_Pool()).create_vault("probed-name")
-        assert "probed-name" not in vss._vault_cache
+        assert ("probed-name", None) not in vss._vault_cache
     finally:
         vss.reset()

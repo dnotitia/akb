@@ -142,7 +142,7 @@ async def test_explicit_help_does_not_render_upstream_mirror_instructions(monkey
     async def allow(uid, vault, required_role="reader", **kw):
         return {"vault_id": "11111111-1111-1111-1111-111111111111"}
 
-    async def mirror(vault, vault_id):
+    async def mirror(vault, vault_id, *, documents=None):
         return None
 
     async def never_read(*args, **kwargs):

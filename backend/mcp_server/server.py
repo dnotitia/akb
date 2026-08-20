@@ -53,6 +53,7 @@ from app.util.errors import (
     INTERNAL,
     INVALID_ARGUMENT,
     INVALID_PATH,
+    VAULT_SKILL_REQUIRED,
     INVALID_URI,
     NOT_FOUND,
     UNKNOWN_ARGUMENT,
@@ -394,7 +395,7 @@ async def _handle_help(args: dict, uid: str, user: _MCPUser) -> dict:
         from app.services import vault_skill_service
         async def _fetch(v, doc_id):
             resp = await vault_skill_service.fetch_for_authorized_reader(
-                v, str(access["vault_id"])
+                v, str(access["vault_id"]), documents=doc_service,
             )
             if resp is None:
                 return None
@@ -1569,7 +1570,7 @@ async def call_tool(name: str, arguments: dict):
                     if payload:
                         result = err(
                             "Apply the vault instructions, then retry this write.",
-                            code="vault_skill_required",
+                            code=VAULT_SKILL_REQUIRED,
                             retryable=True,
                         )
                         result["vault_skill"] = payload

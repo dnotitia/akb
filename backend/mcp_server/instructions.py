@@ -9,11 +9,11 @@ INSTRUCTIONS = """AKB stores documents, tables, files, and publications in vault
 
 Priority of guidance (highest first):
 1. User-defined rules — CLAUDE.md / AGENTS.md / GEMINI.md / loaded skills / explicit user requests in this conversation. These ALWAYS win.
-2. The vault's own conventions — auto-attached on first touch as a "vault_skill" payload (re-attached when it changes). A first write returns `vault_skill_required` without performing the write; apply the guide and retry. For the full text call akb_help(topic="vault-skill", vault="<vault>").
+2. Vault conventions — attached on first touch as `vault_skill` and again when changed. A first write may return `vault_skill_required` without mutating; apply it and retry. Fetch full text with akb_help(topic="vault-skill", vault="<vault>").
 3. AKB default conventions — the numbered rules below. Fallback when 1 and 2 are silent.
 
 When writing into a vault:
-1. Your first tool call touching a vault returns a "vault_skill" payload. If a write returns `vault_skill_required`, no mutation occurred: read and apply the payload, then retry the write with the same OCC/idempotency inputs.
+1. On `vault_skill_required`, apply its payload and retry with the same OCC/idempotency inputs.
 2. If no payload arrives (read-only mirror vaults have no skill), follow the fallback guidance from akb_help(topic="vault-skill", vault="<vault>").
 3. Use akb_browse before akb_put on an unfamiliar collection.
 4. Never inline secrets in document bodies — use ${{secrets.X}} placeholders.
@@ -22,5 +22,5 @@ When writing into a vault:
 7. If listed, use proxy-local akb_put_image and insert its returned `markdown`. For existing documents use targeted akb_edit: akb_update(content=...) replaces the entire body. On write failure call akb_discard_image. If absent, use akb-mcp 2.2+.
 8. For other surfaces (akb_publish, akb_activity, akb_history), call akb_help() for an overview.
 
-Agent memory is handled outside the MCP tool-use loop — the AKB lifecycle plugin (akb-claude-code, akb-cursor, ...) drives /api/v1/agent-sessions REST endpoints automatically. As an agent, your own memory vault (named agent-memory-{your-user-id}, with your display name in its description) is accessible via the normal akb_search / akb_browse / akb_get tools just like any other vault — find it with akb_list_vaults rather than reconstructing the name.
+Agent memory is managed outside this tool loop by lifecycle plugins. Find your accessible memory vault with akb_list_vaults; use normal akb_search / akb_browse / akb_get tools rather than reconstructing its name.
 """

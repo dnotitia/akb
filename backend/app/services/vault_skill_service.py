@@ -124,7 +124,9 @@ def invalidate(vault: str) -> None:
         _vault_cache.pop(key, None)
 
 
-async def _fetch_skill(vault: str, expected_vault_id: str | None = None) -> dict | None:
+async def _fetch_skill(
+    vault: str, expected_vault_id: str | None = None, *, documents=None
+) -> dict | None:
     """Fetch the canonical doc. None = absent OR external-git mirror vault.
 
     Raises on real errors — the caller separates absence from failure.
@@ -152,7 +154,8 @@ async def _fetch_skill(vault: str, expected_vault_id: str | None = None) -> dict
         return None
 
     try:
-        doc = await get_document_service().get(vault, skill_policy.VAULT_SKILL_PATH)
+        service = documents or get_document_service()
+        doc = await service.get(vault, skill_policy.VAULT_SKILL_PATH)
     except NotFoundError:
         return None
 
@@ -300,10 +303,12 @@ async def injection_payload(
         return None
 
 
-async def fetch_for_authorized_reader(vault: str, vault_id: str) -> dict | None:
+async def fetch_for_authorized_reader(
+    vault: str, vault_id: str, *, documents=None
+) -> dict | None:
     """Fetch explicit-help content pinned to a completed reader check.
 
     This is deliberately the same identity- and mirror-aware read as automatic
     injection; explicit help must not become a weaker alternate channel.
     """
-    return await _fetch_skill(vault, vault_id)
+    return await _fetch_skill(vault, vault_id, documents=documents)

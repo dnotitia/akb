@@ -5,12 +5,14 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import PlainTextResponse
 
 from app.services.document_service import VAULT_SKILL_SEED_TEMPLATE
+from app.services.revision_backend import get_document_service
 from app.services.auth_service import AuthenticatedUser
 from app.api.deps import get_current_user
 from app.services.access_service import check_vault_access
 from mcp_server.help import render_vault_skill_response
 
 router = APIRouter()
+doc_service = get_document_service()
 
 
 MARKDOWN_RESPONSE: dict[int | str, dict[str, Any]] = {
@@ -65,7 +67,7 @@ async def get_vault_skill_preview(
 
     async def _fetch(v: str, doc_id: str):
         resp = await vault_skill_service.fetch_for_authorized_reader(
-            v, str(access["vault_id"])
+            v, str(access["vault_id"]), documents=doc_service,
         )
         if resp is None:
             return None
