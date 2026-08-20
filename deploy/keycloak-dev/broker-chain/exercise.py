@@ -8,6 +8,7 @@ import hashlib
 from html import unescape
 from html.parser import HTMLParser
 import json
+import os
 import secrets
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlsplit
@@ -319,6 +320,286 @@ async def _assert_management_roles(
         raise _fail("fixture_management_manage_users_present")
 
 
+PRODUCT_ADMIN = "admin"
+PRODUCT_ADMIN_EMAIL = "admin@broker.localhost"
+INSTALLED_CREDENTIAL = "fixture-only-installed-admin-password"  # pragma: allowlist secret
+
+
+def _rotation_authority() -> tuple[str, str]:
+    """The transient authority the runner created, or a refusal."""
+    client_id = os.environ.get("AKB_FIXTURE_ROTATION_CLIENT_ID", "")
+    client_secret = os.environ.get("AKB_FIXTURE_ROTATION_CLIENT_SECRET", "")
+    if not client_id or not client_secret:
+        raise _fail("fixture_rotation_authority_absent")
+    return client_id, client_secret
+
+
+async def _client_credentials_token(
+    client: httpx.AsyncClient,
+    *,
+    realm: str,
+    client_id: str,
+    client_secret: str,
+) -> str | None:
+    response = await client.post(
+        f"{BROKER}/realms/{realm}/protocol/openid-connect/token",
+        data={
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+        },
+    )
+    if response.status_code in {400, 401, 403, 404}:
+        return None
+    if response.status_code != 200:
+        raise _fail("fixture_client_credentials_failed")
+    token = _require_object(
+        response.json(),
+        "fixture_client_credentials_invalid",
+    ).get("access_token")
+    if not isinstance(token, str) or not token:
+        raise _fail("fixture_client_credentials_invalid")
+    return token
+
+
+async def _exact_realm_user(
+    client: httpx.AsyncClient,
+    *,
+    token: str,
+    username: str,
+) -> dict[str, Any]:
+    response = await client.get(
+        f"{BROKER}/admin/realms/akb/users",
+        params={"username": username, "exact": "true"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    if response.status_code != 200:
+        raise _fail("fixture_product_admin_read_failed")
+    matches = [
+        item
+        for item in _require_objects(response.json(), "fixture_product_admin_read_failed")
+        if item.get("username") == username
+    ]
+    if len(matches) != 1 or not isinstance(matches[0].get("id"), str):
+        raise _fail("fixture_product_admin_not_exact")
+    return matches[0]
+
+
+async def _login_outcome(password: str) -> str:
+    """Drive a real browser login and say what the realm did with it.
+
+    Three outcomes are distinguishable without reading a token: the credential
+    is refused and the login form comes back, the credential is accepted and
+    Keycloak demands the forced password change, or the credential is accepted
+    outright. The middle one is what a correctly delivered administrator
+    credential must produce -- it is one use, and Keycloak says so before it
+    lets anyone in.
+    """
+    params = {
+        "client_id": "fixture-browser",
+        "redirect_uri": "https://client.localhost/callback",
+        "response_type": "code",
+        "scope": "openid profile email",
+        "state": secrets.token_urlsafe(24),
+        "nonce": secrets.token_urlsafe(24),
+    }
+    verifier, challenge = _pkce()
+    params["code_challenge"] = challenge
+    params["code_challenge_method"] = "S256"
+    del verifier
+    async with httpx.AsyncClient(
+        verify=False,
+        follow_redirects=True,
+        timeout=httpx.Timeout(20.0, connect=10.0),
+    ) as client:
+        page = await client.get(
+            f"{BROKER_ISSUER}/protocol/openid-connect/auth",
+            params=params,
+        )
+        if page.status_code != 200:
+            raise _fail("fixture_login_page_unavailable")
+        action, data = _login_form(page)
+        data.update(
+            {
+                "username": PRODUCT_ADMIN,
+                "password": password,
+                "login": data.get("login") or "Sign In",
+            }
+        )
+        result = await client.post(action, data=data)
+        if result.status_code != 200:
+            raise _fail("fixture_login_post_failed")
+        parser = _FormParser()
+        parser.feed(result.text)
+        fields: set[str] = set()
+        for form in parser.forms:
+            inputs = form.get("inputs")
+            if isinstance(inputs, dict):
+                fields.update(inputs)
+    if {"password-new", "password-confirm"} & fields:
+        return "accepted_forced_change"
+    if {"username", "password"} & fields:
+        return "refused"
+    return "accepted"
+
+
+async def _prove_transient_authority_boundary() -> dict[str, object]:
+    """Prove where the authority to mint an administrator credential lives.
+
+    Three facts, and each one is only worth having with the other two:
+
+    1. the permanent management account CANNOT reset the product
+       administrator's password. Its six realm-management roles are asserted
+       elsewhere in this fixture; this is the consequence of them, measured
+       against a real realm rather than inferred from a role list;
+    2. an authority created for the purpose CAN, and the credential it installs
+       is one use -- the realm demands a replacement at first login;
+    3. once that authority is retired, neither the token it was holding nor a
+       newly requested one is accepted. The client is gone and cannot come back.
+
+    Fact 2 alone would read as a hole in the boundary. Facts 1 and 3 are what
+    make it a door: it exists only while someone is holding it open.
+    """
+    client_id, client_secret = _rotation_authority()
+    async with httpx.AsyncClient(verify=False, timeout=20.0) as client:
+        broker_admin = await _admin_token(client, BROKER)
+        create = await client.post(
+            f"{BROKER}/admin/realms/akb/users",
+            headers={"Authorization": f"Bearer {broker_admin}"},
+            json={
+                "username": PRODUCT_ADMIN,
+                "email": PRODUCT_ADMIN_EMAIL,
+                "emailVerified": True,
+                "enabled": True,
+                "firstName": "AKB",
+                "lastName": "Product Administrator",
+                "requiredActions": ["UPDATE_PASSWORD"],
+                "credentials": [
+                    {
+                        "type": "password",
+                        "value": INSTALLED_CREDENTIAL,
+                        "temporary": True,
+                    }
+                ],
+            },
+        )
+        if create.status_code != 201:
+            raise _fail("fixture_product_admin_create_failed")
+
+        management_token = await _client_credentials_token(
+            client,
+            realm="akb",
+            client_id="akb-sso-manager",
+            client_secret="fixture-only-management-secret",  # pragma: allowlist secret
+        )
+        if management_token is None:
+            raise _fail("fixture_management_token_failed")
+        product_admin = await _exact_realm_user(
+            client,
+            token=management_token,
+            username=PRODUCT_ADMIN,
+        )
+        product_admin_id = product_admin["id"]
+        # The permanent account can SEE the administrator -- query-users and
+        # view-users are in its six -- and must not be able to replace its
+        # credential.
+        standing_reset = await client.put(
+            f"{BROKER}/admin/realms/akb/users/{product_admin_id}/reset-password",
+            headers={"Authorization": f"Bearer {management_token}"},
+            json={"type": "password", "value": "would-be-a-standing-mint", "temporary": False},
+        )
+        if standing_reset.status_code != 403:
+            raise _fail("fixture_standing_client_can_mint")
+
+        authority_token = await _client_credentials_token(
+            client,
+            realm="master",
+            client_id=client_id,
+            client_secret=client_secret,
+        )
+        if authority_token is None:
+            raise _fail("fixture_rotation_authority_unusable")
+        rotated_credential = "fixture-only-rotated-admin-password"  # pragma: allowlist secret
+        minted = await client.put(
+            f"{BROKER}/admin/realms/akb/users/{product_admin_id}/reset-password",
+            headers={"Authorization": f"Bearer {authority_token}"},
+            json={"type": "password", "value": rotated_credential, "temporary": True},
+        )
+        if minted.status_code != 204:
+            raise _fail("fixture_transient_authority_mint_failed")
+        after = await _exact_realm_user(
+            client,
+            token=management_token,
+            username=PRODUCT_ADMIN,
+        )
+        if after.get("id") != product_admin_id:
+            raise _fail("fixture_product_admin_changed_under_rotation")
+        if after.get("requiredActions") != ["UPDATE_PASSWORD"]:
+            raise _fail("fixture_rotated_credential_is_not_one_use")
+        if after.get("federationLink"):
+            raise _fail("fixture_product_admin_is_federated")
+
+        authority_clients = await client.get(
+            f"{BROKER}/admin/realms/master/clients",
+            params={"clientId": client_id},
+            headers={"Authorization": f"Bearer {authority_token}"},
+        )
+        if authority_clients.status_code != 200:
+            raise _fail("fixture_rotation_authority_read_failed")
+        matches = [
+            item
+            for item in _require_objects(
+                authority_clients.json(),
+                "fixture_rotation_authority_read_failed",
+            )
+            if item.get("clientId") == client_id
+        ]
+        if len(matches) != 1 or not isinstance(matches[0].get("id"), str):
+            raise _fail("fixture_rotation_authority_not_exact")
+        retired = await client.delete(
+            f"{BROKER}/admin/realms/master/clients/{matches[0]['id']}",
+            headers={"Authorization": f"Bearer {authority_token}"},
+        )
+        if retired.status_code != 204:
+            raise _fail("fixture_rotation_authority_retire_failed")
+
+        # Both directions, because either alone can be true of a live client: a
+        # revoked session would fail the first, and a cached token would pass
+        # the second.
+        proven = False
+        for _attempt in range(5):
+            prior = await client.get(
+                f"{BROKER}/admin/realms/master",
+                headers={"Authorization": f"Bearer {authority_token}"},
+            )
+            fresh = await _client_credentials_token(
+                client,
+                realm="master",
+                client_id=client_id,
+                client_secret=client_secret,
+            )
+            if prior.status_code in {401, 403} and fresh is None:
+                proven = True
+                break
+            await asyncio.sleep(0.5)
+        if not proven:
+            raise _fail("fixture_rotation_authority_still_active")
+
+    # The credential is proven at the door the owner actually uses, not by
+    # reading it back from the store that was just written.
+    if await _login_outcome(INSTALLED_CREDENTIAL) != "refused":
+        raise _fail("fixture_replaced_credential_still_works")
+    if await _login_outcome(rotated_credential) != "accepted_forced_change":
+        raise _fail("fixture_rotated_credential_rejected")
+
+    return {
+        "standing_client_mint": "refused-403",
+        "transient_authority_mint": "accepted-and-forced-change",
+        "replaced_credential": "refused-at-login",
+        "authority_retirement": "old-and-new-token-rejected",
+    }
+
+
 async def _operator_prelink() -> tuple[str, str]:
     async with httpx.AsyncClient(verify=False, timeout=20.0) as client:
         upstream_admin = await _admin_token(client, UPSTREAM)
@@ -591,6 +872,12 @@ async def main() -> None:
     ):
         raise _fail("fixture_secret_preservation_failed")
 
+    # Prove where the authority to mint an administrator credential lives,
+    # before the broker chain adds a second realm to reason about. It touches
+    # only the product-administrator account and the temporary client the runner
+    # created, so it is independent of everything below it.
+    authority_boundary = await _prove_transient_authority_boundary()
+
     upstream_subject, broker_subject = await _operator_prelink()
     prelink = await control.verify_identity_prelink(
         "workforce",
@@ -734,7 +1021,7 @@ async def main() -> None:
     print(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "provider_type": enabled.provider_type,
                 "alias": enabled.alias,
                 "configure_state": configured.state,
@@ -748,6 +1035,7 @@ async def main() -> None:
                 "vault_continuity": "owner-and-writer-verified",
                 "upstream_token_rejected": True,
                 "rollback": "binding-and-operator-cleanup-verified",
+                "authority_boundary": authority_boundary,
                 "client_secret_exposed": False,
             },
             sort_keys=True,

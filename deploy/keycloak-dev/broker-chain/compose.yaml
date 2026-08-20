@@ -2,7 +2,21 @@ services:
   broker:
     image: quay.io/keycloak/keycloak@sha256:0f198be292568439d700cdbfb893e69a6009bb43a94a06a945b1d3d506c76b13
     command: ["start-dev", "--import-realm"]
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
+      # The broker keeps its state in PostgreSQL rather than the dev H2 file,
+      # for one reason: the transient-authority phase creates its authority the
+      # way a deployment does, with Keycloak's own `bootstrap-admin service`
+      # command in a separate process against the same database. An embedded H2
+      # file cannot be opened by a second process, so on H2 that phase could
+      # only be faked -- and a faked creation would leave the production path
+      # unexercised while the fixture reported it verified.
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: akb
+      KC_DB_PASSWORD: akb # pragma: allowlist secret
       KC_BOOTSTRAP_ADMIN_USERNAME: fixture-admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: fixture-only-admin-password # pragma: allowlist secret
       KC_HOSTNAME: https://broker.localhost:19443
@@ -45,5 +59,14 @@ services:
       POSTGRES_DB: akb
     ports:
       - "127.0.0.1:19445:5432"
+    healthcheck:
+      # The broker refuses to start against an unreachable database, so it waits
+      # for this rather than racing it.
+      test: ["CMD-SHELL", "pg_isready --username akb --dbname akb"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - ./keycloak-db-init.sql:/docker-entrypoint-initdb.d/10-keycloak.sql:ro
     tmpfs:
       - /var/lib/postgresql/data
