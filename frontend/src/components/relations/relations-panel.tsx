@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { GitGraph, Link2, Loader2, Plus, Unlink } from "lucide-react";
+import { FileText, GitGraph, Link2, Loader2, Plus, Unlink } from "lucide-react";
 import {
   RELATION_TYPES,
   type RelationType,
@@ -9,7 +9,7 @@ import {
   deleteRelation,
 } from "@/lib/api";
 import { parseUri } from "@/lib/uri";
-import { edgeFor, hrefFor } from "@/components/relations/relation-row-utils";
+import { edgeFor, hrefFor, relationIsInVault } from "@/components/relations/relation-row-utils";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { SelectMenu } from "@/components/ui/select-menu";
@@ -49,6 +49,7 @@ interface RelationsPanelProps {
   sourceUri: string;
   relations: RelationRow[];
   relationsError: boolean;
+  canWrite: boolean;
   graphHref: string;
   onReload: () => void;
 }
@@ -58,34 +59,43 @@ export function RelationsPanel({
   sourceUri,
   relations,
   relationsError,
+  canWrite,
   graphHref,
   onReload,
 }: RelationsPanelProps) {
   const [addOpen, setAddOpen] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<RelationRow | null>(null);
+  // The backend is authoritative, but fail closed during mixed-version
+  // rollouts: a foreign or malformed endpoint must not become a label, route,
+  // or count merely because an older response included it.
+  const visibleRelations = relations.filter((row) => relationIsInVault(row, vault));
 
   return (
     <div className="flex h-full flex-col">
       <div className="mb-2 flex items-center justify-between gap-2">
-        <span className="coord">{relations.length} relation{relations.length === 1 ? "" : "s"}</span>
-        <Button variant="ghost" size="sm" onClick={() => setAddOpen(true)}>
-          <Plus className="h-3.5 w-3.5" aria-hidden />
-          Add
-        </Button>
+        <span className="coord">
+          {visibleRelations.length} relation{visibleRelations.length === 1 ? "" : "s"}
+        </span>
+        {canWrite && (
+          <Button variant="ghost" size="sm" onClick={() => setAddOpen(true)}>
+            <Plus className="h-3.5 w-3.5" aria-hidden />
+            Add
+          </Button>
+        )}
       </div>
 
       {relationsError ? (
         <Alert variant="destructive">Failed to load relations.</Alert>
-      ) : relations.length === 0 ? (
+      ) : visibleRelations.length === 0 ? (
         <div className="coord">No relations yet.</div>
       ) : (
         <ol className="space-y-0.5 font-mono text-[11px] leading-[1.9]">
-          {relations.map((r) => {
+          {visibleRelations.map((r) => {
             const label = r.name || parseUri(r.uri)?.id || r.uri;
             const relColor = RELATION_COLOR[r.relation] || "text-foreground-muted";
-            // `links_to` is auto-derived from markdown — re-created on save, so
-            // unlinking it is meaningless. Hide its delete affordance.
-            const deletable = r.relation !== "links_to";
+            // Only explicit rows are owned by the relation API. Implicit rows
+            // come from frontmatter/body content and would reappear on save.
+            const deletable = canWrite && r.kind === "explicit";
             return (
               <li key={`${r.direction}:${r.relation}:${r.uri}`} className="group flex items-center gap-1">
                 <Link
@@ -98,6 +108,15 @@ export function RelationsPanel({
                     {label}
                   </TooltipText>
                 </Link>
+                {r.kind === "implicit" && (
+                  <span
+                    aria-label="Managed by document content"
+                    title="Managed by document metadata or Markdown content"
+                    className="shrink-0 rounded-[var(--radius-sm)] p-1 text-foreground-muted"
+                  >
+                    <FileText className="h-3 w-3" aria-hidden />
+                  </span>
+                )}
                 {deletable && (
                   <button
                     type="button"
@@ -121,13 +140,15 @@ export function RelationsPanel({
         <GitGraph className="h-3 w-3" aria-hidden /> Open in graph →
       </Link>
 
-      <AddRelationDialog
-        open={addOpen}
-        onOpenChange={setAddOpen}
-        vault={vault}
-        sourceUri={sourceUri}
-        onCreated={onReload}
-      />
+      {canWrite && (
+        <AddRelationDialog
+          open={addOpen}
+          onOpenChange={setAddOpen}
+          vault={vault}
+          sourceUri={sourceUri}
+          onCreated={onReload}
+        />
+      )}
 
       <ConfirmDialog
         open={pendingDelete !== null}

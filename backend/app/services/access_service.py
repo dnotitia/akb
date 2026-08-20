@@ -23,6 +23,7 @@ from app.repositories import vault_write_policy_repo as write_policy_repo
 from app.repositories.events_repo import emit_event
 from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.services.account_markers import is_retired_recovery_admin_password
+from app.services.edge_boundary import edge_scope_sql, vault_uri_prefix
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import vault_uri
 from app.services.write_lane import run_compensation, run_git_write
@@ -775,7 +776,12 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
         # Authoritative collection total — depth-safe, unlike a client-side
         # browse(depth=2) count which silently undercounts deeper nesting.
         _q("SELECT COUNT(*) FROM collections WHERE vault_id = $1", vid),
-        _q("SELECT COUNT(*) FROM edges WHERE vault_id = $1", vid),
+        _q(
+            "SELECT COUNT(*) FROM edges WHERE "
+            + edge_scope_sql(vault_param=1, prefix_param=2),
+            vid,
+            vault_uri_prefix(vault_name),
+        ),
         _r(
             "SELECT updated_at, created_by FROM documents WHERE vault_id = $1 "
             "ORDER BY updated_at DESC LIMIT 1",

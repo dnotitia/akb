@@ -55,6 +55,8 @@ free-form this section. Agents read it as context, not a hard schema.)
 
 ## Relation rules
 
+- Structured relations stay inside this vault. For a cross-vault citation,
+  use an ordinary Markdown link; it remains content and is not a graph edge.
 - depends_on — one resource cannot be understood without another
 - implements — code/spec realizes a designed behavior
 - references — background citation
@@ -138,7 +140,11 @@ from app.services.index_service import (
     delete_document_chunks,
     delete_vault_chunks,
 )
-from app.services.kg_service import delete_document_relations, store_document_relations
+from app.services.kg_service import (
+    delete_document_relations,
+    store_document_relations,
+    validate_new_structured_relation_refs,
+)
 from app.services.resource_hash import HASH_ALGORITHM, compute_text_content_hash
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri
@@ -599,6 +605,12 @@ class DocumentService:
         explicit_slug, now, normalized_collection, doc_repo, coll_repo, conn,
         allow_unavailable_asset_refs=False,
     ) -> DocumentPutResponse:
+        # Structured graph relations are vault-local. Validate before any Git
+        # write or target lookup; ordinary cross-vault Markdown links remain
+        # valid body content and are intentionally handled separately.
+        validate_new_structured_relation_refs(req.vault, req.depends_on)
+        validate_new_structured_relation_refs(req.vault, req.related_to)
+
         # Resolve the final path under the (vault, base_path) advisory lock,
         # which serializes writers racing on the same base slug. If the clean
         # path is free, use it (predictable, human-readable). If taken: a
@@ -1021,6 +1033,22 @@ class DocumentService:
             raise ConflictError(
                 f"content_hash moved: expected {req.expected_content_hash}, "
                 f"actual {current_hash}"
+            )
+
+        # Preserve pre-existing cross-vault metadata as inert legacy content so
+        # unrelated edits still work, but reject any newly introduced value
+        # before the Git commit. Re-extraction below removes any legacy edge.
+        if req.depends_on is not None:
+            validate_new_structured_relation_refs(
+                vault,
+                req.depends_on,
+                existing_refs=ensure_list(current_fm.get("depends_on", [])),
+            )
+        if req.related_to is not None:
+            validate_new_structured_relation_refs(
+                vault,
+                req.related_to,
+                existing_refs=ensure_list(current_fm.get("related_to", [])),
             )
 
         # Merge updates

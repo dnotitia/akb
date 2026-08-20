@@ -158,8 +158,8 @@ TOOLS = [
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for classification"},
                 "domain": {"type": "string", "description": "Domain: engineering, product, ops, legal, etc."},
                 "summary": {"type": "string", "description": "Brief summary (auto-generated if omitted)"},
-                "depends_on": {"type": "array", "items": {"type": "string"}, "description": "akb:// URIs this depends on"},
-                "related_to": {"type": "array", "items": {"type": "string"}, "description": "akb:// URIs of related resources"},
+                "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Same-vault akb:// URIs this depends on. Use an ordinary Markdown link for a cross-vault reference."},
+                "related_to": {"type": "array", "items": {"type": "string"}, "description": "Same-vault akb:// URIs of related resources. Use an ordinary Markdown link for a cross-vault reference."},
             },
             # `vault` + `collection` are required-via-handler rather than
             # required-in-schema — passing `parent` instead also satisfies.
@@ -199,8 +199,8 @@ TOOLS = [
                 "status": {"type": "string", "enum": ["draft", "active", "archived"]},
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "summary": {"type": "string"},
-                "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Update dependency list (akb:// URIs)"},
-                "related_to": {"type": "array", "items": {"type": "string"}, "description": "Update related list (akb:// URIs)"},
+                "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Update the same-vault dependency list (akb:// URIs). Use an ordinary Markdown link in content for a cross-vault reference."},
+                "related_to": {"type": "array", "items": {"type": "string"}, "description": "Update the same-vault related list (akb:// URIs). Use an ordinary Markdown link in content for a cross-vault reference."},
                 "message": {"type": "string", "description": "Commit message describing the change"},
                 "expected_commit": {
                     "type": "string",
@@ -549,7 +549,8 @@ TOOLS = [
         name="akb_relations",
         description=(
             "Get relations for any resource (document, table, or file). "
-            "Shows cross-type connections: doc→table, doc→file, table→file, etc."
+            "Shows same-vault cross-type connections: doc→table, doc→file, table→file, etc. "
+            "Each row identifies whether it is an explicit link or implicit document-derived edge."
         ),
         inputSchema={
             "type": "object",
@@ -564,7 +565,7 @@ TOOLS = [
     Tool(
         name="akb_graph",
         description=(
-            "Get a knowledge graph — nodes (documents, tables, files) and edges (relations). "
+            "Get a same-vault knowledge graph — nodes (documents, tables, files) and edges (relations). "
             "Provide `uri` to get a subgraph centered on any resource with BFS traversal. "
             "Provide `vault` (without uri) to get the full vault graph."
         ),
@@ -592,7 +593,7 @@ TOOLS = [
         name="akb_link",
         description=(
             "Create a relation between any two resources (documents, tables, files). "
-            "Source and target are AKB URIs. "
+            "Source and target are AKB URIs in the same vault. "
             f"Relation types: {_REL_LIST}. "
             "Example: link a design doc to its data table, or attach a diagram file to a spec."
         ),
@@ -613,8 +614,9 @@ TOOLS = [
     Tool(
         name="akb_unlink",
         description=(
-            "Remove a relation between two resources. "
-            "If relation type is omitted, removes ALL relations between the two resources."
+            "Remove an explicit same-vault relation between two resources. "
+            "Implicit relations are removed by editing their source document. "
+            "If relation type is omitted, removes all explicit relations between the two resources."
         ),
         inputSchema={
             "type": "object",
@@ -623,7 +625,7 @@ TOOLS = [
                 "target": {"type": "string", "description": "Target resource URI"},
                 "relation": {
                     "type": "string",
-                    "description": f"Specific relation type to remove, one of: {_REL_LIST} (omit to remove all)",
+                    "description": f"Specific explicit relation type to remove, one of: {_REL_LIST} (omit to remove all explicit relations)",
                     "enum": _REL_ENUM,
                 },
             },
@@ -632,7 +634,10 @@ TOOLS = [
     ),
     Tool(
         name="akb_provenance",
-        description="Get provenance for a document — who created it, when, which entities were extracted.",
+        description=(
+            "Get provenance for a document — who created it, when, which entities were "
+            "extracted, and its visible same-vault relations."
+        ),
         inputSchema={
             "type": "object",
             "properties": {

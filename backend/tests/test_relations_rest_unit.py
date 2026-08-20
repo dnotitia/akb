@@ -151,6 +151,24 @@ def test_get_links_to_filter_is_allowed(client, monkeypatch):
     assert r.json() == {"kind": "relations", "uri": DOC_A, "relations": []}
 
 
+def test_get_relation_exposes_implicit_or_explicit_ownership(client, monkeypatch):
+    async def _relations(*_a, **_kwargs):
+        return [{
+            "direction": "outgoing",
+            "relation": "links_to",
+            "uri": DOC_B,
+            "resource_type": "doc",
+            "kind": "implicit",
+            "name": "B",
+        }]
+
+    monkeypatch.setattr(knowledge, "get_resource_relations", _relations)
+    response = client.get("/api/v1/relations", params={"uri": DOC_A})
+
+    assert response.status_code == 200
+    assert response.json()["relations"][0]["kind"] == "implicit"
+
+
 # ── _bridge_service_error unit behaviour (dict guard + unmapped code) ─
 
 def test_bridge_unmapped_code_falls_back_to_400_and_logs(caplog):
