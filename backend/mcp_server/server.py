@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 import time
 import uuid
@@ -38,9 +39,9 @@ from app.services.search_service import SearchService
 from app.services.kg_service import get_resource_relations, get_graph, get_provenance, link_resources, unlink_resources
 from app.services.uri_service import doc_uri, parse_uri, split_uri
 from app.services.access_service import (
-    check_vault_access, check_vault_scope, grant_access, revoke_access,
-    list_vault_members, list_accessible_vaults, get_vault_info, search_users,
-    transfer_ownership, archive_vault,
+    authorized_vault, authorized_vault_id, check_vault_access, check_vault_scope, grant_access,
+    revoke_access, list_vault_members, list_accessible_vaults, get_vault_info,
+    reset_authorized_vault, search_users, transfer_ownership, archive_vault,
 )
 from app.services.auth_service import resolve_mcp_authorization, token_has_scope
 from app.util.errors import (
@@ -52,6 +53,7 @@ from app.util.errors import (
     INTERNAL,
     INVALID_ARGUMENT,
     INVALID_PATH,
+    VAULT_SKILL_REQUIRED,
     INVALID_URI,
     NOT_FOUND,
     UNKNOWN_ARGUMENT,
@@ -68,6 +70,34 @@ from mcp_server.help import _resolve_help
 from mcp_server.instructions import INSTRUCTIONS
 from mcp_server.vault_contract import project_accessible_vault
 from app.services import audit_log, tool_usage
+
+logger = logging.getLogger("akb.mcp")
+
+# A non-mutating write preflight changes the result shape and requires the
+# client to retry the original operation.  Keep it behind MCP's experimental
+# capability negotiation so older clients continue to receive the additive
+# post-dispatch ``vault_skill`` field they already tolerate.
+VAULT_SKILL_PREFLIGHT_CAPABILITY = "io.dnotitia.akb/vault-skill-preflight"
+VAULT_SKILL_ACK_ARGUMENT = "_vault_skill_ack"
+
+
+def _vault_skill_preflight_version() -> int | None:
+    """Negotiated retry-contract version for this MCP session, if any."""
+    try:
+        params = server.request_context.session.client_params
+        experimental = params.capabilities.experimental if params else None
+        advertised = (experimental or {}).get(VAULT_SKILL_PREFLIGHT_CAPABILITY)
+        if not isinstance(advertised, dict):
+            return None
+        version = advertised.get("version")
+        return version if version in (1, 2) else None
+    except (AttributeError, LookupError):
+        return None
+
+
+def _supports_vault_skill_preflight() -> bool:
+    """Compatibility helper retained for callers/tests that need a boolean."""
+    return _vault_skill_preflight_version() is not None
 
 
 async def _find_doc(vault_name: str, doc_ref: str) -> dict | None:
@@ -378,17 +408,27 @@ async def _handle_help(args: dict, uid: str, user: _MCPUser) -> dict:
     topic = args.get("topic")
     vault = args.get("vault")
     if topic == "vault-skill" and vault:
+        # This branch serves a vault's authored content, so it is a vault READ
+        # and needs the same gate every other read has. Without it the branch
+        # was a read-anything channel plus a vault-existence oracle (a
+        # non-member could tell "exists but I can't see it" from "absent" only
+        # because the absent case renders the mirror fallback). The raised
+        # ForbiddenError/NotFoundError flows to `call_tool`'s canonical
+        # envelope — permission_denied / not_found, same as akb_get.
+        # The REST twin (`app/api/routes/help.py`) already checked reader.
+        access = await check_vault_access(uid, vault, required_role="reader")
         from mcp_server.help import render_vault_skill_response
+        from app.services import vault_skill_service
         async def _fetch(v, doc_id):
-            try:
-                resp = await doc_service.get(v, doc_id)
-            except Exception:
+            resp = await vault_skill_service.fetch_for_authorized_reader(
+                v, str(access["vault_id"]), documents=doc_service,
+            )
+            if resp is None:
                 return None
-            # DocumentResponse fields: .content (from git), .current_commit, .updated_at
             return {
-                "content": resp.content or "",
-                "commit": resp.current_commit,
-                "updated_at": str(resp.updated_at or ""),
+                "content": resp["content"],
+                "commit": resp["version"],
+                "updated_at": "",
             }
         return {"help": await render_vault_skill_response(vault, _fetch)}
     return {"help": _resolve_help(topic)}
@@ -592,6 +632,11 @@ async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
     doc_path = to_nfc(doc_path)
     await check_vault_access(uid, vault, required_role="writer")
+    current = await doc_service.get(vault, doc_path)
+    from app.services import skill_policy
+    skill_internal = current.path == skill_policy.VAULT_SKILL_PATH
+    if skill_internal:
+        await check_vault_access(uid, vault, required_role="owner")
     req = DocumentUpdateRequest(
         content=args.get("content"),
         title=args.get("title"),
@@ -604,7 +649,10 @@ async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
         expected_commit=args.get("expected_commit"),
         expected_content_hash=args.get("expected_content_hash"),
     )
-    result = await doc_service.update(vault, doc_path, req, agent_id=user.username)
+    result = await doc_service.update(
+        vault, doc_path, req, agent_id=user.username,
+        skill_internal=skill_internal,
+    )
     if not result:
         return err("Document not found", code=NOT_FOUND)
     return result.model_dump()
@@ -640,6 +688,11 @@ async def _handle_edit(args: dict, uid: str, user: _MCPUser) -> dict:
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
     doc_path = to_nfc(doc_path)
     await check_vault_access(uid, vault, required_role="writer")
+    current = await doc_service.get(vault, doc_path)
+    from app.services import skill_policy
+    skill_internal = current.path == skill_policy.VAULT_SKILL_PATH
+    if skill_internal:
+        await check_vault_access(uid, vault, required_role="owner")
     try:
         result = await doc_service.edit(
             vault, doc_path,
@@ -649,6 +702,7 @@ async def _handle_edit(args: dict, uid: str, user: _MCPUser) -> dict:
             message=args.get("message"),
             agent_id=user.username,
             base_commit=args.get("base_commit"),
+            skill_internal=skill_internal,
         )
         return result.model_dump()
     except EditError as e:
@@ -1496,11 +1550,51 @@ async def _handle_set_public(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @server.list_tools()
 async def list_tools():
-    return TOOLS
+    if _vault_skill_preflight_version() != 2:
+        return TOOLS
+
+    # Capability v2 makes acknowledgement explicit.  Advertise the reserved
+    # retry argument only to clients that negotiated that contract; older
+    # clients keep the byte-for-byte schemas they already understand.
+    decorated = []
+    for tool in TOOLS:
+        may_write = (
+            _TOOL_SCOPES.get(tool.name, _WRITE_SCOPE) == _WRITE_SCOPE
+            or tool.name in _ARG_WRITE_TRIGGERS
+        )
+        if not may_write:
+            decorated.append(tool)
+            continue
+        copied = tool.model_copy(deep=True)
+        copied.inputSchema.setdefault("properties", {})[
+            VAULT_SKILL_ACK_ARGUMENT
+        ] = {
+            "type": "string",
+            "maxLength": 128,
+            "description": (
+                "Opaque acknowledgement returned as vault_skill.ack_token. "
+                "After applying that guide, retry the unchanged operation with "
+                "this value. The bundled proxy supplies it automatically."
+            ),
+        }
+        decorated.append(copied)
+    return decorated
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
+    # Capability-v2 acknowledgement is transport metadata expressed as a
+    # reserved tool argument so generic MCP clients can send it through their
+    # schema-validated call surface.  Remove it before scope checks, auditing,
+    # unknown-argument validation, and business handlers: it is neither domain
+    # input nor safe to persist in logs.
+    arguments = dict(arguments or {})
+    vault_skill_ack = arguments.pop(VAULT_SKILL_ACK_ARGUMENT, None)
+    # FIRST thing, before anything can dispatch: drop any authorized-vault
+    # marker this task context may still carry. Streamable-HTTP sessions can
+    # reuse a task context across calls, and a stale marker would let this
+    # call's injection ride on the PREVIOUS call's authorization.
+    reset_authorized_vault()
     # Resolve the actor once and reuse it for both dispatch and the audit
     # line so the two can't disagree on who made the call.
     user = await _get_user()
@@ -1514,13 +1608,61 @@ async def call_tool(name: str, arguments: dict):
     # relabelled "error" because the response could not be encoded.
     recorded = False
     try:
-        result = await _dispatch(name, arguments, user)
+        is_write = _required_scope(name, arguments) == _WRITE_SCOPE
+        result: dict | None = None
+
+        # A guide cannot influence a write that has already committed.  For a
+        # reader-authorized caller's first write (or the first write after the
+        # guide changes), return the guide without dispatching the mutation;
+        # the agent applies it and retries the same idempotency/OCC-aware call.
+        # Write-only credentials proceed without disclosure.
+        preflight_version = _vault_skill_preflight_version()
+        if is_write and preflight_version is not None:
+            try:
+                from app.services.tool_usage import vault_of_call
+                from app.services import vault_skill_service
+
+                target_vault = vault_of_call(name, arguments)
+                if target_vault and await _can_read_vault(
+                    user, user.user_id, target_vault
+                ):
+                    if preflight_version == 2:
+                        payload = await vault_skill_service.preflight_payload(
+                            _session_id(),
+                            target_vault,
+                            authorized_vault_id(),
+                            acknowledgement=(
+                                vault_skill_ack
+                                if isinstance(vault_skill_ack, str)
+                                else None
+                            ),
+                        )
+                    else:
+                        payload = await vault_skill_service.injection_payload(
+                            _session_id(), target_vault, authorized_vault_id(),
+                        )
+                    if payload:
+                        result = err(
+                            (
+                                "Apply the vault instructions, then retry this write "
+                                "with its acknowledgement."
+                                if preflight_version == 2
+                                else "Apply the vault instructions, then retry this write."
+                            ),
+                            code=VAULT_SKILL_REQUIRED,
+                            retryable=True,
+                        )
+                        result["vault_skill"] = payload
+            except Exception as e:  # noqa: BLE001 — optional projection only
+                logger.debug("vault_skill preflight skipped: %s", e)
+
+        if result is None:
+            result = await _dispatch(name, arguments, user)
         # Non-blocking: both calls only ENQUEUE (audit to its dedicated writer
         # thread, usage to a bounded deque drained by a worker). No disk I/O or
         # lock on the event loop, and neither touches the shared to_thread pool
         # — a stalled audit disk can't freeze the loop or starve bcrypt /
         # document reads.
-        is_write = _required_scope(name, arguments) == _WRITE_SCOPE
         audit_log.record_tool(name, arguments, user, result, is_write=is_write)
         # Independent sink: usage analytics go to PG so they can be grouped, and
         # must NOT inherit the audit flags (audit is off by default and
@@ -1532,6 +1674,36 @@ async def call_tool(name: str, arguments: dict):
             is_write=is_write,
         )
         recorded = True
+        # Vault-skill auto-injection: first touch of a vault in this session
+        # (or a skill change since last touch) attaches the owner's guide.
+        # Additive key; never fails the call (contract matches tool_usage).
+        #
+        # TWO conditions, and the second is the authorization one. Attribution
+        # (`vault_of_call`) only says which vault the ARGUMENTS name; it is an
+        # analytics helper and a handler is free to never look at that
+        # argument (akb_help's static topics) or to act on a different vault.
+        # `authorized_vault()` is set only by a check_vault_access that
+        # SUCCEEDED during this call, so requiring the two to agree means a
+        # payload can never reach a caller the server did not authorize for
+        # that exact vault — and a non-member cannot use the presence of the
+        # key as a vault-existence oracle either. Fail-closed on None.
+        try:
+            from app.services.tool_usage import vault_of_call
+            from app.services import vault_skill_service
+            if isinstance(result, dict) and result.get("error") is None:
+                target_vault = vault_of_call(name, arguments)
+                if (
+                    target_vault is not None
+                    and await _can_read_vault(user, user.user_id, target_vault)
+                    and target_vault == authorized_vault()
+                ):
+                    payload = await vault_skill_service.injection_payload(
+                        _session_id(), target_vault, authorized_vault_id(),
+                    )
+                    if payload:
+                        result["vault_skill"] = payload
+        except Exception as e:  # noqa: BLE001 — injection must never fail a call
+            logger.debug("vault_skill attach skipped: %s", e)
         # Serialise with json.dumps(default=str) — UNCHANGED from pre-hardening
         # so the MCP wire format stays byte-identical for every tool (datetime →
         # `str()` space form, Enum → `str()`, unknown → stringified). The

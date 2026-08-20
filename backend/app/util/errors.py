@@ -81,6 +81,9 @@ NATIVE_REVISION_SELECTOR_AMBIGUOUS = "native_revision_selector_ambiguous"
 WRITE_BUSY = "write_busy"  # write-lane admission timed out — retry after backoff
 UNIQUE_VIOLATION = "unique_violation"  # PG 23505 — INSERT/UPDATE breaks a unique key
 EDIT_FAILED = "edit_failed"  # akb_edit: old_string match / uniqueness failure
+# A reader-authorized first write is intentionally not dispatched until the
+# caller applies the newly delivered vault guide and retries.
+VAULT_SKILL_REQUIRED = "vault_skill_required"
 
 # SQL surface — `akb_sql`
 MULTI_STATEMENT = "multi_statement"

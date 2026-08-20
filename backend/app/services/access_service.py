@@ -6,6 +6,7 @@ Role hierarchy: owner > admin > writer > reader > (none)
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import uuid
 
@@ -41,6 +42,51 @@ _MUTATING_ROLES = frozenset({"writer", "admin", "owner"})
 WRITE_ACTION_WILDCARD = "*"
 FILE_UPLOAD_WRITE_ACTION = "file_upload"
 VALID_WRITE_ACTIONS = frozenset({WRITE_ACTION_WILDCARD, FILE_UPLOAD_WRITE_ACTION})
+
+# The vault whose `check_vault_access` MOST RECENTLY SUCCEEDED in this request's
+# context. Written here and nowhere else, so "this name was authorized" cannot
+# be asserted by a caller that merely parsed it out of its arguments.
+#
+# Motivating consumer: the vault-skill injector at the MCP dispatch chokepoint.
+# It used to derive its target from raw caller args via `tool_usage.vault_of_call`
+# — an ANALYTICS helper. `akb_help` accepts a `vault` argument and (before this
+# change) ran no access check at all, so attribution named a vault the caller
+# had no right to read and the injector served that vault's skill body to a
+# non-member, doubling as a vault-existence oracle. Reading this contextvar
+# instead makes the injector follow a COMPLETED authorization: absent (None) or
+# naming a different vault ⇒ no injection, fail-closed in both directions.
+_authorized_vault: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "authorized_vault", default=None,
+)
+_authorized_vault_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "authorized_vault_id", default=None,
+)
+
+
+def authorized_vault() -> str | None:
+    """The vault this context has actually been authorized for, or None."""
+    return _authorized_vault.get()
+
+
+def authorized_vault_id() -> str | None:
+    """Immutable identity paired with :func:`authorized_vault`.
+
+    Names can be deleted and recreated.  Consumers that project stored data
+    after an access check must pin both values so an authorization for the old
+    vault cannot be replayed against a new vault with the same name.
+    """
+    return _authorized_vault_id.get()
+
+
+def reset_authorized_vault() -> None:
+    """Drop any authorization recorded in this context.
+
+    Entry points that may run on a REUSED task context (the MCP `call_tool`
+    chokepoint) call this BEFORE dispatch so a previous call's authorization
+    can never be mistaken for this one's.
+    """
+    _authorized_vault.set(None)
+    _authorized_vault_id.set(None)
 
 
 def normalize_write_actions(actions: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
@@ -177,6 +223,31 @@ def check_vault_scope(vault_name: str, required_role: str) -> None:
 
 
 async def check_vault_access(
+    user_id: str, vault_name: str, required_role: str = "reader",
+    *, allow_archived: bool = False, write_action: str | None = None,
+) -> dict:
+    """Authorize `user_id` on `vault_name`, then RECORD that authorization.
+
+    Thin wrapper over `_check_vault_access_impl` purely so the contextvar is
+    set at ONE place: the implementation has six distinct success returns
+    (write grant, admin bypass, system admin, owner, public, member ACL) and a
+    set at each of them is a line that a future return can silently skip.
+    Every raise leaves the contextvar untouched — a failed check must never
+    look like an authorization, and the reset at the MCP chokepoint means
+    "untouched" is None for that surface.
+
+    See `_authorized_vault` for who consumes this and why.
+    """
+    result = await _check_vault_access_impl(
+        user_id, vault_name, required_role,
+        allow_archived=allow_archived, write_action=write_action,
+    )
+    _authorized_vault.set(vault_name)
+    _authorized_vault_id.set(str(result["vault_id"]))
+    return result
+
+
+async def _check_vault_access_impl(
     user_id: str, vault_name: str, required_role: str = "reader",
     *, allow_archived: bool = False, write_action: str | None = None,
 ) -> dict:
@@ -1615,6 +1686,19 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
             await conn.execute("DELETE FROM collections WHERE vault_id = $1", vault_id)
             await conn.execute("DELETE FROM vault_access WHERE vault_id = $1", vault_id)
             await conn.execute("DELETE FROM vaults WHERE id = $1", vault_id)
+
+    # POST-COMMIT, and deliberately ahead of the on-disk/role cleanup below so
+    # it still runs if either of those fails: the vault-skill cache is keyed on
+    # vault NAME, so a same-named recreate within the cache TTL would otherwise
+    # serve the DELETED vault's skill body to the new vault's readers.
+    # Over-invalidating costs one re-fetch; under-invalidating is a
+    # cross-vault disclosure.
+    try:
+        from app.services import vault_skill_service
+
+        vault_skill_service.invalidate(vault_name)
+    except Exception as e:  # noqa: BLE001 — never fail a delete over a cache pop
+        logger.warning("vault_skill cache invalidate failed for %s: %s", vault_name, e)
 
     # Legacy on-disk cleanup: bare repo + persistent worktree. Both must go,
     # otherwise a same-named recreate hits stale state on its second commit.

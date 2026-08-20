@@ -8,6 +8,7 @@ constructs a Git service nor writes the legacy document projection.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from datetime import UTC, datetime
 from typing import NoReturn
@@ -29,6 +30,7 @@ from app.repositories import table_data_repo, table_registry_repo, vault_files_r
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.native_revision_repo import NativeRevisionRepository
 from app.repositories.vault_repo import VaultRepository
+from app.services import skill_policy
 from app.services.document_service import (
     EditError,
     DocumentService,
@@ -297,6 +299,7 @@ class NativeDocumentService(DocumentService):
         agent_id: str | None = None,
         *,
         allow_unavailable_asset_refs: bool = False,
+        skill_internal: bool = False,
     ) -> DocumentPutResponse:
         # The measurement backend stores Markdown verbatim and does not expose
         # the attachment subsystem. Accept the shared import policy argument so
@@ -304,6 +307,10 @@ class NativeDocumentService(DocumentService):
         del allow_unavailable_asset_refs
         if req.status not in DOC_STATUSES:
             raise ValidationError(f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}")
+        skill_policy.check_put(
+            normalize_collection_path(req.collection), req.type,
+            internal=skill_internal,
+        )
         vault_id = await self._vault_id(req.vault)
         now = datetime.now(UTC)
         base_slug = slugify(req.slug) if req.slug else slugify(req.title)
@@ -407,10 +414,13 @@ class NativeDocumentService(DocumentService):
         doc_ref: str,
         req: DocumentUpdateRequest,
         agent_id: str | None = None,
+        *,
+        skill_internal: bool = False,
     ) -> DocumentPutResponse:
         if req.status is not None and req.status not in DOC_STATUSES:
             raise ValidationError(f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}")
         vault_id, current = await self._current(vault, doc_ref)
+        skill_policy.check_update(current.path, req.type, internal=skill_internal)
         return await self._update_from_snapshot(
             vault=vault,
             vault_id=vault_id,
@@ -493,6 +503,9 @@ class NativeDocumentService(DocumentService):
                     resource_id=resource_id,
                 )
                 continue
+            if current.path == skill_policy.VAULT_SKILL_PATH:
+                from app.services import vault_skill_service
+                vault_skill_service.invalidate(vault)
             return DocumentPutResponse(
                 uri=doc_uri(vault, result.path),
                 vault=vault,
@@ -517,6 +530,7 @@ class NativeDocumentService(DocumentService):
         slug: str | None = None,
         message: str | None = None,
         agent_id: str | None = None,
+        skill_internal: bool = False,
     ) -> DocumentPutResponse:
         if collection is None and slug is None:
             raise ValidationError("move requires at least one of collection or slug")
@@ -539,6 +553,9 @@ class NativeDocumentService(DocumentService):
                 )
             )
             base_path = doc_path(next_collection, next_slug)
+            # Inside the loop: a retry re-reads Head, so both the source path
+            # and the recomputed target are re-guarded on every attempt.
+            skill_policy.check_move(current.path, base_path, internal=skill_internal)
             if base_path == current.path:
                 raise ValidationError("move is a no-op: the target path equals the current path")
             next_path = await self._resolve_native_free_path(vault_id, base_path, current.resource_id)
@@ -612,10 +629,13 @@ class NativeDocumentService(DocumentService):
         message: str | None = None,
         agent_id: str | None = None,
         base_commit: str | None = None,
+        *,
+        skill_internal: bool = False,
     ) -> DocumentPutResponse:
         if not old_string:
             raise EditError("old_string cannot be empty")
         vault_id, current = await self._current(vault, doc_ref)
+        skill_policy.check_update(current.path, None, internal=skill_internal)
         resource_id = current.resource_id
         native = await self._native()
         race_count = 0
@@ -686,6 +706,7 @@ class NativeDocumentService(DocumentService):
 
     async def delete(self, vault: str, doc_ref: str, agent_id: str | None = None) -> bool:
         vault_id, current = await self._current(vault, doc_ref)
+        skill_policy.check_delete(current.path)
         resource_id = current.resource_id
         native = await self._native()
         actor = agent_id or "unknown"
@@ -1064,6 +1085,17 @@ class NativeDocumentService(DocumentService):
                 raise ConflictError(f"Vault already exists: {name}") from exc
             raise
         assert vault_id is not None
+        # POST-COMMIT (the transaction above has exited). Drops any negative
+        # cache entry left by a probe of this name before the vault existed —
+        # otherwise first-touch injection stays suppressed for up to a TTL on
+        # a vault that was just seeded with a skill.
+        try:
+            from app.services import vault_skill_service
+            vault_skill_service.invalidate(name)
+        except Exception as e:  # noqa: BLE001 — cache hygiene, never a failure
+            logging.getLogger("akb.native_documents").warning(
+                "vault_skill invalidate skipped for %s: %s", name, e,
+            )
         return str(vault_id)
 
     async def list_vaults(self) -> list[dict]:

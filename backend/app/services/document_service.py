@@ -130,6 +130,7 @@ from app.repositories.vault_external_git_repo import VaultExternalGitRepository
 from app.repositories.vault_repo import VaultRepository, lock_vault_for_child_write
 from app.services.git_service import GitService
 from app.services import asset_service
+from app.services import skill_policy
 from app.services.index_service import (
     build_doc_metadata_header,
     chunk_markdown,
@@ -554,11 +555,15 @@ class DocumentService:
         agent_id: str | None = None,
         *,
         allow_unavailable_asset_refs: bool = False,
+        skill_internal: bool = False,
     ) -> DocumentPutResponse:
         if req.status not in DOC_STATUSES:
             raise ValidationError(
                 f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}"
             )
+        skill_policy.check_put(
+            _normalize_collection(req.collection), req.type, internal=skill_internal,
+        )
         vault_repo, doc_repo, coll_repo = await self._repos()
 
         vault_id = await vault_repo.get_id_by_name(req.vault)
@@ -944,7 +949,10 @@ class DocumentService:
 
     # ── Update ────────────────────────────────────────────────
 
-    async def update(self, vault: str, doc_ref: str, req: DocumentUpdateRequest, agent_id: str | None = None) -> DocumentPutResponse:
+    async def update(
+        self, vault: str, doc_ref: str, req: DocumentUpdateRequest,
+        agent_id: str | None = None, *, skill_internal: bool = False,
+    ) -> DocumentPutResponse:
         if req.status is not None and req.status not in DOC_STATUSES:
             raise ValidationError(
                 f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}"
@@ -960,6 +968,7 @@ class DocumentService:
         if not row:
             raise NotFoundError("Document", doc_ref)
         file_path = row["path"]
+        skill_policy.check_update(file_path, req.type, internal=skill_internal)
 
         async with self._path_lock(vault_id, file_path, vault_name=vault) as conn:
             # Re-read under the lock so we observe any commit that landed
@@ -980,10 +989,22 @@ class DocumentService:
                     f"actual {row['current_commit']}"
                 )
 
-            return await self._update_locked(
+            response = await self._update_locked(
                 req=req, agent_id=agent_id, vault=vault,
                 vault_id=vault_id, doc_repo=doc_repo, row=row, conn=conn,
             )
+
+        # POST-COMMIT. `_path_lock` owns the transaction (it yields inside
+        # `lock_conn.transaction()`), so it commits only as the `async with`
+        # above exits — which is why this cannot live inside `_update_locked`.
+        # Invalidating pre-commit leaves a window in which a concurrent reader
+        # misses, re-reads the *old* row, and re-caches it; no second
+        # invalidation would ever follow, so the stale body would be served for
+        # a full TTL.
+        if file_path == skill_policy.VAULT_SKILL_PATH:
+            from app.services import vault_skill_service
+            vault_skill_service.invalidate(vault)
+        return response
 
     async def _update_locked(self, *, req, agent_id, vault, vault_id, doc_repo, row, conn) -> DocumentPutResponse:
         now = datetime.now(timezone.utc)
@@ -1124,6 +1145,7 @@ class DocumentService:
         self, vault: str, doc_ref: str, *,
         collection: str | None = None, slug: str | None = None,
         message: str | None = None, agent_id: str | None = None,
+        skill_internal: bool = False,
     ) -> DocumentPutResponse:
         """Move/rename a document: change its collection and/or slug while
         keeping its identity (id). The move is a ``git mv``, so ``git log
@@ -1167,6 +1189,7 @@ class DocumentService:
             return nc, ns, _doc_path(nc, ns)
 
         _, _, est_new_path = _target(old_path, row["id"])
+        skill_policy.check_move(old_path, est_new_path, internal=skill_internal)
 
         async with self._move_lock(vault_id, old_path, est_new_path, vault_name=vault) as conn:
             # Re-read under the lock and recompute the target from fresh state.
@@ -1180,6 +1203,7 @@ class DocumentService:
             old_collection_id = row["collection_id"]
 
             new_coll, new_base_slug, base_new_path = _target(old_path, pg_doc_id)
+            skill_policy.check_move(old_path, base_new_path, internal=skill_internal)
             if base_new_path == old_path:
                 raise ValidationError(
                     "move is a no-op: the target path equals the current path"
@@ -1368,6 +1392,8 @@ class DocumentService:
         message: str | None = None,
         agent_id: str | None = None,
         base_commit: str | None = None,
+        *,
+        skill_internal: bool = False,
     ) -> DocumentPutResponse:
         """Edit a document by replacing exact text in its body.
 
@@ -1392,6 +1418,7 @@ class DocumentService:
         if not row:
             raise NotFoundError("Document", doc_ref)
         file_path = row["path"]
+        skill_policy.check_update(file_path, None, internal=skill_internal)
 
         async with self._path_lock(vault_id, file_path, vault_name=vault) as conn:
             row = await doc_repo.find_by_ref_with_conn(
@@ -1404,12 +1431,23 @@ class DocumentService:
                     f"current_commit moved: expected {base_commit}, "
                     f"actual {row['current_commit']}"
                 )
-            return await self._edit_locked(
+            response = await self._edit_locked(
                 vault=vault, vault_id=vault_id, row=row, doc_repo=doc_repo,
                 old_string=old_string, new_string=new_string,
                 replace_all=replace_all, message=message, agent_id=agent_id,
                 conn=conn,
             )
+
+        # POST-COMMIT, for the same reason and with the same placement as
+        # `update()`: `_path_lock` owns the transaction and commits only as the
+        # `async with` above exits, so invalidating any earlier leaves a window
+        # where a concurrent reader re-caches the pre-commit body for a full
+        # TTL. `edit` reaches the canonical document through its own lane, so
+        # it needs its own hook — update()'s does not cover it.
+        if file_path == skill_policy.VAULT_SKILL_PATH:
+            from app.services import vault_skill_service
+            vault_skill_service.invalidate(vault)
+        return response
 
     async def _edit_locked(
         self, *, vault, vault_id, row, doc_repo,
@@ -1564,6 +1602,7 @@ class DocumentService:
         if not row:
             raise NotFoundError("Document", doc_ref)
         file_path = row["path"]
+        skill_policy.check_delete(file_path)
 
         async with self._path_lock(vault_id, file_path, vault_name=vault) as conn:
             # Re-resolve under the lock — a concurrent delete may have run.
@@ -2103,7 +2142,11 @@ class DocumentService:
                 # put() calls coll_repo.get_or_create internally, so no
                 # separate create_empty is needed.
                 seed_req = build_vault_skill_seed_request(name)
-                await self.put(seed_req, agent_id=str(owner_id) if owner_id else None)
+                await self.put(
+                    seed_req,
+                    agent_id=str(owner_id) if owner_id else None,
+                    skill_internal=True,
+                )
         except BaseException:
             # run_compensation: the whole rollback runs to COMPLETION even
             # if the cancellation that may be unwinding us keeps firing;
@@ -2122,6 +2165,16 @@ class DocumentService:
             except Exception as rb_err:  # noqa: BLE001 — defense in depth; _rollback logs its own failures
                 logger.error("create_vault rollback itself failed for %s: %s", name, rb_err)
             raise
+        # Post-success, so the vault row and its seed are committed. A name
+        # PROBED before it existed left a negative (None, None) entry behind,
+        # which would suppress first-touch injection for up to a full TTL on a
+        # brand-new vault. A dict pop cannot fail, but it stays inside the
+        # never-fail posture: vault creation must not break over a cache hint.
+        try:
+            from app.services import vault_skill_service
+            vault_skill_service.invalidate(name)
+        except Exception as e:  # noqa: BLE001 — cache hygiene, never a failure
+            logger.warning("vault_skill invalidate skipped for %s: %s", name, e)
         logger.info("Vault created: %s (owner: %s, template: %s)", name, owner_id, template)
         return str(vault_id)
 

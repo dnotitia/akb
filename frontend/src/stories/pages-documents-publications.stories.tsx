@@ -10,7 +10,6 @@ import {
   publicSectionWarning,
   regularDoc,
   vaultShellHandlers,
-  vaultSkillDoc,
 } from "./page-story-fixtures";
 import { AkbRouteTree } from "./page-route-shell";
 
@@ -30,34 +29,17 @@ const documentPageHandlers = [
   ...defaultDocumentSupportHandlers,
 ];
 
-export const DocumentRendered: Story = {
-  name: "Document read / rendered markdown",
-  parameters: {
-    router: { initialEntries: ["/vault/akb/doc/overview%2Fvault-skill.md"] },
-    msw: {
-      handlers: [
-        ...documentPageHandlers,
-        http.get(`${API}/documents/akb/overview%2Fvault-skill.md`, () => HttpResponse.json(vaultSkillDoc)),
-      ],
-    },
-  },
-  render: () => <AkbRouteTree />,
-  play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    await expect(await canvas.findByRole("heading", { level: 1, name: "Storybook rollout" })).toBeInTheDocument();
-    await expect(await canvas.findByRole("navigation", { name: "Vaults" })).toBeInTheDocument();
-    await expect(await canvas.findByRole("tree", { name: "akb explorer" })).toBeInTheDocument();
-  },
-};
-
+// The canonical guide doc (overview/vault-skill.md) no longer renders in the
+// document viewer — it redirects to the vault-settings guide editor — so the
+// viewer stories read a regular document instead.
 export const DocumentRawTab: Story = {
   name: "Document read / raw markdown tab",
   parameters: {
-    router: { initialEntries: ["/vault/akb/doc/overview%2Fvault-skill.md"] },
+    router: { initialEntries: ["/vault/akb/doc/notes%2Frelease.md"] },
     msw: {
       handlers: [
         ...documentPageHandlers,
-        http.get(`${API}/documents/akb/overview%2Fvault-skill.md`, () => HttpResponse.json(vaultSkillDoc)),
+        http.get(`${API}/documents/akb/notes%2Frelease.md`, () => HttpResponse.json(regularDoc)),
       ],
     },
   },
@@ -66,31 +48,8 @@ export const DocumentRawTab: Story = {
     const canvas = within(canvasElement);
     await expect(await canvas.findByRole("tab", { name: "Raw" })).toBeInTheDocument();
     await userEvent.click(canvas.getByRole("tab", { name: "Raw" }));
-    await expect(canvas.getByTestId("doc-raw")).toHaveTextContent("akb://akb");
+    await expect(canvas.getByTestId("doc-raw")).toHaveTextContent("# Release note");
     await expect(await canvas.findByRole("navigation", { name: "Vaults" })).toBeInTheDocument();
-  },
-};
-
-export const DocumentAgentPreview: Story = {
-  name: "Document read / skill agent preview",
-  parameters: {
-    router: { initialEntries: ["/vault/akb/doc/overview%2Fvault-skill.md"] },
-    msw: {
-      handlers: [
-        ...documentPageHandlers,
-        http.get(`${API}/documents/akb/overview%2Fvault-skill.md`, () => HttpResponse.json(vaultSkillDoc)),
-        http.get(`${API}/help/vault-skill-preview/akb`, () =>
-          HttpResponse.text("Agents read this guide first."),
-        ),
-      ],
-    },
-  },
-  render: () => <AkbRouteTree />,
-  play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    await userEvent.click(await canvas.findByRole("tab", { name: "Agent" }));
-    await expect(await canvas.findByText("Agents read this guide first.")).toBeInTheDocument();
-    await expect(await canvas.findByRole("tree", { name: "akb explorer" })).toBeInTheDocument();
   },
 };
 

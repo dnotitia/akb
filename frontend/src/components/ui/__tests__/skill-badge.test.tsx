@@ -36,6 +36,25 @@ describe("SkillBadge", () => {
     expect(undef.className).not.toMatch(/info/);
   });
 
+  it("renders the template/customized state instead of the line count", () => {
+    const { rerender } = render(<SkillBadge defined customized lineCount={42} />);
+    expect(screen.getByText(/Guide/).textContent).toContain("customized");
+    expect(screen.queryByText(/42L/)).toBeNull();
+
+    rerender(<SkillBadge defined customized={false} />);
+    expect(screen.getByText(/Guide/).textContent).toContain("template");
+  });
+
+  it("customized is teal, still-on-template is neutral", () => {
+    const { rerender, container } = render(<SkillBadge defined customized />);
+    expect((container.firstChild as HTMLElement).className).toMatch(/info/);
+
+    rerender(<SkillBadge defined customized={false} />);
+    const tpl = container.firstChild as HTMLElement;
+    expect(tpl.className).not.toMatch(/info/);
+    expect(tpl.className).not.toMatch(/accent/);
+  });
+
   it("includes Sparkles icon", () => {
     const { container } = render(<SkillBadge defined />);
     const svg = container.querySelector("svg");

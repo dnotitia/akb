@@ -105,3 +105,73 @@ async def test_create_vault_uses_postgres_repository_and_rbac_without_git(monkey
 async def test_create_vault_rejects_non_native_vault_surfaces(kwargs):
     with pytest.raises(native_documents.NativeRevisionUnsupportedSurfaceError):
         await NativeDocumentService(pool=object()).create_vault("native-create", **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_create_vault_drops_a_stale_negative_skill_cache_entry(monkeypatch):
+    """A name probed BEFORE it existed leaves a negative injection-cache entry.
+
+    Without a post-commit invalidate, a vault created seconds later would be
+    injection-silent for the rest of that entry's TTL even though its seed
+    skill is already committed.
+    """
+    from app.services import vault_skill_service as vss
+
+    vault_id = uuid.uuid4()
+
+    class _Transaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class _Connection:
+        def transaction(self):
+            return _Transaction()
+
+    connection = _Connection()
+
+    class _Acquire:
+        async def __aenter__(self):
+            return connection
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    class _VaultRepository:
+        def __init__(self, pool) -> None:
+            pass
+
+        async def get_by_name(self, name: str):
+            return None
+
+        async def create(self, **kwargs):
+            return vault_id
+
+    class _RoleSync:
+        async def on_vault_create_in_conn(self, *a) -> None:
+            pass
+
+        async def on_public_access_change_in_conn(self, *a) -> None:
+            pass
+
+    async def _seed(_service, conn, *, vault_id, vault_name, owner_id) -> None:
+        # Still inside the transaction: invalidating here would be premature.
+        assert ("probed-name", None) in vss._vault_cache
+
+    monkeypatch.setattr(native_documents, "VaultRepository", _VaultRepository, raising=False)
+    monkeypatch.setattr(native_documents, "get_role_sync", lambda: _RoleSync(), raising=False)
+    monkeypatch.setattr(NativeDocumentService, "_seed_native_vault_skill", _seed)
+
+    vss.reset()
+    vss._vault_cache[("probed-name", None)] = (0.0, None, None)
+    try:
+        await NativeDocumentService(pool=_Pool()).create_vault("probed-name")
+        assert ("probed-name", None) not in vss._vault_cache
+    finally:
+        vss.reset()

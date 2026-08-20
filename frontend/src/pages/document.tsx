@@ -1,6 +1,6 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
-import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { Link, Navigate, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowLeft,
@@ -27,6 +27,7 @@ import { timeAgo } from "@/lib/utils";
 import { docUri } from "@/lib/uri";
 import { parseHeadings } from "@/lib/markdown";
 import { sameCommitRef } from "@/lib/commit";
+import { VAULT_SKILL_PATH } from "@/lib/skill";
 import { DocumentOutline } from "@/components/doc-outline";
 import { DocumentView } from "@/components/document-view";
 import { SummaryFold } from "@/components/summary-fold";
@@ -45,10 +46,10 @@ import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import { RelationsPanel } from "@/components/relations/relations-panel";
 
 // Plate is heavy (~hundreds of KB gzipped); lazy-load so the read-only path
-// (Rendered / Raw / Agent) stays cheap.
+// (Rendered / Raw) stays cheap.
 const MarkdownEditor = lazy(() => import("@/components/markdown-editor"));
 
-type DocView = "rendered" | "raw" | "agent" | "edit";
+type DocView = "rendered" | "raw" | "edit";
 
 export default function DocumentPage() {
   const { name, id } = useParams<{ name: string; id: string }>();
@@ -59,13 +60,7 @@ export default function DocumentPage() {
   const commitHash = searchParams.get("commit") || undefined;
   const rawView = searchParams.get("view");
   const view: DocView =
-    rawView === "raw"
-      ? "raw"
-      : rawView === "edit"
-        ? "edit"
-        : rawView === "agent"
-          ? "agent"
-          : "rendered";
+    rawView === "raw" ? "raw" : rawView === "edit" ? "edit" : "rendered";
   const [relations, setRelations] = useState<RelationRow[]>([]);
   const [relationsError, setRelationsError] = useState(false);
   const [provenance, setProvenance] = useState<any[]>([]);
@@ -77,6 +72,7 @@ export default function DocumentPage() {
   const [copied, setCopied] = useState(false);
   const [articleEl, setArticleEl] = useState<HTMLElement | null>(null);
   const [vaultRole, setVaultRole] = useState<string | null>(null);
+  const [vaultKind, setVaultKind] = useState<"normal" | "mirror" | "error" | null>(null);
   const [editOpen, setEditOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
@@ -118,9 +114,16 @@ export default function DocumentPage() {
   useEffect(() => {
     if (!name) return;
     setVaultRole(null);
+    setVaultKind(null);
     getVaultInfo(name)
-      .then((d) => setVaultRole(d?.role || null))
-      .catch(() => setVaultRole(null));
+      .then((d) => {
+        setVaultRole(d?.role || null);
+        setVaultKind(d?.is_external_git ? "mirror" : "normal");
+      })
+      .catch(() => {
+        setVaultRole(null);
+        setVaultKind("error");
+      });
   }, [name]);
 
   const docQuery = useQuery({
@@ -329,6 +332,17 @@ export default function DocumentPage() {
       setProvenance([]);
       setHistoryError(true);
     }
+  }
+
+  // The vault guide is system-managed: its only editing surface is the guide
+  // section in vault settings, so the plain viewer bounces there. A ?commit=
+  // pin is exempt — that is the URL-addressable version view (commit-log and
+  // activity links, and the settings editor's history entry point), and it
+  // must keep resolving. The gate is the raw param, not the computed
+  // `isHistorical`: that one reads false until the HEAD query resolves, which
+  // would redirect every version link away before it could settle.
+  if (docId === VAULT_SKILL_PATH && !commitHash && vaultKind === "normal") {
+    return <Navigate to={`/vault/${name}/settings#skill`} replace />;
   }
 
   if (docQuery.isError) {
@@ -680,7 +694,7 @@ export default function DocumentPage() {
             "w-full flex items-center gap-2.5 px-3 py-2.5 text-sm transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset";
           return (
             <Panel className="shrink-0 mb-4 divide-y divide-border">
-              {canWrite && doc.type !== "skill" && (
+              {canWrite && (
                 <button onClick={() => setEditOpen(true)} className={`${rowCls} text-foreground hover:bg-surface-hover`}>
                   <Pencil className="h-3.5 w-3.5 text-foreground-muted" aria-hidden />
                   Edit details

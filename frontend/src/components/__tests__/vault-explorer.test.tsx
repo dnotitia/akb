@@ -183,6 +183,57 @@ describe("VaultExplorer — role gating", () => {
   });
 });
 
+describe("VaultExplorer — reserved system collection", () => {
+  const withOverview = {
+    vault: "v",
+    path: "",
+    items: [
+      { type: "collection", name: "architecture", path: "architecture" },
+      { type: "collection", name: "overview", path: "overview" },
+      { type: "document", name: "AKB Guide", path: "overview/vault-skill.md", doc_type: "skill" },
+    ],
+  };
+
+  beforeEach(() => {
+    browseMock.mockResolvedValue(withOverview);
+  });
+
+  it("suppresses the row actions on `overview` while keeping them on normal collections", async () => {
+    vaultInfoMock.mockResolvedValue({ role: "writer" });
+    renderAt("/vault/v");
+    // A normal collection keeps all three affordances.
+    expect(
+      await screen.findByRole("button", { name: /create document in architecture/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /create sub-collection in architecture/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /delete collection architecture/i }),
+    ).toBeInTheDocument();
+    // The system collection is managed from vault settings, not the tree.
+    expect(
+      screen.queryByRole("button", { name: /create document in overview/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /create sub-collection in overview/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /delete collection overview/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders `overview` first, marked as a system collection", async () => {
+    vaultInfoMock.mockResolvedValue({ role: "writer" });
+    renderAt("/vault/v");
+    const tree = await screen.findByRole("tree", { name: /v explorer/ });
+    // Not hidden — pinned to the top of the tree.
+    const rows = within(tree).getAllByRole("treeitem");
+    expect(rows[0]).toHaveTextContent("overview");
+    expect(within(tree).getByTitle(/system collection/i)).toBeInTheDocument();
+  });
+});
+
 describe("VaultExplorer — error & empty", () => {
   it("shows a message when browse fails", async () => {
     browseMock.mockRejectedValueOnce(new Error("boom"));

@@ -40,6 +40,7 @@ from app.services.app_resource_service import (
     lock_table_mutation,
 )
 from app.services.role_sync import get_role_sync
+from app.services import skill_policy
 from app.services.uri_service import table_uri
 from app.services.user_sql_executor import (
     PermissionDeniedError,
@@ -821,6 +822,15 @@ async def create_table(
     raw scopes. It defaults to False so a caller that forgets to pass it
     receives the minimal envelope rather than the stored schema.
     """
+    # First statement in the body so the plain-create and the
+    # `if_not_exists=True` "ensure" path are both refused. A path that will
+    # not normalize cannot reach the reserved namespace either, so it falls
+    # through to keep the existing name/path error precedence intact.
+    try:
+        _requested_collection = _normalize_collection_path(collection)
+    except ValueError:
+        _requested_collection = None
+    skill_policy.check_resource_collection(_requested_collection)
     # pg_table_name maps any punctuation to underscore — allowing hyphens
     # would let `mcp-items` and `mcp_items` collide on the PG side.
     if not _TABLE_NAME_RE.fullmatch(name):

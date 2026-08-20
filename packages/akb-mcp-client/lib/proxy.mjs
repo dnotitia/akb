@@ -16,7 +16,7 @@ import { createInterface } from "node:readline";
 import { createReadStream, createWriteStream, readFileSync, statSync } from "node:fs";
 import { mkdir, stat as fsStat } from "node:fs/promises";
 import { basename, dirname, extname, join } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 // ── Connection reuse ───────────────────────────────────────
 // Without keepAlive agents, every MCP tool call (search, browse, put,
@@ -70,6 +70,28 @@ const DOCUMENT_IMAGE_MIMES = new Set([
   "image/gif",
   "image/webp",
 ]);
+const VAULT_SKILL_ACK_ARGUMENT = "_vault_skill_ack";
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function vaultSkillAckProperty() {
+  return {
+    type: "string",
+    maxLength: 128,
+    description:
+      "Opaque acknowledgement from vault_skill.ack_token. Apply the guide, then retry " +
+      "the unchanged operation with this value. The bundled proxy fills it on an exact retry.",
+  };
+}
 const ASSET_URL_RE = /^\/api\/assets\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/?$/i;
 
 function parseAssetUrl(url) {
@@ -333,6 +355,13 @@ function parseFileUri(uri) {
 }
 
 const FILE_TOOL_NAMES = new Set(FILE_TOOLS.map((t) => t.name));
+const FILE_WRITE_TOOL_NAMES = new Set([
+  "akb_put_file",
+  "akb_put_image",
+  "akb_discard_image",
+  "akb_update_file",
+  "akb_delete_file",
+]);
 
 // Tools where proxy injects a `file` param as alternative to `content`
 const FILE_CONTENT_TOOLS = new Set(["akb_put", "akb_update"]);
@@ -341,9 +370,14 @@ const FILE_CONTENT_TOOLS = new Set(["akb_put", "akb_update"]);
 // local `initialize` response, so it must not silently drift on a proxy
 // behaviour change. There is no import of package.json here to keep lib/
 // zero-dependency and load-safe across Node versions.
-const PROXY_VERSION = "2.2.0";
+const PROXY_VERSION = "2.2.1";
+const VAULT_SKILL_PREFLIGHT_CAPABILITY =
+  "io.dnotitia.akb/vault-skill-preflight";
 const PROXY_INSTRUCTIONS =
   "This akb-mcp proxy provides local-file tools in addition to the AKB backend. " +
+  "A first write may return vault_skill_required before any mutation; apply its " +
+  "vault_skill payload and retry the same call. The proxy binds the returned " +
+  "acknowledgement to that exact retry, so unrelated queued writes remain blocked. " +
   "For an inline document image, call akb_put_image and place its returned `markdown` " +
   "with akb_put for a new document or a targeted akb_edit for an existing one. " +
   "Never pass only an image fragment to akb_update(content=...), because it replaces " +
@@ -375,6 +409,12 @@ export class AKBProxy {
     this._servedDegraded = false; // client was handed a fallback (file-tools-only) list
     this._monitorRunning = false; // background reconnect monitor active
     this._closed = false; // stdin closed / shutting down
+    // Exact-operation acknowledgement cache for backend and proxy-local
+    // writes. A challenge never authorizes a different queued mutation.
+    this._vaultSkillRetryAcks = new Map();
+    // Local file/image tools bypass backend call_tool. Keep their vault-level
+    // challenge pending until an exact retry carries its opaque token.
+    this._localVaultSkillPending = new Map();
   }
 
   _sleep(ms) {
@@ -440,10 +480,6 @@ export class AKBProxy {
       return await this._toolsList(id, params);
     }
 
-    if (method === "tools/call" && FILE_TOOL_NAMES.has(params?.name)) {
-      return await this._handleFileTool(id, params);
-    }
-
     // Resolve `file` → `content` for akb_put / akb_update before forwarding
     if (method === "tools/call" && FILE_CONTENT_TOOLS.has(params?.name)) {
       const args = params.arguments;
@@ -469,7 +505,65 @@ export class AKBProxy {
       }
     }
 
-    return await this._forward(msg);
+    const callKey = method === "tools/call" ? this._vaultSkillCallKey(msg.params) : null;
+    if (callKey) msg = this._withVaultSkillAcknowledgement(msg, callKey);
+
+    const response =
+      method === "tools/call" && FILE_TOOL_NAMES.has(msg.params?.name)
+        ? await this._handleFileTool(id, msg.params)
+        : await this._forward(msg);
+    if (callKey) this._recordVaultSkillOutcome(callKey, msg, response);
+    return response;
+  }
+
+  _vaultSkillCallKey(params) {
+    if (!params?.name || !params.arguments || typeof params.arguments !== "object") {
+      return null;
+    }
+    const args = { ...params.arguments };
+    delete args[VAULT_SKILL_ACK_ARGUMENT];
+    const digest = createHash("sha256").update(canonicalJson(args)).digest("base64url");
+    return `${params.name}\n${digest}`;
+  }
+
+  _withVaultSkillAcknowledgement(msg, callKey) {
+    const args = msg.params?.arguments;
+    if (!args || typeof args !== "object" || args[VAULT_SKILL_ACK_ARGUMENT]) {
+      return msg;
+    }
+    const acknowledgement = this._vaultSkillRetryAcks.get(callKey);
+    if (!acknowledgement) return msg;
+    return {
+      ...msg,
+      params: {
+        ...msg.params,
+        arguments: { ...args, [VAULT_SKILL_ACK_ARGUMENT]: acknowledgement },
+      },
+    };
+  }
+
+  _recordVaultSkillOutcome(callKey, msg, response) {
+    const text = response?.result?.content?.find((item) => item?.type === "text")?.text;
+    let envelope = null;
+    if (text) {
+      try {
+        envelope = JSON.parse(text);
+      } catch {
+        // Non-JSON tool results are unrelated to the acknowledgement contract.
+      }
+    }
+    const challenge = envelope?.vault_skill?.ack_token;
+    if (envelope?.code === "vault_skill_required" && typeof challenge === "string") {
+      this._vaultSkillRetryAcks.delete(callKey);
+      this._vaultSkillRetryAcks.set(callKey, challenge);
+      while (this._vaultSkillRetryAcks.size > 256) {
+        this._vaultSkillRetryAcks.delete(this._vaultSkillRetryAcks.keys().next().value);
+      }
+      return;
+    }
+    if (msg.params?.arguments?.[VAULT_SKILL_ACK_ARGUMENT]) {
+      this._vaultSkillRetryAcks.delete(callKey);
+    }
   }
 
   async _initialize(id, params) {
@@ -524,8 +618,24 @@ export class AKBProxy {
       }
       return { ...t };
     });
-    tools.push(...FILE_TOOLS);
+    tools.push(...this._fileToolsForClient());
     return { ...resp, tools };
+  }
+
+  _fileToolsForClient() {
+    return FILE_TOOLS.map((tool) => {
+      if (!FILE_WRITE_TOOL_NAMES.has(tool.name)) return { ...tool };
+      return {
+        ...tool,
+        inputSchema: {
+          ...tool.inputSchema,
+          properties: {
+            ...(tool.inputSchema?.properties || {}),
+            [VAULT_SKILL_ACK_ARGUMENT]: vaultSkillAckProperty(),
+          },
+        },
+      };
+    });
   }
 
   async _toolsList(id, params) {
@@ -552,7 +662,7 @@ export class AKBProxy {
       process.stderr.write(
         "[akb-mcp] backend unreachable — serving file tools only; will re-list on recovery\n",
       );
-      return { jsonrpc: "2.0", id, result: { tools: [...FILE_TOOLS] } };
+      return { jsonrpc: "2.0", id, result: { tools: this._fileToolsForClient() } };
     }
 
     return { jsonrpc: "2.0", id, result: this._decorateTools(resp) };
@@ -592,6 +702,29 @@ export class AKBProxy {
   async _handleFileTool(id, params) {
     const { name, arguments: args } = params;
     try {
+      const vault = this._fileToolVault(name, args);
+      const vaultSkill = await this._fileToolSkillPreflight(
+        vault,
+        args?.[VAULT_SKILL_ACK_ARGUMENT],
+      );
+      if (vaultSkill && FILE_WRITE_TOOL_NAMES.has(name)) {
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                error: "Apply the vault instructions, then retry this write.",
+                code: "vault_skill_required",
+                retryable: true,
+                vault_skill: vaultSkill,
+              }),
+            }],
+            isError: false,
+          },
+        };
+      }
       let result;
       switch (name) {
         case "akb_put_file":
@@ -617,7 +750,12 @@ export class AKBProxy {
         jsonrpc: "2.0",
         id,
         result: {
-          content: [{ type: "text", text: JSON.stringify(result) }],
+          content: [{
+            type: "text",
+            text: JSON.stringify(
+              vaultSkill ? { ...result, vault_skill: vaultSkill } : result,
+            ),
+          }],
           isError: false,
         },
       };
@@ -633,6 +771,67 @@ export class AKBProxy {
         },
       };
     }
+  }
+
+  _fileToolVault(name, args) {
+    if (name === "akb_put_file" || name === "akb_put_image" || name === "akb_discard_image") {
+      return _resolveParent(args).vault;
+    }
+    return parseFileUri(args.uri).vault;
+  }
+
+  /**
+   * Touch the backend MCP session before a proxy-local file operation.
+   *
+   * Local tools bypass the backend `call_tool` dispatcher, so without this
+   * bridge their first write could commit before the session received the
+   * vault guide. `akb_help` is a reader-authorized, mirror-aware backend call
+   * and therefore reuses the same version/session gate as every native tool.
+   * A write-only credential receives no payload and remains usable.
+   */
+  async _fileToolSkillPreflight(vault, acknowledgement = null) {
+    if (!vault) return null;
+    const ok = await this._ensureBackend();
+    if (!ok) throw new Error("backend unreachable");
+    const response = await this._rpc("tools/call", {
+      name: "akb_help",
+      arguments: { topic: "vault-skill", vault },
+    });
+    const text = response.content?.find((item) => item?.type === "text")?.text;
+    let projected = null;
+    try {
+      const envelope = JSON.parse(text);
+      projected = envelope?.vault_skill || null;
+    } catch {
+      projected = null;
+    }
+
+    let pending = this._localVaultSkillPending.get(vault) || null;
+    if (projected) {
+      if (!pending || pending.guide.version !== projected.version) {
+        pending = {
+          token: randomBytes(24).toString("base64url"),
+          guide: null,
+        };
+        pending.guide = { ...projected, ack_token: pending.token };
+        this._localVaultSkillPending.set(vault, pending);
+        while (this._localVaultSkillPending.size > 256) {
+          this._localVaultSkillPending.delete(
+            this._localVaultSkillPending.keys().next().value,
+          );
+        }
+      } else {
+        this._localVaultSkillPending.delete(vault);
+        this._localVaultSkillPending.set(vault, pending);
+      }
+    }
+
+    if (!pending) return null;
+    if (typeof acknowledgement === "string" && acknowledgement === pending.token) {
+      this._localVaultSkillPending.delete(vault);
+      return null;
+    }
+    return pending.guide;
   }
 
   async _putFile(args) {
@@ -1102,10 +1301,26 @@ export class AKBProxy {
     if (this._connecting) return this._connecting;
     this._connecting = (async () => {
       try {
-        const initParams = this._clientInitParams || {
+        const sourceParams = this._clientInitParams || {
           protocolVersion: MCP_PROTOCOL_VERSION,
           capabilities: {},
           clientInfo: { name: "akb-mcp-client", version: PROXY_VERSION },
+        };
+        // Strict vault-guide preflight changes a successful write into a
+        // retry envelope. Advertise support on behalf of this proxy version;
+        // raw/older MCP clients that do not opt in retain additive injection.
+        // Merge rather than replace client capabilities so roots/sampling and
+        // unrelated experimental features survive the bridge unchanged.
+        const sourceCapabilities = sourceParams.capabilities || {};
+        const initParams = {
+          ...sourceParams,
+          capabilities: {
+            ...sourceCapabilities,
+            experimental: {
+              ...(sourceCapabilities.experimental || {}),
+              [VAULT_SKILL_PREFLIGHT_CAPABILITY]: { version: 2 },
+            },
+          },
         };
         await this._rpc("initialize", initParams, { timeoutMs: this._probeTimeoutMs() });
         this._backendReady = true;

@@ -73,6 +73,41 @@ itAsync("initialize falls back to a default protocol version when omitted", asyn
   assert.match(res.result.protocolVersion, /^\d{4}-\d{2}-\d{2}$/);
 });
 
+itAsync("backend initialize negotiates vault-guide preflight without dropping client capabilities", async () => {
+  const proxy = newProxy();
+  const original = {
+    protocolVersion: "2025-06-18",
+    capabilities: {
+      roots: { listChanged: true },
+      experimental: { "example.test/feature": { version: 2 } },
+    },
+    clientInfo: { name: "client", version: "1" },
+  };
+  proxy._clientInitParams = original;
+  let forwarded;
+  proxy._rpc = async (method, params) => {
+    assert.equal(method, "initialize");
+    forwarded = params;
+    return {};
+  };
+
+  assert.equal(await proxy._ensureBackend(), true);
+  assert.deepEqual(forwarded.capabilities.roots, { listChanged: true });
+  assert.deepEqual(
+    forwarded.capabilities.experimental["example.test/feature"],
+    { version: 2 },
+  );
+  assert.deepEqual(
+    forwarded.capabilities.experimental["io.dnotitia.akb/vault-skill-preflight"],
+    { version: 2 },
+  );
+  assert.equal(
+    original.capabilities.experimental["io.dnotitia.akb/vault-skill-preflight"],
+    undefined,
+    "client initialize params are not mutated",
+  );
+});
+
 // ── tools/list degrades to file tools when the backend is unreachable ─
 
 itAsync("tools/list serves file tools only when backend is down and nothing cached", async () => {
@@ -109,6 +144,7 @@ itAsync("tools/list serves the full decorated list from cache", async () => {
   assert.match(image.description, /maximum 10 MiB/);
   assert.match(image.description, /targeted akb_edit/);
   assert.match(image.description, /replaces the entire body/);
+  assert.ok(image.inputSchema.properties._vault_skill_ack);
   assert.equal(proxy._servedDegraded, false, "cached full list is not degraded");
   // The cache must not be mutated by decoration.
   assert.ok(
@@ -154,6 +190,82 @@ itAsync("monitor stays silent on recovery when the list was never degraded", asy
 
   assert.equal(notes.length, 0, "no spurious list_changed when nothing was degraded");
   proxy._closed = true;
+});
+
+itAsync("vault-guide acknowledgement is attached only to the exact backend retry", async () => {
+  const proxy = newProxy();
+  const forwarded = [];
+  const challenge = {
+    error: "Apply the vault instructions",
+    code: "vault_skill_required",
+    retryable: true,
+    vault_skill: {
+      vault: "v1",
+      version: "guide-v1",
+      body: "# Guide",
+      ack_token: "opaque-ack",
+    },
+  };
+  proxy._forward = async (msg) => {
+    forwarded.push(msg);
+    const body = forwarded.length === 1 ? challenge : { updated: true };
+    return {
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: { content: [{ type: "text", text: JSON.stringify(body) }] },
+    };
+  };
+  const params = {
+    name: "akb_update",
+    arguments: { content: "new", uri: "akb://v1/doc/a.md" },
+  };
+
+  await proxy._handle({ jsonrpc: "2.0", id: 1, method: "tools/call", params });
+  await proxy._handle({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    // Reordered keys still identify the unchanged logical operation.
+    params: {
+      name: "akb_update",
+      arguments: { uri: "akb://v1/doc/a.md", content: "new" },
+    },
+  });
+
+  assert.equal(forwarded[0].params.arguments._vault_skill_ack, undefined);
+  assert.equal(forwarded[1].params.arguments._vault_skill_ack, "opaque-ack");
+});
+
+itAsync("vault-guide acknowledgement never authorizes an unrelated queued write", async () => {
+  const proxy = newProxy();
+  const forwarded = [];
+  proxy._forward = async (msg) => {
+    forwarded.push(msg);
+    return {
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            code: "vault_skill_required",
+            vault_skill: { ack_token: "opaque-ack", version: "v1" },
+          }),
+        }],
+      },
+    };
+  };
+
+  await proxy._handle({
+    jsonrpc: "2.0", id: 1, method: "tools/call",
+    params: { name: "akb_put", arguments: { vault: "v1", title: "A", content: "a" } },
+  });
+  await proxy._handle({
+    jsonrpc: "2.0", id: 2, method: "tools/call",
+    params: { name: "akb_put", arguments: { vault: "v1", title: "B", content: "b" } },
+  });
+
+  assert.equal(forwarded[1].params.arguments._vault_skill_ack, undefined);
 });
 
 // ── _forward never kills the process; it recovers or surfaces an error ─

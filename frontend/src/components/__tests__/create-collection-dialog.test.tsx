@@ -56,6 +56,47 @@ describe("CreateCollectionDialog", () => {
     expect(createMock).not.toHaveBeenCalled();
   });
 
+  it("blocks the reserved 'overview' namespace before calling the API", async () => {
+    const user = userEvent.setup();
+    render(
+      <CreateCollectionDialog
+        vault="v"
+        open
+        onOpenChange={() => {}}
+        onCreated={() => {}}
+      />,
+    );
+
+    const input = screen.getByLabelText(/path/i);
+    await user.type(input, "overview");
+    await user.click(screen.getByRole("button", { name: /create/i }));
+    expect(await screen.findByText(/system collection/i)).toBeInTheDocument();
+    expect(createMock).not.toHaveBeenCalled();
+
+    // The whole subtree is reserved, not just the root.
+    fireEvent.change(input, { target: { value: "overview/sub" } });
+    await user.click(screen.getByRole("button", { name: /create/i }));
+    expect(await screen.findByText(/system collection/i)).toBeInTheDocument();
+    expect(createMock).not.toHaveBeenCalled();
+
+    // A merely similar name is NOT reserved.
+    fireEvent.change(input, { target: { value: "overview-notes" } });
+    createMock.mockResolvedValue({
+      ok: true,
+      created: true,
+      collection: {
+        path: "overview-notes",
+        name: "overview-notes",
+        summary: null,
+        doc_count: 0,
+      },
+    });
+    await user.click(screen.getByRole("button", { name: /create/i }));
+    await waitFor(() =>
+      expect(createMock).toHaveBeenCalledWith("v", "overview-notes", undefined),
+    );
+  });
+
   it("trims trailing slash before calling createCollection", async () => {
     createMock.mockResolvedValue({
       ok: true,

@@ -238,6 +238,10 @@ export const VaultSettingsOwner: Story = {
     const canvas = within(canvasElement);
     await expect(await canvas.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
     await expect(await canvas.findByText("Danger zone")).toBeInTheDocument();
+    // Active vault + write role → the guide is editable here.
+    await expect(
+      await canvas.findByRole("button", { name: /reset to template/i }),
+    ).toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
 };
@@ -281,6 +285,14 @@ export const VaultSettingsArchived: Story = {
     const canvas = within(canvasElement);
     await expect(await canvas.findByText("Archived")).toBeInTheDocument();
     await expect(await canvas.findByRole("button", { name: "Unarchive" })).toBeInTheDocument();
+    // Owner, but the vault is server-side read-only: the guide section renders
+    // its read surfaces (await one so the negatives below aren't just "not
+    // loaded yet") without the Edit tab or Reset button.
+    await expect(await canvas.findByRole("tab", { name: /agent view/i })).toBeInTheDocument();
+    await expect(canvas.queryByRole("tab", { name: /^edit$/i })).not.toBeInTheDocument();
+    await expect(
+      canvas.queryByRole("button", { name: /reset to template/i }),
+    ).not.toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
 };

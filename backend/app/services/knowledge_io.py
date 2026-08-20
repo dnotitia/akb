@@ -19,14 +19,17 @@ concept doc imports as a regular document describing that asset.
 from __future__ import annotations
 
 import io
+import logging
 import zipfile
 from collections.abc import Mapping
 from typing import Any
 
 from app.exceptions import ConflictError
 from app.models.document import DocumentPutRequest
-from app.services import okf
+from app.services import okf, skill_policy
 from app.util.text import slugify
+
+logger = logging.getLogger("akb.knowledge_io")
 
 # Registered bundle formats. `fmt` values accepted by every entry point.
 SUPPORTED_FORMATS = ("okf",)
@@ -34,6 +37,16 @@ SUPPORTED_FORMATS = ("okf",)
 # Guard rails for untrusted import archives (zip-bomb / runaway payloads).
 _MAX_BUNDLE_FILES = 10_000
 _MAX_BUNDLE_BYTES = 64 * 1024 * 1024  # 64 MiB uncompressed
+
+
+def _is_reserved_record(rec: dict) -> bool:
+    """Import may not create docs in the reserved namespace or with the
+    reserved type; such records are skipped per-record (never a whole-bundle
+    failure) so pre-reservation bundles keep importing."""
+    return (
+        skill_policy.is_reserved_collection(rec.get("collection"))
+        or rec.get("type") == skill_policy.SKILL_DOC_TYPE
+    )
 
 
 def _require_format(fmt: str) -> str:
@@ -130,8 +143,16 @@ async def import_bundle(
     records = okf.parse_okf_bundle(files)
     created: list[str] = []
     skipped: list[str] = []
+    reserved: list[str] = []
     errors: list[dict[str, str]] = []
     for rec in records:
+        if _is_reserved_record(rec):
+            reserved.append(rec["path"])
+            logger.warning(
+                "import: skipped reserved record %s (overview/skill is system-managed)",
+                rec["path"],
+            )
+            continue
         req = DocumentPutRequest(
             vault=vault_name,
             collection=rec["collection"],
@@ -168,6 +189,7 @@ async def import_bundle(
         "failed": len(errors),
         "uris": created,
         "skipped_paths": skipped,
+        "reserved": reserved,
         "errors": errors,
     }
 

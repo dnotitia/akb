@@ -105,6 +105,8 @@ export const BadgeStates: Story = {
       <Panel>
         <PanelHeader label="Skill guide state" />
         <div className="flex flex-wrap gap-2 p-5">
+          <SkillBadge defined customized />
+          <SkillBadge defined customized={false} />
           <SkillBadge defined lineCount={42} />
           <SkillBadge defined />
           <SkillBadge defined={false} />

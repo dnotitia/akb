@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Alert } from "@/components/ui/alert";
 import { createCollection } from "@/lib/api";
+import { isReservedCollection } from "@/lib/skill";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -45,6 +46,12 @@ function normalize(raw: string): { path: string } | { error: string } {
     if (seg === "" || seg === "." || seg === "..") {
       return { error: `Invalid path segment: "${seg}"` };
     }
+  }
+  if (isReservedCollection(trimmed)) {
+    return {
+      error:
+        "'overview' is a system collection reserved for the vault guide. Pick a different collection.",
+    };
   }
   return { path: trimmed };
 }
