@@ -15,19 +15,39 @@ the AKB API audience and still must be rejected. Finally, the provider is
 disabled, the AKB identity binding is rolled back, the operator removes the
 Keycloak prelink/user, and a secret-free JSON receipt is printed.
 
-It also asks a separate question about a differently shaped account. The
-prelink above is an operator's: marked verified, and linked to the upstream
-subject by hand. An account created by member invitation is neither — it is
-enabled, carries no credential and no required action, its address is
-unverified, and nothing is linked to it — so whether the invited person's first
-login through the broker lands on THAT account is a claim about Keycloak's
-first-broker-login rather than about this codebase. The phase creates the
-seeded shape, checks every property of it rather than assuming it, supplies the
-invited person's upstream credential and nothing else, and records which
-account the login landed on, what became of the address's verified flag, and
-every page demanded along the way. It stops at the first page beyond the
-credential rather than answering it, because a step the invited person cannot
-complete is a failure and not a slow success.
+Two further phases are about the people nobody linked by hand, which is
+everyone a workspace admits after it owns its identity provider.
+
+The first asserts where an account seeded ahead of arrival stops its owner.
+Member invitation used to create the realm account before the person arrived,
+deliberately with no credential — a member holding a realm-native password
+keeps it after their organisation revokes the upstream account meant to govern
+them — and left the address unverified on the stated ground that the first
+accepted login would set the flag from the upstream's signed proof. That was a
+claim about Keycloak, so the phase seeds exactly that shape, checks every
+property of it rather than assuming it, supplies the invited person's upstream
+credential and nothing else, and asserts the page they are stopped on:
+confirm-link, on the broker realm, with no token issued and the verified flag
+still false. The seeding ceremony is still in the codebase behind a switch,
+correct only where the platform is itself the upstream, so the next person to
+read that switch finds the measurement rather than the intention.
+
+The second drives the whole admission chain. Nothing is seeded. The invited
+person signs in through the upstream they already have; the broker mints their
+subject; `invite_only` refuses them and the arrival is recorded with that exact
+pair; an administrator approves that row; they sign in again and they are in —
+and the subject is read out of a token this runtime's own verifier accepted,
+not out of an admin read, because the pair an approval binds must be the pair a
+token actually carries. It also proves the two properties the pre-boundary
+workspace migration depends on, because that migration is the same three steps:
+approving with `existing_user_id` keeps the AKB account a person already has,
+with its token still authorizing and its old binding still beside the new one,
+and someone who signs in twice before anyone approves them produces one record
+rather than two.
+
+Together the two are each other's control: same fixture, same run, same
+credential, one page and a token when nothing was seeded and two pages and no
+token when something was.
 
 It also measures where the authority to mint the product administrator's
 credential actually lives, against the same realm. Three facts in one phase: the
