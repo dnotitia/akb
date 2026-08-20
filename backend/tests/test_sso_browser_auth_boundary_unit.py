@@ -11,7 +11,7 @@ import pytest
 from app.api.routes import auth
 from app.config import settings
 from app.exceptions import AuthenticationError
-from app.services.auth_service import AuthenticatedUser
+from app.services.auth_service import AuthenticatedUser, ProjectionOutcome
 from app.services.auth_verifier_profiles import VerifiedPrincipal
 from app.services.keycloak_oidc import BrowserAuthorizationRequest
 from app.services.sso_browser_session_service import (
@@ -244,7 +244,10 @@ async def test_callback_projects_access_token_but_returns_only_opaque_cookies(
 
     async def project(value):
         assert value is principal
-        return user
+        # The boundary carries a reason alongside the account now, so the callback
+        # can tell "not a member" apart from every other refusal. Success carries
+        # none.
+        return ProjectionOutcome(user)
 
     async def create(value, verified, id_claims, tokens):
         captured.update(
@@ -260,7 +263,7 @@ async def test_callback_projects_access_token_but_returns_only_opaque_cookies(
         )
 
     monkeypatch.setattr(auth, "get_keycloak_oidc", lambda: OIDC())
-    monkeypatch.setattr(auth, "project_verified_principal", project)
+    monkeypatch.setattr(auth, "project_verified_principal_with_reason", project)
     monkeypatch.setattr(auth, "create_sso_browser_session", create)
     request = _request(cookie="__Host-akb_sso_oidc_binding=browser-binding-value-that-is-long-enough")
 
@@ -312,12 +315,21 @@ async def test_unbound_or_replayed_callback_fails_before_token_exchange(monkeypa
             raise AssertionError("unbound state must fail before token exchange")
 
     monkeypatch.setattr(auth, "get_keycloak_oidc", lambda: OIDC())
-    with pytest.raises(AuthenticationError, match="sign-in failed"):
-        await auth.keycloak_callback(
-            _request(),
-            code="code-1",
-            state="state-1",
-        )
+    # The point of this case is unchanged and is asserted by OIDC.exchange_browser_code
+    # above: an unbound or replayed state must fail BEFORE the code is exchanged.
+    # What changed is the shape of the failure. The callback is reached by a
+    # browser following a redirect, so raising rendered a serialized error object
+    # as the page; it now answers with the product's sign-in page instead.
+    response = await auth.keycloak_callback(
+        _request(),
+        code="code-1",
+        state="state-1",
+    )
+
+    assert response.status_code == 303
+    # And it says nothing about why. A replayed state is not a person waiting for
+    # admission, and the only named refusal is the one that helps them.
+    assert response.headers["location"] == "/auth?sso_error=sso_failed"
 
 
 @pytest.mark.asyncio

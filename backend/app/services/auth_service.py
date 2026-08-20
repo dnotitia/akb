@@ -581,33 +581,54 @@ async def _resolve_or_provision_keycloak_user(claims: dict) -> dict:
         return _resolved_external_user(row, newly_provisioned=True)
 
 
+@dataclass(frozen=True)
+class ProjectionOutcome:
+    """What the projection boundary decided, and why when it refused.
+
+    The boundary used to answer ``None`` for every rejection there is — no
+    membership, suspended account, provider disabled, conflicting binding — so
+    nothing above it could tell them apart. Callers that only need "in or not"
+    still get exactly that from ``project_verified_principal``; a caller that
+    has to explain itself to a person can ask for the reason.
+
+    ``refusal_code`` is the AKBError code the service layer already raised. It
+    is not a licence to show it: naming a refusal discloses that this runtime
+    verified the token, so each caller decides which reasons it may repeat.
+    """
+
+    user: AuthenticatedUser | None
+    refusal_code: str | None = None
+
+
 async def _project_keycloak_principal(
     principal: VerifiedPrincipal,
-) -> AuthenticatedUser | None:
+) -> ProjectionOutcome:
     """Project a completely verified OIDC identity onto the AKB account path."""
     claims = dict(principal.claims)
     try:
         issuer, subject = _external_identity_key(claims)
         if (issuer, subject) != (principal.issuer, principal.subject):
-            return None
+            return ProjectionOutcome(None, "identity_claims_inconsistent")
         resolved = await _resolve_or_provision_keycloak_user(claims)
     except AKBError as e:
         logging.getLogger("akb.auth").info("Keycloak access token: account projection rejected (%s)", e)
-        return None
+        return ProjectionOutcome(None, getattr(e, "code", None))
 
     if resolved["newly_provisioned"]:
         await get_role_sync().on_user_create(resolved["user_id"])
 
     scope_str = claims["scope"]
     scopes = [scope for scope in scope_str.split(" ") if scope]
-    return AuthenticatedUser(
-        user_id=str(resolved["user_id"]),
-        username=resolved["username"],
-        email=resolved["email"] or "",
-        display_name=resolved["display_name"],
-        is_admin=resolved["is_admin"],
-        auth_method="oauth",
-        oauth_scopes=scopes,
+    return ProjectionOutcome(
+        AuthenticatedUser(
+            user_id=str(resolved["user_id"]),
+            username=resolved["username"],
+            email=resolved["email"] or "",
+            display_name=resolved["display_name"],
+            is_admin=resolved["is_admin"],
+            auth_method="oauth",
+            oauth_scopes=scopes,
+        )
     )
 
 
@@ -663,16 +684,39 @@ async def project_verified_principal(
     fail-closed: a future caller of this boundary is gated unless it
     deliberately asks not to be.
     """
+    outcome = await project_verified_principal_with_reason(
+        principal,
+        for_credential_change=for_credential_change,
+    )
+    return outcome.user
+
+
+async def project_verified_principal_with_reason(
+    principal: VerifiedPrincipal,
+    *,
+    for_credential_change: bool = False,
+) -> ProjectionOutcome:
+    """The same boundary, carrying the reason when it refuses.
+
+    Only the OIDC path reports a reason today, because it is the only one whose
+    refusal a person is waiting on. The others answer with no code, which reads
+    the same as before and keeps a caller from repeating something the service
+    layer never said.
+    """
     if principal.profile_id == LOCAL_SESSION_RS256_V2:
-        return await _project_local_session_principal(
-            principal,
-            for_credential_change=for_credential_change,
+        return ProjectionOutcome(
+            await _project_local_session_principal(
+                principal,
+                for_credential_change=for_credential_change,
+            )
         )
     if principal.profile_id == KEYCLOAK_ACCESS_V1:
         return await _project_keycloak_principal(principal)
     if principal.profile_id == KEYCLOAK_SERVICE_AUTHORITY_V1:
-        return await _project_service_authority_principal(principal)
-    return None
+        return ProjectionOutcome(
+            await _project_service_authority_principal(principal)
+        )
+    return ProjectionOutcome(None)
 
 
 async def resolve_keycloak_access_token(

@@ -157,6 +157,48 @@ describe("AuthPage mode gate", () => {
     expect(navigate).not.toHaveBeenCalled();
   });
 
+  // The SSO callback is reached by a browser following a redirect, so it cannot
+  // answer with an error body — whatever it returns IS the page. It sends the
+  // person back here with an allowlisted reason code, and this is where that
+  // code has to become a sentence. Measured before the fix: an invited person
+  // waiting for approval saw a serialized error object on a blank white page.
+  it("tells an invited person waiting for approval what is actually happening", async () => {
+    vi.mocked(getAuthConfig).mockResolvedValue(stagedSsoConfig);
+    window.history.replaceState({}, "", "/auth?sso_error=membership_required");
+
+    renderAuth();
+
+    expect(await screen.findByText(/not a member of this workspace yet/i)).toBeInTheDocument();
+    expect(screen.getByText(/administrator has to admit you/i)).toBeInTheDocument();
+  });
+
+  it("says something generic for every other refusal, and never echoes the code", async () => {
+    vi.mocked(getAuthConfig).mockResolvedValue(stagedSsoConfig);
+    // The server only ever sends an allowlisted code; the page must still not
+    // put an arbitrary one on screen, because that is what makes the allowlist
+    // the only thing standing between a query string and rendered text.
+    window.history.replaceState({}, "", "/auth?sso_error=<script>alert(1)</script>");
+
+    renderAuth();
+
+    expect(await screen.findByText(/did not complete/i)).toBeInTheDocument();
+    expect(screen.queryByText(/alert\(1\)/)).toBeNull();
+    expect(screen.queryByText(/not a member of this workspace yet/i)).toBeNull();
+  });
+
+  it("says nothing about SSO failures when the person simply arrived", async () => {
+    vi.mocked(getAuthConfig).mockResolvedValue(stagedSsoConfig);
+    window.history.replaceState({}, "", "/auth");
+
+    renderAuth();
+
+    // `browser_session_ready: false` in this fixture, so the page settles on the
+    // staged-provider notice — enough to know it rendered before asserting absence.
+    await screen.findByText(/SSO browser sign-in is not available yet/i);
+    expect(screen.queryByText(/did not complete/i)).toBeNull();
+    expect(screen.queryByText(/not a member of this workspace yet/i)).toBeNull();
+  });
+
   it("shows setup pending rather than a local fallback when no IdP is enabled", async () => {
     vi.mocked(getAuthConfig).mockResolvedValue({
       ...stagedSsoConfig,
