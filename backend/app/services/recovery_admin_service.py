@@ -772,9 +772,20 @@ async def issue_recovery_admin_credential(
                 # management client is deliberately without `manage-users`,
                 # and the temporary bootstrap client that created the product
                 # administrator is deleted and proven dead before the install
-                # writes its retirement receipt. Rotating here needs an
-                # authority an operator creates and destroys, which does not
-                # exist yet.
+                # writes its retirement receipt.
+                #
+                # Rotating needs an authority that is created and destroyed
+                # around the one operation, and that authority now exists —
+                # outside a running AKB, which is where it has to be. Creating
+                # one means reaching Keycloak's own database, so whoever
+                # performs the ceremony holds far more than `manage-users`
+                # for as long as it lasts. An AKB able to start it would hold
+                # a standing path to exactly that, which is a larger capability
+                # than the one this refusal exists to withhold.
+                #
+                # So this stays a refusal, and is not a gap: it is the boundary
+                # being kept from the inside while the deployment's own control
+                # plane serves the rotation from the outside.
                 raise RecoveryAdminCredentialUnavailableError()
             if not _is_issuable_local_recovery(
                 row,
