@@ -44,6 +44,7 @@ from app.services.document_service import (
     validate_vault_name,
 )
 from app.services.m1_pg_body_store import M1PgBodyStore
+from app.services.kg_service import validate_new_structured_relation_refs
 from app.services.native_revision_service import (
     Failpoint,
     NativeRevisionService,
@@ -307,6 +308,8 @@ class NativeDocumentService(DocumentService):
         del allow_unavailable_asset_refs
         if req.status not in DOC_STATUSES:
             raise ValidationError(f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}")
+        validate_new_structured_relation_refs(req.vault, req.depends_on)
+        validate_new_structured_relation_refs(req.vault, req.related_to)
         skill_policy.check_put(
             normalize_collection_path(req.collection), req.type,
             internal=skill_internal,
@@ -451,6 +454,18 @@ class NativeDocumentService(DocumentService):
             previous_hash = _body_content_hash(current_body)
             if req.expected_content_hash and req.expected_content_hash != previous_hash:
                 raise ConflictError(f"content_hash moved: expected {req.expected_content_hash}, actual {previous_hash}")
+            if req.depends_on is not None:
+                validate_new_structured_relation_refs(
+                    vault,
+                    req.depends_on,
+                    existing_refs=ensure_list(frontmatter.get("depends_on", [])),
+                )
+            if req.related_to is not None:
+                validate_new_structured_relation_refs(
+                    vault,
+                    req.related_to,
+                    existing_refs=ensure_list(frontmatter.get("related_to", [])),
+                )
             if req.title:
                 frontmatter["title"] = req.title
             if req.type:

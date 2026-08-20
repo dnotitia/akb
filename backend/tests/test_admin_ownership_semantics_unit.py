@@ -165,6 +165,10 @@ async def test_owner_initiated_transfer_succeeds_when_row_matches(
 class _VaultInfoConn(_FakeConn):
     """Extends the transfer fake with the vault_info fan-out queries."""
 
+    def __init__(self, *, vault_owner: uuid.UUID):
+        super().__init__(vault_owner=vault_owner)
+        self.fetchval_calls: list[tuple[str, tuple]] = []
+
     async def fetchrow(self, query: str, *args):
         if "SELECT * FROM vaults" in query:
             return {
@@ -183,6 +187,7 @@ class _VaultInfoConn(_FakeConn):
         raise AssertionError(f"unexpected fetchrow: {query}")
 
     async def fetchval(self, query: str, *args):
+        self.fetchval_calls.append((" ".join(query.split()), args))
         return 0
 
 
@@ -234,3 +239,20 @@ async def test_vault_info_keeps_owner_role_for_the_literal_owner(
     info = await access_service.get_vault_info(str(OWNER_ID), "fixture-vault")
 
     assert info["role"] == "owner"
+
+
+async def test_vault_info_edge_count_uses_the_reader_visible_boundary(
+    monkeypatch, vault_info_env
+):
+    _grant_reader_access(monkeypatch, role="reader", role_source="member")
+
+    await access_service.get_vault_info(str(OWNER_ID), "fixture-vault")
+
+    query, args = next(
+        (query, args)
+        for query, args in vault_info_env.fetchval_calls
+        if "FROM edges" in query
+    )
+    assert "starts_with(source_uri, $2)" in query
+    assert "starts_with(target_uri, $2)" in query
+    assert args == (VAULT_ID, "akb://fixture-vault/")

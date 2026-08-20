@@ -185,7 +185,7 @@ async def delete_relation(
     relation: RelationType | None = Query(
         None,
         description="Relation type to remove (one of the link vocabulary); "
-        "omit to remove all edges between the two",
+        "omit to remove all explicit edges between the two",
     ),
     user: AuthenticatedUser = Depends(get_current_user),
 ):

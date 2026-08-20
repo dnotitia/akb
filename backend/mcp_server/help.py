@@ -46,7 +46,8 @@ Every resource has a URI: `akb://{vault}/{type}/{id}`
 - `akb://eng/table/experiments` → table
 - `akb://eng/file/abc123-def456` → file
 
-Use these URIs with `akb_link` and `akb_relations` to connect any resource to any other.
+Use these URIs with `akb_link` and `akb_relations` to connect resources within
+the same vault. Cross-vault citations stay ordinary Markdown links.
 
 ## Workflows — drill down with `akb_help(topic="...")`
 
@@ -435,6 +436,11 @@ Browse results include the `uri` field for each resource.
 
 ## Creating Links
 
+Structured relations are vault-local: every source and target below must use
+the same vault. To cite content in another vault, keep the `akb://` URI as an
+ordinary Markdown link. AKB preserves that authored link but does not query the
+target or add it to either vault's graph.
+
 **Explicit (any resource type):**
 ```
 akb_link(
@@ -467,7 +473,7 @@ akb_unlink(
 
 akb_unlink(
   source="akb://eng/doc/specs/api.md",
-  target="akb://eng/table/api-endpoints")  # removes ALL relations between them
+  target="akb://eng/table/api-endpoints")  # removes all explicit relations between them
 ```
 
 ## Querying Relations
@@ -475,11 +481,15 @@ akb_unlink(
 akb_relations(uri="akb://eng/doc/specs/api.md")
 akb_relations(uri="akb://eng/table/experiments", direction="incoming")
 ```
+Each returned row has `kind="explicit"` for an `akb_link` edge or
+`kind="implicit"` when it is managed by document metadata/body content.
+Remove explicit rows with `akb_unlink`; edit the source document to remove an
+implicit row.
 
 ## Graph View
 ```
 akb_graph(vault="eng")                           # Full vault graph (all types)
-akb_graph(uri="akb://eng/doc/specs/api.md", depth=2)
+akb_graph(uri="akb://eng/doc/specs/api.md", hops=2)
 ```
 
 ## Provenance
@@ -534,7 +544,7 @@ result = akb_put(vault="eng", collection="decisions", title="API Redesign",
 ### Step 4: Verify the graph
 ```
 akb_relations(uri="akb://eng/doc/specs/experiment-design.md")
-akb_graph(uri="akb://eng/doc/specs/experiment-design.md", depth=2)
+akb_graph(uri="akb://eng/doc/specs/experiment-design.md", hops=2)
 ```
 
 ### Step 5: Remove a link if needed
@@ -666,8 +676,8 @@ akb_help(topic="link-resources")    # Workflow guide
 | tags | | ["auth", "api"] |
 | domain | | engineering, product, ops, legal, etc. |
 | summary | | Brief summary (auto-generated if omitted) |
-| depends_on | | ["akb://vault/doc/path"] — URIs of prerequisite documents |
-| related_to | | ["akb://vault/doc/path"] — URIs of related documents |
+| depends_on | | Same-vault URIs of prerequisite documents |
+| related_to | | Same-vault URIs of related documents |
 
 ## Examples
 
@@ -732,8 +742,8 @@ body**. Never pass only a newly uploaded image or another partial fragment as
 | status | | draft (default), active, archived |
 | tags | | New tag list (replaces existing) |
 | summary | | New summary |
-| depends_on | | Update dependency list (akb:// URIs) |
-| related_to | | Update related list (akb:// URIs) |
+| depends_on | | Update same-vault dependency list (akb:// URIs) |
+| related_to | | Update same-vault related list (akb:// URIs) |
 | message | | Git commit message |
 | expected_commit | | Reject if the document moved since it was read |
 | expected_content_hash | | Reject if the current body changed since it was read |
@@ -1130,7 +1140,11 @@ Requires writer role. All edges referencing this document are automatically clea
 ```
 akb_relations(uri="akb://eng/doc/specs/api.md")
 akb_relations(uri="akb://eng/table/experiments", direction="incoming")
-```""",
+```
+
+Every returned row includes `kind`: `explicit` rows are removable with
+`akb_unlink`; `implicit` rows must be removed by editing the document metadata
+or Markdown link that generated them. Relations never cross vaults.""",
 
     "akb_graph": """# akb_graph — Knowledge Graph (Cross-Type)
 
@@ -1141,7 +1155,7 @@ Shows nodes (documents, tables, files) and edges (all relation types).
 |-------|----------|-------------|
 | vault | | Vault name (use for full-vault graph) |
 | uri | | Center node AKB URI (use to anchor on a specific resource) |
-| depth | | BFS traversal depth (1-5, default 2) |
+| hops | | BFS traversal radius (1-5, default 2) |
 | limit | | Max nodes (1-200, default 50) |
 
 Pass either `vault` (full vault graph) or `uri` (graph anchored on one resource).
@@ -1149,7 +1163,7 @@ Pass either `vault` (full vault graph) or `uri` (graph anchored on one resource)
 ## Examples
 ```
 akb_graph(vault="eng")                                            # Full vault graph
-akb_graph(uri="akb://eng/table/experiments", depth=2)             # From a table
+akb_graph(uri="akb://eng/table/experiments", hops=2)              # From a table
 akb_graph(uri="akb://eng/doc/specs/api.md", depth=3)              # 3-hop from doc
 ```""",
 
@@ -1803,6 +1817,8 @@ akb_link(
     "akb_unlink": """# akb_unlink — Remove a Relation
 
 The vault is inferred from the URIs — no separate `vault` arg.
+Both URIs must be in that same vault. This command removes explicit
+`akb_link` edges only; edit the source document to remove an implicit edge.
 
 ## Parameters
 | Param | Required | Description |
@@ -1820,7 +1836,7 @@ akb_unlink(
 
 akb_unlink(
   source="akb://eng/doc/specs/api.md",
-  target="akb://eng/table/endpoints")  # removes ALL relations
+  target="akb://eng/table/endpoints")  # removes all explicit relations
 ```""",
 
     # ── Vault skill ───────────────────────────────────────────

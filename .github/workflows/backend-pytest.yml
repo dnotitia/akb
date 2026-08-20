@@ -197,6 +197,11 @@ jobs:
         # collection intentionally skips without Postgres, so keep both files
         # explicit here: otherwise account uniqueness, exact identity FKs,
         # session concurrency, and the 072 upgrade path would never gate CI.
+        #
+        # Edge vault-boundary enforcement is a PostgreSQL trigger contract.
+        # The application tests prove early rejection and filtered reads; this
+        # live test proves a direct SQL writer cannot create a new cross-vault
+        # edge or turn a valid row into one.
         run: >
           pytest
           tests/test_pgvector_ext_bootstrap_e2e.py
@@ -223,6 +228,7 @@ jobs:
           tests/test_admin_auth_postgres.py
           tests/test_sso_identity_migration_postgres.py
           tests/test_pending_admission_postgres.py
+          tests/test_edge_vault_boundary_postgres.py
           tests/test_workspace_external_identity.py
           tests/test_workspace_account_admin_service.py
           tests/test_sso_browser_session_postgres.py
