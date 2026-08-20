@@ -82,3 +82,23 @@ def test_tools_and_handlers_are_in_sync():
         f"@_h handlers in server.py but not in TOOLS list: "
         f"{sorted(missing_tool)}"
     )
+
+
+def test_relation_tool_descriptions_match_the_vault_boundary():
+    tools = {tool.name: tool for tool in TOOLS}
+
+    for tool_name in ("akb_put", "akb_update"):
+        properties = tools[tool_name].inputSchema["properties"]
+        for field in ("depends_on", "related_to"):
+            description = properties[field]["description"].lower()
+            assert "same-vault" in description
+            assert "ordinary markdown link" in description
+            assert "cross-vault" in description
+
+    assert "same-vault knowledge graph" in tools["akb_graph"].description.lower()
+    assert "visible same-vault relations" in tools["akb_provenance"].description.lower()
+
+    relations = tools["akb_relations"].description.lower()
+    assert "explicit" in relations and "implicit" in relations
+    unlink = tools["akb_unlink"].description.lower()
+    assert "explicit" in unlink and "implicit" in unlink

@@ -199,8 +199,8 @@ TOOLS = [
                 "status": {"type": "string", "enum": ["draft", "active", "archived"]},
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "summary": {"type": "string"},
-                "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Update the same-vault dependency list (akb:// URIs)"},
-                "related_to": {"type": "array", "items": {"type": "string"}, "description": "Update the same-vault related list (akb:// URIs)"},
+                "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Update the same-vault dependency list (akb:// URIs). Use an ordinary Markdown link in content for a cross-vault reference."},
+                "related_to": {"type": "array", "items": {"type": "string"}, "description": "Update the same-vault related list (akb:// URIs). Use an ordinary Markdown link in content for a cross-vault reference."},
                 "message": {"type": "string", "description": "Commit message describing the change"},
                 "expected_commit": {
                     "type": "string",
@@ -565,7 +565,7 @@ TOOLS = [
     Tool(
         name="akb_graph",
         description=(
-            "Get a knowledge graph — nodes (documents, tables, files) and edges (relations). "
+            "Get a same-vault knowledge graph — nodes (documents, tables, files) and edges (relations). "
             "Provide `uri` to get a subgraph centered on any resource with BFS traversal. "
             "Provide `vault` (without uri) to get the full vault graph."
         ),
@@ -634,7 +634,10 @@ TOOLS = [
     ),
     Tool(
         name="akb_provenance",
-        description="Get provenance for a document — who created it, when, which entities were extracted.",
+        description=(
+            "Get provenance for a document — who created it, when, which entities were "
+            "extracted, and its visible same-vault relations."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
