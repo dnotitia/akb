@@ -363,7 +363,7 @@ async def test_approval_cannot_name_a_subject_only_a_row(services):
     Asserted as an exact field set rather than as two absences, so a later
     `issuer` or `subject` cannot appear here without this failing.
     """
-    from app.api.routes.admin_sso import ApprovePendingAdmissionRequest
+    from app.api.routes.access import ApprovePendingAdmissionRequest
 
     with pytest.raises(Exception) as rejected:
         ApprovePendingAdmissionRequest(subject="someone-elses-subject")

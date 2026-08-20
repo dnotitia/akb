@@ -37,6 +37,7 @@ from typing import Any
 from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import NotFoundError, ValidationError
+from app.repositories.events_repo import emit_event
 
 
 _LOG = logging.getLogger("akb.admission")
@@ -168,17 +169,36 @@ async def get_pending_admission(admission_id: str) -> dict[str, Any]:
     return _row(row)
 
 
-async def dismiss_pending_admission(admission_id: str) -> dict[str, Any]:
-    """Forget one arrival. It says nothing about whether they may return."""
+async def dismiss_pending_admission(
+    admission_id: str, *, actor_id: str | None = None
+) -> dict[str, Any]:
+    """Forget one arrival. It says nothing about whether they may return.
+
+    Approval leaves its own trace — the binding it writes is an event. A
+    dismissal writes nothing, so without this it would be the one act on this
+    surface that left no record of having happened.
+    """
     identifier = _admission_uuid(admission_id)
     pool = await get_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "DELETE FROM pending_admissions WHERE id = $1 RETURNING id",
-            identifier,
-        )
-    if row is None:
-        raise NotFoundError("Pending admission", str(identifier))
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "DELETE FROM pending_admissions WHERE id = $1"
+                " RETURNING id, issuer, subject",
+                identifier,
+            )
+            if row is None:
+                raise NotFoundError("Pending admission", str(identifier))
+            await emit_event(
+                conn,
+                "auth.pending_admission_dismissed",
+                actor_id=actor_id,
+                payload={
+                    "admission_id": str(row["id"]),
+                    "issuer": row["issuer"],
+                    "subject": row["subject"],
+                },
+            )
     return {"dismissed": str(row["id"])}
 
 
