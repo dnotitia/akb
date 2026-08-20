@@ -28,7 +28,7 @@ from app.services.auth_service import (
     revoke_all_sessions,
     token_has_scope,
     update_profile,
-    project_verified_principal,
+    project_verified_principal_with_reason,
 )
 from app.services.auth_policy import require_local_auth_enabled, sso_browser_session_ready
 from app.services.keycloak_oidc import get_keycloak_oidc
@@ -418,6 +418,35 @@ async def keycloak_login(redirect: str = "/"):
     )
 
 
+# A browser reaches the callback by following a redirect, so whatever it answers
+# IS the page. Raising rendered a serialized error object on a blank white
+# screen — measured, against a deployed workspace: an invited person waiting for
+# approval saw `{"message":"SSO sign-in failed",...}` and nothing else.
+#
+# So the callback answers with the product's own sign-in page and a reason on the
+# query string. `/auth` is fixed here rather than taken from the request, so this
+# cannot become an open redirect.
+#
+# Only the refusals below are named. Naming one tells a caller that this runtime
+# verified their token and what it then decided, which is a disclosure and not a
+# detail: it is defensible for membership, because to be holding such a token
+# they already authenticated at an upstream this workspace's owner registered,
+# and the alternative leaves the one population this flow exists for staring at
+# their credential — the only thing that is fine — instead of telling an
+# administrator they arrived. It is NOT defensible for the rest: whether an
+# account is suspended is a statement about the person, not about a roster, and
+# it stays generic until somebody decides otherwise on purpose.
+_NAMEABLE_SSO_REFUSALS = frozenset({"membership_required"})
+
+
+def _sso_sign_in_failed(reason: str | None = None) -> RedirectResponse:
+    code = reason if reason in _NAMEABLE_SSO_REFUSALS else "sso_failed"
+    return RedirectResponse(
+        f"/auth?sso_error={quote(code, safe='')}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
 @router.get(
     "/auth/keycloak/callback",
     summary="Complete an ordinary Keycloak SSO browser login",
@@ -432,7 +461,7 @@ async def keycloak_callback(
 ):
     _require_sso_browser_session()
     if error is not None or not code or not state:
-        raise AuthenticationError("SSO sign-in failed")
+        return _sso_sign_in_failed()
     oidc = get_keycloak_oidc()
     transient = await oidc.consume_browser_state(
         state,
@@ -445,33 +474,33 @@ async def keycloak_callback(
         "code_verifier",
         "nonce",
     }:
-        raise AuthenticationError("SSO sign-in failed")
+        return _sso_sign_in_failed()
     if transient.get("client_id") != settings.keycloak_client_id:
-        raise AuthenticationError("SSO sign-in failed")
+        return _sso_sign_in_failed()
     provider_alias = transient.get("provider_alias")
     if not isinstance(provider_alias, str):
-        raise AuthenticationError("SSO sign-in failed")
+        return _sso_sign_in_failed()
     try:
         validate_alias(provider_alias)
     except ProviderDefinitionError:
-        raise AuthenticationError("SSO sign-in failed") from None
+        return _sso_sign_in_failed()
     redirect_path = _safe_redirect_path(transient.get("redirect_path"))
     verifier = transient.get("code_verifier")
     nonce = transient.get("nonce")
     if not isinstance(verifier, str) or not isinstance(nonce, str):
-        raise AuthenticationError("SSO sign-in failed")
+        return _sso_sign_in_failed()
     tokens = await oidc.exchange_browser_code(code, verifier)
     access_token = tokens.get("access_token")
     id_token = tokens.get("id_token")
     if tokens.get("token_type") != "Bearer" or not isinstance(access_token, str) or not isinstance(id_token, str):
-        raise AuthenticationError("SSO sign-in failed")
+        return _sso_sign_in_failed()
     principal = await oidc.verify_access_token(
         access_token,
         settings.api_oauth_audience_effective,
         route_profile="api",
     )
     if principal is None:
-        raise AuthenticationError("SSO sign-in failed")
+        return _sso_sign_in_failed()
     _require_signed_provider(principal.claims, provider_alias)
     id_claims = await oidc.verify_browser_id_token(
         id_token,
@@ -480,9 +509,12 @@ async def keycloak_callback(
         expected_provider_alias=provider_alias,
     )
     _require_signed_provider(id_claims, provider_alias)
-    user = await project_verified_principal(principal)
+    outcome = await project_verified_principal_with_reason(principal)
+    user = outcome.user
     if user is None:
-        raise AuthenticationError("SSO sign-in failed")
+        # The one place the reason is repeated, and only for the refusal the
+        # allowlist above admits.
+        return _sso_sign_in_failed(outcome.refusal_code)
     issued = await create_sso_browser_session(
         user,
         principal,

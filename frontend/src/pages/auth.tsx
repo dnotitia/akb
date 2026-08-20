@@ -40,6 +40,12 @@ export default function AuthPage() {
   const [password, setPassword] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [error, setError] = useState("");
+  // The SSO callback is reached by a browser following a redirect, so it cannot
+  // answer with an error body — whatever it returns IS the page. It sends the
+  // person back here with a reason instead, and this is where that reason
+  // becomes a sentence. Unknown values fall through to the generic line rather
+  // than being echoed, so the query string cannot put text on the screen.
+  const ssoError = new URLSearchParams(window.location.search).get("sso_error") ?? "";
   const [loading, setLoading] = useState(false);
   // Unknown until the versioned public policy is validated. No UI capability
   // is inferred while loading or when the fetch/schema fails.
@@ -231,6 +237,14 @@ export default function AuthPage() {
             {authConfig !== null && !localAuthEnabled && authConfig.available !== true && (
               <Alert variant="destructive">
                 Sign-in is unavailable because authentication configuration could not be verified.
+              </Alert>
+            )}
+
+            {ssoError && (
+              <Alert variant="destructive" id="auth-sso-error">
+                {ssoError === "membership_required"
+                  ? "You signed in, but you are not a member of this workspace yet. An administrator has to admit you — they can see that you arrived."
+                  : "Sign-in through your identity provider did not complete. Try again, and tell your administrator if it keeps happening."}
               </Alert>
             )}
 

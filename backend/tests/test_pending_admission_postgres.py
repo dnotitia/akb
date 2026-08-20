@@ -540,3 +540,48 @@ async def test_dismissing_an_arrival_forgets_it_without_admitting_anyone(service
         await auth_service._resolve_or_provision_keycloak_user(_claims(subject, email))
     with pytest.raises(NotFoundError):
         await admission_service.dismiss_pending_admission(arrival["id"])
+
+
+async def test_the_boundary_carries_the_reason_the_service_layer_raised(services):
+    """"Refused" and "refused because they are not a member" are different facts.
+
+    The projection boundary answered None for every rejection there is, so the
+    HTTP layer could not tell them apart and generalised — which is how a person
+    waiting for approval came to be told their token was invalid. The reason is
+    carried now, and this is the test that fails if it stops being.
+    """
+    pool, auth_service, admission_service, _accounts = services
+    from app.services.auth_verifier_profiles import VerifiedPrincipal
+
+    email = "adm-reason@example.com"
+    claims = _claims("subject-reason", email)
+    claims["scope"] = "openid profile email"
+    principal = VerifiedPrincipal(
+        profile_id=auth_service.KEYCLOAK_ACCESS_V1,
+        issuer=_ISSUER,
+        subject="subject-reason",
+        credential_type="bearer",
+        claims=claims,
+        audience="api",
+    )
+
+    outcome = await auth_service.project_verified_principal_with_reason(principal)
+    assert outcome.user is None
+    assert outcome.refusal_code == "membership_required"
+
+    # The same arrival is on the administrator's list, so the reason the
+    # boundary reports and the row they act on are about one event.
+    listed = await admission_service.list_pending_admissions()
+    rows = [r for r in listed["pending_admissions"] if r["subject"] == "subject-reason"]
+    assert len(rows) == 1
+
+    # Admitted, the same principal projects to an account and reports no reason.
+    await admission_service.approve_pending_admission(
+        rows[0]["id"], actor_id="adm-admin"
+    )
+    admitted = await auth_service.project_verified_principal_with_reason(principal)
+    assert admitted.user is not None
+    assert admitted.refusal_code is None
+
+    # And the plain boundary still answers exactly what it always did.
+    assert (await auth_service.project_verified_principal(principal)) is not None
