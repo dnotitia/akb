@@ -1161,6 +1161,7 @@ async def test_retired_tombstone_rejects_external_identity_adoption(
     )
     actor_user_id, actor_token_id = await _create_retirement_actor(pool)
     monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+    monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
     await _create_sso_recovery_successor(service)
     await service.retire_local_recovery_admin(
         expected_username="local-recovery-admin",
@@ -1171,7 +1172,11 @@ async def test_retired_tombstone_rejects_external_identity_adoption(
 
     with pytest.raises(RecoveryAdminProtectedError):
         await account_service.ensure_human_external_identity(
-            issuer="https://identity.example.com/realms/example",
+            # The prelink refuses any issuer this runtime would not present,
+            # and that refusal now comes first. Naming ours is what lets the
+            # call reach the tombstone this test is actually about — otherwise
+            # it passes on the issuer check and proves nothing about adoption.
+            issuer=settings.keycloak_issuer,
             subject=f"subject-{target_by_id}",
             email="local-recovery-admin@example.com",
             display_name="Retired recovery admin",
