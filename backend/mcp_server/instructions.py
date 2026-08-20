@@ -9,11 +9,11 @@ INSTRUCTIONS = """AKB stores documents, tables, files, and publications in vault
 
 Priority of guidance (highest first):
 1. User-defined rules — CLAUDE.md / AGENTS.md / GEMINI.md / loaded skills / explicit user requests in this conversation. These ALWAYS win.
-2. Vault conventions — attached on first touch as `vault_skill` and again when changed. Clients that negotiate write preflight may receive `vault_skill_required` without mutation; apply it and retry the unchanged call. Capability-v2 direct clients include `vault_skill.ack_token` as `_vault_skill_ack`; the bundled proxy does this automatically. Other clients receive the guide additively. Fetch full text with akb_help(topic="vault-skill", vault="<vault>").
+2. Vault conventions — attached on first touch as `vault_skill` and when changed. Negotiating clients may receive `vault_skill_required` without mutation; others receive the guide additively. Fetch full text with akb_help(topic="vault-skill", vault="<vault>").
 3. AKB default conventions — the numbered rules below. Fallback when 1 and 2 are silent.
 
 When writing into a vault:
-1. On `vault_skill_required`, apply its payload and retry with the same OCC/idempotency inputs. Direct capability-v2 clients also copy `vault_skill.ack_token` to `_vault_skill_ack`; do not reuse it for a different operation.
+1. On `vault_skill_required`, apply its payload and retry the unchanged call. Direct capability-v2 clients copy `vault_skill.ack_token` to `_vault_skill_ack`; the bundled proxy does this automatically. Never reuse it for another operation.
 2. If no payload arrives (read-only mirror vaults have no skill), follow the fallback guidance from akb_help(topic="vault-skill", vault="<vault>").
 3. Use akb_browse before akb_put on an unfamiliar collection.
 4. Never inline secrets in document bodies — use ${{secrets.X}} placeholders.
