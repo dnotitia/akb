@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.2.1 — vault guide preflight for proxy-local tools
+
+Proxy-local file and image tools now participate in the same vault-guide
+session contract as backend-native MCP tools. Before a local write performs
+any transfer or mutation, the proxy touches the authenticated backend session;
+when the guide is new or changed it returns `vault_skill_required` with the
+guide and asks the agent to retry. Reads attach the guide to their successful
+result. Write-only credentials receive no guide content and retain their
+existing write behavior.
+
+Deploy the matching backend before publishing this proxy version. Existing
+MCP processes must restart (or otherwise re-resolve the package) to load the
+new proxy behavior.
+
 ## 2.2.0 — inline document images and conflict-safe file replacement
 
 Adds two proxy-local tools for agent-authored document images:

@@ -4,16 +4,13 @@ from typing import Any
 from fastapi import APIRouter, Depends
 from fastapi.responses import PlainTextResponse
 
-from app.exceptions import NotFoundError
 from app.services.document_service import VAULT_SKILL_SEED_TEMPLATE
-from app.services.revision_backend import get_document_service
 from app.services.auth_service import AuthenticatedUser
 from app.api.deps import get_current_user
 from app.services.access_service import check_vault_access
 from mcp_server.help import render_vault_skill_response
 
 router = APIRouter()
-doc_service = get_document_service()
 
 
 MARKDOWN_RESPONSE: dict[int | str, dict[str, Any]] = {
@@ -63,20 +60,19 @@ async def get_vault_skill_preview(
     """
     # check_vault_access raises NotFoundError or ForbiddenError (both AKBError)
     # which the global exception handler converts to JSON; no need for manual if-check.
-    await check_vault_access(user.user_id, vault, required_role="reader")
+    access = await check_vault_access(user.user_id, vault, required_role="reader")
+    from app.services import vault_skill_service
 
     async def _fetch(v: str, doc_id: str):
-        try:
-            resp = await doc_service.get(v, doc_id)
-        except NotFoundError:
-            return None  # genuinely absent (mirror vault)
-        # Anything else propagates to the global handlers (AKBError → its own
-        # status, everything else → 500) instead of rendering a 200 that claims
-        # the vault has no skill.
+        resp = await vault_skill_service.fetch_for_authorized_reader(
+            v, str(access["vault_id"])
+        )
+        if resp is None:
+            return None
         return {
-            "content": getattr(resp, "content", "") or "",
-            "commit": getattr(resp, "current_commit", None),
-            "updated_at": str(getattr(resp, "updated_at", "")),
+            "content": resp["content"],
+            "commit": resp["version"],
+            "updated_at": "",
         }
 
     body = await render_vault_skill_response(vault, _fetch)

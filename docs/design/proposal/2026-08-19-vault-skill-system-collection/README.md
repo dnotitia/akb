@@ -1,8 +1,8 @@
 ---
-status: proposal
-stage: design
+status: accepted
+stage: implementation
 created: 2026-08-19
-updated: 2026-08-19
+updated: 2026-08-20
 ---
 
 # Vault-skill system collection: reservation, auto-injection, and a single editing surface
@@ -40,6 +40,8 @@ the three things v1 left out:
 | 3 | UI surface | System collection in tree + dedicated editor in vault settings |
 | 4 | Survival invariant | Canonical doc cannot be deleted; reset-to-template only |
 | 5 | Existing violations | Automatic migration (service-layer backfill), prod count taken first |
+| 6 | Guide authorship | Vault owner only; readers may consume it, generic writers cannot alter trusted instructions |
+| 7 | First-write behavior | Return `vault_skill_required` before mutation, then retry after applying the guide |
 
 Decision log with alternatives: `rounds/2026-08-19-brainstorm-decisions.md`.
 
@@ -83,7 +85,7 @@ applies identically to both backends.
 |---|---|---|
 | Create doc in `overview/` | Blocked (internal seed/reset/migration only) | `document_service.put`, `native_document_service` put |
 | Create/retype `skill` outside canonical path | Blocked | put + update (closes the REST PATCH retype hole, `documents.py:150`) |
-| Retype canonical doc | Blocked — `type=skill` pinned; other frontmatter free | `document_service.update` (~:1008) |
+| Edit/retype canonical doc | Owner only; `type=skill` pinned | REST/MCP owner gate plus both document services (bulk writers fail closed) |
 | Move canonical doc, or any move in/out of `overview/` | Blocked | `document_service.move` + native |
 | Delete canonical doc | Blocked — reset only | delete paths, both backends |
 | Delete `overview` collection (incl. cascade) | Blocked | `collection_service.delete` |
@@ -94,42 +96,56 @@ applies identically to both backends.
 Reset = overwrite canonical body with the seed template through the normal
 update pipeline (git history records it; no delete/recreate).
 
-Mirror (external-git) vaults keep the status quo: no seed, no skill, no
-injection; the missing fallback text no longer instructs an impossible
-`akb_put`.
+Mirror (external-git) vaults have no AKB-managed guide even when the upstream
+repository contains the canonical path. Automatic injection, explicit help,
+settings, and canonical-document routing all apply the same exclusion so
+upstream markdown is never attributed to the vault owner.
 
 ### Auto-injection flow
 
 Injection lives at the dispatch chokepoint (`mcp_server/server.py
-call_tool()`, next to audit/tool-usage recording). After a successful
-`_dispatch`, the server:
+call_tool()`, next to audit/tool-usage recording). A reader-authorized write
+performs a non-mutating preflight first. If the guide is new or changed, the
+server returns `vault_skill_required` with the payload and does not dispatch
+the mutation; the agent applies the guide and retries with the same
+OCC/idempotency inputs. Successful reads attach the payload to their result.
 
 1. Resolves the single vault the call touched by promoting
    `tool_usage._vault_of()` to a shared helper (it already handles URI args
    and multi-vault `akb_sql`; calls with no single target inject nothing).
    Reads and writes both qualify — first touch is usually browse/search.
-2. Consults an in-process map `{(session_id, vault): injected_version}`.
+2. Requires explicit read scope plus reader ACL and pins the immutable vault
+   UUID returned by that authorization. Write-only credentials may continue
+   writing but never receive stored guide content.
+3. Consults an in-process map
+   `{(session_id, vault_name, vault_id): injected_version}`.
    Version = skill content hash. On miss or mismatch, attaches to the result
    dict:
 
 ```json
 "vault_skill": {
   "vault": "<name>",
-  "version": "<hash8>",
+  "version": "<hash16>",
   "reason": "first_touch | updated",
   "body": "<markdown, bounded>",
   "truncated": false
 }
 ```
 
-Version/body lookups go through a per-vault cache (60s TTL) with write-through
-invalidation when an update commits to the canonical path in the same process
-(API replicas=1 today; TTL is the safety net for future multi-replica).
+Version/body lookups go through a bounded per-vault cache with write-through
+invalidation. Cache keys include the immutable vault id, and an invalidation
+epoch prevents a slow fetch that started before an update/delete from
+re-populating stale bytes after the commit. The TTL remains the cross-process
+safety net.
+
+Proxy-local file/image tools participate through the same authenticated MCP
+session before local side effects. A first local write returns the same retry
+envelope; a local read attaches the payload to its successful result.
 
 Safety contract (mirrors `tool_usage.record`):
 
-- Injection must never fail or slow-fail the tool call — lookup errors are
-  logged and skipped.
+- A lookup failure never fails the business call; only a successfully fetched
+  new/changed guide produces the deliberate non-mutating write preflight.
 - The session map is bounded; eviction's only cost is one harmless
   re-injection.
 - `body` is clipped (16KB) with `truncated: true` and a pointer to `akb_help`
@@ -165,9 +181,12 @@ Single judgment rule (path == canonical) and single editing surface:
   settings editor (reusing the `/vault/:name/skill` redirect direction);
   SkillBanner's own Edit/Reset buttons and the viewer's AGENT tab are removed
   — the misdirected-reset failure class disappears structurally.
-- **Status chip**: with the survival invariant, defined/missing is
-  meaningless for normal vaults; the chip becomes "template vs customized"
-  (seed-template hash comparison).
+- **Permissions/OCC**: only the owner sees edit/reset. Both operations send
+  `expected_commit`; a concurrent agent/UI edit preserves the local draft and
+  returns the normal conflict instead of overwriting it.
+- **Status chip**: exact current templates and untouched historical seed
+  revisions read as "template"; only authored content reads as "customized".
+  The About panel is withheld for template placeholders.
 - `vault.tsx` empty-state scaffold discount stays but no longer needs the
   existence probe.
 
@@ -183,9 +202,11 @@ aliases + indexes consistent:
 | `skill`-typed docs elsewhere | retype to `note` (frontmatter rewrite via update pipeline) |
 | Vaults missing the canonical doc | reseed via `build_vault_skill_seed_request` |
 | Canonical doc retyped away | restore `type=skill` |
+| Empty legacy `overview/*` subcollections | delete deepest-first through `CollectionService`; non-empty rows remain errors |
 | Mirror vaults | excluded |
 
-A prod violation count runs before the backfill to size the blast radius.
+A prod dry-run count runs from the release candidate before serving the new
+code to size the blast radius.
 Counts are recorded in the private ops vault only — never in this public
 repo.
 
@@ -220,9 +241,10 @@ repo.
 
 ### Release order
 
-1. Prod violation count (recorded privately).
+1. Run the release candidate's read-only dry run against prod (counts recorded privately).
 2. Deploy code (guards + injection + UI).
-3. Run backfill.
+3. Run the idempotent execute backfill; it exits non-zero while resources or
+   non-empty legacy subcollections remain.
 4. Verify + e2e green.
 
 ## Rejected approaches
@@ -236,13 +258,11 @@ repo.
   has no collections rows to flag, and it adds a schema migration for no
   current consumer.
 
-## Open implementation questions
+## Resolved implementation details
 
-- Key name `vault_skill` must be checked against every tool's existing
-  response keys before freezing (no collision found by inspection; verify in
-  the plan).
-- Whether a root-level (collection-less) path is valid for migrated docs, or
-  whether prefix-stripping needs a fallback collection.
-- Behavior for sessions without a usable `_session_id()` (stateless
-  connections): fall back to per-connection tracking rather than per-call
-  injection.
+- `vault_skill` is an additive response key; the tool response inventory and
+  proxy contract tests found no collision.
+- Root-level document paths are valid migration targets; aliases preserve the
+  old canonical URI.
+- Connections without a session id use the process-scoped stdio session key,
+  bounded by the same LRU as normal sessions.

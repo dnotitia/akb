@@ -136,8 +136,17 @@ def _edit_harness(monkeypatch, path: str):
 @pytest.mark.asyncio
 async def test_edit_on_canonical_path_invalidates_version_cache(monkeypatch):
     svc, seen = _edit_harness(monkeypatch, "overview/vault-skill.md")
-    assert await svc.edit("v", "overview/vault-skill.md", "a", "b") == "RESPONSE"
+    assert await svc.edit(
+        "v", "overview/vault-skill.md", "a", "b", skill_internal=True
+    ) == "RESPONSE"
     assert seen == ["v"]
+
+
+@pytest.mark.asyncio
+async def test_edit_on_canonical_path_requires_owner_authorized_bypass(monkeypatch):
+    svc, _ = _edit_harness(monkeypatch, "overview/vault-skill.md")
+    with pytest.raises(ForbiddenError, match="vault owner"):
+        await svc.edit("v", "overview/vault-skill.md", "a", "b")
 
 
 @pytest.mark.asyncio

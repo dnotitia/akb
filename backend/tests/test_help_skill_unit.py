@@ -128,3 +128,34 @@ async def test_static_topic_never_access_checks(monkeypatch):
         {"topic": "quickstart", "vault": "someone-elses"}, "u1", server_mod._MCPUser(),
     )
     assert "help" in out
+
+
+@pytest.mark.asyncio
+async def test_explicit_help_does_not_render_upstream_mirror_instructions(monkeypatch):
+    import tempfile
+
+    from app.config import settings
+    settings.git_storage_path = tempfile.mkdtemp(prefix="akb-help-skill-test-")
+    from app.services import vault_skill_service
+    from mcp_server import server as server_mod
+
+    async def allow(uid, vault, required_role="reader", **kw):
+        return {"vault_id": "11111111-1111-1111-1111-111111111111"}
+
+    async def mirror(vault, vault_id):
+        return None
+
+    async def never_read(*args, **kwargs):
+        raise AssertionError("mirror help must not read upstream markdown")
+
+    monkeypatch.setattr(server_mod, "check_vault_access", allow)
+    monkeypatch.setattr(vault_skill_service, "fetch_for_authorized_reader", mirror)
+    monkeypatch.setattr(server_mod.doc_service, "get", never_read)
+
+    out = await server_mod._HANDLERS["akb_help"](
+        {"topic": "vault-skill", "vault": "mirror-v"},
+        "u1",
+        server_mod._MCPUser(),
+    )
+    assert "read-only" in out["help"].lower() or "mirror" in out["help"].lower()
+    assert "Source: vault owner" not in out["help"]

@@ -39,7 +39,7 @@ from app.services.search_service import SearchService
 from app.services.kg_service import get_resource_relations, get_graph, get_provenance, link_resources, unlink_resources
 from app.services.uri_service import doc_uri, parse_uri, split_uri
 from app.services.access_service import (
-    authorized_vault, check_vault_access, check_vault_scope, grant_access,
+    authorized_vault, authorized_vault_id, check_vault_access, check_vault_scope, grant_access,
     revoke_access, list_vault_members, list_accessible_vaults, get_vault_info,
     reset_authorized_vault, search_users, transfer_ownership, archive_vault,
 )
@@ -389,21 +389,19 @@ async def _handle_help(args: dict, uid: str, user: _MCPUser) -> dict:
         # ForbiddenError/NotFoundError flows to `call_tool`'s canonical
         # envelope — permission_denied / not_found, same as akb_get.
         # The REST twin (`app/api/routes/help.py`) already checked reader.
-        await check_vault_access(uid, vault, required_role="reader")
+        access = await check_vault_access(uid, vault, required_role="reader")
         from mcp_server.help import render_vault_skill_response
+        from app.services import vault_skill_service
         async def _fetch(v, doc_id):
-            from app.exceptions import NotFoundError
-            try:
-                resp = await doc_service.get(v, doc_id)
-            except NotFoundError:
-                return None  # genuinely absent (mirror vault)
-            # Any other exception propagates → canonical error envelope,
-            # so a DB outage no longer renders as "vault has no skill".
-            # DocumentResponse fields: .content (from git), .current_commit, .updated_at
+            resp = await vault_skill_service.fetch_for_authorized_reader(
+                v, str(access["vault_id"])
+            )
+            if resp is None:
+                return None
             return {
-                "content": resp.content or "",
-                "commit": resp.current_commit,
-                "updated_at": str(resp.updated_at or ""),
+                "content": resp["content"],
+                "commit": resp["version"],
+                "updated_at": "",
             }
         return {"help": await render_vault_skill_response(vault, _fetch)}
     return {"help": _resolve_help(topic)}
@@ -607,6 +605,11 @@ async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
     doc_path = to_nfc(doc_path)
     await check_vault_access(uid, vault, required_role="writer")
+    current = await doc_service.get(vault, doc_path)
+    from app.services import skill_policy
+    skill_internal = current.path == skill_policy.VAULT_SKILL_PATH
+    if skill_internal:
+        await check_vault_access(uid, vault, required_role="owner")
     req = DocumentUpdateRequest(
         content=args.get("content"),
         title=args.get("title"),
@@ -619,7 +622,10 @@ async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
         expected_commit=args.get("expected_commit"),
         expected_content_hash=args.get("expected_content_hash"),
     )
-    result = await doc_service.update(vault, doc_path, req, agent_id=user.username)
+    result = await doc_service.update(
+        vault, doc_path, req, agent_id=user.username,
+        skill_internal=skill_internal,
+    )
     if not result:
         return err("Document not found", code=NOT_FOUND)
     return result.model_dump()
@@ -655,6 +661,11 @@ async def _handle_edit(args: dict, uid: str, user: _MCPUser) -> dict:
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
     doc_path = to_nfc(doc_path)
     await check_vault_access(uid, vault, required_role="writer")
+    current = await doc_service.get(vault, doc_path)
+    from app.services import skill_policy
+    skill_internal = current.path == skill_policy.VAULT_SKILL_PATH
+    if skill_internal:
+        await check_vault_access(uid, vault, required_role="owner")
     try:
         result = await doc_service.edit(
             vault, doc_path,
@@ -664,6 +675,7 @@ async def _handle_edit(args: dict, uid: str, user: _MCPUser) -> dict:
             message=args.get("message"),
             agent_id=user.username,
             base_commit=args.get("base_commit"),
+            skill_internal=skill_internal,
         )
         return result.model_dump()
     except EditError as e:
@@ -1534,13 +1546,43 @@ async def call_tool(name: str, arguments: dict):
     # relabelled "error" because the response could not be encoded.
     recorded = False
     try:
-        result = await _dispatch(name, arguments, user)
+        is_write = _required_scope(name, arguments) == _WRITE_SCOPE
+        result: dict | None = None
+
+        # A guide cannot influence a write that has already committed.  For a
+        # reader-authorized caller's first write (or the first write after the
+        # guide changes), return the guide without dispatching the mutation;
+        # the agent applies it and retries the same idempotency/OCC-aware call.
+        # Write-only credentials proceed without disclosure.
+        if is_write:
+            try:
+                from app.services.tool_usage import vault_of_call
+                from app.services import vault_skill_service
+
+                target_vault = vault_of_call(name, arguments)
+                if target_vault and await _can_read_vault(
+                    user, user.user_id, target_vault
+                ):
+                    payload = await vault_skill_service.injection_payload(
+                        _session_id(), target_vault, authorized_vault_id(),
+                    )
+                    if payload:
+                        result = err(
+                            "Apply the vault instructions, then retry this write.",
+                            code="vault_skill_required",
+                            retryable=True,
+                        )
+                        result["vault_skill"] = payload
+            except Exception as e:  # noqa: BLE001 — optional projection only
+                logger.debug("vault_skill preflight skipped: %s", e)
+
+        if result is None:
+            result = await _dispatch(name, arguments, user)
         # Non-blocking: both calls only ENQUEUE (audit to its dedicated writer
         # thread, usage to a bounded deque drained by a worker). No disk I/O or
         # lock on the event loop, and neither touches the shared to_thread pool
         # — a stalled audit disk can't freeze the loop or starve bcrypt /
         # document reads.
-        is_write = _required_scope(name, arguments) == _WRITE_SCOPE
         audit_log.record_tool(name, arguments, user, result, is_write=is_write)
         # Independent sink: usage analytics go to PG so they can be grouped, and
         # must NOT inherit the audit flags (audit is off by default and
@@ -1570,9 +1612,13 @@ async def call_tool(name: str, arguments: dict):
             from app.services import vault_skill_service
             if isinstance(result, dict) and result.get("error") is None:
                 target_vault = vault_of_call(name, arguments)
-                if target_vault is not None and target_vault == authorized_vault():
+                if (
+                    target_vault is not None
+                    and await _can_read_vault(user, user.user_id, target_vault)
+                    and target_vault == authorized_vault()
+                ):
                     payload = await vault_skill_service.injection_payload(
-                        _session_id(), target_vault,
+                        _session_id(), target_vault, authorized_vault_id(),
                     )
                     if payload:
                         result["vault_skill"] = payload

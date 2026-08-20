@@ -414,11 +414,13 @@ class NativeDocumentService(DocumentService):
         doc_ref: str,
         req: DocumentUpdateRequest,
         agent_id: str | None = None,
+        *,
+        skill_internal: bool = False,
     ) -> DocumentPutResponse:
         if req.status is not None and req.status not in DOC_STATUSES:
             raise ValidationError(f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}")
         vault_id, current = await self._current(vault, doc_ref)
-        skill_policy.check_update_type(current.path, req.type)
+        skill_policy.check_update(current.path, req.type, internal=skill_internal)
         return await self._update_from_snapshot(
             vault=vault,
             vault_id=vault_id,
@@ -627,10 +629,13 @@ class NativeDocumentService(DocumentService):
         message: str | None = None,
         agent_id: str | None = None,
         base_commit: str | None = None,
+        *,
+        skill_internal: bool = False,
     ) -> DocumentPutResponse:
         if not old_string:
             raise EditError("old_string cannot be empty")
         vault_id, current = await self._current(vault, doc_ref)
+        skill_policy.check_update(current.path, None, internal=skill_internal)
         resource_id = current.resource_id
         native = await self._native()
         race_count = 0

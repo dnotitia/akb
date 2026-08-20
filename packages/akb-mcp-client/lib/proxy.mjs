@@ -333,6 +333,13 @@ function parseFileUri(uri) {
 }
 
 const FILE_TOOL_NAMES = new Set(FILE_TOOLS.map((t) => t.name));
+const FILE_WRITE_TOOL_NAMES = new Set([
+  "akb_put_file",
+  "akb_put_image",
+  "akb_discard_image",
+  "akb_update_file",
+  "akb_delete_file",
+]);
 
 // Tools where proxy injects a `file` param as alternative to `content`
 const FILE_CONTENT_TOOLS = new Set(["akb_put", "akb_update"]);
@@ -341,9 +348,11 @@ const FILE_CONTENT_TOOLS = new Set(["akb_put", "akb_update"]);
 // local `initialize` response, so it must not silently drift on a proxy
 // behaviour change. There is no import of package.json here to keep lib/
 // zero-dependency and load-safe across Node versions.
-const PROXY_VERSION = "2.2.0";
+const PROXY_VERSION = "2.2.1";
 const PROXY_INSTRUCTIONS =
   "This akb-mcp proxy provides local-file tools in addition to the AKB backend. " +
+  "A first write may return vault_skill_required before any mutation; apply its " +
+  "vault_skill payload and retry the same call. " +
   "For an inline document image, call akb_put_image and place its returned `markdown` " +
   "with akb_put for a new document or a targeted akb_edit for an existing one. " +
   "Never pass only an image fragment to akb_update(content=...), because it replaces " +
@@ -592,6 +601,26 @@ export class AKBProxy {
   async _handleFileTool(id, params) {
     const { name, arguments: args } = params;
     try {
+      const vault = this._fileToolVault(name, args);
+      const vaultSkill = await this._fileToolSkillPreflight(vault);
+      if (vaultSkill && FILE_WRITE_TOOL_NAMES.has(name)) {
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                error: "Apply the vault instructions, then retry this write.",
+                code: "vault_skill_required",
+                retryable: true,
+                vault_skill: vaultSkill,
+              }),
+            }],
+            isError: false,
+          },
+        };
+      }
       let result;
       switch (name) {
         case "akb_put_file":
@@ -617,7 +646,12 @@ export class AKBProxy {
         jsonrpc: "2.0",
         id,
         result: {
-          content: [{ type: "text", text: JSON.stringify(result) }],
+          content: [{
+            type: "text",
+            text: JSON.stringify(
+              vaultSkill ? { ...result, vault_skill: vaultSkill } : result,
+            ),
+          }],
           isError: false,
         },
       };
@@ -632,6 +666,40 @@ export class AKBProxy {
           isError: false,
         },
       };
+    }
+  }
+
+  _fileToolVault(name, args) {
+    if (name === "akb_put_file" || name === "akb_put_image" || name === "akb_discard_image") {
+      return _resolveParent(args).vault;
+    }
+    return parseFileUri(args.uri).vault;
+  }
+
+  /**
+   * Touch the backend MCP session before a proxy-local file operation.
+   *
+   * Local tools bypass the backend `call_tool` dispatcher, so without this
+   * bridge their first write could commit before the session received the
+   * vault guide. `akb_help` is a reader-authorized, mirror-aware backend call
+   * and therefore reuses the same version/session gate as every native tool.
+   * A write-only credential receives no payload and remains usable.
+   */
+  async _fileToolSkillPreflight(vault) {
+    if (!vault) return null;
+    const ok = await this._ensureBackend();
+    if (!ok) throw new Error("backend unreachable");
+    const response = await this._rpc("tools/call", {
+      name: "akb_help",
+      arguments: { topic: "vault-skill", vault },
+    });
+    const text = response.content?.find((item) => item?.type === "text")?.text;
+    if (!text) return null;
+    try {
+      const envelope = JSON.parse(text);
+      return envelope?.vault_skill || null;
+    } catch {
+      return null;
     }
   }
 

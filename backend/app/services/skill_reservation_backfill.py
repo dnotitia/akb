@@ -51,13 +51,10 @@ REPORT-ONLY classes (no treatment, because no treatment EXISTS):
                         run that repaired every document would report success
                         while the namespace still held foreign resources.
   reserved_subcollections
-                        `collections` rows under overview/. Creation is
-                        guarded now (`skill_policy.check_collection_create`),
-                        but rows created before that guard are TRAPPED:
-                        `check_collection_delete` refuses to remove them.
-                        Operator cleanup only — deleting them here would mean
-                        reaching around a guard this module is meant to
-                        enforce.
+                        Legacy `collections` rows under overview/. After
+                        document repairs, empty rows are deleted deepest-first
+                        through CollectionService. Rows that still contain a
+                        file/table/subcollection remain visible as errors.
 """
 
 from __future__ import annotations
@@ -128,8 +125,8 @@ SELECT COUNT(*)
 
 # Sub-collections only: `overview` ITSELF is the sanctioned system collection
 # (both backends' seeds may create it), so it is not a violation.
-_COUNT_RESERVED_SUBCOLLECTIONS_SQL = """
-SELECT COUNT(*)
+_SCAN_RESERVED_SUBCOLLECTIONS_SQL = """
+SELECT v.name AS vault_name, c.path
   FROM collections c
   JOIN vaults v ON v.id = c.vault_id
  WHERE v.id NOT IN (SELECT vault_id FROM vault_external_git)
@@ -191,16 +188,16 @@ async def _count_reserved_resources(scope: str) -> dict[str, int]:
     return {"files": int(files or 0), "tables": int(tables or 0)}
 
 
-async def _count_reserved_subcollections(scope: str) -> int:
+async def _scan_reserved_subcollections(scope: str) -> list[dict]:
     """Read-only. Pre-guard `collections` rows under overview/."""
     from app.db.postgres import get_pool
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        count = await conn.fetchval(
-            _COUNT_RESERVED_SUBCOLLECTIONS_SQL.format(scope=scope)
+        rows = await conn.fetch(
+            _SCAN_RESERVED_SUBCOLLECTIONS_SQL.format(scope=scope)
         )
-    return int(count or 0)
+    return [dict(row) for row in rows]
 
 
 async def _count_archived_excluded() -> int:
@@ -257,7 +254,8 @@ async def _apply_move_out(doc_service, row: dict) -> None:
     # so a clean run really means clean.
     if row["doc_type"] == skill_policy.SKILL_DOC_TYPE:
         await doc_service.update(
-            vault, res.path, _retype_request("note", "retype"), agent_id=_ACTOR
+            vault, res.path, _retype_request("note", "retype"),
+            agent_id=_ACTOR, skill_internal=True,
         )
 
 
@@ -265,6 +263,7 @@ async def _apply_retype(doc_service, row: dict) -> None:
     await doc_service.update(
         row["vault_name"], row["path"],
         _retype_request("note", "retype"), agent_id=_ACTOR,
+        skill_internal=True,
     )
 
 
@@ -272,6 +271,7 @@ async def _apply_restore_type(doc_service, row: dict) -> None:
     await doc_service.update(
         row["vault_name"], row["path"],
         _retype_request(skill_policy.SKILL_DOC_TYPE, "restore"), agent_id=_ACTOR,
+        skill_internal=True,
     )
 
 
@@ -286,7 +286,8 @@ async def _apply_reseed(doc_service, vault: str) -> None:
 
 
 async def run(
-    doc_service, *, execute: bool = False, include_archived: bool = False
+    doc_service, *, execute: bool = False, include_archived: bool = False,
+    collection_service=None,
 ) -> dict:
     """Scan, then (with `execute`) repair. Default is a counts-only dry run.
 
@@ -302,7 +303,7 @@ async def run(
     # Report-only classes; see the module docstring. Scanned in BOTH modes so
     # an execute summary cannot claim a clean namespace it never inspected.
     resources = await _count_reserved_resources(scope)
-    subcollections = await _count_reserved_subcollections(scope)
+    subcollections = await _scan_reserved_subcollections(scope)
 
     plan: dict[str, list] = {name: [] for name in _CLASSES}
     plan["reseed"] = list(missing)
@@ -318,10 +319,11 @@ async def run(
             **{name: len(plan[name]) for name in _CLASSES},
             "archived_excluded": excluded,
             "resource_violations": resources,
-            "reserved_subcollections": subcollections,
+            "reserved_subcollections": len(subcollections),
         }
 
     done = {name: 0 for name in _CLASSES}
+    done["delete_subcollection"] = 0
     errors: list[dict] = []
     # `reseed` items are vault names, the rest are scan rows — so the handlers
     # are deliberately typed loosely rather than joined into one signature.
@@ -340,10 +342,31 @@ async def run(
             except Exception as e:  # noqa: BLE001 — one bad doc must not abort the batch
                 logger.error("%s failed for %s: %s", name, target, e)
                 errors.append({"path": target, "error": str(e)})
+
+    if subcollections:
+        if collection_service is None:
+            from app.services.collection_service import CollectionService
+            collection_service = CollectionService()
+        # A parent cannot become empty until its children are gone.
+        for item in sorted(
+            subcollections, key=lambda row: row["path"].count("/"), reverse=True
+        ):
+            target = f"{item['vault_name']}:{item['path']}"
+            try:
+                await collection_service.delete(
+                    vault=item["vault_name"], path=item["path"],
+                    recursive=False, agent_id=_ACTOR,
+                )
+                done["delete_subcollection"] += 1
+            except Exception as e:  # noqa: BLE001 — report residue, continue batch
+                logger.error("delete_subcollection failed for %s: %s", target, e)
+                errors.append({"path": target, "error": str(e)})
     return {
         "dry_run": False,
         "done": done,
         "errors": errors,
         "resource_violations": resources,
-        "reserved_subcollections": subcollections,
+        "reserved_subcollections": (
+            len(subcollections) - done["delete_subcollection"]
+        ),
     }

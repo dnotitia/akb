@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from app.api.deps import get_current_user
-from app.services import template_registry
+from app.services import skill_policy, template_registry
 from app.services.access_service import (
     check_vault_access,
     check_vault_scope,
@@ -149,7 +149,14 @@ async def get_document(
 )
 async def update_document(vault: str, doc_id: str, req: DocumentUpdateRequest, user: AuthenticatedUser = Depends(get_current_user)):
     await check_vault_access(user.user_id, vault, required_role="writer")
-    return await doc_service.update(vault, doc_id, req, agent_id=user.username)
+    current = await doc_service.get(vault, doc_id)
+    skill_internal = current.path == skill_policy.VAULT_SKILL_PATH
+    if skill_internal:
+        await check_vault_access(user.user_id, vault, required_role="owner")
+    return await doc_service.update(
+        vault, doc_id, req, agent_id=user.username,
+        skill_internal=skill_internal,
+    )
 
 
 @router.delete(

@@ -949,7 +949,10 @@ class DocumentService:
 
     # ── Update ────────────────────────────────────────────────
 
-    async def update(self, vault: str, doc_ref: str, req: DocumentUpdateRequest, agent_id: str | None = None) -> DocumentPutResponse:
+    async def update(
+        self, vault: str, doc_ref: str, req: DocumentUpdateRequest,
+        agent_id: str | None = None, *, skill_internal: bool = False,
+    ) -> DocumentPutResponse:
         if req.status is not None and req.status not in DOC_STATUSES:
             raise ValidationError(
                 f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}"
@@ -965,7 +968,7 @@ class DocumentService:
         if not row:
             raise NotFoundError("Document", doc_ref)
         file_path = row["path"]
-        skill_policy.check_update_type(file_path, req.type)
+        skill_policy.check_update(file_path, req.type, internal=skill_internal)
 
         async with self._path_lock(vault_id, file_path, vault_name=vault) as conn:
             # Re-read under the lock so we observe any commit that landed
@@ -1389,6 +1392,8 @@ class DocumentService:
         message: str | None = None,
         agent_id: str | None = None,
         base_commit: str | None = None,
+        *,
+        skill_internal: bool = False,
     ) -> DocumentPutResponse:
         """Edit a document by replacing exact text in its body.
 
@@ -1413,6 +1418,7 @@ class DocumentService:
         if not row:
             raise NotFoundError("Document", doc_ref)
         file_path = row["path"]
+        skill_policy.check_update(file_path, None, internal=skill_internal)
 
         async with self._path_lock(vault_id, file_path, vault_name=vault) as conn:
             row = await doc_repo.find_by_ref_with_conn(

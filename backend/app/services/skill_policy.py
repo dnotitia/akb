@@ -56,8 +56,19 @@ def check_put(collection: str | None, doc_type: str, *, internal: bool = False) 
         raise ForbiddenError(_SKILL_TYPE_MSG)
 
 
-def check_update_type(path: str, new_type: str | None) -> None:
-    """Retype rules. Body/other-frontmatter updates are always allowed."""
+def check_update(
+    path: str, new_type: str | None, *, internal: bool = False
+) -> None:
+    """Protect the canonical guide and enforce the reserved document type.
+
+    ``internal`` is granted only after the API/MCP surface has performed the
+    owner check, or to the seed/backfill writers.  Keeping the default closed
+    here also covers less obvious writers such as bulk grep/replace.
+    """
+    if path == VAULT_SKILL_PATH and not internal:
+        raise ForbiddenError(
+            "Only the vault owner can edit the vault-skill document."
+        )
     # Falsy = type untouched. Both backends merge with `if req.type:`
     # (document_service._update_locked, native _update_from_snapshot), so an
     # empty string is a no-op there and must not raise here.
@@ -71,6 +82,11 @@ def check_update_type(path: str, new_type: str | None) -> None:
         return
     if new_type == SKILL_DOC_TYPE:
         raise ForbiddenError(_SKILL_TYPE_MSG)
+
+
+def check_update_type(path: str, new_type: str | None) -> None:
+    """Backward-compatible type-only check for non-write policy callers."""
+    check_update(path, new_type, internal=True)
 
 
 def check_move(old_path: str, new_path: str, *, internal: bool = False) -> None:
@@ -108,7 +124,7 @@ def check_collection_create(path: str) -> None:
 
 
 def check_collection_delete(path: str) -> None:
-    if is_reserved_collection(path):
+    if path == SKILL_COLLECTION:
         raise ForbiddenError(
             "'overview' is a reserved system collection and cannot be deleted."
         )

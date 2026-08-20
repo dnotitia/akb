@@ -4,14 +4,10 @@
 chokepoint. Contract mirrors `tool_usage.record`: NEVER raises, never blocks
 the tool call on failure — a lookup error is logged and skipped.
 
-THIS MODULE PERFORMS NO AUTHORIZATION, and must not be called as though it
-did. The chokepoint only reaches it when the vault name matches
-`access_service.authorized_vault()` — i.e. a `check_vault_access` that
-SUCCEEDED during the same call. Two consequences that the code below relies
-on: cache keys are real, already-authorized vault names rather than arbitrary
-caller strings, and a caller cannot use cache-population side effects as a
-vault-existence oracle. The bounds here (LRU + name clamp) deliberately do NOT
-depend on that coupling — they hold even if a future caller forgets it.
+THIS MODULE PERFORMS NO AUTHORIZATION. Callers pass the immutable vault id
+returned by the completed reader access check. The service re-verifies that
+the name still resolves to that id before reading, which closes the
+delete/recreate gap without duplicating ACL policy here.
 
 Session tracking is (session_id, vault) → last-injected skill version, so a
 long-lived session re-receives the skill exactly when it changes. The vault
@@ -40,8 +36,8 @@ guard below into a tool call that has already done its work.
 
 Mirror vaults are excluded even when the upstream repo carries an
 overview/vault-skill.md: auto-injecting upstream-controlled markdown into
-every agent session would be an instruction-injection vector. akb_help still
-serves such a file on explicit request; only the automatic channel is closed.
+every agent session would be an instruction-injection vector. Explicit help
+uses the same exclusion and reports that mirrors do not have an owner guide.
 """
 
 from __future__ import annotations
@@ -81,14 +77,21 @@ _last_timeout_log = 0.0
 # insertion/refresh order: the TTL governs FRESHNESS and evicts nothing, so
 # without a bound this map would grow with the number of distinct vault names
 # ever touched and never shrink.
-_vault_cache: OrderedDict[str, tuple[float, str | None, str | None]] = OrderedDict()
-# (session_id, vault) → injected version. OrderedDict as LRU.
-_session_map: OrderedDict[tuple[str, str], str] = OrderedDict()
+_CacheKey = tuple[str, str | None]
+_vault_cache: OrderedDict[_CacheKey, tuple[float, str | None, str | None]] = OrderedDict()
+# (session_id, vault, immutable vault id) → injected version. OrderedDict as LRU.
+_session_map: OrderedDict[tuple[str, str, str | None], str] = OrderedDict()
 # vault → in-flight fetch. Single-flight: a cache miss costs several DB round
 # trips plus a git read, so N concurrent first-touches of one vault must not
 # become N stampeding fetches. Entries are removed in the leader's `finally`,
 # so the map holds at most one entry per vault being fetched right now.
-_pending: dict[str, asyncio.Future] = {}
+_pending: dict[_CacheKey, asyncio.Future] = {}
+
+# Any invalidation makes an in-flight fetch ineligible for storage.  A global
+# epoch intentionally over-invalidates unrelated concurrent misses: updates
+# are rare, while storing stale owner instructions after an update/delete is
+# a correctness and trust-boundary failure.
+_invalidation_epoch = 0
 
 
 def reset() -> None:
@@ -99,13 +102,14 @@ def reset() -> None:
     `tool_usage.reset()` makes.
     """
     global _BODY_MAX, _CACHE_TTL, _SESSION_MAP_MAX, _VAULT_CACHE_MAX
-    global _FETCH_TIMEOUT, _last_timeout_log
+    global _FETCH_TIMEOUT, _last_timeout_log, _invalidation_epoch
     _BODY_MAX = settings.vault_skill.body_max_bytes
     _CACHE_TTL = settings.vault_skill.cache_ttl_secs
     _SESSION_MAP_MAX = settings.vault_skill.session_map_max
     _VAULT_CACHE_MAX = settings.vault_skill.vault_cache_max
     _FETCH_TIMEOUT = settings.vault_skill.fetch_timeout_secs
     _last_timeout_log = 0.0
+    _invalidation_epoch = 0
     _vault_cache.clear()
     _session_map.clear()
     _pending.clear()
@@ -114,10 +118,13 @@ def reset() -> None:
 def invalidate(vault: str) -> None:
     """Write-through hook: a commit landed on the canonical path, or the vault
     itself was deleted. Callers MUST be past their commit — see module docs."""
-    _vault_cache.pop(vault, None)
+    global _invalidation_epoch
+    _invalidation_epoch += 1
+    for key in [key for key in _vault_cache if key[0] == vault]:
+        _vault_cache.pop(key, None)
 
 
-async def _fetch_skill(vault: str) -> dict | None:
+async def _fetch_skill(vault: str, expected_vault_id: str | None = None) -> dict | None:
     """Fetch the canonical doc. None = absent OR external-git mirror vault.
 
     Raises on real errors — the caller separates absence from failure.
@@ -135,8 +142,11 @@ async def _fetch_skill(vault: str) -> dict | None:
     from app.services.revision_backend import get_document_service
 
     pool = await get_pool()
-    vault_id = await VaultRepository(pool).get_id_by_name(vault)
+    vault_repo = VaultRepository(pool)
+    vault_id = await vault_repo.get_id_by_name(vault)
     if vault_id is None:
+        return None
+    if expected_vault_id is not None and str(vault_id) != expected_vault_id:
         return None
     if await VaultExternalGitRepository(pool).exists(vault_id):
         return None
@@ -145,6 +155,14 @@ async def _fetch_skill(vault: str) -> dict | None:
         doc = await get_document_service().get(vault, skill_policy.VAULT_SKILL_PATH)
     except NotFoundError:
         return None
+
+    # The document service addresses by name. Recheck after its async git/DB
+    # read so delete+recreate between the first lookup and that read cannot
+    # project the replacement vault through the old authorization.
+    if expected_vault_id is not None:
+        current_id = await vault_repo.get_id_by_name(vault)
+        if current_id is None or str(current_id) != expected_vault_id:
+            return None
 
     content = doc.content or ""
     version = (doc.content_hash or doc.current_commit or "")[:16]
@@ -157,10 +175,10 @@ async def _fetch_skill(vault: str) -> dict | None:
     return {"content": content, "version": version}
 
 
-def _store(vault: str, version: str | None, body: str | None) -> None:
+def _store(key: _CacheKey, version: str | None, body: str | None) -> None:
     """Write a cache entry and hold the LRU bound."""
-    _vault_cache[vault] = (time.monotonic(), version, body)
-    _vault_cache.move_to_end(vault)
+    _vault_cache[key] = (time.monotonic(), version, body)
+    _vault_cache.move_to_end(key)
     while len(_vault_cache) > _VAULT_CACHE_MAX:
         _vault_cache.popitem(last=False)
 
@@ -176,23 +194,29 @@ def _log_timeout(vault: str) -> None:
         )
 
 
-async def _current(vault: str) -> tuple[str | None, str | None]:
-    hit = _vault_cache.get(vault)
+async def _current(
+    vault: str, expected_vault_id: str | None = None
+) -> tuple[str | None, str | None]:
+    key = (vault, expected_vault_id)
+    hit = _vault_cache.get(key)
     if hit and time.monotonic() - hit[0] < _CACHE_TTL:
-        _vault_cache.move_to_end(vault)
+        _vault_cache.move_to_end(key)
         return hit[1], hit[2]
 
-    inflight = _pending.get(vault)
+    inflight = _pending.get(key)
     if inflight is not None:
         # `shield` so a cancelled FOLLOWER cannot cancel the shared fetch out
         # from under the other waiters (awaiting a Future directly would).
         return await asyncio.shield(inflight)
 
     fut: asyncio.Future = asyncio.get_running_loop().create_future()
-    _pending[vault] = fut
+    _pending[key] = fut
+    fetch_epoch = _invalidation_epoch
     try:
         try:
-            doc = await asyncio.wait_for(_fetch_skill(vault), timeout=_FETCH_TIMEOUT)
+            doc = await asyncio.wait_for(
+                _fetch_skill(vault, expected_vault_id), timeout=_FETCH_TIMEOUT
+            )
         except TimeoutError:
             # Deliberately NO cache write: a transient stall must not turn
             # into a TTL-long negative entry that suppresses injection for
@@ -219,14 +243,21 @@ async def _current(vault: str) -> tuple[str | None, str | None]:
             result = (None, None)
         else:
             result = (doc["version"], doc["content"])
-        _store(vault, result[0], result[1])
+        if fetch_epoch != _invalidation_epoch:
+            # A writer committed while this fetch was in flight.  The bytes
+            # may describe either side of that commit, so serve/cache neither.
+            result = (None, None)
+        else:
+            _store(key, result[0], result[1])
         fut.set_result(result)
         return result
     finally:
-        _pending.pop(vault, None)
+        _pending.pop(key, None)
 
 
-async def injection_payload(session_id: str | None, vault: str) -> dict | None:
+async def injection_payload(
+    session_id: str | None, vault: str, vault_id: str | None = None
+) -> dict | None:
     """The `vault_skill` payload to attach, or None. Never raises."""
     try:
         if not settings.vault_skill.enabled:
@@ -237,8 +268,8 @@ async def injection_payload(session_id: str | None, vault: str) -> dict | None:
             return None
         # Stdio/CLI callers have no session id; treat them as one
         # per-process pseudo-session (a stdio proxy is one conversation).
-        key = (session_id or "no-session", vault)
-        version, body = await _current(vault)
+        key = (session_id or "no-session", vault, vault_id)
+        version, body = await _current(vault, vault_id)
         if version is None or body is None:
             return None
         prev = _session_map.get(key)
@@ -267,3 +298,12 @@ async def injection_payload(session_id: str | None, vault: str) -> dict | None:
     except Exception as e:  # noqa: BLE001 — injection must never fail a tool call
         logger.warning("vault_skill injection skipped for %s: %s", vault, e)
         return None
+
+
+async def fetch_for_authorized_reader(vault: str, vault_id: str) -> dict | None:
+    """Fetch explicit-help content pinned to a completed reader check.
+
+    This is deliberately the same identity- and mirror-aware read as automatic
+    injection; explicit help must not become a weaker alternate channel.
+    """
+    return await _fetch_skill(vault, vault_id)

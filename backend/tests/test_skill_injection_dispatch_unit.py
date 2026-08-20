@@ -65,15 +65,19 @@ def wired(monkeypatch):
     """
     calls: list[tuple] = []
 
-    async def fake_payload(session_id, vault):
-        calls.append((session_id, vault))
+    async def fake_payload(session_id, vault, vault_id=None):
+        calls.append((session_id, vault, vault_id))
         return dict(_SENTINEL)
+
+    async def fake_can_read(user, uid, vault):
+        return access_service.authorized_vault() == vault
 
     async def fake_get_user():
         return server_mod._MCPUser()
 
     monkeypatch.setattr(vault_skill_service, "injection_payload", fake_payload)
     monkeypatch.setattr(server_mod, "_get_user", fake_get_user)
+    monkeypatch.setattr(server_mod, "_can_read_vault", fake_can_read)
     monkeypatch.setattr(server_mod, "_session_id", lambda: "sess-1")
 
     state = {"calls": calls}
@@ -99,6 +103,7 @@ def _authorizing(vault: str | None, result: dict | None = None):
     async def handler(name, args, user):
         if vault is not None:
             access_service._authorized_vault.set(vault)
+            access_service._authorized_vault_id.set(f"id-{vault}")
         return dict(result or {"ok": 1})
     return handler
 
@@ -110,7 +115,7 @@ async def test_success_path_attaches_payload(wired):
 
     assert body["ok"] == 1
     assert body["vault_skill"] == _SENTINEL
-    assert wired["calls"] == [("sess-1", "v1")]
+    assert wired["calls"] == [("sess-1", "v1", "id-v1")]
 
 
 async def test_no_access_check_means_no_injection(wired):
@@ -146,7 +151,7 @@ async def test_stale_authorization_does_not_leak_into_the_next_call(wired):
     body = await _run("akb_help", {"topic": "quickstart", "vault": "v1"})
 
     assert "vault_skill" not in body
-    assert wired["calls"] == [("sess-1", "v1")]  # only the first call's
+    assert wired["calls"] == [("sess-1", "v1", "id-v1")]  # only the first call's
 
 
 async def test_raised_exception_gets_envelope_without_injection(wired):
@@ -190,7 +195,7 @@ async def test_no_attributable_vault_never_awaits_injector(wired):
 
 async def test_injector_failure_never_fails_the_call(monkeypatch, wired):
     """The attach is best-effort: a raising injector still returns the result."""
-    async def exploding(session_id, vault):
+    async def exploding(session_id, vault, vault_id=None):
         raise RuntimeError("cache backend down")
 
     wired["dispatch"](_authorizing("v1"))
@@ -199,3 +204,48 @@ async def test_injector_failure_never_fails_the_call(monkeypatch, wired):
     body = await _run("akb_get", {"uri": "akb://v1/doc/notes/a.md"})
 
     assert body == {"ok": 1}
+
+
+async def test_first_write_returns_guide_before_dispatch(monkeypatch, wired):
+    dispatched = 0
+
+    async def can_read(user, uid, vault):
+        access_service._authorized_vault.set(vault)
+        access_service._authorized_vault_id.set("immutable-v1")
+        return True
+
+    payloads = iter((dict(_SENTINEL), None, None))
+
+    async def payload(session_id, vault, vault_id=None):
+        return next(payloads)
+
+    async def dispatch(name, args, user):
+        nonlocal dispatched
+        dispatched += 1
+        return {"updated": True}
+
+    monkeypatch.setattr(server_mod, "_can_read_vault", can_read)
+    monkeypatch.setattr(vault_skill_service, "injection_payload", payload)
+    wired["dispatch"](dispatch)
+    args = {"uri": "akb://v1/doc/notes/a.md", "content": "new"}
+
+    first = await _run("akb_update", args)
+    assert first["code"] == "vault_skill_required"
+    assert first["vault_skill"] == _SENTINEL
+    assert dispatched == 0
+
+    second = await _run("akb_update", args)
+    assert second == {"updated": True}
+    assert dispatched == 1
+
+
+async def test_write_only_caller_executes_without_skill_disclosure(monkeypatch, wired):
+    async def cannot_read(user, uid, vault):
+        return False
+
+    monkeypatch.setattr(server_mod, "_can_read_vault", cannot_read)
+    wired["dispatch"](_authorizing("v1", {"updated": True}))
+    body = await _run(
+        "akb_update", {"uri": "akb://v1/doc/notes/a.md", "content": "new"}
+    )
+    assert body == {"updated": True}

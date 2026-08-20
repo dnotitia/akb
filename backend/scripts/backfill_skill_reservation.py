@@ -9,11 +9,9 @@ so are ARCHIVED vaults unless `--include-archived` is passed; the dry run's
 DEFAULT IS A DRY RUN: it only scans and prints per-class counts. Pass
 `--execute` to apply the repairs.
 
-Two classes are REPORT-ONLY because no automated treatment exists:
-`resource_violations` (files/tables under overview/) and
-`reserved_subcollections`. An execute run with a non-zero
-`resource_violations` exits 1 — they still need operator handling, and a
-document-only repair must not read as full compliance.
+Files/tables under overview are report-only because they have no move API.
+Legacy subcollections are removed when empty; non-empty ones are reported as
+errors. An execute run exits non-zero while either class remains.
 
 The stdout summary is COUNTS ONLY, deliberately: it gets pasted into a public
 repo's PRs/issues, so no vault name or document path may appear there. Per-item
@@ -84,10 +82,9 @@ async def main() -> int:
     # (no move operation exists for either), so they are counted, not fixed.
     # A non-zero count therefore has to fail the run: exiting 0 here would let
     # a document-only repair be read as "the namespace is now compliant".
-    # Reserved sub-collections are excluded from this gate deliberately —
-    # they are trapped by the delete guard and need a schema-level decision,
-    # not an operator scramble on every run.
-    return 1 if errors or any(resources.values()) else 0
+    return 1 if (
+        errors or any(resources.values()) or result["reserved_subcollections"]
+    ) else 0
 
 
 if __name__ == "__main__":

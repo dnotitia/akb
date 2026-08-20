@@ -171,7 +171,7 @@ export default function VaultPage() {
     queryKey: ["document", name, VAULT_SKILL_PATH],
     queryFn: () => getDocument(name!, VAULT_SKILL_PATH),
     retry: false,
-    enabled: !!name,
+    enabled: !!name && !!info && !info.is_external_git,
   });
   const skillExists = !skillQuery.isError && !!skillQuery.data;
   const about = skillExists ? aboutExcerpt(skillQuery.data!.content) : "";
@@ -192,8 +192,14 @@ export default function VaultPage() {
   // template resolves — the chip renders no state rather than a wrong one.
   const skillCustomized =
     skillExists && templateQuery.data != null
-      ? (skillQuery.data!.content || "").trim() !==
-        templateQuery.data.replaceAll("{vault}", name!).trim()
+      ? (skillQuery.data!.content || "").trim() ===
+          templateQuery.data.replaceAll("{vault}", name!).trim() ||
+        (skillQuery.data!.created_at != null &&
+          skillQuery.data!.updated_at != null &&
+          Date.parse(skillQuery.data!.created_at) ===
+            Date.parse(skillQuery.data!.updated_at))
+        ? false
+        : true
       : undefined;
 
   function loadInfo(vault: string, alive: () => boolean = () => true) {
@@ -425,7 +431,7 @@ export default function VaultPage() {
 
       {/* About — the vault-skill doc is the best answer to "what is this vault
           for", so surface its opening on the read-first landing. */}
-      {skillExists && about && (
+      {skillCustomized === true && about && (
         <div className="mt-6 rounded-[var(--radius-lg)] border border-border bg-surface/60 px-4 py-3">
           <div className="flex items-baseline justify-between gap-3 mb-1.5">
             <span className="coord-ink">About this vault</span>

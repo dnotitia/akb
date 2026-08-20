@@ -70,9 +70,12 @@ class _FakeDocService:
             path=f"{collection}/{slug}.md" if collection else f"{slug}.md"
         )
 
-    async def update(self, vault, doc_ref, req, agent_id=None):
+    async def update(
+        self, vault, doc_ref, req, agent_id=None, *, skill_internal=False
+    ):
         self.calls.append(
-            ("update", vault, doc_ref, req.type, req.message, agent_id)
+            ("update", vault, doc_ref, req.type, req.message, agent_id,
+             skill_internal)
         )
         exc = self._pop(self._update_raises)
         if exc is not None:
@@ -88,6 +91,18 @@ class _FakeDocService:
         if exc is not None:
             raise exc
         return SimpleNamespace(path=f"{req.collection}/{req.slug}.md")
+
+
+class _FakeCollectionService:
+    def __init__(self, error=None):
+        self.calls = []
+        self.error = error
+
+    async def delete(self, *, vault, path, recursive, agent_id):
+        self.calls.append((vault, path, recursive, agent_id))
+        if self.error:
+            raise self.error
+        return {"ok": True}
 
 
 _NO_RESOURCES = {
@@ -113,12 +128,15 @@ def _patch_scans(monkeypatch, *, rows=(), missing=(),
         return {"files": files, "tables": tables}
 
     async def fake_subcollections(scope):
-        return subcollections
+        return [
+            {"vault_name": "v1", "path": f"overview/legacy-{i}"}
+            for i in range(subcollections)
+        ]
 
     monkeypatch.setattr(backfill, "_scan_violations", fake_violations)
     monkeypatch.setattr(backfill, "_scan_missing", fake_missing)
     monkeypatch.setattr(backfill, "_count_reserved_resources", fake_resources)
-    monkeypatch.setattr(backfill, "_count_reserved_subcollections", fake_subcollections)
+    monkeypatch.setattr(backfill, "_scan_reserved_subcollections", fake_subcollections)
 
 
 async def test_execute_move_out_uses_bypass_and_root_or_nested_collection(monkeypatch):
@@ -186,9 +204,9 @@ async def test_execute_retype_and_restore_type_update_requests(monkeypatch):
     assert result["done"]["restore_type"] == 1
     assert svc.calls == [
         ("update", "v1", "notes/guide.md", "note",
-         "skill-reservation backfill: retype", ACTOR),
+         "skill-reservation backfill: retype", ACTOR, True),
         ("update", "v2", "overview/vault-skill.md", "skill",
-         "skill-reservation backfill: restore", ACTOR),
+         "skill-reservation backfill: restore", ACTOR, True),
     ]
 
 
@@ -219,7 +237,7 @@ async def test_execute_move_out_of_skill_typed_doc_also_retypes(monkeypatch):
     assert svc.calls == [
         ("move", "v1", "overview/rogue.md", "", "rogue", ACTOR, True),
         ("update", "v1", "rogue.md", "note",
-         "skill-reservation backfill: retype", ACTOR),
+         "skill-reservation backfill: retype", ACTOR, True),
     ]
 
 
@@ -292,14 +310,42 @@ async def test_execute_reports_resource_violations_without_treating_them(monkeyp
         files=1, tables=0, subcollections=2,
     )
     svc = _FakeDocService()
+    collections = _FakeCollectionService(RuntimeError("collection not empty"))
 
-    result = await backfill.run(svc, execute=True)
+    result = await backfill.run(
+        svc, execute=True, collection_service=collections
+    )
 
     assert result["done"]["move_out"] == 1
     assert result["resource_violations"] == {"files": 1, "tables": 0}
     assert result["reserved_subcollections"] == 2
-    # Only the document move — no file/table/collection mutation exists.
+    # Documents move automatically; non-empty legacy collections remain and
+    # make the execute summary fail instead of being silently ignored.
     assert [c[0] for c in svc.calls] == ["move"]
+    assert len(result["errors"]) == 2
+
+
+async def test_execute_deletes_empty_legacy_subcollections_deepest_first(monkeypatch):
+    async def subcollections(scope):
+        return [
+            {"vault_name": "v1", "path": "overview/old"},
+            {"vault_name": "v1", "path": "overview/old/deep"},
+        ]
+
+    _patch_scans(monkeypatch)
+    monkeypatch.setattr(backfill, "_scan_reserved_subcollections", subcollections)
+    svc = _FakeDocService()
+    collections = _FakeCollectionService()
+
+    result = await backfill.run(
+        svc, execute=True, collection_service=collections
+    )
+
+    assert result["done"]["delete_subcollection"] == 2
+    assert result["reserved_subcollections"] == 0
+    assert [call[1] for call in collections.calls] == [
+        "overview/old/deep", "overview/old",
+    ]
 
 
 async def test_execute_clean_run_reports_zero_resource_violations(monkeypatch):

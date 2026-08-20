@@ -87,6 +87,18 @@ describe("vault page guide chip", () => {
     expect(link.getAttribute("href")).toBe("/vault/my-v/settings#skill");
   });
 
+  it("keeps an untouched historical seed classified as template", async () => {
+    getDocumentMock.mockResolvedValue({
+      content: "# my-v Guide\n\nAn older default placeholder.",
+      created_at: "2026-01-02T03:04:05Z",
+      updated_at: "2026-01-02T03:04:05Z",
+    });
+    renderVault();
+    const link = await findChip();
+    await waitFor(() => expect(link.textContent).toContain("template"));
+    expect(screen.queryByText("About this vault")).toBeNull();
+  });
+
   it("shows no state (never a wrong one) while the template is in flight", async () => {
     getSkillTemplateMock.mockReturnValue(new Promise(() => {}));
     renderVault();

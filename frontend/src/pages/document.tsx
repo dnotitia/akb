@@ -72,6 +72,7 @@ export default function DocumentPage() {
   const [copied, setCopied] = useState(false);
   const [articleEl, setArticleEl] = useState<HTMLElement | null>(null);
   const [vaultRole, setVaultRole] = useState<string | null>(null);
+  const [vaultKind, setVaultKind] = useState<"normal" | "mirror" | "error" | null>(null);
   const [editOpen, setEditOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
@@ -113,9 +114,16 @@ export default function DocumentPage() {
   useEffect(() => {
     if (!name) return;
     setVaultRole(null);
+    setVaultKind(null);
     getVaultInfo(name)
-      .then((d) => setVaultRole(d?.role || null))
-      .catch(() => setVaultRole(null));
+      .then((d) => {
+        setVaultRole(d?.role || null);
+        setVaultKind(d?.is_external_git ? "mirror" : "normal");
+      })
+      .catch(() => {
+        setVaultRole(null);
+        setVaultKind("error");
+      });
   }, [name]);
 
   const docQuery = useQuery({
@@ -333,7 +341,7 @@ export default function DocumentPage() {
   // must keep resolving. The gate is the raw param, not the computed
   // `isHistorical`: that one reads false until the HEAD query resolves, which
   // would redirect every version link away before it could settle.
-  if (docId === VAULT_SKILL_PATH && !commitHash) {
+  if (docId === VAULT_SKILL_PATH && !commitHash && vaultKind === "normal") {
     return <Navigate to={`/vault/${name}/settings#skill`} replace />;
   }
 

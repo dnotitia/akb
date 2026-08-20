@@ -58,11 +58,24 @@ VALID_WRITE_ACTIONS = frozenset({WRITE_ACTION_WILDCARD, FILE_UPLOAD_WRITE_ACTION
 _authorized_vault: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "authorized_vault", default=None,
 )
+_authorized_vault_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "authorized_vault_id", default=None,
+)
 
 
 def authorized_vault() -> str | None:
     """The vault this context has actually been authorized for, or None."""
     return _authorized_vault.get()
+
+
+def authorized_vault_id() -> str | None:
+    """Immutable identity paired with :func:`authorized_vault`.
+
+    Names can be deleted and recreated.  Consumers that project stored data
+    after an access check must pin both values so an authorization for the old
+    vault cannot be replayed against a new vault with the same name.
+    """
+    return _authorized_vault_id.get()
 
 
 def reset_authorized_vault() -> None:
@@ -73,6 +86,7 @@ def reset_authorized_vault() -> None:
     can never be mistaken for this one's.
     """
     _authorized_vault.set(None)
+    _authorized_vault_id.set(None)
 
 
 def normalize_write_actions(actions: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
@@ -229,6 +243,7 @@ async def check_vault_access(
         allow_archived=allow_archived, write_action=write_action,
     )
     _authorized_vault.set(vault_name)
+    _authorized_vault_id.set(str(result["vault_id"]))
     return result
 
 

@@ -426,6 +426,48 @@ itAsync("_discardImage surfaces backend lookup failures", async () => {
   );
 });
 
+itAsync("proxy-local first write returns the vault guide before side effects", async () => {
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  const guide = {
+    vault: "myvault", version: "abc123", reason: "first_touch",
+    body: "# Owner guide", truncated: false,
+  };
+  proxy._fileToolSkillPreflight = async () => guide;
+  proxy._putImage = async () => {
+    throw new Error("write must not run before the guide is applied");
+  };
+
+  const response = await proxy._handleFileTool(7, {
+    name: "akb_put_image",
+    arguments: { vault: "myvault", file_path: "/not-read-before-preflight.png" },
+  });
+  const body = JSON.parse(response.result.content[0].text);
+  assert.equal(body.code, "vault_skill_required");
+  assert.equal(body.retryable, true);
+  assert.deepEqual(body.vault_skill, guide);
+});
+
+itAsync("proxy-local read attaches the guide to the successful result", async () => {
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  const guide = {
+    vault: "myvault", version: "abc123", reason: "first_touch",
+    body: "# Owner guide", truncated: false,
+  };
+  proxy._fileToolSkillPreflight = async () => guide;
+  proxy._getFile = async () => ({ kind: "file", save_to: "/tmp/a.bin" });
+
+  const response = await proxy._handleFileTool(8, {
+    name: "akb_get_file",
+    arguments: {
+      uri: "akb://myvault/file/11111111-2222-3333-4444-555555555555",
+      save_to: "/tmp/a.bin",
+    },
+  });
+  const body = JSON.parse(response.result.content[0].text);
+  assert.equal(body.kind, "file");
+  assert.deepEqual(body.vault_skill, guide);
+});
+
 // ── Summary ──────────────────────────────────────────────────────
 
 await Promise.all(pending);

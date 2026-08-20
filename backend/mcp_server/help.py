@@ -1880,13 +1880,17 @@ document at `overview/vault-skill.md` (`type="skill"`, one per vault).
 
 It is seeded at vault creation, so normal vaults always have one. It cannot be
 deleted, moved, or retyped — to start over, reset it to the template. Edit it
-with `akb_update` on `overview/vault-skill.md`, or from the vault settings UI.
-The `overview` collection and `type="skill"` are reserved for it.
+as the vault owner with `akb_update` on `overview/vault-skill.md`, or from the
+vault settings UI. Generic writers can read the guide but cannot change these
+trusted instructions. The `overview` collection and `type="skill"` are
+reserved for it.
 
-Agents do not have to ask for it: the first tool response touching a vault in a
-session carries the skill as a `vault_skill` payload, re-attached whenever the
-skill changes. Read-only external git mirror vaults have no skill and never
-emit the payload.
+Agents do not have to ask for it: the first touch in a session carries the
+skill as a `vault_skill` payload, re-attached whenever the skill changes. A
+first write returns `vault_skill_required` before performing the mutation;
+apply the payload and retry with the same OCC/idempotency inputs. Read-only
+external git mirror vaults have no skill and never emit the payload, including
+through explicit vault help.
 
 For the full text (the payload may be truncated) call:
 

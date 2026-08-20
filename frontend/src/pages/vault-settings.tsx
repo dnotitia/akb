@@ -112,7 +112,7 @@ export default function VaultSettingsPage() {
     queryKey: ["document", name, VAULT_SKILL_PATH],
     queryFn: () => getDocument(name!, VAULT_SKILL_PATH),
     retry: false,
-    enabled: !!name,
+    enabled: !!name && !!info && !info.is_external_git,
   });
   const skillDoc = skillQuery.isError ? null : skillQuery.data;
 
@@ -166,14 +166,7 @@ export default function VaultSettingsPage() {
   }, [name]);
 
   const canEdit = info?.role === "owner";
-  // Vault metadata is owner-only, but the vault guide is an ordinary document
-  // write — the backend accepts a canonical body update from any writer (the
-  // skill guards only pin the type). Same rule the document page uses, plus
-  // the archived check: an archived vault is server-side read-only, so a
-  // writer would take a 403 on save (matches vault.tsx's CTA rule).
-  const canWrite =
-    (info?.role === "writer" || info?.role === "admin" || info?.role === "owner") &&
-    !info?.is_archived;
+  const canManageSkill = info?.role === "owner" && !info?.is_archived;
   const savedPublic = (info?.public_access as PublicAccess) || "none";
   const dirty = Boolean(
     info && (description !== (info.description || "") || publicAccess !== savedPublic),
@@ -526,7 +519,7 @@ export default function VaultSettingsPage() {
         // mirror note replaces it.
         loading={skillQuery.isLoading || (!info && !loadError)}
         isMirror={info?.is_external_git}
-        canWrite={canWrite}
+        canManage={canManageSkill}
       />
 
       {/* § LIFECYCLE — the two non-destructive lifecycle controls grouped into

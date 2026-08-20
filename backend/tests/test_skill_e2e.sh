@@ -415,6 +415,60 @@ echo "$N5" | grep -q "$MARKER" \
   && pass "Granted reader receives the skill through akb_help" \
   || fail "T8.8" "reader denied after grant: $(echo $N5 | head -c 200)"
 
+# 8.9 A fresh writer session must receive the guide BEFORE its first write,
+# and the canonical guide itself remains owner-managed.
+mcp akb_grant "{\"vault\":\"$INJECT_VAULT\",\"user\":\"$E2E_USER2\",\"role\":\"writer\"}" >/dev/null 2>&1
+
+INIT3=$(curl -sk -i -X POST "$BASE_URL/mcp/" \
+  -H "Authorization: Bearer $PAT2" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"skill-e2e-writer","version":"1.0"}}}' 2>&1)
+SID3=$(echo "$INIT3" | grep -i "mcp-session-id" | tr -d '\r' | awk '{print $2}')
+curl -sk -X POST "$BASE_URL/mcp/" \
+  -H "Authorization: Bearer $PAT2" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "mcp-session-id: $SID3" \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null 2>&1
+
+mcp3() {
+  local tool="$1"; local args="$2"
+  MCP_ID=$((MCP_ID+1))
+  curl -sk -X POST "$BASE_URL/mcp/" \
+    -H "Authorization: Bearer $PAT2" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -H "mcp-session-id: $SID3" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":$MCP_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}"
+}
+
+PUT_ARGS="{\"vault\":\"$INJECT_VAULT\",\"collection\":\"notes\",\"title\":\"Preflight probe\",\"slug\":\"preflight-probe\",\"content\":\"body\"}"
+W1=$(mcp3 akb_put "$PUT_ARGS" | mcp_text)
+echo "$W1" | grep -q '"code": *"vault_skill_required"' \
+  && pass "Fresh writer receives guide before the first mutation" \
+  || fail "T8.9" "first write was not preflighted: $(echo $W1 | head -c 200)"
+
+BEFORE_RETRY=$(mcp akb_get "{\"uri\":\"akb://$INJECT_VAULT/doc/notes/preflight-probe.md\"}" | mcp_text_noskill)
+echo "$BEFORE_RETRY" | grep -q '"code": *"not_found"' \
+  && pass "Preflight response leaves the document absent" \
+  || fail "T8.10" "first write produced a document before retry"
+
+W2=$(mcp3 akb_put "$PUT_ARGS" | mcp_text_noskill)
+echo "$W2" | grep -q '"action": *"created"' \
+  && pass "Retry performs the writer's document mutation" \
+  || fail "T8.11" "retry did not create the document: $(echo $W2 | head -c 200)"
+
+W3=$(mcp3 akb_update "{\"uri\":\"akb://$INJECT_VAULT/doc/overview/vault-skill.md\",\"content\":\"writer replacement\"}" | mcp_text)
+echo "$W3" | grep -q '"code": *"permission_denied"' \
+  && pass "Generic writer cannot alter owner-authored vault instructions" \
+  || fail "T8.12" "writer skill update was not denied: $(echo $W3 | head -c 200)"
+
+OWNER_READ=$(mcp akb_get "{\"uri\":\"akb://$INJECT_VAULT/doc/overview/vault-skill.md\"}" | mcp_text_noskill)
+echo "$OWNER_READ" | grep -q "$MARKER" \
+  && pass "Denied writer update leaves the guide unchanged" \
+  || fail "T8.13" "guide changed after the denied writer update"
+
 # ── Cleanup ──────────────────────────────────────────────────
 # The reserved-namespace guards do not block vault deletion (the vault delete
 # path is not a document/collection delete) — assert it rather than assume it,

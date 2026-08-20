@@ -69,6 +69,16 @@ class TestCheckUpdateType:
         sp.check_update_type("notes/a.md", "")
 
 
+class TestCheckUpdateAuthority:
+    def test_canonical_write_requires_owner_authorized_internal_lane(self):
+        with pytest.raises(ForbiddenError, match="vault owner"):
+            sp.check_update(sp.VAULT_SKILL_PATH, None)
+        sp.check_update(sp.VAULT_SKILL_PATH, None, internal=True)
+
+    def test_ordinary_document_write_remains_available(self):
+        sp.check_update("notes/a.md", None)
+
+
 class TestCheckMove:
     def test_move_out_of_overview_blocked(self):
         with pytest.raises(ForbiddenError):
@@ -97,11 +107,10 @@ class TestCheckDelete:
 
 
 class TestCheckCollectionDelete:
-    def test_overview_and_subtree_blocked(self):
+    def test_overview_blocked_but_legacy_subtree_can_be_cleaned(self):
         with pytest.raises(ForbiddenError):
             sp.check_collection_delete("overview")
-        with pytest.raises(ForbiddenError):
-            sp.check_collection_delete("overview/sub")
+        sp.check_collection_delete("overview/sub")
 
     def test_other_collections_pass(self):
         sp.check_collection_delete("notes")

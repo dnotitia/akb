@@ -26,7 +26,9 @@ async def test_collection_delete_overview_forbidden(monkeypatch):
     monkeypatch.setattr(svc, "_repos", _boom, raising=False)
     with pytest.raises(ForbiddenError):
         await svc.delete(vault="v", path="overview", recursive=True, agent_id=None)
-    with pytest.raises(ForbiddenError):
+    # Legacy rows below the reserved root must remain deletable so the
+    # reservation backfill can remove them through this service layer.
+    with pytest.raises(AssertionError, match="guard must fire"):
         await svc.delete(vault="v", path="overview/sub", recursive=False, agent_id=None)
 
 
