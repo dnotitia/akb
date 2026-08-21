@@ -81,6 +81,22 @@ source /etc/os-release 2>/dev/null || die "cannot inspect /etc/os-release"
 "${SUDO[@]}" apt-get install -y curl ca-certificates \
   || die "curl/CA package installation failed"
 
+# The transport profiles execute the repository's real zero-dependency Node
+# consumer after this host layer completes.  Use the Ubuntu 24.04 archive
+# rather than an unpinned third-party installer so a clean VM gets the same
+# package-managed node/npm toolchain as the rest of its base image.
+"${SUDO[@]}" apt-get install -y nodejs npm \
+  || die "Node.js/npm package installation failed"
+command -v node >/dev/null 2>&1 \
+  || die "Node.js executable is unavailable after package installation"
+command -v npm >/dev/null 2>&1 \
+  || die "npm executable is unavailable after package installation"
+NODE_VERSION=$(node --version) \
+  || die "Node.js version check failed"
+NPM_VERSION=$(npm --version) \
+  || die "npm version check failed"
+echo "Node.js ${NODE_VERSION}, npm ${NPM_VERSION} ready" >&2
+
 if ! command -v docker >/dev/null 2>&1; then
   "${SUDO[@]}" apt-get install -y docker.io \
     || die "Docker Engine package installation failed"

@@ -1011,6 +1011,10 @@ def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
     assert "exec 3>&1 1>&2" in text
     assert "--scenario empty" in text
     assert "app-installation-lifecycle" in text
+    assert 'apt-get install -y nodejs npm' in text
+    assert 'command -v node' in text
+    assert 'command -v npm' in text
+    assert "Node.js/npm package installation failed" in text
     assert "uv sync --locked" in text
     assert "exec 1>&3 3>&-" in text
     assert stat.S_IMODE(BOOTSTRAP.stat().st_mode) & stat.S_IXUSR

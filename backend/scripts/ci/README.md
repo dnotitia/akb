@@ -153,10 +153,12 @@ to the descriptor, logs, argv, or committed files.
 contain runtime lifecycle logic. On a clean Ubuntu 24.04 host it:
 
 1. verifies the base image and installs `curl`/CA certificates as needed;
-2. installs and starts Docker Engine plus Compose v2 idempotently;
-3. installs/verifies `uv` and Python 3.14 under the private runtime root;
-4. runs `uv sync --locked --extra dev --project backend`; and
-5. `exec`s the same Python supervisor in `gate` or `serve` mode.
+2. installs the Ubuntu archive's `nodejs`/`npm` packages and verifies both
+   executables before any selected stdio profile is validated;
+3. installs and starts Docker Engine plus Compose v2 idempotently;
+4. installs/verifies `uv` and Python 3.14 under the private runtime root;
+5. runs `uv sync --locked --extra dev --project backend`; and
+6. `exec`s the same Python supervisor in `gate` or `serve` mode.
 
 Package, network, Docker, uv, and Python failures are provisioning failures
 and stop immediately with an actionable stderr message. The bootstrap does
