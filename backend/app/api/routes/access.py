@@ -51,6 +51,7 @@ from app.services.access_service import (
     unarchive_vault,
     update_vault_metadata,
 )
+from app.services.account_service import presented_issuer_or_none
 from app.services.admission_service import (
     approve_pending_admission,
     dismiss_pending_admission,
@@ -397,8 +398,17 @@ async def admin_remove_vault_write_grant(
 
 @router.get("/admin/users", summary="[admin] List every user with stats")
 async def admin_list_users(user: AuthenticatedUser = Depends(get_current_user)):
+    """Every account, plus the issuer this runtime presents.
+
+    The issuer is reported rather than left for the caller to derive. A control
+    plane that computed it a second way would be a second answer to a question
+    that must have one, and the runtime is the side that actually presents it.
+    """
     _require_admin(user)
-    return {"users": await list_all_users_admin()}
+    return {
+        "users": await list_all_users_admin(),
+        "presented_issuer": presented_issuer_or_none(),
+    }
 
 
 @router.post(

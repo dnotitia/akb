@@ -51,12 +51,29 @@ def _presented_issuer(issuer: str) -> str:
     it locks the account out of the only credential it has.
     """
 
-    if settings.require_auth_mode() != "sso" or not settings.keycloak_enabled:
+    expected = presented_issuer_or_none()
+    if expected is None:
         raise ExternalAuthDisabledError()
-    expected = settings.keycloak_issuer
     if issuer != expected:
         raise ExternalIdentityIssuerMismatchError(expected)
     return issuer
+
+
+def presented_issuer_or_none() -> str | None:
+    """The issuer this runtime stamps on the tokens it will accept, or None.
+
+    ``_presented_issuer`` is the write-path guard built on this. Read paths need
+    the same answer without the refusal: a control plane asking "is this account
+    bound to the issuer you present" is not attempting a write, and it must be
+    able to tell "no" from "the question does not apply here".
+
+    None is not "some other issuer" — in local mode this runtime presents none
+    at all, and a caller that reads that as a mismatch would mark every account
+    stale. The absence has to travel as absence.
+    """
+    if settings.require_auth_mode() != "sso" or not settings.keycloak_enabled:
+        return None
+    return settings.keycloak_issuer
 
 
 _HUMAN_SENTINEL_HASH = "!keycloak-sso:no-local-login!"
