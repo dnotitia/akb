@@ -23,6 +23,7 @@ from app.repositories import vault_write_policy_repo as write_policy_repo
 from app.repositories.events_repo import emit_event
 from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.services.account_markers import is_retired_recovery_admin_password
+from app.services.account_service import presented_issuer_or_none
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import vault_uri
 from app.services.write_lane import run_compensation, run_git_write
@@ -1022,14 +1023,27 @@ async def search_users(query: str | None = None, limit: int = 20) -> list[dict]:
 
 
 async def list_all_users_admin() -> list[dict]:
-    """Admin-only: list every user with vault counts. Caller must gate on is_admin."""
+    """Admin-only: list every user with vault counts. Caller must gate on is_admin.
+
+    Each account also carries the issuers it is bound under, and whether one of
+    them is the issuer this runtime presents. A control plane that has moved a
+    workspace to its own realm cannot answer that from a bare "has an external
+    identity": after the move every stale account still answers yes, which is
+    exactly how a member who cannot sign in reads as ready.
+    """
+    presented = presented_issuer_or_none()
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT u.id, u.username, u.display_name, u.email, u.is_admin,
                    u.auth_provider, u.account_status, u.account_kind, u.created_at,
-                   (SELECT COUNT(*) FROM vaults v WHERE v.owner_id = u.id) AS owned_vaults
+                   (SELECT COUNT(*) FROM vaults v WHERE v.owner_id = u.id) AS owned_vaults,
+                   COALESCE((
+                       SELECT ARRAY_AGG(DISTINCT e.issuer ORDER BY e.issuer)
+                         FROM external_identities e
+                        WHERE e.user_id = u.id
+                   ), ARRAY[]::text[]) AS identity_issuers
             FROM users u
             ORDER BY u.created_at
             """
@@ -1046,6 +1060,12 @@ async def list_all_users_admin() -> list[dict]:
             "account_kind": r["account_kind"],
             "created_at": r["created_at"].isoformat(),
             "owned_vaults": r["owned_vaults"],
+            "identity_issuers": list(r["identity_issuers"]),
+            # None, not False, when this runtime presents no issuer — see
+            # `presented_issuer_or_none`.
+            "bound_to_presented_issuer": (
+                None if presented is None else presented in r["identity_issuers"]
+            ),
         }
         for r in rows
     ]
