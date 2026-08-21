@@ -370,7 +370,7 @@ const FILE_CONTENT_TOOLS = new Set(["akb_put", "akb_update"]);
 // local `initialize` response, so it must not silently drift on a proxy
 // behaviour change. There is no import of package.json here to keep lib/
 // zero-dependency and load-safe across Node versions.
-const PROXY_VERSION = "2.2.1";
+const PROXY_VERSION = "2.2.2";
 const VAULT_SKILL_PREFLIGHT_CAPABILITY =
   "io.dnotitia.akb/vault-skill-preflight";
 const PROXY_INSTRUCTIONS =
@@ -573,14 +573,28 @@ export class AKBProxy {
     // regardless of whether the backend is reachable right now. If the VPN
     // is down at startup, the server still registers; tools recover once
     // connectivity returns (see the monitor + tools/list_changed path).
+    const requestedProtocol =
+      params && typeof params.protocolVersion === "string" && params.protocolVersion;
+    if (requestedProtocol && requestedProtocol !== MCP_PROTOCOL_VERSION) {
+      // Never claim success by echoing a protocol revision this proxy does
+      // not implement.  A client can retry with the explicit supported
+      // revision; there is no fallback or downgrade path here.
+      return {
+        jsonrpc: "2.0",
+        id,
+        error: {
+          code: -32602,
+          message: "Unsupported protocol version",
+          data: { supported: [MCP_PROTOCOL_VERSION] },
+        },
+      };
+    }
     this._clientInitParams = params || null;
     this._initialized = true;
     // Kick off the backend session + tool prefetch in the background.
     this._startBackendMonitor();
 
-    const protocolVersion =
-      (params && typeof params.protocolVersion === "string" && params.protocolVersion) ||
-      MCP_PROTOCOL_VERSION;
+    const protocolVersion = requestedProtocol || MCP_PROTOCOL_VERSION;
     return {
       jsonrpc: "2.0",
       id,

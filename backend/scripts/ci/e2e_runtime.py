@@ -5,7 +5,9 @@ The runtime owns only the test infrastructure around AKB:
 * Compose manages the pinned PostgreSQL/pgvector and MinIO dependencies.
 * Uvicorn runs the embedding stub and backend as host processes.
 * A small in-process fixture control app exposes health, discovery, and the
-  project-neutral ``empty`` reset.
+  bounded scenario reset.
+* Optional profiles add the clean stdio proxy consumer and/or a lightweight
+  OIDC Resource Server fixture without changing the schema-v2 descriptor.
 
 The process deliberately keeps all runtime state outside the checkout.  It
 prints one machine-readable descriptor to stdout after readiness; operational
@@ -29,12 +31,13 @@ import shlex
 import shutil
 import signal
 import socket
+import subprocess
 import sys
 import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -43,10 +46,12 @@ from e2e_gate_observability import (
     shell_exit_code,
 )
 from fixture_control import create_app
+from oidc_fixture import OIDCFixture
 
 
 LOGGER = logging.getLogger("akb.e2e_runtime")
 SCHEMA_VERSION = 2
+PROTOCOL_REVISION = "2025-06-18"
 Scenario = Literal[
     "empty",
     "app-installation-lifecycle",
@@ -61,16 +66,110 @@ DEFAULT_EMBED_PORT = 8888
 DEFAULT_FIXTURE_PORT = 8889
 DEFAULT_COMPOSE_PROJECT = "akb-e2e"
 DEFAULT_TIMEOUT_SECONDS = 180.0
+DEFAULT_PROFILE = "tool-only"
+
+
+@dataclasses.dataclass(frozen=True)
+class CapabilityProfile:
+    """One explicit, fail-closed runtime capability selection."""
+
+    name: str
+    capabilities: frozenset[str]
+
+    @property
+    def needs_stdio(self) -> bool:
+        return "stdio" in self.capabilities
+
+    @property
+    def needs_oidc(self) -> bool:
+        return "oidc" in self.capabilities
+
+    @property
+    def needs_keycloak_overlay(self) -> bool:
+        return "keycloak" in self.capabilities
+
+
+_PROFILE_CAPABILITIES: dict[str, frozenset[str]] = {
+    "tool-only": frozenset({"http", "pat"}),
+    "transport-proxy": frozenset({"http", "pat", "stdio"}),
+    "oidc-resource-server": frozenset({"http", "pat", "oidc"}),
+    "transport-oidc": frozenset({"http", "pat", "stdio", "oidc"}),
+    # The common runtime never starts Keycloak.  Selecting this profile is an
+    # explicit request for the specialist overlay and therefore fails closed
+    # unless the orchestrator supplies that separate runtime.
+    "keycloak-overlay": frozenset({"http", "pat", "keycloak"}),
+}
+_CAPABILITY_ALIASES = {
+    "http": "http",
+    "pat": "pat",
+    "stdio": "stdio",
+    "oidc": "oidc",
+    "keycloak": "keycloak",
+}
+
+
+def _canonical_capabilities(values: Sequence[str]) -> frozenset[str]:
+    selected: set[str] = set()
+    for raw in values:
+        for token in re.split(r"[,+]", raw.strip().lower().replace("_", "-").replace("/", "-")):
+            if not token:
+                continue
+            capability = _CAPABILITY_ALIASES.get(token)
+            if capability is None:
+                raise ValueError(f"unknown runtime capability: {raw}")
+            selected.add(capability)
+    # Every supported MCP profile is rooted in the same HTTP/PAT fixture.  A
+    # caller selecting only a transport capability still gets the complete
+    # base rather than an accidental unauthenticated or HTTP-less runtime.
+    selected.update({"http", "pat"})
+    return frozenset(selected)
+
+
+def select_capability_profile(
+    profile: str = DEFAULT_PROFILE,
+    capabilities: Sequence[str] = (),
+) -> CapabilityProfile:
+    """Resolve one profile name plus optional capability additions."""
+
+    normalized = profile.strip().lower()
+
+    if normalized not in _PROFILE_CAPABILITIES:
+        raise ValueError(f"unknown runtime capability profile: {profile}")
+    selected = set(_PROFILE_CAPABILITIES[normalized])
+    if capabilities:
+        selected.update(_canonical_capabilities(capabilities))
+    resolved = frozenset(selected)
+    canonical_name = next(
+        (name for name, values in _PROFILE_CAPABILITIES.items() if values == resolved),
+        "custom-" + "-".join(sorted(resolved)),
+    )
+    return CapabilityProfile(canonical_name, resolved)
 
 
 class ProvisioningFailure(RuntimeError):
     """A dependency, process, or fixture precondition failed."""
 
 
+class BlockedRuntimeConfig(ProvisioningFailure):
+    """A requested capability cannot be provided by this runtime."""
+
+    code = "blocked_runtime_config"
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(f"{self.code}: {detail}")
+
+
+class ProductAssertionFailure(RuntimeError):
+    """A live profile assertion failed after provisioning succeeded."""
+
+    code = "product_assertion_failed"
+
+
 @dataclasses.dataclass(frozen=True)
 class CredentialNames:
     username_env: str = DEFAULT_USERNAME_ENV
     password_env: str = DEFAULT_PASSWORD_ENV
+    pat_env: str = "AKB_E2E_PAT"
 
     def values(self) -> tuple[str, str]:
         username = os.environ.get(self.username_env, "")
@@ -99,6 +198,12 @@ class RuntimeConfig:
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     credentials: CredentialNames = dataclasses.field(default_factory=CredentialNames)
     scenario: Scenario = SCENARIO
+    profile: str = DEFAULT_PROFILE
+    capabilities: tuple[str, ...] = ()
+
+    @property
+    def capability_profile(self) -> CapabilityProfile:
+        return select_capability_profile(self.profile, self.capabilities)
 
     @property
     def backend_dir(self) -> Path:
@@ -128,11 +233,21 @@ class RuntimeConfig:
     def logs_dir(self) -> Path:
         return self.runtime_root / "logs"
 
+    @property
+    def proxy_package_dir(self) -> Path:
+        return self.checkout / "packages" / "akb-mcp-client"
+
+    @property
+    def proxy_consumer_dir(self) -> Path:
+        return self.runtime_root / "node-consumer"
+
 
 @dataclasses.dataclass
 class ManagedProcess:
     process: asyncio.subprocess.Process
     process_group: bool = True
+    stdin: asyncio.StreamWriter | None = None
+    stdout: asyncio.StreamReader | None = None
 
 
 def prepare_private_runtime_root(root: Path) -> tuple[Path, Path, Path, Path]:
@@ -161,6 +276,32 @@ def _write_private_text(path: Path, value: str) -> None:
 
 def _http_get(url: str, timeout: float = 2.0) -> tuple[int, bytes]:
     request = Request(url, method="GET")
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return response.status, response.read()
+    except HTTPError as exc:
+        return exc.code, exc.read()
+    except (URLError, OSError):
+        return 0, b""
+
+
+def _http_json(
+    url: str,
+    *,
+    method: str = "GET",
+    body: dict[str, object] | None = None,
+    authorization: str | None = None,
+    timeout: float = 10.0,
+) -> tuple[int, bytes]:
+    """Small JSON client used for runtime-owned credential provisioning."""
+
+    payload = json.dumps(body, separators=(",", ":")).encode("utf-8") if body is not None else None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    if authorization:
+        headers["Authorization"] = authorization
+    request = Request(url, data=payload, headers=headers, method=method)
     try:
         with urlopen(request, timeout=timeout) as response:
             return response.status, response.read()
@@ -215,6 +356,7 @@ async def terminate_process(
 class E2ERuntime:
     def __init__(self, config: RuntimeConfig) -> None:
         self.config = config
+        self.profile = config.capability_profile
         self._children: dict[str, ManagedProcess] = {}
         self._active_command: asyncio.subprocess.Process | None = None
         self._fixture_server: Any | None = None
@@ -233,6 +375,22 @@ class E2ERuntime:
         self._fixture_private_values: tuple[str, ...] = ()
         self._fixture_private_marker = ""
         self._fixture_controls: dict[str, object] = {}
+        self._pat_value = ""
+        self._candidate_revision: str | None = None
+        self._proxy_version: str | None = None
+        self._stdio_initialize_observed = False
+        self._stdio_tools_list_observed = False
+        self._stdio_read_call_observed = False
+        self._stdio_next_id = 2
+        self.oidc_fixture: OIDCFixture | None = (
+            OIDCFixture(
+                origin=config.fixture_origin,
+                realm="runtime",
+                audience=f"{config.app_origin}/mcp",
+            )
+            if self.profile.needs_oidc
+            else None
+        )
 
         self._compose_log = self.config.logs_dir / "compose.log"
 
@@ -244,6 +402,129 @@ class E2ERuntime:
     @property
     def scenario(self) -> Scenario:
         return self.config.scenario
+
+    @property
+    def selected_capabilities(self) -> tuple[str, ...]:
+        return tuple(sorted(self.profile.capabilities))
+
+    def _source_revision(self) -> str:
+        if self._candidate_revision is not None:
+            return self._candidate_revision
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(self.config.checkout), "rev-parse", "HEAD"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            completed = None
+        revision = completed.stdout.strip() if completed and completed.returncode == 0 else "unknown"
+        self._candidate_revision = revision
+        return revision
+
+    def _artifact_version(self, package_dir: Path, *, default: str = "unknown") -> str:
+        package_file = package_dir / "package.json"
+        try:
+            parsed = json.loads(package_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return default
+        version = parsed.get("version")
+        return version if isinstance(version, str) and version else default
+
+    def _backend_version(self) -> str:
+        try:
+            text = (self.config.backend_dir / "pyproject.toml").read_text(encoding="utf-8")
+        except OSError:
+            return "unknown"
+        match = re.search(r"(?m)^version\s*=\s*[\"']([^\"']+)[\"']", text)
+        return match.group(1) if match else "unknown"
+
+    def runtime_evidence(self) -> dict[str, object]:
+        """Return source-bound, credential-free evidence coordinates."""
+
+        fixture_namespace = self._fixture_catalog.get("namespace")
+        fixture: dict[str, object] = {
+            "scenario": self.config.scenario,
+            "reset": {
+                "method": "POST",
+                "url": f"{self.config.fixture_origin}/reset",
+                "body": {"scenario": self.config.scenario},
+            },
+        }
+        if isinstance(fixture_namespace, str):
+            fixture["namespace"] = fixture_namespace
+        evidence: dict[str, object] = {
+            "source_revision": self._source_revision(),
+            "backend_artifact_version": self._backend_version(),
+            "protocol_revision": PROTOCOL_REVISION,
+            "transport": ["http", "stdio"] if self.profile.needs_stdio else ["http"],
+            "selected_capabilities": list(self.selected_capabilities),
+            "tool_cases": {
+                "read": "akb_list_vaults",
+                "write": "akb_put",
+                "destructive": "akb_delete",
+                "comparison": "same candidate, fixture, origin and credential",
+            },
+            "origin": {
+                "backend": self.config.app_origin,
+                "fixture": self.config.fixture_origin,
+            },
+            "credential_env": {
+                "username": self.config.credentials.username_env,
+                "password": self.config.credentials.password_env,
+                "pat": self.config.credentials.pat_env,
+            },
+            "pat": {
+                "credential_env": self.config.credentials.pat_env,
+                "mint": {
+                    "service": "app",
+                    "method": "POST",
+                    "path": "/api/v1/auth/tokens",
+                    "body_fields": ["name", "scopes", "vault_scope"],
+                    "auth": "login_session",
+                },
+                "cases": {
+                    "valid": {"authorization": "credential_env"},
+                    "unauthenticated": {"authorization": "omitted"},
+                    "read_only": {"scope": "akb:vault:read"},
+                    "write": {"scope": "akb:vault:write"},
+                    "destructive": {"scope": "akb:vault:admin"},
+                },
+            },
+            "fixture": fixture,
+            "failure_stages": ["provisioning", "product_assertion"],
+        }
+        if self.profile.needs_stdio:
+            if self._proxy_version is None:
+                self._proxy_version = self._artifact_version(self.config.proxy_package_dir)
+            evidence["proxy_artifact_version"] = self._proxy_version
+            evidence["stdio"] = {
+                "package": "akb-mcp",
+                "executable": "akb-mcp",
+                "consumer_root": str(self.config.proxy_consumer_dir),
+                "environment": {
+                    "AKB_MCP_URL": f"{self.config.app_origin}/mcp/",
+                    "AKB_PAT": self.config.credentials.pat_env,
+                },
+                "initialize_observed": self._stdio_initialize_observed,
+                "tools_list_observed": getattr(self, "_stdio_tools_list_observed", False),
+                "read_call_observed": getattr(self, "_stdio_read_call_observed", False),
+            }
+        if self.oidc_fixture is not None:
+            oidc_evidence = self.oidc_fixture.discovery()
+            oidc_evidence["resource_metadata"] = {
+                "method": "GET",
+                "url": f"{self.config.app_origin}/.well-known/oauth-protected-resource",
+            }
+            oidc_evidence["challenge"] = {
+                "method": "POST",
+                "url": f"{self.config.app_origin}/mcp/",
+                "authorization": "omitted",
+            }
+            evidence["oidc"] = oidc_evidence
+        return evidence
 
     def fixture_health(self) -> dict[str, object]:
         return {
@@ -287,6 +568,9 @@ class E2ERuntime:
                 "path": "/log-observation",
             }
         }
+        catalog["runtime"] = self.runtime_evidence()
+        if self.oidc_fixture is not None:
+            catalog["oidc"] = self.oidc_fixture.discovery()
         if self.config.scenario in {"app-release-rollout", "app-control-plane"}:
             installations = catalog.get("installations", [])
             targets: list[dict[str, str]] = []
@@ -670,7 +954,7 @@ class E2ERuntime:
             return
 
     def descriptor(self) -> dict[str, object]:
-        return {
+        descriptor: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
             "status": "ready",
             "scenario": self.config.scenario,
@@ -710,21 +994,93 @@ class E2ERuntime:
                 "login_path": "/api/v1/auth/login",
             },
         }
+        # Keep the legacy default descriptor byte-for-byte compatible.  A
+        # selected non-default profile advertises its added capabilities using
+        # the same schema-v2 service map rather than a parallel MCP descriptor.
+        if self.profile.name != DEFAULT_PROFILE or self.config.capabilities:
+            descriptor["profile"] = self.profile.name
+            descriptor["capabilities"] = list(self.selected_capabilities)
+            descriptor["evidence"] = self.runtime_evidence()
+        if self.profile.needs_stdio:
+            services = descriptor["services"]
+            assert isinstance(services, dict)
+            services["stdio"] = {
+                "origin": self.config.app_origin,
+                "transport": "stdio",
+                "package": "akb-mcp",
+                "executable": "akb-mcp",
+                "consumer_root": str(self.config.proxy_consumer_dir),
+                "environment": {
+                    "AKB_MCP_URL": f"{self.config.app_origin}/mcp/",
+                    "AKB_PAT": self.config.credentials.pat_env,
+                },
+            }
+            credentials = descriptor["credentials"]
+            assert isinstance(credentials, dict)
+            credentials["pat_env"] = self.config.credentials.pat_env
+        if self.oidc_fixture is not None:
+            services = descriptor["services"]
+            assert isinstance(services, dict)
+            app_service = services["app"]
+            assert isinstance(app_service, dict)
+            app_service["oauth_metadata"] = {
+                "method": "GET",
+                "url": f"{self.config.app_origin}/.well-known/oauth-protected-resource",
+            }
+            app_service["oauth_challenge"] = {
+                "method": "POST",
+                "url": f"{self.config.app_origin}/mcp/",
+                "authorization": "omitted",
+            }
+            services["oidc"] = {
+                "origin": self.config.fixture_origin,
+                "health": {"method": "GET", "url": self.oidc_fixture.health_uri},
+                "discovery": {"method": "GET", "url": self.oidc_fixture.metadata_uri},
+                "jwks": {"method": "GET", "url": self.oidc_fixture.jwks_uri},
+                "token": {
+                    "method": "POST",
+                    "url": self.oidc_fixture.token_uri,
+                    "body": {"variant": "valid"},
+                },
+            }
+        return descriptor
 
     def _validate_checkout(self) -> None:
         if not self.config.checkout.is_dir():
             raise ProvisioningFailure(f"checkout does not exist: {self.config.checkout}")
-        required = (
+        required: tuple[Path, ...] = (
             self.config.backend_dir / "uv.lock",
             self.config.backend_dir / "pyproject.toml",
             self.config.backend_dir / "scripts" / "ci" / "embed_stub.py",
             self.config.backend_dir / "scripts" / "ci" / "e2e_suite_runner.py",
         )
+        if self.profile.needs_stdio:
+            required += (
+                self.config.proxy_package_dir / "package.json",
+                self.config.proxy_package_dir / "bin" / "akb-mcp.mjs",
+            )
         missing = [str(path) for path in required if not path.is_file()]
         if missing:
             raise ProvisioningFailure("checkout is missing runtime inputs")
         if self.config.checkout == self.config.runtime_root or self.config.checkout in self.config.runtime_root.parents:
             raise ProvisioningFailure("runtime root must be outside the checkout")
+
+    def _validate_profile(self) -> None:
+        if self.profile.needs_keycloak_overlay:
+            raise BlockedRuntimeConfig(
+                "the common runtime does not start Keycloak; use the specialist SSO/IdP overlay"
+            )
+        if self.profile.needs_stdio:
+            missing = [name for name in ("node", "npm") if shutil.which(name) is None]
+            if missing:
+                raise BlockedRuntimeConfig(
+                    "stdio capability requires the installed Node consumer toolchain: "
+                    + ", ".join(missing)
+                )
+            if not self.config.proxy_package_dir.is_dir():
+                raise BlockedRuntimeConfig("stdio capability requires packages/akb-mcp-client")
+        if self.profile.needs_oidc and self.oidc_fixture is None:
+            raise BlockedRuntimeConfig("OIDC capability was selected without its fixture")
 
     def _write_config(self) -> None:
         import yaml
@@ -755,6 +1111,20 @@ class E2ERuntime:
             "s3_public_url": "http://127.0.0.1:9000",
             "s3_bucket": "akb-files",
         }
+        if self.oidc_fixture is not None:
+            app_config.update(
+                {
+                    "keycloak_enabled": True,
+                    "mcp_oauth_enabled": True,
+                    "keycloak_server_url": self.oidc_fixture.origin,
+                    "keycloak_internal_url": self.oidc_fixture.origin,
+                    "keycloak_realm": self.oidc_fixture.realm,
+                    "keycloak_client_id": "runtime-mcp-client",
+                    "mcp_oauth_audience": self.oidc_fixture.audience,
+                    "keycloak_enrollment_mode": "open",
+                    "keycloak_require_verified_email": True,
+                }
+            )
         secret_config = {
             "db_password": "akb",
             "system_hmac_secret": secrets.token_urlsafe(48),
@@ -772,7 +1142,7 @@ class E2ERuntime:
             yaml.safe_dump(secret_config, sort_keys=False),
         )
 
-    def _child_environment(self) -> dict[str, str]:
+    def _child_environment(self, overrides: dict[str, str] | None = None) -> dict[str, str]:
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONFAULTHANDLER"] = "1"
@@ -793,6 +1163,8 @@ class E2ERuntime:
             )
         env.setdefault("AKB_PG_USER", "akb")
         env.setdefault("AKB_PG_DB", "akb")
+        if overrides:
+            env.update(overrides)
         return env
 
     def _compose_command(self, *arguments: str) -> list[str]:
@@ -896,10 +1268,46 @@ class E2ERuntime:
             )
             self._children[name] = ManagedProcess(process)
 
+    async def _spawn_interactive_process(
+        self,
+        name: str,
+        command: list[str],
+        log_name: str,
+        *,
+        environment: dict[str, str],
+    ) -> ManagedProcess:
+        """Start a real stdio boundary while keeping stderr in private logs."""
+
+        if name in self._children:
+            raise ProvisioningFailure(f"process already running: {name}")
+        log_path = self.config.logs_dir / log_name
+        with log_path.open("ab", buffering=0) as handle:
+            os.chmod(log_path, 0o600)
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(self.config.runtime_root),
+                env=self._child_environment(environment),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=handle,
+                start_new_session=True,
+            )
+        managed = ManagedProcess(
+            process,
+            stdin=process.stdin,
+            stdout=process.stdout,
+        )
+        self._children[name] = managed
+        return managed
+
     async def _stop_named_process(self, name: str) -> None:
         managed = self._children.pop(name, None)
         if managed is None:
             return
+        if managed.stdin is not None:
+            managed.stdin.close()
+            with contextlib.suppress(Exception):
+                await managed.stdin.wait_closed()
         await terminate_process(managed.process, process_group=managed.process_group)
 
     async def _start_dependencies(self) -> None:
@@ -977,6 +1385,209 @@ class E2ERuntime:
             f"{self.config.app_origin}/readyz",
             self._ready_response,
         )
+
+    async def _mint_runtime_pat(self) -> None:
+        """Mint one candidate-bound PAT without ever putting it in argv/logs."""
+
+        username, password = self.config.credentials.values()
+        status, body = await asyncio.to_thread(
+            _http_json,
+            f"{self.config.app_origin}/api/v1/auth/login",
+            method="POST",
+            body={"username": username, "password": password},
+        )
+        if status != 200:
+            raise ProvisioningFailure("runtime PAT login failed")
+        try:
+            login_payload = json.loads(body)
+            session_token = login_payload["token"]
+            if not isinstance(session_token, str) or not session_token:
+                raise ValueError
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            raise ProvisioningFailure("runtime PAT login returned an invalid response") from None
+        # The session bearer is only an in-memory provisioning intermediate;
+        # include it in the private-value redaction set before the token mint
+        # request so a driver or child log can never echo it through discovery.
+        self._fixture_private_values = (*self._fixture_private_values, session_token)
+
+        status, body = await asyncio.to_thread(
+            _http_json,
+            f"{self.config.app_origin}/api/v1/auth/tokens",
+            method="POST",
+            authorization=f"Bearer {session_token}",
+            body={"name": "runtime-mcp"},
+        )
+        if status != 200:
+            raise ProvisioningFailure("runtime PAT mint failed")
+        try:
+            token_payload = json.loads(body)
+            token = token_payload["token"]
+            if not isinstance(token, str) or not token.startswith("akb_"):
+                raise ValueError
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            raise ProvisioningFailure("runtime PAT mint returned an invalid response") from None
+        self._pat_value = token
+        self._fixture_private_values = (*self._fixture_private_values, token)
+
+    async def _install_stdio_proxy(self) -> Path:
+        """Install the checkout package into the private clean Node consumer."""
+
+        consumer = self.config.proxy_consumer_dir
+        consumer.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(consumer, 0o700)
+        try:
+            await self._run_logged_command(
+                [
+                    "npm",
+                    "install",
+                    "--prefix",
+                    str(consumer),
+                    "--no-save",
+                    "--package-lock=false",
+                    "--ignore-scripts",
+                    "--no-audit",
+                    "--no-fund",
+                    str(self.config.proxy_package_dir),
+                ],
+                log_path=self.config.logs_dir / "stdio-install.log",
+            )
+        except ProvisioningFailure as exc:
+            raise BlockedRuntimeConfig("clean Node consumer installation failed") from exc
+        executable = consumer / "node_modules" / ".bin" / "akb-mcp"
+        if not executable.is_file():
+            executable = consumer / "node_modules" / "akb-mcp" / "bin" / "akb-mcp.mjs"
+        if not executable.is_file():
+            raise BlockedRuntimeConfig("installed akb-mcp package did not expose its bin")
+        self._proxy_version = self._artifact_version(self.config.proxy_package_dir)
+        return executable
+
+    async def _start_stdio_proxy(self) -> None:
+        if not self._pat_value:
+            raise BlockedRuntimeConfig("stdio capability requires a runtime PAT")
+        executable = await self._install_stdio_proxy()
+        node = shutil.which("node")
+        if node is None:
+            raise BlockedRuntimeConfig("stdio capability requires node")
+        managed = await self._spawn_interactive_process(
+            "stdio",
+            [node, str(executable)],
+            "stdio-proxy.log",
+            environment={
+                "AKB_MCP_URL": f"{self.config.app_origin}/mcp/",
+                "AKB_PAT": self._pat_value,
+            },
+        )
+        if managed.stdin is None or managed.stdout is None:
+            raise BlockedRuntimeConfig("stdio proxy did not expose stdin/stdout pipes")
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": PROTOCOL_REVISION,
+                "capabilities": {},
+                "clientInfo": {"name": "akb-e2e-runtime", "version": "1"},
+            },
+        }
+        managed.stdin.write((json.dumps(initialize, separators=(",", ":")) + "\n").encode())
+        await managed.stdin.drain()
+        try:
+            for _ in range(8):
+                line = await asyncio.wait_for(managed.stdout.readline(), timeout=10)
+                if not line:
+                    break
+                response = json.loads(line)
+                if not isinstance(response, dict):
+                    continue
+                if response.get("id") != 1:
+                    continue
+                if "error" in response:
+                    raise ValueError
+                self._stdio_initialize_observed = True
+                initialized = {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {},
+                }
+                managed.stdin.write((json.dumps(initialized, separators=(",", ":")) + "\n").encode())
+                await managed.stdin.drain()
+                return
+        except (asyncio.TimeoutError, ValueError, json.JSONDecodeError):
+            pass
+        await self._stop_named_process("stdio")
+        raise BlockedRuntimeConfig("stdio proxy initialize did not cross the process boundary")
+
+    async def _stdio_response(self, expected_id: int) -> dict[str, object]:
+        managed = self._children.get("stdio")
+        if managed is None or managed.stdout is None:
+            raise ProductAssertionFailure("stdio process is unavailable")
+        for _ in range(32):
+            try:
+                line = await asyncio.wait_for(managed.stdout.readline(), timeout=20)
+            except asyncio.TimeoutError:
+                raise ProductAssertionFailure("stdio response timed out") from None
+            if not line:
+                raise ProductAssertionFailure("stdio process closed its output")
+            try:
+                response = json.loads(line)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                # A non-JSON line is not a valid protocol response.  Do not
+                # copy it into an error because it could contain credentials.
+                continue
+            if isinstance(response, dict) and response.get("id") == expected_id:
+                return response
+        raise ProductAssertionFailure("stdio response id was not observed")
+
+    async def _stdio_request(self, method: str, params: dict[str, object] | None = None) -> dict[str, object]:
+        managed = self._children.get("stdio")
+        if managed is None or managed.stdin is None:
+            raise ProductAssertionFailure("stdio process is unavailable")
+        request_id = self._stdio_next_id
+        self._stdio_next_id += 1
+        message: dict[str, object] = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+        }
+        if params is not None:
+            message["params"] = params
+        managed.stdin.write((json.dumps(message, separators=(",", ":")) + "\n").encode())
+        await managed.stdin.drain()
+        return await self._stdio_response(request_id)
+
+    async def _probe_stdio_behavior(self) -> None:
+        """Observe the installed proxy at the protocol boundary.
+
+        This is intentionally a small read-only product assertion.  The
+        curated HTTP suites remain responsible for write/destructive side
+        effects; the discovery evidence advertises the same tool cases for a
+        source-blind transport comparison.
+        """
+
+        if not self.profile.needs_stdio:
+            return
+        response = await self._stdio_request("tools/list", {})
+        result = response.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("tools"), list):
+            raise ProductAssertionFailure("stdio tools/list returned an invalid result")
+        names = {
+            item.get("name")
+            for item in result["tools"]
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+        required = {"akb_list_vaults", "akb_put", "akb_delete_vault"}
+        if not required.issubset(names):
+            raise ProductAssertionFailure("stdio tools/list omitted a required tool")
+        self._stdio_tools_list_observed = True
+
+        read_response = await self._stdio_request(
+            "tools/call",
+            {"name": "akb_list_vaults", "arguments": {}},
+        )
+        read_result = read_response.get("result")
+        if not isinstance(read_result, dict) or "error" in read_response:
+            raise ProductAssertionFailure("stdio read tool call was not accepted")
+        self._stdio_read_call_observed = True
 
     @staticmethod
     def _ready_response(status: int, body: bytes) -> bool:
@@ -2379,6 +2990,7 @@ class E2ERuntime:
         await self._stop_named_process("backend")
         await self._seed_external_credential()
         await self._start_backend()
+        await self._mint_runtime_pat()
 
     async def _start_fixture_control(self) -> None:
         import uvicorn
@@ -2407,6 +3019,7 @@ class E2ERuntime:
 
     async def prepare(self) -> None:
         self._validate_checkout()
+        self._validate_profile()
         prepare_private_runtime_root(self.config.runtime_root)
         self._write_config()
         self.config.logs_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -2414,6 +3027,8 @@ class E2ERuntime:
         await self._start_fixture_control()
         await self._start_embed_stub()
         await self._bootstrap_backend_and_seed()
+        if self.profile.needs_stdio:
+            await self._start_stdio_proxy()
         self._prepared = True
 
     async def reset_scenario(self) -> None:
@@ -2424,6 +3039,11 @@ class E2ERuntime:
             self._resetting = True
             try:
                 self._fixture_controls.clear()
+                await self._stop_named_process("stdio")
+                self._stdio_initialize_observed = False
+                self._stdio_tools_list_observed = False
+                self._stdio_read_call_observed = False
+                self._stdio_next_id = 2
                 await self._stop_named_process("backend")
                 await self._stop_named_process("embed")
                 await self._compose("down", "--volumes", "--remove-orphans", check=False)
@@ -2434,6 +3054,8 @@ class E2ERuntime:
                 await self._start_dependencies()
                 await self._start_embed_stub()
                 await self._bootstrap_backend_and_seed()
+                if self.profile.needs_stdio:
+                    await self._start_stdio_proxy()
             finally:
                 self._resetting = False
 
@@ -2493,8 +3115,39 @@ class E2ERuntime:
                 "process": "supervisor",
                 "suite_runner": str(suite_path),
                 "gate_log": str(log_path),
+                "stage": "product_assertion",
+                "profile": self.profile.name,
+                "capabilities": list(self.selected_capabilities),
+                "source_revision": self._source_revision(),
             },
         )
+
+        if self.profile.needs_stdio:
+            await self._probe_stdio_behavior()
+            emit_gate_event(
+                {
+                    "event": "stdio_contract_start",
+                    "process": "supervisor",
+                    "stage": "product_assertion",
+                    "profile": self.profile.name,
+                }
+            )
+            try:
+                await self._run_logged_command(
+                    ["npm", "test", "--prefix", str(self.config.proxy_package_dir)],
+                    log_path=self.config.logs_dir / "stdio-contract.log",
+                )
+            except ProvisioningFailure as exc:
+                raise ProductAssertionFailure("stdio contract/reconnect tests failed") from exc
+            emit_gate_event(
+                {
+                    "event": "stdio_contract_complete",
+                    "process": "supervisor",
+                    "stage": "product_assertion",
+                    "profile": self.profile.name,
+                    "returncode": 0,
+                }
+            )
 
         child_env = self._child_environment()
         with log_path.open("ab", buffering=0) as handle:
@@ -2564,6 +3217,7 @@ class E2ERuntime:
             await terminate_process(self._suite_process.process)
             self._suite_process = None
         await self._stop_fixture_control()
+        await self._stop_named_process("stdio")
         await self._stop_named_process("backend")
         await self._stop_named_process("embed")
         with contextlib.suppress(Exception):
@@ -2577,13 +3231,36 @@ class E2ERuntime:
             # Validate before any process/resource is created.  The values are
             # intentionally read only for presence and later hashing; they are
             # never copied into a descriptor, command line, or log message.
+            self._validate_profile()
             self.config.credentials.values()
             await self.prepare()
             print(json.dumps(self.descriptor(), separators=(",", ":"), ensure_ascii=False), flush=True)
             if self.config.mode == "gate":
                 return await self._run_gate()
             return await self._serve_foreground()
+        except ProductAssertionFailure as exc:
+            emit_gate_event(
+                {
+                    "event": "product_assertion_failed",
+                    "process": "supervisor",
+                    "code": ProductAssertionFailure.code,
+                    "stage": "product_assertion",
+                    "profile": self.profile.name,
+                }
+            )
+            LOGGER.error("E2E product assertion failed: %s", str(exc))
+            return 1
         except ProvisioningFailure as exc:
+            if isinstance(exc, BlockedRuntimeConfig):
+                emit_gate_event(
+                    {
+                        "event": "runtime_blocked",
+                        "process": "supervisor",
+                        "code": BlockedRuntimeConfig.code,
+                        "stage": "provisioning",
+                        "profile": self.profile.name,
+                    }
+                )
             LOGGER.error("E2E runtime provisioning failed: %s", str(exc))
             return 1
         except Exception:
@@ -2619,6 +3296,21 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
     parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--username-env", default=DEFAULT_USERNAME_ENV)
     parser.add_argument("--password-env", default=DEFAULT_PASSWORD_ENV)
+    parser.add_argument("--pat-env", default="AKB_E2E_PAT")
+    parser.add_argument(
+        "--profile",
+        default=DEFAULT_PROFILE,
+        help=(
+            "capability profile: tool-only, transport-proxy, "
+            "oidc-resource-server, transport-oidc, or keycloak-overlay"
+        ),
+    )
+    parser.add_argument(
+        "--capability",
+        action="append",
+        default=[],
+        help="optional capability addition (stdio, oidc, or keycloak); repeatable",
+    )
     parser.add_argument(
         "--scenario",
         choices=(
@@ -2630,6 +3322,11 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
         default=SCENARIO,
     )
     args = parser.parse_args(argv)
+
+    try:
+        select_capability_profile(args.profile, args.capability)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     checkout = args.checkout.expanduser().resolve()
     runtime_root = (
@@ -2649,8 +3346,10 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
         embed_port=args.embed_port,
         fixture_port=args.fixture_port,
         timeout_seconds=args.timeout_seconds,
-        credentials=CredentialNames(args.username_env, args.password_env),
+        credentials=CredentialNames(args.username_env, args.password_env, args.pat_env),
         scenario=args.scenario,
+        profile=args.profile,
+        capabilities=tuple(args.capability),
     )
 
 

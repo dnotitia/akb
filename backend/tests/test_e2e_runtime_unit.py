@@ -18,13 +18,16 @@ CI_DIR = Path(__file__).resolve().parent.parent / "scripts" / "ci"
 sys.path.insert(0, str(CI_DIR))
 
 from e2e_runtime import (  # noqa: E402
+    BlockedRuntimeConfig,
+    CapabilityProfile,
     CredentialNames,
     E2ERuntime,
     ManagedProcess,
     RuntimeConfig,
     _parse_args,
-    terminate_process,
     prepare_private_runtime_root,
+    select_capability_profile,
+    terminate_process,
 )
 from e2e_gate_observability import (  # noqa: E402
     EVENT_PREFIX,
@@ -1008,6 +1011,98 @@ def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
     assert "exec 3>&1 1>&2" in text
     assert "--scenario empty" in text
     assert "app-installation-lifecycle" in text
+    assert 'apt-get install -y nodejs npm' in text
+    assert 'command -v node' in text
+    assert 'command -v npm' in text
+    assert "Node.js/npm package installation failed" in text
     assert "uv sync --locked" in text
     assert "exec 1>&3 3>&-" in text
     assert stat.S_IMODE(BOOTSTRAP.stat().st_mode) & stat.S_IXUSR
+
+
+def test_capability_profiles_are_explicit_and_composable():
+    assert select_capability_profile("tool-only") == CapabilityProfile(
+        "tool-only", frozenset({"http", "pat"})
+    )
+    assert select_capability_profile("transport-proxy").needs_stdio
+    assert select_capability_profile("oidc-resource-server").needs_oidc
+    combined = select_capability_profile("tool-only", ("stdio", "oidc"))
+    assert combined.name == "transport-oidc"
+    assert combined.capabilities == frozenset({"http", "pat", "stdio", "oidc"})
+
+
+def test_tool_only_does_not_advertise_optional_processes(tmp_path):
+    runtime = E2ERuntime(make_config(tmp_path))
+    descriptor = runtime.descriptor()
+    assert set(descriptor["services"]) == {"app", "fixture"}
+    assert "profile" not in descriptor
+    discovery = runtime.fixture_discovery()
+    assert discovery["runtime"]["selected_capabilities"] == ["http", "pat"]
+    assert "stdio" not in discovery["runtime"]
+    assert "oidc" not in discovery["runtime"]
+
+
+def test_transport_profile_exposes_real_proxy_boundary_without_secret(tmp_path):
+    runtime = E2ERuntime(
+        dataclasses.replace(make_config(tmp_path), profile="transport-proxy")
+    )
+    runtime._pat_value = "akb_runtime_secret"  # pragma: allowlist secret
+    descriptor = runtime.descriptor()
+    assert descriptor["services"]["stdio"]["transport"] == "stdio"
+    assert descriptor["credentials"]["pat_env"] == "AKB_E2E_PAT"
+    serialized = json.dumps(descriptor)
+    assert "akb_runtime_secret" not in serialized
+    assert "AKB_E2E_PAT" in serialized
+    assert descriptor["evidence"]["transport"] == ["http", "stdio"]
+
+
+@pytest.mark.asyncio
+async def test_oidc_profile_serves_jwks_metadata_and_deterministic_variants(tmp_path):
+    runtime = E2ERuntime(
+        dataclasses.replace(make_config(tmp_path), profile="oidc-resource-server")
+    )
+    app = create_app(runtime)
+    jwks_path = runtime.oidc_fixture.jwks_uri.removeprefix(runtime.config.fixture_origin)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url=runtime.config.fixture_origin
+    ) as client:
+        health = await client.get("/oidc/health")
+        metadata = await client.get("/.well-known/openid-configuration")
+        jwks = await client.get(jwks_path)
+        token = await client.post("/oidc/token", json={"variant": "valid"})
+        bad = await client.post("/oidc/token", json={"variant": "wrong_issuer"})
+    assert health.status_code == 200
+    assert metadata.json()["issuer"] == runtime.oidc_fixture.issuer
+    assert jwks.json()["keys"][0]["alg"] == "RS256"
+    assert token.status_code == 200 and token.json()["token_type"] == "Bearer"
+    assert bad.status_code == 200 and bad.json()["access_token"] != token.json()["access_token"]
+    assert metadata.json()["scopes_supported"] == ["akb:vault:read", "akb:vault:write"]
+    assert set(runtime.oidc_fixture.discovery()["token_variants"]) == {
+        "valid",
+        "wrong_issuer",
+        "wrong_audience",
+        "expired",
+        "wrong_algorithm",
+        "wrong_key_id",
+        "insufficient_scope",
+    }
+    assert "challenge_cases" in runtime.oidc_fixture.discovery()
+    assert "access_token" not in json.dumps(runtime.fixture_discovery())
+
+
+def test_optional_capabilities_fail_closed_without_silent_skip(tmp_path, monkeypatch):
+    runtime = E2ERuntime(
+        dataclasses.replace(make_config(tmp_path), profile="keycloak-overlay")
+    )
+    with pytest.raises(BlockedRuntimeConfig, match="blocked_runtime_config"):
+        runtime._validate_profile()
+
+    transport = E2ERuntime(
+        dataclasses.replace(make_config(tmp_path), profile="transport-proxy")
+    )
+    monkeypatch.setattr(
+        "e2e_runtime.shutil.which",
+        lambda name: None if name == "node" else "/usr/bin/npm",
+    )
+    with pytest.raises(BlockedRuntimeConfig, match="stdio capability"):
+        transport._validate_profile()

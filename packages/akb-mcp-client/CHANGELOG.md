@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.2.2 — strict MCP protocol boundary
+
+The stdio proxy now rejects an `initialize` request that names an unsupported
+MCP protocol revision instead of echoing that revision as a successful
+handshake. The response identifies the single supported revision so a caller
+can retry explicitly; no fallback or downgrade path is introduced.
+
 ## 2.2.1 — vault guide preflight for proxy-local tools
 
 Proxy-local file and image tools now participate in the same vault-guide
