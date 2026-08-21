@@ -79,6 +79,19 @@ The supervisor has two modes:
   the foreground until SIGINT/SIGTERM. The fixture's `POST /reset` performs a
   safe empty reset and waits for backend readiness again.
 
+Each invocation also selects one explicit capability profile. The default
+`tool-only` profile starts only the HTTP backend, PAT fixture, and shared
+fixture control app. `transport-proxy` adds a clean install of the checkout's
+`akb-mcp` package into the private runtime root and starts its real executable
+over stdin/stdout. `oidc-resource-server` adds an ephemeral RSA issuer/JWKS
+fixture with deterministic token variants. `transport-oidc` composes both.
+`keycloak-overlay` is intentionally rejected with
+`blocked_runtime_config`; browser SSO and the real Keycloak service remain a
+specialist overlay. Add a capability explicitly with repeatable
+`--capability stdio` / `--capability oidc` (or use `--profile`). Optional
+processes are never started for `tool-only`, and an unavailable selected
+capability is a hard failure rather than a skip.
+
 The ready descriptor is the only line written to stdout by the supervisor.
 Operational logs go to stderr and the private runtime log directory. Its
 shape is schema v2:
@@ -89,10 +102,27 @@ shape is schema v2:
 
 Credential values are read only from the named environment variables and are
 never put in the descriptor, argv, or runtime logs. The only supported
-scenario is `empty`; callers must pass `--scenario empty` when mapping a
-runtime command. Both `gate` and `serve` require
+scenarios are `empty`, `app-installation-lifecycle`, `app-release-rollout`,
+and `app-control-plane`; callers must pass the selected scenario when mapping
+a runtime command. Both `gate` and `serve` require
 `AKB_E2E_USERNAME` and `AKB_E2E_PASSWORD` to be present before the supervisor
 starts; the runtime does not generate or persist those values.
+
+For a selected transport profile the supervisor mints one candidate-bound PAT
+in memory, passes it to the real proxy only as the `AKB_PAT` child environment
+value, and exposes only the configured PAT environment-name in descriptor and
+discovery. The private discovery `runtime` object records the exact source
+revision, backend/proxy artifact versions, protocol revision, transport,
+selected capabilities, tool-case coordinates, fixture reset, and whether the
+stdio initialize/tools-list/read probes crossed the process boundary. The
+OIDC discovery object exposes issuer/JWKS/token coordinates and variant names,
+never an access token or signing key.
+
+`gate` runs the existing curated HTTP suite runner for every profile. A
+transport profile additionally runs the existing proxy contract/reconnect
+tests after the clean install and observes `tools/list` plus a read-only
+`tools/call` through the real child process. Provisioning failures and live
+product-assertion failures are emitted as separate gate events.
 
 For a direct local gate, use the uv-managed Python environment to generate
 per-run values and export them without placing a credential value in the

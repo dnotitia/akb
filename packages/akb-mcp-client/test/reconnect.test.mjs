@@ -73,6 +73,20 @@ itAsync("initialize falls back to a default protocol version when omitted", asyn
   assert.match(res.result.protocolVersion, /^\d{4}-\d{2}-\d{2}$/);
 });
 
+itAsync("initialize rejects an unsupported protocol version instead of echoing it", async () => {
+  const proxy = newProxy();
+  proxy._startBackendMonitor = () => {};
+  const res = await proxy._initialize(1, {
+    protocolVersion: "2099-01-01",
+    capabilities: {},
+  });
+
+  assert.equal(res.error.code, -32602);
+  assert.deepEqual(res.error.data.supported, ["2025-06-18"]);
+  assert.equal(res.result, undefined);
+  assert.equal(proxy._initialized, false);
+});
+
 itAsync("backend initialize negotiates vault-guide preflight without dropping client capabilities", async () => {
   const proxy = newProxy();
   const original = {

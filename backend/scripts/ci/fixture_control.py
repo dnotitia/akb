@@ -64,6 +64,16 @@ def create_app(runtime: FixtureRuntime) -> FastAPI:
         openapi_url="/openapi.json",
     )
 
+    # The lightweight OIDC Resource Server fixture is an optional capability
+    # of the same in-process control service.  Keeping it absent from the app
+    # when the profile does not select OIDC makes tool-only startup cheap and
+    # prevents an accidental Keycloak/issuer dependency.
+    oidc_fixture = getattr(runtime, "oidc_fixture", None)
+    if oidc_fixture is not None:
+        register = getattr(oidc_fixture, "register", None)
+        if callable(register):
+            register(app)
+
     @app.get("/health")
     async def health() -> dict[str, object]:
         return runtime.fixture_health()

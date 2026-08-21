@@ -16,7 +16,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 DEFAULT_CHECKOUT=$(cd -- "$SCRIPT_DIR/../../.." && pwd)
 MODE="${1:-}"
 [ "$MODE" = "gate" ] || [ "$MODE" = "serve" ] \
-  || die "usage: $0 {gate|serve} [--scenario empty|app-installation-lifecycle|app-release-rollout] [--checkout PATH] [--runtime-root PATH] [supervisor options]"
+  || die "usage: $0 {gate|serve} [--profile tool-only|transport-proxy|oidc-resource-server|transport-oidc] [--capability stdio|oidc] [--scenario empty|app-installation-lifecycle|app-release-rollout|app-control-plane] [--checkout PATH] [--runtime-root PATH] [supervisor options]"
 shift
 
 CHECKOUT="${AKB_CHECKOUT:-$DEFAULT_CHECKOUT}"
