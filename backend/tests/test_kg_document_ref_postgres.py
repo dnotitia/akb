@@ -10,7 +10,7 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
-from app.services.kg_service import _resolve_doc_ref
+from app.services.kg_service import _resolve_doc_ref, store_document_relations
 
 
 pytestmark = pytest.mark.asyncio
@@ -109,11 +109,14 @@ async def test_non_uri_suffix_reference_is_literal(
     near_path: str,
 ):
     async with pool.acquire() as conn:
-        # Insert the wildcard near-miss first so an unescaped LIKE pattern
-        # would return the wrong row instead of the requested document.
+        # With only the wildcard-shaped near miss present, an unescaped LIKE
+        # pattern returns the wrong row.  Assert absence before adding the
+        # literal target so the regression never depends on PostgreSQL row
+        # order when both rows match the old predicate.
         near_id = await _insert_document(conn, vault_id, near_path)
-        target_id = await _insert_document(conn, vault_id, target_path)
+        assert await _resolve_doc_ref(conn, vault_id, ref) is None
 
+        target_id = await _insert_document(conn, vault_id, target_path)
         resolved = await _resolve_doc_ref(conn, vault_id, ref)
 
     assert resolved == target_id
@@ -139,3 +142,22 @@ async def test_exact_path_precedes_suffix_fallback(pool, vault_id: uuid.UUID):
         await _insert_document(conn, vault_id, "nested/api.md")
 
         assert await _resolve_doc_ref(conn, vault_id, "api.md") == exact_id
+
+
+async def test_relation_refresh_ignores_unresolved_trailing_backslash(
+    pool,
+    vault_id: uuid.UUID,
+):
+    async with pool.acquire() as conn:
+        stored = await store_document_relations(
+            conn,
+            vault_id,
+            "literal-references",
+            "source.md",
+            [],
+            [],
+            [],
+            "See [[missing" + "\\" + "]]",
+        )
+
+    assert stored == 0
