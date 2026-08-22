@@ -207,4 +207,5 @@ jobs:
           tests/test_app_rollout_postgres.py
           tests/test_tool_usage_e2e.py
           tests/test_table_if_not_exists_e2e.py
+          tests/test_kg_document_ref_postgres.py
           -v --tb=short

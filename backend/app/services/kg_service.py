@@ -29,6 +29,7 @@ from app.util.errors import (
     NOT_FOUND,
     SELF_LINK,
 )
+from app.util.text import like_escape
 
 logger = logging.getLogger("akb.graph")
 
@@ -1181,12 +1182,13 @@ async def _resolve_doc_ref(conn, vault_id: uuid.UUID, ref: str) -> uuid.UUID | N
     the URI cutover):
       1. UUID — `id = $2`
       2. Exact path — `path = $2`
-      3. Trailing-segment match — `path LIKE '%/' || $2` (e.g. ref
-         `api.md` matches `notes/api.md` iff there is exactly one such
-         doc; the unique constraint on `(vault_id, path)` does NOT
-         dedupe across collections, so this can still return one of
-         several matches — but the suffix is anchored at `/`, so
-         `api.md` cannot match `funapi.md`).
+      3. Trailing-segment match — `path LIKE '%/' || $2` with the
+         reference escaped as a literal pattern (e.g. ref `api.md`
+         matches `notes/api.md` iff there is exactly one such doc; the
+         unique constraint on `(vault_id, path)` does NOT dedupe across
+         collections, so this can still return one of several matches —
+         but the suffix is anchored at `/`, so `api.md` cannot match
+         `funapi.md`).
     """
     # UUID + exact-path arms share the same predicate as `find_by_ref`
     # / `drill_down` — keep the substring-match ban centralised.
@@ -1201,8 +1203,8 @@ async def _resolve_doc_ref(conn, vault_id: uuid.UUID, ref: str) -> uuid.UUID | N
     # Trailing-segment match: `api.md` ↔ `notes/api.md`. Anchored at
     # `/` so it can't match arbitrary substrings.
     row = await conn.fetchrow(
-        "SELECT id FROM documents WHERE vault_id = $1 AND path LIKE '%/' || $2",
-        vault_id, ref,
+        "SELECT id FROM documents WHERE vault_id = $1 AND path LIKE '%/' || $2 ESCAPE '\\'",
+        vault_id, like_escape(ref),
     )
     if row:
         return row["id"]
