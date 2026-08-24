@@ -36,6 +36,7 @@ class ProviderReadback:
     client_id: str | None
     client_secret_configured: bool
     redirect_uri: str
+    post_logout_redirect_uri: str
     supports_logout: bool
     supports_identity_migration: bool
 
@@ -51,6 +52,7 @@ class ProviderReadback:
             "client_id": self.client_id,
             "client_secret_configured": self.client_secret_configured,
             "redirect_uri": self.redirect_uri,
+            "post_logout_redirect_uri": self.post_logout_redirect_uri,
             "capabilities": {
                 "supports_logout": self.supports_logout,
                 "supports_identity_migration": self.supports_identity_migration,

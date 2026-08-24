@@ -68,6 +68,9 @@ def _provider(alias: str = "workforce", state: str = "enabled") -> ProviderReadb
         client_id="akb-broker",
         client_secret_configured=True,
         redirect_uri=("https://id.example/realms/akb/broker/workforce/endpoint"),
+        post_logout_redirect_uri=(
+            "https://id.example/realms/akb/broker/workforce/endpoint/logout_response"
+        ),
         supports_logout=True,
         supports_identity_migration=True,
     )

@@ -407,6 +407,7 @@ def readback(
         client_id=client_id,
         client_secret_configured=secret_configured,
         redirect_uri=redirect_uri,
+        post_logout_redirect_uri=f"{redirect_uri}/logout_response",
         supports_logout=True,
         # This capability means AKB can verify an operator-created exact
         # Keycloak prelink and atomically add the broker identity to one
