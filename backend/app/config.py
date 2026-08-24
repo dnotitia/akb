@@ -1084,13 +1084,12 @@ class Settings(BaseModel):
     bm25_k1: float = 1.5
     bm25_b: float = 0.75
     # How often to recompute `bm25_stats(total_docs, avgdl)` + per-term
-    # df from the live chunks corpus. The recompute also runs once at
-    # startup, so this controls the steady-state cadence. recompute_stats
-    # tokenizes every chunk and gets expensive on large corpora; the
-    # refresher skips ticks when the chunk count hasn't moved (see
-    # `_should_recompute` in sparse_encoder), so an aggressive interval
-    # is cheap when nothing's changing. 6 h matches the slow drift of
-    # avgdl/df on a steady-state corpus.
+    # df from the live chunks corpus. Startup and steady-state ticks share a
+    # tokenizer/corpus-revision gate, so a stable process restart does not
+    # retokenize the corpus. `recompute_stats` is expensive on large corpora;
+    # source INSERT/DELETE/content changes advance a DB sequence and the
+    # refresher batches that drift. 6 h matches the slow drift of avgdl/df on
+    # a steady-state corpus.
     bm25_recompute_interval_secs: int = 21600
 
     # Periodic PG-RBAC reconcile cadence. Lifecycle hooks emit role

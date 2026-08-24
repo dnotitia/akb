@@ -332,6 +332,22 @@ async def tokenize(text: str) -> list[str]:
     return tokens
 
 
+async def _tokenize_uncached(text: str) -> list[str]:
+    """Tokenize without retaining source text/results in the API-process LRU.
+
+    Corpus recomputation walks every chunk exactly once, so caching those rows
+    has no reuse value and leaves the last 2,048 potentially-large chunks live
+    in the worker RSS.  Query/document encoding keeps using :func:`tokenize`.
+    """
+    if not text:
+        return []
+    pool = _tokenizer_pool
+    if pool is not None:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(pool, _tokenize_sync, text)
+    return await asyncio.to_thread(_tokenize_sync, text)
+
+
 # ── Vocab management (append-only) ────────────────────────────────
 
 
@@ -570,8 +586,11 @@ _BM25_RECOMPUTE_LOCK_KEY = 987654321
 async def recompute_stats(batch_size: int = 500) -> dict:
     """Rebuild df (per term) and (total_docs, avgdl). Safe to run repeatedly.
 
-    Streams chunks in keyset-paginated batches to keep memory bounded even
-    on large corpora.
+    Streams chunks in keyset-paginated batches and accumulates document
+    frequency in a PostgreSQL temporary table.  The old process-global
+    ``Counter`` retained every unique term until the end of the scan, so the
+    function described itself as bounded while backend RSS still grew with
+    corpus vocabulary.  Only one batch's terms now live in Python memory.
 
     Held under a session-scoped PG advisory lock for the duration of the
     scan AND write. Without this, two replicas would each spend minutes
@@ -601,9 +620,27 @@ async def recompute_stats(batch_size: int = 500) -> dict:
                 "skipped": True,
             }
         try:
+            # Capture the invalidation boundary before the scan.  Chunk writes
+            # that commit while we are walking the corpus advance the sequence
+            # past this value, so a later tick will conservatively revisit them
+            # even if READ COMMITTED happened to expose some of those rows.
+            source_revision = await _current_corpus_revision(lock_conn)
+            source_chunk_count = 0
             total_docs = 0
             total_length = 0
-            df_counts: Counter[str] = Counter()
+
+            # The advisory lock guarantees a single recompute globally, but a
+            # cancelled prior call can leave its temp table on this pooled
+            # session.  Recreate it explicitly before accumulating this run.
+            await lock_conn.execute("DROP TABLE IF EXISTS bm25_recompute_df")
+            await lock_conn.execute(
+                """
+                CREATE TEMPORARY TABLE bm25_recompute_df (
+                    term TEXT PRIMARY KEY,
+                    df BIGINT NOT NULL
+                ) ON COMMIT PRESERVE ROWS
+                """
+            )
 
             last_id = None
             while True:
@@ -621,46 +658,65 @@ async def recompute_stats(batch_size: int = 500) -> dict:
                     )
                 if not rows:
                     break
+                batch_df_counts: Counter[str] = Counter()
                 for r in rows:
                     last_id = r["id"]
-                    toks = await tokenize(r["content"] or "")
+                    source_chunk_count += 1
+                    toks = await _tokenize_uncached(r["content"] or "")
                     if not toks:
                         continue
                     total_docs += 1
                     total_length += len(toks)
                     for term in set(toks):
-                        df_counts[term] += 1
+                        batch_df_counts[term] += 1
+
+                if batch_df_counts:
+                    terms, counts = zip(*batch_df_counts.items())
+                    await lock_conn.execute(
+                        """
+                        INSERT INTO bm25_recompute_df AS aggregate (term, df)
+                        SELECT * FROM unnest($1::text[], $2::bigint[])
+                        ON CONFLICT (term) DO UPDATE
+                            SET df = aggregate.df + EXCLUDED.df
+                        """,
+                        list(terms),
+                        list(counts),
+                    )
 
             avgdl = (total_length / total_docs) if total_docs else 0.0
+            vocab_count = int(
+                await lock_conn.fetchval(
+                    "SELECT COUNT(*) FROM bm25_recompute_df"
+                ) or 0
+            )
 
             async with lock_conn.transaction():
-                # Ensure all encountered terms have vocab ids. Assign in one batch.
-                if df_counts:
+                # Ensure all encountered terms have stable vocab ids.  Reading
+                # directly from the temp aggregate avoids materialising the
+                # corpus vocabulary in Python a second time.
+                if vocab_count:
                     await lock_conn.execute(
                         """
                         INSERT INTO bm25_vocab (term, term_id)
-                        SELECT t, nextval('bm25_term_id_seq')
-                          FROM unnest($1::text[]) AS t
+                        SELECT term, nextval('bm25_term_id_seq')
+                          FROM bm25_recompute_df
+                         ORDER BY term
                         ON CONFLICT (term) DO NOTHING
-                        """,
-                        list(df_counts.keys()),
+                        """
                     )
 
-                # Two-step reset: (1) zero every row, (2) set counts for present
-                # terms from a single unnest. Replaces a full-table UPDATE + N
-                # executemany (one round-trip per term) with exactly two queries.
+                # Two-step reset preserves append-only term ids while making
+                # terms absent from the current corpus explicitly zero.
                 await lock_conn.execute("UPDATE bm25_vocab SET df = 0, updated_at = NOW()")
-                if df_counts:
-                    terms, counts = zip(*df_counts.items())
+                if vocab_count:
                     await lock_conn.execute(
                         """
                         UPDATE bm25_vocab v
-                           SET df = c.cnt,
+                           SET df = c.df,
                                updated_at = NOW()
-                          FROM unnest($1::text[], $2::bigint[]) AS c(term, cnt)
+                          FROM bm25_recompute_df c
                          WHERE v.term = c.term
-                        """,
-                        list(terms), list(counts),
+                        """
                     )
 
                 await lock_conn.execute(
@@ -670,22 +726,35 @@ async def recompute_stats(batch_size: int = 500) -> dict:
                            avgdl = $2,
                            tokenizer_name = $3,
                            tokenizer_version = $4,
+                           source_revision = $5,
+                           source_chunk_count = $6,
                            updated_at = NOW()
                      WHERE id = 1
                     """,
                     total_docs, avgdl, tname, tver,
+                    source_revision, source_chunk_count,
                 )
 
             _invalidate_stats_cache()
-            logger.info("BM25 stats recomputed: total_docs=%d avgdl=%.2f vocab_size=%d",
-                        total_docs, avgdl, len(df_counts))
+            logger.info(
+                "BM25 stats recomputed: source_chunks=%d total_docs=%d "
+                "avgdl=%.2f vocab_size=%d source_revision=%d",
+                source_chunk_count,
+                total_docs,
+                avgdl,
+                vocab_count,
+                source_revision,
+            )
             return {
                 "total_docs": total_docs,
                 "avgdl": avgdl,
-                "vocab_size": len(df_counts),
+                "vocab_size": vocab_count,
                 "tokenizer": f"{tname}@{tver}",
+                "source_revision": source_revision,
+                "source_chunk_count": source_chunk_count,
             }
         finally:
+            await lock_conn.execute("DROP TABLE IF EXISTS bm25_recompute_df")
             await lock_conn.execute(
                 "SELECT pg_advisory_unlock($1)", _BM25_RECOMPUTE_LOCK_KEY
             )
@@ -708,25 +777,94 @@ async def vocab_size() -> int:
 # stuck at zero, then on a fixed cadence so a long-running deploy
 # stays in sync as docs are added/removed/updated.
 
-# Skip a tick when the indexable chunk count hasn't moved by this many
-# rows since the last recompute. Tokenizing a 600k-row corpus through
-# Kiwi is minutes of CPU, so an unconditional cadence wastes work on a
-# steady-state vault.
+# Skip a tick until this many source-corpus mutations have accumulated since
+# the last recompute.  The mutation sequence tracks inserts, deletes, and
+# content changes without conflating raw source chunks with token-bearing BM25
+# documents (the old count comparison did exactly that).
 _BM25_RECOMPUTE_DELTA_THRESHOLD = 50
 
 
+async def _current_corpus_revision(conn) -> int:
+    """Return the sequence's logical revision (zero before first mutation)."""
+    row = await conn.fetchrow(
+        "SELECT last_value, is_called FROM bm25_corpus_revision_seq"
+    )
+    if not row or not row["is_called"]:
+        return 0
+    return int(row["last_value"])
+
+
+def _state_requires_recompute(
+    row,
+    current_revision: int,
+    *,
+    live_chunk_count: int | None = None,
+) -> bool:
+    """Pure refresh decision shared by the periodic and startup gates.
+
+    ``live_chunk_count`` is intentionally optional.  A steady-state tick needs
+    only the O(1) sequence read; the full COUNT is a fallback for a small
+    revision delta so a one-statement TRUNCATE is still detected.
+    """
+    if not row:
+        return True
+    if (
+        row["tokenizer_name"] != "kiwi"
+        or row["tokenizer_version"] != _kiwi_version
+    ):
+        return True
+
+    stored_revision = int(row["source_revision"] or 0)
+    if current_revision < stored_revision:
+        # A restored/reset sequence must never make stale stats look current.
+        return True
+    delta = current_revision - stored_revision
+    if delta == 0:
+        return False
+    if delta >= _BM25_RECOMPUTE_DELTA_THRESHOLD:
+        return True
+
+    source_chunk_count = int(row["source_chunk_count"] or 0)
+    if source_chunk_count < _BM25_RECOMPUTE_DELTA_THRESHOLD:
+        # Small corpora are cheap and need useful IDF immediately rather than
+        # waiting until they happen to accumulate fifty mutations.
+        return True
+    if live_chunk_count is not None:
+        return (
+            abs(live_chunk_count - source_chunk_count)
+            >= _BM25_RECOMPUTE_DELTA_THRESHOLD
+        )
+    return False
+
+
 async def _should_recompute() -> bool:
-    """True if the chunk count has drifted enough from the stored
-    `total_docs` to warrant a fresh recompute. Cheap COUNT(*) probe."""
+    """True when tokenizer identity or source-corpus revision is stale."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        live = await conn.fetchval(
-            "SELECT COUNT(*) FROM chunks WHERE content IS NOT NULL"
+        row = await conn.fetchrow(
+            """
+            SELECT source_revision, source_chunk_count,
+                   tokenizer_name, tokenizer_version
+              FROM bm25_stats
+             WHERE id = 1
+            """
         )
-        stored = await conn.fetchval(
-            "SELECT total_docs FROM bm25_stats WHERE id = 1"
-        )
-    return abs(int(live or 0) - int(stored or 0)) >= _BM25_RECOMPUTE_DELTA_THRESHOLD
+        current_revision = await _current_corpus_revision(conn)
+        if _state_requires_recompute(row, current_revision):
+            return True
+
+        # A sub-threshold revision delta normally waits for more changes.  The
+        # only exception is a large set-based mutation represented by one
+        # revision (notably TRUNCATE), detected by this conditional count.
+        stored_revision = int(row["source_revision"] or 0) if row else 0
+        if current_revision != stored_revision:
+            live = int(await conn.fetchval("SELECT COUNT(*) FROM chunks") or 0)
+            return _state_requires_recompute(
+                row,
+                current_revision,
+                live_chunk_count=live,
+            )
+    return False
 
 
 async def _refresh_tick() -> int:
@@ -741,46 +879,24 @@ async def _refresh_tick() -> int:
 from app.services._backfill import BackfillRunner  # noqa: E402
 
 _refresher = BackfillRunner("bm25_stats_refresher", _refresh_tick, idle_secs=1)
-_bootstrap_task: asyncio.Task | None = None
 
 
 def start_stats_refresher(interval_secs: int = 1800) -> None:
     """Launch the periodic stats refresher. Idempotent.
 
-    Always fires `recompute_stats` once at startup (bypassing the delta
-    gate) so a fresh install isn't stuck at total_docs=0; subsequent
-    ticks honour the gate.
+    ``BackfillRunner`` executes one tick immediately before its first sleep, so
+    the startup path naturally uses the same tokenizer/revision gate as every
+    periodic tick.  A fresh or tokenizer-changed database recomputes promptly,
+    while restarting a stable 960k-chunk deployment performs no corpus scan.
     """
-    global _bootstrap_task
     if _refresher.is_running():
         return
     _refresher.configure_idle_secs(interval_secs)
-    # Bootstrap: force one recompute on startup regardless of delta so
-    # a brand-new DB doesn't have to wait `interval_secs` for usable
-    # sparse weights. Wrapped in a task so startup isn't blocked.
-    _bootstrap_task = asyncio.create_task(
-        _bootstrap_recompute(), name="bm25_stats_bootstrap",
-    )
     _refresher.start()
-
-
-async def _bootstrap_recompute() -> None:
-    try:
-        await recompute_stats()
-    except Exception as e:  # noqa: BLE001
-        logger.warning("BM25 bootstrap recompute failed: %s", e)
 
 
 async def stop_stats_refresher() -> None:
     """Signal stop and await the runner. Safe to call when not started."""
-    global _bootstrap_task
-    task, _bootstrap_task = _bootstrap_task, None
-    if task is not None and not task.done():
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
     if _refresher is not None:
         await _refresher.stop()
 
@@ -792,23 +908,34 @@ async def stats_snapshot() -> dict:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT total_docs, avgdl, tokenizer_name, tokenizer_version, updated_at
+            SELECT total_docs, avgdl, tokenizer_name, tokenizer_version,
+                   source_revision, source_chunk_count, updated_at
               FROM bm25_stats WHERE id = 1
             """
         )
         vocab = await conn.fetchval("SELECT COUNT(*) FROM bm25_vocab")
+        current_revision = await _current_corpus_revision(conn)
     if not row:
         return {
             "total_docs": 0, "avgdl": 0.0,
             "tokenizer": "kiwi@0",
             "vocab_size": int(vocab or 0),
+            "source_chunk_count": 0,
+            "source_revision": 0,
+            "current_revision": current_revision,
+            "pending_changes": current_revision,
             "last_recomputed_at": None,
         }
+    source_revision = int(row["source_revision"] or 0)
     return {
         "total_docs": int(row["total_docs"] or 0),
         "avgdl": float(row["avgdl"] or 0.0),
         "tokenizer": f"{row['tokenizer_name']}@{row['tokenizer_version']}",
         "vocab_size": int(vocab or 0),
+        "source_chunk_count": int(row["source_chunk_count"] or 0),
+        "source_revision": source_revision,
+        "current_revision": current_revision,
+        "pending_changes": max(0, current_revision - source_revision),
         "last_recomputed_at": (
             row["updated_at"].isoformat() if row["updated_at"] else None
         ),
