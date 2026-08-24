@@ -44,6 +44,7 @@ import { PublishOptionsDialog } from "@/components/publish-options-dialog";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import { RelationsPanel } from "@/components/relations/relations-panel";
+import { relationIsInVault } from "@/components/relations/relation-row-utils";
 
 // Plate is heavy (~hundreds of KB gzipped); lazy-load so the read-only path
 // (Rendered / Raw) stays cheap.
@@ -94,6 +95,10 @@ export default function DocumentPage() {
   const isDirty = editingContent !== originalContent;
   const hasUnsavedWork = isDirty || uploadingImage;
   const docId = id ? decodeURIComponent(id) : "";
+  const visibleRelationCount = useMemo(
+    () => relations.filter((row) => name && relationIsInVault(row, name)).length,
+    [name, relations],
+  );
 
   const applyView = (next: DocView) => {
     const p = new URLSearchParams(searchParams);
@@ -754,8 +759,8 @@ export default function DocumentPage() {
             </TabsTrigger>
             <TabsTrigger value="relations" className="flex-1 min-w-0 gap-1 px-2">
               Relations
-              {relations.length > 0 && (
-                <span className="coord tabular-nums">{relations.length}</span>
+              {visibleRelationCount > 0 && (
+                <span className="coord tabular-nums">{visibleRelationCount}</span>
               )}
             </TabsTrigger>
             <TabsTrigger value="history" className="flex-1 min-w-0 gap-1 px-2">
@@ -782,6 +787,7 @@ export default function DocumentPage() {
               sourceUri={doc.path ? docUri(name!, doc.path) : ""}
               relations={relations}
               relationsError={relationsError}
+              canWrite={canEdit}
               graphHref={`/vault/${name}/graph${doc.path ? `?entry=${encodeURIComponent(doc.path)}` : ""}`}
               onReload={reloadRelations}
             />
@@ -889,18 +895,6 @@ function FrontmatterCard({ doc }: { doc: any }) {
     rows.push([
       "Tags",
       <span className="text-info break-words">{doc.tags.map((t: string) => `#${t}`).join(" ")}</span>,
-    ]);
-  }
-  if (doc.depends_on?.length) {
-    rows.push([
-      "Depends on",
-      <span className="text-foreground-muted break-words">{doc.depends_on.join(", ")}</span>,
-    ]);
-  }
-  if (doc.related_to?.length) {
-    rows.push([
-      "Related to",
-      <span className="text-foreground-muted break-words">{doc.related_to.join(", ")}</span>,
     ]);
   }
   if (doc.is_public) {

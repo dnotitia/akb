@@ -214,6 +214,21 @@ def test_inline_image_guidance_is_safe_and_matches_bounded_lifecycle() -> None:
     assert unsafe_example not in put_image
 
 
+def test_relation_help_matches_the_vault_boundary_and_graph_schema() -> None:
+    topics = _help_topics()
+
+    graph = topics["akb_graph"]
+    assert "depth=" not in graph
+    assert "hops=3" in graph
+
+    provenance = topics["akb_provenance"].lower()
+    assert "visible same-vault relations" in provenance
+
+    relations = topics["akb_relations"].lower()
+    assert "relations never cross vaults" in relations
+    assert "explicit" in relations and "implicit" in relations
+
+
 def test_help_root_table_topics_are_real_help_topics() -> None:
     """Every drill-down topic the root help table points at exists as a key.
 

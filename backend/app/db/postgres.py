@@ -305,6 +305,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "080_local_forced_credential_change.py",  # local parity for the identity provider's UPDATE_PASSWORD: a delivered credential is owed a replacement until its holder changes it
         "081_service_identities.py",  # non-human (issuer, client) → AKB service account bindings, kept out of the human external_identities population
         "082_pending_admissions.py",  # the arrival invite_only refuses, kept so an administrator can approve that exact identity instead of guessing a subject in advance
+        "083_edge_vault_boundary.py",  # graph edges are vault-local: owner/source/target authorities agree; legacy rows stay hidden pending reviewed cleanup
     ):
         if filename in applied:
             continue
