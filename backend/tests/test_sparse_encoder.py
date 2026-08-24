@@ -2,7 +2,11 @@ import asyncio
 
 import pytest
 
-from app.services.sparse_encoder import _english_token_variants
+from app.services.sparse_encoder import (
+    _BM25_RECOMPUTE_DELTA_THRESHOLD,
+    _english_token_variants,
+    _state_requires_recompute,
+)
 
 
 def test_english_token_variants_keep_original_and_match_past_tense():
@@ -40,6 +44,53 @@ def test_english_token_variants_stem_plural_once_no_es_s_overlap():
     assert "studie" not in studies
 
 
+def _stats_row(**overrides):
+    from app.services import sparse_encoder
+
+    row = {
+        "source_revision": 10_000,
+        "source_chunk_count": 960_000,
+        "tokenizer_name": "kiwi",
+        "tokenizer_version": sparse_encoder._kiwi_version,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_refresh_gate_ignores_token_bearing_doc_count_mismatch():
+    # The old gate compared 960k raw chunks with ~954k token-bearing docs and
+    # rebuilt forever. total_docs is deliberately absent from the new decision.
+    assert not _state_requires_recompute(_stats_row(), 10_000)
+
+
+def test_refresh_gate_detects_same_count_content_replacements():
+    assert _state_requires_recompute(
+        _stats_row(),
+        10_000 + _BM25_RECOMPUTE_DELTA_THRESHOLD,
+    )
+
+
+def test_refresh_gate_updates_small_corpus_without_waiting_for_fifty_changes():
+    assert _state_requires_recompute(
+        _stats_row(source_chunk_count=12),
+        10_001,
+    )
+
+
+def test_refresh_gate_uses_conditional_count_for_set_based_truncate():
+    row = _stats_row()
+    assert not _state_requires_recompute(row, 10_001)
+    assert _state_requires_recompute(row, 10_001, live_chunk_count=0)
+
+
+def test_refresh_gate_fails_safe_on_tokenizer_change_or_sequence_restore():
+    assert _state_requires_recompute(
+        _stats_row(tokenizer_version="old"),
+        10_000,
+    )
+    assert _state_requires_recompute(_stats_row(), 9_999)
+
+
 @pytest.mark.asyncio
 async def test_stats_refresher_start_is_idempotent_and_keeps_one_health_runner(
     monkeypatch,
@@ -52,11 +103,7 @@ async def test_stats_refresher_start_is_idempotent_and_keeps_one_health_runner(
     async def no_work() -> int:
         return 0
 
-    async def bootstrap() -> None:
-        await asyncio.sleep(0)
-
     monkeypatch.setattr(sparse_encoder._refresher, "_process_once", no_work)
-    monkeypatch.setattr(sparse_encoder, "_bootstrap_recompute", bootstrap)
     before = sum(
         item["name"] == "bm25_stats_refresher" for item in runner_snapshots()
     )

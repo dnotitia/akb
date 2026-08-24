@@ -233,6 +233,7 @@ jobs:
           tests/test_workspace_account_admin_service.py
           tests/test_sso_browser_session_postgres.py
           tests/test_sso_session_epoch_upgrade_postgres.py
+          tests/test_bm25_corpus_revision_postgres.py
           tests/test_tool_usage_e2e.py
           tests/test_table_if_not_exists_e2e.py
           tests/test_kg_document_ref_postgres.py

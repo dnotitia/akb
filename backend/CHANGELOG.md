@@ -7,6 +7,22 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Fixed repeated production-scale BM25 rebuilds and bounded rebuild memory
+
+The BM25 refresher no longer compares all non-null chunks with the smaller set
+of chunks that produce at least one Kiwi token. That population mismatch made a
+stable corpus look permanently stale and repeatedly retokenized roughly 960k
+chunks. A PostgreSQL sequence now records only BM25-relevant chunk mutations;
+the startup and periodic refresh paths share that revision gate, so a stable
+worker restart performs no full scan while inserts, deletes, content changes,
+tokenizer changes, and sequence restores remain detectable.
+
+Full rebuilds now aggregate document frequency in a PostgreSQL temporary table
+one input batch at a time and bypass the process-local token LRU. Backend Python
+memory is therefore bounded by batch size instead of growing with the entire
+corpus vocabulary. Kubernetes' existing API/worker split and explicit Kiwi
+worker limits remain the cgroup isolation boundary.
+
 ### Made vault-guide write preflight concurrency-safe
 
 MCP clients can negotiate vault-guide preflight version 2. The server now
