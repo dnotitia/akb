@@ -6,15 +6,17 @@ import hashlib
 import re
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, SkipValidation
 
+from app.api.deps import get_current_user
 from app.api.routes.admin_auth import (
     ProductAdminActor,
     get_current_product_admin,
     get_product_admin_mutation,
 )
 from app.config import settings
+from app.exceptions import ForbiddenError
 from app.services import audit_log
 from app.sso.keycloak_admin import (
     ProviderControlError,
@@ -144,6 +146,41 @@ def _require_sso_mode() -> None:
 router = APIRouter(dependencies=[Depends(_require_sso_mode)])
 
 
+async def get_sso_provider_control_actor(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    csrf_header: str | None = Header(default=None, alias="X-AKB-Admin-CSRF"),
+) -> ProductAdminActor:
+    """Resolve the browser administrator or the platform's service administrator.
+
+    The bearer exception is deliberately local to provider catalog/configuration
+    and enable/disable routes. It does not change the general product-admin
+    dependency and therefore does not turn a service token into a browser admin
+    session. ``get_current_user`` still enforces the token's method scope before
+    this stricter service-admin conjunction is checked.
+    """
+    if authorization:
+        actor = await get_current_user(request)
+        if (
+            not actor.is_admin
+            or actor.account_kind != "service"
+            or actor.auth_method != "pat"
+            or actor.token_id is None
+            or actor.key_class != "service"
+            or actor.token_scopes is None
+            or "admin" not in actor.token_scopes
+        ):
+            raise ForbiddenError("SSO provider control requires an administrator service key")
+        return actor
+    if request.method == "GET":
+        return await get_current_product_admin(request, authorization=None)
+    return await get_product_admin_mutation(
+        request,
+        authorization=None,
+        csrf_header=csrf_header,
+    )
+
+
 def _raise_control_error(error: ProviderControlError) -> None:
     if error.code in _INVALID_CODES:
         status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
@@ -263,7 +300,7 @@ def _raise_identity_migration_error(error: IdentityMigrationError) -> None:
 
 @router.get("/admin/sso/providers", summary="List managed SSO providers")
 async def list_sso_providers(
-    _actor: ProductAdminActor = Depends(get_current_product_admin),
+    _actor: ProductAdminActor = Depends(get_sso_provider_control_actor),
 ):
     control = get_keycloak_provider_control()
     providers: tuple[ProviderReadback, ...] = ()
@@ -288,7 +325,7 @@ async def list_sso_providers(
 async def configure_sso_provider(
     alias: str,
     request: ConfigureProviderRequest,
-    actor: ProductAdminActor = Depends(get_product_admin_mutation),
+    actor: ProductAdminActor = Depends(get_sso_provider_control_actor),
 ):
     _audit(
         "admin.sso.provider.configure.requested",
@@ -375,7 +412,7 @@ async def _toggle_sso_provider(
 )
 async def enable_sso_provider(
     alias: str,
-    actor: ProductAdminActor = Depends(get_product_admin_mutation),
+    actor: ProductAdminActor = Depends(get_sso_provider_control_actor),
 ):
     return await _toggle_sso_provider(alias, enabled=True, actor=actor)
 
@@ -386,7 +423,7 @@ async def enable_sso_provider(
 )
 async def disable_sso_provider(
     alias: str,
-    actor: ProductAdminActor = Depends(get_product_admin_mutation),
+    actor: ProductAdminActor = Depends(get_sso_provider_control_actor),
 ):
     return await _toggle_sso_provider(alias, enabled=False, actor=actor)
 
@@ -604,4 +641,3 @@ async def rollback_sso_identity_migration(
         actor,
         operation="rollback",
     )
-

@@ -10,8 +10,9 @@ import pytest
 
 from app.api.routes import admin_auth, admin_sso
 from app.config import settings
-from app.exceptions import AuthenticationError
+from app.exceptions import AuthenticationError, ForbiddenError
 from app.services.admin_auth_service import ProductAdminIdentity
+from app.services.auth_service import AuthenticatedUser
 from app.sso.keycloak_admin import ProviderControlError
 from app.sso.identity_migration import (
     IdentityMigrationError,
@@ -115,6 +116,7 @@ def _client(monkeypatch, control: Control, *, admin=None) -> TestClient:
     actor = admin or _admin()
     app.dependency_overrides[admin_auth.get_current_product_admin] = lambda: actor
     app.dependency_overrides[admin_auth.get_product_admin_mutation] = lambda: actor
+    app.dependency_overrides[admin_sso.get_sso_provider_control_actor] = lambda: actor
     return TestClient(app)
 
 
@@ -311,6 +313,169 @@ async def test_sso_mutation_dependency_rejects_missing_csrf_before_resolution(
             authorization=None,
             csrf_header=None,
         )
+
+
+async def test_service_admin_controls_provider_without_browser_csrf(monkeypatch):
+    """A service administrator controls SSO providers without a browser CSRF token."""
+    actor = AuthenticatedUser(
+        user_id=str(uuid.uuid4()),
+        username="platform-bot",
+        email="platform-bot@invalid.local",
+        display_name="AKB Platform",
+        is_admin=True,
+        auth_method="pat",
+        account_kind="service",
+        token_id=str(uuid.uuid4()),
+        key_class="service",
+        token_scopes=frozenset({"read", "write", "admin"}),
+    )
+
+    async def resolve_service(_request):
+        return actor
+
+    monkeypatch.setattr(admin_sso, "get_current_user", resolve_service)
+
+    class Request:
+        method = "PUT"
+
+    resolved = await admin_sso.get_sso_provider_control_actor(  # type: ignore[attr-defined]
+        Request(),
+        authorization="Bearer akb_secret_platform",  # pragma: allowlist secret
+        csrf_header=None,
+    )
+
+    assert resolved is actor
+
+
+@pytest.mark.parametrize(
+    ("is_admin", "account_kind", "auth_method", "token_id", "key_class", "token_scopes"),
+    [
+        (False, "service", "pat", "token-id", "service", frozenset({"read", "write", "admin"})),
+        (True, "human", "pat", "token-id", "service", frozenset({"read", "write", "admin"})),
+        (True, "service", "oauth", "token-id", "service", frozenset({"read", "write", "admin"})),
+        (True, "service", "pat", None, "service", frozenset({"read", "write", "admin"})),
+        (True, "service", "pat", "token-id", "pat", frozenset({"read", "write", "admin"})),
+        (True, "service", "pat", "token-id", "service", frozenset({"read", "write"})),
+    ],
+)
+async def test_provider_service_control_requires_the_exact_machine_authority(
+    monkeypatch,
+    is_admin,
+    account_kind,
+    auth_method,
+    token_id,
+    key_class,
+    token_scopes,
+):
+    actor = AuthenticatedUser(
+        user_id=str(uuid.uuid4()),
+        username="candidate",
+        email="candidate@invalid.local",
+        display_name=None,
+        is_admin=is_admin,
+        auth_method=auth_method,
+        account_kind=account_kind,
+        token_id=token_id,
+        key_class=key_class,
+        token_scopes=token_scopes,
+    )
+
+    async def resolve_candidate(_request):
+        return actor
+
+    monkeypatch.setattr(admin_sso, "get_current_user", resolve_candidate)
+
+    class Request:
+        method = "POST"
+
+    with pytest.raises(ForbiddenError, match="administrator service key"):
+        await admin_sso.get_sso_provider_control_actor(  # type: ignore[arg-type]
+            Request(),
+            authorization="Bearer candidate",
+            csrf_header=None,
+        )
+
+
+async def test_provider_browser_mutation_still_requires_admin_csrf(monkeypatch):
+    monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+
+    class Request:
+        method = "PUT"
+        cookies = {
+            "__Host-akb_admin_session": "opaque-session-value-that-is-long-enough",
+            "__Host-akb_admin_csrf": "opaque-csrf-value-that-is-long-enough",
+        }
+
+    with pytest.raises(AuthenticationError, match="Invalid admin CSRF token"):
+        await admin_sso.get_sso_provider_control_actor(  # type: ignore[arg-type]
+            Request(),
+            authorization=None,
+            csrf_header=None,
+        )
+
+
+async def test_invalid_bearer_never_falls_through_to_admin_cookie(monkeypatch):
+    browser_fallback_called = False
+
+    async def reject_bearer(_request):
+        raise AuthenticationError("invalid bearer")
+
+    async def browser_fallback(*_args, **_kwargs):
+        nonlocal browser_fallback_called
+        browser_fallback_called = True
+        return _admin()
+
+    monkeypatch.setattr(admin_sso, "get_current_user", reject_bearer)
+    monkeypatch.setattr(admin_sso, "get_product_admin_mutation", browser_fallback)
+
+    class Request:
+        method = "POST"
+
+    with pytest.raises(AuthenticationError, match="invalid bearer"):
+        await admin_sso.get_sso_provider_control_actor(  # type: ignore[arg-type]
+            Request(),
+            authorization="Bearer invalid",
+            csrf_header="attacker-controlled",
+        )
+    assert browser_fallback_called is False
+
+
+def _route_dependency_callables(route) -> set:
+    return {
+        dependency.call
+        for dependency in route.dependant.dependencies
+        if dependency.call is not None
+    }
+
+
+def test_only_provider_catalog_configuration_and_toggle_use_machine_control():
+    provider_routes = {
+        (route.path, method)
+        for route in admin_sso.router.routes
+        for method in getattr(route, "methods", set())
+        if route.path.startswith("/admin/sso/providers")
+    }
+    machine_routes = {
+        ("/admin/sso/providers", "GET"),
+        ("/admin/sso/providers/{alias}", "PUT"),
+        ("/admin/sso/providers/{alias}/enable", "POST"),
+        ("/admin/sso/providers/{alias}/disable", "POST"),
+    }
+    assert machine_routes <= provider_routes
+
+    for route in admin_sso.router.routes:
+        if not route.path.startswith("/admin/sso/providers"):
+            continue
+        callables = _route_dependency_callables(route)
+        keyed_methods = {(route.path, method) for method in route.methods}
+        if keyed_methods & machine_routes:
+            assert admin_sso.get_sso_provider_control_actor in callables
+        else:
+            assert admin_sso.get_sso_provider_control_actor not in callables
+            assert (
+                admin_auth.get_current_product_admin in callables
+                or admin_auth.get_product_admin_mutation in callables
+            )
 
 
 def test_identity_migration_preflight_derives_both_issuers_server_side(monkeypatch):
