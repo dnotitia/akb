@@ -23,6 +23,25 @@ logger = logging.getLogger("akb.migration.084")
 
 
 async def migrate(conn) -> None:
+    # A supported historical-bootstrap fixture records migration 005 as
+    # applied while intentionally omitting its optional derived-index tables.
+    # Do not make an unrelated auth-schema upgrade recreate (or depend on)
+    # that subsystem.  Fresh/current databases have both tables because 005
+    # runs before this migration.
+    bm25_tables_available = bool(
+        await conn.fetchval(
+            """
+            SELECT to_regclass('public.chunks') IS NOT NULL
+               AND to_regclass('public.bm25_stats') IS NOT NULL
+            """
+        )
+    )
+    if not bm25_tables_available:
+        logger.info(
+            "Migration 084: optional BM25 corpus tables are unavailable; skipping"
+        )
+        return
+
     sequence_existed = bool(
         await conn.fetchval(
             "SELECT to_regclass('public.bm25_corpus_revision_seq') IS NOT NULL"

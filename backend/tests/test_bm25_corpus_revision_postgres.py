@@ -24,6 +24,22 @@ async def _revision(conn) -> int:
     return int(row["last_value"]) if row["is_called"] else 0
 
 
+async def test_migration_skips_optional_bm25_tables_when_not_materialized():
+    from app.db.postgres import _load_migration
+
+    class HistoricalBootstrapConnection:
+        async def fetchval(self, query, *args):
+            assert "to_regclass('public.bm25_stats')" in query
+            return False
+
+        def transaction(self):
+            raise AssertionError("a skipped migration must not start DDL")
+
+    migration = _load_migration("084_bm25_corpus_revision.py")
+    assert migration is not None
+    await migration.migrate(HistoricalBootstrapConnection())
+
+
 @pytest.fixture
 async def connection():
     try:
