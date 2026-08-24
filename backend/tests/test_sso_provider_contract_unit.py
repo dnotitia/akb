@@ -235,6 +235,9 @@ def test_readback_recognizes_only_exact_disabled_and_enabled_profiles():
     assert enabled.redirect_uri == (
         "https://auth.akb.example.com/realms/akb/broker/workforce/endpoint"
     )
+    assert enabled.post_logout_redirect_uri == (
+        "https://auth.akb.example.com/realms/akb/broker/workforce/endpoint/logout_response"
+    )
 
 
 @pytest.mark.parametrize(

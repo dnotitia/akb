@@ -25,6 +25,9 @@ def _provider(alias: str, state: str) -> ProviderReadback:
         client_id="akb-broker",
         client_secret_configured=True,
         redirect_uri=(f"https://auth.akb.example.com/realms/akb/broker/{alias}/endpoint"),
+        post_logout_redirect_uri=(
+            f"https://auth.akb.example.com/realms/akb/broker/{alias}/endpoint/logout_response"
+        ),
         supports_logout=True,
         supports_identity_migration=True,
     )

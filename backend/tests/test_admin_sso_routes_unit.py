@@ -56,6 +56,9 @@ def _provider(
         client_id="akb-broker",
         client_secret_configured=True,
         redirect_uri=("https://auth.akb.example.com/realms/akb/broker/workforce/endpoint"),
+        post_logout_redirect_uri=(
+            "https://auth.akb.example.com/realms/akb/broker/workforce/endpoint/logout_response"
+        ),
         supports_logout=True,
         supports_identity_migration=True,
     )
