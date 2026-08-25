@@ -1002,13 +1002,30 @@ async def transfer_ownership(owner_id: str, vault_name: str, new_owner_username:
 # ── User search ──────────────────────────────────────────────
 
 async def search_users(query: str | None = None, limit: int = 20) -> list[dict]:
-    """Search users by username or display_name."""
+    """Search users by username or display_name.
+
+    Carries the canonical ``id`` alongside the display fields.
+
+    The id is what a caller needs to record a person durably: a username can be
+    renamed, so anything keyed on one silently detaches when it is. Every client
+    that stores a reference to a Workspace member — an authorization surface, a
+    membership list, an assignment — has to hold the id, and until now the only
+    way to obtain one was ``/admin/users``, which requires system admin. That
+    left an ordinary authenticated caller with no way at all to name a person
+    durably, and pushed clients toward either a broad admin credential or a
+    username they would have to hope never changes.
+
+    This does not widen who can see whom: the endpoint already returns
+    ``username``, ``display_name`` and ``email`` to any authenticated caller,
+    and an opaque uuid discloses strictly less than the email beside it. What
+    changes is only that the identifier those three describe is now nameable.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         if query:
             rows = await conn.fetch(
                 """
-                SELECT username, display_name, email
+                SELECT id, username, display_name, email
                 FROM users
                 WHERE username ILIKE $1 OR display_name ILIKE $1 OR email ILIKE $1
                 ORDER BY username
@@ -1018,12 +1035,17 @@ async def search_users(query: str | None = None, limit: int = 20) -> list[dict]:
             )
         else:
             rows = await conn.fetch(
-                "SELECT username, display_name, email FROM users ORDER BY username LIMIT $1",
+                "SELECT id, username, display_name, email FROM users ORDER BY username LIMIT $1",
                 limit,
             )
 
     return [
-        {"username": r["username"], "display_name": r["display_name"], "email": r["email"]}
+        {
+            "id": str(r["id"]),
+            "username": r["username"],
+            "display_name": r["display_name"],
+            "email": r["email"],
+        }
         for r in rows
     ]
 
