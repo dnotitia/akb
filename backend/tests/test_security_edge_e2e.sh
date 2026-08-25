@@ -6,6 +6,7 @@
 set -uo pipefail
 
 BASE_URL="${AKB_URL:-http://localhost:8000}"
+source "$(dirname "$0")/mcp_modern.sh"
 PASS=0
 FAIL=0
 ERRORS=()
@@ -44,37 +45,18 @@ PAT2=$(setup_user "$USER2")
 
 [ -n "$PAT1" ] && [ -n "$PAT2" ] && pass "2 users created" || { fail "Setup" "user creation failed"; exit 1; }
 
-# MCP session helpers
+# MCP stateless helpers
 setup_mcp() {
-  local pat=$1
-  local tmpfile=$(mktemp)
-  curl -sk -i -X POST "$BASE_URL/mcp/" \
-    -H "Authorization: Bearer $pat" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" \
-    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"sec-e2e","version":"1.0"}}}' > "$tmpfile" 2>/dev/null
-  local sid=$(grep -i "mcp-session-id" "$tmpfile" | tr -d '\r' | awk '{print $2}')
-  rm -f "$tmpfile"
-  curl -sk -X POST "$BASE_URL/mcp/" \
-    -H "Authorization: Bearer $pat" \
-    -H "Content-Type: application/json" \
-    -H "mcp-session-id: $sid" \
-    -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null 2>&1
-  echo "$sid"
+  mcp_modern_discover "$1" sec-e2e >/dev/null && echo modern
 }
 
 SID1=$(setup_mcp "$PAT1")
 SID2=$(setup_mcp "$PAT2")
 
 mcp_as() {
-  local pat=$1 sid=$2 tool=$3 args=$4
+  local pat=$1 _sid=$2 tool=$3 args=$4
   MCP_ID=$((MCP_ID+1))
-  curl -sk -X POST "$BASE_URL/mcp/" \
-    -H "Authorization: Bearer $pat" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" \
-    -H "mcp-session-id: $sid" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":$MCP_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}" 2>&1
+  mcp_modern_call "$pat" "$tool" "$args" "$MCP_ID" sec-e2e
 }
 
 mr() { python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['result']['content'][0]['text'])" 2>/dev/null; }

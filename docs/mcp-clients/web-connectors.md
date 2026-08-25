@@ -7,11 +7,17 @@ stdio-based clients (Claude Desktop, Codex CLI via `akb-mcp`,
 Claude Code via the stdio proxy), see the project README: the PAT
 flow there is unchanged.
 
+The backend and proxy support only MCP **2026-07-28**. HTTP requests are
+stateless: each `POST /mcp/` carries its own `_meta` protocol envelope plus
+`Mcp-Protocol-Version`, `Mcp-Method`, and named-call routing headers. Clients
+discover the server with `server/discover`; the removed initialize handshake
+and `Mcp-Session-Id` session flow are rejected.
+
 ## What you need
 
 | Piece | Why |
 |---|---|
-| AKB backend ≥ the version that ships `mcp_oauth_enabled` | Adds the Resource Server code path |
+| AKB backend ≥ `0.15.0` | Adds the Resource Server code path and MCP 2026-07-28 transport |
 | An OIDC IdP — Keycloak in the reference deployment | AKB does NOT host an Authorization Server; the IdP issues access tokens |
 | Realm configuration: `akb:vault:read`, `akb:vault:write` scopes (each with an audience mapper) + DCR trusted hosts + `offline_access` exposed | Lets clients DCR-register and request the scopes the consent screen presents |
 | `config/app.yaml`: explicit `auth_mode`, `mcp_oauth_enabled: true`, a non-empty `public_base_url` | Activates the new path without changing the chosen human-login mode. Default keeps it off so PAT-only deployments are bit-for-bit unchanged |
@@ -105,8 +111,8 @@ claude mcp add --transport http akb https://akb.example.com/mcp/
 
 > **Trailing slash matters.** Register with the trailing `/mcp/`, not
 > bare `/mcp`. Backend issues a 307 redirect from `/mcp` → `/mcp/`,
-> which drops the POST body and breaks the session/initialize
-> handshake — the connector then appears as "Failed to connect" in
+> which can drop the POST body and break the stateless discover request —
+> the connector then appears as "Failed to connect" in
 > `claude mcp list` even though OAuth succeeded.
 
 The command itself does **not** open a browser. `claude mcp list` will
@@ -118,7 +124,7 @@ akb   ! Needs authentication
 
 Complete OAuth one of two ways:
 
-- **Up-front, before the session**:
+- **Up-front, before the first discover request**:
   ```bash
   claude mcp login akb
   ```
@@ -127,10 +133,10 @@ Complete OAuth one of two ways:
   resulting tokens on your machine (macOS keychain, or
   `~/.claude/mcp-credentials` on other platforms).
 
-- **Lazily, inside a session**: run `/mcp` in the session, select `akb`,
+- **Lazily, from a client session**: run `/mcp`, select `akb`,
   and choose `Authenticate`. A browser opens for the same flow.
 
-Once authenticated, Claude Code calls `https://akb.example.com/mcp`
+Once authenticated, Claude Code calls `https://akb.example.com/mcp/`
 with `Authorization: Bearer <access_token>`. The access token is
 auto-refreshed silently as long as the IdP advertises `offline_access`
 in its `scopes_supported` — which the AKB realm does.

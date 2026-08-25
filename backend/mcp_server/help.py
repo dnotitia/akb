@@ -1547,7 +1547,7 @@ Permissions: SELECT=reader, INSERT/UPDATE/DELETE=writer""",
     "images": """# Inline Document Images
 
 Availability: `akb_put_image` and `akb_discard_image` are local-filesystem
-tools supplied by the `akb-mcp` stdio proxy version 2.2 or newer. Use this
+tools supplied by the `akb-mcp` stdio proxy version 2.3 or newer. Use this
 workflow only when those names are present in the client's tool list.
 
 Use `akb_put_image` when a local raster image should render inside an AKB
@@ -1641,7 +1641,7 @@ permanent image archive.
 
     "akb_put_image": """# akb_put_image — Upload an Inline Document Image
 
-Availability: proxy-local in `akb-mcp` 2.2 or newer; it is not exposed by a
+Availability: proxy-local in `akb-mcp` 2.3 or newer; it is not exposed by a
 direct connection to the backend MCP endpoint.
 
 Reads a local PNG, JPEG, GIF, or WebP through the akb-mcp stdio proxy and
@@ -1686,7 +1686,7 @@ fails, pass `image.url` to `akb_discard_image`.""",
 
     "akb_discard_image": """# akb_discard_image — Clean Up an Uncommitted Image
 
-Availability: proxy-local in `akb-mcp` 2.2 or newer; it is not exposed by a
+Availability: proxy-local in `akb-mcp` 2.3 or newer; it is not exposed by a
 direct connection to the backend MCP endpoint.
 
 Deletes a caller-owned image upload only when no document commit has claimed

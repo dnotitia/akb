@@ -24,6 +24,7 @@
 set -uo pipefail
 
 BASE_URL="${AKB_URL:-http://localhost:8000}"
+source "$(dirname "$0")/mcp_modern.sh"
 TS=$(date +%s)
 VAULT="pubres-e2e-$TS"
 USER="pubres-user-$TS"
@@ -198,28 +199,13 @@ T2_MOVER_URI="${OUT%%|*}"; T2_MOVER_PATH="${OUT##*|}"
 [ -n "$T2_MOVER_URI" ] && pass "T2 setup: unpublished doc created ($T2_MOVER_PATH)" || fail "T2 setup" "no mover uri"
 
 # There is no REST move endpoint — move is MCP-only (akb_move).
-SESS=$(curl -sk -X POST "$BASE_URL/mcp/" \
-  -H "Authorization: Bearer $MCP_PAT" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"pubres-e2e","version":"0.1"}}}' \
-  -i 2>&1 | grep -i "mcp-session-id:" | tr -d '\r' | awk '{print $2}')
-[ -n "$SESS" ] && pass "T2: MCP session initialized" || fail "T2 MCP init" "no session id"
-
-curl -sk -X POST "$BASE_URL/mcp/" \
-  -H "Authorization: Bearer $MCP_PAT" -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" -H "Mcp-Session-Id: $SESS" \
-  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null
+DISCOVER=$(mcp_modern_discover "$MCP_PAT" pubres-e2e)
+echo "$DISCOVER" | grep -q '2026-07-28' && pass "T2: MCP stateless discovery" || fail "T2 MCP discovery" "failed"
 
 mcp() {
   local id=$1; shift
   local name=$1; shift
-  curl -sk -X POST "$BASE_URL/mcp/" \
-    -H "Authorization: Bearer $MCP_PAT" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" \
-    -H "Mcp-Session-Id: $SESS" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"tools/call\",\"params\":{\"name\":\"$name\",\"arguments\":$1}}" 2>&1
+  mcp_modern_call "$MCP_PAT" "$name" "$1" "$id" pubres-e2e
 }
 mcp_text() {
   python3 -c "

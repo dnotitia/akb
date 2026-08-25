@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.3.0 — MCP 2026-07-28 stateless protocol
+
+The stdio proxy now speaks the single 2026-07-28 MCP revision. It forwards the
+per-request metadata plus `Mcp-Protocol-Version`, `Mcp-Method`, and
+`Mcp-Name` routing headers, uses `server/discover` instead of initialize, and
+never creates or forwards an MCP session id. Unsupported revisions are
+returned as the typed `-32022` error rather than echoed as a successful
+handshake. Backend and proxy tool catalogs remain deterministic and include
+cache metadata; local file/image tools and reconnect behavior stay available
+when the backend is unavailable.
+
 ## 2.2.2 — strict MCP protocol boundary
 
 The stdio proxy now rejects an `initialize` request that names an unsupported

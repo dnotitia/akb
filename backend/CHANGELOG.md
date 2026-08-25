@@ -7,6 +7,17 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+## 0.15.0 — 2026-08-25  *(feat — MCP 2026-07-28 stateless protocol)*
+
+### Added the single-revision stateless MCP transport
+
+The backend now uses the native MCP SDK 2.1.0 modern transport. Every HTTP
+request must carry the 2026-07-28 protocol envelope and routing headers; the
+server provides `server/discover`, deterministic cacheable `tools/list`, and
+per-request authentication and client metadata without session affinity.
+Legacy initialize/session requests receive the typed unsupported-version or
+stateless-request error instead of a downgrade.
+
 ### Fixed repeated production-scale BM25 rebuilds and bounded rebuild memory
 
 The BM25 refresher no longer compares all non-null chunks with the smaller set

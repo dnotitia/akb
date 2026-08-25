@@ -33,6 +33,15 @@ function itAsync(name, fn) {
   ));
 }
 
+const modernParams = (params = {}) => ({
+  ...params,
+  _meta: {
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientCapabilities": {},
+    "io.modelcontextprotocol/clientInfo": { name: "contract-test", version: "1" },
+  },
+});
+
 // ── Fixtures: representative backend envelope responses ──────────
 
 const initiateUploadResp = JSON.stringify({
@@ -408,6 +417,29 @@ itAsync("_http honors the per-call probe timeout", async () => {
   }
 });
 
+itAsync("_rpc sends the modern envelope and routing headers", async () => {
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  let observed;
+  proxy._http = async (method, path, body, headers) => {
+    observed = { method, path, body: JSON.parse(body.toString()), headers };
+    return { text: '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}', headers: {} };
+  };
+
+  const result = await proxy._rpc("tools/call", {
+    name: "akb_get",
+    arguments: { uri: "akb://vault/doc/readme.md" },
+  });
+
+  assert.deepEqual(result, { ok: true });
+  assert.equal(observed.headers["mcp-protocol-version"], "2026-07-28");
+  assert.equal(observed.headers["mcp-method"], "tools/call");
+  assert.equal(observed.headers["mcp-name"], "akb_get");
+  assert.equal(observed.body.params._meta["io.modelcontextprotocol/protocolVersion"], "2026-07-28");
+  assert.deepEqual(observed.body.params._meta["io.modelcontextprotocol/clientCapabilities"].experimental[
+    "io.dnotitia.akb/vault-skill-preflight"
+  ], { version: 2 });
+});
+
 itAsync("_discardImage surfaces backend lookup failures", async () => {
   const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
   const assetId = "11111111-2222-4333-8444-555555555555";
@@ -474,7 +506,7 @@ itAsync("proxy-local exact retry acknowledges the guide before writing", async (
   };
 
   const first = await proxy._handle({
-    jsonrpc: "2.0", id: 1, method: "tools/call", params,
+    jsonrpc: "2.0", id: 1, method: "tools/call", params: modernParams(params),
   });
   const firstBody = JSON.parse(first.result.content[0].text);
   assert.equal(firstBody.code, "vault_skill_required");
@@ -482,7 +514,7 @@ itAsync("proxy-local exact retry acknowledges the guide before writing", async (
   assert.equal(writes, 0);
 
   const second = await proxy._handle({
-    jsonrpc: "2.0", id: 2, method: "tools/call", params,
+    jsonrpc: "2.0", id: 2, method: "tools/call", params: modernParams(params),
   });
   const secondBody = JSON.parse(second.result.content[0].text);
   assert.equal(secondBody.kind, "document_image");

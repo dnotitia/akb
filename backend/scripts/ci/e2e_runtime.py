@@ -51,7 +51,7 @@ from oidc_fixture import OIDCFixture
 
 LOGGER = logging.getLogger("akb.e2e_runtime")
 SCHEMA_VERSION = 2
-PROTOCOL_REVISION = "2025-06-18"
+PROTOCOL_REVISION = "2026-07-28"
 Scenario = Literal[
     "empty",
     "app-installation-lifecycle",
@@ -378,7 +378,7 @@ class E2ERuntime:
         self._pat_value = ""
         self._candidate_revision: str | None = None
         self._proxy_version: str | None = None
-        self._stdio_initialize_observed = False
+        self._stdio_discover_observed = False
         self._stdio_tools_list_observed = False
         self._stdio_read_call_observed = False
         self._stdio_next_id = 2
@@ -508,7 +508,7 @@ class E2ERuntime:
                     "AKB_MCP_URL": f"{self.config.app_origin}/mcp/",
                     "AKB_PAT": self.config.credentials.pat_env,
                 },
-                "initialize_observed": self._stdio_initialize_observed,
+                "discover_observed": self._stdio_discover_observed,
                 "tools_list_observed": getattr(self, "_stdio_tools_list_observed", False),
                 "read_call_observed": getattr(self, "_stdio_read_call_observed", False),
             }
@@ -994,7 +994,7 @@ class E2ERuntime:
                 "login_path": "/api/v1/auth/login",
             },
         }
-        # Keep the legacy default descriptor byte-for-byte compatible.  A
+        # Keep the default descriptor shape stable. A
         # selected non-default profile advertises its added capabilities using
         # the same schema-v2 service map rather than a parallel MCP descriptor.
         if self.profile.name != DEFAULT_PROFILE or self.config.capabilities:
@@ -1479,17 +1479,20 @@ class E2ERuntime:
         )
         if managed.stdin is None or managed.stdout is None:
             raise BlockedRuntimeConfig("stdio proxy did not expose stdin/stdout pipes")
-        initialize = {
+        discover = {
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "initialize",
+            "method": "server/discover",
             "params": {
-                "protocolVersion": PROTOCOL_REVISION,
-                "capabilities": {},
-                "clientInfo": {"name": "akb-e2e-runtime", "version": "1"},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": PROTOCOL_REVISION,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                    "io.modelcontextprotocol/clientInfo": {"name": "akb-e2e-runtime", "version": "1"},
+                },
             },
         }
-        managed.stdin.write((json.dumps(initialize, separators=(",", ":")) + "\n").encode())
+        self._stdio_meta = discover["params"]["_meta"]
+        managed.stdin.write((json.dumps(discover, separators=(",", ":")) + "\n").encode())
         await managed.stdin.drain()
         try:
             for _ in range(8):
@@ -1503,19 +1506,15 @@ class E2ERuntime:
                     continue
                 if "error" in response:
                     raise ValueError
-                self._stdio_initialize_observed = True
-                initialized = {
-                    "jsonrpc": "2.0",
-                    "method": "notifications/initialized",
-                    "params": {},
-                }
-                managed.stdin.write((json.dumps(initialized, separators=(",", ":")) + "\n").encode())
-                await managed.stdin.drain()
+                result = response.get("result")
+                if not isinstance(result, dict) or PROTOCOL_REVISION not in result.get("supportedVersions", []):
+                    raise ValueError
+                self._stdio_discover_observed = True
                 return
         except (asyncio.TimeoutError, ValueError, json.JSONDecodeError):
             pass
         await self._stop_named_process("stdio")
-        raise BlockedRuntimeConfig("stdio proxy initialize did not cross the process boundary")
+        raise BlockedRuntimeConfig("stdio proxy server/discover did not cross the process boundary")
 
     async def _stdio_response(self, expected_id: int) -> dict[str, object]:
         managed = self._children.get("stdio")
@@ -1550,7 +1549,14 @@ class E2ERuntime:
             "method": method,
         }
         if params is not None:
-            message["params"] = params
+            message["params"] = {
+                **params,
+                "_meta": dict(getattr(self, "_stdio_meta", {
+                    "io.modelcontextprotocol/protocolVersion": PROTOCOL_REVISION,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                    "io.modelcontextprotocol/clientInfo": {"name": "akb-e2e-runtime", "version": "1"},
+                })),
+            }
         managed.stdin.write((json.dumps(message, separators=(",", ":")) + "\n").encode())
         await managed.stdin.drain()
         return await self._stdio_response(request_id)
@@ -3040,7 +3046,7 @@ class E2ERuntime:
             try:
                 self._fixture_controls.clear()
                 await self._stop_named_process("stdio")
-                self._stdio_initialize_observed = False
+                self._stdio_discover_observed = False
                 self._stdio_tools_list_observed = False
                 self._stdio_read_call_observed = False
                 self._stdio_next_id = 2

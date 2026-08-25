@@ -1,4 +1,4 @@
-"""MCP initialize instructions — bootstrap gate for AKB agents.
+"""MCP request instructions — bootstrap gate for AKB agents.
 
 This module is kept deliberately lightweight (no heavy imports) so that
 unit tests and tooling can import INSTRUCTIONS without pulling in the full
@@ -19,7 +19,7 @@ When writing into a vault:
 4. Never inline secrets in document bodies — use ${{secrets.X}} placeholders.
 5. Destructive tools (akb_delete_vault, akb_delete_collection) require explicit user confirmation.
 6. Reference resources by the akb:// URIs returned by tool calls — do not reassemble paths yourself.
-7. If listed, use proxy-local akb_put_image and insert its returned `markdown`. For existing documents use targeted akb_edit: akb_update(content=...) replaces the entire body. On write failure call akb_discard_image. If absent, use akb-mcp 2.2+.
+7. If listed, use proxy-local akb_put_image and insert its returned `markdown`. For existing documents use targeted akb_edit: akb_update(content=...) replaces the entire body. On write failure call akb_discard_image. If absent, use akb-mcp 2.3+.
 8. For other surfaces (akb_publish, akb_activity, akb_history), call akb_help() for an overview.
 
 Agent memory is managed outside this tool loop by lifecycle plugins. Find your accessible memory vault with akb_list_vaults; use normal akb_search / akb_browse / akb_get tools rather than reconstructing its name.

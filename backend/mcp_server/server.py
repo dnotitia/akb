@@ -18,6 +18,8 @@ import logging
 import sys
 import time
 import uuid
+from contextvars import ContextVar
+from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any
 
@@ -26,9 +28,10 @@ from app.util.git_refs import HEX_COMMIT_RE
 # Add backend to path so we can import app modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from mcp.server import Server
+from mcp.server import CacheHint, Server
+from mcp.server.context import ServerRequestContext
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent
+from mcp.types import CallToolResult, ListToolsResult, TextContent
 
 from app.db.postgres import get_pool, init_db, close_pool
 from app.exceptions import ConflictError, NotFoundError, ValidationError, WriteBusyError
@@ -81,11 +84,17 @@ VAULT_SKILL_PREFLIGHT_CAPABILITY = "io.dnotitia.akb/vault-skill-preflight"
 VAULT_SKILL_ACK_ARGUMENT = "_vault_skill_ack"
 
 
+_REQUEST_CONTEXT: ContextVar[ServerRequestContext[Any, Any] | None] = ContextVar(
+    "akb_mcp_request_context", default=None
+)
+
+
 def _vault_skill_preflight_version() -> int | None:
-    """Negotiated retry-contract version for this MCP session, if any."""
+    """Negotiated retry-contract version for the current MCP request."""
+    context = _REQUEST_CONTEXT.get()
     try:
-        params = server.request_context.session.client_params
-        experimental = params.capabilities.experimental if params else None
+        capabilities = context.session.client_capabilities if context else None
+        experimental = capabilities.experimental if capabilities else None
         advertised = (experimental or {}).get(VAULT_SKILL_PREFLIGHT_CAPABILITY)
         if not isinstance(advertised, dict):
             return None
@@ -114,9 +123,6 @@ async def _find_doc(vault_name: str, doc_ref: str) -> dict | None:
             return None
         return await doc_repo.find_by_ref_with_conn(conn, vault["id"], doc_ref)
 
-
-
-server = Server("akb", instructions=INSTRUCTIONS)
 
 
 class _MCPUser:
@@ -148,13 +154,13 @@ _FALLBACK_USER = _MCPUser()
 async def _get_user() -> _MCPUser:
     """Get authenticated user from MCP request context.
 
-    Uses the standard MCP SDK mechanism: server.request_context.request
-    contains the original HTTP Request, from which we extract the
-    Authorization header and apply the MCP credential capability.
+    The pinned MCP SDK passes the original HTTP Request through the
+    per-request ``ServerRequestContext``. Authentication is therefore resolved
+    independently for every stateless request.
     """
     try:
-        ctx = server.request_context
-        request = ctx.request  # Starlette Request object
+        context = _REQUEST_CONTEXT.get()
+        request = context.request if context else None
         if request:
             auth_header = request.headers.get("authorization", "")
             if auth_header:
@@ -183,15 +189,14 @@ async def _get_user() -> _MCPUser:
 
 
 def _session_id() -> str | None:
-    """The caller's MCP session id, for correlating a conversation's tool calls.
+    """Return a legacy transport id when one is present for analytics only.
 
-    Same source as `_get_user()` — the SDK stashes the originating HTTP request
-    on the request context. Absent for stdio/CLI callers and for the very first
-    POST of a session (the server mints the id during `initialize`), so this is
-    nullable by construction and must never be treated as a required key.
+    The public HTTP entrypoint rejects session-bound requests, so modern
+    stateless calls and stdio calls return ``None``.
     """
     try:
-        request = server.request_context.request
+        context = _REQUEST_CONTEXT.get()
+        request = context.request if context else None
         if request:
             return request.headers.get("mcp-session-id")
     except (LookupError, AttributeError):
@@ -342,7 +347,7 @@ def _required_scope(name: str, args: dict) -> str:
 # time from the same TOOLS list returned via list_tools, so the
 # "what the agent saw" and "what we accept" can't drift.
 _TOOL_ARG_NAMES: dict[str, set[str]] = {
-    t.name: set((t.inputSchema or {}).get("properties", {}).keys())
+    t.name: set((t.input_schema or {}).get("properties", {}).keys())
     for t in TOOLS
 }
 
@@ -1548,14 +1553,10 @@ async def _handle_set_public(args: dict, uid: str, user: _MCPUser) -> dict:
 
 # ── Tool Handlers ────────────────────────────────────────────
 
-@server.list_tools()
 async def list_tools():
-    if _vault_skill_preflight_version() != 2:
-        return TOOLS
-
-    # Capability v2 makes acknowledgement explicit.  Advertise the reserved
-    # retry argument only to clients that negotiated that contract; older
-    # clients keep the byte-for-byte schemas they already understand.
+    # The catalog is one cacheable public surface. Advertise the reserved
+    # acknowledgement argument for every possible writer so client metadata
+    # cannot select a different schema or invalidate a public cache entry.
     decorated = []
     for tool in TOOLS:
         may_write = (
@@ -1566,7 +1567,7 @@ async def list_tools():
             decorated.append(tool)
             continue
         copied = tool.model_copy(deep=True)
-        copied.inputSchema.setdefault("properties", {})[
+        copied.input_schema.setdefault("properties", {})[
             VAULT_SKILL_ACK_ARGUMENT
         ] = {
             "type": "string",
@@ -1581,7 +1582,6 @@ async def list_tools():
     return decorated
 
 
-@server.call_tool()
 async def call_tool(name: str, arguments: dict):
     # Capability-v2 acknowledgement is transport metadata expressed as a
     # reserved tool argument so generic MCP clients can send it through their
@@ -1747,6 +1747,27 @@ async def call_tool(name: str, arguments: dict):
         )]
 
 
+async def _handle_list_tools(
+    context: ServerRequestContext[Any, Any], _params: Any
+) -> ListToolsResult:
+    token = _REQUEST_CONTEXT.set(context)
+    try:
+        return ListToolsResult(tools=await list_tools())
+    finally:
+        _REQUEST_CONTEXT.reset(token)
+
+
+async def _handle_call_tool(
+    context: ServerRequestContext[Any, Any], params: Any
+) -> CallToolResult:
+    token = _REQUEST_CONTEXT.set(context)
+    try:
+        content = await call_tool(params.name, params.arguments or {})
+    finally:
+        _REQUEST_CONTEXT.reset(token)
+    return CallToolResult(content=content)
+
+
 async def _dispatch(name: str, args: dict, user: "_MCPUser"):
     uid = user.user_id
 
@@ -1816,6 +1837,19 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
             hint="The vault is under heavy write load. Wait a few seconds and retry; no partial write occurred.",
             retry_after_secs=e.retry_after_secs,
         )
+
+
+server = Server(
+    "akb",
+    version=package_version("akb"),
+    instructions=INSTRUCTIONS,
+    cache_hints={
+        "server/discover": CacheHint(ttl_ms=300_000, scope="public"),
+        "tools/list": CacheHint(ttl_ms=300_000, scope="public"),
+    },
+    on_list_tools=_handle_list_tools,
+    on_call_tool=_handle_call_tool,
+)
 
 
 # ── Entry point ──────────────────────────────────────────────

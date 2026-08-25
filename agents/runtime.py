@@ -23,7 +23,6 @@ from __future__ import annotations
 import json
 import logging
 import ssl
-import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -31,6 +30,7 @@ import aiohttp
 from openai import AsyncOpenAI
 
 logger = logging.getLogger("akb.agent")
+MCP_PROTOCOL_VERSION = "2026-07-28"
 
 
 @dataclass
@@ -51,7 +51,11 @@ class MCP:
     def __init__(self, base_url: str, pat: str):
         self.url = f"{base_url.rstrip('/')}/mcp/"
         self.pat = pat
-        self.session_id: str | None = None
+        self._meta = {
+            "io.modelcontextprotocol/protocolVersion": MCP_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": {"name": "akb-agent-runtime", "version": "1.0"},
+        }
         self._ssl = ssl.create_default_context()
         self._ssl.check_hostname = False
         self._ssl.verify_mode = ssl.CERT_NONE
@@ -60,21 +64,17 @@ class MCP:
         self._msg_id = 0
 
     async def connect(self) -> list[dict]:
-        """Initialize MCP session and fetch tools."""
+        """Discover the stateless MCP server and fetch tools."""
         self._http = aiohttp.ClientSession()
 
-        # Initialize
-        resp = await self._rpc("initialize", {
-            "protocolVersion": "2025-03-26",
-            "capabilities": {},
-            "clientInfo": {"name": "akb-agent-runtime", "version": "1.0"},
-        })
-        self.session_id = resp.get("_session_id")
+        discovery = await self._rpc("server/discover", {})
+        if MCP_PROTOCOL_VERSION not in discovery.get("supportedVersions", []):
+            raise RuntimeError(f"MCP server does not support {MCP_PROTOCOL_VERSION}")
 
         # List tools
         result = await self._rpc("tools/list", {})
         self._tools = result.get("tools", [])
-        logger.info("MCP connected: %d tools, session=%s", len(self._tools), self.session_id)
+        logger.info("MCP connected: %d tools, protocol=%s", len(self._tools), MCP_PROTOCOL_VERSION)
         return self._tools
 
     async def call_tool(self, name: str, arguments: dict) -> Any:
@@ -100,11 +100,14 @@ class MCP:
         headers = {
             "Authorization": f"Bearer {self.pat}",
             "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
+            "Accept": "application/json",
+            "Mcp-Protocol-Version": MCP_PROTOCOL_VERSION,
+            "Mcp-Method": method,
         }
-        if self.session_id:
-            headers["mcp-session-id"] = self.session_id
+        if method == "tools/call" and isinstance(params.get("name"), str):
+            headers["Mcp-Name"] = params["name"]
 
+        params = {**params, "_meta": {**self._meta, **params.get("_meta", {})}}
         body = {
             "jsonrpc": "2.0",
             "id": self._msg_id,
@@ -113,18 +116,10 @@ class MCP:
         }
 
         async with self._http.post(self.url, json=body, headers=headers, ssl=self._ssl) as resp:
-            # Capture session ID from response headers
-            sid = resp.headers.get("mcp-session-id")
-            if sid:
-                self.session_id = sid
-
             data = await resp.json()
             if "error" in data:
                 raise RuntimeError(f"MCP error: {data['error']}")
-            result = data.get("result", {})
-            if sid:
-                result["_session_id"] = sid
-            return result
+            return data.get("result", {})
 
     def get_openai_tools(self) -> list[dict]:
         """Convert MCP tools to OpenAI function calling format."""

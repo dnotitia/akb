@@ -1,18 +1,18 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
   "name": "io.github.dnotitia/akb",
-  "description": "Git-backed org memory for AI agents — hybrid search, tables, files & a URI graph over MCP.",
+  "description": "Git-backed org memory for AI agents — MCP 2026-07-28 stateless discovery, hybrid search, tables, files & a URI graph.",
   "repository": {
     "url": "https://github.com/dnotitia/akb",
     "source": "github"
   },
-  "version": "2.1.0",
+  "version": "2.3.0",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "akb-mcp",
-      "version": "2.1.0",
+      "version": "2.3.0",
       "transport": {
         "type": "stdio"
       },

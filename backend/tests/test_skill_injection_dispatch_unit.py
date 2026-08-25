@@ -292,21 +292,20 @@ async def test_v2_write_requires_explicit_matching_ack_and_strips_it(
     assert acknowledgements == [None, None, token]
 
 
-async def test_v2_tool_list_advertises_ack_only_on_possible_writes(monkeypatch):
-    monkeypatch.setattr(server_mod, "_vault_skill_preflight_version", lambda: 2)
+async def test_tool_list_advertises_ack_only_on_possible_writes():
     tools = await server_mod.list_tools()
     by_name = {tool.name: tool for tool in tools}
 
     assert server_mod.VAULT_SKILL_ACK_ARGUMENT in (
-        by_name["akb_update"].inputSchema["properties"]
+        by_name["akb_update"].input_schema["properties"]
     )
     # akb_grep is normally read-only but becomes a writer when `replace` is
     # present, so its schema must carry the acknowledgement too.
     assert server_mod.VAULT_SKILL_ACK_ARGUMENT in (
-        by_name["akb_grep"].inputSchema["properties"]
+        by_name["akb_grep"].input_schema["properties"]
     )
     assert server_mod.VAULT_SKILL_ACK_ARGUMENT not in (
-        by_name["akb_get"].inputSchema["properties"]
+        by_name["akb_get"].input_schema["properties"]
     )
 
 

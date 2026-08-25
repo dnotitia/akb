@@ -7,6 +7,7 @@
 set -uo pipefail
 
 BASE_URL="${AKB_URL:-http://localhost:8000}"
+source "$(dirname "$0")/mcp_modern.sh"
 VAULT="coll-life-$(date +%s)"
 E2E_USER="coll-life-u1-$(date +%s)"
 READER_USER="coll-life-u2-$(date +%s)"
@@ -57,38 +58,19 @@ PAT2=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
 
 [ -n "$PAT2" ] && pass "Reader PAT acquired" || { fail "Reader PAT" "could not get PAT"; exit 1; }
 
-# ── 1. MCP Initialize ───────────────────────────────────────
+# ── 1. MCP discovery ────────────────────────────────────────
 echo ""
-echo "▸ 1. MCP Initialize"
+echo "▸ 1. MCP 2026-07-28"
 
-INIT_RESP=$(curl -sk -i -X POST "$BASE_URL/mcp/" \
-  -H "Authorization: Bearer $PAT" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"coll-life-e2e","version":"1.0"}}}' 2>&1)
-
-SID=$(echo "$INIT_RESP" | grep -i "mcp-session-id" | tr -d '\r' | awk '{print $2}')
-[ -n "$SID" ] && pass "Session ID received ($SID)" || { fail "Session ID" "missing"; exit 1; }
-
-# Send initialized notification
-curl -sk -X POST "$BASE_URL/mcp/" \
-  -H "Authorization: Bearer $PAT" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -H "mcp-session-id: $SID" \
-  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null 2>&1
+DISCOVER=$(mcp_modern_discover "$PAT" coll-life-e2e)
+echo "$DISCOVER" | grep -q '2026-07-28' && pass "Stateless MCP discovery" || { fail "MCP" "discovery failed"; exit 1; }
 
 # Helper: MCP tool call
 MCP_ID=10
 mcp_call() {
   local tool=$1 args=$2
   MCP_ID=$((MCP_ID+1))
-  curl -sk -X POST "$BASE_URL/mcp/" \
-    -H "Authorization: Bearer $PAT" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" \
-    -H "mcp-session-id: $SID" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":$MCP_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}" 2>&1
+  mcp_modern_call "$PAT" "$tool" "$args" "$MCP_ID" coll-life-e2e
 }
 
 mcp_result() {

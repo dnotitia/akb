@@ -6,6 +6,7 @@
 set -uo pipefail
 
 BASE_URL="${AKB_URL:-http://localhost:8000}"
+source "$(dirname "$0")/mcp_modern.sh"
 VAULT="edit-e2e-$(date +%s)"
 E2E_USER="edit-user-$(date +%s)"
 READER_USER="edit-reader-$(date +%s)"
@@ -54,60 +55,23 @@ READER_PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
   -H 'Content-Type: application/json' \
   -d '{"name":"edit-reader"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
 
-# MCP Initialize (writer)
-INIT_RESP=$(curl -sk -i -X POST "$BASE_URL/mcp/" \
-  -H "Authorization: Bearer $PAT" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"edit-e2e","version":"1.0"}}}' 2>&1)
-
-SID=$(echo "$INIT_RESP" | grep -i "mcp-session-id" | tr -d '\r' | awk '{print $2}')
-[ -n "$SID" ] && pass "MCP session ($SID)" || { fail "MCP" "no session"; exit 1; }
-
-curl -sk -X POST "$BASE_URL/mcp/" \
-  -H "Authorization: Bearer $PAT" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -H "mcp-session-id: $SID" \
-  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null 2>&1
-
-# MCP Initialize (reader)
-READER_INIT_RESP=$(curl -sk -i -X POST "$BASE_URL/mcp/" \
-  -H "Authorization: Bearer $READER_PAT" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"edit-e2e-reader","version":"1.0"}}}' 2>&1)
-
-READER_SID=$(echo "$READER_INIT_RESP" | grep -i "mcp-session-id" | tr -d '\r' | awk '{print $2}')
-
-curl -sk -X POST "$BASE_URL/mcp/" \
-  -H "Authorization: Bearer $READER_PAT" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -H "mcp-session-id: $READER_SID" \
-  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null 2>&1
+# MCP discovery (writer + reader)
+DISCOVER=$(mcp_modern_discover "$PAT" edit-e2e)
+echo "$DISCOVER" | grep -q '2026-07-28' && pass "MCP stateless discovery" || { fail "MCP" "discovery failed"; exit 1; }
+SID="modern"
+READER_SID="modern"
 
 # MCP helpers
 MCP_ID=10
 mcp_call() {
   local tool=$1 args=$2
   MCP_ID=$((MCP_ID+1))
-  curl -sk -X POST "$BASE_URL/mcp/" \
-    -H "Authorization: Bearer $PAT" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" \
-    -H "mcp-session-id: $SID" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":$MCP_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}" 2>&1
+  mcp_modern_call "$PAT" "$tool" "$args" "$MCP_ID" edit-e2e
 }
 mcp_call_as_reader() {
   local tool=$1 args=$2
   MCP_ID=$((MCP_ID+1))
-  curl -sk -X POST "$BASE_URL/mcp/" \
-    -H "Authorization: Bearer $READER_PAT" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" \
-    -H "mcp-session-id: $READER_SID" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":$MCP_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}" 2>&1
+  mcp_modern_call "$READER_PAT" "$tool" "$args" "$MCP_ID" edit-e2e-reader
 }
 mcp_result() {
   python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['result']['content'][0]['text'])" 2>/dev/null
@@ -130,9 +94,10 @@ echo "▸ 1. Tool Discovery"
 TOOLS_RESP=$(curl -sk -X POST "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $PAT" \
   -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -H "mcp-session-id: $SID" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' 2>&1)
+  -H "Accept: application/json" \
+  -H "Mcp-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: tools/list" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"edit-e2e","version":"1"}}}}' 2>&1)
 
 HAS_EDIT=$(echo "$TOOLS_RESP" | python3 -c "import sys,json; tools=json.load(sys.stdin)['result']['tools']; print(any(t['name']=='akb_edit' for t in tools))" 2>/dev/null)
 [ "$HAS_EDIT" = "True" ] && pass "akb_edit in tools/list" || fail "akb_edit discovery" "tool not found"

@@ -13,6 +13,7 @@
 set -uo pipefail
 
 BASE_URL="${AKB_URL:-http://localhost:8000}"
+source "$(dirname "$0")/mcp_modern.sh"
 VAULT="pub-e2e-$(date +%s)"
 USER="pub-user-$(date +%s)"
 PASS=0
@@ -681,8 +682,8 @@ CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$TQ_SLUG
 
 echo ""
 
-# ── 12. MCP integration: legacy akb_publish backward compat ──
-echo "▸ 12. MCP backward compat"
+# ── 12. MCP integration: akb_publish over modern transport ──
+echo "▸ 12. MCP modern transport"
 
 # Init MCP session
 # A local user-session JWT is deliberately not an MCP credential.
@@ -690,34 +691,17 @@ JWT_MCP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/mcp/" 
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test-local-session-boundary","version":"0.1"}}}')
+  -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}')
 [ "$JWT_MCP_CODE" = "401" ] && pass "Local session JWT rejected by MCP" || fail "MCP local JWT boundary" "HTTP $JWT_MCP_CODE"
 
-SESS=$(curl -sk -X POST "$BASE_URL/mcp/" \
-  -H "Authorization: Bearer $MCP_PAT" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}' \
-  -i 2>&1 | grep -i "mcp-session-id:" | tr -d '\r' | awk '{print $2}')
-[ -n "$SESS" ] && pass "MCP session initialized" || fail "MCP init" "no session"
-
-curl -sk -X POST "$BASE_URL/mcp/" \
-  -H "Authorization: Bearer $MCP_PAT" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -H "Mcp-Session-Id: $SESS" \
-  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null
+DISCOVER=$(mcp_modern_discover "$MCP_PAT" publications-e2e)
+echo "$DISCOVER" | grep -q '2026-07-28' && pass "MCP stateless discovery" || fail "MCP discovery" "failed"
 
 mcp() {
   local id=$1; shift
   local name=$1; shift
   local args=$1
-  curl -sk -X POST "$BASE_URL/mcp/" \
-    -H "Authorization: Bearer $MCP_PAT" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" \
-    -H "Mcp-Session-Id: $SESS" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"tools/call\",\"params\":{\"name\":\"$name\",\"arguments\":$args}}" 2>&1
+  mcp_modern_call "$MCP_PAT" "$name" "$args" "$id" publications-e2e
 }
 mcp_text() {
   python3 -c "

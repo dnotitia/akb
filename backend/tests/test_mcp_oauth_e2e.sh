@@ -42,6 +42,8 @@
 set -uo pipefail
 
 AKB_URL="${AKB_URL:-http://localhost:8000}"
+BASE_URL="$AKB_URL"
+source "$(dirname "$0")/mcp_modern.sh"
 KC_URL="${KC_URL:-http://localhost:8080}"
 KC_REALM="${KC_REALM:-akb}"
 KC_TEST_CLIENT_ID="${KC_TEST_CLIENT_ID:-akb-web}"
@@ -72,23 +74,19 @@ mint_token() {
 }
 
 mcp_initialize_call() {
-  # Sends a minimal MCP `initialize` then a `tools/list` call.
+  # Sends the modern discovery request.
   local token="$1"
-  curl -s -X POST "${AKB_URL}/mcp/" \
-       -H "Authorization: Bearer ${token}" \
-       -H "Content-Type: application/json" \
-       -H "Accept: application/json, text/event-stream" \
-       -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0"}}}'
+  mcp_modern_discover "$token" oauth-e2e
 }
 
 mcp_tool_call() {
   # $1 = bearer token, $2 = MCP method (tools/call etc.), $3 = JSON args
   local token="$1" method="$2" args="$3"
-  curl -s -X POST "${AKB_URL}/mcp/" \
-       -H "Authorization: Bearer ${token}" \
-       -H "Content-Type: application/json" \
-       -H "Accept: application/json, text/event-stream" \
-       -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"${method}\",\"params\":${args}}"
+  local name=""
+  if [ "$method" = "tools/call" ]; then
+    name=$(echo "$args" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("name",""))')
+  fi
+  mcp_modern_request "$token" 2 "$method" "$args" "$name" oauth-e2e
 }
 
 # ── 1. Protected-resource metadata shape ─────────────────────
@@ -143,7 +141,7 @@ section "Read+write token → /mcp accepts, tools/list returns AKB tools"
 good_token=$(mint_token "akb:vault:read akb:vault:write")
 if [ -z "$good_token" ]; then fail "mint scoped token" "Keycloak returned no access_token"; else
   init_resp=$(mcp_initialize_call "$good_token")
-  # Streamable HTTP returns SSE; just check the response carried a JSON-RPC frame
+  # Stateless discover returns a JSON-RPC frame with the supported revision.
   case "$init_resp" in *'"jsonrpc"'*) pass "initialize accepted" ;;
                             *) fail "initialize accepted" "got '${init_resp:0:200}'" ;; esac
   list_resp=$(mcp_tool_call "$good_token" "tools/list" "{}")
@@ -192,7 +190,7 @@ case "$pat" in
 esac
 if [ -n "$pat" ]; then
   init_resp=$(mcp_initialize_call "$pat")
-  case "$init_resp" in *'"jsonrpc"'*) pass "PAT initialize works" ;;
+  case "$init_resp" in *'"jsonrpc"'*) pass "PAT discover works" ;;
                             *) fail "PAT initialize works" "got '${init_resp:0:200}'" ;; esac
 fi
 

@@ -8,6 +8,10 @@ MCP client.
 agent to an **AKB backend**, which speaks MCP over Streamable HTTP. So you
 need two values:
 
+The current backend and proxy contract is MCP **2026-07-28**: discovery uses
+`server/discover`, every request is stateless, and the removed initialize/
+session-id flow is not supported. Use the trailing `/mcp/` URL shown below.
+
 - **`AKB_MCP_URL`** — the AKB backend's MCP endpoint, e.g.
   `https://akb.example.com/mcp/`
 - **`AKB_PAT`** — an AKB Personal Access Token (looks like `akb_...`)

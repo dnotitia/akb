@@ -4,7 +4,7 @@ The backend ``DocumentPutRequest`` model and ``document_service._put`` already
 honor a ``slug`` (``slug = (req.slug and _slugify(req.slug)) or _slugify(req.title)``);
 these tests pin the two MCP-surface seams that expose it to a caller:
 
-  1. ``tools.py`` advertises ``slug`` in the ``akb_put`` ``inputSchema``. Because
+  1. ``tools.py`` advertises ``slug`` in the ``akb_put`` ``input_schema``. Because
      ``server._TOOL_ARG_NAMES`` is schema-derived, advertising it here is also
      what makes the ``_dispatch`` arg-validator accept it (otherwise the call is
      rejected with ``unknown_argument``).
@@ -63,7 +63,7 @@ def _dict_value(node: ast.expr, key: str) -> ast.expr:
 def _akb_put_schema_property_names() -> set[str]:
     tree = ast.parse((_MCP / "tools.py").read_text())
     call = _tool_call(tree, "akb_put")
-    schema = _kwarg_value(call, "inputSchema")
+    schema = _kwarg_value(call, "input_schema")
     props = _dict_value(schema, "properties")
     assert isinstance(props, ast.Dict)
     return {k.value for k in props.keys if isinstance(k, ast.Constant)}
@@ -103,7 +103,7 @@ def test_akb_put_schema_exposes_slug() -> None:
     names = _akb_put_schema_property_names()
     assert "title" in names and "content" in names
     assert "slug" in names, (
-        "akb_put inputSchema must advertise `slug` so a caller can set it AND so "
+        "akb_put input_schema must advertise `slug` so a caller can set it AND so "
         "the schema-derived arg-validator (_TOOL_ARG_NAMES) accepts it."
     )
 

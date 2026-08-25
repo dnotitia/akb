@@ -1,8 +1,8 @@
 // Resilience contract for the proxy's connection lifecycle.
 //
 // Covers the VPN-drop failure mode: the client-visible MCP server must
-// survive backend unreachability. `initialize` is answered locally,
-// `tools/list` degrades gracefully, and a background monitor restores the
+// survive backend unreachability. `server/discover` has a local advertisement
+// fallback, `tools/list` degrades gracefully, and a background monitor restores the
 // full toolset (via tools/list_changed) once connectivity returns — all
 // without killing the proxy process. No real network calls — backend RPCs
 // are stubbed.
@@ -43,83 +43,90 @@ const fileToolNames = [
   "akb_delete_file",
 ];
 
-// ── initialize is answered locally, never blocking on the backend ────
+const modernMeta = (capabilities = {}, clientInfo = { name: "client", version: "1" }) => ({
+  "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+  "io.modelcontextprotocol/clientCapabilities": capabilities,
+  "io.modelcontextprotocol/clientInfo": clientInfo,
+});
 
-itAsync("initialize responds locally even when the backend is down", async () => {
+const modernParams = (params = {}, capabilities = {}) => ({
+  ...params,
+  _meta: modernMeta(capabilities),
+});
+
+// ── server/discover is the stateless advertisement boundary ─────────
+
+itAsync("server/discover responds locally while the backend is down", async () => {
   const proxy = newProxy();
-  proxy._startBackendMonitor = () => {}; // don't spin a real monitor here
-  proxy._ensureBackend = async () => false; // backend unreachable
+  proxy._startBackendMonitor = () => {};
+  proxy._ensureBackend = async () => false;
 
-  const res = await proxy._initialize(1, {
-    protocolVersion: "2025-06-18",
-    capabilities: {},
-    clientInfo: { name: "c", version: "1" },
+  const res = await proxy._handle({
+    jsonrpc: "2.0", id: 1, method: "server/discover",
+    params: modernParams(),
   });
 
-  assert.equal(res.result.protocolVersion, "2025-06-18", "echoes client protocol version");
+  assert.deepEqual(res.result.supportedVersions, ["2026-07-28"]);
   assert.equal(res.result.capabilities.tools.listChanged, true, "advertises listChanged");
-  assert.equal(res.result.serverInfo.name, "akb-mcp");
+  assert.deepEqual(res.result._meta["io.modelcontextprotocol/serverInfo"], {
+    name: "akb-mcp", version: "2.3.0",
+  });
   assert.match(res.result.instructions, /akb_put_image/);
   assert.match(res.result.instructions, /targeted akb_edit/);
   assert.match(res.result.instructions, /replaces the entire document body/);
   assert.match(res.result.instructions, /akb_discard_image/);
-  assert.equal(proxy._initialized, true);
 });
 
-itAsync("initialize falls back to a default protocol version when omitted", async () => {
+itAsync("server/discover forwards modern metadata and adds proxy capability", async () => {
   const proxy = newProxy();
-  proxy._startBackendMonitor = () => {};
-  const res = await proxy._initialize(1, { capabilities: {} });
-  assert.match(res.result.protocolVersion, /^\d{4}-\d{2}-\d{2}$/);
+  proxy._ensureBackend = async () => true;
+  let forwarded;
+  proxy._rpc = async (method, params) => {
+    forwarded = { method, params };
+    return {
+      supportedVersions: ["2026-07-28"],
+      capabilities: { tools: { listChanged: false } },
+      _meta: { "io.modelcontextprotocol/serverInfo": { name: "akb", version: "0.15.0" } },
+    };
+  };
+
+  const res = await proxy._handle({
+    jsonrpc: "2.0", id: 1, method: "server/discover",
+    params: modernParams({}, { roots: { listChanged: true } }),
+  });
+
+  assert.equal(forwarded.method, "server/discover");
+  assert.equal(
+    forwarded.params._meta["io.modelcontextprotocol/protocolVersion"],
+    "2026-07-28",
+  );
+  assert.deepEqual(
+    forwarded.params._meta["io.modelcontextprotocol/clientCapabilities"].roots,
+    { listChanged: true },
+  );
+  const backendMeta = proxy._backendRequestMeta(forwarded.params._meta);
+  assert.deepEqual(
+    backendMeta["io.modelcontextprotocol/clientCapabilities"].experimental[
+      "io.dnotitia.akb/vault-skill-preflight"
+    ],
+    { version: 2 },
+  );
+  assert.equal(res.result.capabilities.tools.listChanged, false);
 });
 
 itAsync("initialize rejects an unsupported protocol version instead of echoing it", async () => {
   const proxy = newProxy();
-  proxy._startBackendMonitor = () => {};
-  const res = await proxy._initialize(1, {
-    protocolVersion: "2099-01-01",
-    capabilities: {},
+  const res = await proxy._handle({
+    jsonrpc: "2.0", id: 1, method: "initialize", params: {
+      protocolVersion: "2099-01-01",
+      capabilities: {},
+    },
   });
 
-  assert.equal(res.error.code, -32602);
-  assert.deepEqual(res.error.data.supported, ["2025-06-18"]);
+  assert.equal(res.error.code, -32022);
+  assert.deepEqual(res.error.data.supported, ["2026-07-28"]);
+  assert.equal(res.error.data.requested, "2099-01-01");
   assert.equal(res.result, undefined);
-  assert.equal(proxy._initialized, false);
-});
-
-itAsync("backend initialize negotiates vault-guide preflight without dropping client capabilities", async () => {
-  const proxy = newProxy();
-  const original = {
-    protocolVersion: "2025-06-18",
-    capabilities: {
-      roots: { listChanged: true },
-      experimental: { "example.test/feature": { version: 2 } },
-    },
-    clientInfo: { name: "client", version: "1" },
-  };
-  proxy._clientInitParams = original;
-  let forwarded;
-  proxy._rpc = async (method, params) => {
-    assert.equal(method, "initialize");
-    forwarded = params;
-    return {};
-  };
-
-  assert.equal(await proxy._ensureBackend(), true);
-  assert.deepEqual(forwarded.capabilities.roots, { listChanged: true });
-  assert.deepEqual(
-    forwarded.capabilities.experimental["example.test/feature"],
-    { version: 2 },
-  );
-  assert.deepEqual(
-    forwarded.capabilities.experimental["io.dnotitia.akb/vault-skill-preflight"],
-    { version: 2 },
-  );
-  assert.equal(
-    original.capabilities.experimental["io.dnotitia.akb/vault-skill-preflight"],
-    undefined,
-    "client initialize params are not mutated",
-  );
 });
 
 // ── tools/list degrades to file tools when the backend is unreachable ─
@@ -234,7 +241,9 @@ itAsync("vault-guide acknowledgement is attached only to the exact backend retry
     arguments: { content: "new", uri: "akb://v1/doc/a.md" },
   };
 
-  await proxy._handle({ jsonrpc: "2.0", id: 1, method: "tools/call", params });
+  await proxy._handle({
+    jsonrpc: "2.0", id: 1, method: "tools/call", params: modernParams(params),
+  });
   await proxy._handle({
     jsonrpc: "2.0",
     id: 2,
@@ -243,6 +252,7 @@ itAsync("vault-guide acknowledgement is attached only to the exact backend retry
     params: {
       name: "akb_update",
       arguments: { uri: "akb://v1/doc/a.md", content: "new" },
+      _meta: modernMeta(),
     },
   });
 
@@ -272,11 +282,11 @@ itAsync("vault-guide acknowledgement never authorizes an unrelated queued write"
 
   await proxy._handle({
     jsonrpc: "2.0", id: 1, method: "tools/call",
-    params: { name: "akb_put", arguments: { vault: "v1", title: "A", content: "a" } },
+    params: modernParams({ name: "akb_put", arguments: { vault: "v1", title: "A", content: "a" } }),
   });
   await proxy._handle({
     jsonrpc: "2.0", id: 2, method: "tools/call",
-    params: { name: "akb_put", arguments: { vault: "v1", title: "B", content: "b" } },
+    params: modernParams({ name: "akb_put", arguments: { vault: "v1", title: "B", content: "b" } }),
   });
 
   assert.equal(forwarded[1].params.arguments._vault_skill_ack, undefined);
@@ -304,6 +314,26 @@ itAsync("_forward retries a connection error then surfaces it (process survives)
   assert.equal(proxy._backendReady, false, "marks backend not-ready");
   assert.ok(restarts >= 1, "kicks the reconnect monitor");
   assert.ok(calls >= 3, "attempted the initial call plus retries");
+});
+
+itAsync("_forward preserves backend protocol errors instead of treating them as outages", async () => {
+  const proxy = newProxy();
+  proxy._backendReady = true;
+  proxy._startBackendMonitor = () => { throw new Error("protocol errors must not reconnect"); };
+  proxy._rpc = async () => {
+    const error = new Error("HTTP 400: Unsupported protocol version");
+    error.statusCode = 400;
+    error.rpcError = {
+      code: -32022,
+      message: "Unsupported protocol version",
+      data: { supported: ["2026-07-28"], requested: "2025-11-25" },
+    };
+    throw error;
+  };
+
+  const result = await proxy._forward({ method: "tools/list", id: 8, params: {} });
+  assert.equal(result.error.code, -32022);
+  assert.equal(proxy._backendReady, true);
 });
 
 itAsync("_forward recovers on a later attempt once the backend returns", async () => {

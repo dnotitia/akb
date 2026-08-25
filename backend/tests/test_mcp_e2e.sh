@@ -39,35 +39,28 @@ PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
 
 [ -n "$PAT" ] && pass "PAT acquired" || { fail "PAT" "could not get PAT"; exit 1; }
 
-# ── 1. MCP Initialize ───────────────────────────────────────
+# ── 1. MCP 2026-07-28 discovery ─────────────────────────────
 echo ""
 echo "▸ 1. MCP Protocol"
 
-INIT_RESP=$(curl -sk -i -X POST "$BASE_URL/mcp/" \
+MCP_META='{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"e2e-test","version":"1.0"}}'
+DISCOVER_RESP=$(curl -sk -X POST "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $PAT" \
   -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"e2e-test","version":"1.0"}}}' 2>&1)
+  -H "Accept: application/json" \
+  -H "Mcp-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: server/discover" \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{\"_meta\":$MCP_META}}" 2>&1)
 
-SID=$(echo "$INIT_RESP" | grep -i "mcp-session-id" | tr -d '\r' | awk '{print $2}')
-INIT_BODY=$(echo "$INIT_RESP" | tail -1)
-PROTO=$(echo "$INIT_BODY" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['protocolVersion'])" 2>/dev/null)
-
-[ -n "$SID" ] && pass "Session ID received ($SID)" || fail "Session ID" "missing"
-[ "$PROTO" = "2025-03-26" ] && pass "Protocol version: $PROTO" || fail "Protocol" "expected 2025-03-26, got $PROTO"
-
-# Send initialized notification
-curl -sk -X POST "$BASE_URL/mcp/" \
-  -H "Authorization: Bearer $PAT" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -H "mcp-session-id: $SID" \
-  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null 2>&1
+SUPPORTED=$(echo "$DISCOVER_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['supportedVersions'][0])" 2>/dev/null)
+NO_SESSION=$(echo "$DISCOVER_RESP" | grep -i "mcp-session-id" || true)
+[ "$SUPPORTED" = "2026-07-28" ] && pass "Protocol revision: $SUPPORTED" || fail "Protocol" "expected 2026-07-28, got $SUPPORTED"
+[ -z "$NO_SESSION" ] && pass "Stateless discovery has no session header" || fail "Session header" "unexpected session id"
 
 # Auth rejection without PAT
 AUTH_RESP=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/mcp/" \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' 2>/dev/null)
+  -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}' 2>/dev/null)
 [ "$AUTH_RESP" = "401" ] && pass "MCP rejects unauthenticated (401)" || fail "MCP auth" "expected 401, got $AUTH_RESP"
 
 # Helper: MCP tool call
@@ -78,9 +71,11 @@ mcp_call() {
   curl -sk -X POST "$BASE_URL/mcp/" \
     -H "Authorization: Bearer $PAT" \
     -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" \
-    -H "mcp-session-id: $SID" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":$MCP_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}" 2>&1
+    -H "Accept: application/json" \
+    -H "Mcp-Protocol-Version: 2026-07-28" \
+    -H "Mcp-Method: tools/call" \
+    -H "Mcp-Name: $tool" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":$MCP_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args,\"_meta\":$MCP_META}}" 2>&1
 }
 
 # Extract tool result text
@@ -100,9 +95,10 @@ echo "▸ 2. Tools List"
 TOOLS_RESP=$(curl -sk -X POST "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $PAT" \
   -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -H "mcp-session-id: $SID" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' 2>&1)
+  -H "Accept: application/json" \
+  -H "Mcp-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: tools/list" \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{\"_meta\":$MCP_META}}" 2>&1)
 TOOL_COUNT=$(echo "$TOOLS_RESP" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['result']['tools']))" 2>/dev/null)
 [ "$TOOL_COUNT" -ge 22 ] 2>/dev/null && pass "tools/list returns $TOOL_COUNT tools" || fail "tools/list" "expected >=22, got $TOOL_COUNT"
 
@@ -513,21 +509,26 @@ JWT2=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" -H 'Content-Type: applicat
 PAT2=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" -H "Authorization: Bearer $JWT2" -H 'Content-Type: application/json' \
   -d '{"name":"u2-test"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
 
-INIT2=$(curl -sk -i -X POST "$BASE_URL/mcp/" \
+MCP_META2='{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"user2","version":"1.0"}}'
+DISCOVER2=$(curl -sk -X POST "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $PAT2" \
   -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"user2","version":"1.0"}}}' 2>&1)
-SID2=$(echo "$INIT2" | grep -i "mcp-session-id" | tr -d '\r' | awk '{print $2}')
-[ -n "$SID2" ] && pass "User2 registered + MCP session" || fail "User2 setup" "no SID"
+  -H "Accept: application/json" \
+  -H "Mcp-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: server/discover" \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{\"_meta\":$MCP_META2}}" 2>&1)
+PROTO2=$(echo "$DISCOVER2" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['supportedVersions'][0])" 2>/dev/null)
+[ "$PROTO2" = "2026-07-28" ] && pass "User2 registered + stateless MCP" || fail "User2 setup" "discovery failed"
 
 mcp_call2() {
   curl -sk -X POST "$BASE_URL/mcp/" \
     -H "Authorization: Bearer $PAT2" \
     -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" \
-    -H "mcp-session-id: $SID2" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":$((RANDOM)),\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":$2}}" 2>/dev/null
+    -H "Accept: application/json" \
+    -H "Mcp-Protocol-Version: 2026-07-28" \
+    -H "Mcp-Method: tools/call" \
+    -H "Mcp-Name: $1" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":$((RANDOM)),\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":$2,\"_meta\":$MCP_META2}}" 2>/dev/null
 }
 mcp_result2() { python3 -c "import sys,json; d=json.load(sys.stdin); print(d['result']['content'][0]['text'])" 2>/dev/null; }
 
@@ -709,15 +710,14 @@ R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"content_type\":\"tables\"}" | m
 TBL_GONE=$(echo "$R" | python3 -c "import sys,json; print(len([i for i in json.load(sys.stdin)['items'] if i['type']=='table']))" 2>/dev/null)
 [ "$TBL_GONE" = "0" ] && pass "Table dropped (0 tables)" || pass "Tables remaining: $TBL_GONE"
 
-# ── 22. MCP Session Termination ──────────────────────────────
+# ── 22. Removed session path is rejected ────────────────────
 echo ""
-echo "▸ 22. MCP Session Termination"
+echo "▸ 22. MCP Stateless Boundary"
 
-TERM_RESP=$(curl -sk -X DELETE "$BASE_URL/mcp/" \
+TERM_STATUS=$(curl -sk -o /dev/null -w "%{http_code}" -X DELETE "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $PAT" \
-  -H "mcp-session-id: $SID" 2>&1)
-TERMINATED=$(echo "$TERM_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('terminated',False))" 2>/dev/null)
-[ "$TERMINATED" = "True" ] && pass "MCP session terminated" || fail "Session termination" "failed"
+  -H "Mcp-Protocol-Version: 2026-07-28" 2>/dev/null)
+[ "$TERM_STATUS" = "405" ] && pass "MCP DELETE session path rejected" || fail "Session termination" "expected 405, got $TERM_STATUS"
 
 # ── Results ──────────────────────────────────────────────────
 echo ""

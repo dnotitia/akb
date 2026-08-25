@@ -11,6 +11,7 @@
 set -uo pipefail
 
 BASE_URL="${AKB_URL:-http://localhost:8000}"
+source "$(dirname "$0")/mcp_modern.sh"
 SUF="$(date +%s)-$$"
 VAULT="uk-e2e-$SUF"
 USER="uk-user-$SUF"
@@ -36,20 +37,14 @@ register_pat() {  # $1=username → echoes PAT
     | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])' 2>/dev/null
 }
 
-mcp_session() {  # $1=PAT → echoes SID
-  curl -sk -i -X POST "$BASE_URL/mcp/" -H "Authorization: Bearer $1" \
-    -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
-    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"e2e","version":"1.0"}}}' 2>&1 \
-    | grep -i "mcp-session-id" | tr -d '\r' | awk '{print $2}'
+mcp_session() {  # $1=PAT → stateless discovery marker
+  mcp_modern_discover "$1" e2e >/dev/null && echo modern
 }
 
 MCP_ID=10
 mcp() {  # $1=PAT $2=SID $3=tool $4=args-json → echoes result text (content[0].text)
   MCP_ID=$((MCP_ID+1))
-  curl -sk -X POST "$BASE_URL/mcp/" -H "Authorization: Bearer $1" \
-    -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
-    -H "mcp-session-id: $2" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":$MCP_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"$3\",\"arguments\":$4}}" 2>&1 \
+  mcp_modern_call "$1" "$3" "$4" "$MCP_ID" e2e \
     | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['result']['content'][0]['text'])" 2>/dev/null
 }
 field() { python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d$1)" 2>/dev/null; }
@@ -68,9 +63,6 @@ PAT=$(register_pat "$USER")
 [ -n "$PAT" ] && pass "PAT acquired" || { fail "setup" "no PAT"; exit 1; }
 SID=$(mcp_session "$PAT")
 [ -n "$SID" ] && pass "MCP session" || { fail "setup" "no session"; exit 1; }
-curl -sk -X POST "$BASE_URL/mcp/" -H "Authorization: Bearer $PAT" -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" -H "mcp-session-id: $SID" \
-  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null 2>&1
 R=$(mcp "$PAT" "$SID" akb_create_vault "{\"name\":\"$VAULT\",\"description\":\"#215 e2e\"}")
 echo "$R" | field "['name']" | grep -q "$VAULT" && pass "vault created" || fail "create_vault" "$R"
 
@@ -132,9 +124,6 @@ CODE=$(echo "$R" | field "['code']")
 # ── permission: non-admin (reader) cannot alter_table
 PAT2=$(register_pat "$USER2")
 SID2=$(mcp_session "$PAT2")
-curl -sk -X POST "$BASE_URL/mcp/" -H "Authorization: Bearer $PAT2" -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" -H "mcp-session-id: $SID2" \
-  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null 2>&1
 mcp "$PAT" "$SID" akb_grant "{\"vault\":\"$VAULT\",\"user\":\"$USER2\",\"role\":\"reader\"}" >/dev/null
 R=$(mcp "$PAT2" "$SID2" akb_alter_table "{\"uri\":\"akb://$VAULT/table/events\",\"add_indexes\":[{\"columns\":[\"principal_id\"]}]}")
 # admin gate fires BEFORE any DDL (check_vault_access). Assert the alter was

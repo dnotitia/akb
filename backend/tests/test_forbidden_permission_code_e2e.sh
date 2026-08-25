@@ -10,6 +10,7 @@
 #
 set -uo pipefail
 BASE_URL="${AKB_URL:-http://localhost:8000}"
+source "$(dirname "$0")/mcp_modern.sh"
 SUF="$(date +%s)-$$"
 VAULT="fb-e2e-$SUF"; ADMIN="fb-admin-$SUF"; READER="fb-reader-$SUF"
 PASS=0; FAIL=0; ERRORS=()
@@ -29,22 +30,15 @@ register_pat() {
     | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])' 2>/dev/null
 }
 mcp_session() {
-  curl -sk -i -X POST "$BASE_URL/mcp/" -H "Authorization: Bearer $1" \
-    -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
-    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"e2e","version":"1.0"}}}' 2>&1 \
-    | grep -i "mcp-session-id" | tr -d '\r' | awk '{print $2}'
+  mcp_modern_discover "$1" e2e >/dev/null && echo modern
 }
 init_notify() {
-  curl -sk -X POST "$BASE_URL/mcp/" -H "Authorization: Bearer $1" -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" -H "mcp-session-id: $2" \
-    -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null 2>&1
+  :
 }
 MCP_ID=10
 mcp() {
   MCP_ID=$((MCP_ID+1))
-  curl -sk -X POST "$BASE_URL/mcp/" -H "Authorization: Bearer $1" -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" -H "mcp-session-id: $2" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":$MCP_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"$3\",\"arguments\":$4}}" 2>&1 \
+  mcp_modern_call "$1" "$3" "$4" "$MCP_ID" e2e \
     | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['result']['content'][0]['text'])" 2>/dev/null
 }
 field() { python3 -c "import sys,json; print(json.loads(sys.stdin.read())$1)" 2>/dev/null; }
