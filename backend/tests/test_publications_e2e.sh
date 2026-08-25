@@ -1022,9 +1022,6 @@ DELV=$(mcp 99 akb_delete_vault "{\"vault\":\"$VAULT\"}" | mcp_text)
 DELOK=$(echo "$DELV" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("deleted"))' 2>/dev/null)
 [ "$DELOK" = "True" ] && pass "Cleanup: test vault deleted" || fail "Cleanup vault delete" "$DELV"
 
-# Terminate MCP session
-curl -sk -X DELETE "$BASE_URL/mcp/" -H "Authorization: Bearer $MCP_PAT" -H "Mcp-Session-Id: $SESS" >/dev/null 2>&1
-
 echo ""
 echo "╔══════════════════════════════════════════╗"
 printf "║   Results: %d passed, %d failed%s║\n" "$PASS" "$FAIL" "$(printf '%*s' $((22-${#PASS}-${#FAIL})) '')"
