@@ -21,6 +21,7 @@ from app.services.native_revision_backfill import (
     NativeRevisionBackfill,
 )
 from app.repositories.native_revision_migration_repo import NativeRevisionMigrationRepository
+from app.repositories.native_revision_repo import NativeRevisionRepository
 from app.services.native_revision_reconcile import (
     NativeRevisionReconcile,
     ReconcileIntegrityError,
@@ -36,6 +37,30 @@ _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:5433/akb",  # pragma: allowlist secret
 )
+
+# Revisions of one Resource are a parent chain, and the chain is the order.
+# ``occurred_at`` is not: reconcile copies it from the legacy Git commit, Git
+# commit times are whole seconds, and a fixture that commits twice inside one
+# second gives both Revisions the *same* instant.  Sorting on
+# ``occurred_at, revision_id`` then let the 40-hex content address decide, which
+# is why this file's move assertion flipped on an unchanged tree (akb#399).
+_LINEAGE_ORDERED_REVISIONS = """
+    WITH RECURSIVE lineage AS (
+        SELECT revision_id, parent_revision_id, 0 AS depth
+          FROM native_revisions
+         WHERE resource_id = $1 AND parent_revision_id IS NULL
+        UNION ALL
+        SELECT child.revision_id, child.parent_revision_id, parent.depth + 1
+          FROM native_revisions child
+          JOIN lineage parent ON child.parent_revision_id = parent.revision_id
+         WHERE child.resource_id = $1
+    )
+    SELECT r.revision_id, r.parent_revision_id, r.action, r.path_from, r.path_to
+      FROM native_revisions r
+      JOIN lineage l ON l.revision_id = r.revision_id
+     WHERE r.resource_id = $1
+     ORDER BY l.depth
+"""
 
 
 async def _reachable() -> bool:
@@ -63,6 +88,11 @@ def _load(filename: str):
 @asynccontextmanager
 async def _fresh_schema(tmp_path: Path):
     if not await _reachable():
+        # The DB-free unit job has nothing on the default DSN, so skipping there
+        # is correct. On the live-PG gate it is not: a skip and a pass read the
+        # same, and every assertion in this file is about what PostgreSQL stores.
+        if os.environ.get("REQUIRE_REAL_PG") == "1":
+            pytest.fail(f"the real-PG gate requires a reachable Postgres at {_DSN}")
         pytest.skip(f"Postgres not reachable at {_DSN}")
 
     name = f"akb_c9_reconcile_{uuid.uuid4().hex[:12]}"
@@ -413,12 +443,7 @@ async def test_update_then_final_move_collapses_to_one_move_and_binds_suffix(tmp
         assert result.items[0].action == "move"
         async with pool.acquire() as conn:
             revisions = await conn.fetch(
-                """
-                SELECT revision_id, parent_revision_id, action, path_from, path_to
-                  FROM native_revisions
-                 WHERE resource_id = $1
-                 ORDER BY occurred_at, revision_id
-                """,
+                _LINEAGE_ORDERED_REVISIONS,
                 fixture["document_id"],
             )
             mappings = await conn.fetch(
@@ -452,6 +477,78 @@ async def test_update_then_final_move_collapses_to_one_move_and_binds_suffix(tmp
         assert mappings[-1]["native_revision_id"] == revisions[-1]["revision_id"]
         assert alias["old_path"] == "doc.md"
         assert alias["created_revision_id"] == revisions[-1]["revision_id"]
+
+
+async def _reconciled_head_and_history(pool, tmp_path, monkeypatch, *, make_at: str, advance_at: str):
+    """Build the reconcile fixture with the legacy clock pinned.
+
+    ``GIT_AUTHOR_DATE``/``GIT_COMMITTER_DATE`` are what a legacy vault's commit
+    times actually are to us — reconcile copies them into ``occurred_at``
+    verbatim — so pinning them here builds the real state through the real
+    writer instead of forging rows the immutability trigger rightly refuses.
+    """
+    for name in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"):
+        monkeypatch.setenv(name, make_at)
+    fixture = await _make_fixture(pool, tmp_path)
+    for name in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"):
+        monkeypatch.setenv(name, advance_at)
+    fixture = await _advance_fixture(fixture, move=True)
+
+    service = NativeRevisionReconcile(pool, git=fixture["git"], bridge=fixture["bridge"])
+    await service.reconcile(
+        namespace_id=fixture["namespace_id"],
+        fixed_ref=fixture["fixed_r2"],
+    )
+    resource_id = fixture["document_id"]
+    async with pool.acquire() as conn:
+        head_revision_id = await conn.fetchval(
+            "SELECT head_revision_id FROM native_resources WHERE resource_id = $1",
+            resource_id,
+        )
+        instants = await conn.fetchval(
+            "SELECT count(DISTINCT occurred_at) FROM native_revisions WHERE resource_id = $1",
+            resource_id,
+        )
+    history = await NativeRevisionRepository(pool).list_history(resource_id=resource_id)
+    return head_revision_id, instants, history
+
+
+def _assert_history_is_the_chain(head_revision_id, history):
+    assert [row["action"] for row in history] == ["move", "create"]
+    assert history[0]["revision_id"] == head_revision_id
+    assert history[1]["revision_id"] == history[0]["parent_revision_id"]
+
+
+async def test_history_is_the_chain_when_two_revisions_share_one_second(tmp_path, monkeypatch):
+    """Git commit times are whole seconds, so one instant can hold both Revisions.
+
+    The fixture already reaches this state on roughly 4 runs in 10 by committing
+    twice inside the same second; pinning the legacy clock makes it every run.
+    ``occurred_at`` then carries no order, and whatever breaks the tie decides
+    what the caller is told is newest.
+
+    Sorting on ``revision_id`` gets that right half the time by luck, so the
+    loop below keeps building fixtures until it has the half it gets wrong — a
+    head whose content address sorts *below* its own parent's.  Asserting
+    against a case that only shows up on a coin flip is how this file came to
+    have a test that flipped on an unchanged tree (akb#399).
+    """
+    async with _fresh_schema(tmp_path) as pool:
+        instant = "2026-01-02T03:04:05+00:00"
+        for _ in range(24):
+            head_revision_id, instants, history = await _reconciled_head_and_history(
+                pool, tmp_path, monkeypatch, make_at=instant, advance_at=instant
+            )
+            assert instants == 1, "the pinned legacy clock did not collapse to one instant"
+            parent_revision_id = next(
+                row["revision_id"] for row in history if row["revision_id"] != head_revision_id
+            )
+            if head_revision_id < parent_revision_id:
+                break
+        else:
+            pytest.fail("could not build a head whose content address sorts below its parent's")
+
+        _assert_history_is_the_chain(head_revision_id, history)
 
 
 async def test_move_then_update_collapses_to_move_and_resolves_suffix_mappings(tmp_path):

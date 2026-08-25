@@ -708,15 +708,50 @@ class NativeRevisionRepository:
         limit: int = 100,
         conn: asyncpg.Connection | None = None,
     ) -> list[dict]:
+        """Return the head's lineage, newest first.
+
+        A Resource's history is a parent chain, not a timestamp sort.
+        ``occurred_at`` cannot stand in for that order: the reconcile path
+        copies it from the legacy Git commit, and Git commit times are whole
+        seconds, so two Revisions of one Resource routinely carry the *same*
+        instant.  Ordering by ``occurred_at DESC, revision_id DESC`` then
+        decided the tie on ``revision_id`` — a content address with no
+        chronology in it — and returned the ``create`` as the newest event
+        ahead of the ``move`` that descends from it, on 4 of 10 runs of the
+        same fixture (akb#399).
+
+        Walking up from ``native_resources.head_revision_id`` is causal by
+        construction: a Revision can never precede its own parent, and each
+        step is a primary-key lookup bounded by ``limit``, so the walk reads
+        exactly as many rows as it returns.
+
+        This is the head's lineage specifically.  A Revision that is not
+        reachable from the current head is not part of how this Resource got
+        to its current state, and is not history.
+        """
         sql = """
-            SELECT revision_id, resource_id, parent_revision_id, action,
-                   path_at_revision AS path, path_from, path_to,
-                   payload_manifest_id, message, subject, summary, actor,
-                   occurred_at
-              FROM native_revisions
-             WHERE resource_id = $1
-             ORDER BY occurred_at DESC, revision_id DESC
-             LIMIT $2
+            WITH RECURSIVE lineage AS (
+                SELECT head.revision_id, head.parent_revision_id, 0 AS distance
+                  FROM native_revisions head
+                  JOIN native_resources resource
+                    ON resource.resource_id = head.resource_id
+                   AND resource.head_revision_id = head.revision_id
+                 WHERE head.resource_id = $1
+                UNION ALL
+                SELECT parent.revision_id, parent.parent_revision_id, child.distance + 1
+                  FROM native_revisions parent
+                  JOIN lineage child ON parent.revision_id = child.parent_revision_id
+                 WHERE parent.resource_id = $1
+                   AND child.distance + 1 < $2
+            )
+            SELECT r.revision_id, r.resource_id, r.parent_revision_id, r.action,
+                   r.path_at_revision AS path, r.path_from, r.path_to,
+                   r.payload_manifest_id, r.message, r.subject, r.summary, r.actor,
+                   r.occurred_at
+              FROM native_revisions r
+              JOIN lineage l ON l.revision_id = r.revision_id
+             WHERE r.resource_id = $1
+             ORDER BY l.distance
         """
         if conn is not None:
             rows = await conn.fetch(sql, resource_id, limit)
