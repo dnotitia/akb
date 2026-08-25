@@ -88,6 +88,11 @@ def _load(filename: str):
 @asynccontextmanager
 async def _fresh_schema(tmp_path: Path):
     if not await _reachable():
+        # The DB-free unit job has nothing on the default DSN, so skipping there
+        # is correct. On the live-PG gate it is not: a skip and a pass read the
+        # same, and every assertion in this file is about what PostgreSQL stores.
+        if os.environ.get("REQUIRE_REAL_PG") == "1":
+            pytest.fail(f"the real-PG gate requires a reachable Postgres at {_DSN}")
         pytest.skip(f"Postgres not reachable at {_DSN}")
 
     name = f"akb_c9_reconcile_{uuid.uuid4().hex[:12]}"

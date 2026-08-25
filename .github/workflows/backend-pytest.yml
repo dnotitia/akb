@@ -210,6 +210,7 @@ jobs:
           tests/test_migration_058_publication_identity_unit.py
           tests/test_index_order_unit.py
           tests/concurrency/test_alter_unique_race_unit.py
+          tests/test_native_revision_reconcile_pg.py
           tests/concurrency/test_native_ledger_b_core.py
           tests/concurrency/test_native_derived_pipeline.py
           tests/test_m1_file_measurement_pg.py
