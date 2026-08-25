@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import json
 import re
+import subprocess
 from pathlib import Path
 
 import httpx
@@ -31,6 +32,35 @@ def test_protocol_and_release_metadata_are_aligned():
     assert registry["version"] == package["version"]
     assert registry["packages"][0]["version"] == package["version"]
     assert f'const PROXY_VERSION = "{package["version"]}";' in proxy_source
+
+
+def test_modern_shell_helper_keeps_empty_params_as_one_json_object():
+    root = Path(__file__).resolve().parents[2]
+    script = r'''
+set -euo pipefail
+BASE_URL=http://example.test
+source backend/tests/mcp_modern.sh
+curl() {
+  local previous=""
+  for arg in "$@"; do
+    if [ "$previous" = "-d" ]; then
+      printf '%s\n' "$arg"
+      return 0
+    fi
+    previous="$arg"
+  done
+}
+mcp_modern_discover test-pat helper-test
+'''
+    completed = subprocess.run(
+        ["bash", "-c", script],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(completed.stdout)
+    assert payload["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
 
 
 class _User:

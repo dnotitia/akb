@@ -10,7 +10,10 @@ mcp_modern_request() {
   local pat=$1
   local request_id=$2
   local method=$3
-  local params_json=${4:-{}}
+  local params_json="${4-}"
+  if [ -z "$params_json" ]; then
+    params_json='{}'
+  fi
   local name=${5:-}
   local client_name=${6:-mcp-e2e}
   local body
