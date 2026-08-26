@@ -63,6 +63,24 @@ const stagedSsoConfig = {
   mcp_oauth: { enabled: false },
 };
 
+const legacyHybridConfig = {
+  available: true,
+  schema_version: 1 as const,
+  auth_mode: "hybrid" as const,
+  local_auth: { enabled: true },
+  keycloak: {
+    enabled: true,
+    browser_session_ready: false,
+  },
+  providers: [{
+    provider_type: "legacy-keycloak-oidc",
+    alias: "legacy-keycloak",
+    display_name: "SSO",
+    login_url: "/api/v1/auth/keycloak/login",
+  }],
+  mcp_oauth: { enabled: true },
+};
+
 function renderAuth() {
   return render(
     <MemoryRouter>
@@ -92,6 +110,18 @@ describe("AuthPage mode gate", () => {
     expect(screen.getByRole("tab", { name: /Register/i })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: /Forgot password/i })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /SSO/i })).toBeNull();
+  });
+
+  it("renders local and Keycloak choices together for the adapted legacy contract", async () => {
+    vi.mocked(getAuthConfig).mockResolvedValue(legacyHybridConfig);
+
+    renderAuth();
+
+    expect(await screen.findByLabelText(/Username/i)).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /Register/i })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /^Sign in with SSO$/i }),
+    ).toBeInTheDocument();
   });
 
   it("renders no local or unusable SSO controls while browser custody is staged", async () => {

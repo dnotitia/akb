@@ -23,6 +23,7 @@ import { authLogin, authRegister, getMe, getToken, setToken } from "@/lib/api";
 vi.mock("@/lib/api", () => ({
   authLogin: vi.fn(),
   authRegister: vi.fn(),
+  clearLegacySsoSession: vi.fn(),
   setToken: vi.fn(),
   // null → not signed in, so AuthPage's authed-guard doesn't redirect on mount.
   getToken: vi.fn(() => null),

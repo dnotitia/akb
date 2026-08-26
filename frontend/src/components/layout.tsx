@@ -56,7 +56,8 @@ export function Layout() {
       if (
         config.available !== true ||
         config.auth_mode === null ||
-        (config.auth_mode === "local" && !getToken())
+        ((config.auth_mode === "local" || config.auth_mode === "hybrid") &&
+          !getToken())
       ) {
         if (!cancelled) setSession({ status: "unauthenticated", user: null });
         return;
