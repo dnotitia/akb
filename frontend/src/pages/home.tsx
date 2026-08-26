@@ -371,7 +371,7 @@ export default function HomePage() {
   // Vaults and change history close; the rail only carries setup and compact
   // workspace context that is not repeated in the ledgers.
   return (
-    <div className="fade-up w-full space-y-6">
+    <div className="fade-up w-full space-y-8">
       <HomeWorkspaceHeader
         vaultCount={vaults.length}
         loading={vaultsLoading}
@@ -380,7 +380,7 @@ export default function HomePage() {
         indexingAbandoned={indexingAbandoned}
       />
 
-      <div className="grid grid-cols-1 items-start gap-5 2xl:grid-cols-[minmax(0,1fr)_320px]">
+      <div className="grid grid-cols-1 items-start gap-x-8 gap-y-8 2xl:grid-cols-[minmax(0,1fr)_320px]">
         {continueWorking.length > 0 && (
           <div className="order-2 min-w-0 2xl:col-start-1 2xl:row-start-1">
             <ContinueWorkingSection items={continueWorking} />
@@ -419,7 +419,7 @@ export default function HomePage() {
           </span>
 
           {vaultsLoading ? (
-            <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4" aria-hidden>
+            <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4" aria-hidden>
               {Array.from({ length: 4 }).map((_, index) => (
                 <Panel key={index} className="min-h-32 p-3">
                   <span className="block h-4 w-24 animate-pulse rounded bg-surface-muted" />
@@ -458,7 +458,7 @@ export default function HomePage() {
               }
             />
           ) : (
-            <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4 stagger">
+            <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4 stagger">
               {previewVaults.map((vault) => (
                 <HomeVaultCard
                   key={vault.id}
@@ -473,7 +473,7 @@ export default function HomePage() {
         </section>
 
         <aside
-          className={`order-3 space-y-4 2xl:col-start-2 2xl:row-start-1 ${
+          className={`order-3 space-y-5 2xl:col-start-2 2xl:row-start-1 ${
             continueWorking.length > 0 ? "2xl:row-span-3" : "2xl:row-span-2"
           }`}
           aria-label="Workspace setup and summary"
@@ -553,7 +553,7 @@ export default function HomePage() {
         </span>
 
         {recentLoading ? (
-          <Panel className="mt-3" aria-hidden>
+          <Panel className="mt-4" aria-hidden>
             <ul className="divide-y divide-border">
               {Array.from({ length: 4 }).map((_, i) => (
                 <li key={i} className="grid grid-cols-[36px_minmax(0,1fr)_56px] items-center gap-3 px-4 py-3.5">
@@ -589,7 +589,7 @@ export default function HomePage() {
             description="Document changes across your Vaults will appear here."
           />
         ) : (
-          <Panel className="mt-3">
+          <Panel className="mt-4">
             <ol className="divide-y divide-border stagger">
               {recent.map((change) => {
                 const Icon = recentIcon(change.type);
@@ -713,7 +713,7 @@ function ContinueWorkingSection({ items }: { items: RecentDocumentView[] }) {
         <span className="text-xs text-foreground-muted">Recent on this browser</span>
       </header>
 
-      <ul className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+      <ul className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
         {items.map((item) => (
           <li key={`${item.vault}:${item.path}`} className="min-w-0">
             <Panel className="h-full">

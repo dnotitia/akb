@@ -264,6 +264,11 @@ an `sr-only` summary, never the only signal.
   It opens with a cardless masthead anchored by a
   neutral hairline: one `brand-gradient` word in the title, a plain-language
   description, and labelled Vault/index facts rather than floating badges. A
+  32px dashboard gutter separates the primary ledger from its context rail and
+  carries through the vertical section rhythm; section anchors keep 16px before
+  their first bounded content surface so neighbouring information does not read
+  as one continuous block.
+  A
   browser-local, user-scoped Continue working strip appears only when real
   document views exist. It sits at the top of the primary work column rather
   than spanning the dashboard, and follows the same title, underline, and card
