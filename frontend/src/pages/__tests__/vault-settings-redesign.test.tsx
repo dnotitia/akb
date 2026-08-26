@@ -83,7 +83,7 @@ describe("Vault Settings redesign", () => {
     for (const title of ["General", "Access", "Vault guide"]) {
       const header = screen
         .getByRole("heading", { name: title })
-        .closest('[data-slot="settings-section-header"]');
+        .closest('[data-slot="workspace-section-header"]');
       expect(header).toHaveClass("border-border", "pb-3");
       expect(header).not.toHaveClass("bg-surface-2/55");
       expect(header?.nextElementSibling).toHaveClass("border-border-strong");

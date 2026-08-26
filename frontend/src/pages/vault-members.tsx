@@ -36,6 +36,7 @@ import { RoleSelect } from "@/components/role-select";
 import { RoleBadge } from "@/components/status-badge";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { TonalIcon } from "@/components/ui/tonal-icon";
+import { WorkspaceSectionHeader } from "@/components/ui/workspace-section-header";
 import { ROLE_ICONS, type Role } from "@/lib/roles";
 import { timeAgo } from "@/lib/utils";
 
@@ -219,11 +220,40 @@ export default function VaultMembersPage() {
           Members
         </h1>
 
+        <WorkspaceSectionHeader
+          id="direct-access-heading"
+          icon={UsersRound}
+          title="Direct access"
+          description={members === null ? "Loading roster…" : policy.summary}
+          tone="people"
+          testId="member-roster-header"
+          className="mx-3 mt-3 sm:mx-4 lg:mx-5 xl:mx-0 xl:mt-0"
+          right={
+            <>
+              {members && (
+                <Badge variant="default">
+                  {total} member{total === 1 ? "" : "s"}
+                </Badge>
+              )}
+              {canManage && (
+                <Button
+                  variant="accent"
+                  size="sm"
+                  onClick={() => setInviteOpen(true)}
+                >
+                  <Plus className="h-3.5 w-3.5" aria-hidden />
+                  Invite member
+                </Button>
+              )}
+            </>
+          }
+        />
+
         <div
           data-testid="members-workspace-frame"
           className="grid min-h-0 flex-1 xl:grid-cols-[minmax(0,1fr)_20rem] xl:overflow-hidden xl:rounded-[var(--radius-md)] xl:border xl:border-border 2xl:grid-cols-[minmax(0,1fr)_22rem]"
         >
-          <main className="rail-scroll rail-scroll-auto min-w-0 p-3 sm:p-4 lg:p-5 xl:overflow-y-auto xl:p-0">
+          <main className="rail-scroll rail-scroll-auto min-w-0 px-3 pb-3 sm:px-4 sm:pb-4 lg:px-5 lg:pb-5 xl:overflow-y-auto xl:p-0">
             {info?.role_source === "public" && (
               <Alert
                 variant="info"
@@ -285,57 +315,30 @@ export default function VaultMembersPage() {
               inset={false}
               className="xl:rounded-none xl:border-x-0 xl:border-t-0 xl:shadow-none"
             >
-              <div
-                data-testid="member-roster-header"
-                className="flex min-h-14 flex-wrap items-center gap-3 border-b border-border-strong bg-surface-2/55 px-4 py-2.5 lg:px-5"
-              >
-                <TonalIcon tone="people" size="sm">
-                  <UsersRound aria-hidden />
-                </TonalIcon>
-                <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-foreground-muted">
-                  <h2 className="text-sm font-semibold text-foreground">
-                    Direct access
-                  </h2>
-                  {members && (
-                    <Badge variant="default">
-                      {total} member{total === 1 ? "" : "s"}
-                    </Badge>
-                  )}
-                  <span aria-hidden>·</span>
-                  <span>
-                    {members === null ? "Loading roster…" : policy.summary}
-                  </span>
+              {total > FILTER_THRESHOLD && (
+                <div
+                  data-testid="member-roster-controls"
+                  className="flex min-h-14 items-center justify-between gap-3 border-b border-border bg-surface px-4 py-2.5 lg:px-5"
+                >
+                  <p className="text-xs font-medium text-foreground-muted">
+                    Filter roster
+                  </p>
+                  <div className="relative w-56 max-w-full">
+                    <Search
+                      className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-foreground-muted"
+                      aria-hidden
+                    />
+                    <Input
+                      type="search"
+                      value={filter}
+                      onChange={(event) => setFilter(event.target.value)}
+                      placeholder="Filter members…"
+                      aria-label="Filter members"
+                      className="bg-surface pl-9"
+                    />
+                  </div>
                 </div>
-
-                <div className="ml-auto flex flex-wrap items-center gap-2">
-                  {total > FILTER_THRESHOLD && (
-                    <div className="relative w-56 max-w-full">
-                      <Search
-                        className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-foreground-muted"
-                        aria-hidden
-                      />
-                      <Input
-                        type="search"
-                        value={filter}
-                        onChange={(event) => setFilter(event.target.value)}
-                        placeholder="Filter members…"
-                        aria-label="Filter members"
-                        className="bg-surface pl-9"
-                      />
-                    </div>
-                  )}
-                  {canManage && (
-                    <Button
-                      variant="accent"
-                      size="sm"
-                      onClick={() => setInviteOpen(true)}
-                    >
-                      <Plus className="h-3.5 w-3.5" aria-hidden />
-                      Invite member
-                    </Button>
-                  )}
-                </div>
-              </div>
+              )}
 
               {error ? (
                 <div className="p-4">
@@ -823,7 +826,7 @@ function publicPolicy(access: VaultInfo["public_access"]) {
   if (access === "writer") {
     return {
       label: "Public write",
-      summary: "public write enabled",
+      summary: "Public write enabled",
       description:
         "Any signed-in person with the link can read and change content.",
       Icon: Globe,
@@ -832,14 +835,14 @@ function publicPolicy(access: VaultInfo["public_access"]) {
   if (access === "reader") {
     return {
       label: "Public read",
-      summary: "public read enabled",
+      summary: "Public read enabled",
       description: "Any signed-in person with the link can read this vault.",
       Icon: Globe,
     };
   }
   return {
     label: "Private",
-    summary: "private vault",
+    summary: "Private Vault",
     description: "Only people listed on this page can open the vault.",
     Icon: Lock,
   };

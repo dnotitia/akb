@@ -35,6 +35,7 @@ import { RelativeTime } from "@/components/ui/relative-time";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { TonalIcon, type TonalIconTone } from "@/components/ui/tonal-icon";
+import { WorkspaceSectionHeader } from "@/components/ui/workspace-section-header";
 import {
   deletePublication,
   getDocument,
@@ -213,36 +214,29 @@ export default function PublicationsPage() {
           Publish
         </h1>
 
-        <Panel variant="workspace" className="w-full">
-          <section aria-labelledby="publications-heading">
-            <div
-              data-testid="publication-ledger-header"
-              className="flex min-h-16 flex-wrap items-center gap-3 border-b border-border-strong bg-surface-2/55 px-4 py-3 sm:px-5"
-            >
-              <TonalIcon tone="publish">
-                <Share2 aria-hidden />
-              </TonalIcon>
-              <div className="min-w-0 flex-1">
-                <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                  <span className="text-sm font-semibold text-foreground">
-                    Published links
-                  </span>
-                  {items !== null && (
-                    <Badge variant="default">
-                      {count} link{count === 1 ? "" : "s"}
-                    </Badge>
-                  )}
-                  <span className="text-xs tabular-nums text-foreground-muted">
-                    {items === null
-                      ? error
-                        ? "Unavailable"
-                        : "Loading links…"
-                      : count > 0
-                        ? `${totalViews.toLocaleString()} total views`
-                        : "Vault content is private by default"}
-                  </span>
-                </div>
-              </div>
+        <WorkspaceSectionHeader
+          id="published-links-heading"
+          icon={Share2}
+          title="Published links"
+          description="Manage public, read-only links created from this Vault."
+          tone="publish"
+          testId="publication-ledger-header"
+          right={
+            <>
+              {items !== null && (
+                <Badge variant="default">
+                  {count} link{count === 1 ? "" : "s"}
+                </Badge>
+              )}
+              <span className="text-xs tabular-nums text-foreground-muted">
+                {items === null
+                  ? error
+                    ? "Unavailable"
+                    : "Loading links…"
+                  : count > 0
+                    ? `${totalViews.toLocaleString()} total views`
+                    : "Vault content is private by default"}
+              </span>
               {count > 0 && (
                 <Button asChild variant="ghost" size="sm" className="shrink-0">
                   <Link to={`/vault/${name}`}>
@@ -251,8 +245,12 @@ export default function PublicationsPage() {
                   </Link>
                 </Button>
               )}
-            </div>
+            </>
+          }
+        />
 
+        <Panel variant="workspace" className="w-full">
+          <section aria-labelledby="published-links-heading">
             <PublicationPolicySummary />
 
             {items !== null && filtersVisible && (

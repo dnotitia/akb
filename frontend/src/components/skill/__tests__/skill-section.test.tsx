@@ -44,7 +44,7 @@ describe("SkillSection", () => {
     expect(document.getElementById("skill")).toBeTruthy();
     const sectionHeader = screen
       .getByRole("heading", { name: "Vault guide" })
-      .closest('[data-slot="settings-section-header"]');
+      .closest('[data-slot="workspace-section-header"]');
     expect(sectionHeader).toHaveClass("border-border", "pb-3");
     expect(sectionHeader).not.toHaveClass("bg-surface-2/55");
     expect(sectionHeader?.nextElementSibling).toHaveClass(

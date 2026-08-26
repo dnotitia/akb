@@ -118,10 +118,11 @@ describe("Vault Members redesign", () => {
       "bg-surface",
     );
     expect(screen.getByTestId("member-roster-header")).toHaveClass(
+      "border-border",
+      "pb-3",
+    );
+    expect(screen.getByTestId("member-roster-header")).not.toHaveClass(
       "bg-surface-2/55",
-      "border-border-strong",
-      "px-4",
-      "lg:px-5",
     );
     expect(screen.getByRole("columnheader", { name: "Member" })).toHaveClass(
       "px-4",
@@ -141,11 +142,9 @@ describe("Vault Members redesign", () => {
       level: 2,
       name: "Direct access",
     });
-    expect(directAccessHeading).toHaveClass("text-sm", "font-semibold");
-    const accessSummary = directAccessHeading.parentElement;
-    expect(accessSummary).not.toBeNull();
+    expect(directAccessHeading).toHaveClass("text-base", "font-semibold");
     expect(
-      within(accessSummary as HTMLElement).getByText("3 members"),
+      within(screen.getByTestId("member-roster-header")).getByText("3 members"),
     ).toBeInTheDocument();
     expect(screen.getByText("Vault Owner")).toBeInTheDocument();
     expect(screen.getByText("You")).toBeInTheDocument();

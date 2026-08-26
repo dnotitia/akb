@@ -41,7 +41,7 @@ import { PageShell } from "@/components/ui/page-shell";
 import { Panel, PanelHeader } from "@/components/ui/panel";
 import { VaultContextBadge } from "@/components/ui/vault-context-badge";
 import { Segmented } from "@/components/ui/segmented";
-import { SettingsSectionHeader } from "@/components/ui/settings-section-header";
+import { WorkspaceSectionHeader } from "@/components/ui/workspace-section-header";
 import { TonalIcon } from "@/components/ui/tonal-icon";
 import { Textarea } from "@/components/ui/textarea";
 import { DeleteVaultDialog } from "@/components/delete-vault-dialog";
@@ -403,7 +403,7 @@ export default function VaultSettingsPage() {
                   aria-labelledby="general-settings-heading"
                   className="scroll-mt-6"
                 >
-                  <SettingsSectionHeader
+                  <WorkspaceSectionHeader
                     id="general-settings-heading"
                     icon={Settings2}
                     title="General"
@@ -478,7 +478,7 @@ export default function VaultSettingsPage() {
                   aria-labelledby="access-settings-heading"
                   className="scroll-mt-6"
                 >
-                  <SettingsSectionHeader
+                  <WorkspaceSectionHeader
                     id="access-settings-heading"
                     icon={ShieldCheck}
                     title="Access"

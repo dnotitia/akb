@@ -78,8 +78,11 @@ describe("Publish page redesign", () => {
       "max-w-none",
     );
     expect(screen.getByTestId("publication-ledger-header")).toHaveClass(
+      "border-border",
+      "pb-3",
+    );
+    expect(screen.getByTestId("publication-ledger-header")).not.toHaveClass(
       "bg-surface-2/55",
-      "border-border-strong",
     );
     expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
     const policy = screen.getByTestId("publication-policy-summary");

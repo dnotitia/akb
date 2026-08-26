@@ -10,7 +10,7 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { SkillBadge } from "@/components/ui/skill-badge";
 import { Panel } from "@/components/ui/panel";
-import { SettingsSectionHeader } from "@/components/ui/settings-section-header";
+import { WorkspaceSectionHeader } from "@/components/ui/workspace-section-header";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { getSkillTemplate, updateDocument } from "@/lib/api";
@@ -131,7 +131,7 @@ export function SkillSection({
 
   return (
     <section id="skill" aria-labelledby="skill-h" className="scroll-mt-6">
-      <SettingsSectionHeader
+      <WorkspaceSectionHeader
         id="skill-h"
         icon={BookOpen}
         title="Vault guide"

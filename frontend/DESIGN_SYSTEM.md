@@ -355,9 +355,10 @@ commits` control and `Full commit log` route. Below `xl`, the work area stacks
   as document reading without forcing a document-sized canvas. On desktop, the
   connected roster and access inspector sit inside one inset workspace frame
   with the same 16–20px outer gutter used by Activity and Publish. The frame is
-  a single border, not two floating cards: the direct-access toolbar and roster
-  remain one flush ledger, and its neutral layered header owns member count, policy summary,
-  filtering, and invite action. Its ledger padding is responsive: 16px on
+  a single border, not two floating cards. A cardless `WorkspaceSectionHeader`
+  sits above that frame and owns Direct access, the policy summary, member count,
+  and Invite action; the roster panel begins with an on-demand filter row only
+  when the list is large enough to need it. Its ledger padding is responsive: 16px on
   narrow screens and 20px from `lg`, adding reading space without detaching the
   ledger from the access inspector. The access inspector uses the same neutral
   layers; `people`, `info`, and semantic state tones stay on its icon chips while
@@ -460,7 +461,7 @@ Compose pages from these instead of re-writing patterns inline.
 | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Button`                                               | `default` (teal) · `accent` (orange CTA) · `outline` · `secondary` · `ghost` · `destructive` · `link`. Sizes `sm/md/lg/icon`. `loading` prop = spinner + disable + `aria-busy`.                                                                                                                                                                                                                                                                                                                                                                     |
 | `Panel` + `PanelHeader`                                | canonical `surface` container (border + soft shadow). Default `card` keeps the family rounded-card treatment; `variant="workspace"` uses a tighter radius, flatter shadow, and soft header bar for dense Vault/file workspaces. `inset` (default) clips divided lists. For a `.card-hover` lift on rows inside a Panel, set `inset={false}`, re-round the end rows to the panel's selected radius, and stack the hovered row above its neighbours (`relative z-0 hover:z-10`).                                                                      |
-| `SettingsSectionHeader`                                | cardless General / Access / Vault guide anchor for the Settings form column; uses a sentence-case H2, concise description, neutral hairline, and meaningful `TonalIcon` tone above the settings panel.                                                                                                                                                                                                                                                                                                                                              |
+| `WorkspaceSectionHeader`                               | shared cardless section anchor for Settings, Members, and Publish; uses a sentence-case H2, concise description, neutral hairline, and meaningful `TonalIcon` tone above a form or ledger panel, with an optional responsive metadata/action slot.                                                                                                                                                                                                                                                                                                  |
 | `PageHeader`                                           | masthead: `font-display` title + muted subtitle + actions slot; `compact` is the Vault tool-page density, not a global heading reset.                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `WorkspacePageHeader`                                  | compact Vault identity row combining H1, canonical address, state, and actions without a landing-page hero. Its default bounded tool-row surface suits operational workspaces; Overview removes that surface and uses a bottom hairline so identity remains page-level above the first data panel.                                                                                                                                                                                                                                                  |
 | `TonalIcon`                                            | small bordered icon chip for category or semantic scan cues. Content mapping: document/knowledge=`cat-1`, collection/people=`cat-2`, table/data=`cat-3`, file/guide/publish=`cat-4`, neutral/commit=`cat-6`; status uses `info/success/warning/destructive`. Color is always paired with a glyph and label, and whole header bands remain neutral.                                                                                                                                                                                                  |
@@ -487,9 +488,11 @@ stacks into one flow; existing members remain excluded from results.
 
 The Publish route is a full-working-width, single-column public-link registry,
 not a creation landing page. It shares Activity's thin 12–20px route gutter and
-uses one workspace Panel so long lists remain scannable; its neutral header
-uses a warm publish glyph while live state stays semantic green. Do not reserve a
-persistent policy rail. Explain
+uses one workspace Panel so long lists remain scannable. A cardless
+`WorkspaceSectionHeader` above the panel owns the warm publish glyph, link count,
+total views, and Vault return action; the panel itself begins with policy and
+continues directly into filters and the registry. Do not reserve a persistent
+policy rail. Explain
 the public/read-only boundary once in a compact policy line directly below the
 registry header (`Public · Read-only · No sign-in required`), then expose
 password, expiry, and view-limit state per link. Each ledger row carries a
