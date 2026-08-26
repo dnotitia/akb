@@ -102,6 +102,12 @@ describe("SearchPage · semantic (dense) mode", () => {
     expect(workspace.contains(suggestions)).toBe(true);
     expect(screen.getByRole("group", { name: "Search mode" })).toBeTruthy();
     expect(screen.getByRole("region", { name: "Search results" })).toBeTruthy();
+    expect(screen.getByTestId("search-scope-row")).toHaveClass(
+      "order-3",
+      "basis-full",
+      "sm:order-none",
+      "sm:flex-1",
+    );
     await user.click(
       screen.getByRole("button", { name: "Filter by document type" }),
     );

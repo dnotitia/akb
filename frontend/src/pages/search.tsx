@@ -510,7 +510,10 @@ export default function SearchPage() {
             </div>
           </form>
 
-          <div className="flex min-h-12 flex-wrap items-center gap-2 border-b border-border-strong bg-surface-2/60 px-3 py-1.5 sm:px-4">
+          <div
+            data-testid="search-tool-row"
+            className="flex min-h-12 flex-wrap items-center justify-between gap-2 border-b border-border-strong bg-surface-2/60 px-3 py-1.5 sm:justify-start sm:px-4"
+          >
             <div
               role="group"
               aria-label="Search mode"
@@ -540,7 +543,10 @@ export default function SearchPage() {
 
             <div className="hidden h-6 w-px bg-border sm:block" aria-hidden />
 
-            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+            <div
+              data-testid="search-scope-row"
+              className="order-3 flex min-w-0 basis-full flex-wrap items-center gap-2 sm:order-none sm:basis-auto sm:flex-1"
+            >
               {scopedVault ? (
                 <>
                   <div
@@ -556,7 +562,7 @@ export default function SearchPage() {
                   </div>
                   <Link
                     to={allVaultsHref}
-                    className="inline-flex h-9 items-center gap-1.5 rounded-[var(--radius-md)] px-2.5 text-xs font-medium text-link transition-token hover:bg-surface-hover hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-[var(--radius-md)] px-2.5 text-xs font-medium text-link transition-token hover:bg-surface-hover hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
                     All vaults
                     <ExternalLink className="h-3.5 w-3.5" aria-hidden />

@@ -523,10 +523,13 @@ full-working-width results ledger. Source-kind and document-type facets stay
 behind the labelled Filters control and appear only after results provide useful
 counts; active filters remain visible through the control's count badge. This
 keeps refinement close to the query without allowing a fixed rail to tax every
-result row or compete with the collapsed Collections rail. The results canvas
-owns all empty, loading, no-result, degraded, filtered-empty, retry, and ranked-
-list states inside the same stable boundary. Its empty state reuses the global
-panel's Suggested searches ledger, but real re-entry context leads when it is
+result row or compete with the collapsed Collections rail. On narrow screens,
+mode and Filters stay together on the first tool row while Vault scope moves to
+a full-width second row; scope identity must never be truncated out between
+adjacent controls. From `sm`, all three return to one compact row. The results
+canvas owns all empty, loading, no-result, degraded, filtered-empty, retry, and
+ranked-list states inside the same stable boundary. Its empty state reuses the
+global panel's Suggested searches ledger, but real re-entry context leads when it is
 available: user-scoped browser search history and recently viewed documents are
 shown as connected ledgers, with inaccessible Vault history removed through the
 existing Vault list. The history stores query/scope/mode and document identity
