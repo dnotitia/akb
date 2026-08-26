@@ -1,17 +1,23 @@
-import { type ReactNode, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import {
+  Activity,
   AlertTriangle,
   Archive,
   ArrowLeft,
+  BookOpen,
+  Box,
   CheckCircle2,
   CircleDashed,
   Globe,
   Lock,
   RotateCcw,
   Save,
+  Settings2,
+  ShieldCheck,
   Trash2,
   Unlock,
+  Users,
   type LucideIcon,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
@@ -28,12 +34,16 @@ import { VAULT_SKILL_PATH } from "@/lib/skill";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { StatTile } from "@/components/ui/stat-tile";
-import { Textarea } from "@/components/ui/textarea";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { CopyButton } from "@/components/ui/copy-button";
+import { Label } from "@/components/ui/label";
+import { PageShell } from "@/components/ui/page-shell";
+import { Panel, PanelHeader } from "@/components/ui/panel";
+import { VaultContextBadge } from "@/components/ui/vault-context-badge";
 import { Segmented } from "@/components/ui/segmented";
+import { SettingsSectionHeader } from "@/components/ui/settings-section-header";
+import { TonalIcon } from "@/components/ui/tonal-icon";
+import { Textarea } from "@/components/ui/textarea";
 import { DeleteVaultDialog } from "@/components/delete-vault-dialog";
 import { RoleBadge, VaultStateBadge } from "@/components/status-badge";
 import { useVaultHealth } from "@/hooks/use-vault-health";
@@ -54,8 +64,6 @@ interface VaultInfo {
   is_archived?: boolean;
   is_external_git?: boolean;
   public_access?: "none" | "reader" | "writer";
-  // Identity + scale from get_vault_info (already on the wire) — surfaced so the
-  // settings page can answer "who owns it, how old, how big" without a re-fetch.
   owner?: string;
   owner_display_name?: string;
   created_at?: string;
@@ -70,6 +78,8 @@ interface VaultInfo {
 }
 
 type PublicAccess = "none" | "reader" | "writer";
+type SaveScope = "general" | "access";
+
 const PUBLIC_LABELS: Record<PublicAccess, string> = {
   none: "Private",
   reader: "Public · read",
@@ -83,9 +93,9 @@ const PUBLIC_ICONS: Record<PublicAccess, LucideIcon> = {
 const PUBLIC_DESCRIPTIONS: Record<PublicAccess, string> = {
   none: "Only invited members can see anything in this vault.",
   reader:
-    "Any signed-in person with the link can read this vault — including people you never invited. Writes still require an invite.",
+    "Any signed-in person with the link can read this vault. Writes still require an invitation.",
   writer:
-    "Any signed-in person with the link can read AND write — create, edit, and delete content. Use sparingly.",
+    "Any signed-in person with the link can create, edit, and delete content. Use this only for deliberately open collaboration.",
 };
 const PUBLIC_ORDER: PublicAccess[] = ["none", "reader", "writer"];
 
@@ -98,15 +108,18 @@ export default function VaultSettingsPage() {
   const [loadError, setLoadError] = useState("");
   const [description, setDescription] = useState("");
   const [publicAccess, setPublicAccess] = useState<PublicAccess>("none");
-  const [saving, setSaving] = useState(false);
-  const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [savingScope, setSavingScope] = useState<SaveScope | null>(null);
+  const [savedScope, setSavedScope] = useState<SaveScope | null>(null);
   const [saveError, setSaveError] = useState("");
+  const [saveErrorScope, setSaveErrorScope] = useState<SaveScope | null>(null);
   const [pendingArchive, setPendingArchive] = useState(false);
   const [pendingUnarchive, setPendingUnarchive] = useState(false);
   const [pendingPublicWrite, setPendingPublicWrite] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const generalStatusRef = useRef<HTMLSpanElement>(null);
+  const accessStatusRef = useRef<HTMLSpanElement>(null);
+  const settingsMainRef = useRef<HTMLElement>(null);
   const vaultHealth = useVaultHealth(name);
-  const saveStatusRef = useRef<HTMLSpanElement>(null);
 
   const skillQuery = useQuery({
     queryKey: ["document", name, VAULT_SKILL_PATH],
@@ -119,122 +132,143 @@ export default function VaultSettingsPage() {
   function loadInfo(vault: string) {
     setLoadError("");
     getVaultInfo(vault)
-      .then((d) => {
-        setInfo(d);
-        setDescription(d.description || "");
-        setPublicAccess((d.public_access as PublicAccess) || "none");
+      .then((data) => {
+        setInfo(data);
+        setDescription(data.description || "");
+        setPublicAccess((data.public_access as PublicAccess) || "none");
       })
-      .catch((e) => setLoadError(e?.message || "Couldn't load this vault."));
+      .catch((error) =>
+        setLoadError(error?.message || "Couldn't load this vault."),
+      );
   }
 
   useEffect(() => {
     if (!name) return;
-    // Reset stale state from previous param before re-fetch resolves.
     setInfo(null);
     setLoadError("");
     setDescription("");
     setPublicAccess("none");
     setSaveError("");
-    setSavedAt(null);
+    setSaveErrorScope(null);
+    setSavedScope(null);
     loadInfo(name);
   }, [name]);
 
-  // Land on #skill when the canonical-doc redirect (or the vault page's guide
-  // link) sends the browser here. React Router doesn't restore hash targets on
-  // its own, and the section mounts after the doc query resolves — so re-run
-  // once the guide is in hand. Keyed on location.key too so re-clicking the
-  // same in-page hash re-scrolls (mirrors home.tsx).
   useEffect(() => {
     const target = location.hash.slice(1);
-    if (target !== "skill") return;
-    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (!["general", "access", "skill", "danger"].includes(target)) return;
+    const reduce = window.matchMedia(
+      "(prefers-reduced-motion: reduce)",
+    ).matches;
     requestAnimationFrame(() => {
-      document
-        .getElementById(target)
-        ?.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" });
+      const targetElement = document.getElementById(target);
+      if (!targetElement) return;
+      const mainPane = settingsMainRef.current;
+      if (mainPane && window.matchMedia("(min-width: 1280px)").matches) {
+        const paneTop = mainPane.getBoundingClientRect().top;
+        const targetTop = targetElement.getBoundingClientRect().top;
+        mainPane.scrollTo({
+          top: Math.max(0, mainPane.scrollTop + targetTop - paneTop - 24),
+          behavior: reduce ? "auto" : "smooth",
+        });
+        return;
+      }
+      targetElement.scrollIntoView({
+        behavior: reduce ? "auto" : "smooth",
+        block: "start",
+      });
     });
-  }, [location.hash, location.key, skillQuery.isLoading]);
+  }, [info, location.hash, location.key, skillQuery.isLoading]);
 
-  // Name the tab/history entry for this page (tab switching + SR orientation).
   useEffect(() => {
     if (!name) return;
-    const prev = document.title;
+    const previous = document.title;
     document.title = `${name} · Settings · AKB`;
     return () => {
-      document.title = prev;
+      document.title = previous;
     };
   }, [name]);
 
   const canEdit = info?.role === "owner";
   const canManageSkill = info?.role === "owner" && !info?.is_archived;
   const savedPublic = (info?.public_access as PublicAccess) || "none";
-  const dirty = Boolean(
-    info && (description !== (info.description || "") || publicAccess !== savedPublic),
+  const descriptionDirty = Boolean(
+    info && description !== (info.description || ""),
   );
+  const accessDirty = Boolean(info && publicAccess !== savedPublic);
+  const dirty = descriptionDirty || accessDirty;
+  const saving = savingScope !== null;
 
-  // Guard a dirty config behind the browser's unload prompt (refresh / close /
-  // external nav), mirroring document-new.tsx. In-app SPA nav has a Discard
-  // button + the unsaved hint as its safety net.
   useEffect(() => {
     if (!dirty || saving) return;
-    const onBeforeUnload = (e: BeforeUnloadEvent) => {
-      e.preventDefault();
-      e.returnValue = "";
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
     };
     window.addEventListener("beforeunload", onBeforeUnload);
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
   }, [dirty, saving]);
 
-  // Public-write is the highest-blast-radius change on the page, so unlike the
-  // other (gated) lifecycle actions it must clear a destructive confirm before
-  // Save commits it. Lowering access or toggling read stays frictionless.
-  function requestSave() {
+  function requestSave(scope: SaveScope) {
     if (!info) return;
-    const enablingPublicWrite = publicAccess === "writer" && savedPublic !== "writer";
+    const enablingPublicWrite =
+      scope === "access" &&
+      publicAccess === "writer" &&
+      savedPublic !== "writer";
     if (enablingPublicWrite) {
       setPendingPublicWrite(true);
       return;
     }
-    void doSave();
+    void doSave(scope);
   }
 
-  async function doSave() {
+  async function doSave(scope: SaveScope) {
     if (!name || !info) return;
-    setSaving(true);
+    setSavingScope(scope);
     setSaveError("");
+    setSaveErrorScope(null);
     try {
-      await updateVault(name, { description, public_access: publicAccess });
-      setInfo({ ...info, description, public_access: publicAccess });
-      setSavedAt(Date.now());
-      // Move focus to a stable status node so a keyboard Save doesn't drop focus
-      // to <body> when the (now-clean) Save disables + the Discard button
-      // unmounts. "Saved" persists until the next edit (dirty hides it).
-      requestAnimationFrame(() => saveStatusRef.current?.focus());
-    } catch (e: any) {
-      setSaveError(e?.message || "Save failed");
+      const patch =
+        scope === "general" ? { description } : { public_access: publicAccess };
+      await updateVault(name, patch);
+      setInfo({ ...info, ...patch });
+      setSavedScope(scope);
+      refetchVaults();
+      requestAnimationFrame(() => {
+        (scope === "general"
+          ? generalStatusRef
+          : accessStatusRef
+        ).current?.focus();
+      });
+    } catch (error: unknown) {
+      setSaveError(error instanceof Error ? error.message : "Save failed");
+      setSaveErrorScope(scope);
     } finally {
-      setSaving(false);
+      setSavingScope(null);
     }
   }
 
-  function handleDiscard() {
+  function handleDiscard(scope: SaveScope) {
     if (!info) return;
-    setDescription(info.description || "");
-    setPublicAccess(savedPublic);
+    if (scope === "general") setDescription(info.description || "");
+    else setPublicAccess(savedPublic);
     setSaveError("");
-    // Discarding is not a save — don't leave the "Saved" chip up.
-    setSavedAt(null);
+    setSaveErrorScope(null);
+    setSavedScope(null);
   }
 
   async function confirmArchive() {
     if (!name) return;
     await archiveVault(name);
     setInfo(await getVaultInfo(name));
+    refetchVaults();
   }
+
   async function confirmUnarchive() {
     if (!name) return;
     await unarchiveVault(name);
     setInfo(await getVaultInfo(name));
+    refetchVaults();
   }
 
   if (!name) return null;
@@ -242,22 +276,34 @@ export default function VaultSettingsPage() {
   const loading = info === null && !loadError;
   const tables = info?.tables ?? [];
   const deleteScale = info
-    ? ([
-        [info.document_count, "document"],
-        [info.table_count, "table"],
-        [info.file_count, "file"],
-      ] as Array<[number | undefined, string]>)
-        .filter(([n]) => (n ?? 0) > 0)
-        .map(([n, w]) => `${n!.toLocaleString()} ${w}${n === 1 ? "" : "s"}`)
+    ? (
+        [
+          [info.document_count, "document"],
+          [info.table_count, "table"],
+          [info.file_count, "file"],
+        ] as Array<[number | undefined, string]>
+      )
+        .filter(([count]) => (count ?? 0) > 0)
+        .map(
+          ([count, word]) =>
+            `${count!.toLocaleString()} ${word}${count === 1 ? "" : "s"}`,
+        )
         .join(", ")
     : "";
 
   return (
-    <div className="fade-up max-w-[1100px] mx-auto">
+    <PageShell
+      header={null}
+      contentWidth="full"
+      className="min-h-full xl:h-full xl:min-h-0"
+      contentClassName="min-h-full xl:flex xl:h-full xl:min-h-0 xl:flex-col"
+    >
+      <h1 className="sr-only">Settings</h1>
+
       {loadError && (
-        <Alert variant="destructive" className="mb-4">
+        <Alert variant="destructive" className="mb-5">
           {loadError}
-          <div className="mt-2">
+          <div className="mt-3">
             <Button variant="outline" size="sm" onClick={() => loadInfo(name)}>
               Try again
             </Button>
@@ -265,394 +311,549 @@ export default function VaultSettingsPage() {
         </Alert>
       )}
 
-      <div className="flex items-baseline justify-between mb-6 flex-wrap gap-y-2">
-        <Link
-          to={`/vault/${name}`}
-          className="inline-flex items-center gap-1.5 min-h-[36px] coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background rounded-[var(--radius-sm)]"
-        >
-          <ArrowLeft className="h-3 w-3" aria-hidden />
-          Back to {name}
-        </Link>
-        {info?.role && <RoleBadge role={info.role} />}
-      </div>
+      {loading && <SettingsLoadingState />}
 
-      <div className="coord mb-3">
-        Vault · <span className="text-foreground">{name}</span> · Settings
-      </div>
-      <h1 className="font-display text-3xl tracking-tight text-foreground mb-2">
-        Settings
-      </h1>
-      <p className="text-sm leading-relaxed text-foreground-muted mb-2 max-w-prose">
-        Vault metadata, public access, and lifecycle controls.
-      </p>
-
-      {/* Identity line — who owns it, how old, how alive. From get_vault_info,
-          already fetched. Owner is a display name (sans, not mono). */}
-      {info &&
-        (() => {
-          const segs: ReactNode[] = [];
-          const owner = info.owner_display_name || info.owner;
-          if (owner)
-            segs.push(
-              <>
-                Owned by <span className="text-foreground">{owner}</span>
-              </>,
-            );
-          if (info.created_at) segs.push(<>Created {timeAgo(info.created_at)}</>);
-          if (info.last_activity)
-            segs.push(<>Last active {timeAgo(info.last_activity)}</>);
-          if (info.member_count != null)
-            segs.push(
-              <>
-                {info.member_count.toLocaleString()} member
-                {info.member_count === 1 ? "" : "s"}
-              </>,
-            );
-          if (!segs.length) return null;
-          return (
-            <div className="coord mt-1.5 mb-6 flex flex-wrap items-center gap-x-2 gap-y-1">
-              {segs.map((s, i) => (
-                <span key={i} className="flex items-center gap-x-2">
-                  {i > 0 && <span aria-hidden>·</span>}
-                  <span>{s}</span>
-                </span>
-              ))}
-            </div>
-          );
-        })()}
-
-      {/* State badges */}
-      <div className="mb-4 min-h-[1.5rem]" aria-busy={loading || undefined}>
-        {loading ? (
-          <span
-            className="inline-block h-5 w-40 rounded bg-surface-muted animate-pulse"
-            aria-hidden
-          />
-        ) : (
-          <VaultStateBadge
-            archived={info?.is_archived}
-            externalGit={info?.is_external_git}
-            publicAccess={info?.public_access}
-          />
-        )}
-      </div>
-      <span className="sr-only" role="status" aria-live="polite">
-        {loading ? "Loading vault settings" : loadError ? "Could not load settings" : ""}
-      </span>
-
-      {/* At a glance — the scale this vault carries, from the same /info payload,
-          so the masthead is substantive instead of a thin line over empty space. */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        {info ? (
-          (
-            [
-              ["Collections", info.collection_count],
-              ["Documents", info.document_count],
-              ["Tables", info.table_count],
-              ["Files", info.file_count],
-            ] as Array<[string, number | undefined]>
-          ).map(([label, value]) => (
-            <StatTile key={label} label={label} value={(value ?? 0).toLocaleString()} dimZero />
-          ))
-        ) : loadError ? null : (
-          Array.from({ length: 4 }).map((_, i) => <SettingsStatSkeleton key={i} />)
-        )}
-      </div>
       {info && (
-        <div className="coord mt-2 mb-10 flex flex-wrap items-center gap-x-3 gap-y-1">
-          {info.edge_count != null && (
-            <span className="tabular-nums">
-              {info.edge_count.toLocaleString()} graph link
-              {info.edge_count === 1 ? "" : "s"}
-            </span>
-          )}
-          {info.edge_count != null && <span aria-hidden>·</span>}
-          <Link
-            to={`/vault/${name}`}
-            className="inline-flex items-center gap-1 hover:text-link transition-colors rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-          >
-            ↗ Open overview
-          </Link>
-        </div>
-      )}
-
-      {!canEdit && info && (
         <div
-          role="status"
-          className="rounded-[var(--radius-md)] border border-border bg-surface-muted px-4 py-2 mb-8 text-xs flex flex-wrap items-center gap-2"
+          data-testid="settings-workspace-shell"
+          className="min-h-full w-full xl:flex xl:min-h-0 xl:flex-1 xl:flex-col"
         >
-          <span>
-            Read-only view — only the owner can change these settings. Your role: {info.role}.
-          </span>
-          {info.role_source === "public" && (
-            <Badge
-              variant="info-outline"
-              title="This role comes from the vault's public-access setting, not a direct invite."
-            >
-              <Globe className="h-3 w-3" aria-hidden />
-              via public access
-            </Badge>
-          )}
-        </div>
-      )}
-
-      {/* § METADATA — the form column is capped for a readable measure. */}
-      <section className="mb-12" aria-labelledby="meta-h">
-        <header className="flex items-baseline gap-3 pb-3 border-b border-border mb-4">
-          <h2 id="meta-h" className="coord-ink">
-            Metadata
-          </h2>
-          <span className="coord">name · description · access</span>
-        </header>
-
-        <div className="space-y-5 max-w-2xl">
-          <div>
-            <Label className="coord-ink mb-1.5 block">Name</Label>
-            <Input value={name} disabled />
-            <p className="text-xs text-foreground-muted mt-1.5">
-              Vault names are immutable. Create a new vault and migrate if you need a rename.
-            </p>
-          </div>
-
-          <div>
-            <Label htmlFor="vault-description" className="coord-ink mb-1.5 block">
-              Description
-            </Label>
-            <Textarea
-              id="vault-description"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              readOnly={!canEdit}
-              disabled={saving}
-              placeholder="One sentence on what lives in this vault."
-              rows={2}
-              className="resize-y"
-            />
+          <div
+            data-testid="settings-workspace-frame"
+            className="flex min-h-full w-full flex-col xl:min-h-0 xl:flex-1 xl:overflow-hidden"
+          >
             {!canEdit && (
-              <p className="text-xs text-foreground-muted mt-1.5">
-                Read-only — only the owner can edit the description.
-              </p>
-            )}
-          </div>
-
-          <div>
-            <Label id="public-access-label" className="coord-ink mb-1.5 block">
-              Public access
-            </Label>
-            <Segmented
-              aria-labelledby="public-access-label"
-              value={publicAccess}
-              onChange={(v) => setPublicAccess(v as PublicAccess)}
-              disabled={!canEdit || saving}
-              className="grid-cols-1 sm:grid-cols-3"
-              options={PUBLIC_ORDER.map((v) => {
-                const Icon = PUBLIC_ICONS[v];
-                return {
-                  value: v,
-                  label: PUBLIC_LABELS[v],
-                  icon: <Icon className="h-3 w-3" aria-hidden />,
-                  danger: v === "writer",
-                };
-              })}
-            />
-            <p
-              className={`text-xs mt-2 leading-relaxed flex items-start gap-1.5 ${
-                publicAccess === "writer" ? "text-warning-soft-foreground" : "text-foreground-muted"
-              }`}
-            >
-              {publicAccess === "writer" && (
-                <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5" aria-hidden />
-              )}
-              {PUBLIC_DESCRIPTIONS[publicAccess]}
-            </p>
-            {info && (
-              <p className="coord mt-1">
-                Currently {PUBLIC_LABELS[savedPublic]}
-                {dirty && publicAccess !== savedPublic && (
-                  <>
-                    {" "}→ changing to{" "}
-                    <span className="text-foreground">{PUBLIC_LABELS[publicAccess]}</span>
-                  </>
-                )}
-              </p>
-            )}
-          </div>
-
-          {saveError && <Alert variant="destructive">{saveError}</Alert>}
-
-          {canEdit && (
-            <div className="flex items-center gap-3">
-              <Button onClick={requestSave} loading={saving} disabled={!dirty}>
-                {!saving && <Save className="h-4 w-4" aria-hidden />}
-                {saving ? "Saving…" : "Save changes"}
-              </Button>
-              {dirty && !saving && (
-                <Button variant="outline" onClick={handleDiscard}>
-                  Discard
-                </Button>
-              )}
-              <span
-                ref={saveStatusRef}
-                tabIndex={-1}
-                role="status"
-                aria-live="polite"
-                className="min-w-[8rem] inline-flex items-center outline-none"
+              <Alert
+                variant="info"
+                className="shrink-0 rounded-none border-x-0 border-t-0 border-b px-4 py-2 sm:px-5 lg:px-6"
               >
-                {saving ? null : !dirty && savedAt ? (
-                  <span className="coord-spark">Saved</span>
-                ) : dirty ? (
-                  <span className="coord">Unsaved changes</span>
-                ) : null}
-              </span>
-            </div>
-          )}
-        </div>
-      </section>
-
-      {/* § VAULT GUIDE — the single editing surface for the system-managed
-          skill doc; the document viewer redirects here. */}
-      <SkillSection
-        vault={name}
-        doc={skillDoc}
-        // Hold the skeleton until /info lands too: on a mirror vault the guide
-        // 404s, and without info the section would flash "missing" before the
-        // mirror note replaces it.
-        loading={skillQuery.isLoading || (!info && !loadError)}
-        isMirror={info?.is_external_git}
-        canManage={canManageSkill}
-      />
-
-      {/* § LIFECYCLE — the two non-destructive lifecycle controls grouped into
-          one card so the tinted Danger zone below reads as the deliberate
-          outlier. */}
-      {canEdit && (
-        <section aria-labelledby="lifecycle-h" className="mb-12">
-          <header className="flex items-baseline gap-3 pb-3 border-b border-border mb-4">
-            <h2 id="lifecycle-h" className="coord-ink">
-              Lifecycle
-            </h2>
-            <span className="coord">archive · transfer</span>
-          </header>
-
-          <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm divide-y divide-border">
-            <div className="p-4">
-              <div className="flex items-baseline justify-between flex-wrap gap-y-3">
-                <div className="min-w-0 pr-4">
-                  <h3 className="text-base font-semibold tracking-tight mb-1 inline-flex items-center gap-1.5">
-                    {info?.is_archived ? (
-                      <Archive className="h-4 w-4 text-foreground-muted" aria-hidden />
-                    ) : (
-                      <CheckCircle2 className="h-4 w-4 text-success" aria-hidden />
-                    )}
-                    {info?.is_archived ? "Archived" : "Active"}
-                  </h3>
-                  <p className="text-sm text-foreground-muted leading-relaxed max-w-prose">
-                    {info?.is_archived
-                      ? "Read-only. Documents and tables can still be browsed and searched, but no writes happen — neither from agents nor from this UI."
-                      : "Archive to mark a project as finished. The vault becomes read-only; agents can still recall but cannot write. Reversible."}
-                  </p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span>
+                    You can review these settings, but only the vault owner can
+                    change them.
+                  </span>
+                  {info.role_source === "public" && (
+                    <Badge
+                      variant="info-outline"
+                      title="This role comes from public access."
+                    >
+                      <Globe className="h-3 w-3" aria-hidden />
+                      Access via public policy
+                    </Badge>
+                  )}
                 </div>
-                {info?.is_archived ? (
-                  <Button variant="outline" onClick={() => setPendingUnarchive(true)}>
-                    <RotateCcw className="h-4 w-4" aria-hidden />
-                    Unarchive
-                  </Button>
-                ) : (
-                  <Button variant="outline" onClick={() => setPendingArchive(true)}>
-                    <Archive className="h-4 w-4" aria-hidden />
-                    Archive
-                  </Button>
+              </Alert>
+            )}
+
+            <div className="grid min-h-full w-full items-stretch bg-background lg:grid-cols-[10.5rem_minmax(0,1fr)] xl:min-h-0 xl:flex-1 xl:grid-cols-[10.5rem_minmax(0,1fr)_17rem]">
+              <nav
+                aria-label="Vault settings sections"
+                className="sticky top-0 z-[var(--z-sticky)] min-w-0 overflow-hidden border-b border-border bg-surface lg:static lg:col-start-1 lg:row-start-1 lg:overflow-visible lg:border-r lg:border-b-0 xl:min-h-0 xl:overflow-y-auto"
+              >
+                <div className="flex min-w-0 gap-1 overflow-x-auto bg-surface p-1 lg:sticky lg:top-0 lg:flex-col lg:overflow-visible lg:p-2 xl:static">
+                  {[
+                    { href: "#general", label: "General", Icon: Settings2 },
+                    { href: "#access", label: "Access", Icon: ShieldCheck },
+                    { href: "#skill", label: "Vault guide", Icon: BookOpen },
+                    ...(canEdit
+                      ? [
+                          {
+                            href: "#danger",
+                            label: "Danger zone",
+                            Icon: AlertTriangle,
+                          },
+                        ]
+                      : []),
+                  ].map(({ href, label, Icon }) => {
+                    const active = (location.hash || "#general") === href;
+                    return (
+                      <a
+                        key={href}
+                        href={href}
+                        onClick={(event) => {
+                          event.preventDefault();
+                          navigate({
+                            pathname: location.pathname,
+                            search: location.search,
+                            hash: href,
+                          });
+                        }}
+                        aria-current={active ? "location" : undefined}
+                        className={`inline-flex h-8 shrink-0 items-center gap-2 rounded-[var(--radius-sm)] px-2.5 text-xs font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+                          active
+                            ? "bg-surface-selected text-surface-selected-foreground"
+                            : "text-foreground-muted hover:bg-surface-hover hover:text-foreground"
+                        }`}
+                      >
+                        <Icon className="h-3.5 w-3.5" aria-hidden />
+                        {label}
+                      </a>
+                    );
+                  })}
+                </div>
+              </nav>
+
+              <main
+                ref={settingsMainRef}
+                className="rail-scroll min-w-0 space-y-6 p-4 sm:p-5 lg:col-start-2 lg:row-start-1 lg:p-6 xl:min-h-0 xl:overflow-y-auto xl:overscroll-contain xl:scroll-py-6 xl:px-7"
+              >
+                <Panel
+                  variant="workspace"
+                  id="general"
+                  role="region"
+                  aria-labelledby="general-settings-heading"
+                  inset={false}
+                  className="scroll-mt-6 border-border-strong"
+                >
+                  <SettingsSectionHeader
+                    id="general-settings-heading"
+                    icon={Settings2}
+                    title="General"
+                    description="The identity people see across the workspace."
+                    tone="knowledge"
+                  />
+                  <div className="grid gap-4 p-4 2xl:grid-cols-[minmax(16rem,0.8fr)_minmax(22rem,1.2fr)]">
+                    <div>
+                      <Label className="mb-1.5 block">Vault address</Label>
+                      <div className="flex min-h-10 items-center justify-between gap-3 rounded-[var(--radius-md)] border border-border bg-surface-2 px-3">
+                        <span className="truncate font-mono text-sm text-foreground">
+                          akb://{name}
+                        </span>
+                        <CopyButton
+                          value={`akb://${name}`}
+                          label="Copy vault address"
+                        />
+                      </div>
+                      <p className="mt-1.5 text-xs leading-relaxed text-foreground-muted">
+                        Vault names are permanent because every document URI
+                        depends on this address.
+                      </p>
+                    </div>
+
+                    <div>
+                      <Label
+                        htmlFor="vault-description"
+                        className="mb-1.5 block"
+                      >
+                        Description
+                      </Label>
+                      <Textarea
+                        id="vault-description"
+                        value={description}
+                        onChange={(event) => {
+                          setDescription(event.target.value);
+                          setSavedScope(null);
+                        }}
+                        readOnly={!canEdit}
+                        disabled={saving}
+                        placeholder="Explain what belongs in this vault and who it serves."
+                        rows={3}
+                        className="resize-y"
+                      />
+                      <p className="mt-1.5 text-xs leading-relaxed text-foreground-muted">
+                        This description appears in Vault Overview and helps
+                        people choose the right knowledge space.
+                      </p>
+                    </div>
+
+                    {saveErrorScope === "general" && (
+                      <Alert variant="destructive">{saveError}</Alert>
+                    )}
+                  </div>
+                  {canEdit && (
+                    <SettingsActionBar
+                      dirty={descriptionDirty}
+                      saving={savingScope === "general"}
+                      saved={savedScope === "general" && !descriptionDirty}
+                      statusRef={generalStatusRef}
+                      onSave={() => requestSave("general")}
+                      onDiscard={() => handleDiscard("general")}
+                    />
+                  )}
+                </Panel>
+
+                <Panel
+                  variant="workspace"
+                  id="access"
+                  role="region"
+                  aria-labelledby="access-settings-heading"
+                  inset={false}
+                  className="scroll-mt-6 border-border-strong"
+                >
+                  <SettingsSectionHeader
+                    id="access-settings-heading"
+                    icon={ShieldCheck}
+                    title="Access"
+                    description="Set the vault-wide default without changing individual member roles."
+                    tone={publicAccess === "none" ? "info" : "success"}
+                  />
+                  <div className="space-y-4 p-4">
+                    <div>
+                      <Label id="public-access-label" className="mb-2 block">
+                        Public access
+                      </Label>
+                      <Segmented
+                        aria-labelledby="public-access-label"
+                        value={publicAccess}
+                        onChange={(value) => {
+                          setPublicAccess(value as PublicAccess);
+                          setSavedScope(null);
+                        }}
+                        disabled={!canEdit || saving}
+                        className="grid-cols-1 sm:grid-cols-3"
+                        options={PUBLIC_ORDER.map((value) => {
+                          const Icon = PUBLIC_ICONS[value];
+                          return {
+                            value,
+                            label: PUBLIC_LABELS[value],
+                            icon: <Icon className="h-3.5 w-3.5" aria-hidden />,
+                            danger: value === "writer",
+                          };
+                        })}
+                      />
+                      <p
+                        className={`mt-3 flex items-start gap-2 text-xs leading-relaxed ${
+                          publicAccess === "writer"
+                            ? "text-warning-soft-foreground"
+                            : "text-foreground-muted"
+                        }`}
+                      >
+                        {publicAccess === "writer" ? (
+                          <AlertTriangle
+                            className="mt-0.5 h-3.5 w-3.5 shrink-0"
+                            aria-hidden
+                          />
+                        ) : publicAccess === "none" ? (
+                          <Lock
+                            className="mt-0.5 h-3.5 w-3.5 shrink-0"
+                            aria-hidden
+                          />
+                        ) : (
+                          <Globe
+                            className="mt-0.5 h-3.5 w-3.5 shrink-0"
+                            aria-hidden
+                          />
+                        )}
+                        <span>{PUBLIC_DESCRIPTIONS[publicAccess]}</span>
+                      </p>
+                    </div>
+
+                    {saveErrorScope === "access" && (
+                      <Alert variant="destructive">{saveError}</Alert>
+                    )}
+                  </div>
+                  {canEdit && (
+                    <SettingsActionBar
+                      dirty={accessDirty}
+                      saving={savingScope === "access"}
+                      saved={savedScope === "access" && !accessDirty}
+                      statusRef={accessStatusRef}
+                      onSave={() => requestSave("access")}
+                      onDiscard={() => handleDiscard("access")}
+                    />
+                  )}
+                  <div className="flex flex-col gap-3 border-t border-border bg-surface-2 p-4 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="flex min-w-0 items-start gap-3">
+                      <TonalIcon tone="people">
+                        <Users className="h-4 w-4" aria-hidden />
+                      </TonalIcon>
+                      <div>
+                        <h3 className="text-sm font-semibold text-foreground">
+                          Members and ownership
+                        </h3>
+                        <p className="mt-1 text-xs leading-relaxed text-foreground-muted">
+                          Invite people, adjust roles, or transfer ownership
+                          from the Members page.
+                        </p>
+                      </div>
+                    </div>
+                    <Button
+                      asChild
+                      variant="outline"
+                      size="sm"
+                      className="shrink-0"
+                    >
+                      <Link to={`/vault/${name}/members`}>Open members</Link>
+                    </Button>
+                  </div>
+                </Panel>
+
+                <SkillSection
+                  vault={name}
+                  doc={skillDoc}
+                  loading={skillQuery.isLoading || (!info && !loadError)}
+                  isMirror={info.is_external_git}
+                  canManage={canManageSkill}
+                />
+
+                {canEdit && (
+                  <Panel
+                    variant="workspace"
+                    id="danger"
+                    role="region"
+                    aria-labelledby="danger-settings-heading"
+                    className="scroll-mt-4 border-destructive"
+                  >
+                    <div className="border-b border-destructive bg-destructive-soft px-3 py-2.5">
+                      <div className="flex items-start gap-3">
+                        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-sm)] border border-destructive text-destructive">
+                          <AlertTriangle className="h-4 w-4" aria-hidden />
+                        </span>
+                        <div>
+                          <h2
+                            id="danger-settings-heading"
+                            className="text-sm font-semibold text-destructive"
+                          >
+                            Danger zone
+                          </h2>
+                          <p className="mt-1 text-xs leading-relaxed text-foreground-muted">
+                            These actions change availability for every member
+                            and connected agent.
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="divide-y divide-border">
+                      <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
+                        <div className="min-w-0">
+                          <h3 className="flex items-center gap-2 text-sm font-semibold text-foreground">
+                            {info.is_archived ? (
+                              <Archive
+                                className="h-4 w-4 text-foreground-muted"
+                                aria-hidden
+                              />
+                            ) : (
+                              <CheckCircle2
+                                className="h-4 w-4 text-success"
+                                aria-hidden
+                              />
+                            )}
+                            {info.is_archived
+                              ? "Vault archived"
+                              : "Archive vault"}
+                          </h3>
+                          <p className="mt-1 max-w-2xl text-sm leading-relaxed text-foreground-muted">
+                            {info.is_archived
+                              ? "The vault is read-only. Members and agents can still retrieve its knowledge."
+                              : "Freeze all writes while keeping documents searchable. Archiving is reversible."}
+                          </p>
+                        </div>
+                        {info.is_archived ? (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setPendingUnarchive(true)}
+                          >
+                            <RotateCcw className="h-4 w-4" aria-hidden />
+                            Unarchive
+                          </Button>
+                        ) : (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setPendingArchive(true)}
+                          >
+                            <Archive className="h-4 w-4" aria-hidden />
+                            Archive
+                          </Button>
+                        )}
+                      </div>
+
+                      <div className="flex flex-col gap-3 bg-destructive-soft p-4 sm:flex-row sm:items-center sm:justify-between">
+                        <div className="min-w-0">
+                          <h3 className="flex items-center gap-2 text-sm font-semibold text-destructive">
+                            <Trash2 className="h-4 w-4" aria-hidden />
+                            Delete vault permanently
+                          </h3>
+                          <p className="mt-1 max-w-2xl text-sm leading-relaxed text-foreground-muted">
+                            Removes everything inside
+                            {deleteScale ? ` — ${deleteScale}` : ""}, plus git
+                            history, relations, embeddings, sessions, and stored
+                            files. This cannot be undone.
+                          </p>
+                          {tables.length > 0 && (
+                            <p className="mt-2 max-w-2xl text-xs leading-relaxed text-foreground-muted">
+                              Tables removed:{" "}
+                              {tables
+                                .slice(0, 4)
+                                .map((table) => table.name)
+                                .join(", ")}
+                              {tables.length > 4
+                                ? `, and ${tables.length - 4} more`
+                                : ""}
+                              .
+                            </p>
+                          )}
+                        </div>
+                        <Button
+                          variant="destructive"
+                          size="sm"
+                          onClick={() => setDeleteOpen(true)}
+                        >
+                          <Trash2 className="h-4 w-4" aria-hidden />
+                          Delete vault
+                        </Button>
+                      </div>
+                    </div>
+                  </Panel>
                 )}
-              </div>
-            </div>
+              </main>
 
-            <div className="p-4">
-              <h3 className="text-base font-semibold tracking-tight mb-1">
-                Transfer ownership
-              </h3>
-              <p className="text-sm text-foreground-muted leading-relaxed max-w-prose mb-3">
-                You currently own <span className="text-foreground">{name}</span>.
-                Reassign ownership to another vault member and you become an admin
-                afterward. Use the Members page — it knows who can be promoted.
-              </p>
-              <Button asChild variant="outline">
-                <Link to={`/vault/${name}/members`}>Open members</Link>
-              </Button>
-            </div>
-          </div>
-        </section>
-      )}
+              <aside
+                aria-label="Vault settings context"
+                className="rail-scroll min-w-0 border-t border-border bg-surface-2 p-4 sm:p-5 lg:col-start-2 lg:row-start-2 xl:col-start-3 xl:row-start-1 xl:min-h-0 xl:overflow-y-auto xl:overscroll-contain xl:border-t-0 xl:border-l xl:bg-surface xl:p-0"
+              >
+                <div className="grid gap-3 lg:grid-cols-2 xl:grid-cols-1 xl:gap-0">
+                  <Panel
+                    variant="workspace"
+                    className="xl:rounded-none xl:border-x-0 xl:border-t-0 xl:shadow-none"
+                  >
+                    <div
+                      data-slot="vault-context-header"
+                      className="border-b border-border-strong bg-surface-2/55 p-3"
+                    >
+                      <div className="flex items-start gap-3">
+                        <TonalIcon tone="knowledge">
+                          <Box className="h-4 w-4" aria-hidden />
+                        </TonalIcon>
+                        <div className="min-w-0">
+                          <p className="text-xs text-foreground-muted">
+                            Current vault
+                          </p>
+                          <h2 className="mt-0.5 truncate font-display text-base font-semibold text-foreground">
+                            {name}
+                          </h2>
+                        </div>
+                      </div>
+                    </div>
 
-      {/* § DANGER ZONE */}
-      {canEdit && (
-        <section aria-labelledby="danger-h" className="mb-12">
-          <header className="flex items-baseline gap-3 pb-3 border-b border-destructive mb-4">
-            <h2 id="danger-h" className="coord-spark text-destructive">
-              Danger zone
-            </h2>
-          </header>
+                    <div className="p-3">
+                      <VaultContextBadge name={name} address copyable />
 
-          <div className="rounded-[var(--radius-lg)] border border-destructive bg-destructive-soft p-4">
-            <div className="flex items-baseline justify-between flex-wrap gap-y-3">
-              <div className="min-w-0 pr-4">
-                <h3 className="text-base font-semibold tracking-tight mb-1 inline-flex items-center gap-1.5 text-destructive">
-                  <AlertTriangle className="h-4 w-4" aria-hidden />
-                  Delete vault permanently
-                </h3>
-                <p className="text-sm text-foreground-muted leading-relaxed max-w-prose">
-                  Removes the vault and everything inside it
-                  {deleteScale ? <> — <span className="text-foreground">{deleteScale}</span></> : null},
-                  plus embeddings, relations, sessions, memories, S3 file objects,
-                  and the git repository. Agents lose access immediately. This
-                  cannot be undone — prefer Archive if you only need to freeze the
-                  vault.
-                </p>
-                {tables.length > 0 && (
-                  <p className="text-xs text-foreground-muted leading-relaxed max-w-prose mt-2">
-                    Tables destroyed:{" "}
-                    {tables.slice(0, 6).map((t, i) => (
-                      <span key={t.name}>
-                        {i > 0 && ", "}
-                        <span className="text-foreground">{t.name}</span> (
-                        {(t.row_count ?? 0).toLocaleString()} row
-                        {t.row_count === 1 ? "" : "s"})
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {info.role && <RoleBadge role={info.role} />}
+                        <VaultStateBadge
+                          archived={info.is_archived}
+                          externalGit={info.is_external_git}
+                          publicAccess={info.public_access}
+                        />
+                      </div>
+                    </div>
+                    <Link
+                      to={`/vault/${name}`}
+                      className="flex min-h-10 items-center justify-between gap-3 border-t border-border px-3 text-xs font-medium text-link transition-token hover:bg-surface-hover hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                    >
+                      Open Vault Overview
+                      <ArrowLeft className="h-4 w-4 rotate-180" aria-hidden />
+                    </Link>
+                  </Panel>
+
+                  <Panel
+                    variant="workspace"
+                    className="xl:rounded-none xl:border-x-0 xl:border-t-0 xl:shadow-none"
+                  >
+                    <PanelHeader
+                      variant="workspace"
+                      label="About"
+                      className="border-border-strong bg-surface-2/55"
+                    />
+                    <dl className="divide-y divide-border px-4 text-sm">
+                      <ContextRow
+                        label="Owner"
+                        value={
+                          info.owner_display_name || info.owner || "Unknown"
+                        }
+                      />
+                      <ContextRow
+                        label="Created"
+                        value={
+                          info.created_at ? timeAgo(info.created_at) : "Unknown"
+                        }
+                      />
+                      <ContextRow
+                        label="Last active"
+                        value={
+                          info.last_activity
+                            ? timeAgo(info.last_activity)
+                            : "No activity"
+                        }
+                      />
+                      <ContextRow
+                        label="Members"
+                        value={(info.member_count ?? 0).toLocaleString()}
+                      />
+                    </dl>
+                    <div className="grid grid-cols-2 border-t border-border bg-surface-2">
+                      <SnapshotCell
+                        label="Collections"
+                        value={info.collection_count ?? 0}
+                      />
+                      <SnapshotCell
+                        label="Documents"
+                        value={info.document_count ?? 0}
+                        bordered
+                      />
+                      <SnapshotCell
+                        label="Tables"
+                        value={info.table_count ?? 0}
+                        top
+                      />
+                      <SnapshotCell
+                        label="Files"
+                        value={info.file_count ?? 0}
+                        bordered
+                        top
+                      />
+                    </div>
+                    <div className="flex items-center justify-between gap-3 border-t border-border px-4 py-3 text-xs">
+                      <span className="text-foreground-muted">Graph links</span>
+                      <span className="tabular-nums text-foreground">
+                        {(info.edge_count ?? 0).toLocaleString()}
                       </span>
-                    ))}
-                    {tables.length > 6 && <>, +{tables.length - 6} more</>}.
-                  </p>
-                )}
-              </div>
-              <Button variant="destructive" onClick={() => setDeleteOpen(true)}>
-                <Trash2 className="h-4 w-4" aria-hidden />
-                Delete vault
-              </Button>
+                    </div>
+                  </Panel>
+
+                  {vaultHealth && (
+                    <Panel
+                      variant="workspace"
+                      className="xl:rounded-none xl:border-x-0 xl:border-t-0 xl:shadow-none"
+                    >
+                      <PanelHeader
+                        variant="workspace"
+                        label="Operations"
+                        className="border-border-strong bg-surface-2/55"
+                      />
+                      <div className="divide-y divide-border">
+                        <PipelineStatus
+                          label="Indexing"
+                          stats={vaultHealth.vector_store?.backfill?.upsert}
+                        />
+                        <PipelineStatus
+                          label="Metadata"
+                          stats={vaultHealth.metadata_backfill}
+                        />
+                      </div>
+                      <p className="border-t border-border px-4 py-3 text-xs leading-relaxed text-foreground-muted">
+                        New content is processed asynchronously after each
+                        write.
+                      </p>
+                    </Panel>
+                  )}
+                </div>
+              </aside>
             </div>
           </div>
-        </section>
+        </div>
       )}
 
-      {/* § DIAGNOSTICS — owner-only (non-owners get the indexing summary on the
-          overview badge; the raw worker telemetry is operator detail). */}
-      {canEdit && vaultHealth && (
-        <section aria-labelledby="diag-h">
-          <header className="flex items-baseline gap-3 pb-3 border-b border-border mb-4">
-            <h2 id="diag-h" className="coord-ink">
-              Diagnostics
-            </h2>
-            <span className="coord">indexing pipeline</span>
-          </header>
-          <div className="grid grid-cols-2 gap-px rounded-[var(--radius-lg)] overflow-hidden border border-border bg-border shadow-sm">
-            <DiagCell title="Indexing" stats={vaultHealth.vector_store?.backfill?.upsert} />
-            <DiagCell title="Metadata" stats={vaultHealth.metadata_backfill} />
-          </div>
-          <p className="text-xs text-foreground-muted mt-2 leading-relaxed max-w-prose">
-            Backfill workers process new chunks asynchronously after a write.
-            Numbers reset to zero when caught up. Persistent non-zero values
-            across multiple refreshes signal a stuck worker — check the
-            embedding API or vector-store health.
-          </p>
-        </section>
-      )}
+      <span className="sr-only" role="status" aria-live="polite">
+        {loading
+          ? "Loading vault settings"
+          : loadError
+            ? "Could not load settings"
+            : ""}
+      </span>
 
       <ConfirmDialog
         open={pendingArchive}
@@ -679,16 +880,19 @@ export default function VaultSettingsPage() {
         variant="destructive"
         description={
           <span className="flex items-start gap-2">
-            <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5 text-destructive" aria-hidden />
+            <AlertTriangle
+              className="mt-0.5 h-4 w-4 shrink-0 text-destructive"
+              aria-hidden
+            />
             <span>
-              Any signed-in person with the link — including people you never
-              invited — will be able to create, edit, and delete content in this
-              vault. You can lower this again at any time.
+              Any signed-in person with the link will be able to create, edit,
+              and delete content in this vault. You can lower access again
+              later.
             </span>
           </span>
         }
         confirmLabel="Make world-writable"
-        onConfirm={doSave}
+        onConfirm={() => doSave("access")}
       />
 
       <DeleteVaultDialog
@@ -696,24 +900,96 @@ export default function VaultSettingsPage() {
         onOpenChange={setDeleteOpen}
         vault={name}
         onDeleted={() => {
-          // Invalidate the sidebar list before navigating so the
-          // just-deleted vault doesn't briefly reappear in the picker.
           refetchVaults();
           navigate("/vault");
         }}
       />
+    </PageShell>
+  );
+}
+
+function SettingsActionBar({
+  dirty,
+  saving,
+  saved,
+  statusRef,
+  onSave,
+  onDiscard,
+}: {
+  dirty: boolean;
+  saving: boolean;
+  saved: boolean;
+  statusRef: RefObject<HTMLSpanElement | null>;
+  onSave: () => void;
+  onDiscard: () => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-2 border-t border-border bg-surface-2 px-4 py-2.5">
+      <Button
+        type="button"
+        size="sm"
+        onClick={onSave}
+        loading={saving}
+        disabled={!dirty}
+      >
+        {!saving && <Save className="h-3.5 w-3.5" aria-hidden />}
+        {saving ? "Saving…" : "Save changes"}
+      </Button>
+      {dirty && !saving && (
+        <Button type="button" variant="outline" size="sm" onClick={onDiscard}>
+          Discard
+        </Button>
+      )}
+      <span
+        ref={statusRef}
+        tabIndex={-1}
+        role="status"
+        aria-live="polite"
+        className="outline-none"
+      >
+        {dirty ? (
+          <span className="text-xs text-foreground-muted">Unsaved changes</span>
+        ) : saved ? (
+          <span className="inline-flex items-center gap-1.5 text-xs text-success">
+            <CheckCircle2 className="h-3.5 w-3.5" aria-hidden />
+            Saved
+          </span>
+        ) : null}
+      </span>
     </div>
   );
 }
 
-function SettingsStatSkeleton() {
+function ContextRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center justify-between gap-3 py-2.5 text-xs">
+      <dt className="text-foreground-muted">{label}</dt>
+      <dd className="truncate text-right font-medium text-foreground">
+        {value}
+      </dd>
+    </div>
+  );
+}
+
+function SnapshotCell({
+  label,
+  value,
+  bordered = false,
+  top = false,
+}: {
+  label: string;
+  value: number;
+  bordered?: boolean;
+  top?: boolean;
+}) {
   return (
     <div
-      className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm px-4 py-3.5"
-      aria-hidden
+      className={`${bordered ? "border-l border-border" : ""} ${top ? "border-t border-border" : ""} px-3 py-2.5`}
     >
-      <div className="h-3 w-16 rounded bg-surface-muted animate-pulse mb-2" />
-      <div className="h-7 w-10 rounded bg-surface-muted animate-pulse" />
+      <p className="text-xs text-foreground-muted">{label}</p>
+      <p className="mt-1 text-sm font-semibold tabular-nums text-foreground">
+        {value.toLocaleString()}
+      </p>
     </div>
   );
 }
@@ -724,43 +1000,79 @@ interface DiagStats {
   abandoned?: number;
 }
 
-/** A glanceable verdict so a healthy pipeline reads "Caught up" instead of a
- *  wall of 0/0/0 — color always paired with an icon + word. */
-function diagVerdict(stats?: DiagStats): { label: string; cls: string; Icon: LucideIcon } {
-  const a = stats?.abandoned ?? 0;
+function diagVerdict(stats?: DiagStats): {
+  label: string;
+  className: string;
+  Icon: LucideIcon;
+} {
+  const abandoned = stats?.abandoned ?? 0;
   const inFlight = (stats?.pending ?? 0) + (stats?.retrying ?? 0);
-  if (a > 0) return { label: `${a.toLocaleString()} abandoned`, cls: "text-destructive", Icon: AlertTriangle };
-  if (inFlight > 0)
-    return { label: `${inFlight.toLocaleString()} in progress`, cls: "text-warning", Icon: CircleDashed };
-  return { label: "Caught up", cls: "text-success", Icon: CheckCircle2 };
+  if (abandoned > 0) {
+    return {
+      label: `${abandoned.toLocaleString()} need attention`,
+      className: "text-destructive",
+      Icon: AlertTriangle,
+    };
+  }
+  if (inFlight > 0) {
+    return {
+      label: `${inFlight.toLocaleString()} in progress`,
+      className: "text-warning",
+      Icon: CircleDashed,
+    };
+  }
+  return { label: "Caught up", className: "text-success", Icon: CheckCircle2 };
 }
 
-function DiagCell({ title, stats }: { title: string; stats?: DiagStats }) {
-  const v = diagVerdict(stats);
-  const VIcon = v.Icon;
+function PipelineStatus({
+  label,
+  stats,
+}: {
+  label: string;
+  stats?: DiagStats;
+}) {
+  const verdict = diagVerdict(stats);
+  const Icon = verdict.Icon;
   return (
-    <div className="bg-surface p-3">
-      <div className="flex items-center justify-between gap-2 mb-2">
-        <div className="coord-ink">{title}</div>
-        <span className={`inline-flex items-center gap-1 text-xs ${v.cls}`}>
-          <VIcon className="h-3 w-3" aria-hidden />
-          {v.label}
-        </span>
+    <div className="flex items-center justify-between gap-3 px-4 py-3 text-sm">
+      <span className="flex items-center gap-2 text-foreground">
+        {label === "Indexing" ? (
+          <Activity className="h-4 w-4 text-foreground-muted" aria-hidden />
+        ) : (
+          <BookOpen className="h-4 w-4 text-foreground-muted" aria-hidden />
+        )}
+        {label}
+      </span>
+      <span
+        className={`inline-flex items-center gap-1.5 text-xs ${verdict.className}`}
+      >
+        <Icon className="h-3.5 w-3.5" aria-hidden />
+        {verdict.label}
+      </span>
+    </div>
+  );
+}
+
+function SettingsLoadingState() {
+  return (
+    <div
+      className="grid gap-5 lg:grid-cols-[9.5rem_minmax(0,1fr)]"
+      role="status"
+      aria-label="Loading vault settings"
+    >
+      <div
+        className="h-44 animate-pulse rounded-[var(--radius-md)] border border-border bg-surface"
+        aria-hidden
+      />
+      <div className="space-y-4">
+        {[0, 1, 2].map((index) => (
+          <div
+            key={index}
+            className="h-48 animate-pulse rounded-[var(--radius-md)] border border-border bg-surface"
+            aria-hidden
+          />
+        ))}
       </div>
-      <dl className="text-xs space-y-1 tabular-nums">
-        <div className="flex justify-between">
-          <dt className="text-foreground-muted">pending</dt>
-          <dd>{stats?.pending ?? "—"}</dd>
-        </div>
-        <div className="flex justify-between">
-          <dt className="text-foreground-muted">retrying</dt>
-          <dd>{stats?.retrying ?? "—"}</dd>
-        </div>
-        <div className="flex justify-between text-destructive">
-          <dt>abandoned</dt>
-          <dd>{stats?.abandoned ?? "—"}</dd>
-        </div>
-      </dl>
     </div>
   );
 }

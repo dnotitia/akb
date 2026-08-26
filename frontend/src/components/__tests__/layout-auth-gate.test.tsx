@@ -13,6 +13,7 @@ vi.mock("@/lib/api", () => ({
   getToken: vi.fn(),
   getAuthConfig: vi.fn(),
   getMe: vi.fn(),
+  searchDocs: vi.fn(),
   logoutOrdinarySession: vi.fn(),
   clearPrivateAssetCache: vi.fn(),
 }));
@@ -34,6 +35,10 @@ function renderAt(path: string, queryClient = new QueryClient()) {
           <Route element={<Layout />}>
             <Route path="/" element={<div data-testid="home" />} />
             <Route path="/search" element={<div data-testid="search-page" />} />
+            <Route
+              path="/vault/:name/settings"
+              element={<div data-testid="vault-settings" />}
+            />
           </Route>
           <Route path="/auth" element={<div data-testid="auth-page" />} />
         </Routes>
@@ -79,6 +84,24 @@ describe("Layout — auth gate", () => {
     expect(await screen.findByTestId("home")).toBeTruthy();
     expect(api.getMe).toHaveBeenCalledWith({ redirectOnUnauthorized: false });
     expect(screen.queryByTestId("auth-page")).toBeNull();
+  });
+
+  it("keeps the global header full-width without page-level responsive gutters", async () => {
+    vi.mocked(api.getToken).mockReturnValue("fake-jwt");
+    renderAt("/");
+
+    expect(await screen.findByTestId("home")).toBeTruthy();
+    const headerRow = screen.getByRole("banner").firstElementChild;
+    expect(headerRow).toHaveClass("w-full", "px-3");
+    expect(headerRow).not.toHaveClass("xl:px-12", "2xl:px-16");
+  });
+
+  it("does not reserve a second root scrollbar gutter for vault workspaces", async () => {
+    vi.mocked(api.getToken).mockReturnValue("fake-jwt");
+    renderAt("/vault/demo/settings");
+
+    expect(await screen.findByTestId("vault-settings")).toBeTruthy();
+    expect(document.documentElement).toHaveClass("vault-workspace-scroll-lock");
   });
 
   it("accepts a verified SSO cookie session without any local token", async () => {

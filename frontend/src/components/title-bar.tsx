@@ -1,5 +1,14 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { ArrowLeft, Compass, GitGraph, Search as SearchIcon, Share2, Users } from "lucide-react";
+import {
+  ArrowLeft,
+  Compass,
+  GitGraph,
+  Search as SearchIcon,
+  Settings as SettingsIcon,
+  Share2,
+  Users,
+  type LucideIcon,
+} from "lucide-react";
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
@@ -13,11 +22,13 @@ export function TitleBar({
   right,
   left,
   className,
+  showBack = true,
 }: {
   crumbs: Crumb[];
   right?: ReactNode;
   left?: ReactNode;
   className?: string;
+  showBack?: boolean;
 }) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -34,36 +45,38 @@ export function TitleBar({
   return (
     <div
       className={cn(
-        "flex items-center gap-2.5 h-10 px-3 border-b border-border bg-surface/80 backdrop-blur",
+        "flex h-10 items-center gap-2 overflow-x-auto border-b border-border bg-surface/80 px-3 backdrop-blur [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
         "text-xs font-medium text-foreground-muted",
         className,
       )}
     >
       {left}
-      <button
-        type="button"
-        onClick={handleBack}
-        disabled={!canBack}
-        aria-label="Go back"
-        title="Go back"
-        className={cn(
-          "inline-flex items-center justify-center h-6 w-6 -ml-1",
-          "text-foreground-muted hover:text-foreground hover:bg-surface-hover",
-          "disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-transparent",
-          "transition-colors duration-150",
-          "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
-          "cursor-pointer",
-        )}
-      >
-        <ArrowLeft className="h-3 w-3" aria-hidden />
-      </button>
+      {showBack && (
+        <button
+          type="button"
+          onClick={handleBack}
+          disabled={!canBack}
+          aria-label="Go back"
+          title="Go back"
+          className={cn(
+            "-ml-1 inline-flex h-7 w-7 items-center justify-center rounded-[var(--radius-sm)]",
+            "text-foreground-muted hover:text-foreground hover:bg-surface-hover",
+            "disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-transparent",
+            "transition-colors duration-150",
+            "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
+            "cursor-pointer",
+          )}
+        >
+          <ArrowLeft className="h-3 w-3" aria-hidden />
+        </button>
+      )}
       {crumbs.length > 0 && (
-        <nav aria-label="Breadcrumb">
-          <ol className="flex items-center gap-2.5">
+        <nav aria-label="Breadcrumb" className="shrink-0">
+          <ol className="flex items-center gap-2">
             {crumbs.map((c, i) => {
               const isLast = i === crumbs.length - 1;
               return (
-                <li key={i} className="flex items-center gap-2.5">
+                <li key={i} className="flex items-center gap-2">
                   {i > 0 && (
                     <span className="text-foreground-muted" aria-hidden>
                       ›
@@ -94,14 +107,14 @@ export function TitleBar({
           </ol>
         </nav>
       )}
-      {right && <div className="ml-auto flex items-center gap-2">{right}</div>}
+      {right && <div className="ml-auto flex shrink-0 items-center gap-1">{right}</div>}
     </div>
   );
 }
 
-// `settings`/`activity` have no top-level tab (reached via the overview action
-// row + breadcrumb) but are listed so they no longer fall through to
-// `overview` and mis-light its tab.
+// Activity has no top-level tab, but remains a distinct page kind so it does
+// not fall through to Overview. Members and Settings form one governance group
+// after the structural divider in VaultActions.
 export type VaultPageKind =
   | "overview"
   | "search"
@@ -117,36 +130,45 @@ interface VaultActionsProps {
 }
 
 export function VaultActions({ vault, page }: VaultActionsProps) {
-  const actions: Array<[VaultPageKind, string, string, React.ComponentType<any>]> = [
+  type VaultAction = [VaultPageKind, string, string, LucideIcon];
+
+  const actions: VaultAction[] = [
     ["overview", "Overview", `/vault/${vault}`, Compass],
     ["search", "Search", `/vault/${vault}/search`, SearchIcon],
     ["graph", "Graph", `/vault/${vault}/graph`, GitGraph],
-    ["members", "Members", `/vault/${vault}/members`, Users],
     ["publish", "Publish", `/vault/${vault}/publications`, Share2],
   ];
+  const governanceActions: VaultAction[] = [
+    ["members", "Members", `/vault/${vault}/members`, Users],
+    ["settings", "Settings", `/vault/${vault}/settings`, SettingsIcon],
+  ];
+
+  const renderAction = ([k, label, href, Icon]: (typeof actions)[number]) => {
+    const active = k === page;
+    return (
+      <Link
+        key={k}
+        to={href}
+        aria-current={active ? "page" : undefined}
+        className={cn(
+          "relative inline-flex h-8 items-center gap-1.5 rounded-[var(--radius-sm)] border border-transparent px-2 text-xs transition-token",
+          "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
+          active
+            ? "bg-surface-selected font-semibold text-surface-selected-foreground"
+            : "text-foreground-muted hover:bg-surface-hover hover:text-foreground",
+        )}
+      >
+        <Icon className="h-3.5 w-3.5" aria-hidden />
+        {label}
+      </Link>
+    );
+  };
+
   return (
-    <nav aria-label="Vault sections" className="flex items-center gap-1">
-      {actions.map(([k, label, href, Icon]) => {
-        const active = k === page;
-        return (
-          <Link
-            key={k}
-            to={href}
-            aria-current={active ? "page" : undefined}
-            className={cn(
-              "inline-flex items-center gap-1 px-2.5 h-9 rounded-[var(--radius-sm)] border transition-token",
-              "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
-              // Selection is teal app-wide — no per-tab orange special-case.
-              active
-                ? "border-transparent bg-surface-selected text-surface-selected-foreground"
-                : "border-border text-foreground-muted hover:text-foreground hover:bg-surface-hover",
-            )}
-          >
-            <Icon className="h-3 w-3" aria-hidden />
-            {label}
-          </Link>
-        );
-      })}
+    <nav aria-label="Vault sections" className="flex items-center gap-0.5">
+      {actions.map(renderAction)}
+      <span className="mx-0.5 h-4 w-px bg-border" aria-hidden />
+      {governanceActions.map(renderAction)}
     </nav>
   );
 }

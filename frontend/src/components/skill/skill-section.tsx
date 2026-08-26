@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
-import { History, RotateCcw, Save } from "lucide-react";
+import { BookOpen, History, RotateCcw, Save } from "lucide-react";
 import { AgentPreview } from "./agent-preview";
 import { MarkdownRender } from "@/components/markdown-render";
 import { Alert } from "@/components/ui/alert";
@@ -9,6 +9,8 @@ import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { SkillBadge } from "@/components/ui/skill-badge";
+import { Panel } from "@/components/ui/panel";
+import { SettingsSectionHeader } from "@/components/ui/settings-section-header";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { getSkillTemplate, updateDocument } from "@/lib/api";
@@ -44,7 +46,13 @@ interface Props {
  * backend's pinned-type guard would reject the save. Title/type/tags on this
  * doc are system-managed anyway.
  */
-export function SkillSection({ vault, doc, loading, isMirror, canManage }: Props) {
+export function SkillSection({
+  vault,
+  doc,
+  loading,
+  isMirror,
+  canManage,
+}: Props) {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState("preview");
   const [draft, setDraft] = useState("");
@@ -56,7 +64,9 @@ export function SkillSection({ vault, doc, loading, isMirror, canManage }: Props
   const [resetBaseCommit, setResetBaseCommit] = useState<string | null>(null);
 
   function invalidate() {
-    queryClient.invalidateQueries({ queryKey: ["document", vault, VAULT_SKILL_PATH] });
+    queryClient.invalidateQueries({
+      queryKey: ["document", vault, VAULT_SKILL_PATH],
+    });
     queryClient.invalidateQueries({ queryKey: ["vault-skill-preview", vault] });
   }
 
@@ -113,143 +123,152 @@ export function SkillSection({ vault, doc, loading, isMirror, canManage }: Props
       content,
       expected_commit: resetBaseCommit || undefined,
     });
-    queryClient.invalidateQueries({ queryKey: ["document", vault, VAULT_SKILL_PATH] });
+    queryClient.invalidateQueries({
+      queryKey: ["document", vault, VAULT_SKILL_PATH],
+    });
     queryClient.invalidateQueries({ queryKey: ["vault-skill-preview", vault] });
   }
 
   return (
-    <section id="skill" aria-labelledby="skill-h" className="mb-12 scroll-mt-6">
-      <header className="flex items-baseline gap-3 pb-3 border-b border-border mb-4">
-        <h2 id="skill-h" className="coord-ink">
-          Vault guide
-        </h2>
-        <span className="coord">agents read this first · system-managed</span>
-      </header>
+    <section id="skill" aria-labelledby="skill-h" className="scroll-mt-6">
+      <Panel variant="workspace" inset={false} className="border-border-strong">
+        <SettingsSectionHeader
+          id="skill-h"
+          icon={BookOpen}
+          title="Vault guide"
+          description="The operating instructions injected into every agent session for this vault."
+          tone="guide"
+        />
 
-      {isMirror ? (
-        <p className="text-sm text-foreground-muted leading-relaxed max-w-prose">
-          Read-only mirror vaults don't carry a vault guide. Content here is
-          synced from an external git repository; edit the guide in that
-          repository instead.
-        </p>
-      ) : loading ? (
-        <Skeleton className="h-40 w-full" />
-      ) : !doc ? (
-        <p className="text-sm text-foreground-muted leading-relaxed max-w-prose">
-          The vault guide is missing. It is restored automatically by the system
-          backfill; contact an administrator if this persists.
-        </p>
-      ) : (
-        <>
-          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 mb-4">
-            <div className="flex items-center gap-3 text-xs">
-              <SkillBadge defined />
-              <span className="text-foreground-muted">
-                {doc.updated_at
-                  ? `Last updated ${timeAgo(doc.updated_at)}`
-                  : VAULT_SKILL_PATH}
-              </span>
-            </div>
-            <div className="flex items-center gap-1">
-              {doc.current_commit && (
-                <Button asChild variant="ghost" size="sm">
-                  <Link
-                    to={`/vault/${vault}/doc/${encodeURIComponent(VAULT_SKILL_PATH)}?commit=${doc.current_commit}`}
-                  >
-                    <History className="h-3 w-3" aria-hidden />
-                    History
-                  </Link>
-                </Button>
-              )}
-              {canManage && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => {
-                    setResetBaseCommit(doc.current_commit || null);
-                    setResetOpen(true);
-                  }}
-                >
-                  <RotateCcw className="h-3 w-3" aria-hidden />
-                  Reset to template
-                </Button>
-              )}
-            </div>
-          </div>
-
-          <Tabs value={tab} onValueChange={selectTab}>
-            <TabsList>
-              <TabsTrigger value="preview">Preview</TabsTrigger>
-              <TabsTrigger value="agent">Agent view</TabsTrigger>
-              {canManage && <TabsTrigger value="edit">Edit</TabsTrigger>}
-            </TabsList>
-
-            <TabsContent value="preview">
-              <div className="rounded-[var(--radius-lg)] border border-border bg-surface p-4 min-w-0">
-                <MarkdownRender
-                  markdown={doc.content || ""}
-                  assetContext={{
-                    mode: "authenticated",
-                    vault,
-                    document: VAULT_SKILL_PATH,
-                    commit: doc.current_commit || undefined,
-                  }}
-                />
+        <div className="p-4">
+          {isMirror ? (
+            <Alert variant="info">
+              Read-only mirror vaults don't carry a vault guide. Edit the guide
+              in the external git repository that owns this content instead.
+            </Alert>
+          ) : loading ? (
+            <Skeleton className="h-40 w-full" />
+          ) : !doc ? (
+            <Alert variant="warning">
+              The vault guide is missing. It is restored automatically by the
+              system backfill; contact an administrator if this persists.
+            </Alert>
+          ) : (
+            <>
+              <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius-md)] border border-border bg-surface-2 px-3 py-2.5">
+                <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs">
+                  <SkillBadge defined />
+                  <span className="text-foreground-muted">
+                    {doc.updated_at
+                      ? `Updated ${timeAgo(doc.updated_at)}`
+                      : VAULT_SKILL_PATH}
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {doc.current_commit && (
+                    <Button asChild variant="ghost" size="sm">
+                      <Link
+                        to={`/vault/${vault}/doc/${encodeURIComponent(VAULT_SKILL_PATH)}?commit=${doc.current_commit}`}
+                      >
+                        <History className="h-3.5 w-3.5" aria-hidden />
+                        History
+                      </Link>
+                    </Button>
+                  )}
+                  {canManage && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="border-destructive text-destructive hover:bg-destructive-soft"
+                      onClick={() => {
+                        setResetBaseCommit(doc.current_commit || null);
+                        setResetOpen(true);
+                      }}
+                    >
+                      <RotateCcw className="h-3.5 w-3.5" aria-hidden />
+                      Reset to template
+                    </Button>
+                  )}
+                </div>
               </div>
-            </TabsContent>
 
-            <TabsContent value="agent">
-              <p className="text-xs text-foreground-muted leading-relaxed max-w-prose mb-2">
-                The guide exactly as an agent receives it — server-composed, not
-                the stored markdown.
-              </p>
-              <AgentPreview vault={vault} />
-            </TabsContent>
+              <Tabs value={tab} onValueChange={selectTab}>
+                <TabsList className="max-w-full overflow-x-auto">
+                  <TabsTrigger value="preview">Preview</TabsTrigger>
+                  <TabsTrigger value="agent">Agent view</TabsTrigger>
+                  {canManage && <TabsTrigger value="edit">Edit</TabsTrigger>}
+                </TabsList>
 
-            {canManage && (
-            <TabsContent value="edit">
-              <Textarea
-                aria-label="Vault guide body"
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
-                disabled={saving}
-                rows={20}
-                placeholder="Markdown body of the vault guide."
-                className="resize-y font-mono text-[12px] leading-relaxed"
-                spellCheck={false}
-              />
-              {saveError && (
-                <Alert
-                  variant={saveConflict ? "warning" : "destructive"}
-                  title={saveConflict ? "Guide changed elsewhere" : undefined}
-                  className="mt-3"
-                >
-                  {saveError}
-                </Alert>
-              )}
-              <div className="flex items-center gap-3 mt-3">
-                <Button
-                  variant="accent"
-                  onClick={handleSave}
-                  loading={saving}
-                  disabled={draft === (doc.content || "")}
-                >
-                  {!saving && <Save className="h-4 w-4" aria-hidden />}
-                  {saving ? "Saving…" : "Save guide"}
-                </Button>
-                <Button
-                  variant="outline"
-                  onClick={() => selectTab("preview")}
-                  disabled={saving}
-                >
-                  Cancel
-                </Button>
-              </div>
-            </TabsContent>
-            )}
-          </Tabs>
-        </>
-      )}
+                <TabsContent value="preview">
+                  <div className="min-w-0 rounded-[var(--radius-md)] border border-border bg-background p-5 sm:p-6">
+                    <MarkdownRender
+                      markdown={doc.content || ""}
+                      assetContext={{
+                        mode: "authenticated",
+                        vault,
+                        document: VAULT_SKILL_PATH,
+                        commit: doc.current_commit || undefined,
+                      }}
+                    />
+                  </div>
+                </TabsContent>
+
+                <TabsContent value="agent">
+                  <p className="mb-3 max-w-prose text-xs leading-relaxed text-foreground-muted">
+                    This is the server-composed payload an agent receives, not
+                    merely the stored markdown document.
+                  </p>
+                  <AgentPreview vault={vault} />
+                </TabsContent>
+
+                {canManage && (
+                  <TabsContent value="edit">
+                    <Textarea
+                      aria-label="Vault guide body"
+                      value={draft}
+                      onChange={(event) => setDraft(event.target.value)}
+                      disabled={saving}
+                      rows={20}
+                      placeholder="Markdown body of the vault guide."
+                      className="resize-y font-mono text-xs leading-relaxed"
+                      spellCheck={false}
+                    />
+                    {saveError && (
+                      <Alert
+                        variant={saveConflict ? "warning" : "destructive"}
+                        title={
+                          saveConflict ? "Guide changed elsewhere" : undefined
+                        }
+                        className="mt-3"
+                      >
+                        {saveError}
+                      </Alert>
+                    )}
+                    <div className="mt-3 flex items-center gap-3">
+                      <Button
+                        variant="accent"
+                        onClick={handleSave}
+                        loading={saving}
+                        disabled={draft === (doc.content || "")}
+                      >
+                        {!saving && <Save className="h-4 w-4" aria-hidden />}
+                        {saving ? "Saving…" : "Save guide"}
+                      </Button>
+                      <Button
+                        variant="outline"
+                        onClick={() => selectTab("preview")}
+                        disabled={saving}
+                      >
+                        Cancel
+                      </Button>
+                    </div>
+                  </TabsContent>
+                )}
+              </Tabs>
+            </>
+          )}
+        </div>
+      </Panel>
 
       <ConfirmDialog
         open={resetOpen}

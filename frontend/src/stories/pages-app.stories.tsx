@@ -192,8 +192,8 @@ export const SettingsProfile: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
-    await expect(await canvas.findByText("Account")).toBeInTheDocument();
+    await expect(await canvas.findByRole("heading", { name: "Account settings" })).toBeInTheDocument();
+    await expect(await canvas.findByText("Personal workspace")).toBeInTheDocument();
     await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
     await expect(canvas.queryByRole("navigation", { name: "Vaults" })).not.toBeInTheDocument();
   },
@@ -259,7 +259,7 @@ export const SettingsAdminPermissionFallback: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("Account")).toBeInTheDocument();
+    await expect(await canvas.findByText("Personal workspace")).toBeInTheDocument();
     await expect(canvas.queryByRole("tab", { name: "Admin" })).not.toBeInTheDocument();
     await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
   },

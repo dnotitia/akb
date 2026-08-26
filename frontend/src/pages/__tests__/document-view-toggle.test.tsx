@@ -4,7 +4,9 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { VaultRefreshProvider } from "@/contexts/vault-refresh-context";
+import { CurrentUserProvider } from "@/contexts/current-user-context";
 import DocumentPage from "@/pages/document";
+import { readRecentDocumentViews } from "@/lib/recent-document-views";
 
 vi.mock("@/lib/api", () => ({
   getDocument: vi.fn(),
@@ -48,6 +50,15 @@ const updateDocumentMock = updateDocument as unknown as ReturnType<typeof vi.fn>
 
 const SAMPLE_CONTENT = "# BodyHeading\n\nworld";
 const UPDATED_COMMIT = "fedcba987654321"; // pragma: allowlist secret — synthetic Git commit
+const CURRENT_USER = {
+  user_id: "document-reader",
+  username: "reader",
+  email: "reader@example.com",
+  display_name: "Document Reader",
+  is_admin: false,
+  auth_method: "local",
+  key_class: null,
+};
 
 function makeDoc(overrides: Record<string, unknown> = {}) {
   // NB: the real GET /documents response exposes NO internal `id` — `uri`/
@@ -72,7 +83,12 @@ function makeDoc(overrides: Record<string, unknown> = {}) {
 
 function LocationProbe() {
   const loc = useLocation();
-  return <div data-testid="location-search">{loc.search}</div>;
+  return (
+    <>
+      <div data-testid="location-search">{loc.search}</div>
+      <div data-testid="location-state">{JSON.stringify(loc.state)}</div>
+    </>
+  );
 }
 
 function renderAt(url: string) {
@@ -80,11 +96,49 @@ function renderAt(url: string) {
   return render(
     <QueryClientProvider client={qc}>
       <MemoryRouter initialEntries={[url]}>
-        <VaultRefreshProvider refetchVaults={vi.fn()} refetchTree={vi.fn()}>
-          <Routes>
-            <Route path="/vault/:name/doc/:id" element={<DocumentPage />} />
-          </Routes>
-        </VaultRefreshProvider>
+        <CurrentUserProvider user={CURRENT_USER}>
+          <VaultRefreshProvider refetchVaults={vi.fn()} refetchTree={vi.fn()}>
+            <Routes>
+              <Route path="/vault/:name/doc/:id" element={<DocumentPage />} />
+            </Routes>
+          </VaultRefreshProvider>
+        </CurrentUserProvider>
+        <LocationProbe />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+function renderPreviewAt(url: string) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const backgroundLocation = {
+    pathname: "/search",
+    search: "?q=hello",
+    hash: "",
+    state: null,
+    key: "search-result-list",
+  };
+  return render(
+    <QueryClientProvider client={qc}>
+      <MemoryRouter
+        initialEntries={[
+          {
+            pathname: url.split("?")[0],
+            search: url.includes("?") ? `?${url.split("?")[1]}` : "",
+            state: { documentPreview: true, backgroundLocation },
+          },
+        ]}
+      >
+        <CurrentUserProvider user={CURRENT_USER}>
+          <VaultRefreshProvider refetchVaults={vi.fn()} refetchTree={vi.fn()}>
+            <Routes>
+              <Route
+                path="/vault/:name/doc/:id"
+                element={<DocumentPage presentation="preview" />}
+              />
+            </Routes>
+          </VaultRefreshProvider>
+        </CurrentUserProvider>
         <LocationProbe />
       </MemoryRouter>
     </QueryClientProvider>,
@@ -92,6 +146,7 @@ function renderAt(url: string) {
 }
 
 beforeEach(() => {
+  localStorage.clear();
   getDocumentMock.mockReset();
   getVaultInfoMock.mockReset();
   getRelationsMock.mockReset();
@@ -121,6 +176,129 @@ afterEach(() => {
 });
 
 describe("DocumentPage view toggle", () => {
+  it("records a successful document read for Home resume", async () => {
+    getDocumentMock.mockResolvedValue(makeDoc({
+      type: "report",
+      updated_at: "2026-08-25T09:00:00Z",
+    }));
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await screen.findByRole("heading", { level: 1, name: "DocTitle" });
+    await waitFor(() => {
+      expect(readRecentDocumentViews(CURRENT_USER.user_id)[0]).toEqual(
+        expect.objectContaining({
+          vault: "v",
+          path: "notes/hello.md",
+          title: "DocTitle",
+          type: "report",
+          updatedAt: "2026-08-25T09:00:00Z",
+        }),
+      );
+    });
+  });
+
+  it("keeps preview history state across view tabs and clears it for full-page reading", async () => {
+    const user = userEvent.setup();
+    renderPreviewAt("/vault/v/doc/notes%2Fhello.md");
+
+    const workspace = await screen.findByRole("region", {
+      name: "Document workspace",
+    });
+    expect(workspace).toHaveAttribute("data-presentation", "preview");
+    expect(screen.getByTestId("location-state")).toHaveTextContent(
+      '"documentPreview":true',
+    );
+
+    await user.click(screen.getByRole("tab", { name: "Raw" }));
+    expect(await screen.findByTestId("doc-raw")).toBeInTheDocument();
+    expect(screen.getByTestId("location-state")).toHaveTextContent(
+      '"documentPreview":true',
+    );
+
+    await user.click(screen.getByRole("button", { name: "Full page" }));
+    expect(screen.getByTestId("location-state")).toHaveTextContent("null");
+    expect(screen.getByTestId("location-search")).toHaveTextContent("view=raw");
+  });
+
+  it("links a preview back to its Vault overview", async () => {
+    renderPreviewAt("/vault/v/doc/notes%2Fhello.md");
+
+    expect(
+      await screen.findByRole("link", { name: "Open v Vault overview" }),
+    ).toHaveAttribute("href", "/vault/v");
+  });
+
+  it("keeps the Vault guide readable inside a search preview", async () => {
+    getDocumentMock.mockResolvedValue(
+      makeDoc({
+        path: "overview/vault-skill.md",
+        title: "v Guide",
+      }),
+    );
+    renderPreviewAt("/vault/v/doc/overview%2Fvault-skill.md");
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "v Guide" }),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("location-state")).toHaveTextContent(
+      '"documentPreview":true',
+    );
+  });
+
+  it("uses a full-width document canvas with an overlay details drawer", async () => {
+    const user = userEvent.setup();
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await screen.findByRole("heading", { level: 1, name: "DocTitle" });
+    expect(screen.getByRole("region", { name: "Document workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Document content" })).toBeInTheDocument();
+    expect(screen.getAllByText("abcdef1").length).toBeGreaterThan(0);
+    expect(screen.queryByText("akb://v/coll/notes/doc/hello.md")).not.toBeInTheDocument();
+
+    const article = screen.getByRole("article");
+    expect(article).toHaveClass("w-full", "p-2", "sm:p-3");
+    expect(article).not.toHaveClass("max-w-6xl");
+    expect(article.querySelector(".document-reading-flow")).toBeInTheDocument();
+    const documentViewTabs = screen.getByRole("tablist", { name: "Document view" });
+    expect(documentViewTabs.parentElement).toHaveClass("justify-end");
+    expect(
+      screen.getByLabelText("Document statistics: 3 lines, 20 Bytes"),
+    ).toBeInTheDocument();
+    const copyMarkdown = screen.getByRole("button", { name: "Copy markdown" });
+    expect(copyMarkdown).toBeVisible();
+    expect(copyMarkdown.nextElementSibling).toBe(documentViewTabs);
+    expect(document.getElementById("document-reading-canvas")).not.toHaveClass(
+      "lg:pr-80",
+      "xl:pr-88",
+    );
+
+    const details = document.getElementById("document-details-panel") as HTMLElement;
+    const detailsToggle = screen.getByRole("button", { name: "Details" });
+    expect(details).toHaveAttribute("aria-hidden", "true");
+    expect(details).toHaveClass("translate-x-full");
+    expect(detailsToggle).toHaveAttribute("aria-expanded", "false");
+
+    await user.click(detailsToggle);
+    expect(details).toHaveAttribute("aria-hidden", "false");
+    expect(details).toHaveClass("translate-x-0");
+    expect(detailsToggle).toHaveAttribute("aria-expanded", "true");
+
+    await user.click(screen.getByRole("button", { name: "Hide document details" }));
+    expect(details).toHaveAttribute("aria-hidden", "true");
+    await waitFor(() => expect(detailsToggle).toHaveFocus());
+
+    await user.click(screen.getByRole("button", { name: "History" }));
+    expect(details).toHaveAttribute("aria-hidden", "false");
+    expect(screen.getByRole("tab", { name: /^History/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+
+    await user.keyboard("{Escape}");
+    expect(details).toHaveAttribute("aria-hidden", "true");
+    await waitFor(() => expect(detailsToggle).toHaveFocus());
+  });
+
   it("renders Markdown by default", async () => {
     renderAt("/vault/v/doc/notes%2Fhello.md");
     // Body markdown headings are demoted one level (the page title is the sole
@@ -132,6 +310,15 @@ describe("DocumentPage view toggle", () => {
     );
     // The raw <pre> should NOT be present.
     expect(screen.queryByTestId("doc-raw")).not.toBeInTheDocument();
+  });
+
+  it("counts logical lines and UTF-8 bytes", async () => {
+    getDocumentMock.mockResolvedValue(makeDoc({ content: "가\n나" }));
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    expect(
+      await screen.findByLabelText("Document statistics: 2 lines, 7 Bytes"),
+    ).toBeInTheDocument();
   });
 
   it("loads relations keyed by the document path (not a nonexistent id)", async () => {
@@ -166,6 +353,7 @@ describe("DocumentPage view toggle", () => {
 
     renderAt("/vault/v/doc/notes%2Fhello.md");
 
+    await userEvent.setup().click(await screen.findByRole("button", { name: "Details" }));
     const relationsTab = await screen.findByRole("tab", { name: /^Relations/ });
     expect(relationsTab).toHaveTextContent(/^Relations1$/);
     expect(relationsTab).not.toHaveTextContent("2");

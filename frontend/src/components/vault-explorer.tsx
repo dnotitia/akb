@@ -1,4 +1,4 @@
-import { Link, useLocation, useNavigate } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronDown,
@@ -17,6 +17,7 @@ import { Alert } from "@/components/ui/alert";
 import { SkillBadge } from "@/components/ui/skill-badge";
 import { useVaultTree, useExpandedPaths, type NodeKind, type TreeNode } from "@/hooks/use-vault-tree";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
+import { useOpenDocumentCreateDialog } from "@/contexts/document-create-dialog-context";
 import {
   activePathFromRoute,
   countDocs,
@@ -71,7 +72,7 @@ export function VaultExplorer({
   onRefetchReady,
 }: VaultExplorerProps) {
   const { tree, loading, error, refetch } = useVaultTree(vault);
-  const navigate = useNavigate();
+  const openCreateDocument = useOpenDocumentCreateDialog();
   const refreshCtx = useVaultRefresh();
   // Prefer the explicit prop; otherwise fall back to context. This lets
   // tests render the explorer with no provider and still wire mutation
@@ -264,7 +265,9 @@ export function VaultExplorer({
         {loading && <div className="coord px-3 py-3" role="status" aria-live="polite">— Loading —</div>}
         {error && <Alert variant="destructive" className="m-2">{error}</Alert>}
         {!loading && !error && total === 0 && (
-          <div className="coord px-3 py-3" role="status">— Empty —</div>
+          <div className="px-3 py-4 text-xs leading-relaxed text-foreground-muted" role="status">
+            No collections yet — the tree fills in with your first document.
+          </div>
         )}
         {!loading && !error && total > 0 && visibleRows.length === 0 && filter && (
           <div className="coord px-3 py-1.5" role="status">— No matches —</div>
@@ -284,9 +287,7 @@ export function VaultExplorer({
               onToggle={toggle}
               canWrite={canWrite}
               onCreateDoc={(node) =>
-                navigate(
-                  `/vault/${vault}/doc/new?collection=${encodeURIComponent(node.path)}`,
-                )
+                openCreateDocument({ collection: node.path })
               }
               onCreateSubCollection={(node) => openCreate(node.path)}
               onDeleteCollection={(node) =>
@@ -323,10 +324,11 @@ export function VaultExplorer({
             </button>
           )}
 
-        {/* Always-visible "+ NEW COLLECTION" affordance at the bottom of
-            the tree. Pairs the discoverable bottom-of-list button with
-            the row-hover sub-collection `+`. Writer+ only. */}
-        {!loading && !error && canWrite && (
+        {/* Once real knowledge exists, keep a discoverable root-collection
+            action at the bottom of the tree. In the empty state the main
+            onboarding already owns the next action, matching the quiet mockup
+            rather than showing two competing ways to begin. */}
+        {!loading && !error && total > 0 && canWrite && (
           <button
             type="button"
             onClick={() => openCreate(null)}
@@ -611,4 +613,3 @@ function cssEscape(s: string): string {
   if (typeof CSS !== "undefined" && typeof CSS.escape === "function") return CSS.escape(s);
   return s.replace(/([^\w-])/g, "\\$1");
 }
-

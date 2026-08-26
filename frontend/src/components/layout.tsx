@@ -1,5 +1,5 @@
-import { Link, Outlet, useNavigate, Navigate, useLocation, useSearchParams } from "react-router-dom";
-import { useEffect, useState } from "react";
+import { Link, Outlet, Navigate, useLocation } from "react-router-dom";
+import { useEffect, useLayoutEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   clearPrivateAssetCache,
@@ -12,7 +12,9 @@ import { useHealth } from "@/hooks/use-health";
 import { UserMenu } from "@/components/user-menu";
 import { Logo } from "@/components/logo";
 import { ErrorBoundary } from "@/components/error-boundary";
+import { GlobalSearchDialog } from "@/components/global-search-dialog";
 import { appRouteBoundaryForPath } from "@/app-route-contract";
+import { CurrentUserProvider } from "@/contexts/current-user-context";
 
 function identityFingerprint(user: CurrentUser): string {
   return JSON.stringify([
@@ -28,14 +30,7 @@ function identityFingerprint(user: CurrentUser): string {
 
 export function Layout() {
   const queryClient = useQueryClient();
-  const navigate = useNavigate();
   const location = useLocation();
-  const [searchParams] = useSearchParams();
-  const onSearchPage = location.pathname === "/search";
-  const fullBleedHome = location.pathname === "/";
-  const [searchQuery, setSearchQuery] = useState(() =>
-    onSearchPage ? searchParams.get("q") || "" : "",
-  );
   const [session, setSession] = useState<
     | { status: "checking"; user: null }
     | { status: "authenticated"; user: CurrentUser }
@@ -125,15 +120,14 @@ export function Layout() {
     };
   }, [activeFingerprint, activeUser, queryClient]);
 
-  useEffect(() => {
-    if (onSearchPage) {
-      setSearchQuery(searchParams.get("q") || "");
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [location.pathname, searchParams]);
-
   const wide = appRouteBoundaryForPath(location.pathname) === "vault-shell";
   const { data: health } = useHealth(session.status === "authenticated");
+
+  useLayoutEffect(() => {
+    const root = document.documentElement;
+    root.classList.toggle("vault-workspace-scroll-lock", wide);
+    return () => root.classList.remove("vault-workspace-scroll-lock");
+  }, [wide]);
 
   if (session.status === "checking" || revalidating) {
     return (
@@ -168,16 +162,8 @@ export function Layout() {
       </a>
       {/* ── Glass app header ───────────────────────────────────────── */}
       <header className="app-header sticky top-0 z-40 shrink-0">
-        {/* Home follows the full-width mockup; task-oriented routes retain the
-            bounded shell. Home keeps the full canvas while its gutters grow
-            with the viewport, so wide dashboards do not cling to the edges. */}
-        <div
-          className={`flex items-center ${
-            fullBleedHome
-              ? "h-14 w-full px-4 sm:px-6 lg:px-8 xl:px-12 2xl:px-16"
-              : "mx-auto h-16 max-w-[1400px] px-6"
-          }`}
-        >
+        {/* One responsive horizontal system across Home and task routes. */}
+        <div className="flex h-14 w-full items-center px-3">
           {/* The brand stays visually independent. Search-corpus status belongs
               with the Home search affordance rather than the identity lockup. */}
           <div className="flex min-w-0 items-center">
@@ -190,31 +176,11 @@ export function Layout() {
             </Link>
           </div>
 
-          {/* Compact global search. Semantic/Literal selection belongs to the
-              Home and Search views; the header performs knowledge search only. */}
-          <form
-            className="ml-auto hidden h-9 w-64 shrink-0 sm:flex"
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (!searchQuery.trim()) return;
-              const p = new URLSearchParams({ q: searchQuery });
-              navigate(`/search?${p.toString()}`);
-            }}
-            role="search"
-            aria-label="Search knowledge base"
-          >
-            <div className="flex w-full items-center overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface px-3 transition-token focus-within:border-primary focus-within:ring-2 focus-within:ring-ring/30">
-              <label className="sr-only" htmlFor="header-search">Search</label>
-              <input
-                id="header-search"
-                type="search"
-                placeholder="Search knowledge…"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="min-w-0 flex-1 bg-transparent text-sm text-foreground placeholder:text-foreground-muted focus:outline-none"
-              />
-            </div>
-          </form>
+          {/* This is a real global-search surface, not a shortcut to /search.
+              Advanced mode and vault/type filters remain on the full page. */}
+          <CurrentUserProvider user={session.user}>
+            <GlobalSearchDialog />
+          </CurrentUserProvider>
 
           {/* Nav + actions */}
           <nav aria-label="Primary" className="ml-4 flex items-center gap-1">
@@ -233,20 +199,18 @@ export function Layout() {
       {/* Content */}
       <main id="main" tabIndex={-1} className={wide ? "flex-1 min-h-0 animate-in focus:outline-none" : "flex-1 animate-in focus:outline-none"}>
         {wide ? (
-          <ErrorBoundary resetKeys={[location.pathname, location.search]}>
-            <Outlet context={{ health }} />
-          </ErrorBoundary>
-        ) : (
-          <div
-            className={
-              fullBleedHome
-                ? "w-full px-4 py-8 sm:px-6 lg:px-8 xl:px-12 2xl:px-16"
-                : "mx-auto max-w-[1400px] px-6 py-8"
-            }
-          >
+          <CurrentUserProvider user={session.user}>
             <ErrorBoundary resetKeys={[location.pathname, location.search]}>
               <Outlet context={{ health }} />
             </ErrorBoundary>
+          </CurrentUserProvider>
+        ) : (
+          <div className="w-full px-4 py-8 sm:px-6 lg:px-8 xl:px-12 2xl:px-16">
+            <CurrentUserProvider user={session.user}>
+              <ErrorBoundary resetKeys={[location.pathname, location.search]}>
+                <Outlet context={{ health }} />
+              </ErrorBoundary>
+            </CurrentUserProvider>
           </div>
         )}
       </main>
@@ -254,13 +218,7 @@ export function Layout() {
       {/* Footer — hidden on vault workspace routes (viewport-locked) */}
       {!wide && (
         <footer className="border-t border-border">
-          <div
-            className={`flex items-center justify-between py-3 ${
-              fullBleedHome
-                ? "w-full px-4 sm:px-6 lg:px-8 xl:px-12 2xl:px-16"
-                : "mx-auto max-w-[1400px] px-6"
-            }`}
-          >
+          <div className="flex w-full items-center justify-between px-4 py-3 sm:px-6 lg:px-8 xl:px-12 2xl:px-16">
             <div className="coord">© Dnotitia · Seahorse</div>
             <div className="coord hidden md:block">Agent Knowledgebase</div>
             <div className="coord">v1.0</div>

@@ -76,6 +76,10 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
 
   return (
     <DropdownMenu.Root
+      // The account menu is a lightweight popover, not a modal task. Radix's
+      // modal default locks document scrolling, removing the viewport scrollbar
+      // and nudging the shared header/page horizontally on long routes.
+      modal={false}
       open={open}
       onOpenChange={(next) => {
         if (!signingOut || next) setOpen(next);

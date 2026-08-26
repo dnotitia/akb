@@ -35,6 +35,55 @@ describe("MarkdownEditor image insertion", () => {
     });
   });
 
+  it("renders the composer canvas without a nested editor frame", () => {
+    render(
+      <MarkdownEditor
+        value="Draft"
+        vault="team"
+        appearance="canvas"
+        ariaLabel="Document content"
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("textbox", { name: "Document content" })).toHaveClass(
+      "border-0",
+      "focus-visible:ring-0",
+      "focus-within:ring-0",
+    );
+    expect(screen.getByRole("toolbar", { name: "Text formatting" })).toHaveClass(
+      "backdrop-blur-sm",
+    );
+    expect(screen.getByRole("group", { name: "Block type" })).not.toHaveClass(
+      "bg-surface-2",
+    );
+  });
+
+  it("renders a compact workspace editor inside a parent-owned frame", () => {
+    render(
+      <MarkdownEditor
+        value="Draft"
+        vault="team"
+        appearance="workspace"
+        ariaLabel="Workspace content"
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("textbox", { name: "Workspace content" })).toHaveClass(
+      "border-0",
+      "focus-visible:ring-0",
+      "!min-h-96",
+    );
+    expect(screen.getByRole("toolbar", { name: "Text formatting" })).toHaveClass(
+      "px-3",
+      "py-2",
+    );
+    expect(screen.getByRole("group", { name: "Block type" })).not.toHaveClass(
+      "bg-surface-2",
+    );
+  });
+
   it("rejects unsupported and oversized files before upload", () => {
     expect(validateEditorImage(new File(["svg"], "vector.svg", { type: "image/svg+xml" }))).toMatch(/PNG/);
     expect(
@@ -329,6 +378,34 @@ describe("MarkdownEditor image insertion", () => {
     fireEvent.click(screen.getByRole("button", { name: "Upload" }));
     await waitFor(() => expect(apiMocks.uploadAsset).toHaveBeenCalledTimes(2));
     expect(apiMocks.uploadAsset.mock.calls[1][1]).toBe(second);
+  });
+
+  it("accepts a local image dropped on the toolbar without navigating away", async () => {
+    apiMocks.uploadAsset.mockResolvedValue({
+      id: ASSET_ID,
+      url: `/api/assets/${ASSET_ID}`,
+      name: "toolbar-drop.png",
+      mime_type: "image/png",
+      size_bytes: 5,
+    });
+    render(<MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />);
+    const file = new File(["image"], "toolbar-drop.png", { type: "image/png" });
+
+    const dropResult = fireEvent.drop(screen.getByRole("toolbar", { name: "Text formatting" }), {
+      dataTransfer: {
+        files: [file],
+        items: [{ kind: "file", type: "image/png" }],
+      },
+    });
+
+    expect(dropResult).toBe(false);
+    await waitFor(() =>
+      expect(apiMocks.uploadAsset).toHaveBeenCalledWith("team", file, expect.any(AbortSignal)),
+    );
+    expect(await screen.findByRole("img", { name: "toolbar-drop" })).toHaveAttribute(
+      "src",
+      "blob:editor-image",
+    );
   });
 
   it("uploads a copied image even when the clipboard also carries HTML", async () => {

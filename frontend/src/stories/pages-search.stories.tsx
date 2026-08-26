@@ -34,7 +34,7 @@ export const ReadyNoQuery: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByRole("heading", { name: "Query the base" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("heading", { name: "Suggested searches" })).toBeInTheDocument();
     await expect(canvas.getByRole("search", { name: "Search all vaults" })).toBeInTheDocument();
     await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
     await expect(canvas.queryByRole("navigation", { name: "Vaults" })).not.toBeInTheDocument();
@@ -75,7 +75,7 @@ export const SemanticNoResults: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("No results")).toBeInTheDocument();
+    await expect(await canvas.findByRole("heading", { name: /No results/i })).toBeInTheDocument();
     await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
   },
 };

@@ -1,6 +1,6 @@
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
-import { forwardRef, type HTMLAttributes } from "react";
+import { forwardRef, type ComponentPropsWithoutRef, type HTMLAttributes } from "react";
 import { cn } from "@/lib/utils";
 
 const Dialog = DialogPrimitive.Root;
@@ -14,6 +14,7 @@ const DialogOverlay = forwardRef<
 >(({ className, ...props }, ref) => (
   <DialogPrimitive.Overlay
     ref={ref}
+    data-slot="dialog-overlay"
     className={cn(
       "fixed inset-0 z-[var(--z-overlay)] bg-black/50",
       "data-[state=open]:animate-in data-[state=closed]:animate-out",
@@ -26,10 +27,13 @@ DialogOverlay.displayName = DialogPrimitive.Overlay.displayName;
 
 const DialogContent = forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,
-  React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content>
->(({ className, children, ...props }, ref) => (
+  ComponentPropsWithoutRef<typeof DialogPrimitive.Content> & {
+    hideClose?: boolean;
+    overlayProps?: ComponentPropsWithoutRef<typeof DialogPrimitive.Overlay>;
+  }
+>(({ className, children, hideClose = false, overlayProps, ...props }, ref) => (
   <DialogPortal>
-    <DialogOverlay />
+    <DialogOverlay {...overlayProps} />
     <DialogPrimitive.Content
       ref={ref}
       className={cn(
@@ -44,17 +48,19 @@ const DialogContent = forwardRef<
       {...props}
     >
       {children}
-      <DialogPrimitive.Close
-        aria-label="Close dialog"
-        className={cn(
-          "absolute right-2 top-2 h-9 w-9 inline-flex items-center justify-center",
-          "text-foreground-muted hover:text-foreground transition-colors",
-          "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
-          "cursor-pointer",
-        )}
-      >
-        <X className="h-4 w-4" aria-hidden />
-      </DialogPrimitive.Close>
+      {!hideClose && (
+        <DialogPrimitive.Close
+          aria-label="Close dialog"
+          className={cn(
+            "absolute right-2 top-2 h-9 w-9 inline-flex items-center justify-center",
+            "text-foreground-muted hover:text-foreground transition-colors",
+            "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
+            "cursor-pointer",
+          )}
+        >
+          <X className="h-4 w-4" aria-hidden />
+        </DialogPrimitive.Close>
+      )}
     </DialogPrimitive.Content>
   </DialogPortal>
 ));

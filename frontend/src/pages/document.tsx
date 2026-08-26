@@ -1,16 +1,36 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
-import { Link, Navigate, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import {
+  Link,
+  Navigate,
+  useLocation,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowLeft,
+  Box,
   CheckCircle2,
+  Clock3,
+  Code2,
   ExternalLink,
+  FileText,
+  FolderTree,
+  GitCommitHorizontal,
+  History,
+  Info,
+  Link2,
+  ListTree,
   Loader2,
   Lock,
+  Maximize2,
+  PanelRightClose,
+  PanelRightOpen,
   Pencil,
+  Share2,
   Trash2,
-  Unlock,
 } from "lucide-react";
 import {
   authenticatedFetch,
@@ -23,7 +43,7 @@ import {
   unpublishDoc,
   updateDocument,
 } from "@/lib/api";
-import { timeAgo } from "@/lib/utils";
+import { cn, timeAgo } from "@/lib/utils";
 import { docUri } from "@/lib/uri";
 import { parseHeadings } from "@/lib/markdown";
 import { sameCommitRef } from "@/lib/commit";
@@ -34,7 +54,6 @@ import { SummaryFold } from "@/components/summary-fold";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { Panel } from "@/components/ui/panel";
 import { Badge } from "@/components/ui/badge";
 import { HistoryList } from "@/components/history-list";
 import { FrontmatterEditDialog } from "@/components/frontmatter-edit-dialog";
@@ -45,6 +64,8 @@ import { TooltipText } from "@/components/ui/tooltip-text";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import { RelationsPanel } from "@/components/relations/relations-panel";
 import { relationIsInVault } from "@/components/relations/relation-row-utils";
+import { useCurrentUser } from "@/contexts/current-user-context";
+import { recordRecentDocumentView } from "@/lib/recent-document-views";
 
 // Plate is heavy (~hundreds of KB gzipped); lazy-load so the read-only path
 // (Rendered / Raw) stays cheap.
@@ -52,12 +73,21 @@ const MarkdownEditor = lazy(() => import("@/components/markdown-editor"));
 
 type DocView = "rendered" | "raw" | "edit";
 
-export default function DocumentPage() {
+interface DocumentPageProps {
+  /** Search-launched previews are read-first and keep the search route behind them. */
+  presentation?: "page" | "preview";
+}
+
+export default function DocumentPage({
+  presentation = "page",
+}: DocumentPageProps) {
   const { name, id } = useParams<{ name: string; id: string }>();
+  const currentUser = useCurrentUser();
   const navigate = useNavigate();
+  const routeLocation = useLocation();
   const queryClient = useQueryClient();
   const { refetchTree } = useVaultRefresh();
-  const [searchParams, setSearchParams] = useSearchParams();
+  const [searchParams] = useSearchParams();
   const commitHash = searchParams.get("commit") || undefined;
   const rawView = searchParams.get("view");
   const view: DocView =
@@ -77,6 +107,10 @@ export default function DocumentPage() {
   const [editOpen, setEditOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [detailsTab, setDetailsTab] = useState<"outline" | "relations" | "history">("outline");
+  const detailsToggleRef = useRef<HTMLButtonElement | null>(null);
+  const detailsCloseRef = useRef<HTMLButtonElement | null>(null);
   // Plate manages its own state; we remount via `editorKey` when hydrating
   // a fresh server value rather than treating `value` as controlled.
   const [editingContent, setEditingContent] = useState("");
@@ -104,7 +138,7 @@ export default function DocumentPage() {
     const p = new URLSearchParams(searchParams);
     if (next === "rendered") p.delete("view");
     else p.set("view", next);
-    setSearchParams(p, { replace: true });
+    updateRouteParams(p, { replace: true });
   };
   const setView = (next: DocView) => {
     // Leaving Edit with unsaved changes routes through a ConfirmDialog
@@ -115,6 +149,48 @@ export default function DocumentPage() {
     }
     applyView(next);
   };
+
+  function updateRouteParams(
+    params: URLSearchParams,
+    options: { replace: boolean },
+  ) {
+    const search = params.toString();
+    navigate(
+      {
+        pathname: routeLocation.pathname,
+        search: search ? `?${search}` : "",
+      },
+      {
+        ...options,
+        // Rendered/Raw and version changes must not discard the search route
+        // stored in history state, otherwise the preview unexpectedly becomes
+        // a full-page document navigation.
+        state: routeLocation.state,
+      },
+    );
+  }
+
+  function openFullPage(nextView: DocView = view) {
+    const p = new URLSearchParams(searchParams);
+    if (nextView === "rendered") p.delete("view");
+    else p.set("view", nextView);
+    const search = p.toString();
+    navigate(
+      {
+        pathname: routeLocation.pathname,
+        search: search ? `?${search}` : "",
+      },
+      { replace: true, state: null },
+    );
+  }
+
+  function requestEdit() {
+    if (presentation === "preview") {
+      openFullPage("edit");
+      return;
+    }
+    setView("edit");
+  }
 
   useEffect(() => {
     if (!name) return;
@@ -131,6 +207,27 @@ export default function DocumentPage() {
       });
   }, [name]);
 
+  useEffect(() => {
+    if (!detailsOpen) return;
+
+    const focusFrame = window.matchMedia?.("(max-width: 1023px)").matches
+      ? window.requestAnimationFrame(() => detailsCloseRef.current?.focus())
+      : null;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setDetailsOpen(false);
+      window.requestAnimationFrame(() => detailsToggleRef.current?.focus());
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      if (focusFrame !== null) window.cancelAnimationFrame(focusFrame);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [detailsOpen]);
+
   const docQuery = useQuery({
     queryKey: ["document", name, docId, commitHash],
     queryFn: () => getDocument(name!, docId, commitHash),
@@ -139,6 +236,19 @@ export default function DocumentPage() {
   });
 
   const doc = docOverride ?? docQuery.data ?? null;
+  const currentUserId = currentUser?.user_id;
+
+  useEffect(() => {
+    const loaded = docQuery.data;
+    if (!currentUserId || !name || !loaded?.path || !loaded?.title) return;
+    recordRecentDocumentView(currentUserId, {
+      vault: name,
+      path: loaded.path,
+      title: loaded.title,
+      type: loaded.type,
+      updatedAt: loaded.updated_at,
+    });
+  }, [currentUserId, docQuery.data, name]);
 
   // A versioned read reports current_commit = the requested version (not HEAD),
   // so `doc` alone can't reveal the doc's true latest commit. While a commit is
@@ -193,7 +303,10 @@ export default function DocumentPage() {
     // changes after mount.
     setEditorKey((k) => k + 1);
     if (d.path && d.path !== docId) {
-      navigate(`/vault/${name}/doc/${encodeURIComponent(d.path)}`, { replace: true });
+      navigate(`/vault/${name}/doc/${encodeURIComponent(d.path)}`, {
+        replace: true,
+        state: routeLocation.state,
+      });
     }
     if (d.path) {
       // getRelations builds the canonical akb:// URI from the vault-relative
@@ -274,7 +387,7 @@ export default function DocumentPage() {
       // newer HEAD. Return to the live document instead of leaving the URL on
       // the now-historical revision while showing the new body.
       p.delete("commit");
-      setSearchParams(p, { replace: true });
+      updateRouteParams(p, { replace: true });
     } catch (e: unknown) {
       const status = e instanceof ApiError ? e.status : 0;
       // 5xx responses can carry stack traces or SQL fragments — never
@@ -340,13 +453,20 @@ export default function DocumentPage() {
   }
 
   // The vault guide is system-managed: its only editing surface is the guide
-  // section in vault settings, so the plain viewer bounces there. A ?commit=
-  // pin is exempt — that is the URL-addressable version view (commit-log and
-  // activity links, and the settings editor's history entry point), and it
-  // must keep resolving. The gate is the raw param, not the computed
+  // section in vault settings, so the plain full-page viewer bounces there.
+  // Search preview is exempt so every document result keeps the same modal
+  // reading flow. A ?commit= pin is also exempt — that is the URL-addressable
+  // version view (commit-log and activity links, and the settings editor's
+  // history entry point), and it must keep resolving. The gate is the raw
+  // param, not the computed
   // `isHistorical`: that one reads false until the HEAD query resolves, which
   // would redirect every version link away before it could settle.
-  if (docId === VAULT_SKILL_PATH && !commitHash && vaultKind === "normal") {
+  if (
+    presentation !== "preview" &&
+    docId === VAULT_SKILL_PATH &&
+    !commitHash &&
+    vaultKind === "normal"
+  ) {
     return <Navigate to={`/vault/${name}/settings#skill`} replace />;
   }
 
@@ -402,422 +522,558 @@ export default function DocumentPage() {
 
   const commitShort = headCommit?.slice(0, 7);
   const inEditMode = view === "edit";
+  const fileName = doc.path?.split("/").pop() || doc.title || "Document";
+  const collectionPath = doc.path?.includes("/")
+    ? doc.path.slice(0, doc.path.lastIndexOf("/"))
+    : "Root";
+  const isUuid = (value: string) =>
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+  const authorName =
+    doc.created_by_name ||
+    (doc.created_by && !isUuid(doc.created_by) ? doc.created_by : null);
+  const canWrite =
+    vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner";
+
+  const closeDetails = () => {
+    setDetailsOpen(false);
+    window.requestAnimationFrame(() => detailsToggleRef.current?.focus());
+  };
 
   return (
-    <div
-      className={`grid grid-cols-1 gap-x-8 lg:gap-x-10 gap-y-6 fade-up ${
-        inEditMode
-          ? ""
-          : "lg:grid-cols-[minmax(0,1fr)_280px] xl:grid-cols-[minmax(0,1fr)_320px] 2xl:grid-cols-[minmax(0,1fr)_360px]"
-      }`}
-    >
-      <article
-        ref={setArticleEl}
-        aria-labelledby="doc-title"
-        className="min-w-0 w-full max-w-none"
+    <>
+      <section
+        aria-label="Document workspace"
+        className="flex h-full min-h-0 flex-col overflow-hidden bg-background fade-in"
+        data-presentation={presentation}
       >
+        <header
+          className={cn(
+            "relative z-[var(--z-sticky)] flex h-16 shrink-0 items-center gap-3 border-b border-border bg-surface pl-3 sm:pl-4 lg:pl-5",
+            presentation === "preview"
+              ? "pr-12 sm:pr-14"
+              : "pr-3 sm:pr-4 lg:pr-5",
+          )}
+        >
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="hidden h-9 w-9 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-primary/20 bg-surface-selected text-surface-selected-foreground sm:flex">
+              <FileText className="h-4 w-4" aria-hidden />
+            </div>
+            <div className="min-w-0">
+              <div className="flex min-w-0 items-center gap-2">
+                <h1 id="doc-title" className="truncate font-display text-base font-semibold text-foreground sm:text-lg">
+                  {doc.title}
+                </h1>
+                {isHistorical ? (
+                  <Badge variant="warning">Historical</Badge>
+                ) : (
+                  <Badge variant={doc.status === "archived" ? "archived" : doc.status === "draft" ? "draft" : "active"}>
+                    {doc.status || "Current"}
+                  </Badge>
+                )}
+              </div>
+              <p className="truncate text-xs text-foreground-muted">
+                <span className="font-mono">{fileName}</span>
+                <span aria-hidden> · </span>
+                {presentation === "preview" ? (
+                  <Link
+                    to={`/vault/${name}`}
+                    aria-label={`Open ${name} Vault overview`}
+                    className="inline-flex items-center gap-1 rounded-[var(--radius-sm)] font-medium text-link transition-token hover:text-link-hover hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                  >
+                    <Box className="h-3 w-3" aria-hidden />
+                    {name}
+                  </Link>
+                ) : (
+                  <span className="font-medium text-foreground">{name}</span>
+                )}
+              </p>
+            </div>
+          </div>
+
+          <div className="ml-auto flex shrink-0 items-center gap-2">
+            <div className="mr-1 hidden items-center gap-2 text-xs text-foreground-muted xl:flex" role="status" aria-live="polite">
+              {savedAt ? (
+                <CheckCircle2 className="h-3.5 w-3.5 text-success" aria-hidden />
+              ) : (
+                <GitCommitHorizontal className="h-3.5 w-3.5" aria-hidden />
+              )}
+              <span>{savedAt ? "Saved just now" : doc.updated_at ? `Changed ${timeAgo(doc.updated_at)}` : "Versioned in Git"}</span>
+            </div>
+            {!inEditMode && (
+              <Button
+                ref={detailsToggleRef}
+                type="button"
+                variant="outline"
+                size="sm"
+                aria-controls="document-details-panel"
+                aria-expanded={detailsOpen}
+                onClick={() => {
+                  if (detailsOpen) closeDetails();
+                  else setDetailsOpen(true);
+                }}
+              >
+                {detailsOpen ? (
+                  <PanelRightClose className="h-4 w-4" aria-hidden />
+                ) : (
+                  <PanelRightOpen className="h-4 w-4" aria-hidden />
+                )}
+                <span className="hidden sm:inline">Details</span>
+              </Button>
+            )}
+            {presentation === "preview" && !inEditMode && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => openFullPage(view)}
+              >
+                <Maximize2 className="h-4 w-4" aria-hidden />
+                <span className="hidden lg:inline">Full page</span>
+              </Button>
+            )}
+            {inEditMode ? (
+              <>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={handleCancelBody}
+                  disabled={savingBody || uploadingImage || !isDirty}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  variant="accent"
+                  size="sm"
+                  aria-label="Save"
+                  loading={savingBody}
+                  onClick={handleSaveBody}
+                  disabled={uploadingImage || !isDirty}
+                >
+                  {savingBody ? "Saving…" : "Save changes"}
+                </Button>
+              </>
+            ) : canEdit ? (
+              <Button type="button" size="sm" onClick={requestEdit}>
+                <Pencil className="h-4 w-4" aria-hidden />
+                <span className="hidden sm:inline">
+                  {presentation === "preview" ? "Edit" : "Edit body"}
+                </span>
+              </Button>
+            ) : null}
+          </div>
+        </header>
+
         {isHistorical && (
           <div
             role="status"
             aria-live="polite"
-            className="rounded-[var(--radius-lg)] border border-accent bg-accent/5 px-4 py-2 mb-4 flex items-center justify-between gap-3 flex-wrap shadow-sm"
+            className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-warning/30 bg-warning-soft px-4 py-2 text-sm text-warning-soft-foreground sm:px-6"
           >
-            <div className="flex items-baseline gap-2 min-w-0">
-              <span className="coord-spark shrink-0">⊙ Historical view</span>
-              <span className="text-sm text-foreground">
-                Viewing version{" "}
-                <code className="font-mono text-accent-strong">{commitHash.slice(0, 7)}</code>
-                {" "}— writes are disabled until you return to the latest version.
+            <div className="flex min-w-0 items-center gap-2">
+              <History className="h-4 w-4 shrink-0" aria-hidden />
+              <span>
+                Viewing commit <code className="font-mono font-medium">{commitHash.slice(0, 7)}</code>. Editing is disabled for historical versions.
               </span>
             </div>
-            <button
+            <Button
               type="button"
+              variant="outline"
+              size="sm"
               onClick={() => {
                 const p = new URLSearchParams(searchParams);
                 p.delete("commit");
-                setSearchParams(p, { replace: false });
+                updateRouteParams(p, { replace: false });
               }}
-              className="inline-flex items-center gap-1 px-2 h-7 text-xs rounded-[var(--radius-sm)] border border-primary text-link hover:bg-primary hover:text-primary-foreground transition-token cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
             >
-              ← Back to latest
-            </button>
+              Back to latest
+            </Button>
           </div>
         )}
-        {/* Meta line */}
-        <div className="coord mb-2">
-          Doc · <span className="font-mono">{docUri(name!, doc.path)}</span>
-          {commitShort && (
+
+        {publishError && (
+          <div className="shrink-0 border-b border-border bg-surface px-4 py-3 sm:px-6">
+            <Alert variant="destructive">{publishError}</Alert>
+          </div>
+        )}
+
+        <div className="relative min-h-0 flex-1 overflow-hidden">
+          <main
+            id="document-reading-canvas"
+            className="h-full overflow-y-auto bg-background"
+          >
+            <article
+              ref={setArticleEl}
+              aria-labelledby="doc-title"
+              className={cn(
+                "w-full",
+                inEditMode
+                  ? "px-3 py-4 sm:px-4 sm:py-5 lg:px-5 xl:px-6 2xl:px-8"
+                  : "p-2 sm:p-3",
+              )}
+            >
+              <div className="mb-3 flex min-h-11 min-w-0 items-center gap-3 rounded-[var(--radius-lg)] border border-border bg-surface px-3 shadow-xs">
+                <div className="flex min-w-0 items-center gap-2 text-xs text-foreground-muted">
+                  <FolderTree className="h-3.5 w-3.5 shrink-0 text-link" aria-hidden />
+                  <span className="truncate">
+                    <span className="font-medium text-foreground">{collectionPath}</span>
+                    <span aria-hidden> / </span>
+                    <span className="font-mono">{fileName}</span>
+                  </span>
+                  {authorName && (
+                    <span className="hidden shrink-0 items-center gap-1.5 border-l border-border pl-3 xl:inline-flex">
+                      <span
+                        className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-surface-selected text-[10px] font-semibold uppercase text-surface-selected-foreground"
+                        aria-hidden
+                      >
+                        {authorName.trim()[0] || "?"}
+                      </span>
+                      <span className="font-medium text-foreground">{authorName}</span>
+                    </span>
+                  )}
+                </div>
+                <div className="ml-auto flex shrink-0 items-center gap-3 text-xs text-foreground-muted">
+                  {commitShort && (
+                    <span className="inline-flex items-center gap-1.5">
+                      <GitCommitHorizontal className="h-3.5 w-3.5" aria-hidden />
+                      <code className="font-mono text-foreground">{commitShort}</code>
+                    </span>
+                  )}
+                  {doc.updated_at && (
+                    <span className="inline-flex items-center gap-1.5">
+                      <Clock3 className="h-3.5 w-3.5" aria-hidden />
+                      {timeAgo(doc.updated_at)}
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDetailsOpen(true);
+                      setDetailsTab("history");
+                    }}
+                    className="inline-flex h-8 items-center gap-1.5 rounded-[var(--radius-md)] px-2 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-link focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <History className="h-3.5 w-3.5" aria-hidden />
+                    <span className="hidden sm:inline">History</span>
+                  </button>
+                </div>
+              </div>
+
+              {inEditMode ? (
+                <section className="overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm">
+                  <div
+                    role="tablist"
+                    aria-label="Document view"
+                    className="flex min-h-11 items-center gap-1 border-b border-border bg-surface-2/60 px-3"
+                    onKeyDown={(event) => {
+                      const buttons = Array.from(
+                        event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]'),
+                      );
+                      const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+                      if (index < 0) return;
+                      let next: number;
+                      if (event.key === "ArrowRight") next = (index + 1) % buttons.length;
+                      else if (event.key === "ArrowLeft") next = (index - 1 + buttons.length) % buttons.length;
+                      else if (event.key === "Home") next = 0;
+                      else if (event.key === "End") next = buttons.length - 1;
+                      else return;
+                      event.preventDefault();
+                      buttons[next]?.focus();
+                    }}
+                  >
+                    <button
+                      role="tab"
+                      aria-selected={false}
+                      tabIndex={-1}
+                      onClick={() => setView("rendered")}
+                      className="inline-flex items-center gap-1.5 rounded-[var(--radius-sm)] px-3 py-1 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      <FileText className="h-3.5 w-3.5" aria-hidden />
+                      Rendered
+                    </button>
+                    <button
+                      role="tab"
+                      aria-selected={false}
+                      tabIndex={-1}
+                      onClick={() => setView("raw")}
+                      className="inline-flex items-center gap-1.5 rounded-[var(--radius-sm)] px-3 py-1 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      <Code2 className="h-3.5 w-3.5" aria-hidden />
+                      Raw
+                    </button>
+                    <button
+                      role="tab"
+                      id="doc-tab-edit"
+                      aria-selected={true}
+                      aria-controls="doc-panel-edit"
+                      tabIndex={0}
+                      className="inline-flex items-center gap-1.5 rounded-[var(--radius-sm)] bg-surface-selected px-3 py-1 text-xs font-medium text-surface-selected-foreground"
+                    >
+                      <Pencil className="h-3.5 w-3.5" aria-hidden />
+                      Edit{isDirty ? "*" : ""}
+                    </button>
+                    <span className="ml-auto text-xs text-foreground-muted">
+                      {uploadingImage ? "Uploading image…" : isDirty ? "Unsaved changes" : "No changes"}
+                    </span>
+                  </div>
+                  <div
+                    id="doc-panel-edit"
+                    role="tabpanel"
+                    aria-labelledby="doc-tab-edit"
+                    className="p-4 sm:p-6"
+                  >
+                    <Suspense fallback={<MarkdownEditorFallback />}>
+                      <MarkdownEditor
+                        key={editorKey}
+                        value={originalContent}
+                        onChange={(markdown, assetIds) => {
+                          setEditingAssetIds(assetIds);
+                          if (hydratedKey.current !== editorKey) {
+                            hydratedKey.current = editorKey;
+                            setOriginalContent(markdown);
+                            setEditingContent(markdown);
+                            return;
+                          }
+                          setEditingContent(markdown);
+                        }}
+                        ariaLabel="Document body (markdown)"
+                        autoFocus
+                        readOnly={savingBody}
+                        vault={name!}
+                        document={doc?.path}
+                        commit={doc?.current_commit ?? undefined}
+                        appearance="workspace"
+                        onUploadingChange={(uploading) => {
+                          setUploadingImage(uploading);
+                          if (uploading) setClaimedAssetIds(null);
+                        }}
+                        preserveUploadsOnUnmount={savingBody}
+                        claimedAssetIds={claimedAssetIds}
+                      />
+                    </Suspense>
+                    {bodyError && <Alert variant="destructive" className="mt-4">{bodyError}</Alert>}
+                  </div>
+                </section>
+              ) : (
+                <DocumentView
+                  vault={name!}
+                  docId={docId}
+                  version={commitHash}
+                  view={view}
+                  onViewChange={(next) => setView(next)}
+                  appearance="file"
+                  extraTab={
+                    canEdit
+                      ? {
+                          label: `Edit${isDirty ? "*" : ""}`,
+                          onClick: requestEdit,
+                        }
+                      : undefined
+                  }
+                />
+              )}
+            </article>
+          </main>
+
+          {!inEditMode && (
             <>
-              {" · HEAD "}
-              <span className="font-mono text-accent-strong">{commitShort}</span>
+              {detailsOpen && (
+                <button
+                  type="button"
+                  aria-label="Close document details"
+                  onClick={closeDetails}
+                  className="absolute inset-0 z-[var(--z-raised)] bg-black/40 lg:hidden"
+                />
+              )}
+              <aside
+                id="document-details-panel"
+                aria-label="Document details"
+                aria-hidden={!detailsOpen}
+                inert={!detailsOpen}
+                className={cn(
+                  "absolute inset-y-0 right-0 z-[var(--z-overlay)] flex w-full max-w-md flex-col overflow-hidden border-l border-border bg-surface shadow-xl transition-transform duration-[var(--duration-base)] ease-[var(--ease-out)] lg:w-80 xl:w-88",
+                  detailsOpen
+                    ? "translate-x-0"
+                    : "pointer-events-none translate-x-full",
+                )}
+              >
+              <div className="flex h-14 shrink-0 items-center justify-between border-b border-border px-4">
+                <div>
+                  <h2 className="text-sm font-semibold text-foreground">Document details</h2>
+                  <p className="text-xs text-foreground-muted">Context, links and versions</p>
+                </div>
+                <Button
+                  ref={detailsCloseRef}
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Hide document details"
+                  onClick={closeDetails}
+                >
+                  <PanelRightClose className="h-4 w-4" aria-hidden />
+                </Button>
+              </div>
+
+              <section aria-labelledby="document-properties-heading" className="shrink-0 border-b border-border px-4 py-4">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <h3 id="document-properties-heading" className="flex items-center gap-2 text-sm font-semibold text-foreground">
+                    <Info className="h-4 w-4 text-link" aria-hidden />
+                    Properties
+                  </h3>
+                  {canWrite && !isHistorical && (
+                    <Button type="button" variant="ghost" size="sm" onClick={() => setEditOpen(true)}>
+                      <Pencil className="h-3.5 w-3.5" aria-hidden />
+                      Edit
+                    </Button>
+                  )}
+                </div>
+                <dl className="space-y-2.5 text-xs">
+                  {doc.summary && (
+                    <div className="mb-3 rounded-[var(--radius-md)] bg-surface-2 px-3 py-2.5">
+                      <dt className="mb-1 text-[11px] font-medium text-foreground-muted">Summary</dt>
+                      <dd>
+                        <SummaryFold summary={doc.summary} className="" />
+                      </dd>
+                    </div>
+                  )}
+                  <PropertyRow label="Title">
+                    <span className="block truncate text-foreground" title={doc.title}>{doc.title}</span>
+                  </PropertyRow>
+                  {authorName && (
+                    <PropertyRow label="Author">
+                      <span className="text-foreground">{authorName}</span>
+                    </PropertyRow>
+                  )}
+                  <PropertyRow label="Collection">
+                    <TooltipText as="span" tip={collectionPath} className="block truncate font-mono text-foreground">
+                      {collectionPath}
+                    </TooltipText>
+                  </PropertyRow>
+                  <PropertyRow label="Type">
+                    <span className="text-foreground">{doc.type || "document"}</span>
+                  </PropertyRow>
+                  <PropertyRow label="Status">
+                    <Badge variant={doc.status === "archived" ? "archived" : doc.status === "draft" ? "draft" : "active"}>
+                      {doc.status || "active"}
+                    </Badge>
+                  </PropertyRow>
+                  {doc.domain && (
+                    <PropertyRow label="Domain">
+                      <span className="text-foreground">{doc.domain}</span>
+                    </PropertyRow>
+                  )}
+                  {doc.tags?.length > 0 && (
+                    <PropertyRow label="Tags">
+                      <span className="flex min-w-0 flex-wrap justify-end gap-1">
+                        {doc.tags.map((tag: string) => (
+                          <Badge key={tag} variant="outline">{tag}</Badge>
+                        ))}
+                      </span>
+                    </PropertyRow>
+                  )}
+                  <PropertyRow label="Commit">
+                    <code className="font-mono text-foreground">{commitShort || "—"}</code>
+                  </PropertyRow>
+                </dl>
+
+                {!isHistorical && (
+                  <div className="mt-4 grid grid-cols-2 gap-2">
+                    {doc.is_public && doc.public_slug ? (
+                      <>
+                        <Button type="button" variant="outline" size="sm" onClick={copyPublicLink}>
+                          {copied ? <CheckCircle2 className="h-3.5 w-3.5 text-success" aria-hidden /> : <ExternalLink className="h-3.5 w-3.5" aria-hidden />}
+                          {copied ? "Copied" : "Copy link"}
+                        </Button>
+                        <Button type="button" variant="outline" size="sm" onClick={handleUnpublish} disabled={publishing}>
+                          {publishing ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Lock className="h-3.5 w-3.5" aria-hidden />}
+                          Unpublish
+                        </Button>
+                      </>
+                    ) : (
+                      <Button type="button" variant="outline" size="sm" className="col-span-2" onClick={() => setPublishOpen(true)} disabled={publishing}>
+                        <Share2 className="h-3.5 w-3.5" aria-hidden />
+                        Publish document
+                      </Button>
+                    )}
+                  </div>
+                )}
+              </section>
+
+              <Tabs
+                value={detailsTab}
+                onValueChange={(value) => setDetailsTab(value as typeof detailsTab)}
+                className="flex min-h-0 flex-1 flex-col"
+              >
+                <TabsList className="mx-4 mt-4 w-[calc(100%-2rem)] shrink-0">
+                  <TabsTrigger value="outline" className="min-w-0 flex-1 gap-1 px-2 text-xs">
+                    <ListTree className="h-3.5 w-3.5" aria-hidden />
+                    Outline
+                    <span className="coord tabular-nums">{headingSlugs.length}</span>
+                  </TabsTrigger>
+                  <TabsTrigger value="relations" className="min-w-0 flex-1 gap-1 px-2 text-xs">
+                    <Link2 className="h-3.5 w-3.5" aria-hidden />
+                    Relations
+                    {visibleRelationCount > 0 && <span className="coord tabular-nums">{visibleRelationCount}</span>}
+                  </TabsTrigger>
+                  <TabsTrigger value="history" className="min-w-0 flex-1 gap-1 px-2 text-xs">
+                    <History className="h-3.5 w-3.5" aria-hidden />
+                    History
+                    {provenance.length > 0 && <span className="coord tabular-nums">{provenance.length}</span>}
+                  </TabsTrigger>
+                </TabsList>
+
+                <TabsContent value="outline" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 pt-3 rail-scroll">
+                  <DocumentOutline markdown={doc.content || ""} articleEl={articleEl} />
+                </TabsContent>
+                <TabsContent value="relations" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 pt-3 rail-scroll">
+                  <RelationsPanel
+                    vault={name!}
+                    sourceUri={doc.path ? docUri(name!, doc.path) : ""}
+                    relations={relations}
+                    relationsError={relationsError}
+                    canWrite={canEdit}
+                    graphHref={`/vault/${name}/graph${doc.path ? `?entry=${encodeURIComponent(doc.path)}` : ""}`}
+                    onReload={reloadRelations}
+                  />
+                </TabsContent>
+                <TabsContent value="history" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 pt-3 rail-scroll">
+                  {historyError ? (
+                    <Alert variant="destructive">Failed to load history.</Alert>
+                  ) : (
+                    <HistoryList
+                      entries={provenance as any}
+                      selectedHash={commitHash}
+                      onSelect={(hash) => {
+                        const p = new URLSearchParams(searchParams);
+                        if (commitHash === hash) p.delete("commit");
+                        else p.set("commit", hash);
+                        updateRouteParams(p, { replace: false });
+                      }}
+                    />
+                  )}
+                </TabsContent>
+              </Tabs>
+
+              {canWrite && !isHistorical && (
+                <div className="shrink-0 border-t border-border p-3">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="w-full justify-start text-destructive hover:bg-destructive-soft hover:text-destructive-soft-foreground"
+                    onClick={() => setDeleteOpen(true)}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" aria-hidden />
+                    Delete document
+                  </Button>
+                </div>
+              )}
+              </aside>
             </>
           )}
         </div>
-
-        {/* Display title */}
-        <h1 id="doc-title" className="font-display text-3xl font-semibold tracking-tight text-foreground mb-3 break-words">
-          {doc.title}
-        </h1>
-
-        {/* Byline — resolved author name + avatar (raw id only in the tooltip) */}
-        {(() => {
-          if (!doc.created_by && !doc.updated_at) return null;
-          // created_by is a user UUID for app-authored docs; external-git
-          // imports store a readable author string. Prefer the resolved name;
-          // fall back to a non-UUID raw value; never surface a raw UUID inline.
-          const isUuid = (s: string) =>
-            /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
-          const authorName =
-            doc.created_by_name ||
-            (doc.created_by && !isUuid(doc.created_by) ? doc.created_by : null);
-          const initial = authorName?.trim()[0] || "?"; // CSS uppercases the glyph (§8)
-          return (
-            <div className="flex items-center gap-2 text-sm text-foreground-muted mb-7">
-              {doc.created_by && (
-                <span
-                  className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-surface-selected text-primary text-[11px] font-semibold uppercase"
-                  title={doc.created_by}
-                  aria-hidden
-                >
-                  {initial}
-                </span>
-              )}
-              <span>
-                {authorName ? (
-                  <>
-                    Written by{" "}
-                    <span className="text-foreground font-medium">{authorName}</span>
-                  </>
-                ) : (
-                  "Edited"
-                )}
-                {doc.updated_at && <> · {timeAgo(doc.updated_at)}</>}
-              </span>
-            </div>
-          );
-        })()}
-
-        {/* Frontmatter card — mono metadata with semantic colors */}
-        <FrontmatterCard doc={doc} />
-
-        <SummaryFold summary={doc.summary} className="mt-4 mb-7" />
-
-        {publishError && (
-          <Alert variant="destructive" className="mb-6">{publishError}</Alert>
-        )}
-
-        {inEditMode ? (
-          <>
-            <div className="flex items-center justify-end mb-3 gap-3">
-              {savedAt && (
-                <span
-                  role="status"
-                  aria-live="polite"
-                  className="coord text-success inline-flex items-baseline gap-1"
-                >
-                  <CheckCircle2 className="h-3 w-3 self-center" aria-hidden />
-                  Saved
-                </span>
-              )}
-              <div
-                role="tablist"
-                aria-label="Document view"
-                className="inline-flex items-center gap-1 rounded-[var(--radius-md)] bg-surface-2 p-1"
-                onKeyDown={(e) => {
-                  // Roving tabindex within the strip — Arrow keys move
-                  // focus, Enter/Space (handled by the button itself)
-                  // activates. Matches the WAI-ARIA tabs pattern used in
-                  // DocumentView's TabStrip.
-                  const buttons = Array.from(
-                    e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]'),
-                  );
-                  const idx = buttons.indexOf(document.activeElement as HTMLButtonElement);
-                  if (idx < 0) return;
-                  let next: number;
-                  if (e.key === "ArrowRight") next = (idx + 1) % buttons.length;
-                  else if (e.key === "ArrowLeft") next = (idx - 1 + buttons.length) % buttons.length;
-                  else if (e.key === "Home") next = 0;
-                  else if (e.key === "End") next = buttons.length - 1;
-                  else return;
-                  e.preventDefault();
-                  buttons[next]?.focus();
-                }}
-              >
-                {/* Rendered/Raw are navigation triggers here (their panels live
-                    in DocumentView, unmounted while editing) — no aria-controls
-                    so we don't point at non-existent ids. */}
-                <button
-                  role="tab"
-                  id="doc-tab-rendered"
-                  aria-selected={false}
-                  tabIndex={-1}
-                  onClick={() => setView("rendered")}
-                  className="px-3 py-1 text-xs font-medium rounded-[var(--radius-sm)] transition-token cursor-pointer text-foreground-muted hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  Rendered
-                </button>
-                <button
-                  role="tab"
-                  id="doc-tab-raw"
-                  aria-selected={false}
-                  tabIndex={-1}
-                  onClick={() => setView("raw")}
-                  className="px-3 py-1 text-xs font-medium rounded-[var(--radius-sm)] transition-token cursor-pointer text-foreground-muted hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  Raw
-                </button>
-                <button
-                  role="tab"
-                  id="doc-tab-edit"
-                  aria-selected={true}
-                  aria-controls="doc-panel-edit"
-                  tabIndex={0}
-                  className="px-3 py-1 text-xs font-medium rounded-[var(--radius-sm)] bg-surface text-foreground shadow-sm cursor-default"
-                >
-                  Edit{isDirty ? "*" : ""}
-                </button>
-              </div>
-            </div>
-            <div
-              id="doc-panel-edit"
-              role="tabpanel"
-              aria-labelledby="doc-tab-edit"
-              className="space-y-3"
-            >
-              <div className="coord flex items-center justify-between">
-                <span>Editing body</span>
-                <span className="text-foreground-muted normal-case tracking-normal font-sans">
-                  Title, type, tags and other metadata are managed separately
-                  via <span className="font-medium">Edit details</span> →
-                </span>
-              </div>
-              <Suspense fallback={<MarkdownEditorFallback />}>
-                <MarkdownEditor
-                  key={editorKey}
-                  value={originalContent}
-                  onChange={(md, assetIds) => {
-                    setEditingAssetIds(assetIds);
-                    if (hydratedKey.current !== editorKey) {
-                      hydratedKey.current = editorKey;
-                      setOriginalContent(md);
-                      setEditingContent(md);
-                      return;
-                    }
-                    setEditingContent(md);
-                  }}
-                  ariaLabel="Document body (markdown)"
-                  autoFocus
-                  readOnly={savingBody}
-                  vault={name!}
-                  document={doc?.path}
-                  commit={doc?.current_commit ?? undefined}
-                  onUploadingChange={(uploading) => {
-                    setUploadingImage(uploading);
-                    if (uploading) setClaimedAssetIds(null);
-                  }}
-                  preserveUploadsOnUnmount={savingBody}
-                  claimedAssetIds={claimedAssetIds}
-                />
-              </Suspense>
-              {bodyError && <Alert variant="destructive">{bodyError}</Alert>}
-              <div className="flex items-center justify-between">
-                <div className="coord">
-                  {uploadingImage ? (
-                    <span className="text-info">Waiting for image upload</span>
-                  ) : (
-                    isDirty && <span className="text-warning">Unsaved changes</span>
-                  )}
-                </div>
-                <div className="flex items-center gap-2">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={handleCancelBody}
-                    disabled={savingBody || uploadingImage || !isDirty}
-                    size="sm"
-                  >
-                    Cancel
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="accent"
-                    onClick={handleSaveBody}
-                    disabled={savingBody || uploadingImage || !isDirty}
-                    size="sm"
-                  >
-                    {savingBody ? (
-                      <>
-                        <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-                        Saving…
-                      </>
-                    ) : (
-                      "Save"
-                    )}
-                  </Button>
-                </div>
-              </div>
-            </div>
-          </>
-        ) : (
-          <>
-            {savedAt && (
-              <div className="flex items-center justify-end mb-2">
-                <span
-                  role="status"
-                  aria-live="polite"
-                  className="coord text-success inline-flex items-baseline gap-1"
-                >
-                  <CheckCircle2 className="h-3 w-3 self-center" aria-hidden />
-                  Saved
-                </span>
-              </div>
-            )}
-            <DocumentView
-              vault={name!}
-              docId={docId}
-              version={commitHash}
-              view={view}
-              onViewChange={(v) => setView(v)}
-              extraTab={
-                canEdit
-                  ? {
-                      label: `Edit${isDirty ? "*" : ""}`,
-                      onClick: () => setView("edit"),
-                    }
-                  : undefined
-              }
-            />
-          </>
-        )}
-      </article>
-
-      {!inEditMode && (
-      <aside className="lg:sticky lg:top-4 lg:self-start lg:max-h-[calc(100dvh-9rem)] flex flex-col text-sm min-h-0">
-        {!isHistorical && (() => {
-          const canWrite = vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner";
-          const rowCls =
-            "w-full flex items-center gap-2.5 px-3 py-2.5 text-sm transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset";
-          return (
-            <Panel className="shrink-0 mb-4 divide-y divide-border">
-              {canWrite && (
-                <button onClick={() => setEditOpen(true)} className={`${rowCls} text-foreground hover:bg-surface-hover`}>
-                  <Pencil className="h-3.5 w-3.5 text-foreground-muted" aria-hidden />
-                  Edit details
-                </button>
-              )}
-              {canWrite && (
-                <button onClick={() => setDeleteOpen(true)} className={`${rowCls} text-foreground-muted hover:bg-destructive-soft hover:text-destructive-soft-foreground`}>
-                  <Trash2 className="h-3.5 w-3.5" aria-hidden />
-                  Delete document
-                </button>
-              )}
-              {doc.is_public && doc.public_slug ? (
-                <div className="px-3 py-2.5 text-xs">
-                  <div className="flex items-center justify-between gap-2 mb-1.5">
-                    <span className="coord-spark">Published</span>
-                    <div className="flex items-center gap-2.5">
-                      <button
-                        onClick={copyPublicLink}
-                        className="inline-flex items-center gap-1 text-foreground-muted hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
-                      >
-                        {copied ? <CheckCircle2 className="h-3 w-3 text-accent" aria-hidden /> : <ExternalLink className="h-3 w-3" aria-hidden />}
-                        {copied ? "Copied" : "Copy"}
-                      </button>
-                      <button
-                        onClick={handleUnpublish}
-                        disabled={publishing}
-                        className="inline-flex items-center gap-1 text-foreground-muted hover:text-destructive transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset disabled:opacity-50"
-                      >
-                        {publishing ? <Loader2 className="h-3 w-3 animate-spin" aria-hidden /> : <Lock className="h-3 w-3" aria-hidden />}
-                        {publishing ? "…" : "Unpublish"}
-                      </button>
-                    </div>
-                  </div>
-                  <TooltipText as="div" tip={`/p/${doc.public_slug}`} className="font-mono text-[11px] text-foreground-muted truncate">
-                    /p/{doc.public_slug}
-                  </TooltipText>
-                </div>
-              ) : (
-                <button
-                  onClick={() => setPublishOpen(true)}
-                  disabled={publishing}
-                  className={`${rowCls} text-foreground hover:bg-surface-hover hover:text-link disabled:opacity-50`}
-                >
-                  <Unlock className="h-3.5 w-3.5 text-foreground-muted" aria-hidden />
-                  Publish to /p/…
-                </button>
-              )}
-            </Panel>
-          );
-        })()}
-
-        <Tabs defaultValue="outline" className="flex flex-col min-h-0 flex-1">
-          <TabsList className="shrink-0 w-full">
-            <TabsTrigger value="outline" className="flex-1 min-w-0 gap-1 px-2">
-              Outline
-              <span className="coord tabular-nums">{headingSlugs.length}</span>
-            </TabsTrigger>
-            <TabsTrigger value="relations" className="flex-1 min-w-0 gap-1 px-2">
-              Relations
-              {visibleRelationCount > 0 && (
-                <span className="coord tabular-nums">{visibleRelationCount}</span>
-              )}
-            </TabsTrigger>
-            <TabsTrigger value="history" className="flex-1 min-w-0 gap-1 px-2">
-              History
-              {provenance.length > 0 && (
-                <span className="coord tabular-nums">{provenance.length}</span>
-              )}
-            </TabsTrigger>
-          </TabsList>
-
-          <TabsContent
-            value="outline"
-            className="flex-1 min-h-0 overflow-y-auto rail-scroll pr-1 pt-3"
-          >
-            <DocumentOutline markdown={doc.content || ""} articleEl={articleEl} />
-          </TabsContent>
-
-          <TabsContent
-            value="relations"
-            className="flex-1 min-h-0 overflow-y-auto rail-scroll pr-1 pt-3"
-          >
-            <RelationsPanel
-              vault={name!}
-              sourceUri={doc.path ? docUri(name!, doc.path) : ""}
-              relations={relations}
-              relationsError={relationsError}
-              canWrite={canEdit}
-              graphHref={`/vault/${name}/graph${doc.path ? `?entry=${encodeURIComponent(doc.path)}` : ""}`}
-              onReload={reloadRelations}
-            />
-          </TabsContent>
-
-          <TabsContent
-            value="history"
-            className="flex-1 min-h-0 overflow-y-auto rail-scroll pr-1 pt-3"
-          >
-            {historyError ? (
-              <Alert variant="destructive">Failed to load history.</Alert>
-            ) : (
-              <HistoryList
-                entries={provenance as any}
-                selectedHash={commitHash}
-                onSelect={(hash) => {
-                  const p = new URLSearchParams(searchParams);
-                  if (commitHash === hash) {
-                    p.delete("commit");
-                  } else {
-                    p.set("commit", hash);
-                  }
-                  setSearchParams(p, { replace: false });
-                }}
-              />
-            )}
-          </TabsContent>
-        </Tabs>
-      </aside>
-      )}
+      </section>
 
       <FrontmatterEditDialog
         open={editOpen}
@@ -874,47 +1130,15 @@ export default function DocumentPage() {
           if (next) applyView(next);
         }}
       />
-    </div>
+    </>
   );
 }
 
-// ── Frontmatter metadata card ─────────────────────────────────
-function FrontmatterCard({ doc }: { doc: any }) {
-  const rows: Array<[string, React.ReactNode]> = [];
-  if (doc.type) rows.push(["Type", <span className="text-foreground">{doc.type}</span>]);
-  if (doc.status) {
-    // Status carries a shape (Badge), not color alone (WCAG 1.4.1).
-    const variant =
-      doc.status === "active" ? "active" :
-      doc.status === "archived" ? "archived" :
-      "draft";
-    rows.push(["Status", <Badge variant={variant}>{doc.status}</Badge>]);
-  }
-  if (doc.domain) rows.push(["Domain", <span className="text-foreground">{doc.domain}</span>]);
-  if (doc.tags?.length) {
-    rows.push([
-      "Tags",
-      <span className="text-info break-words">{doc.tags.map((t: string) => `#${t}`).join(" ")}</span>,
-    ]);
-  }
-  if (doc.is_public) {
-    rows.push([
-      "Published",
-      <span className="text-foreground break-all">
-        /p/{doc.public_slug}
-      </span>,
-    ]);
-  }
-
-  if (rows.length === 0) return null;
-
+function PropertyRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <Panel className="px-4 py-3 font-mono text-[11px] leading-[1.85]">
-      {rows.map(([k, v]) => (
-        <div key={k}>
-          <span className="text-foreground-muted">{k}:</span> {v}
-        </div>
-      ))}
-    </Panel>
+    <div className="grid grid-cols-[5rem_minmax(0,1fr)] items-start gap-3">
+      <dt className="text-foreground-muted">{label}</dt>
+      <dd className="min-w-0 text-right">{children}</dd>
+    </div>
   );
 }

@@ -232,6 +232,21 @@ describe("VaultExplorer — reserved system collection", () => {
     expect(rows[0]).toHaveTextContent("overview");
     expect(within(tree).getByTitle(/system collection/i)).toBeInTheDocument();
   });
+
+  it("shows the provisioned guide even when the backend returns no collection row", async () => {
+    browseMock.mockResolvedValueOnce({
+      vault: "v",
+      path: "",
+      items: [
+        { type: "document", name: "Vault guide", path: "overview/vault-skill.md", doc_type: "skill" },
+      ],
+    });
+    renderAt("/vault/v");
+    const tree = await screen.findByRole("tree", { name: /v explorer/ });
+    expect(within(tree).getByRole("treeitem")).toHaveTextContent("overview");
+    expect(within(tree).getByTitle(/system collection/i)).toBeInTheDocument();
+    expect(screen.queryByText(/No collections yet/i)).toBeNull();
+  });
 });
 
 describe("VaultExplorer — error & empty", () => {
@@ -244,9 +259,9 @@ describe("VaultExplorer — error & empty", () => {
     expect(alert).toHaveTextContent(/boom/);
   });
 
-  it("shows EMPTY when the vault has no items", async () => {
+  it("explains how the empty tree will fill when the vault has no items", async () => {
     browseMock.mockResolvedValueOnce({ vault: "v", path: "", items: [] });
     renderAt("/vault/v");
-    expect(await screen.findByText(/— Empty —/i)).toBeInTheDocument();
+    expect(await screen.findByText(/No collections yet/i)).toBeInTheDocument();
   });
 });

@@ -1,6 +1,12 @@
-import { useEffect, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
-import { ArrowLeft } from "lucide-react";
+import { useEffect, useState, type ComponentType } from "react";
+import { useSearchParams } from "react-router-dom";
+import {
+  KeyRound,
+  Palette,
+  ShieldCheck,
+  UserRound,
+  type LucideProps,
+} from "lucide-react";
 import {
   getAuthConfig,
   getMe,
@@ -15,12 +21,42 @@ import {
   TabsList,
   TabsTrigger,
 } from "@/components/ui/tabs";
+import { PageHeader } from "@/components/ui/page-header";
+import { PageShell } from "@/components/ui/page-shell";
+import { RoleBadge } from "@/components/status-badge";
+import { cn } from "@/lib/utils";
 import { ProfileSection, type User } from "./profile-section";
 import { TokensSection, type PAT } from "./tokens-section";
 import { PreferencesSection } from "./preferences-section";
 import { AdminSection } from "./admin-section";
 
 type TabId = "profile" | "tokens" | "preferences" | "admin";
+
+const SETTINGS_SECTIONS: Array<{
+  id: Exclude<TabId, "admin">;
+  label: string;
+  description: string;
+  icon: ComponentType<LucideProps>;
+}> = [
+  {
+    id: "profile",
+    label: "Profile",
+    description: "Identity and password",
+    icon: UserRound,
+  },
+  {
+    id: "tokens",
+    label: "Agent access",
+    description: "Tokens and connections",
+    icon: KeyRound,
+  },
+  {
+    id: "preferences",
+    label: "Appearance",
+    description: "Theme preference",
+    icon: Palette,
+  },
+];
 
 export default function SettingsPage() {
   const [user, setUser] = useState<User | null>(null);
@@ -29,9 +65,11 @@ export default function SettingsPage() {
   const [users, setUsers] = useState<AdminUser[] | null>(null);
   const [usersError, setUsersError] = useState(false);
   const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
+  const [verticalNav, setVerticalNav] = useState(() =>
+    typeof window !== "undefined" ? window.matchMedia("(min-width: 1024px)").matches : false,
+  );
 
   const [searchParams, setSearchParams] = useSearchParams();
-  const navigate = useNavigate();
 
   // Name the tab/history entry (tab switching + SR route-change orientation).
   // Keyed on the raw `?tab=` (the derived activeTab lives past an early return,
@@ -45,14 +83,6 @@ export default function SettingsPage() {
       document.title = prev;
     };
   }, [searchParams]);
-
-  // Walk back if there's history (user entered Settings from somewhere
-  // meaningful — a vault, a doc, etc.), otherwise fall through to Home.
-  // Browser history length hits 1 on a fresh tab / direct deep-link.
-  const goBack = () => {
-    if (window.history.length > 1) navigate(-1);
-    else navigate("/");
-  };
 
   useEffect(() => {
     let cancelled = false;
@@ -70,6 +100,14 @@ export default function SettingsPage() {
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  useEffect(() => {
+    const media = window.matchMedia("(min-width: 1024px)");
+    const syncOrientation = () => setVerticalNav(media.matches);
+    syncOrientation();
+    media.addEventListener("change", syncOrientation);
+    return () => media.removeEventListener("change", syncOrientation);
   }, []);
 
   async function loadPATs() {
@@ -135,94 +173,162 @@ export default function SettingsPage() {
   };
 
   return (
-    <div className="max-w-4xl mx-auto fade-up">
-      {/* One upward affordance — a history-aware Back. The breadcrumb's
-          location (Settings › {tab}) was redundant with the H1 + the tab bar
-          right below, and its middle crumb self-linked to this page. */}
-      <div className="mb-6">
-        <button
-          type="button"
-          onClick={goBack}
-          className="inline-flex items-center gap-1.5 min-h-[36px] coord hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background rounded-[var(--radius-sm)]"
-        >
-          <ArrowLeft className="h-3 w-3" aria-hidden />
-          Back
-        </button>
-      </div>
+    <PageShell
+      header={
+        <PageHeader
+          eyebrow="Personal workspace"
+          title="Account settings"
+          subtitle="Manage how you appear, how agents connect, and how AKB looks on this device."
+          className="mb-7"
+        />
+      }
+      contentWidth="full"
+    >
+      <Tabs
+        value={activeTab}
+        onValueChange={setTab}
+        orientation={verticalNav ? "vertical" : "horizontal"}
+        className="grid items-start gap-5 lg:grid-cols-[16.5rem_minmax(0,1fr)] xl:gap-8 xl:grid-cols-[18rem_minmax(0,1fr)]"
+      >
+        <aside className="min-w-0 lg:sticky lg:top-20 lg:flex lg:min-h-[calc(100vh-14rem)] lg:flex-col lg:rounded-[var(--radius-md)] lg:border lg:border-border lg:bg-surface lg:p-4 lg:shadow-xs xl:p-5">
+          <div className="hidden border-b border-border pb-5 lg:block">
+            <span className="coord-ink">Account</span>
+            <div className="mt-3 flex items-center gap-3">
+              <span
+                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-border-strong bg-surface-selected text-sm font-semibold text-surface-selected-foreground"
+                aria-hidden
+              >
+                {initialsFor(user.display_name?.trim() || user.username)}
+              </span>
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-sm font-semibold text-foreground">
+                  {user.display_name?.trim() || user.username}
+                </p>
+                <p className="mt-0.5 truncate text-xs text-foreground-muted">@{user.username}</p>
+              </div>
+              <RoleBadge role={user.is_admin ? "admin" : "user"} />
+            </div>
+            <p className="mt-3 truncate text-xs text-foreground-muted">{user.email}</p>
+          </div>
 
-      <header className="mb-6">
-        <div className="coord-spark mb-2">Account · {user.username}</div>
-        <h1 className="font-display text-3xl text-foreground">
-          Settings
-        </h1>
-        <p className="mt-1.5 text-sm text-foreground-muted">
-          Manage your account, connection tokens, and preferences.
-        </p>
-      </header>
+          <TabsList
+            aria-label="Account settings"
+            className="flex w-full max-w-full items-stretch gap-1 overflow-x-auto rounded-[var(--radius-lg)] border border-border bg-surface p-2 shadow-sm [scrollbar-width:none] [&::-webkit-scrollbar]:hidden lg:mt-4 lg:flex-col lg:overflow-visible lg:rounded-none lg:border-0 lg:bg-transparent lg:p-0 lg:shadow-none"
+          >
+            {SETTINGS_SECTIONS.map((section) => (
+              <SettingsTab
+                key={section.id}
+                {...section}
+                count={section.id === "tokens" ? pats?.length : undefined}
+              />
+            ))}
+            {user.is_admin && (
+              <SettingsTab
+                id="admin"
+                label="Administration"
+                description="Users and server access"
+                icon={ShieldCheck}
+                count={users?.length}
+              />
+            )}
+          </TabsList>
 
-      <Tabs value={activeTab} onValueChange={setTab}>
-        {/* Scroll the pill track on narrow screens so the admin 4-tab row never
-            clips at 375px (the raised pills break if wrapped). */}
-        <TabsList className="max-w-full overflow-x-auto">
-          <TabsTrigger value="profile">Profile</TabsTrigger>
-          <TabsTrigger value="tokens" className="gap-1.5">
-            Tokens
-            <span className="coord tabular-nums">[{pats ? pats.length : "··"}]</span>
-          </TabsTrigger>
-          <TabsTrigger value="preferences">Preferences</TabsTrigger>
-          {user.is_admin && (
-            <TabsTrigger value="admin" className="gap-1.5">
-              Admin
-              {users && (
-                <span className="coord tabular-nums">[{users.length}]</span>
-              )}
-            </TabsTrigger>
-          )}
-        </TabsList>
+          <div className="mt-5 hidden items-center gap-2 border-t border-border pt-4 text-xs text-foreground-muted lg:mt-auto lg:flex">
+            <span className="h-2 w-2 shrink-0 rounded-full bg-success" aria-hidden />
+            <span>Signed in as <span className="font-medium text-foreground">@{user.username}</span></span>
+          </div>
+        </aside>
 
-        <TabsContent value="profile" className="pt-6 space-y-6">
-          <ProfileSection
-            user={user}
-            localPasswordEnabled={localPasswordEnabled}
-            localProfileEditingEnabled={localPasswordEnabled}
-            onUserUpdate={(patch) =>
-              setUser((u) => (u ? { ...u, ...patch } : u))
-            }
-          />
-        </TabsContent>
-
-        <TabsContent value="tokens" className="pt-6 space-y-6">
-          <TokensSection
-            pats={pats}
-            patsError={patsError}
-            mcpOauthEnabled={mcpOauthEnabled}
-            onReloadPats={loadPATs}
-          />
-        </TabsContent>
-
-        {/* Preferences — theme control inline (synced with the header menu via
-            useTheme), not a read-only status pointing off-page. */}
-        <TabsContent value="preferences" className="pt-6 space-y-6">
-          <PreferencesSection />
-        </TabsContent>
-
-        {/* The "Memory" tab was removed in v0.5.0 — agent memory now
-            lives in a per-user vault (`agent-memory-{username}`) and is
-            accessible via the standard /vault/ browse UI. */}
-
-        {/* Admin — user management. Only rendered when user.is_admin. */}
-        {user.is_admin && (
-          <TabsContent value="admin" className="pt-6 space-y-6">
-            <AdminSection
+        <div className="min-w-0">
+          <TabsContent value="profile" className="space-y-6 pt-0">
+            <ProfileSection
               user={user}
-              users={users}
-              usersError={usersError}
               localPasswordEnabled={localPasswordEnabled}
-              onReloadUsers={loadUsers}
+              localProfileEditingEnabled={localPasswordEnabled}
+              onUserUpdate={(patch) =>
+                setUser((u) => (u ? { ...u, ...patch } : u))
+              }
             />
           </TabsContent>
-        )}
+
+          <TabsContent value="tokens" className="space-y-6 pt-0">
+            <TokensSection
+              pats={pats}
+              patsError={patsError}
+              mcpOauthEnabled={mcpOauthEnabled}
+              onReloadPats={loadPATs}
+            />
+          </TabsContent>
+
+          <TabsContent value="preferences" className="space-y-6 pt-0">
+            <PreferencesSection />
+          </TabsContent>
+
+          {user.is_admin && (
+            <TabsContent value="admin" className="space-y-6 pt-0">
+              <AdminSection
+                user={user}
+                users={users}
+                usersError={usersError}
+                localPasswordEnabled={localPasswordEnabled}
+                onReloadUsers={loadUsers}
+              />
+            </TabsContent>
+          )}
+        </div>
       </Tabs>
-    </div>
+    </PageShell>
   );
+}
+
+function SettingsTab({
+  id,
+  label,
+  description,
+  icon: Icon,
+  count,
+}: {
+  id: TabId;
+  label: string;
+  description: string;
+  icon: ComponentType<LucideProps>;
+  count?: number;
+}) {
+  return (
+    <TabsTrigger
+      value={id}
+      className={cn(
+        "group relative min-h-11 min-w-max justify-start gap-2.5 px-3 py-2 text-left",
+        "data-[state=active]:bg-surface-selected data-[state=active]:text-surface-selected-foreground data-[state=active]:shadow-none",
+        "lg:w-full lg:min-w-0 lg:rounded-[var(--radius-md)] lg:pl-4 lg:py-2.5",
+      )}
+    >
+      <span
+        className="absolute inset-y-2 left-0 hidden w-0.5 rounded-full bg-primary opacity-0 transition-opacity group-data-[state=active]:opacity-100 lg:block"
+        aria-hidden
+      />
+      <span className="hidden h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-sm)] border border-transparent bg-surface-2 text-foreground-muted transition-token group-data-[state=active]:border-primary/15 group-data-[state=active]:bg-surface group-data-[state=active]:text-primary lg:flex">
+        <Icon className="h-4 w-4" aria-hidden />
+      </span>
+      <span className="min-w-0">
+        <span className="block text-sm font-semibold">{label}</span>
+        <span className="mt-0.5 hidden truncate text-[11px] font-normal text-foreground-muted lg:block">
+          {description}
+        </span>
+      </span>
+      {count !== undefined && (
+        <span className="ml-auto hidden min-w-6 rounded-full bg-surface px-1.5 py-0.5 text-center text-[10px] font-semibold tabular-nums text-foreground-muted ring-1 ring-border lg:inline-block">
+          {count}
+        </span>
+      )}
+    </TabsTrigger>
+  );
+}
+
+function initialsFor(label: string): string {
+  const words = label.trim().split(/\s+/).filter(Boolean);
+  if (words.length > 1) {
+    return `${Array.from(words[0])[0] ?? ""}${Array.from(words[words.length - 1])[0] ?? ""}`;
+  }
+  return Array.from(words[0] ?? "?").slice(0, 2).join("");
 }

@@ -82,6 +82,9 @@
   --color-surface-active: #e3e7ec;   /* pressed fill (one notch past surface-2) */
   --color-surface-selected: #e0eef2; /* selected/current — teal-tinted, not gray */
   --color-surface-selected-foreground: #004059;
+  /* Static section headers need a structural brand tint without borrowing the
+     selected-state token (which would falsely imply interaction). */
+  --color-workspace-section: #edf5f7;
   /* Home search hero: exact single-bloom treatment from the approved mockup.
      Kept separate from the global brand aurora because this is a centered,
      cool-only search spotlight rather than a teal/orange atmosphere mesh. */
@@ -219,6 +222,7 @@
   --color-surface-active: #26303c;
   --color-surface-selected: #0f2a33; /* teal-tinted */
   --color-surface-selected-foreground: #9fd4e6;
+  --color-workspace-section: #11272f;
   --color-home-hero-glow: rgba(24, 138, 168, 0.24);
 
   /* categorical / dataviz (dark) */
@@ -262,6 +266,18 @@
 html, body, #root {
   height: 100%;
   margin: 0;
+}
+
+/* Keep the shared app bar on one horizontal coordinate system. Document-flow
+   routes may own the viewport scrollbar, so they reserve its gutter before it
+   appears. Vault routes lock the viewport and scroll inside their workspace;
+   reserving a second root gutter there only leaves a dead strip at the right. */
+html {
+  scrollbar-gutter: stable;
+}
+
+html.vault-workspace-scroll-lock {
+  scrollbar-gutter: auto;
 }
 
 body {
@@ -721,6 +737,15 @@ body::before {
 }
 .akb-md .katex-display > .katex { white-space: nowrap; }
 
+/* The document file frame may grow into space reclaimed from either rail.
+   Keep prose scannable without constraining tables, code blocks, or media that
+   benefit from the wider Git-style workspace. */
+.document-reading-flow > :where(h1, h2, h3, h4, h5, h6, p, ul, ol, blockquote) {
+  width: 100%;
+  max-width: 64rem;
+  margin-inline: auto;
+}
+
 /* ── Hairline + misc utilities (preserved) ──────────────────────── */
 .hairline-b { border-bottom: 1px solid var(--color-border); }
 .hairline-t { border-top: 1px solid var(--color-border); }
@@ -734,6 +759,8 @@ body::before {
 }
 
 .rail-scroll { scrollbar-gutter: stable; scrollbar-width: thin; }
+.rail-scroll-auto { scrollbar-gutter: auto; }
+.rail-scroll-centered { scrollbar-gutter: stable both-edges; }
 .rail-scroll::-webkit-scrollbar { width: 6px; }
 .rail-scroll::-webkit-scrollbar-track { background: transparent; }
 .rail-scroll::-webkit-scrollbar-thumb {
