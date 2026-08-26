@@ -140,7 +140,7 @@ export function AssetImage({
 
   if (isPrivateAsset && !currentLoadState?.blobUrl && !currentLoadState?.failed) {
     return (
-      <div
+      <span
         role="status"
         aria-label={alt ? `Loading image: ${alt}` : "Loading image"}
         className={cn(
@@ -150,13 +150,13 @@ export function AssetImage({
       >
         <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
         Loading image…
-      </div>
+      </span>
     );
   }
 
   if (currentLoadState?.failed || imageFailed || !resolvedSrc) {
     return (
-      <div
+      <span
         role="img"
         aria-label={alt ? `Image unavailable: ${alt}` : "Image unavailable"}
         className={cn(
@@ -166,7 +166,7 @@ export function AssetImage({
       >
         <ImageOff className="h-4 w-4" aria-hidden />
         Image unavailable
-      </div>
+      </span>
     );
   }
 

@@ -239,6 +239,7 @@ describe("Layout — auth gate", () => {
       mcp_oauth: { enabled: true },
     });
     vi.mocked(api.getToken).mockReturnValue(null);
+    let resolveForeground: ((user: api.CurrentUser) => void) | undefined;
     vi.mocked(api.getMe)
       .mockResolvedValueOnce({
         user_id: "user-1",
@@ -249,26 +250,33 @@ describe("Layout — auth gate", () => {
         auth_method: "browser_session",
         key_class: null,
       })
-      .mockResolvedValueOnce({
-        user_id: "user-2",
-        username: "bob",
-        email: "bob@example.com",
-        display_name: "Bob",
-        is_admin: false,
-        auth_method: "browser_session",
-        key_class: null,
-      });
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        resolveForeground = resolve;
+      }));
     const queryClient = new QueryClient();
     queryClient.setQueryData(["private", "alice"], { secret: true });
 
     renderAt("/", queryClient);
-    expect(await screen.findByTestId("home")).toBeTruthy();
+    const mountedWorkspace = await screen.findByTestId("home");
 
     window.dispatchEvent(new Event("focus"));
 
     expect(await screen.findByText("Verifying session…")).toBeTruthy();
+    expect(screen.getByTestId("home")).toBe(mountedWorkspace);
+    resolveForeground?.({
+      user_id: "user-2",
+      username: "bob",
+      email: "bob@example.com",
+      display_name: "Bob",
+      is_admin: false,
+      auth_method: "browser_session",
+      key_class: null,
+    });
     await waitFor(() => expect(api.getMe).toHaveBeenCalledTimes(2));
-    expect(await screen.findByTestId("home")).toBeTruthy();
+    await waitFor(() => {
+      expect(screen.queryByText("Verifying session…")).toBeNull();
+    });
+    expect(screen.getByTestId("home")).toBe(mountedWorkspace);
     expect(queryClient.getQueryData(["private", "alice"])).toBeUndefined();
     expect(api.clearPrivateAssetCache).toHaveBeenCalled();
   });

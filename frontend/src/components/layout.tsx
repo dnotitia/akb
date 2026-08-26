@@ -154,7 +154,7 @@ export function Layout() {
     return () => root.classList.remove("vault-workspace-scroll-lock");
   }, [viewportLocked]);
 
-  if (session.status === "checking" || revalidating) {
+  if (session.status === "checking") {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background text-foreground">
         <div className="coord" role="status" aria-live="polite">
@@ -179,7 +179,16 @@ export function Layout() {
     : "min-h-screen flex flex-col bg-background text-foreground";
 
   return (
-    <div className={rootClass}>
+    <div className={rootClass} aria-busy={revalidating || undefined}>
+      {revalidating && (
+        <div
+          className="fixed inset-0 z-[var(--z-toast)] flex items-center justify-center bg-background/95 backdrop-blur-sm"
+          role="status"
+          aria-live="polite"
+        >
+          <div className="coord">Verifying session…</div>
+        </div>
+      )}
       {/* Skip link — first focusable element; jumps keyboard/SR users past the
           header chrome to the page content on every route. */}
       <a
