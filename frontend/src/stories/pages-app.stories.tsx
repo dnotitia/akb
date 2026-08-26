@@ -57,11 +57,52 @@ export const HomeWorkspace: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByRole("heading", { name: "Workspace" })).toBeInTheDocument();
+    await expect(
+      await canvas.findByRole("heading", { name: "Find what the team already knows." }),
+    ).toBeInTheDocument();
     await expect(await canvas.findByText("Recent activity")).toBeInTheDocument();
     await expect(await canvas.findByText("Your vaults")).toBeInTheDocument();
+    await expect(await canvas.findByRole("link", { name: "View all vaults" })).toBeInTheDocument();
+    await expect(canvas.queryByRole("button", { name: "Show more vaults" })).not.toBeInTheDocument();
+    await expect(await canvas.findByRole("heading", { name: "Connect" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("button", { name: "Mint token" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("tab", { name: "Claude Code" })).toBeInTheDocument();
     await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
     await expect(canvas.queryByRole("navigation", { name: "Vaults" })).not.toBeInTheDocument();
+  },
+};
+
+const expandableRecent = Array.from({ length: 16 }, (_, index) => ({
+  ...recentChanges.changes[index % recentChanges.changes.length],
+  doc_id: `d-expand-${index + 1}`,
+  title: `Expandable change ${index + 1}`,
+  changed_at: new Date(Date.UTC(2026, 6, 6, 4, 12 - index)).toISOString(),
+}));
+
+export const HomeRecentExpandable: Story = {
+  name: "Home / recent show more",
+  parameters: {
+    router: { initialEntries: ["/"] },
+    msw: {
+      handlers: [
+        ...chromeWithTokens,
+        defaultVaultListHandler,
+        defaultAnyVaultInfoHandler,
+        http.get(`${API}/recent`, ({ request }) => {
+          const limit = Number(new URL(request.url).searchParams.get("limit") || "8");
+          return HttpResponse.json({ changes: expandableRecent.slice(0, limit) });
+        }),
+      ],
+    },
+  },
+  render: () => <AkbRouteTree />,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await expect(await canvas.findByText("Expandable change 8")).toBeInTheDocument();
+    await expect(canvas.queryByText("Expandable change 9")).not.toBeInTheDocument();
+    await expect(
+      await canvas.findByRole("button", { name: "Show more recent activity" }),
+    ).toBeInTheDocument();
   },
 };
 
@@ -106,7 +147,9 @@ export const HomeRecentLoading: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("Workspace")).toBeInTheDocument();
+    await expect(
+      await canvas.findByRole("heading", { name: "Find what the team already knows." }),
+    ).toBeInTheDocument();
     await expect(await canvas.findByText("Recent activity")).toBeInTheDocument();
     await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
   },

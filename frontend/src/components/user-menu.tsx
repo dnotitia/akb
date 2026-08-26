@@ -4,26 +4,25 @@ import { useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   LogOut,
-  Monitor,
-  Moon,
   Settings as SettingsIcon,
-  Sun,
 } from "lucide-react";
 import { getMe, logoutOrdinarySession, type CurrentUser } from "@/lib/api";
 import { useTheme, type Theme } from "@/hooks/use-theme";
 import { TooltipText } from "@/components/ui/tooltip-text";
-
-const THEME_ICONS: Record<Theme, React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>> = {
-  light: Sun,
-  dark: Moon,
-  system: Monitor,
-};
 
 const THEME_LABELS: Record<Theme, string> = {
   light: "Light",
   dark: "Dark",
   system: "System",
 };
+
+function initialsFor(label: string): string {
+  const words = label.trim().split(/\s+/).filter(Boolean);
+  if (words.length > 1) {
+    return `${Array.from(words[0])[0] ?? ""}${Array.from(words[words.length - 1])[0] ?? ""}`;
+  }
+  return Array.from(words[0] ?? "?").slice(0, 2).join("");
+}
 
 /**
  * Unified user menu — avatar trigger, dropdown with identity + account actions.
@@ -73,7 +72,7 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
   const label = user?.display_name || user?.username || "Account";
   // Glyph casing is CSS-only (`uppercase` on the avatar), not a JS transform of
   // the user-supplied display name (§8).
-  const initial = label[0] || "?";
+  const initials = initialsFor(label);
 
   return (
     <DropdownMenu.Root
@@ -84,23 +83,17 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
     >
       <DropdownMenu.Trigger
         aria-label={`Account menu — ${label}`}
-        className="inline-flex h-9 items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface px-2 pr-3 text-foreground hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background transition-token cursor-pointer"
+        className="group inline-flex h-9 min-w-9 max-w-28 cursor-pointer items-center gap-2 rounded-[var(--radius-md)] border border-border-strong bg-surface py-1 pl-1 pr-2.5 shadow-xs transition-token hover:border-primary hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background data-[state=open]:border-primary data-[state=open]:bg-surface-selected data-[state=open]:ring-2 data-[state=open]:ring-ring/30 sm:max-w-48"
       >
         <span
-          className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-gradient-to-br from-[var(--color-teal)] to-[var(--color-teal-2)] text-white font-mono text-[10px] font-semibold uppercase"
+          className="inline-grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-sm)] bg-surface-selected font-display text-xs font-bold uppercase text-surface-selected-foreground group-hover:bg-surface-active"
           aria-hidden
         >
-          {initial}
+          {initials}
         </span>
-        {/* Cap the label so long display names truncate instead of wrapping
-            the header onto a second line; full name stays reachable via the
-            overflow tooltip and the trigger's aria-label. */}
-        <TooltipText
-          as="span"
-          className="hidden sm:inline max-w-[10rem] truncate text-[13px] font-medium"
-        >
+        <span className="min-w-0 truncate text-sm font-medium normal-case text-foreground">
           {label}
-        </TooltipText>
+        </span>
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
         <DropdownMenu.Content
@@ -108,20 +101,28 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
           sideOffset={6}
           className="z-50 min-w-[240px] rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
         >
-          {/* Identity header */}
-          <div className="px-3 py-2 border-b border-border mb-1">
-            <div className="coord">Account</div>
-            <TooltipText as="div" className="text-sm font-medium text-foreground truncate mt-0.5">
-              {label}
-            </TooltipText>
-            {user?.email && (
-              <TooltipText as="div" className="font-mono text-[11px] text-foreground-muted truncate">
-                {user.email}
+          {/* Identity card: the compact header trigger expands into the full
+              account context here, where there is enough room to read it. */}
+          <div className="mb-1 flex items-center gap-3 border-b border-border px-3 py-3">
+            <span
+              className="inline-grid h-10 w-10 shrink-0 place-items-center rounded-[var(--radius-md)] border border-border-strong bg-surface-selected font-display text-xs font-bold uppercase text-surface-selected-foreground"
+              aria-hidden
+            >
+              {initials}
+            </span>
+            <div className="min-w-0 flex-1">
+              <TooltipText as="div" className="truncate text-sm font-semibold text-foreground">
+                {label}
               </TooltipText>
-            )}
-            {user?.is_admin && (
-              <div className="coord-spark mt-1">Admin</div>
-            )}
+              {user?.email && (
+                <TooltipText as="div" className="truncate text-xs text-foreground-muted">
+                  {user.email}
+                </TooltipText>
+              )}
+              {user?.is_admin && (
+                <div className="mt-0.5 text-xs font-medium text-link">Administrator</div>
+              )}
+            </div>
           </div>
 
           {/* Theme — inline radio-ish row. Labelled sub-header to keep
@@ -129,7 +130,6 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
           <div className="px-3 pt-2 pb-1 coord">THEME</div>
           <div className="flex gap-1 px-2 pb-2">
             {(["light", "dark", "system"] as const).map((opt) => {
-              const Icon = THEME_ICONS[opt];
               const active = theme === opt;
               return (
                 <button
@@ -143,7 +143,6 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
                       : "border-border text-foreground-muted hover:text-foreground hover:bg-surface-hover"
                   }`}
                 >
-                  <Icon className="h-3 w-3" aria-hidden />
                   {THEME_LABELS[opt]}
                 </button>
               );

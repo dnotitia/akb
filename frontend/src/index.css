@@ -82,6 +82,10 @@
   --color-surface-active: #e3e7ec;   /* pressed fill (one notch past surface-2) */
   --color-surface-selected: #e0eef2; /* selected/current — teal-tinted, not gray */
   --color-surface-selected-foreground: #004059;
+  /* Home search hero: exact single-bloom treatment from the approved mockup.
+     Kept separate from the global brand aurora because this is a centered,
+     cool-only search spotlight rather than a teal/orange atmosphere mesh. */
+  --color-home-hero-glow: rgba(10, 111, 134, 0.13);
 
   /* ── Categorical / dataviz scale — teal→orange arc + one neutral, CVD-safe
      (lightness-ramped so categories stay separable under color-vision
@@ -215,6 +219,7 @@
   --color-surface-active: #26303c;
   --color-surface-selected: #0f2a33; /* teal-tinted */
   --color-surface-selected-foreground: #9fd4e6;
+  --color-home-hero-glow: rgba(24, 138, 168, 0.24);
 
   /* categorical / dataviz (dark) */
   --color-cat-1: #4aa6bd;
@@ -373,6 +378,117 @@ h1, h2, h3, h4, h5, h6 {
   background-clip: text;
   color: transparent;
 }
+
+/* Search-led Home masthead. The mockup uses one strict 800px axis: a 44px,
+   heavy title followed by the complete search system. Its atmosphere is a
+   single 720×420 teal bloom, centered and pulled 220px above the hero. The
+   section bleeds through Home's responsive page gutter so the glow starts
+   immediately below the app header, while content stays on the shared inset. */
+.home-search-hero {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  margin-top: -2rem;
+  padding-block: 4.5rem 3.5rem;
+}
+.home-search-hero::before {
+  content: "";
+  position: absolute;
+  top: -13.75rem;
+  left: 50%;
+  width: 45rem;
+  height: 26.25rem;
+  z-index: 0;
+  pointer-events: none;
+  background: radial-gradient(var(--color-home-hero-glow), transparent 70%);
+  transform: translateX(-50%);
+}
+.home-search-hero > * {
+  position: relative;
+  z-index: 1;
+}
+.home-search-title {
+  margin-bottom: 1.625rem;
+  color: var(--color-foreground);
+  font-family: var(--font-display);
+  font-size: clamp(2.125rem, 5vw, 2.75rem);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1.12;
+}
+.home-search-title em {
+  color: var(--color-link);
+  font-style: normal;
+}
+.knowledge-search-shell {
+  box-shadow: var(--shadow-md);
+  transition:
+    border-color var(--duration-fast) var(--ease-out),
+    box-shadow var(--duration-fast) var(--ease-out);
+}
+.knowledge-search-shell:focus-within {
+  border-color: var(--color-primary);
+  box-shadow: var(--shadow-md), 0 0 0 2px var(--color-surface-selected);
+}
+.knowledge-search-action {
+  background: linear-gradient(180deg, var(--color-link), var(--color-primary));
+}
+.knowledge-search-action:hover {
+  background: var(--color-primary);
+}
+
+/* Home knowledge ledger: cards and change rows share one restrained teal
+   interaction rail. It appears only on hover/focus and uses transform-only
+   motion, so the dense dashboard keeps stable geometry. */
+.home-vault-card.card-hover {
+  transition:
+    transform var(--duration-base) var(--ease-out),
+    border-color var(--duration-fast) var(--ease-out),
+    box-shadow var(--duration-base) var(--ease-out);
+}
+.home-vault-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 0.75rem auto;
+  height: 2px;
+  z-index: 1;
+  pointer-events: none;
+  background: var(--color-primary);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform var(--duration-base) var(--ease-out);
+}
+.home-vault-card:hover,
+.home-vault-card:focus-within {
+  border-color: var(--color-border-strong);
+}
+.home-vault-card:hover::before,
+.home-vault-card:focus-within::before {
+  transform: scaleX(1);
+}
+.home-activity-row {
+  position: relative;
+}
+.home-activity-row::before {
+  content: "";
+  position: absolute;
+  inset: 0.75rem auto 0.75rem 0;
+  width: 2px;
+  pointer-events: none;
+  background: var(--color-primary);
+  transform: scaleY(0);
+  transform-origin: center;
+  transition: transform var(--duration-fast) var(--ease-out);
+}
+.home-activity-row:hover::before,
+.home-activity-row:focus-visible::before {
+  transform: scaleY(1);
+}
+@media (max-width: 639px) {
+  .home-search-hero {
+    padding-block: 3rem 2.5rem;
+  }
+}
 .brand-mark {
   filter: drop-shadow(0 2px 6px rgba(0, 64, 89, 0.18));
 }
@@ -398,43 +514,6 @@ body::before {
     radial-gradient(45rem 45rem at 8% -12%, rgba(10, 111, 134, 0.1), transparent 60%),
     radial-gradient(40rem 40rem at 102% -6%, rgba(229, 94, 44, 0.075), transparent 55%),
     radial-gradient(50rem 30rem at 50% 120%, rgba(10, 111, 134, 0.06), transparent 60%);
-}
-
-/* Header-local aurora wash — the global body::before mesh is anchored
-   off-screen at the corners, so the masthead itself reads flat. This brings
-   one teal bloom up from the lower-left + a faint orange kiss from the
-   upper-right onto the actual header band, fading out within its own box.
-   Static (no motion), pointer-events:none, behind the header content (z-0). */
-.aurora-header {
-  position: relative;
-  /* Own stacking context so the ::before wash (z-0) stays strictly behind
-     header content and — paired with the bounded inset below — can't paint
-     over the content grid that follows (it tinted "Recent activity" before). */
-  isolation: isolate;
-}
-.aurora-header::before {
-  content: "";
-  position: absolute;
-  /* Bound all four edges to the header band (+ small bleed). Previously
-     `bottom: auto; height: 200%` let the box run ~1× header-height past
-     the band, unclipped, so the teal bloom's core landed in the content
-     area below — now it fades within its own box as intended. */
-  inset: -1.5rem -1rem -1rem -1rem;
-  z-index: 0;
-  pointer-events: none;
-  background:
-    /* teal core anchored inside the band (was 115% → sat below it) */
-    radial-gradient(30rem 16rem at 10% 85%, rgba(0, 64, 89, 0.07), transparent 62%),
-    radial-gradient(24rem 14rem at 94% -12%, rgba(229, 94, 44, 0.06), transparent 60%);
-}
-.dark .aurora-header::before {
-  background:
-    radial-gradient(30rem 16rem at 10% 85%, rgba(10, 111, 134, 0.13), transparent 62%),
-    radial-gradient(24rem 14rem at 94% -12%, rgba(229, 94, 44, 0.1), transparent 60%);
-}
-.aurora-header > * {
-  position: relative;
-  z-index: 1;
 }
 
 /* interactive card: lift + shadow on hover */

@@ -7,13 +7,16 @@ export function Logo({
   size = 28,
   wordmark = true,
   subtitle = false,
+  variant = "default",
   className,
 }: {
   size?: number;
   wordmark?: boolean;
   subtitle?: boolean;
+  variant?: "default" | "header";
   className?: string;
 }) {
+  const headerLockup = variant === "header";
   return (
     <span className={cn("inline-flex items-center gap-2.5", className)}>
       <span
@@ -26,7 +29,7 @@ export function Logo({
         }}
         aria-hidden
       >
-        a
+        {headerLockup ? "A" : "a"}
         <span
           className="absolute rounded-full"
           style={{
@@ -38,7 +41,18 @@ export function Logo({
           }}
         />
       </span>
-      {wordmark && (
+      {wordmark && headerLockup ? (
+        <span className="flex items-baseline gap-2 whitespace-nowrap leading-none">
+          <span className="font-display text-sm font-semibold tracking-tight text-foreground">
+            AKB
+          </span>
+          {subtitle && (
+            <span className="coord hidden tracking-wide md:inline">
+              AGENT KNOWLEDGEBASE
+            </span>
+          )}
+        </span>
+      ) : wordmark ? (
         <span className="flex flex-col leading-none">
           <span
             className="brand-gradient font-display tracking-tight"
@@ -52,7 +66,7 @@ export function Logo({
             </span>
           )}
         </span>
-      )}
+      ) : null}
     </span>
   );
 }
