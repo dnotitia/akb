@@ -397,13 +397,11 @@ export default function VaultSettingsPage() {
                 ref={settingsMainRef}
                 className="rail-scroll min-w-0 space-y-6 p-4 sm:p-5 lg:col-start-2 lg:row-start-1 lg:p-6 xl:min-h-0 xl:overflow-y-auto xl:overscroll-contain xl:scroll-py-6 xl:px-7"
               >
-                <Panel
-                  variant="workspace"
+                <section
                   id="general"
                   role="region"
                   aria-labelledby="general-settings-heading"
-                  inset={false}
-                  className="scroll-mt-6 border-border-strong"
+                  className="scroll-mt-6"
                 >
                   <SettingsSectionHeader
                     id="general-settings-heading"
@@ -412,73 +410,73 @@ export default function VaultSettingsPage() {
                     description="The identity people see across the workspace."
                     tone="knowledge"
                   />
-                  <div className="grid gap-4 p-4 2xl:grid-cols-[minmax(16rem,0.8fr)_minmax(22rem,1.2fr)]">
-                    <div>
-                      <Label className="mb-1.5 block">Vault address</Label>
-                      <div className="flex min-h-10 items-center justify-between gap-3 rounded-[var(--radius-md)] border border-border bg-surface-2 px-3">
-                        <span className="truncate font-mono text-sm text-foreground">
-                          akb://{name}
-                        </span>
-                        <CopyButton
-                          value={`akb://${name}`}
-                          label="Copy vault address"
-                        />
+                  <Panel variant="workspace" className="border-border-strong">
+                    <div className="grid gap-4 p-4 2xl:grid-cols-[minmax(16rem,0.8fr)_minmax(22rem,1.2fr)]">
+                      <div>
+                        <Label className="mb-1.5 block">Vault address</Label>
+                        <div className="flex min-h-10 items-center justify-between gap-3 rounded-[var(--radius-md)] border border-border bg-surface-2 px-3">
+                          <span className="truncate font-mono text-sm text-foreground">
+                            akb://{name}
+                          </span>
+                          <CopyButton
+                            value={`akb://${name}`}
+                            label="Copy vault address"
+                          />
+                        </div>
+                        <p className="mt-1.5 text-xs leading-relaxed text-foreground-muted">
+                          Vault names are permanent because every document URI
+                          depends on this address.
+                        </p>
                       </div>
-                      <p className="mt-1.5 text-xs leading-relaxed text-foreground-muted">
-                        Vault names are permanent because every document URI
-                        depends on this address.
-                      </p>
-                    </div>
 
-                    <div>
-                      <Label
-                        htmlFor="vault-description"
-                        className="mb-1.5 block"
-                      >
-                        Description
-                      </Label>
-                      <Textarea
-                        id="vault-description"
-                        value={description}
-                        onChange={(event) => {
-                          setDescription(event.target.value);
-                          setSavedScope(null);
-                        }}
-                        readOnly={!canEdit}
-                        disabled={saving}
-                        placeholder="Explain what belongs in this vault and who it serves."
-                        rows={3}
-                        className="resize-y"
+                      <div>
+                        <Label
+                          htmlFor="vault-description"
+                          className="mb-1.5 block"
+                        >
+                          Description
+                        </Label>
+                        <Textarea
+                          id="vault-description"
+                          value={description}
+                          onChange={(event) => {
+                            setDescription(event.target.value);
+                            setSavedScope(null);
+                          }}
+                          readOnly={!canEdit}
+                          disabled={saving}
+                          placeholder="Explain what belongs in this vault and who it serves."
+                          rows={3}
+                          className="resize-y"
+                        />
+                        <p className="mt-1.5 text-xs leading-relaxed text-foreground-muted">
+                          This description appears in Vault Overview and helps
+                          people choose the right knowledge space.
+                        </p>
+                      </div>
+
+                      {saveErrorScope === "general" && (
+                        <Alert variant="destructive">{saveError}</Alert>
+                      )}
+                    </div>
+                    {canEdit && (
+                      <SettingsActionBar
+                        dirty={descriptionDirty}
+                        saving={savingScope === "general"}
+                        saved={savedScope === "general" && !descriptionDirty}
+                        statusRef={generalStatusRef}
+                        onSave={() => requestSave("general")}
+                        onDiscard={() => handleDiscard("general")}
                       />
-                      <p className="mt-1.5 text-xs leading-relaxed text-foreground-muted">
-                        This description appears in Vault Overview and helps
-                        people choose the right knowledge space.
-                      </p>
-                    </div>
-
-                    {saveErrorScope === "general" && (
-                      <Alert variant="destructive">{saveError}</Alert>
                     )}
-                  </div>
-                  {canEdit && (
-                    <SettingsActionBar
-                      dirty={descriptionDirty}
-                      saving={savingScope === "general"}
-                      saved={savedScope === "general" && !descriptionDirty}
-                      statusRef={generalStatusRef}
-                      onSave={() => requestSave("general")}
-                      onDiscard={() => handleDiscard("general")}
-                    />
-                  )}
-                </Panel>
+                  </Panel>
+                </section>
 
-                <Panel
-                  variant="workspace"
+                <section
                   id="access"
                   role="region"
                   aria-labelledby="access-settings-heading"
-                  inset={false}
-                  className="scroll-mt-6 border-border-strong"
+                  className="scroll-mt-6"
                 >
                   <SettingsSectionHeader
                     id="access-settings-heading"
@@ -487,96 +485,100 @@ export default function VaultSettingsPage() {
                     description="Set the vault-wide default without changing individual member roles."
                     tone={publicAccess === "none" ? "info" : "success"}
                   />
-                  <div className="space-y-4 p-4">
-                    <div>
-                      <Label id="public-access-label" className="mb-2 block">
-                        Public access
-                      </Label>
-                      <Segmented
-                        aria-labelledby="public-access-label"
-                        value={publicAccess}
-                        onChange={(value) => {
-                          setPublicAccess(value as PublicAccess);
-                          setSavedScope(null);
-                        }}
-                        disabled={!canEdit || saving}
-                        className="grid-cols-1 sm:grid-cols-3"
-                        options={PUBLIC_ORDER.map((value) => {
-                          const Icon = PUBLIC_ICONS[value];
-                          return {
-                            value,
-                            label: PUBLIC_LABELS[value],
-                            icon: <Icon className="h-3.5 w-3.5" aria-hidden />,
-                            danger: value === "writer",
-                          };
-                        })}
-                      />
-                      <p
-                        className={`mt-3 flex items-start gap-2 text-xs leading-relaxed ${
-                          publicAccess === "writer"
-                            ? "text-warning-soft-foreground"
-                            : "text-foreground-muted"
-                        }`}
-                      >
-                        {publicAccess === "writer" ? (
-                          <AlertTriangle
-                            className="mt-0.5 h-3.5 w-3.5 shrink-0"
-                            aria-hidden
-                          />
-                        ) : publicAccess === "none" ? (
-                          <Lock
-                            className="mt-0.5 h-3.5 w-3.5 shrink-0"
-                            aria-hidden
-                          />
-                        ) : (
-                          <Globe
-                            className="mt-0.5 h-3.5 w-3.5 shrink-0"
-                            aria-hidden
-                          />
-                        )}
-                        <span>{PUBLIC_DESCRIPTIONS[publicAccess]}</span>
-                      </p>
-                    </div>
-
-                    {saveErrorScope === "access" && (
-                      <Alert variant="destructive">{saveError}</Alert>
-                    )}
-                  </div>
-                  {canEdit && (
-                    <SettingsActionBar
-                      dirty={accessDirty}
-                      saving={savingScope === "access"}
-                      saved={savedScope === "access" && !accessDirty}
-                      statusRef={accessStatusRef}
-                      onSave={() => requestSave("access")}
-                      onDiscard={() => handleDiscard("access")}
-                    />
-                  )}
-                  <div className="flex flex-col gap-3 border-t border-border bg-surface-2 p-4 sm:flex-row sm:items-center sm:justify-between">
-                    <div className="flex min-w-0 items-start gap-3">
-                      <TonalIcon tone="people">
-                        <Users className="h-4 w-4" aria-hidden />
-                      </TonalIcon>
+                  <Panel variant="workspace" className="border-border-strong">
+                    <div className="space-y-4 p-4">
                       <div>
-                        <h3 className="text-sm font-semibold text-foreground">
-                          Members and ownership
-                        </h3>
-                        <p className="mt-1 text-xs leading-relaxed text-foreground-muted">
-                          Invite people, adjust roles, or transfer ownership
-                          from the Members page.
+                        <Label id="public-access-label" className="mb-2 block">
+                          Public access
+                        </Label>
+                        <Segmented
+                          aria-labelledby="public-access-label"
+                          value={publicAccess}
+                          onChange={(value) => {
+                            setPublicAccess(value as PublicAccess);
+                            setSavedScope(null);
+                          }}
+                          disabled={!canEdit || saving}
+                          className="grid-cols-1 sm:grid-cols-3"
+                          options={PUBLIC_ORDER.map((value) => {
+                            const Icon = PUBLIC_ICONS[value];
+                            return {
+                              value,
+                              label: PUBLIC_LABELS[value],
+                              icon: (
+                                <Icon className="h-3.5 w-3.5" aria-hidden />
+                              ),
+                              danger: value === "writer",
+                            };
+                          })}
+                        />
+                        <p
+                          className={`mt-3 flex items-start gap-2 text-xs leading-relaxed ${
+                            publicAccess === "writer"
+                              ? "text-warning-soft-foreground"
+                              : "text-foreground-muted"
+                          }`}
+                        >
+                          {publicAccess === "writer" ? (
+                            <AlertTriangle
+                              className="mt-0.5 h-3.5 w-3.5 shrink-0"
+                              aria-hidden
+                            />
+                          ) : publicAccess === "none" ? (
+                            <Lock
+                              className="mt-0.5 h-3.5 w-3.5 shrink-0"
+                              aria-hidden
+                            />
+                          ) : (
+                            <Globe
+                              className="mt-0.5 h-3.5 w-3.5 shrink-0"
+                              aria-hidden
+                            />
+                          )}
+                          <span>{PUBLIC_DESCRIPTIONS[publicAccess]}</span>
                         </p>
                       </div>
+
+                      {saveErrorScope === "access" && (
+                        <Alert variant="destructive">{saveError}</Alert>
+                      )}
                     </div>
-                    <Button
-                      asChild
-                      variant="outline"
-                      size="sm"
-                      className="shrink-0"
-                    >
-                      <Link to={`/vault/${name}/members`}>Open members</Link>
-                    </Button>
-                  </div>
-                </Panel>
+                    {canEdit && (
+                      <SettingsActionBar
+                        dirty={accessDirty}
+                        saving={savingScope === "access"}
+                        saved={savedScope === "access" && !accessDirty}
+                        statusRef={accessStatusRef}
+                        onSave={() => requestSave("access")}
+                        onDiscard={() => handleDiscard("access")}
+                      />
+                    )}
+                    <div className="flex flex-col gap-3 border-t border-border bg-surface-2 p-4 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="flex min-w-0 items-start gap-3">
+                        <TonalIcon tone="people">
+                          <Users className="h-4 w-4" aria-hidden />
+                        </TonalIcon>
+                        <div>
+                          <h3 className="text-sm font-semibold text-foreground">
+                            Members and ownership
+                          </h3>
+                          <p className="mt-1 text-xs leading-relaxed text-foreground-muted">
+                            Invite people, adjust roles, or transfer ownership
+                            from the Members page.
+                          </p>
+                        </div>
+                      </div>
+                      <Button
+                        asChild
+                        variant="outline"
+                        size="sm"
+                        className="shrink-0"
+                      >
+                        <Link to={`/vault/${name}/members`}>Open members</Link>
+                      </Button>
+                    </div>
+                  </Panel>
+                </section>
 
                 <SkillSection
                   vault={name}

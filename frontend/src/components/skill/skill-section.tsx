@@ -131,15 +131,15 @@ export function SkillSection({
 
   return (
     <section id="skill" aria-labelledby="skill-h" className="scroll-mt-6">
-      <Panel variant="workspace" inset={false} className="border-border-strong">
-        <SettingsSectionHeader
-          id="skill-h"
-          icon={BookOpen}
-          title="Vault guide"
-          description="The operating instructions injected into every agent session for this vault."
-          tone="guide"
-        />
+      <SettingsSectionHeader
+        id="skill-h"
+        icon={BookOpen}
+        title="Vault guide"
+        description="The operating instructions injected into every agent session for this vault."
+        tone="guide"
+      />
 
+      <Panel variant="workspace" className="border-border-strong">
         <div className="p-4">
           {isMirror ? (
             <Alert variant="info">

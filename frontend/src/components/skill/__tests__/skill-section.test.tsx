@@ -42,11 +42,14 @@ describe("SkillSection", () => {
 
     // Anchor for the #skill redirect target.
     expect(document.getElementById("skill")).toBeTruthy();
-    expect(
-      screen
-        .getByRole("heading", { name: "Vault guide" })
-        .closest('[data-slot="settings-section-header"]'),
-    ).toHaveClass("bg-surface-2/55");
+    const sectionHeader = screen
+      .getByRole("heading", { name: "Vault guide" })
+      .closest('[data-slot="settings-section-header"]');
+    expect(sectionHeader).toHaveClass("border-border", "pb-3");
+    expect(sectionHeader).not.toHaveClass("bg-surface-2/55");
+    expect(sectionHeader?.nextElementSibling).toHaveClass(
+      "border-border-strong",
+    );
     expect(screen.getByText(/Stored body/)).toBeTruthy();
 
     // History points at the canonical doc pinned to its commit — the one URL

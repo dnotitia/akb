@@ -84,7 +84,9 @@ describe("Vault Settings redesign", () => {
       const header = screen
         .getByRole("heading", { name: title })
         .closest('[data-slot="settings-section-header"]');
-      expect(header).toHaveClass("bg-surface-2/55", "border-border-strong");
+      expect(header).toHaveClass("border-border", "pb-3");
+      expect(header).not.toHaveClass("bg-surface-2/55");
+      expect(header?.nextElementSibling).toHaveClass("border-border-strong");
     }
 
     const overviewLinks = screen.getAllByRole("link", { name: /overview/i });
