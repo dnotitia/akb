@@ -13,7 +13,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 
 import SearchPage from "../search";
-import { searchDocs, grepDocs, listVaults } from "@/lib/api";
+import { searchDocs, listVaults } from "@/lib/api";
 
 vi.mock("@/lib/api", () => ({
   searchDocs: vi.fn(),
@@ -22,7 +22,6 @@ vi.mock("@/lib/api", () => ({
 }));
 
 const mockedSearch = vi.mocked(searchDocs);
-const mockedGrep = vi.mocked(grepDocs);
 const mockedListVaults = vi.mocked(listVaults);
 
 afterEach(cleanup);
@@ -40,9 +39,30 @@ function renderAt(url: string) {
 }
 
 describe("Search filter chips", () => {
-  it("renders type chips including SKILL", () => {
-    mockedSearch.mockResolvedValue({ query: "", total: 0, returned: 0, total_matches: 0, results: [] });
+  it("progressively reveals type filters when results exist", async () => {
+    mockedSearch.mockResolvedValue({
+      query: "test",
+      total: 1,
+      returned: 1,
+      total_matches: 1,
+      results: [
+        {
+          source_type: "document",
+          uri: "akb://v/document/d-1",
+          vault: "v",
+          path: "overview/vault-skill.md",
+          title: "A skill doc",
+          doc_type: "skill",
+          score: 0.95,
+        },
+      ],
+    });
+    const u = userEvent.setup();
     renderAt("/search?q=test");
+    await screen.findByText("A skill doc");
+    await u.click(
+      screen.getByRole("button", { name: "Filter by document type" }),
+    );
     expect(screen.getByRole("button", { name: /toggle skill/i })).toBeTruthy();
     expect(screen.getByRole("button", { name: /toggle note/i })).toBeTruthy();
   });
@@ -82,6 +102,9 @@ describe("Search filter chips", () => {
     expect(screen.queryByText("A note")).toBeTruthy();
 
     // toggle NOTE chip off
+    await u.click(
+      screen.getByRole("button", { name: "Filter by document type" }),
+    );
     await u.click(screen.getByRole("button", { name: /toggle note/i }));
 
     // NOTE is now filtered out client-side; skill doc remains
@@ -89,6 +112,93 @@ describe("Search filter chips", () => {
     expect(screen.queryByText("A skill doc")).toBeTruthy();
 
     // only one searchDocs call — no re-fetch
+    expect(mockedSearch).toHaveBeenCalledTimes(1);
+  });
+
+  it("filters resource kinds in the progressive filter tray without re-fetching", async () => {
+    mockedSearch.mockResolvedValue({
+      query: "platform",
+      total: 2,
+      returned: 2,
+      total_matches: 2,
+      results: [
+        {
+          source_type: "document",
+          uri: "akb://v/document/d-1",
+          vault: "v",
+          path: "platform.md",
+          title: "Platform guide",
+          doc_type: "note",
+          score: 0.95,
+        },
+        {
+          source_type: "table",
+          uri: "akb://v/table/services",
+          vault: "v",
+          path: "services",
+          title: "Services",
+          score: 0.84,
+        },
+      ],
+    });
+    const user = userEvent.setup();
+    renderAt("/search?q=platform");
+
+    await screen.findByText("Platform guide");
+    expect(screen.getByText("Services")).toBeTruthy();
+    await user.click(
+      screen.getByRole("button", { name: "Filter by document type" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Tables" }));
+
+    expect(screen.queryByText("Platform guide")).toBeNull();
+    expect(screen.getByText("Services")).toBeTruthy();
+    expect(mockedSearch).toHaveBeenCalledTimes(1);
+  });
+
+  it("filters optional backend tags locally and cleans indexed context headers", async () => {
+    mockedSearch.mockResolvedValue({
+      query: "worker",
+      total: 2,
+      returned: 2,
+      total_matches: 2,
+      results: [
+        {
+          source_type: "document",
+          uri: "akb://v/document/d-1",
+          vault: "v",
+          path: "worker.md",
+          title: "Worker guide",
+          doc_type: "note",
+          tags: ["runtime", "operations"],
+          matched_section:
+            "[# Worker guide > ## Results] * API stays available while the worker restarts.",
+          score: 0.95,
+        },
+        {
+          source_type: "document",
+          uri: "akb://v/document/d-2",
+          vault: "v",
+          path: "auth.md",
+          title: "Authentication guide",
+          doc_type: "note",
+          tags: ["security"],
+          score: 0.85,
+        },
+      ],
+    });
+    const user = userEvent.setup();
+    renderAt("/search?q=worker");
+
+    expect(await screen.findByText("API stays available while the worker restarts.")).toBeTruthy();
+    expect(screen.queryByText(/\[# Worker guide/)).toBeNull();
+    await user.click(
+      screen.getByRole("button", { name: "Filter by document type" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Toggle tag security" }));
+
+    expect(screen.queryByText("Worker guide")).toBeNull();
+    expect(screen.getByText("Authentication guide")).toBeTruthy();
     expect(mockedSearch).toHaveBeenCalledTimes(1);
   });
 });

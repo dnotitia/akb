@@ -5,6 +5,7 @@ import {
   Copy,
   Eye,
   EyeOff,
+  KeyRound,
   Plus,
   RotateCw,
   Trash2,
@@ -14,6 +15,7 @@ import { createPAT, revokePAT } from "@/lib/api";
 import { formatDate, timeAgo } from "@/lib/utils";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { CodeSnippet } from "@/components/ui/code-snippet";
@@ -172,16 +174,19 @@ export function TokensSection({
 
   return (
     <>
+      <div className="grid items-start gap-6 xl:grid-cols-[minmax(0,1.3fr)_minmax(22rem,0.7fr)]">
       {newPat && (
         <section
-          className="rounded-[var(--radius-lg)] border border-accent/40 bg-accent/5 shadow-sm overflow-hidden"
+          className="overflow-hidden rounded-[var(--radius-lg)] border border-accent/40 bg-accent/5 shadow-sm xl:col-span-2"
           role="status"
           aria-live="polite"
         >
-          <div className="border-b border-accent/40 px-4 py-2 flex items-baseline justify-between gap-2 flex-wrap">
+          <div className="flex flex-wrap items-start justify-between gap-3 border-b border-accent/40 px-5 py-4 sm:px-6">
             <div>
-              <span className="coord-spark">Fresh token — copy now</span>
-              <span className="coord ml-2">Shown once. If you dismiss without copying, you'll need to reissue.</span>
+              <h2 className="text-base font-semibold text-foreground">Fresh token — copy now</h2>
+              <p className="mt-1 text-sm text-foreground-muted">
+                This secret is shown once. Store it before leaving this page.
+              </p>
             </div>
             <button
               onClick={() => setNewPat(null)}
@@ -191,7 +196,7 @@ export function TokensSection({
               <X className="h-3 w-3" aria-hidden />
             </button>
           </div>
-          <div className="p-6 space-y-4">
+          <div className="space-y-4 p-5 sm:p-6">
             <div className="flex items-start gap-3">
               <code className="flex-1 font-mono text-xs text-foreground break-all rounded-[var(--radius-md)] border border-border px-3 py-2 bg-surface">
                 {showPat ? newPat : newPat.slice(0, 12) + "•".repeat(20)}
@@ -223,132 +228,29 @@ export function TokensSection({
         </section>
       )}
 
-      {/* Active tokens — primary content on this tab (management). */}
-      <section className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden">
-        <header className="border-b border-border px-6 py-3 flex items-baseline gap-3">
-          <span className="coord-ink">Active tokens</span>
-          <span className="coord tabular-nums">[{pats ? pats.length : "··"}]</span>
-        </header>
-        <div className="p-6 space-y-4">
-          {reissueError && <Alert variant="destructive">{reissueError}</Alert>}
-          {patsError ? (
-            <EmptyState
-              title="Couldn't load tokens"
-              description="Something went wrong fetching your tokens."
-              action={
-                <Button variant="outline" size="sm" onClick={onReloadPats}>
-                  Retry
-                </Button>
-              }
-            />
-          ) : !pats ? (
-            <>
-              <span className="sr-only" role="status" aria-live="polite">
-                Loading tokens
-              </span>
-              <div
-                className="rounded-[var(--radius-md)] border border-border divide-y divide-border overflow-hidden"
-                aria-hidden
-              >
-                {Array.from({ length: 3 }).map((_, i) => (
-                  <div key={i} className="px-4 py-3 space-y-2">
-                    <div className="flex items-center gap-3">
-                      <span className="h-3 w-5 rounded bg-surface-muted animate-pulse" />
-                      <span className="h-4 w-32 rounded bg-surface-muted animate-pulse" />
-                    </div>
-                    <div className="h-3 w-40 rounded bg-surface-muted animate-pulse ml-7" />
-                  </div>
-                ))}
-              </div>
-            </>
-          ) : pats.length === 0 ? (
-            <EmptyState
-              title="No tokens yet"
-              description="Mint your first token to connect an agent."
-              action={
-                !setupOpen ? (
-                  <Button variant="outline" size="sm" onClick={() => setSetupOpen(true)}>
-                    Set up a token
-                  </Button>
-                ) : undefined
-              }
-            />
-          ) : (
-            <div className="rounded-[var(--radius-md)] border border-border divide-y divide-border overflow-hidden">
-              {(pats ?? []).map((p, i) => (
-                <div key={p.token_id} className="px-4 py-3 space-y-1.5">
-                  {/* Line 1 — identity */}
-                  <div className="flex items-baseline gap-3 min-w-0">
-                    <span className="coord tabular-nums shrink-0">
-                      {String(i + 1).padStart(2, "0")}
-                    </span>
-                    <span title={p.name} className="text-sm font-medium truncate text-foreground">
-                      {p.name}
-                    </span>
-                    <code className="font-mono text-[11px] text-foreground-muted">
-                      {p.prefix}••••
-                    </code>
-                  </div>
-                  {/* Line 2 — meta + actions */}
-                  <div className="flex items-center justify-between gap-3 flex-wrap pl-7">
-                    <div className="flex items-center gap-3 text-foreground-muted">
-                      <span
-                        className="coord tabular-nums"
-                        title={`Created ${formatDate(p.created_at)}`}
-                      >
-                        Created {timeAgo(p.created_at)}
-                      </span>
-                      <span
-                        className="coord tabular-nums"
-                        title={p.last_used_at ? `Last used ${formatDate(p.last_used_at)}` : undefined}
-                      >
-                        {p.last_used_at ? `Used ${timeAgo(p.last_used_at)}` : "Never used"}
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-1 ml-auto">
-                      <button
-                        onClick={() => setPendingReissue(p)}
-                        disabled={reissuingId === p.token_id}
-                        aria-label={`Reissue token ${p.name}`}
-                        className="inline-flex items-center gap-1 px-2 min-h-[36px] rounded-[var(--radius-sm)] text-xs text-foreground-muted hover:text-primary hover:bg-surface-hover disabled:opacity-50 transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-                      >
-                        <RotateCw
-                          className={`h-3 w-3 ${reissuingId === p.token_id ? "animate-spin" : ""}`}
-                          aria-hidden
-                        />
-                        {reissuingId === p.token_id ? "Reissuing" : "Reissue"}
-                      </button>
-                      <button
-                        onClick={() => setPendingRevokePat(p)}
-                        aria-label={`Revoke token ${p.name}`}
-                        className="inline-flex items-center gap-1 px-2 min-h-[36px] rounded-[var(--radius-sm)] text-xs text-destructive hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-                      >
-                        <Trash2 className="h-3 w-3" aria-hidden />
-                        Revoke
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      </section>
 
       {/* Collapsible setup guide */}
-      <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden">
+      <section className="order-2 overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm xl:order-none">
         <button
           type="button"
           onClick={toggleSetup}
           aria-expanded={!!setupOpen}
           aria-controls="setup-guide-body"
-          className="w-full flex items-center justify-between px-6 py-3 border-b border-border hover:bg-surface-hover cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          className="flex w-full cursor-pointer items-start justify-between gap-4 border-b border-border px-5 py-4 text-left transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background sm:px-6"
         >
-          <span className="coord-ink">Setup guide — 3 steps</span>
-          <ChevronRight
-            className={`h-4 w-4 transition-transform ${setupOpen ? "rotate-90" : ""}`}
-            aria-hidden
-          />
+          <span>
+            <span className="block text-base font-semibold text-foreground">Connect an agent</span>
+            <span className="mt-1 block text-sm text-foreground-muted">
+              Create credentials, add the client config, and verify the connection.
+            </span>
+          </span>
+          <span className="flex shrink-0 items-center gap-2 pt-0.5">
+            <Badge variant="default">3 steps</Badge>
+            <ChevronRight
+              className={`h-4 w-4 text-foreground-muted transition-transform ${setupOpen ? "rotate-90" : ""}`}
+              aria-hidden
+            />
+          </span>
         </button>
         {setupOpen && (
           <div id="setup-guide-body" className="p-6 space-y-6">
@@ -476,7 +378,7 @@ export function TokensSection({
                         // rather than rendering an empty snippet box.
                         <div className="rounded-[var(--radius-md)] border border-border px-4 py-3 text-sm text-foreground-muted">
                           {MCP_AGENT_LABELS[clientTab]} uses the stdio path —
-                          switch the toggle to <span className="text-accent-strong">Token (PAT)</span>
+                          switch the toggle to <span className="font-medium text-foreground">Token (PAT)</span>
                           {" "}to see its snippet.
                         </div>
                       )
@@ -556,6 +458,124 @@ export function TokensSection({
 
           </div>
         )}
+      </section>
+
+      {/* Active tokens — primary content on this tab (management). */}
+      <section className="order-1 overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm xl:order-none">
+        <header className="flex items-start justify-between gap-4 border-b border-border px-5 py-4 sm:px-6">
+          <div>
+            <h2 className="text-base font-semibold text-foreground">Active tokens</h2>
+            <p className="mt-1 text-sm text-foreground-muted">
+              Review agent access, recent use, and rotation status.
+            </p>
+          </div>
+          <Badge variant="default" className="shrink-0 tabular-nums">
+            {pats ? pats.length : "··"}
+          </Badge>
+        </header>
+        <div className="space-y-4 p-5 sm:p-6">
+          {reissueError && <Alert variant="destructive">{reissueError}</Alert>}
+          {patsError ? (
+            <EmptyState
+              title="Couldn't load tokens"
+              description="Something went wrong fetching your tokens."
+              action={
+                <Button variant="outline" size="sm" onClick={onReloadPats}>
+                  Retry
+                </Button>
+              }
+            />
+          ) : !pats ? (
+            <>
+              <span className="sr-only" role="status" aria-live="polite">
+                Loading tokens
+              </span>
+              <div
+                className="rounded-[var(--radius-md)] border border-border divide-y divide-border overflow-hidden"
+                aria-hidden
+              >
+                {Array.from({ length: 3 }).map((_, i) => (
+                  <div key={i} className="px-4 py-3 space-y-2">
+                    <div className="flex items-center gap-3">
+                      <span className="h-3 w-5 rounded bg-surface-muted animate-pulse" />
+                      <span className="h-4 w-32 rounded bg-surface-muted animate-pulse" />
+                    </div>
+                    <div className="h-3 w-40 rounded bg-surface-muted animate-pulse ml-7" />
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : pats.length === 0 ? (
+            <EmptyState
+              title="No tokens yet"
+              description="Mint your first token to connect an agent."
+              action={
+                !setupOpen ? (
+                  <Button variant="outline" size="sm" onClick={() => setSetupOpen(true)}>
+                    Set up a token
+                  </Button>
+                ) : undefined
+              }
+            />
+          ) : (
+            <div className="rounded-[var(--radius-md)] border border-border divide-y divide-border overflow-hidden">
+              {(pats ?? []).map((p) => (
+                <div key={p.token_id} className="flex flex-col gap-3 px-4 py-4">
+                  <div className="flex min-w-0 items-start gap-3">
+                    <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[var(--radius-md)] bg-surface-selected text-surface-selected-foreground">
+                      <KeyRound className="h-4 w-4" aria-hidden />
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1">
+                        <span title={p.name} className="truncate text-sm font-semibold text-foreground">
+                          {p.name}
+                        </span>
+                        <code className="font-mono text-xs text-foreground-muted">
+                          {p.prefix}••••
+                        </code>
+                      </div>
+                      <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-foreground-muted">
+                        <span className="tabular-nums" title={`Created ${formatDate(p.created_at)}`}>
+                          Created {timeAgo(p.created_at)}
+                        </span>
+                        <span aria-hidden>·</span>
+                        <span
+                          className="tabular-nums"
+                          title={p.last_used_at ? `Last used ${formatDate(p.last_used_at)}` : undefined}
+                        >
+                          {p.last_used_at ? `Used ${timeAgo(p.last_used_at)}` : "Never used"}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-end gap-1 border-t border-border pt-2">
+                    <button
+                      onClick={() => setPendingReissue(p)}
+                      disabled={reissuingId === p.token_id}
+                      aria-label={`Reissue token ${p.name}`}
+                      className="inline-flex min-h-[36px] cursor-pointer items-center gap-1 rounded-[var(--radius-sm)] px-2 text-xs text-foreground-muted transition-colors hover:bg-surface-hover hover:text-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:opacity-50"
+                    >
+                      <RotateCw
+                        className={`h-3 w-3 ${reissuingId === p.token_id ? "animate-spin" : ""}`}
+                        aria-hidden
+                      />
+                      {reissuingId === p.token_id ? "Reissuing" : "Reissue"}
+                    </button>
+                    <button
+                      onClick={() => setPendingRevokePat(p)}
+                      aria-label={`Revoke token ${p.name}`}
+                      className="inline-flex min-h-[36px] cursor-pointer items-center gap-1 rounded-[var(--radius-sm)] px-2 text-xs text-destructive transition-colors hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                    >
+                      <Trash2 className="h-3 w-3" aria-hidden />
+                      Revoke
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </section>
       </div>
 
       <ConfirmDialog
@@ -593,7 +613,7 @@ function PromptExample({ text, label }: { text: string; label: string }) {
       <div className="coord">{label}</div>
       {/* Conversational example prompts — sans, not code (they are sentences to
           say to an agent, not a snippet to paste). */}
-      <span className="text-[13px] text-foreground leading-relaxed">{text}</span>
+      <span className="text-sm leading-relaxed text-foreground">{text}</span>
     </div>
   );
 }

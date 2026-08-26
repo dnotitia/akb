@@ -58,6 +58,7 @@ describe("GraphDetailPanel · document node", () => {
         <GraphDetailPanel
           vault="akb"
           docId="d-1"
+          name="Fallback title"
           kind="document"
           uri="akb://akb/doc/x"
           onSelectRelated={() => {}}
@@ -90,6 +91,7 @@ describe("GraphDetailPanel · document node", () => {
         <GraphDetailPanel
           vault="akb"
           docId="d-1"
+          name="Hello"
           kind="document"
           uri="akb://akb/doc/x"
           onSelectRelated={onSelectRelated}
@@ -125,6 +127,7 @@ describe("GraphDetailPanel · document node", () => {
         <GraphDetailPanel
           vault="akb"
           docId="d-1"
+          name="Fallback title"
           kind="document"
           uri="u"
           onSelectRelated={() => {}}
@@ -150,6 +153,7 @@ describe("GraphDetailPanel · fetch states", () => {
         <GraphDetailPanel
           vault="akb"
           docId="d-x"
+          name="x"
           kind="document"
           uri="akb://akb/doc/x"
           onSelectRelated={() => {}}
@@ -176,6 +180,7 @@ describe("GraphDetailPanel · fetch states", () => {
         <GraphDetailPanel
           vault="akb"
           docId="d-x"
+          name="x"
           kind="document"
           uri="akb://akb/doc/x"
           onSelectRelated={() => {}}
@@ -191,21 +196,16 @@ describe("GraphDetailPanel · fetch states", () => {
 });
 
 describe("GraphDetailPanel · table node", () => {
-  it("does not show preview for tables", async () => {
-    getDocument.mockResolvedValue({
-      doc_id: "t-1",
-      title: "Things",
-      columns: ["a", "b"],
-      type: "table",
-    });
+  it("uses graph identity without calling the document endpoint", async () => {
     getRelations.mockResolvedValue({ doc_id: "t-1", uri: "u", relations: [] });
     render(
       wrap(
         <GraphDetailPanel
           vault="akb"
           docId="t-1"
+          name="Things"
           kind="table"
-          uri="u"
+          uri="akb://akb/table/things"
           onSelectRelated={() => {}}
           onFitToNode={() => {}}
           onClose={() => {}}
@@ -213,6 +213,8 @@ describe("GraphDetailPanel · table node", () => {
       ),
     );
     await screen.findByText("Things");
-    expect(screen.queryByText(/§ PREVIEW/i)).toBeNull();
+    expect(getDocument).not.toHaveBeenCalled();
+    expect(getRelations).toHaveBeenCalledWith("akb", "akb://akb/table/things");
+    expect(screen.queryByText(/document preview/i)).toBeNull();
   });
 });

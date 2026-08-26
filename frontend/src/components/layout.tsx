@@ -1,7 +1,7 @@
-import { Link, Outlet, useNavigate, Navigate, useLocation, useSearchParams } from "react-router-dom";
-import { useEffect, useState } from "react";
+import { Link, Outlet, Navigate, useLocation } from "react-router-dom";
+import { useEffect, useLayoutEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Search as SearchIcon } from "lucide-react";
+import { Boxes, House, type LucideIcon } from "lucide-react";
 import {
   clearPrivateAssetCache,
   getAuthConfig,
@@ -11,21 +11,14 @@ import {
 } from "@/lib/api";
 import { useHealth } from "@/hooks/use-health";
 import { UserMenu } from "@/components/user-menu";
-import { ThemeToggle } from "@/components/theme-toggle";
 import { Logo } from "@/components/logo";
-import { IndexingBadge } from "@/components/status-badge";
 import { ErrorBoundary } from "@/components/error-boundary";
+import { GlobalSearchDialog } from "@/components/global-search-dialog";
+import { AppSidebar } from "@/components/app-sidebar";
 import { appRouteBoundaryForPath } from "@/app-route-contract";
+import { CurrentUserProvider } from "@/contexts/current-user-context";
 
-type SearchMode = "dense" | "literal";
-
-// Sanitize the URL `mode` param instead of a bare `as SearchMode` cast: an
-// unknown value (legacy/typo'd ?mode=foo) must fall back to dense, not slip
-// through as truthy-non-dense and silently route to literal/grep search with
-// neither toggle highlighted.
-function asMode(raw: string | null): SearchMode {
-  return raw === "literal" ? "literal" : "dense";
-}
+const APP_SIDEBAR_COMPACT_KEY = "akb_app_sidebar_compact";
 
 function identityFingerprint(user: CurrentUser): string {
   return JSON.stringify([
@@ -41,22 +34,20 @@ function identityFingerprint(user: CurrentUser): string {
 
 export function Layout() {
   const queryClient = useQueryClient();
-  const navigate = useNavigate();
   const location = useLocation();
-  const [searchParams] = useSearchParams();
-  const onSearchPage = location.pathname === "/search";
-  const [searchQuery, setSearchQuery] = useState(() =>
-    onSearchPage ? searchParams.get("q") || "" : "",
-  );
-  const [searchMode, setSearchMode] = useState<SearchMode>(() =>
-    onSearchPage ? asMode(searchParams.get("mode")) : "dense",
-  );
   const [session, setSession] = useState<
     | { status: "checking"; user: null }
     | { status: "authenticated"; user: CurrentUser }
     | { status: "unauthenticated"; user: null }
   >({ status: "checking", user: null });
   const [revalidating, setRevalidating] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem(APP_SIDEBAR_COMPACT_KEY) === "true";
+    } catch {
+      return false;
+    }
+  });
 
   useEffect(() => {
     let cancelled = false;
@@ -98,7 +89,8 @@ export function Layout() {
       try {
         const verified = await getMe({ redirectOnUnauthorized: false });
         if (disposed) return;
-        const identityChanged = identityFingerprint(verified) !== activeFingerprint;
+        const identityChanged =
+          identityFingerprint(verified) !== activeFingerprint;
         // SSO cookies are shared across tabs and are intentionally invisible
         // to JavaScript. After every foreground proof, clear query state so a
         // replaced identity or changed server-side ACL cannot inherit data
@@ -140,21 +132,33 @@ export function Layout() {
     };
   }, [activeFingerprint, activeUser, queryClient]);
 
-  useEffect(() => {
-    if (onSearchPage) {
-      setSearchQuery(searchParams.get("q") || "");
-      setSearchMode(asMode(searchParams.get("mode")));
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [location.pathname, searchParams]);
-
   const wide = appRouteBoundaryForPath(location.pathname) === "vault-shell";
+  const isSearchWorkspace = location.pathname === "/search";
+  const viewportLocked = wide || isSearchWorkspace;
+  const sidebarCompact = wide || sidebarCollapsed;
   const { data: health } = useHealth(session.status === "authenticated");
+
+  function setSidebarCompact(compact: boolean) {
+    setSidebarCollapsed(compact);
+    try {
+      localStorage.setItem(APP_SIDEBAR_COMPACT_KEY, String(compact));
+    } catch {
+      // Storage can be disabled. The current session still keeps the choice.
+    }
+  }
+
+  useLayoutEffect(() => {
+    const root = document.documentElement;
+    root.classList.toggle("vault-workspace-scroll-lock", viewportLocked);
+    return () => root.classList.remove("vault-workspace-scroll-lock");
+  }, [viewportLocked]);
 
   if (session.status === "checking" || revalidating) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background text-foreground">
-        <div className="coord" role="status" aria-live="polite">Verifying session…</div>
+        <div className="coord" role="status" aria-live="polite">
+          Verifying session…
+        </div>
       </div>
     );
   }
@@ -163,18 +167,13 @@ export function Layout() {
     // Preserve where the user was headed so /auth can return them there after
     // signing in (deep-linked / shared URLs don't dump everyone on home).
     const dest = location.pathname + location.search;
-    const to = dest && dest !== "/" ? `/auth?next=${encodeURIComponent(dest)}` : "/auth";
+    const to =
+      dest && dest !== "/" ? `/auth?next=${encodeURIComponent(dest)}` : "/auth";
     return <Navigate to={to} replace />;
   }
-  const upsert = health?.vector_store?.backfill?.upsert;
-  const indexingPending: number | null = upsert
-    ? Math.max(0, (upsert.pending || 0) - (upsert.abandoned || 0))
-    : null;
-  const indexingAbandoned: number = upsert?.abandoned || 0;
-
-  // Vault workspace routes lock to viewport height (own internal scroll). Other
-  // routes keep natural document scroll with the footer at the bottom.
-  const rootClass = wide
+  // Canvas-style workspaces lock to viewport height and own their internal
+  // scroll. Document-flow routes keep natural page scroll and the footer.
+  const rootClass = viewportLocked
     ? "h-screen flex flex-col overflow-hidden bg-background text-foreground"
     : "min-h-screen flex flex-col bg-background text-foreground";
 
@@ -190,142 +189,141 @@ export function Layout() {
       </a>
       {/* ── Glass app header ───────────────────────────────────────── */}
       <header className="app-header sticky top-0 z-40 shrink-0">
-        {/* Header uses the same max-w-[1400px] px-6 gutter as the page content
-            and footer on EVERY route, so the brand/nav stay aligned and don't
-            jump wider when entering a vault workspace. */}
-        <div className="mx-auto grid grid-cols-[1fr_minmax(0,52rem)_1fr] max-w-[1400px] items-center gap-4 px-6 h-16">
-          {/* Brand */}
-          <Link
-            to="/"
-            aria-label="AKB home"
-            className="justify-self-start shrink-0 rounded-[var(--radius-md)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-          >
-            <Logo size={30} subtitle />
-          </Link>
-
-          {/* Global search — centered in the header, fills the wide center column */}
-          <form
-            className="hidden sm:flex h-10 w-full justify-self-center"
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (!searchQuery.trim()) return;
-              const p = new URLSearchParams({ q: searchQuery });
-              if (searchMode !== "dense") p.set("mode", searchMode);
-              navigate(`/search?${p.toString()}`);
-            }}
-            role="search"
-            aria-label="Search knowledge base"
-          >
-            <div className="flex w-full items-stretch rounded-[var(--radius-md)] border border-border bg-surface overflow-hidden focus-within:border-primary focus-within:ring-2 focus-within:ring-ring/30 transition-colors">
-              <div className="flex shrink-0 p-1 gap-0.5">
-                {(["dense", "literal"] as const).map((mode) => (
-                  <button
-                    key={mode}
-                    type="button"
-                    onClick={() => setSearchMode(mode)}
-                    title={
-                      mode === "dense"
-                        ? "Semantic hybrid search (dense + BM25 + rerank)"
-                        : "Literal substring / regex search"
-                    }
-                    aria-pressed={searchMode === mode}
-                    className={`px-3 rounded-[var(--radius-sm)] text-xs font-medium transition-token cursor-pointer ${
-                      searchMode === mode
-                        ? "bg-surface-selected text-surface-selected-foreground"
-                        : "text-foreground-muted hover:bg-surface-hover"
-                    }`}
-                  >
-                    {mode === "dense" ? "Semantic" : "Literal"}
-                  </button>
-                ))}
-              </div>
-              <div className="relative flex flex-1 items-center pr-3">
-                <SearchIcon
-                  className="h-4 w-4 text-foreground-muted mr-2 pointer-events-none"
-                  aria-hidden
-                />
-                <label className="sr-only" htmlFor="header-search">Search</label>
-                <input
-                  id="header-search"
-                  type="search"
-                  placeholder={searchMode === "dense" ? "Search knowledge…" : "Literal search…"}
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="flex-1 bg-transparent text-sm text-foreground placeholder:text-foreground-muted focus:outline-none"
-                />
-              </div>
-            </div>
-          </form>
-
-          {/* Nav + actions */}
-          <nav aria-label="Primary" className="flex items-center gap-1 justify-self-end">
-            <NavLink to="/" active={location.pathname === "/"} name="Home" />
-            <NavLink
-              to="/vault"
-              active={location.pathname.startsWith("/vault") && location.pathname !== "/vault/new"}
-              name="Vaults"
-            />
-            <div className="mx-1.5 h-6 w-px bg-border" aria-hidden />
-            {/* Fixed-width slot so the indexing badge popping in/out (background
-                polling) can't resize the nav and shove the centered search
-                sideways. IndexingBadge still returns null when idle — the
-                always-mounted slot is the placeholder. Overflow is clipped
-                rather than pushed on the rare pending+abandoned two-chip case.
-                aria-live announces status changes politely (per Codex review). */}
-            <div
-              className="hidden sm:flex w-32 shrink-0 items-center justify-end gap-1 overflow-hidden whitespace-nowrap"
-              aria-live="polite"
-              aria-atomic="true"
+        <div className="flex h-14 w-full items-center">
+          {/* Keep the brand lockup stable while the navigation rail changes
+              density. Collapsing navigation must not remove product identity
+              or shift the global-search entry point. */}
+          <div className="flex shrink-0 items-center px-3 lg:w-52">
+            <Link
+              to="/"
+              aria-label="AKB home"
+              className="shrink-0 rounded-[var(--radius-md)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
             >
-              <IndexingBadge pending={indexingPending} abandoned={indexingAbandoned} />
+              <Logo
+                size={28}
+                wordmark
+                subtitle
+                variant="header"
+              />
+            </Link>
+          </div>
+
+          <div className="flex min-w-0 flex-1 items-center pr-3">
+            {/* This is a real global-search surface, not a shortcut to /search.
+                Advanced mode and vault/type filters remain on the full page. */}
+            <CurrentUserProvider user={session.user}>
+              <GlobalSearchDialog />
+            </CurrentUserProvider>
+
+            {/* The persistent sidebar owns desktop entry points. Compact icon
+                links remain in the header only where that rail is hidden. */}
+            <nav
+              aria-label="Primary mobile navigation"
+              className="ml-2 flex items-center gap-1 lg:hidden"
+            >
+              <MobileNavLink
+                to="/"
+                active={location.pathname === "/"}
+                name="Home"
+                icon={House}
+              />
+              <MobileNavLink
+                to="/vault"
+                active={location.pathname.startsWith("/vault")}
+                name="Vaults"
+                icon={Boxes}
+              />
+            </nav>
+
+            <div className="ml-3 flex shrink-0 items-center justify-end border-l border-border pl-3 lg:w-28">
+              <UserMenu initialUser={session.user} />
             </div>
-            <ThemeToggle />
-            <UserMenu initialUser={session.user} />
-          </nav>
+          </div>
         </div>
       </header>
 
-      {/* Content */}
-      <main id="main" tabIndex={-1} className={wide ? "flex-1 min-h-0 animate-in focus:outline-none" : "flex-1 animate-in focus:outline-none"}>
-        {wide ? (
-          <ErrorBoundary resetKeys={[location.pathname, location.search]}>
-            <Outlet />
-          </ErrorBoundary>
-        ) : (
-          <div className="mx-auto max-w-[1400px] px-6 py-8">
-            <ErrorBoundary resetKeys={[location.pathname, location.search]}>
-              <Outlet />
-            </ErrorBoundary>
-          </div>
-        )}
-      </main>
+      <div className={viewportLocked ? "flex min-h-0 flex-1" : "flex flex-1"}>
+        <AppSidebar
+          compact={sidebarCompact}
+          collapsible={!wide}
+          onCompactChange={setSidebarCompact}
+        />
 
-      {/* Footer — hidden on vault workspace routes (viewport-locked) */}
-      {!wide && (
-        <footer className="border-t border-border">
-          <div className="mx-auto flex max-w-[1400px] items-center justify-between px-6 py-3">
-            <div className="coord">© Dnotitia · Seahorse</div>
-            <div className="coord hidden md:block">Agent Knowledgebase</div>
-            <div className="coord">v1.0</div>
-          </div>
-        </footer>
-      )}
+        <div
+          className={
+            viewportLocked
+              ? "flex min-h-0 min-w-0 flex-1 flex-col"
+              : "flex min-w-0 flex-1 flex-col"
+          }
+        >
+          {/* Content */}
+          <main
+            id="main"
+            tabIndex={-1}
+            className={
+              viewportLocked
+                ? "min-h-0 flex-1 animate-in focus:outline-none"
+                : "flex-1 animate-in focus:outline-none"
+            }
+          >
+            {viewportLocked ? (
+              <CurrentUserProvider user={session.user}>
+                <ErrorBoundary resetKeys={[location.pathname, location.search]}>
+                  <Outlet context={{ health }} />
+                </ErrorBoundary>
+              </CurrentUserProvider>
+            ) : (
+              <div className="w-full px-4 py-8 sm:px-6 lg:px-8 xl:px-12 2xl:px-36">
+                <CurrentUserProvider user={session.user}>
+                  <ErrorBoundary
+                    resetKeys={[location.pathname, location.search]}
+                  >
+                    <Outlet context={{ health }} />
+                  </ErrorBoundary>
+                </CurrentUserProvider>
+              </div>
+            )}
+          </main>
+
+          {/* Footer — hidden while a viewport-locked workspace owns scrolling. */}
+          {!viewportLocked && (
+            <footer className="border-t border-border">
+              <div className="flex w-full items-center justify-between px-4 py-3 sm:px-6 lg:px-8 xl:px-12 2xl:px-36">
+                <div className="coord">© Dnotitia · Seahorse</div>
+                <div className="coord hidden md:block">Agent Knowledgebase</div>
+                <div className="coord">v1.0</div>
+              </div>
+            </footer>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
 
-function NavLink({ to, active, name }: { to: string; active: boolean; name: string }) {
+function MobileNavLink({
+  to,
+  active,
+  name,
+  icon: Icon,
+}: {
+  to: string;
+  active: boolean;
+  name: string;
+  icon: LucideIcon;
+}) {
   return (
     <Link
       to={to}
+      aria-label={name}
       aria-current={active ? "page" : undefined}
-      className={`rounded-[var(--radius-md)] px-3 py-1.5 text-sm font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
+      className={`flex h-9 w-9 items-center justify-center rounded-[var(--radius-md)] transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
         active
           ? "bg-surface-selected text-surface-selected-foreground"
           : "text-foreground-muted hover:text-foreground hover:bg-surface-hover"
       }`}
     >
-      {name}
+      <Icon className="h-4 w-4" aria-hidden />
     </Link>
   );
 }

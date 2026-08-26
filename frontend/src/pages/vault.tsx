@@ -1,17 +1,23 @@
-import { type ReactNode, useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   AlertTriangle,
   BookText,
-  ChevronDown,
+  Box,
   ChevronRight,
   FileClock,
+  Files,
   FilePlus,
+  FileText,
+  FolderInput,
+  FolderTree,
+  GitCommit,
   Plug,
-  Settings as SettingsIcon,
-  Sparkles,
+  ShieldCheck,
   Table as TableIcon,
+  Upload,
   Users,
+  type LucideIcon,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -20,6 +26,8 @@ import {
   getSkillTemplate,
   getVaultActivity,
   getVaultInfo,
+  importKnowledgeBundle,
+  type KnowledgeImportResult,
 } from "@/lib/api";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { recentIcon, recentTone } from "@/lib/recent";
@@ -28,13 +36,23 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Panel } from "@/components/ui/panel";
 import { EmptyState } from "@/components/empty-state";
-import { IndexingBadge, RoleBadge, VaultStateBadge } from "@/components/status-badge";
+import {
+  IndexingBadge,
+  RoleBadge,
+  VaultStateBadge,
+} from "@/components/status-badge";
 import { useVaultHealth } from "@/hooks/use-vault-health";
-import { SkillStatusChip } from "@/components/skill/skill-status-chip";
 import { VAULT_SKILL_PATH } from "@/lib/skill";
-import { StatTile } from "@/components/ui/stat-tile";
 import { TooltipText } from "@/components/ui/tooltip-text";
-import { CopyButton } from "@/components/ui/copy-button";
+import { cn } from "@/lib/utils";
+import { useVaultRefresh } from "@/contexts/vault-refresh-context";
+import { useOpenDocumentCreateDialog } from "@/contexts/document-create-dialog-context";
+import { WorkspacePageHeader } from "@/components/ui/workspace-page-header";
+import { VaultContextBadge } from "@/components/ui/vault-context-badge";
+import { TonalIcon, type TonalIconTone } from "@/components/ui/tonal-icon";
+import { FileUploadDialog } from "@/components/file-upload-dialog";
+import { TableCreateDialog } from "@/components/table-create-dialog";
+import { parseFileUri } from "@/lib/uri";
 
 interface TableMeta {
   name: string;
@@ -84,6 +102,7 @@ interface ActivityRow {
   author_name?: string;
   subject?: string;
   summary?: string;
+  date?: string;
   timestamp?: string;
   files?: Array<{ path: string; change?: string }>;
 }
@@ -117,11 +136,10 @@ function changeMark(change?: string) {
     deleted: { letter: "D", cls: "text-destructive" },
     renamed: { letter: "R", cls: "text-link" },
   };
-  const m =
-    map[change.toLowerCase()] ?? {
-      letter: change.slice(0, 1).toUpperCase(),
-      cls: "text-foreground-muted",
-    };
+  const m = map[change.toLowerCase()] ?? {
+    letter: change.slice(0, 1).toUpperCase(),
+    cls: "text-foreground-muted",
+  };
   return (
     <span
       title={change}
@@ -136,25 +154,33 @@ function changeMark(change?: string) {
 function StatTileSkeleton() {
   return (
     <div
-      className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm px-4 py-3.5"
+      className="flex min-h-12 items-center gap-2 bg-surface px-3 py-2"
       aria-hidden
     >
-      <div className="h-3 w-16 rounded bg-surface-muted animate-pulse mb-2" />
-      <div className="h-7 w-10 rounded bg-surface-muted animate-pulse" />
+      <div className="h-4 w-4 shrink-0 rounded bg-surface-muted animate-pulse" />
+      <div className="h-4 w-7 rounded bg-surface-muted animate-pulse" />
+      <div className="h-3 w-14 rounded bg-surface-muted animate-pulse" />
     </div>
   );
 }
 
 export default function VaultPage() {
   const { name } = useParams<{ name: string }>();
+  const navigate = useNavigate();
+  const { refetchTree } = useVaultRefresh();
+  const openCreateDocument = useOpenDocumentCreateDialog();
+  const uploadButtonRef = useRef<HTMLButtonElement>(null);
+  const tableButtonRef = useRef<HTMLButtonElement>(null);
+  const [uploadOpen, setUploadOpen] = useState(false);
+  const [tableCreateOpen, setTableCreateOpen] = useState(false);
   const [info, setInfo] = useState<VaultInfo | null>(null);
   const [infoError, setInfoError] = useState(false);
   const [recent, setRecent] = useState<RecentRow[]>([]);
   const [recentLoading, setRecentLoading] = useState(true);
   const [recentError, setRecentError] = useState(false);
   const [activity, setActivity] = useState<ActivityRow[]>([]);
-  const [commitsOpen, setCommitsOpen] = useState(false);
-  const [commitsLoaded, setCommitsLoaded] = useState(false);
+  const [activityLoading, setActivityLoading] = useState(true);
+  const [activityError, setActivityError] = useState(false);
 
   const vaultHealth = useVaultHealth(name);
   // Same shape as the global header: `pending` from the backend includes
@@ -223,6 +249,25 @@ export default function VaultPage() {
     }
   }
 
+  async function loadActivity(
+    vault: string,
+    alive: () => boolean = () => true,
+  ) {
+    setActivityLoading(true);
+    setActivityError(false);
+    try {
+      const result = await getVaultActivity(vault, { limit: 10 });
+      if (!alive()) return;
+      setActivity(result.activity || []);
+    } catch {
+      if (!alive()) return;
+      setActivity([]);
+      setActivityError(true);
+    } finally {
+      if (alive()) setActivityLoading(false);
+    }
+  }
+
   useEffect(() => {
     if (!name) return;
     let alive = true;
@@ -235,10 +280,11 @@ export default function VaultPage() {
     setRecentError(false);
     setRecentLoading(true);
     setActivity([]);
-    setCommitsLoaded(false);
-    setCommitsOpen(false);
+    setActivityError(false);
+    setActivityLoading(true);
     loadInfo(name, isAlive);
     loadRecent(name, isAlive);
+    loadActivity(name, isAlive);
     return () => {
       alive = false;
     };
@@ -255,26 +301,10 @@ export default function VaultPage() {
     };
   }, [name]);
 
-  async function ensureCommitsLoaded(vault: string) {
-    if (commitsLoaded) return;
-    try {
-      const r = await getVaultActivity(vault, { limit: 20 });
-      setActivity(r.activity || []);
-    } catch {
-      setActivity([]);
-    } finally {
-      setCommitsLoaded(true);
-    }
-  }
-
-  function toggleCommits() {
-    const next = !commitsOpen;
-    setCommitsOpen(next);
-    if (next && name) ensureCommitsLoaded(name);
-  }
-
   const canWrite =
     info?.role === "writer" || info?.role === "admin" || info?.role === "owner";
+  const canCreateContent =
+    canWrite && !info?.is_archived && !info?.is_external_git;
 
   // "Just getting started" = no real content yet. A freshly created vault is
   // auto-seeded with an overview/vault-skill.md scaffold, so that one doc
@@ -289,10 +319,54 @@ export default function VaultPage() {
     (info.table_count ?? 0) === 0 &&
     (info.file_count ?? 0) === 0;
 
+  const inventory: Array<{
+    label: string;
+    value: number;
+    Icon: LucideIcon;
+    tone: TonalIconTone;
+  }> = info
+    ? [
+        {
+          label: "Documents",
+          value: info.document_count ?? 0,
+          Icon: FileText,
+          tone: "knowledge",
+        },
+        {
+          label: "Collections",
+          value: info.collection_count ?? 0,
+          Icon: FolderTree,
+          tone: "collection",
+        },
+        {
+          label: "Tables",
+          value: info.table_count ?? 0,
+          Icon: TableIcon,
+          tone: "data",
+        },
+        {
+          label: "Files",
+          value: info.file_count ?? 0,
+          Icon: Files,
+          tone: "file",
+        },
+        {
+          label: "Members",
+          value: info.member_count ?? 0,
+          Icon: Users,
+          tone: "people",
+        },
+      ]
+    : [];
+
   return (
-    <div className="fade-up">
+    <div
+      role="region"
+      aria-label={`${name} Vault overview`}
+      className="flex min-h-full w-full flex-col gap-4 bg-background p-3 sm:p-4 xl:p-5"
+    >
       {infoError && (
-        <Alert variant="destructive" className="mb-4">
+        <Alert variant="destructive">
           Could not load this vault's details. Some information may be missing.
           <div className="mt-2">
             <Button
@@ -310,561 +384,992 @@ export default function VaultPage() {
         </Alert>
       )}
 
-      {/* Meta line — one identity only (the H1 below states the name; the
-          breadcrumb says "where am I"), so don't print the name a third time:
-          just the label + the canonical mono URI. */}
-      <div className="coord mb-3 inline-flex items-center gap-1.5">
-        Vault · <span className="font-mono">akb://{name}</span>
-        <CopyButton value={`akb://${name}`} label="Copy vault URI" />
-      </div>
-
-      {/* Display title */}
-      <h1 className="font-display text-3xl font-semibold tracking-tight text-foreground mb-3">
-        {name}
-      </h1>
-
-      {info?.description ? (
-        <p className="text-base leading-[1.55] text-foreground-muted mb-1 max-w-2xl">
-          {info.description}
-        </p>
-      ) : info === null && !infoError ? (
-        <div
-          className="mb-1 h-4 max-w-md rounded bg-surface-muted animate-pulse"
-          aria-hidden
-        />
-      ) : null}
-
-      {/* Vitality line — who owns it, how old, how alive. Display names are
-          sans (not mono); last_active_user is a raw UUID server-side so it's
-          intentionally omitted until the endpoint resolves it. Segments join
-          with a "·" only BETWEEN present items (no dangling leading dot when,
-          e.g., the owner has no display name yet). */}
-      {(() => {
-        if (!info) return null;
-        const segs: ReactNode[] = [];
-        if (info.owner_display_name)
-          segs.push(
+      <WorkspacePageHeader
+        icon={Box}
+        iconTone="knowledge"
+        title={name}
+        context={
+          info?.description ? (
+            <span className="line-clamp-1 max-w-3xl">{info.description}</span>
+          ) : undefined
+        }
+        meta={
+          <>
+            <VaultContextBadge name={name!} address copyable />
+            {info?.role && <RoleBadge role={info.role} />}
+            <VaultStateBadge
+              archived={info?.is_archived}
+              externalGit={info?.is_external_git}
+              publicAccess={info?.public_access}
+            />
+            <IndexingBadge
+              pending={vaultPending}
+              abandoned={vaultAbandoned}
+            />
+          </>
+        }
+        actions={
+          canCreateContent ? (
             <>
-              Owned by{" "}
-              <span className="text-foreground">{info.owner_display_name}</span>
-            </>,
-          );
-        if (info.created_at)
-          segs.push(<>Created <RelativeTime iso={info.created_at} /></>);
-        if (info.last_activity)
-          segs.push(<>Last active <RelativeTime iso={info.last_activity} /></>);
-        if (!segs.length) return null;
-        return (
-          <div className="coord mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
-            {segs.map((s, i) => (
-              <span key={i} className="flex items-center gap-x-2">
-                {i > 0 && <span aria-hidden>·</span>}
-                <span>{s}</span>
-              </span>
-            ))}
-          </div>
-        );
-      })()}
+              <Button
+                ref={uploadButtonRef}
+                variant="outline"
+                size="sm"
+                onClick={() => setUploadOpen(true)}
+              >
+                <Upload className="h-4 w-4" aria-hidden />
+                Upload file
+              </Button>
+              <Button
+                ref={tableButtonRef}
+                variant="outline"
+                size="sm"
+                onClick={() => setTableCreateOpen(true)}
+              >
+                <TableIcon className="h-4 w-4" aria-hidden />
+                New table
+              </Button>
+              <Button
+                variant="accent"
+                size="sm"
+                onClick={() => openCreateDocument()}
+              >
+                <FilePlus className="h-4 w-4" aria-hidden />
+                New document
+              </Button>
+            </>
+          ) : undefined
+        }
+        className="rounded-none border-0 border-b border-border-strong bg-transparent px-0 pb-3 pt-0 shadow-none"
+      />
 
-      {/* Identity pills — what this vault IS. */}
-      <div className="flex flex-wrap items-center gap-2 mt-4">
-        {info?.role && <RoleBadge role={info.role} />}
-        <VaultStateBadge
-          archived={info?.is_archived}
-          externalGit={info?.is_external_git}
-          publicAccess={info?.public_access}
-        />
-        <IndexingBadge pending={vaultPending} abandoned={vaultAbandoned} />
-        {/* Mirror vaults are excluded from the guide seed server-side, so the
-            chip would advertise something that cannot exist there. Withheld
-            until `info` resolves for the same reason — no guessing. */}
-        {!skillQuery.isLoading && info && !info.is_external_git && (
-          <SkillStatusChip
-            vault={name!}
-            defined={skillExists}
-            customized={skillCustomized}
-          />
-        )}
-      </div>
-
-      {/* Actions — what you can DO. Secondary nav on the left, the single
-          marquee CTA on the right; kept distinct from the identity pills above
-          so "what it is" never reads as "what to do". */}
-      <div className="flex flex-wrap items-center gap-x-5 gap-y-2 mt-4">
-        <Link
-          to={`/vault/${name}/members`}
-          className="inline-flex items-center gap-1.5 min-h-[36px] coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background rounded-[var(--radius-sm)]"
-        >
-          <Users className="h-3 w-3" aria-hidden />
-          Members
-          {info?.member_count !== undefined && (
-            <span className="tabular-nums">[{fmt(info.member_count)}]</span>
-          )}
-        </Link>
-        {info?.role === "owner" && (
-          <Link
-            to={`/vault/${name}/settings`}
-            className="inline-flex items-center gap-1.5 min-h-[36px] coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background rounded-[var(--radius-sm)]"
-          >
-            <SettingsIcon className="h-3 w-3" aria-hidden />
-            Settings
-          </Link>
-        )}
-        {canWrite && !info?.is_archived && !isEmpty && (
-          <Button asChild variant="accent" size="md" className="ml-auto">
-            <Link to={`/vault/${name}/doc/new`}>
-              <FilePlus className="h-4 w-4" aria-hidden />
-              New document
-            </Link>
-          </Button>
-        )}
-      </div>
-
-      {/* Archived vaults are hard read-only server-side, so the write CTA above
-          is withheld — say why rather than routing into a guaranteed failure. */}
       {info?.is_archived && (
-        <Alert variant="info" className="mt-4">
-          This vault is archived — content is read-only. Existing documents stay
-          browsable; new writes are disabled.
+        <Alert variant="info">
+          This vault is archived — content is read-only. Existing documents
+          stay browsable; new writes are disabled.
         </Alert>
       )}
 
-      {/* About — the vault-skill doc is the best answer to "what is this vault
-          for", so surface its opening on the read-first landing. */}
-      {skillCustomized === true && about && (
-        <div className="mt-6 rounded-[var(--radius-lg)] border border-border bg-surface/60 px-4 py-3">
-          <div className="flex items-baseline justify-between gap-3 mb-1.5">
-            <span className="coord-ink">About this vault</span>
-            <Link
-              to={`/vault/${name}/settings#skill`}
-              className="coord shrink-0 inline-flex items-center min-h-[28px] hover:text-link transition-colors rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-            >
-              Vault guide ↗
-            </Link>
-          </div>
-          <p className="text-sm leading-relaxed text-foreground-muted line-clamp-2">
-            {about}
-          </p>
-        </div>
+      {!infoError && (
+        <Panel variant="workspace" className="min-w-0">
+          <section aria-labelledby="vault-inventory-heading">
+            <h2 id="vault-inventory-heading" className="sr-only">
+              Vault inventory
+            </h2>
+            <div className="grid grid-cols-2 gap-px bg-border sm:grid-cols-3 xl:grid-cols-[8.75rem_repeat(5,minmax(0,1fr))]">
+              <div className="col-span-2 flex min-h-14 items-center gap-2.5 bg-surface-2/70 px-3 text-xs font-semibold text-foreground sm:col-span-3 xl:col-span-1 xl:px-4">
+                <TonalIcon tone="neutral" size="sm">
+                  <FolderTree aria-hidden />
+                </TonalIcon>
+                <span>Inventory</span>
+              </div>
+              {info
+                ? inventory.map(({ label, value, Icon, tone }) => (
+                    <div
+                      key={label}
+                      className="flex min-h-14 min-w-0 items-center gap-2.5 bg-surface px-3 py-2"
+                    >
+                      <TonalIcon tone={tone} size="sm">
+                        <Icon aria-hidden />
+                      </TonalIcon>
+                      <span className="min-w-0">
+                        <span
+                          className={cn(
+                            "block text-sm font-semibold tabular-nums",
+                            value === 0 ? "text-subtle" : "text-foreground",
+                          )}
+                        >
+                          {fmt(value)}
+                        </span>
+                        <span className="block truncate text-xs text-foreground-muted">
+                          {label}
+                        </span>
+                      </span>
+                    </div>
+                  ))
+                : Array.from({ length: 5 }).map((_, i) => (
+                    <StatTileSkeleton key={i} />
+              ))}
+            </div>
+          </section>
+        </Panel>
       )}
 
-      {/* Empty vault → an onboarding hero instead of a barren wall of dimmed
-          zeros + empty lists. Otherwise: stats → tables → recent → commit log. */}
-      {info && isEmpty ? (
-        <VaultEmptyOnboarding
-          name={name!}
-          canWrite={canWrite}
-          skillDefined={skillExists}
-          isMirror={!!info.is_external_git}
-        />
-      ) : (
-      <>
-      {/* Ledger — 4-stat tiles read from the authoritative, depth-safe counts
-          in /info. Skeletons reserve the height so the tiles don't pop in. The
-          label already names the category, so no jargon unit row; 0 recedes. */}
-      <div className="mt-10 grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <div className="grid min-w-0 items-start gap-4 xl:grid-cols-[minmax(0,1fr)_20rem] 2xl:grid-cols-[minmax(0,1fr)_22rem]">
+        <div className="flex min-w-0 flex-col gap-4">
+          {info && isEmpty ? (
+            <VaultEmptyOnboarding
+              name={name!}
+              canWrite={canCreateContent}
+              skillCustomized={skillCustomized}
+              isMirror={!!info.is_external_git}
+              onCreateDocument={() => openCreateDocument()}
+              onUploadFile={() => setUploadOpen(true)}
+              onCreateTable={() => setTableCreateOpen(true)}
+              onImported={() => {
+                refetchTree();
+                loadInfo(name!);
+                void loadRecent(name!);
+                void loadActivity(name!);
+              }}
+            />
+          ) : (
+            <RecentActivityPanel
+              name={name!}
+              rows={recent}
+              loading={recentLoading}
+              error={recentError}
+              onRetry={() => name && loadRecent(name)}
+            />
+          )}
+
+          {info && !isEmpty && (
+            <CommitHistoryPanel
+              name={name!}
+              rows={activity}
+              loading={activityLoading}
+              error={activityError}
+              onRetry={() => name && loadActivity(name)}
+            />
+          )}
+        </div>
+
         {info ? (
-          (
-            [
-              ["Collections", info.collection_count ?? 0],
-              ["Documents", info.document_count ?? 0],
-              ["Tables", info.table_count ?? 0],
-              ["Files", info.file_count ?? 0],
-            ] as Array<[string, number]>
-          ).map(([label, value]) => (
-            <StatTile key={label} label={label} value={fmt(value)} dimZero />
-          ))
-        ) : infoError ? null : (
-          Array.from({ length: 4 }).map((_, i) => <StatTileSkeleton key={i} />)
+          <VaultOverviewAside
+            name={name!}
+            info={info}
+            about={about}
+            guideDefined={skillExists}
+            guideCustomized={skillCustomized}
+            guideLoading={skillQuery.isLoading}
+          />
+        ) : (
+          <VaultContextSkeleton />
         )}
       </div>
 
-      {info?.tables && info.tables.length > 0 && (
-        <TablesBand name={name!} tables={info.tables} />
+      {name && (
+        <>
+          <FileUploadDialog
+            open={uploadOpen}
+            onOpenChange={setUploadOpen}
+            vault={name}
+            returnFocusRef={uploadButtonRef}
+            onUploaded={(file) => {
+              refetchTree();
+              loadInfo(name);
+              void loadRecent(name);
+              const parsed = parseFileUri(file.uri);
+              if (parsed)
+                navigate(
+                  `/vault/${name}/file/${encodeURIComponent(parsed.id)}`,
+                );
+            }}
+          />
+          <TableCreateDialog
+            open={tableCreateOpen}
+            onOpenChange={setTableCreateOpen}
+            vault={name}
+            returnFocusRef={tableButtonRef}
+            onCreated={(tableName) => {
+              refetchTree();
+              loadInfo(name);
+              void loadRecent(name);
+              navigate(`/vault/${name}/table/${encodeURIComponent(tableName)}`);
+            }}
+          />
+        </>
       )}
+    </div>
+  );
+}
 
-      {/* Recent writes — primary. Same grammar as the Home dashboard's Recent
-          activity (loading flag → skeleton, type-tinted leading chip,
-          fresh-token spark, card-hover lift) so a change reads identically
-          across the app. Single-vault context here, so no per-row VaultChip.
-          The row links to the LIVE document (no ?commit pin): /recent returns
-          each doc's current_commit, so pinning it opened the latest version in
-          read-only "historical" mode. The commit ref still shows (demoted) as
-          an at-a-glance HEAD label. */}
-      <section
-        className="mt-10"
-        aria-labelledby="recent-heading"
-        aria-busy={recentLoading}
-      >
-        <div className="flex items-baseline gap-3 pb-3 border-b border-border mb-3">
-          <h2 id="recent-heading" className="text-xl font-semibold tracking-tight">
+function RecentActivityPanel({
+  name,
+  rows,
+  loading,
+  error,
+  onRetry,
+}: {
+  name: string;
+  rows: RecentRow[];
+  loading: boolean;
+  error: boolean;
+  onRetry: () => void;
+}) {
+  return (
+    <Panel
+      variant="workspace"
+      flush
+      role="region"
+      aria-labelledby="recent-heading"
+      aria-busy={loading}
+      className="min-w-0"
+    >
+      <div className="flex min-h-12 flex-wrap items-center gap-3 border-b border-border-strong bg-surface-2/55 px-4 py-2 sm:px-5">
+        <TonalIcon tone="knowledge" size="sm">
+          <FileClock aria-hidden />
+        </TonalIcon>
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+          <h2
+            id="recent-heading"
+            className="text-sm font-semibold text-foreground"
+          >
             Recent activity
           </h2>
-          {!recentLoading && !recentError && recent.length > 0 && (
+          {!loading && !error && (
             <Badge variant="default" className="tabular-nums">
-              {recent.length}
+              {rows.length} change{rows.length === 1 ? "" : "s"}
             </Badge>
           )}
         </div>
-        <span className="sr-only" role="status" aria-live="polite">
-          {recentLoading
-            ? "Loading recent activity"
-            : recentError
-              ? "Could not load recent activity"
-              : `${recent.length} recent change${recent.length === 1 ? "" : "s"}`}
-        </span>
+      </div>
 
-        {recentLoading ? (
-          <Panel aria-hidden>
-            <ul className="divide-y divide-border">
-              {Array.from({ length: 5 }).map((_, i) => (
-                <li key={i} className="flex items-center gap-3 px-3 py-2.5">
-                  <span className="h-5 w-5 rounded bg-surface-muted shrink-0" />
-                  <span className="h-3 flex-1 rounded bg-surface-muted" />
-                  <span className="h-2.5 w-14 rounded bg-surface-muted" />
-                </li>
-              ))}
-            </ul>
-          </Panel>
-        ) : recentError ? (
+      <span className="sr-only" role="status" aria-live="polite">
+        {loading
+          ? "Loading recent activity"
+          : error
+            ? "Could not load recent activity"
+            : `${rows.length} recent change${rows.length === 1 ? "" : "s"}`}
+      </span>
+
+      {loading ? (
+        <ul className="divide-y divide-border" aria-hidden>
+          {Array.from({ length: 4 }).map((_, index) => (
+            <li
+              key={index}
+              className="flex items-center gap-3 px-4 py-3 sm:px-5"
+            >
+              <span className="h-7 w-7 rounded-[var(--radius-sm)] bg-surface-muted" />
+              <span className="h-3 flex-1 rounded bg-surface-muted" />
+              <span className="h-2.5 w-14 rounded bg-surface-muted" />
+            </li>
+          ))}
+        </ul>
+      ) : error ? (
+        <div className="p-4 sm:p-5">
           <EmptyState
-            icon={
-              <span className="feature-tile feat-neutral h-14 w-14">
-                <AlertTriangle className="h-6 w-6" aria-hidden />
-              </span>
-            }
+            icon={<AlertTriangle className="h-6 w-6" aria-hidden />}
             title="Couldn't load recent activity"
             description="Something went wrong fetching this vault's latest changes."
             action={
-              <Button variant="outline" size="sm" onClick={() => name && loadRecent(name)}>
+              <Button variant="outline" size="sm" onClick={onRetry}>
                 Retry
               </Button>
             }
           />
-        ) : recent.length === 0 ? (
+        </div>
+      ) : rows.length === 0 ? (
+        <div className="p-4 sm:p-5">
           <EmptyState
-            icon={
-              <span className="feature-tile feat-knowledge h-14 w-14">
-                <FileClock className="h-6 w-6" aria-hidden />
-              </span>
-            }
+            icon={<FileClock className="h-6 w-6" aria-hidden />}
             title="Nothing written yet"
             description="Document writes in this vault will appear here."
           />
-        ) : (
-          <Panel inset={false}>
-            {/* inset={false} so a hovered row's lift + shadow aren't clipped;
-                the end rows are re-rounded to keep the divided-panel look. */}
-            <ol className="divide-y divide-border stagger [&>li:first-child>a]:rounded-t-[var(--radius-lg)] [&>li:last-child>a]:rounded-b-[var(--radius-lg)]">
-              {recent.map((c, i) => {
-                const Icon = recentIcon(c.type);
-                const tone = recentTone(c.type);
-                return (
-                  <li key={`${c.doc_id}:${c.commit ?? ""}:${i}`}>
-                    <Link
-                      to={`/vault/${name}/doc/${encodeURIComponent(c.path || c.doc_id)}`}
-                      className="group card-hover relative z-0 hover:z-10 grid grid-cols-[20px_minmax(0,1fr)_auto] items-center gap-x-3 px-3 py-2.5 bg-surface hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+        </div>
+      ) : (
+        <ol className="divide-y divide-border bg-surface">
+          {rows.map((row, index) => {
+            const Icon = recentIcon(row.type);
+            const tone = recentTone(row.type);
+            return (
+              <li key={`${row.doc_id}:${row.commit ?? ""}:${index}`}>
+                <Link
+                  to={`/vault/${name}/doc/${encodeURIComponent(row.path || row.doc_id)}`}
+                  className="group grid grid-cols-[28px_minmax(0,1fr)_auto] items-center gap-x-3 px-4 py-2.5 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:grid-cols-[28px_minmax(0,1fr)_auto_auto] sm:px-5"
+                >
+                  <span
+                    className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-[var(--radius-sm)]"
+                    style={{
+                      color: tone,
+                      backgroundColor: `color-mix(in srgb, ${tone} 12%, transparent)`,
+                    }}
+                    aria-hidden
+                  >
+                    <Icon className="h-3.5 w-3.5" aria-hidden />
+                  </span>
+                  <span className="min-w-0 sm:flex sm:items-baseline sm:gap-2">
+                    <span
+                      title={row.title}
+                      className="block truncate text-sm font-medium tracking-tight text-foreground transition-colors group-hover:text-link sm:max-w-[42%] sm:shrink-0"
                     >
-                      <span
-                        className="inline-flex h-5 w-5 items-center justify-center rounded-[var(--radius-sm)] shrink-0"
-                        style={{
-                          color: tone,
-                          backgroundColor: `color-mix(in srgb, ${tone} 12%, transparent)`,
-                        }}
-                        aria-hidden
-                      >
-                        <Icon className="h-3 w-3" aria-hidden />
+                      {row.title}
+                    </span>
+                    <span title={row.path} className="coord block truncate">
+                      {row.path}
+                    </span>
+                  </span>
+                  {row.commit && (
+                    <span
+                      className="coord hidden font-mono tabular-nums sm:block"
+                      title={`commit ${row.commit}`}
+                    >
+                      {row.commit.slice(0, 7)}
+                    </span>
+                  )}
+                  <RelativeTime
+                    iso={row.changed_at}
+                    className="w-[60px] justify-end text-right"
+                  />
+                </Link>
+              </li>
+            );
+          })}
+        </ol>
+      )}
+    </Panel>
+  );
+}
+
+function CommitHistoryPanel({
+  name,
+  rows,
+  loading,
+  error,
+  onRetry,
+}: {
+  name: string;
+  rows: ActivityRow[];
+  loading: boolean;
+  error: boolean;
+  onRetry: () => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const expandable = loading || error || rows.length > 0;
+
+  return (
+    <Panel
+      variant="workspace"
+      flush
+      role="region"
+      aria-labelledby="commit-history-heading"
+      aria-busy={loading}
+      className="w-full min-w-0"
+    >
+      <div className="flex min-h-12 flex-wrap items-center gap-2 border-b border-border-strong bg-surface-2/55 px-4 py-2 sm:px-5">
+        <TonalIcon tone="neutral" size="sm">
+          <GitCommit aria-hidden />
+        </TonalIcon>
+        <div className="flex min-w-0 flex-1 flex-wrap items-baseline gap-2">
+          <h2
+            id="commit-history-heading"
+            className="text-sm font-semibold text-foreground"
+          >
+            Commit history
+          </h2>
+          <span className="text-xs tabular-nums text-foreground-muted">
+            {loading
+              ? "Loading commits…"
+              : error
+                ? "Unavailable"
+                : rows.length > 0
+                  ? `${fmt(rows.length)} recent`
+                  : "No commits yet"}
+          </span>
+        </div>
+        {expandable && (
+          <button
+            type="button"
+            aria-expanded={expanded}
+            aria-controls="commit-history-list"
+            onClick={() => setExpanded((current) => !current)}
+            className="inline-flex min-h-8 cursor-pointer items-center rounded-[var(--radius-sm)] px-2 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {expanded ? "Hide commits" : "Show commits"}
+            <ChevronRight
+              className={cn(
+                "ml-1 h-3.5 w-3.5 transition-transform",
+                expanded && "rotate-90",
+              )}
+              aria-hidden
+            />
+          </button>
+        )}
+        <Link
+          to={`/vault/${name}/activity`}
+          className="inline-flex min-h-8 items-center rounded-[var(--radius-sm)] px-2 text-xs font-medium text-link transition-token hover:bg-surface-hover hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          Full commit log
+          <ChevronRight className="ml-1 h-3.5 w-3.5" aria-hidden />
+        </Link>
+      </div>
+
+      {expanded && (
+        <div id="commit-history-list">
+          {loading ? (
+            <ul className="divide-y divide-border" aria-hidden>
+              {Array.from({ length: 5 }).map((_, index) => (
+                <li
+                  key={index}
+                  className="flex items-center gap-3 px-4 py-3 sm:px-5"
+                >
+                  <span className="h-3 w-14 rounded bg-surface-muted" />
+                  <span className="h-3 w-24 rounded bg-surface-muted" />
+                  <span className="h-3 flex-1 rounded bg-surface-muted" />
+                </li>
+              ))}
+            </ul>
+          ) : error ? (
+            <div className="p-4 sm:p-5">
+              <EmptyState
+                icon={<AlertTriangle className="h-6 w-6" aria-hidden />}
+                title="Couldn't load commit history"
+                description="The latest commits are temporarily unavailable."
+                action={
+                  <Button variant="outline" size="sm" onClick={onRetry}>
+                    Retry
+                  </Button>
+                }
+              />
+            </div>
+          ) : rows.length === 0 ? (
+            <p className="px-4 py-6 text-sm text-foreground-muted sm:px-5">
+              No commits have landed in this vault yet.
+            </p>
+          ) : (
+            <ol className="divide-y divide-border">
+              {rows.map((row, index) => {
+                const primaryPath = row.files?.[0]?.path;
+                const filesCount = row.files?.length || 0;
+                const author =
+                  row.author_name || row.agent || row.author || "unknown";
+                const link = primaryPath
+                  ? `/vault/${name}/doc/${encodeURIComponent(primaryPath)}` +
+                    (row.hash ? `?commit=${encodeURIComponent(row.hash)}` : "")
+                  : `/vault/${name}`;
+                return (
+                  <li key={`${row.hash ?? "commit"}:${index}`}>
+                    <Link
+                      to={link}
+                      className="group grid grid-cols-[62px_minmax(0,1fr)_auto] items-center gap-3 px-4 py-2.5 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:grid-cols-[62px_120px_minmax(0,1fr)_auto] sm:px-5"
+                    >
+                      <span className="font-mono text-xs tabular-nums text-foreground-muted">
+                        {(row.hash || "").slice(0, 7)}
                       </span>
-                      <div className="min-w-0">
-                        <div
-                          title={c.title}
-                          className="text-sm font-medium tracking-tight truncate text-foreground group-hover:text-link transition-colors"
-                        >
-                          {c.title}
-                        </div>
-                        <div title={c.path} className="coord truncate">
-                          {c.path}
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-3 shrink-0">
-                        {c.commit && (
-                          <span
-                            className="coord font-mono tabular-nums"
-                            title={`commit ${c.commit}`}
+                      <TooltipText
+                        tip={author}
+                        className="hidden truncate text-xs text-foreground sm:block"
+                      >
+                        {author}
+                      </TooltipText>
+                      <span className="min-w-0">
+                        <span className="flex min-w-0 items-center gap-2">
+                          {changeMark(row.files?.[0]?.change)}
+                          <TooltipText
+                            tip={
+                              row.subject ||
+                              primaryPath ||
+                              row.summary ||
+                              "Commit"
+                            }
+                            className="truncate text-sm text-foreground transition-colors group-hover:text-link"
                           >
-                            {c.commit.slice(0, 7)}
+                            {row.subject ||
+                              primaryPath ||
+                              row.summary ||
+                              "Commit"}
+                          </TooltipText>
+                        </span>
+                        {primaryPath && (
+                          <span className="coord block truncate pl-6">
+                            {primaryPath}
+                            {filesCount > 1 && ` · +${filesCount - 1} files`}
                           </span>
                         )}
-                        <RelativeTime
-                          iso={c.changed_at}
-                          className="w-[60px] justify-end text-right"
-                        />
-                      </div>
+                      </span>
+                      <RelativeTime
+                        iso={row.timestamp || row.date}
+                        className="w-[60px] justify-end text-right"
+                      />
                     </Link>
                   </li>
                 );
               })}
             </ol>
-          </Panel>
-        )}
-      </section>
+          )}
+        </div>
+      )}
+    </Panel>
+  );
+}
 
-      {/* Commit log — collapsible (secondary detail). The disclosure label is a
-          real <h2> wrapping the button (accordion pattern) so it shows in the
-          screen-reader heading list. */}
-      <section className="mt-8 mb-10" aria-labelledby="commit-log-heading">
-        {/* Disclosure button + the full-history link are SIBLINGS — a <Link>
-            nested inside a <button> is invalid HTML and breaks keyboard nav. */}
-        <div className="flex items-center gap-2 py-2">
-          <h2 className="flex-1 min-w-0">
-            <button
-              onClick={toggleCommits}
-              aria-expanded={commitsOpen}
-              aria-controls="commit-log-list"
-              className="flex w-full items-center gap-2 min-h-[36px] -my-1 text-left text-foreground-muted hover:text-foreground transition-colors rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-            >
-              {commitsOpen ? (
-                <ChevronDown className="h-3 w-3" aria-hidden />
-              ) : (
-                <ChevronRight className="h-3 w-3" aria-hidden />
-              )}
-              <span id="commit-log-heading" className="coord-ink">
-                Commit log
-              </span>
-              {commitsLoaded && (
-                <span className="coord tabular-nums">[{fmt(activity.length)}]</span>
-              )}
-            </button>
-          </h2>
-          <Link
-            to={`/vault/${name}/activity`}
-            className="coord shrink-0 inline-flex items-center min-h-[36px] -my-1 px-1 hover:text-link transition-colors rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-          >
-            ↗ Full commit history
-          </Link>
+function VaultOverviewAside({
+  name,
+  info,
+  about,
+  guideDefined,
+  guideCustomized,
+  guideLoading,
+}: {
+  name: string;
+  info: VaultInfo;
+  about: string;
+  guideDefined: boolean;
+  guideCustomized?: boolean;
+  guideLoading: boolean;
+}) {
+  const guideStatus = guideLoading
+    ? "Checking…"
+    : !guideDefined
+      ? "Guide not configured"
+      : guideCustomized === undefined
+        ? "Guide ready"
+        : guideCustomized
+          ? "Guide customized"
+          : "Starter template";
+  const summary = info.is_external_git
+    ? "This vault mirrors an external Git source, which remains the authoritative guide."
+    : guideCustomized && about
+      ? about
+      : guideDefined
+        ? "Add purpose, scope, and agent instructions when you are ready to customize this guide."
+        : "Set up a vault guide so connected agents understand this knowledge space.";
+  const owner = info.owner_display_name || info.owner || "Not available";
+  const publicAccess =
+    info.public_access === "writer"
+      ? "Public write"
+      : info.public_access === "reader"
+        ? "Public read"
+        : "Private";
+  const tables = info.tables || [];
+  const shownTables = tables.slice(0, TABLES_PREVIEW);
+  const visibilityVariant =
+    info.public_access === "writer"
+      ? "warning"
+      : info.public_access === "reader"
+        ? "info-outline"
+        : "default";
+
+  return (
+    <aside className="min-w-0" aria-label="Vault overview details">
+      <Panel variant="workspace" flush className="min-w-0">
+        <div className="flex min-h-12 items-center justify-between gap-3 border-b border-border-strong bg-surface-2/55 px-4 py-2.5">
+          <div className="flex min-w-0 items-center gap-2.5">
+            <TonalIcon tone="neutral" size="sm">
+              <Box aria-hidden />
+            </TonalIcon>
+            <div className="min-w-0">
+              <h2 className="text-sm font-semibold text-foreground">
+                Vault context
+              </h2>
+              <p className="truncate text-xs text-foreground-muted">
+                Guide and access
+              </p>
+            </div>
+          </div>
+          <Badge variant={visibilityVariant}>{publicAccess}</Badge>
         </div>
 
-        {commitsOpen && (
-          <div
-            id="commit-log-list"
-            className="mt-2 rounded-[var(--radius-lg)] border border-border bg-surface p-3 overflow-x-auto shadow-sm"
-          >
-            <div className="coord mb-2 pb-2 border-b border-border">Latest commits</div>
-            {!commitsLoaded ? (
-              <div className="coord" role="status" aria-live="polite">
-                Loading…
+        <section
+          aria-labelledby="vault-guide-heading"
+          className="border-b border-border"
+        >
+          <div className="flex items-start gap-3 px-4 py-3.5">
+            <TonalIcon tone="guide" size="sm">
+              <BookText aria-hidden />
+            </TonalIcon>
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3
+                  id="vault-guide-heading"
+                  className="text-xs font-semibold text-foreground"
+                >
+                  Vault guide
+                </h3>
+                <Badge variant="info-outline">{guideStatus}</Badge>
               </div>
-            ) : activity.length === 0 ? (
-              <div className="coord" role="status">
-                No commits
-              </div>
-            ) : (
-              <ol className="text-xs leading-relaxed min-w-[520px]">
-                {activity.map((c, i) => {
-                  const filePath = c.files?.[0]?.path || c.summary || "";
-                  const filesCount = c.files?.length || 0;
-                  const change = c.files?.[0]?.change;
-                  const author = c.author_name || c.agent || c.author || "unknown";
-                  const primaryDocPath = c.files?.[0]?.path;
-                  const link = primaryDocPath
-                    ? `/vault/${name}/doc/${encodeURIComponent(primaryDocPath)}` +
-                      (c.hash ? `?commit=${encodeURIComponent(c.hash)}` : "")
-                    : `/vault/${name}`;
-                  return (
-                    <li key={i}>
-                      <Link
-                        to={link}
-                        className="group grid grid-cols-[68px_140px_1fr_20px_56px] gap-3 py-1 items-baseline hover:bg-surface-hover -mx-2 px-2 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-                      >
-                        <span className="font-mono text-[11px] text-foreground-muted tabular-nums">
-                          {(c.hash || "").slice(0, 7)}
-                        </span>
-                        <TooltipText className="text-foreground truncate">
-                          {author}
-                        </TooltipText>
-                        <TooltipText
-                          tip={c.subject || filePath}
-                          className="text-foreground truncate"
-                        >
-                          {c.subject || filePath}
-                          {filesCount > 1 && (
-                            <span className="text-foreground-muted"> · +{filesCount - 1}</span>
-                          )}
-                        </TooltipText>
-                        <span className="text-center">{changeMark(change)}</span>
-                        <RelativeTime iso={c.timestamp} className="text-right" />
-                      </Link>
-                    </li>
-                  );
-                })}
-              </ol>
-            )}
+              <p className="mt-2 text-xs leading-relaxed text-foreground-muted">
+                {summary}
+              </p>
+              {!info.is_external_git && (
+                <Link
+                  to={`/vault/${name}/settings#skill`}
+                  aria-label={
+                    guideDefined ? "Open vault guide" : "Set up vault guide"
+                  }
+                  className="mt-2 inline-flex min-h-7 items-center gap-1 rounded-[var(--radius-sm)] text-xs font-medium text-link hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  {guideDefined ? "Open guide" : "Set up guide"}
+                  <ChevronRight className="h-3.5 w-3.5" aria-hidden />
+                  <span className="sr-only">{guideStatus}</span>
+                </Link>
+              )}
+            </div>
           </div>
+        </section>
+
+        <section
+          aria-labelledby="access-overview-heading"
+          className="border-b border-border"
+        >
+          <div className="flex items-center gap-3 px-4 pt-3.5">
+            <TonalIcon
+              tone={info.public_access === "none" ? "info" : "success"}
+              size="sm"
+            >
+              <ShieldCheck aria-hidden />
+            </TonalIcon>
+            <h3
+              id="access-overview-heading"
+              className="min-w-0 flex-1 text-xs font-semibold text-foreground"
+            >
+              Access and ownership
+            </h3>
+            <Link
+              to={`/vault/${name}/members`}
+              className="inline-flex min-h-7 items-center rounded-[var(--radius-sm)] text-xs font-medium text-link hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              Members
+            </Link>
+          </div>
+          <dl className="mt-2 divide-y divide-border px-4 pb-1">
+            <OverviewContextRow label="Owner" value={owner} />
+            <OverviewContextRow label="Visibility" value={publicAccess} />
+            <OverviewContextRow
+              label="Members"
+              value={fmt(info.member_count ?? 0)}
+            />
+          </dl>
+        </section>
+
+        {(info.table_count ?? 0) > 0 && (
+          <section aria-labelledby="tables-overview-heading">
+            <div className="flex min-h-11 items-center gap-3 border-b border-border px-4 py-2">
+              <TonalIcon tone="data" size="sm">
+                <TableIcon aria-hidden />
+              </TonalIcon>
+              <h3
+                id="tables-overview-heading"
+                className="min-w-0 flex-1 text-xs font-semibold text-foreground"
+              >
+                Tables
+              </h3>
+              <Badge variant="default" className="tabular-nums">
+                {fmt(info.table_count ?? 0)}
+              </Badge>
+            </div>
+            {shownTables.length > 0 ? (
+              <ul className="divide-y divide-border">
+                {shownTables.map((table) => (
+                  <li key={table.name}>
+                    <Link
+                      to={`/vault/${name}/table/${encodeURIComponent(table.name)}`}
+                      className="group flex min-h-11 items-center gap-2 px-4 py-2 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                    >
+                      <TableIcon
+                        className="h-3.5 w-3.5 shrink-0 text-[var(--color-cat-3)]"
+                        aria-hidden
+                      />
+                      <span className="min-w-0 flex-1 truncate text-sm text-foreground group-hover:text-link">
+                        {table.name}
+                      </span>
+                      <span className="coord shrink-0 tabular-nums">
+                        {fmt(table.row_count ?? 0)} rows
+                      </span>
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="p-4 text-xs leading-relaxed text-foreground-muted">
+                Browse this Vault's tables from Collections.
+              </p>
+            )}
+            {(info.table_count ?? 0) > shownTables.length && (
+              <p className="border-t border-border px-4 py-2.5 text-xs text-foreground-muted">
+                +{fmt((info.table_count ?? 0) - shownTables.length)} more in
+                Collections
+              </p>
+            )}
+          </section>
         )}
-      </section>
-      </>
-      )}
+      </Panel>
+    </aside>
+  );
+}
+
+const TABLES_PREVIEW = 3;
+
+function OverviewContextRow({
+  label,
+  value,
+}: {
+  label: string;
+  value: ReactNode;
+}) {
+  return (
+    <div className="flex min-h-10 items-center justify-between gap-3 py-2 text-xs">
+      <dt className="text-foreground-muted">{label}</dt>
+      <dd className="min-w-0 truncate text-right text-foreground">{value}</dd>
     </div>
   );
 }
 
-const TABLES_PREVIEW = 6;
-
-/** Tables-at-a-glance — name + row/column counts per table, linking to the
- *  table viewer. Surfaces the schema /info already pre-loads instead of
- *  collapsing it to a single count tile. */
-function TablesBand({ name, tables }: { name: string; tables: TableMeta[] }) {
-  const shown = tables.slice(0, TABLES_PREVIEW);
-  const more = tables.length - shown.length;
+function VaultContextSkeleton() {
   return (
-    <section className="mt-8" aria-labelledby="tables-heading">
-      <div className="flex items-baseline gap-3 pb-3 border-b border-border mb-3">
-        <h2 id="tables-heading" className="text-xl font-semibold tracking-tight">
-          Tables
-        </h2>
-        <Badge variant="default" className="tabular-nums">
-          {fmt(tables.length)}
-        </Badge>
+    <aside
+      className="min-w-0 overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface shadow-xs"
+      aria-hidden
+    >
+      <div className="h-12 border-b border-border-strong bg-surface-2/55" />
+      <div className="space-y-3 p-4">
+        <div className="h-4 w-24 animate-pulse rounded bg-surface-muted" />
+        <div className="h-3 w-full animate-pulse rounded bg-surface-muted" />
+        <div className="h-3 w-4/5 animate-pulse rounded bg-surface-muted" />
       </div>
-      <ul className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-        {shown.map((t) => {
-          const rows = t.row_count ?? 0;
-          const cols = t.columns?.length ?? 0;
-          return (
-            <li key={t.name}>
-              <Link
-                to={`/vault/${name}/table/${encodeURIComponent(t.name)}`}
-                className="group card-hover flex items-center justify-between gap-3 rounded-[var(--radius-lg)] border border-border bg-surface px-3 py-2.5 shadow-sm hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-              >
-                <span className="inline-flex items-center gap-2 min-w-0">
-                  <span
-                    className="inline-flex h-5 w-5 items-center justify-center rounded-[var(--radius-sm)] shrink-0"
-                    style={{
-                      color: "var(--color-cat-3)",
-                      backgroundColor:
-                        "color-mix(in srgb, var(--color-cat-3) 12%, transparent)",
-                    }}
-                    aria-hidden
-                  >
-                    <TableIcon className="h-3 w-3" aria-hidden />
-                  </span>
-                  <span
-                    title={t.name}
-                    className="truncate text-sm font-medium text-foreground group-hover:text-link transition-colors"
-                  >
-                    {t.name}
-                  </span>
-                </span>
-                <span className="coord tabular-nums shrink-0 whitespace-nowrap">
-                  {fmt(rows)} {rows === 1 ? "row" : "rows"} · {cols}{" "}
-                  {cols === 1 ? "col" : "cols"}
-                </span>
-              </Link>
-            </li>
-          );
-        })}
-      </ul>
-      {more > 0 && (
-        <p className="coord mt-2">
-          +{fmt(more)} more {more === 1 ? "table" : "tables"} in the sidebar tree
-        </p>
+    </aside>
+  );
+}
+
+/** First-run guidance that occupies the same primary-content slot as Recent
+ *  activity. Adding the first resource changes state, not the page grammar. */
+function VaultEmptyOnboarding({
+  name,
+  canWrite,
+  skillCustomized,
+  isMirror,
+  onCreateDocument,
+  onUploadFile,
+  onCreateTable,
+  onImported,
+}: {
+  name: string;
+  canWrite: boolean;
+  skillCustomized?: boolean;
+  isMirror: boolean;
+  onCreateDocument: () => void;
+  onUploadFile: () => void;
+  onCreateTable: () => void;
+  onImported: () => void;
+}) {
+  const importInputRef = useRef<HTMLInputElement | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] =
+    useState<KnowledgeImportResult | null>(null);
+  const [importError, setImportError] = useState("");
+
+  async function importBundle(file: File) {
+    setImporting(true);
+    setImportResult(null);
+    setImportError("");
+    try {
+      const result = await importKnowledgeBundle(name, file);
+      setImportResult(result);
+      if (result.created > 0) onImported();
+    } catch (error) {
+      setImportError(
+        error instanceof Error
+          ? error.message
+          : "The knowledge bundle could not be imported.",
+      );
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  return (
+    <section
+      aria-labelledby="vault-getting-started-heading"
+      className="overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface shadow-xs"
+    >
+      <div className="flex min-h-14 flex-wrap items-center gap-3 border-b border-border-strong bg-surface-2/55 px-4 py-2.5 sm:px-5">
+        <TonalIcon tone="guide" size="sm">
+          <BookText aria-hidden />
+        </TonalIcon>
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+          <h2
+            id="vault-getting-started-heading"
+            className="text-sm font-semibold text-foreground"
+          >
+            Getting started
+          </h2>
+          <Badge variant="default">Ready for content</Badge>
+        </div>
+      </div>
+
+      <div className="flex items-start gap-3 border-b border-border px-4 py-4 sm:px-5">
+        <TonalIcon tone="knowledge">
+          <BookText aria-hidden />
+        </TonalIcon>
+        <div className="min-w-0">
+          <h3 className="font-display text-lg font-semibold tracking-tight text-foreground">
+            This vault is just getting started
+          </h3>
+          <p className="mt-2 max-w-2xl text-sm leading-relaxed text-foreground-muted">
+            {isMirror
+              ? "This vault mirrors an external Git source. Content is managed by that source."
+              : canWrite
+                ? "Add the first document, file, or structured table to begin building this knowledge space."
+                : "There is no content here yet. A writer or connected agent can add the first documents."}
+          </p>
+        </div>
+      </div>
+
+      {canWrite && (
+        <div className="grid grid-cols-1 gap-px bg-border sm:grid-cols-3">
+          <OnboardStep
+            icon={FilePlus}
+            tone="knowledge"
+            onClick={onCreateDocument}
+            title="Write a document"
+            body="Capture knowledge in the full editor with tags and collections."
+          />
+          <OnboardStep
+            icon={Upload}
+            tone="file"
+            onClick={onUploadFile}
+            title="Upload a file"
+            body="Keep source files and attachments beside the rest of the Vault."
+          />
+          <OnboardStep
+            icon={TableIcon}
+            tone="data"
+            onClick={onCreateTable}
+            title="Create a table"
+            body="Define a queryable schema for structured operational knowledge."
+          />
+        </div>
+      )}
+
+      {canWrite && !isMirror && (
+        <section aria-labelledby="vault-setup-heading">
+          <div className="flex min-h-10 flex-wrap items-center justify-between gap-2 border-y border-border-strong bg-surface-2 px-4 py-2 sm:px-5">
+            <h3
+              id="vault-setup-heading"
+              className="text-xs font-semibold text-foreground"
+            >
+              Set up this Vault
+            </h3>
+            <span className="text-xs text-foreground-muted">
+              Optional next steps
+            </span>
+          </div>
+          <div className="grid grid-cols-1 gap-px bg-border sm:grid-cols-3">
+            <OnboardStep
+              icon={FolderInput}
+              tone="file"
+              onClick={() => importInputRef.current?.click()}
+              busy={importing}
+              title={
+                importing ? "Importing knowledge…" : "Import knowledge bundle"
+              }
+              body="Bring an existing AKB knowledge bundle into this Vault."
+            />
+            <OnboardStep
+              icon={BookText}
+              tone="guide"
+              to={`/vault/${name}/settings#skill`}
+              title={
+                skillCustomized ? "Edit Vault guide" : "Describe this Vault"
+              }
+              body="Define its purpose, scope, and instructions for connected agents."
+            />
+            <OnboardStep
+              icon={Plug}
+              tone="people"
+              to="/settings?tab=tokens"
+              title="Connect an agent"
+              body="Create a token and let an MCP client contribute knowledge here."
+            />
+          </div>
+        </section>
+      )}
+
+      {!isMirror && (
+        <input
+          ref={importInputRef}
+          type="file"
+          accept=".zip,application/zip"
+          className="sr-only"
+          aria-label="Choose knowledge bundle"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            event.target.value = "";
+            if (file) void importBundle(file);
+          }}
+        />
+      )}
+      {importError && (
+        <div className="border-t border-border p-4">
+          <Alert variant="destructive" title="Import failed">
+            {importError}
+          </Alert>
+        </div>
+      )}
+      {importResult && (
+        <div className="border-t border-border p-4">
+          <Alert
+            variant={importResult.failed > 0 ? "warning" : "success"}
+            title={
+              importResult.created > 0
+                ? "Knowledge imported"
+                : "Nothing new to import"
+            }
+          >
+            {importResult.created} document
+            {importResult.created === 1 ? "" : "s"} created
+            {importResult.skipped > 0
+              ? ` · ${importResult.skipped} already existed`
+              : ""}
+            {importResult.failed > 0 ? ` · ${importResult.failed} failed` : ""}.
+          </Alert>
+        </div>
       )}
     </section>
   );
 }
 
-/** First-run hero for a brand-new (fully empty) vault — owns the single marquee
- *  orange CTA (the header's is withheld while empty), plus quiet next-step
- *  cards for writers. Readers get the message without the CTAs. */
-function VaultEmptyOnboarding({
-  name,
-  canWrite,
-  skillDefined,
-  isMirror,
-}: {
-  name: string;
-  canWrite: boolean;
-  skillDefined: boolean;
-  isMirror: boolean;
-}) {
-  return (
-    <div className="mt-10">
-      <EmptyState
-        icon={
-          <span className="feature-tile feat-knowledge h-14 w-14">
-            <Sparkles className="h-6 w-6" aria-hidden />
-          </span>
-        }
-        title="This vault is just getting started"
-        description={
-          canWrite
-            ? "Nothing here yet — write the first document, describe what it's for, or point an agent at it."
-            : "No content yet. A writer or an agent can add the first documents."
-        }
-        action={
-          canWrite ? (
-            <Button asChild variant="accent" size="md">
-              <Link to={`/vault/${name}/doc/new`}>
-                <FilePlus className="h-4 w-4" aria-hidden />
-                New document
-              </Link>
-            </Button>
-          ) : undefined
-        }
-      />
-      {canWrite && (
-        <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
-          {/* Mirror vaults carry no guide, so this step has no destination
-              there — only the agent step remains. */}
-          {!isMirror && (
-            <OnboardStep
-              icon={BookText}
-              to={
-                skillDefined
-                  ? `/vault/${name}/settings#skill`
-                  : `/vault/${name}/doc/new`
-              }
-              title={skillDefined ? "Edit the vault guide" : "Describe this vault"}
-              body="Tell agents what this vault is for and how to use it."
-            />
-          )}
-          <OnboardStep
-            icon={Plug}
-            to="/settings?tab=tokens"
-            title="Connect an agent"
-            body="Mint a token and wire up your MCP client to write here."
-          />
-        </div>
-      )}
-    </div>
-  );
-}
-
 function OnboardStep({
   icon: Icon,
+  tone = "neutral",
   to,
+  onClick,
+  busy = false,
   title,
   body,
 }: {
-  icon: typeof BookText;
-  to: string;
+  icon: LucideIcon;
+  tone?: TonalIconTone;
+  to?: string;
+  onClick?: () => void;
+  busy?: boolean;
   title: string;
   body: string;
 }) {
-  return (
-    <Link
-      to={to}
-      className="group card-hover flex items-start gap-3 rounded-[var(--radius-lg)] border border-border bg-surface px-4 py-3 shadow-sm hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-    >
-      <span className="inline-flex h-8 w-8 items-center justify-center rounded-[var(--radius-md)] bg-surface-muted text-foreground-muted shrink-0 group-hover:text-link transition-colors">
-        <Icon className="h-4 w-4" aria-hidden />
-      </span>
-      <span className="min-w-0">
-        <span className="block text-sm font-medium text-foreground group-hover:text-link transition-colors">
+  const className =
+    "group flex min-h-24 w-full flex-col items-start bg-surface px-4 py-3 text-left transition-token hover:bg-surface-hover focus:outline-none focus-visible:z-10 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50";
+  const content = (
+    <>
+      <TonalIcon tone={tone} size="sm">
+        <Icon className={cn(busy && "animate-pulse")} aria-hidden />
+      </TonalIcon>
+      <span className="mt-2 min-w-0">
+        <span className="block text-sm font-semibold text-foreground transition-colors group-hover:text-link">
           {title}
         </span>
-        <span className="block coord mt-0.5">{body}</span>
+        <span className="mt-1 block text-xs leading-relaxed text-foreground-muted">
+          {body}
+        </span>
       </span>
-    </Link>
+    </>
+  );
+
+  if (to) {
+    return (
+      <Link to={to} className={className}>
+        {content}
+      </Link>
+    );
+  }
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={busy}
+      aria-busy={busy || undefined}
+      className={className}
+    >
+      {content}
+    </button>
   );
 }

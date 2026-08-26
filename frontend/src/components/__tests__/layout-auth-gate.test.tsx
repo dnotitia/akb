@@ -1,4 +1,11 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -13,6 +20,7 @@ vi.mock("@/lib/api", () => ({
   getToken: vi.fn(),
   getAuthConfig: vi.fn(),
   getMe: vi.fn(),
+  searchDocs: vi.fn(),
   logoutOrdinarySession: vi.fn(),
   clearPrivateAssetCache: vi.fn(),
 }));
@@ -34,6 +42,10 @@ function renderAt(path: string, queryClient = new QueryClient()) {
           <Route element={<Layout />}>
             <Route path="/" element={<div data-testid="home" />} />
             <Route path="/search" element={<div data-testid="search-page" />} />
+            <Route
+              path="/vault/:name/settings"
+              element={<div data-testid="vault-settings" />}
+            />
           </Route>
           <Route path="/auth" element={<div data-testid="auth-page" />} />
         </Routes>
@@ -45,6 +57,7 @@ function renderAt(path: string, queryClient = new QueryClient()) {
 describe("Layout — auth gate", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
     vi.mocked(api.getAuthConfig).mockResolvedValue({
       available: true,
       schema_version: 2,
@@ -79,6 +92,99 @@ describe("Layout — auth gate", () => {
     expect(await screen.findByTestId("home")).toBeTruthy();
     expect(api.getMe).toHaveBeenCalledWith({ redirectOnUnauthorized: false });
     expect(screen.queryByTestId("auth-page")).toBeNull();
+  });
+
+  it("keeps the global header full-width without page-level responsive gutters", async () => {
+    vi.mocked(api.getToken).mockReturnValue("fake-jwt");
+    renderAt("/");
+
+    expect(await screen.findByTestId("home")).toBeTruthy();
+    const headerRow = screen.getByRole("banner").firstElementChild;
+    expect(headerRow).toHaveClass("w-full");
+    expect(headerRow).not.toHaveClass("px-3");
+    expect(headerRow).not.toHaveClass("xl:px-12", "2xl:px-16");
+  });
+
+  it("moves desktop entry points into an expanded workspace sidebar", async () => {
+    vi.mocked(api.getToken).mockReturnValue("fake-jwt");
+    renderAt("/");
+
+    expect(await screen.findByTestId("home")).toBeTruthy();
+    const sidebar = screen.getByTestId("app-sidebar");
+    const navigation = within(sidebar).getByRole("navigation", {
+      name: "Workspace navigation",
+    });
+
+    expect(sidebar).toHaveAttribute("data-compact", "false");
+    expect(sidebar).toHaveClass("lg:w-52");
+    expect(
+      within(navigation).getByRole("link", { name: "Home" }),
+    ).toHaveAttribute("aria-current", "page");
+    expect(
+      within(navigation).getByRole("link", { name: "Vaults" }),
+    ).toHaveAttribute("href", "/vault");
+    expect(
+      within(navigation).getByRole("link", { name: "Search" }),
+    ).toHaveAttribute("href", "/search");
+    expect(
+      screen.getByRole("button", { name: "Collapse sidebar" }),
+    ).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("collapses the workspace sidebar and remembers the preference", async () => {
+    vi.mocked(api.getToken).mockReturnValue("fake-jwt");
+    renderAt("/");
+
+    expect(await screen.findByTestId("home")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+
+    const sidebar = screen.getByTestId("app-sidebar");
+    expect(sidebar).toHaveAttribute("data-compact", "true");
+    expect(sidebar).toHaveClass("lg:w-14");
+    expect(
+      screen.getByRole("button", { name: "Expand sidebar" }),
+    ).toHaveAttribute("aria-expanded", "false");
+    const brandLink = screen.getByRole("link", { name: "AKB home" });
+    expect(brandLink.parentElement).toHaveClass("lg:w-52");
+    expect(within(brandLink).getByText("AKB")).toBeVisible();
+    expect(within(brandLink).getByText("AGENT KNOWLEDGEBASE")).toBeVisible();
+    expect(localStorage.getItem("akb_app_sidebar_compact")).toBe("true");
+  });
+
+  it("uses equal desktop content gutters outside the sidebar", async () => {
+    vi.mocked(api.getToken).mockReturnValue("fake-jwt");
+    renderAt("/");
+
+    expect(await screen.findByTestId("home")).toBeTruthy();
+    expect(screen.getByRole("main").firstElementChild).toHaveClass(
+      "lg:px-8",
+      "xl:px-12",
+      "2xl:px-36",
+    );
+  });
+
+  it("does not reserve a second root scrollbar gutter for vault workspaces", async () => {
+    vi.mocked(api.getToken).mockReturnValue("fake-jwt");
+    renderAt("/vault/demo/settings");
+
+    expect(await screen.findByTestId("vault-settings")).toBeTruthy();
+    expect(document.documentElement).toHaveClass("vault-workspace-scroll-lock");
+    expect(screen.getByTestId("app-sidebar")).toHaveAttribute(
+      "data-compact",
+      "true",
+    );
+    expect(screen.getByTestId("app-sidebar")).toHaveClass("lg:w-14");
+  });
+
+  it("gives the advanced search route a full-height, unpadded workspace", async () => {
+    vi.mocked(api.getToken).mockReturnValue("fake-jwt");
+    renderAt("/search");
+
+    const searchPage = await screen.findByTestId("search-page");
+    expect(document.documentElement).toHaveClass("vault-workspace-scroll-lock");
+    expect(screen.getByRole("main")).toHaveClass("min-h-0", "flex-1");
+    expect(searchPage.parentElement).toBe(screen.getByRole("main"));
+    expect(screen.queryByRole("contentinfo")).toBeNull();
   });
 
   it("accepts a verified SSO cookie session without any local token", async () => {

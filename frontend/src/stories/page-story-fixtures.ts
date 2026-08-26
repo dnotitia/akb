@@ -267,7 +267,7 @@ export const vaultHealth = {
   vector_store: {
     reachable: true,
     backfill: {
-      upsert: { pending: 2, abandoned: 0 },
+      upsert: { pending: 2, abandoned: 0, indexed: 5886 },
     },
   },
   metadata_backfill: { pending: 1 },

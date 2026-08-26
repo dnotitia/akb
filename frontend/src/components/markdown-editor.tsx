@@ -439,9 +439,10 @@ function RibbonButton({ label, active, disabled, onClick, children }: RibbonButt
 interface EditorToolbarProps {
   uploadingImage: boolean;
   onChooseImages: (files: File[]) => void;
+  appearance: "framed" | "canvas" | "workspace";
 }
 
-function EditorToolbar({ uploadingImage, onChooseImages }: EditorToolbarProps) {
+function EditorToolbar({ uploadingImage, onChooseImages, appearance }: EditorToolbarProps) {
   // useEditorState re-renders on editor changes so active states stay in sync;
   // useEditorRef gives a stable handle for the mutating callbacks.
   const editor = useEditorRef();
@@ -487,6 +488,10 @@ function EditorToolbar({ uploadingImage, onChooseImages }: EditorToolbarProps) {
     insertTable(editor, { rowCount: 3, colCount: 3, header: true });
   };
 
+  const toolbarGroupClass = appearance !== "framed"
+    ? "inline-flex items-center gap-0.5 border-r border-border pr-1.5 last:border-r-0 last:pr-0"
+    : TOOLBAR_GROUP;
+
   return (
     <div
       contentEditable={false}
@@ -494,12 +499,16 @@ function EditorToolbar({ uploadingImage, onChooseImages }: EditorToolbarProps) {
       aria-label="Text formatting"
       className={cn(
         "sticky top-0 z-10 flex flex-wrap items-center gap-1.5",
-        "border-b border-border bg-surface px-2 py-1.5",
-        "rounded-t-[var(--radius-sm)] select-none",
+        "border-b border-border select-none",
+        appearance === "canvas"
+          ? "bg-surface/95 px-5 py-2 backdrop-blur-sm sm:px-8 lg:px-10"
+          : appearance === "workspace"
+            ? "bg-surface px-3 py-2"
+            : "rounded-t-[var(--radius-sm)] bg-surface px-2 py-1.5",
       )}
     >
       {/* Block types */}
-      <div className={TOOLBAR_GROUP} role="group" aria-label="Block type">
+      <div className={toolbarGroupClass} role="group" aria-label="Block type">
         <RibbonButton
           label="Paragraph"
           active={isBlock(ParagraphPlugin.key)}
@@ -519,7 +528,7 @@ function EditorToolbar({ uploadingImage, onChooseImages }: EditorToolbarProps) {
       </div>
 
       {/* Marks */}
-      <div className={TOOLBAR_GROUP} role="group" aria-label="Marks">
+      <div className={toolbarGroupClass} role="group" aria-label="Marks">
         <RibbonButton label="Bold" active={isMark(BoldPlugin.key)} onClick={() => toggleMark(BoldPlugin.key)}>
           <Bold className="h-4 w-4" />
         </RibbonButton>
@@ -539,7 +548,7 @@ function EditorToolbar({ uploadingImage, onChooseImages }: EditorToolbarProps) {
       </div>
 
       {/* Lists */}
-      <div className={TOOLBAR_GROUP} role="group" aria-label="Lists">
+      <div className={toolbarGroupClass} role="group" aria-label="Lists">
         <RibbonButton
           label="Bulleted list"
           onClick={() => toggleList(editor, { listStyleType: ListStyleType.Disc })}
@@ -555,7 +564,7 @@ function EditorToolbar({ uploadingImage, onChooseImages }: EditorToolbarProps) {
       </div>
 
       {/* Blocks: quote, code block, rule */}
-      <div className={TOOLBAR_GROUP} role="group" aria-label="Blocks">
+      <div className={toolbarGroupClass} role="group" aria-label="Blocks">
         <RibbonButton
           label="Blockquote"
           active={isBlock(BlockquotePlugin.key)}
@@ -576,7 +585,7 @@ function EditorToolbar({ uploadingImage, onChooseImages }: EditorToolbarProps) {
       </div>
 
       {/* Link + table */}
-      <div className={TOOLBAR_GROUP} role="group" aria-label="Insert">
+      <div className={toolbarGroupClass} role="group" aria-label="Insert">
         <RibbonButton label="Insert link on selection" onClick={onLink}>
           <Link2 className="h-4 w-4" />
         </RibbonButton>
@@ -610,7 +619,7 @@ function EditorToolbar({ uploadingImage, onChooseImages }: EditorToolbarProps) {
       </div>
 
       {/* History */}
-      <div className={TOOLBAR_GROUP} role="group" aria-label="History">
+      <div className={toolbarGroupClass} role="group" aria-label="History">
         <RibbonButton label="Undo" onClick={() => editor.tf.undo()}>
           <Undo2 className="h-4 w-4" />
         </RibbonButton>
@@ -634,6 +643,10 @@ export interface MarkdownEditorProps {
   autoFocus?: boolean;
   readOnly?: boolean;
   className?: string;
+  /** Visual chrome around the editor. Canvas mode removes textarea-like
+   * framing so the surrounding composer can provide one continuous surface;
+   * workspace mode keeps the same borderless editor inside a parent frame. */
+  appearance?: "framed" | "canvas" | "workspace";
   /** Accessible name for the contenteditable region (it carries role=textbox
    * but no native label). Pass one of these so SR users hear the field name. */
   ariaLabel?: string;
@@ -660,6 +673,7 @@ export function MarkdownEditor({
   autoFocus,
   readOnly,
   className,
+  appearance = "framed",
   ariaLabel,
   ariaLabelledby,
   required,
@@ -884,40 +898,92 @@ export function MarkdownEditor({
     [commit, document, vault],
   );
 
+  const handleImageDragOver = React.useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      const hasImage =
+        transferredImages(event.dataTransfer).length > 0 ||
+        Array.from(event.dataTransfer.items).some(
+          (item) => item.kind === "file" && item.type.startsWith("image/"),
+        );
+      if (!hasImage) return;
+
+      // The browser opens a dropped local file when no element accepts it.
+      // Consume image drags across the whole editor surface — including the
+      // toolbar and upload banners — so an imprecise drop never replaces the
+      // current page and destroys the draft.
+      event.preventDefault();
+      event.dataTransfer.dropEffect = readOnly ? "none" : "copy";
+    },
+    [readOnly],
+  );
+
+  const handleImageDrop = React.useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      const files = transferredImages(event.dataTransfer);
+      if (files.length === 0) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      if (readOnly) return;
+      if (uploadInFlightRef.current) {
+        deferredImageFilesRef.current.push(...files);
+        return;
+      }
+
+      const droppedInBody =
+        event.target instanceof Element &&
+        event.target.closest("[contenteditable='true']") !== null;
+      let dropRange = editor.selection;
+      if (droppedInBody) {
+        try {
+          dropRange = editor.api.findEventRange(event.nativeEvent) || editor.selection;
+        } catch {
+          // Some browsers do not expose a caret coordinate for drops near a
+          // void node or padding. Preserve the user's current caret instead
+          // of allowing Slate to throw and tear down the authoring surface.
+        }
+      }
+      void uploadImages(files, dropRange);
+    },
+    [editor, readOnly, uploadImages],
+  );
+
   return (
     <EditorAssetLifecycleContext.Provider value={assetLifecycle}>
-      <Plate
-        editor={editor}
-        onChange={({ editor: ed }) => {
-          if (!onChange) return;
-          // Serialize on every change — for documents in the typical AKB size
-          // (single-digit KB markdown), this is well under a millisecond. Move
-          // to a debounce only if profiling shows the cost.
-          const md = ed.getApi(MarkdownPlugin).markdown.serialize();
-          const assetIds: string[] = [];
-          const visit = (nodes: unknown[]) => {
-            for (const node of nodes) {
-              if (!node || typeof node !== "object") continue;
-              const element = node as {
-                type?: string;
-                url?: string;
-                children?: unknown[];
-              };
-              if (element.type === ImagePlugin.key) {
-                const assetId = assetIdFromUrl(element.url);
-                if (assetId) assetIds.push(assetId);
+      <div onDragOverCapture={handleImageDragOver} onDropCapture={handleImageDrop}>
+        <Plate
+          editor={editor}
+          onChange={({ editor: ed }) => {
+            if (!onChange) return;
+            // Serialize on every change — for documents in the typical AKB size
+            // (single-digit KB markdown), this is well under a millisecond. Move
+            // to a debounce only if profiling shows the cost.
+            const md = ed.getApi(MarkdownPlugin).markdown.serialize();
+            const assetIds: string[] = [];
+            const visit = (nodes: unknown[]) => {
+              for (const node of nodes) {
+                if (!node || typeof node !== "object") continue;
+                const element = node as {
+                  type?: string;
+                  url?: string;
+                  children?: unknown[];
+                };
+                if (element.type === ImagePlugin.key) {
+                  const assetId = assetIdFromUrl(element.url);
+                  if (assetId) assetIds.push(assetId);
+                }
+                if (Array.isArray(element.children)) visit(element.children);
               }
-              if (Array.isArray(element.children)) visit(element.children);
-            }
-          };
-          visit(ed.children);
-          onChange(md, assetIds);
-        }}
+            };
+            visit(ed.children);
+            onChange(md, assetIds);
+          }}
       >
       {!readOnly && (
         <EditorToolbar
           uploadingImage={uploadingImage}
           onChooseImages={(files) => void uploadImages(files)}
+          appearance={appearance}
         />
       )}
       {uploadingImage && (
@@ -991,45 +1057,22 @@ export function MarkdownEditor({
           }
           void uploadImages(files);
         }}
-        onDragOver={(event) => {
-          if (
-            !readOnly &&
-            Array.from(event.dataTransfer.items).some(
-              (item) => item.kind === "file" && item.type.startsWith("image/"),
-            )
-          ) {
-            event.preventDefault();
-            event.dataTransfer.dropEffect = "copy";
-          }
-        }}
-        onDrop={(event) => {
-          if (readOnly) return;
-          const files = transferredImages(event.dataTransfer);
-          if (files.length === 0) return;
-          // Always consume an image-file drop once drag-over advertised copy.
-          // Letting the browser's default run here can navigate to/open the
-          // local file, which would discard the editor session. A concurrent
-          // batch is retained in the visible retry affordance instead.
-          event.preventDefault();
-          event.stopPropagation();
-          if (uploadInFlightRef.current) {
-            deferredImageFilesRef.current.push(...files);
-            return;
-          }
-          const dropRange = editor.api.findEventRange(event.nativeEvent) || editor.selection;
-          void uploadImages(files, dropRange);
-        }}
         className={cn(
-          "min-h-[360px] w-full outline-none cursor-text",
+          "!min-h-96 w-full outline-none cursor-text",
           // `prose` defaults to max-width: 65ch — explicitly override so
           // the editor expands to its container in Edit mode (typography
           // plugin's selector beats a plain `max-w-none`).
           "prose dark:prose-invert !max-w-none",
           "font-sans text-[15px] leading-7 text-foreground",
-          // PlateContent renders a div whose direct children are blocks; we
-          // want the editor to look like an article surface, not a textarea.
-          "border border-border bg-surface px-5 py-4",
-          "hover:border-foreground-muted focus-within:border-primary focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2 focus-within:ring-offset-background transition-colors",
+          // PlateContent renders a div whose direct children are blocks. The
+          // default appearance keeps the reusable textarea-like frame; the
+          // composer canvas deliberately delegates focus feedback to its
+          // section label so a cursor never produces a second ghost rectangle.
+          appearance === "canvas"
+            ? "border-0 bg-transparent px-5 py-6 focus:outline-none focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 focus-within:outline-none focus-within:ring-0 focus-within:ring-offset-0 sm:px-8 lg:px-10"
+            : appearance === "workspace"
+              ? "border-0 bg-transparent px-4 py-4 focus:outline-none focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 focus-within:outline-none focus-within:ring-0 focus-within:ring-offset-0"
+              : "border border-border bg-surface px-5 py-4 hover:border-foreground-muted focus-within:border-primary focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2 focus-within:ring-offset-background transition-colors",
           // Plate marks the first empty leaf with `data-slate-placeholder`
           // when the editor is empty; surface it so a blank editor isn't a
           // mysterious silent box.
@@ -1037,7 +1080,8 @@ export function MarkdownEditor({
           className,
         )}
       />
-      </Plate>
+        </Plate>
+      </div>
     </EditorAssetLifecycleContext.Provider>
   );
 }

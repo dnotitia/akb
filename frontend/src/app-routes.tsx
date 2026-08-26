@@ -1,7 +1,14 @@
 import type { ComponentType } from "react";
-import { Navigate, Route, Routes, useParams } from "react-router-dom";
+import {
+  Navigate,
+  Route,
+  Routes,
+  useLocation,
+  useParams,
+} from "react-router-dom";
 import { Layout } from "@/components/layout";
 import { VaultShell } from "@/components/vault-shell";
+import { DocumentPreviewDialog } from "@/components/document-preview-dialog";
 import AdminPage from "@/pages/admin";
 import AuthPage from "@/pages/auth";
 import AuthForgotPage from "@/pages/auth-forgot";
@@ -28,6 +35,7 @@ import {
   type AppRouteBoundary,
   type AppRouteComponentName,
 } from "@/app-route-contract";
+import { documentPreviewBackground } from "@/lib/document-preview-navigation";
 
 // Old /vault/:name/skill URLs redirect to the guide editor in vault settings —
 // the vault guide is system-managed and has no plain-viewer surface.
@@ -73,15 +81,29 @@ function renderRoutes(boundaries: readonly AppRouteBoundary[]) {
 
 /** The route tree shared by the production BrowserRouter and Storybook MemoryRouter. */
 export function AppRoutes() {
+  const location = useLocation();
+  const backgroundLocation = documentPreviewBackground(location);
+
   return (
-    <Routes>
-      {renderRoutes(["admin", "auth", "public"])}
-      <Route element={<Layout />}>
-        {renderRoutes(["app-layout"])}
-        <Route element={<VaultShell />}>
-          {renderRoutes(["vault-shell"])}
+    <>
+      <Routes location={backgroundLocation ?? location}>
+        {renderRoutes(["admin", "auth", "public"])}
+        <Route element={<Layout />}>
+          {renderRoutes(["app-layout"])}
+          <Route element={<VaultShell />}>
+            {renderRoutes(["vault-shell"])}
+          </Route>
         </Route>
-      </Route>
-    </Routes>
+      </Routes>
+
+      {backgroundLocation && (
+        <Routes location={location}>
+          <Route
+            path="/vault/:name/doc/:id"
+            element={<DocumentPreviewDialog />}
+          />
+        </Routes>
+      )}
+    </>
   );
 }

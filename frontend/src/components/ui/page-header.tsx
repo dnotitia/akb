@@ -13,6 +13,7 @@ export function PageHeader({
   eyebrow,
   actions,
   size = "lg",
+  compact = false,
   className,
 }: {
   title: ReactNode;
@@ -20,25 +21,49 @@ export function PageHeader({
   eyebrow?: ReactNode;
   actions?: ReactNode;
   size?: "md" | "lg";
+  compact?: boolean;
   className?: string;
 }) {
   return (
-    <div className={cn("mb-8 flex items-start justify-between gap-4 flex-wrap", className)}>
-      <div className="min-w-0">
-        {eyebrow && <Eyebrow tone="spark" className="mb-2 block">{eyebrow}</Eyebrow>}
+    <div
+      className={cn(
+        "flex flex-wrap items-start justify-between",
+        compact ? "mb-6 gap-3" : "mb-8 gap-4",
+        className,
+      )}
+    >
+      <div className="flex min-w-0 flex-col">
+        {eyebrow && (
+          <Eyebrow tone={compact ? "ink" : "spark"} className={compact ? "mb-1.5 block" : "mb-2 block"}>
+            {eyebrow}
+          </Eyebrow>
+        )}
         <h1
           className={cn(
-            "font-display text-foreground",
-            size === "lg" ? "text-3xl sm:text-[34px]" : "text-2xl",
+            "font-display font-semibold tracking-tight text-foreground",
+            compact
+              ? size === "lg"
+                ? "text-2xl"
+                : "text-xl"
+              : size === "lg"
+                ? "text-3xl sm:text-[34px]"
+                : "text-2xl",
           )}
         >
           {title}
         </h1>
         {subtitle && (
-          <p className="mt-1.5 text-sm text-foreground-muted max-w-2xl">{subtitle}</p>
+          <p
+            className={cn(
+              "text-sm text-foreground-muted",
+              compact ? "mt-1 max-w-3xl leading-relaxed" : "mt-1.5 max-w-2xl",
+            )}
+          >
+            {subtitle}
+          </p>
         )}
       </div>
-      {actions && <div className="flex items-center gap-2 shrink-0">{actions}</div>}
+      {actions && <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">{actions}</div>}
     </div>
   );
 }

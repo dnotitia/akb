@@ -1,67 +1,56 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Link, useLocation } from "react-router-dom";
-import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Link, useLocation, useOutletContext } from "react-router-dom";
 import {
   AlertTriangle,
   ArrowRight,
-  ChevronDown,
-  Copy,
-  Eye,
-  EyeOff,
+  ArrowUpRight,
+  Box,
+  Check,
+  ChevronRight,
+  Circle,
+  Clock3,
+  Database,
   FileClock,
-  FilePlus,
-  FileText,
   FolderPlus,
+  PlugZap,
   Plus,
-  Trash2,
+  Star,
 } from "lucide-react";
-import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { PageHeader } from "@/components/ui/page-header";
 import { Panel } from "@/components/ui/panel";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
-import { CodeSnippet } from "@/components/ui/code-snippet";
-import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { TonalIcon } from "@/components/ui/tonal-icon";
 import { EmptyState } from "@/components/empty-state";
-import { VaultList, type VaultRow } from "@/components/vault-list";
+import type { VaultRow } from "@/components/vault-list";
 import { useVaultFavorites } from "@/hooks/use-vault-favorites";
-import { VaultChip } from "@/components/ui/vault-chip";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { TooltipText } from "@/components/ui/tooltip-text";
-import { MenuFilter } from "@/components/ui/menu-filter";
-import { MENU_FILTER_THRESHOLD, filterByText } from "@/components/ui/menu-filter-utils";
-import { QuickstartDialog, QUICKSTART_DISMISS_KEY } from "@/components/quickstart-dialog";
+import { RoleBadge } from "@/components/status-badge";
+import { QuickstartDialog } from "@/components/quickstart-dialog";
 import {
   listVaults,
   getRecent,
-  createPAT,
+  getVaultInfo,
   listPATs,
-  revokePAT,
   getAuthConfig,
 } from "@/lib/api";
-import { timeAgo } from "@/lib/utils";
 import { recentIcon, recentTone } from "@/lib/recent";
+import type { HealthSnapshot } from "@/hooks/use-health";
+import { useCurrentUser } from "@/contexts/current-user-context";
 import {
-  mcpInstallSnippets,
-  mcpOAuthSnippets,
-  MCP_AGENT_FILES,
-} from "@/lib/mcp-snippets";
-
-type ConnectMode = "pat" | "oauth";
-
-type Tab = "claude" | "cursor" | "codex" | "vscode" | "openclaw";
+  readRecentDocumentViews,
+  type RecentDocumentView,
+} from "@/lib/recent-document-views";
 
 // Recent-activity fetch size. The list starts with this many; "Show more"
 // grows it (doubling — "this many again") up to RECENT_MAX. When a fetch comes
 // back full we render the count as "N+" rather than implying it's the total.
-const RECENT_LIMIT = 8;
+const RECENT_LIMIT = 6;
 // Backend /recent caps `limit` at 100, so that's the ceiling for "Show more".
 const RECENT_MAX = 100;
 // How many vaults the Home preview shows before linking out to /vault.
-const VAULT_PREVIEW_LIMIT = 6;
+const VAULT_PREVIEW_LIMIT = 4;
+const HOME_SETUP_DISMISS_KEY = "akb.homeSetupDismissed";
 
 interface RecentRow {
   doc_id: string;
@@ -71,6 +60,14 @@ interface RecentRow {
   type?: string;
   commit?: string;
   changed_at?: string;
+  /** Forward-compatible enrichment. Older backends omit these fields and the
+   *  row simply keeps its compact title/location shape. */
+  updated_by_name?: string;
+  author_name?: string;
+  created_by_name?: string;
+  action?: string;
+  summary?: string;
+  excerpt?: string;
 }
 
 interface PATRow {
@@ -80,11 +77,22 @@ interface PATRow {
   last_used_at?: string;
 }
 
+interface VaultMetrics {
+  document_count?: number;
+  table_count?: number;
+  file_count?: number;
+  last_activity?: string;
+}
+
 export default function HomePage() {
+  const { health } = useOutletContext<{ health: HealthSnapshot | null }>();
+  const currentUser = useCurrentUser();
   const [vaults, setVaults] = useState<VaultRow[]>([]);
-  // How many vaults the in-page preview shows. Starts at VAULT_PREVIEW_LIMIT;
-  // "Show more" doubles it client-side (all vaults are already loaded, so no
-  // refetch — unlike Recent activity, which grows its server-side limit).
+  const [vaultsLoading, setVaultsLoading] = useState(true);
+  const [vaultsError, setVaultsError] = useState(false);
+  // The Home directory is a bounded preview. This state only preserves row
+  // stability if an extra visible favorite is unpinned; discovery of the full
+  // directory belongs to the always-visible "View all vaults" route.
   const [vaultLimit, setVaultLimit] = useState(VAULT_PREVIEW_LIMIT);
   // Per-browser favorited vault IDs (localStorage) — same source the vault rail
   // uses, so pinning here and in the rail stay in sync.
@@ -95,36 +103,60 @@ export default function HomePage() {
   const [recentLimit, setRecentLimit] = useState(RECENT_LIMIT);
   const [recentLoadingMore, setRecentLoadingMore] = useState(false);
   const [pats, setPats] = useState<PATRow[]>([]);
-  const [pendingRevoke, setPendingRevoke] = useState<PATRow | null>(null);
-  const [activePat, setActivePat] = useState<string | null>(null);
-  const [showPat, setShowPat] = useState(false);
-  const [copied, setCopied] = useState<string | null>(null);
-  const [creating, setCreating] = useState(false);
-  const [mintError, setMintError] = useState<string | null>(null);
-  const [newName, setNewName] = useState("");
-  const [tab, setTab] = useState<Tab>("claude");
+  const [patsLoading, setPatsLoading] = useState(true);
+  const [vaultMetrics, setVaultMetrics] = useState<Record<string, VaultMetrics>>({});
+  const metricsRequested = useRef<Set<string>>(new Set());
   const [quickstartOpen, setQuickstartOpen] = useState(false);
-  const quickstartChecked = useRef(false);
+  const [setupDismissed, setSetupDismissed] = useState(
+    () => localStorage.getItem(HOME_SETUP_DISMISS_KEY) === "1",
+  );
   const location = useLocation();
+  const [recentViews, setRecentViews] = useState<RecentDocumentView[]>([]);
   const recentCapped = recent.length >= recentLimit;
   const canLoadMore =
     !recentLoading && !recentError && recent.length >= recentLimit && recentLimit < RECENT_MAX;
 
   useEffect(() => {
     let cancelled = false;
-    // Per-vault content counts are fetched by <VaultList> for whatever rows it
-    // renders, so Home only needs the bare list (for the count + preview).
+    // The directory endpoint stays lightweight; Home enriches only the vault
+    // cards it renders with bounded /info requests below.
+    setVaultsLoading(true);
+    setVaultsError(false);
     listVaults()
       .then((d) => {
         if (!cancelled) setVaults(d.vaults || []);
       })
-      .catch(console.error);
+      .catch(() => {
+        if (!cancelled) setVaultsError(true);
+      })
+      .finally(() => {
+        if (!cancelled) setVaultsLoading(false);
+      });
     loadRecent(() => cancelled);
     loadPATs();
     return () => {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    setRecentViews(
+      currentUser ? readRecentDocumentViews(currentUser.user_id, 8) : [],
+    );
+  }, [currentUser, location.key]);
+
+  async function retryVaults() {
+    setVaultsLoading(true);
+    setVaultsError(false);
+    try {
+      const data = await listVaults();
+      setVaults(data.vaults || []);
+    } catch {
+      setVaultsError(true);
+    } finally {
+      setVaultsLoading(false);
+    }
+  }
 
   async function loadRecent(
     isCancelled: () => boolean = () => false,
@@ -179,63 +211,18 @@ export default function HomePage() {
   }, [location.hash, location.key]);
 
   async function loadPATs() {
+    setPatsLoading(true);
     try {
       const d = await listPATs();
-      const toks = d.tokens || [];
-      setPats(toks);
-      // First-run quickstart: proactively surface the connect flow once when a
-      // fresh account has no tokens yet (unless the user opted out).
-      if (!quickstartChecked.current) {
-        quickstartChecked.current = true;
-        if (toks.length === 0 && localStorage.getItem(QUICKSTART_DISMISS_KEY) !== "1") {
-          setQuickstartOpen(true);
-        }
-      }
+      setPats(d.tokens || []);
     } catch {
       /* non-fatal: leave pats empty */
-    }
-  }
-
-  async function copy(text: string, label: string) {
-    // clipboard is undefined on insecure (plain-HTTP) origins — guard so a copy
-    // never throws an uncaught TypeError mid-render with no feedback.
-    try {
-      await navigator.clipboard?.writeText(text);
-      setCopied(label);
-      setTimeout(() => setCopied(null), 2000);
-    } catch {
-      /* clipboard blocked — value stays on screen to copy manually */
-    }
-  }
-
-  async function handleCreatePAT(e: React.FormEvent) {
-    e.preventDefault();
-    const name = newName.trim();
-    if (!name) return;
-    setMintError(null);
-    setCreating(true);
-    try {
-      const r = await createPAT(name);
-      setActivePat(r.token);
-      setShowPat(true);
-      setNewName("");
-      await loadPATs();
-    } catch (err) {
-      // No app-wide toast — surface inline or the button just settles with no
-      // token and no explanation.
-      setMintError(err instanceof Error ? err.message : "Couldn't mint a token. Please try again.");
     } finally {
-      setCreating(false);
+      setPatsLoading(false);
     }
   }
 
-  const pat = activePat || "<YOUR_PAT>";
-  const snippets = useMemo(() => mcpInstallSnippets(pat), [pat]);
-  const oauthSnippetsMap = useMemo(() => mcpOAuthSnippets(), []);
-  // Toggle gated on the backend advertising mcp_oauth.enabled. Default
-  // mode = PAT for parity with the rest of the home CONNECT UX.
   const [oauthEnabled, setOauthEnabled] = useState(false);
-  const [connectMode, setConnectMode] = useState<ConnectMode>("pat");
   useEffect(() => {
     let cancelled = false;
     getAuthConfig().then((cfg) => {
@@ -249,8 +236,7 @@ export default function HomePage() {
   // Home shows a preview of the vault directory; the full list (with filter)
   // lives on /vault. Favorites float to the top (mirroring the vault rail) and
   // are always visible: the preview cap is a FLOOR, not a hard slice — a
-  // favorite is never hidden behind "Show more". Memoized so <VaultList>
-  // doesn't re-fetch metrics on every unrelated render.
+  // favorite is never hidden behind "Show more".
   const orderedVaults = useMemo(() => {
     // Filter to the LIVE list so a favorited-but-deleted/revoked vault id drops
     // silently (same as the rail); newest-favorited first within the group.
@@ -270,13 +256,71 @@ export default function HomePage() {
     () => orderedVaults.slice(0, visibleVaultCount),
     [orderedVaults, visibleVaultCount],
   );
-  const canShowMoreVaults = orderedVaults.length > visibleVaultCount;
+  const continueWorking = useMemo(() => {
+    if (vaultsLoading || vaultsError) return [];
+    const accessible = new Set(vaults.map((vault) => vault.name));
+    return recentViews
+      .filter((view) => accessible.has(view.vault))
+      .slice(0, 4);
+  }, [recentViews, vaults, vaultsError, vaultsLoading]);
 
-  function showMoreVaults() {
-    // Grow from the ACTUAL rendered row count (not vaultLimit — favorites may
-    // have pushed it higher), "this many again", capped at the full list.
-    setVaultLimit(() => Math.min(visibleVaultCount * 2, orderedVaults.length));
-  }
+  // Home cards need the same small set of live counts as the shared vault
+  // directory. Keep the enrichment bounded: /vaults/{v}/info fans out into
+  // several count queries, so loading every card at once can saturate the pool.
+  useEffect(() => {
+    let cancelled = false;
+    const requested = metricsRequested.current;
+    const completed = new Set<string>();
+    const todo = previewVaults.filter((v) => !requested.has(v.name));
+    todo.forEach((v) => requested.add(v.name));
+    void (async () => {
+      for (let i = 0; i < todo.length; i += 4) {
+        if (cancelled) return;
+        await Promise.all(
+          todo.slice(i, i + 4).map((v) =>
+            getVaultInfo(v.name)
+              .then((info) => {
+                if (cancelled) return;
+                completed.add(v.name);
+                setVaultMetrics((current) => ({
+                  ...current,
+                  [v.name]: {
+                    document_count: info?.document_count,
+                    table_count: info?.table_count,
+                    file_count: info?.file_count,
+                    last_activity: info?.last_activity,
+                  },
+                }));
+              })
+              .catch(() => {
+                requested.delete(v.name);
+              }),
+          ),
+        );
+      }
+    })();
+    return () => {
+      cancelled = true;
+      todo.forEach((v) => {
+        if (!completed.has(v.name)) requested.delete(v.name);
+      });
+    };
+  }, [previewVaults]);
+
+  const archivedVaults = vaults.filter((v) => v.status === "archived").length;
+  const vaultAccess = useMemo(
+    () =>
+      vaults.reduce(
+        (counts, vault) => {
+          if (vault.role === "owner") counts.owned += 1;
+          if (vault.role === "admin" || vault.role === "writer") counts.editable += 1;
+          if (vault.role === "reader") counts.readOnly += 1;
+          return counts;
+        },
+        { owned: 0, editable: 0, readOnly: 0 },
+      ),
+    [vaults],
+  );
 
   function toggleVaultFavorite(v: VaultRow) {
     // Lock in the current row count before toggling so unpinning a cap-exempt
@@ -286,174 +330,116 @@ export default function HomePage() {
     toggleFavorite(v.id);
   }
 
-  // Main column — Recent + Vaults. Right rail — summary + connect.
-  return (
-    <div className="fade-up">
-      {/* Page header — centralized primitive, wrapped in a header-local aurora
-          wash so the masthead carries brand depth (the global mesh is anchored
-          off-screen). Static, decorative, behind the header content. */}
-      <div className="aurora-header">
-        <PageHeader
-          title="Workspace"
-          subtitle="Your knowledge base for AI agents — browse vaults, see recent changes, and manage agent connections."
-          actions={
-            <div className="flex items-center gap-2">
-              {/* Only offer vaults the user can actually write to — a reader
-                  vault in the picker just leads to a 403 on create. */}
-              {vaults.some((v) => v.role !== "reader") && (
-                <NewDocAction vaults={vaults.filter((v) => v.role !== "reader")} />
-              )}
-              <Button asChild variant={vaults.length > 0 ? "outline" : "accent"} size="md">
-                <Link to="/vault/new">
-                  <Plus className="h-4 w-4" aria-hidden />
-                  New vault
-                </Link>
-              </Button>
-            </div>
-          }
-        />
-      </div>
+  const indexUpsert = health?.vector_store?.backfill?.upsert;
+  const indexedCount = indexUpsert?.indexed ?? null;
+  const indexingAbandoned = indexUpsert?.abandoned ?? 0;
+  const indexingPending = indexUpsert
+    ? Math.max(0, (indexUpsert.pending ?? 0) - indexingAbandoned)
+    : 0;
+  const hasVault = vaults.length > 0;
+  const writableVault = vaults.find(
+    (vault) => vault.status !== "archived" && vault.role !== "reader",
+  );
+  const hasKnowledge =
+    recent.some((change) => change.path !== "overview/vault-skill.md") ||
+    Object.values(vaultMetrics).some(
+      (metrics) =>
+        (metrics.document_count ?? 0) > 1 ||
+        (metrics.table_count ?? 0) > 0 ||
+        (metrics.file_count ?? 0) > 0,
+    );
+  // A read-only member should not be held in an onboarding step they cannot
+  // complete. Their job is to explore the Vaults already shared with them.
+  const knowledgeReady = hasKnowledge || (hasVault && !writableVault);
+  const hasConnectedAgent = pats.some((token) => Boolean(token.last_used_at));
+  const setupCompleted = [hasVault, knowledgeReady, hasConnectedAgent].filter(Boolean).length;
+  const setupLoading = vaultsLoading || recentLoading || patsLoading;
+  const setupComplete = setupCompleted === 3;
+  const showAgentConnect = !setupLoading && !hasConnectedAgent;
 
-      <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_340px] gap-x-10 gap-y-10">
-      {/* ── Main column ──────────────────────────────────────── */}
-      <div className="space-y-10 min-w-0">
-        {/* § 01 Recent — top priority, the jump-back-in list. */}
-        <section id="recent" className="scroll-mt-24" aria-busy={recentLoading}>
-          <header className="flex items-baseline gap-3 pb-3 border-b border-border">
-            <h2 className="text-xl font-semibold tracking-tight">Recent activity</h2>
-            {!recentLoading && !recentError && (
-              <Badge variant="default" className="tabular-nums">
-                {recent.length}{recentCapped ? "+" : ""}
-              </Badge>
-            )}
+  function dismissSetup() {
+    localStorage.setItem(HOME_SETUP_DISMISS_KEY, "1");
+    setSetupDismissed(true);
+  }
+
+  function showSetup() {
+    localStorage.removeItem(HOME_SETUP_DISMISS_KEY);
+    setSetupDismissed(false);
+  }
+
+  // Home is a working set, not a second search page. The primary column keeps
+  // Vaults and change history close; the rail only carries setup and compact
+  // workspace context that is not repeated in the ledgers.
+  return (
+    <div className="fade-up w-full space-y-8">
+      <HomeWorkspaceHeader
+        vaultCount={vaults.length}
+        loading={vaultsLoading}
+        indexedCount={indexedCount}
+        indexingPending={indexingPending}
+        indexingAbandoned={indexingAbandoned}
+      />
+
+      <div className="grid grid-cols-1 items-start gap-x-8 gap-y-8 2xl:grid-cols-[minmax(0,1fr)_320px]">
+        {continueWorking.length > 0 && (
+          <div className="order-2 min-w-0 2xl:col-start-1 2xl:row-start-1">
+            <ContinueWorkingSection items={continueWorking} />
+          </div>
+        )}
+
+        <section
+          id="vaults"
+          className={`order-1 min-w-0 scroll-mt-24 2xl:col-start-1 ${
+            continueWorking.length > 0 ? "2xl:row-start-2" : "2xl:row-start-1"
+          }`}
+          aria-busy={vaultsLoading}
+        >
+          <header className="flex min-h-10 flex-wrap items-center justify-between gap-3 border-b border-border pb-2.5">
+            <div className="flex min-w-0 items-center gap-2.5">
+              <TonalIcon tone="knowledge" size="sm">
+                <Box aria-hidden />
+              </TonalIcon>
+              <h2 className="text-base font-semibold tracking-tight">Your vaults</h2>
+              <Badge variant="default" className="tabular-nums">{vaults.length}</Badge>
+            </div>
+            <Link
+              to="/vault"
+              className="inline-flex min-h-9 items-center gap-1 rounded-[var(--radius-sm)] text-xs text-link hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            >
+              View all vaults
+              <ArrowRight className="h-3 w-3" aria-hidden />
+            </Link>
           </header>
           <span className="sr-only" role="status" aria-live="polite">
-            {recentLoading
-              ? "Loading recent activity"
-              : recentError
-                ? "Could not load recent activity"
-                : `${recent.length} recent change${recent.length === 1 ? "" : "s"}`}
+            {vaultsLoading
+              ? "Loading your vaults"
+              : vaultsError
+                ? "Could not load your vaults"
+                : `${vaults.length} accessible vault${vaults.length === 1 ? "" : "s"}`}
           </span>
 
-          {recentLoading ? (
-            <Panel className="mt-3" aria-hidden>
-              <ul className="divide-y divide-border">
-                {Array.from({ length: 4 }).map((_, i) => (
-                  <li key={i} className="flex items-center gap-4 px-4 py-3">
-                    <span className="h-2.5 w-6 rounded bg-surface-muted" />
-                    <span className="h-3 flex-1 rounded bg-surface-muted" />
-                    <span className="h-2.5 w-10 rounded bg-surface-muted" />
-                  </li>
-                ))}
-              </ul>
-            </Panel>
-          ) : recentError ? (
+          {vaultsLoading ? (
+            <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4" aria-hidden>
+              {Array.from({ length: 4 }).map((_, index) => (
+                <Panel key={index} className="min-h-32 p-3">
+                  <span className="block h-4 w-24 animate-pulse rounded bg-surface-muted" />
+                  <span className="mt-3 block h-3 w-4/5 animate-pulse rounded bg-surface-muted" />
+                  <span className="mt-2 block h-3 w-3/5 animate-pulse rounded bg-surface-muted" />
+                </Panel>
+              ))}
+            </div>
+          ) : vaultsError ? (
             <EmptyState
               icon={
                 <span className="feature-tile feat-neutral h-14 w-14">
                   <AlertTriangle className="h-6 w-6" aria-hidden />
                 </span>
               }
-              title="Couldn't load recent activity"
-              description="Something went wrong fetching your latest changes."
-              action={
-                <Button variant="outline" size="sm" onClick={() => loadRecent()}>
-                  Retry
-                </Button>
-              }
+              title="Couldn't load your vaults"
+              description="The vault directory is temporarily unavailable."
+              action={<Button variant="outline" size="sm" onClick={retryVaults}>Retry</Button>}
             />
-          ) : recent.length === 0 ? (
-            <EmptyState
-              icon={
-                <span className="feature-tile feat-knowledge h-14 w-14">
-                  <FileClock className="h-6 w-6" aria-hidden />
-                </span>
-              }
-              title="Nothing touched yet"
-              description="Recent document writes across all your vaults will appear here."
-            />
-          ) : (
-            <>
-            <Panel
-              className="mt-3"
-              inset={false}
-            >
-              {/* inset={false} so a hovered row's lift + shadow aren't clipped;
-                  the end rows are re-rounded to keep the divided-panel look at
-                  rest. */}
-              <ol className="divide-y divide-border stagger [&>li:first-child>a]:rounded-t-[var(--radius-lg)] [&>li:last-child>a]:rounded-b-[var(--radius-lg)]">
-                {recent.map((c, i) => {
-                  const Icon = recentIcon(c.type);
-                  const tone = recentTone(c.type);
-                  return (
-                  <li key={`${c.doc_id}:${c.changed_at ?? ""}:${i}`}>
-                    <Link
-                      to={`/vault/${c.vault}/doc/${c.doc_id}`}
-                      className="group card-hover relative z-0 hover:z-10 grid grid-cols-[20px_minmax(0,1fr)_auto_64px] items-center gap-x-3 gap-y-1 px-4 py-3 bg-surface hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-                    >
-                      <span
-                        className="inline-flex h-5 w-5 items-center justify-center rounded-[var(--radius-sm)] shrink-0"
-                        style={{
-                          color: tone,
-                          backgroundColor: `color-mix(in srgb, ${tone} 12%, transparent)`,
-                        }}
-                        aria-hidden
-                      >
-                        <Icon className="h-3 w-3" aria-hidden />
-                      </span>
-                      <div className="min-w-0">
-                        <div title={c.title} className="text-sm font-medium tracking-tight truncate text-foreground group-hover:text-link transition-colors">
-                          {c.title}
-                        </div>
-                        <div title={c.path} className="coord truncate">{c.path}</div>
-                      </div>
-                      <span className="flex items-center gap-1.5 shrink-0 max-w-[150px]">
-                        <VaultChip name={c.vault} size="sm" />
-                        <TooltipText className="truncate text-xs text-foreground-muted">{c.vault}</TooltipText>
-                      </span>
-                      <RelativeTime iso={c.changed_at} className="justify-end text-right" />
-                    </Link>
-                  </li>
-                  );
-                })}
-              </ol>
-            </Panel>
-            {canLoadMore && (
-              <div className="mt-3 flex justify-center">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={loadMoreRecent}
-                  disabled={recentLoadingMore}
-                  aria-label="Show more recent activity"
-                >
-                  {recentLoadingMore ? "Loading…" : "Show more"}
-                </Button>
-              </div>
-            )}
-            </>
-          )}
-        </section>
-
-        {/* § 02 Vaults — a preview of the directory; the full list lives at /vault. */}
-        <section id="vaults" className="scroll-mt-24">
-          <header className="flex items-baseline justify-between gap-4 flex-wrap pb-3 border-b border-border">
-            <div className="flex items-baseline gap-3">
-              <h2 className="text-xl font-semibold tracking-tight">Your vaults</h2>
-              <Badge variant="default" className="tabular-nums">{vaults.length}</Badge>
-            </div>
-            {vaults.length > VAULT_PREVIEW_LIMIT && (
-              <Link
-                to="/vault"
-                className="coord inline-flex items-center gap-1 hover:text-link rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-              >
-                View all {vaults.length}
-                <ArrowRight className="h-3 w-3" aria-hidden />
-              </Link>
-            )}
-          </header>
-
-          {vaults.length === 0 ? (
+          ) : vaults.length === 0 ? (
             <EmptyState
               icon={
                 <span className="feature-tile feat-memory h-14 w-14">
@@ -461,260 +447,240 @@ export default function HomePage() {
                 </span>
               }
               title="No vaults yet"
-              description="Mint a token, then ask your agent to create one — or use the button above."
+              description="Create a vault to give your team and agents a shared knowledge space."
               action={
-                <Button asChild variant="accent" size="sm">
-                  <Link to="/vault/new">
+                <Button asChild variant="outline" size="sm">
+                  <Link to="/vault">
                     <Plus className="h-4 w-4" aria-hidden />
-                    Create first vault
+                    Open Vaults
                   </Link>
                 </Button>
               }
             />
           ) : (
-            <>
-              <VaultList
-                vaults={previewVaults}
-                favoriteControl={{ isFavorite, onToggle: toggleVaultFavorite }}
-              />
-              {canShowMoreVaults && (
-                <div className="mt-3 flex justify-center">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={showMoreVaults}
-                    aria-label="Show more vaults"
-                  >
-                    Show more
-                  </Button>
-                </div>
-              )}
-            </>
+            <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4 stagger">
+              {previewVaults.map((vault) => (
+                <HomeVaultCard
+                  key={vault.id}
+                  vault={vault}
+                  metrics={vaultMetrics[vault.name]}
+                  favorite={isFavorite(vault.id)}
+                  onToggleFavorite={() => toggleVaultFavorite(vault)}
+                />
+              ))}
+            </div>
           )}
         </section>
-      </div>
 
-      {/* ── Right rail ───────────────────────────────────────── */}
-      <aside className="space-y-8 min-w-0" aria-label="Workspace summary and connection">
-        {/* Summary stats — glass shell so the masthead aurora tints the rail,
-            raised one tier (shadow-md) above the content field. */}
-        <section className="rounded-[var(--radius-lg)] border glass shadow-md overflow-hidden" aria-labelledby="rail-glance">
-          <div className="border-b border-border px-4 py-2">
-            <h2 id="rail-glance" className="coord-ink">At a glance</h2>
+        <aside
+          className={`order-3 space-y-5 2xl:col-start-2 2xl:row-start-1 ${
+            continueWorking.length > 0 ? "2xl:row-span-3" : "2xl:row-span-2"
+          }`}
+          aria-label="Workspace setup and summary"
+        >
+          {!setupComplete && !setupDismissed && (
+            showAgentConnect ? (
+              <HomeAgentConnectPanel
+                completed={setupCompleted}
+                tokenReady={pats.length > 0}
+                tokenCount={pats.length}
+                workspaceReady={hasVault && knowledgeReady}
+                onConnect={() => setQuickstartOpen(true)}
+                onDismiss={dismissSetup}
+              />
+            ) : (
+              <HomeSetupPanel
+                loading={setupLoading}
+                completed={setupCompleted}
+                hasVault={hasVault}
+                hasKnowledge={knowledgeReady}
+                hasConnectedAgent={hasConnectedAgent}
+                tokenReady={pats.length > 0}
+                writableVault={writableVault}
+                onConnect={() => setQuickstartOpen(true)}
+                onDismiss={dismissSetup}
+              />
+            )
+          )}
+
+          <WorkspaceSummary
+            loading={vaultsLoading || patsLoading}
+            vaultCount={vaults.length}
+            ownedCount={vaultAccess.owned}
+            editableCount={vaultAccess.editable}
+            readOnlyCount={vaultAccess.readOnly}
+            favoriteCount={liveFavCount}
+            archivedCount={archivedVaults}
+            tokenCount={pats.length}
+            hasConnectedAgent={hasConnectedAgent}
+            showAgentStatus={!showAgentConnect || setupDismissed}
+            indexedCount={indexedCount}
+            indexingPending={indexingPending}
+            indexingAbandoned={indexingAbandoned}
+            showSetupLink={!setupComplete && setupDismissed}
+            onShowSetup={showSetup}
+          />
+
+        </aside>
+
+        <section
+          id="recent"
+          className={`order-4 scroll-mt-24 2xl:col-start-1 ${
+            continueWorking.length > 0 ? "2xl:row-start-3" : "2xl:row-start-2"
+          }`}
+          aria-busy={recentLoading}
+        >
+        <header className="flex min-h-10 flex-wrap items-center justify-between gap-3 border-b border-border pb-2.5">
+          <div className="flex min-w-0 items-center gap-2.5">
+            <TonalIcon tone="neutral" size="sm">
+              <FileClock aria-hidden />
+            </TonalIcon>
+            <h2 className="text-base font-semibold tracking-tight">Recent updates</h2>
+            {!recentLoading && !recentError && (
+              <Badge variant="default" className="tabular-nums">
+                {recent.length}{recentCapped ? "+" : ""}
+              </Badge>
+            )}
           </div>
-          <ActivitySparkline recent={recent} />
-          <dl className="divide-y divide-border">
-            <RailStat label="Vaults" value={vaults.length} />
-            <RailStat label="Tokens" value={pats.length} />
-            <RailStat
-              label="Recent"
-              value={recentCapped ? `${RECENT_LIMIT}+` : recent.length}
-            />
-          </dl>
-        </section>
+          <span className="text-xs text-foreground-muted">Latest document changes across your Vaults</span>
+        </header>
+        <span className="sr-only" role="status" aria-live="polite">
+          {recentLoading
+            ? "Loading recent activity"
+            : recentError
+              ? "Could not load recent activity"
+              : `${recent.length} recent update${recent.length === 1 ? "" : "s"}`}
+        </span>
 
-        {/* Connect — always open. Mint + snippet tabs kept; prompt examples
-            moved to docs-territory since they're one-time guidance. */}
-        <section className="rounded-[var(--radius-lg)] border glass shadow-md overflow-hidden" aria-labelledby="rail-connect">
-          <div className="flex items-baseline justify-between gap-2 px-4 py-3">
-            <h2 id="rail-connect" className="coord-ink">Connect</h2>
-            <div className="flex items-baseline gap-3">
-              {pats.length > 0 ? (
-                <span className="coord tabular-nums">{pats.length}</span>
-              ) : (
-                <Badge variant="pending">needs setup</Badge>
-              )}
-              <Link
-                to="/settings?tab=tokens"
-                className="coord hover:text-primary rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-              >
-                Manage
-              </Link>
-            </div>
-          </div>
+        {recentLoading ? (
+          <Panel className="mt-4" aria-hidden>
+            <ul className="divide-y divide-border">
+              {Array.from({ length: 4 }).map((_, i) => (
+                <li key={i} className="grid grid-cols-[36px_minmax(0,1fr)_56px] items-center gap-3 px-4 py-3.5">
+                  <span className="h-9 w-9 rounded-[var(--radius-md)] bg-surface-muted" />
+                  <span className="min-w-0 space-y-2">
+                    <span className="block h-3 w-3/5 rounded bg-surface-muted" />
+                    <span className="block h-2.5 w-4/5 rounded bg-surface-muted" />
+                  </span>
+                  <span className="h-3 w-12 justify-self-end rounded bg-surface-muted" />
+                </li>
+              ))}
+            </ul>
+          </Panel>
+        ) : recentError ? (
+          <EmptyState
+            icon={
+              <span className="feature-tile feat-neutral h-14 w-14">
+                <AlertTriangle className="h-6 w-6" aria-hidden />
+              </span>
+            }
+            title="Couldn't load recent updates"
+            description="The latest document changes are temporarily unavailable."
+            action={<Button variant="outline" size="sm" onClick={() => loadRecent()}>Retry</Button>}
+          />
+        ) : recent.length === 0 ? (
+          <EmptyState
+            icon={
+              <span className="feature-tile feat-knowledge h-14 w-14">
+                <FileClock className="h-6 w-6" aria-hidden />
+              </span>
+            }
+            title="Nothing updated yet"
+            description="Document changes across your Vaults will appear here."
+          />
+        ) : (
+          <Panel className="mt-4">
+            <ol className="divide-y divide-border stagger">
+              {recent.map((change) => {
+                const Icon = recentIcon(change.type);
+                const tone = recentTone(change.type);
+                const updateAuthor = change.updated_by_name || change.author_name;
+                const creator = updateAuthor ? null : change.created_by_name;
+                const preview = change.excerpt?.trim() || change.summary?.trim();
+                return (
+                  <li key={`${change.doc_id}:${change.changed_at ?? change.commit ?? change.path}`}>
+                    <Link
+                      to={`/vault/${change.vault}/doc/${change.doc_id}`}
+                      className="home-activity-row group grid grid-cols-[36px_minmax(0,1fr)_auto] items-start gap-3 bg-surface px-4 py-3.5 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+                    >
+                      <span
+                        className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-border"
+                        style={{
+                          color: tone,
+                          backgroundColor: `color-mix(in srgb, ${tone} 12%, transparent)`,
+                        }}
+                        aria-hidden
+                      >
+                        <Icon className="h-4 w-4" aria-hidden />
+                      </span>
 
-          <div className="border-t border-border">
-              {/* Mint */}
-              <div className="p-4 border-b border-border">
-                <div className="coord-spark mb-2">Mint token</div>
-                <form onSubmit={handleCreatePAT} className="space-y-2">
-                  <Label htmlFor="pat-name" className="sr-only">Token name</Label>
-                  <Input
-                    id="pat-name"
-                    type="text"
-                    placeholder="Token name (e.g. my-laptop)"
-                    value={newName}
-                    onChange={(e) => setNewName(e.target.value)}
-                    aria-invalid={mintError ? true : undefined}
-                    className="h-8 text-xs"
-                  />
-                  <Button
-                    type="submit"
-                    loading={creating}
-                    disabled={!newName.trim()}
-                    variant="default"
-                    size="sm"
-                    className="w-full"
-                  >
-                    {!creating && <Plus className="h-3 w-3" aria-hidden />}
-                    {creating ? "Minting…" : "Mint token"}
-                  </Button>
-                </form>
-                {mintError && (
-                  <Alert variant="destructive" className="mt-2 text-xs">{mintError}</Alert>
-                )}
-
-                {activePat && (
-                  <div
-                    className="mt-3 rounded-[var(--radius-md)] border border-accent/40 bg-accent/5 p-2"
-                    role="status"
-                    aria-live="polite"
-                  >
-                    <div className="coord-spark mb-1">New token — copy now</div>
-                    <div className="flex items-center gap-1.5">
-                      <code className="flex-1 font-mono text-[10px] text-foreground break-all leading-snug">
-                        {showPat ? activePat : activePat.slice(0, 10) + "•".repeat(14)}
-                      </code>
-                      {/* full token always reachable by SR even while masked */}
-                      {!showPat && <span className="sr-only">Token value: {activePat}</span>}
-                      <button
-                        onClick={() => setShowPat(!showPat)}
-                        aria-label={showPat ? "Hide token" : "Show token"}
-                        className="coord hover:text-primary cursor-pointer shrink-0 rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-                      >
-                        {showPat ? (
-                          <EyeOff className="h-3 w-3" aria-hidden />
-                        ) : (
-                          <Eye className="h-3 w-3" aria-hidden />
-                        )}
-                      </button>
-                      <button
-                        onClick={() => copy(activePat, "pat")}
-                        aria-label={copied === "pat" ? "Token copied" : "Copy token"}
-                        className="coord hover:text-primary cursor-pointer shrink-0 rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-                      >
-                        {copied === "pat" ? <span aria-hidden>OK</span> : <Copy className="h-3 w-3" aria-hidden />}
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* Snippet — compact tabs, one panel. */}
-              <div className="p-4 border-b border-border">
-                <div className="coord-spark mb-2">Drop snippet</div>
-                {oauthEnabled && (
-                  <div className="flex items-center gap-2 text-[10px] mb-2">
-                    <div className="inline-flex rounded-[var(--radius-sm)] border border-border overflow-hidden">
-                      <button
-                        type="button"
-                        onClick={() => setConnectMode("pat")}
-                        className={`px-2 py-0.5 ${connectMode === "pat" ? "bg-primary text-primary-foreground" : "bg-surface text-foreground-muted hover:text-foreground"}`}
-                        aria-pressed={connectMode === "pat"}
-                      >
-                        PAT
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setConnectMode("oauth")}
-                        className={`px-2 py-0.5 ${connectMode === "oauth" ? "bg-primary text-primary-foreground" : "bg-surface text-foreground-muted hover:text-foreground"}`}
-                        aria-pressed={connectMode === "oauth"}
-                      >
-                        OAuth
-                      </button>
-                    </div>
-                    <span className="text-foreground-muted">
-                      {connectMode === "oauth" ? "Browser sign-in." : "Paste a minted token."}
-                    </span>
-                  </div>
-                )}
-                <Tabs value={tab} onValueChange={(v) => setTab(v as Tab)}>
-                  <TabsList className="flex-wrap gap-0 mb-2">
-                    <TabsTrigger value="claude" className="px-2 py-1 text-[10px]">Claude Code</TabsTrigger>
-                    <TabsTrigger value="cursor" className="px-2 py-1 text-[10px]">Cursor</TabsTrigger>
-                    <TabsTrigger value="codex" className="px-2 py-1 text-[10px]">Codex</TabsTrigger>
-                    <TabsTrigger value="vscode" className="px-2 py-1 text-[10px]">VS Code</TabsTrigger>
-                    <TabsTrigger value="openclaw" className="px-2 py-1 text-[10px]">OpenClaw</TabsTrigger>
-                  </TabsList>
-                  <TabsContent value={tab}>
-                    {connectMode === "oauth" ? (
-                      oauthSnippetsMap[tab] !== undefined ? (
-                        <CodeSnippet
-                          code={oauthSnippetsMap[tab] as string}
-                          filename={MCP_AGENT_FILES[tab]}
-                        />
-                      ) : (
-                        <div className="rounded-[var(--radius-md)] border border-border px-3 py-2 text-[10px] text-foreground-muted">
-                          stdio path — switch to PAT for this client.
-                        </div>
-                      )
-                    ) : (
-                      <CodeSnippet code={snippets[tab]} filename={MCP_AGENT_FILES[tab]} />
-                    )}
-                  </TabsContent>
-                </Tabs>
-              </div>
-
-              {/* Active tokens — one-line rows; manage link sits in the
-                  Connect section header to keep related actions together. */}
-              <div className="p-4">
-                <div className="coord-spark mb-2">Active tokens</div>
-                {pats.length === 0 ? (
-                  <div className="coord">— none —</div>
-                ) : (
-                  <ul className="divide-y divide-border rounded-[var(--radius-md)] border border-border overflow-hidden">
-                    {pats.slice(0, 4).map((p) => (
-                      <li
-                        key={p.token_id}
-                        className="flex items-center justify-between gap-2 px-2 py-1.5 text-xs"
-                      >
-                        <span title={p.name} className="truncate text-foreground font-medium">{p.name}</span>
-                        <div className="flex items-center gap-2 shrink-0">
-                          <span className="coord tabular-nums">
-                            {p.last_used_at ? timeAgo(p.last_used_at) : "—"}
+                      <span className="min-w-0">
+                        {updateAuthor && (
+                          <span className="mb-1 block truncate text-xs text-foreground-muted">
+                            <span className="font-medium text-foreground">{updateAuthor}</span>{" "}
+                            {recentActionLabel(change.action)}
                           </span>
-                          <button
-                            onClick={() => setPendingRevoke(p)}
-                            aria-label={`Revoke token ${p.name}`}
-                            className="text-foreground-muted hover:text-destructive transition-colors cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-                          >
-                            <Trash2 className="h-3 w-3" aria-hidden />
-                          </button>
-                        </div>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-                {pats.length > 4 && (
-                  <Link
-                    to="/settings?tab=tokens"
-                    className="coord mt-2 inline-flex items-center gap-1 hover:text-primary rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-                  >
-                    +{pats.length - 4} more
-                    <ArrowRight className="h-3 w-3" aria-hidden />
-                  </Link>
-                )}
-              </div>
-          </div>
-        </section>
-      </aside>
-      </div>
+                        )}
+                        <span
+                          className="block truncate text-sm font-semibold tracking-tight text-foreground transition-colors group-hover:text-link"
+                          title={change.title}
+                        >
+                          {change.title}
+                        </span>
+                        <span className="mt-1 flex min-w-0 items-center gap-1.5 text-xs text-foreground-muted">
+                          <TooltipText className="max-w-32 shrink-0 truncate font-medium text-link">
+                            {change.vault}
+                          </TooltipText>
+                          <ChevronRight className="h-3 w-3 shrink-0 text-subtle" aria-hidden />
+                          <span className="min-w-0 truncate" title={change.path}>{change.path}</span>
+                          {change.commit && (
+                            <code className="coord ml-1 hidden shrink-0 rounded-[var(--radius-sm)] border border-border bg-surface-muted px-1.5 py-0.5 font-mono sm:inline">
+                              {change.commit.slice(0, 7)}
+                            </code>
+                          )}
+                        </span>
+                        {creator && (
+                          <span className="mt-1 block truncate text-xs text-foreground-muted">
+                            Created by <span className="font-medium text-foreground">{creator}</span>
+                          </span>
+                        )}
+                        {preview && (
+                          <span className="mt-2 line-clamp-2 block max-w-4xl text-xs leading-relaxed text-foreground-muted">
+                            {preview}
+                          </span>
+                        )}
+                      </span>
 
-      <ConfirmDialog
-        open={pendingRevoke !== null}
-        onOpenChange={(o) => !o && setPendingRevoke(null)}
-        title={pendingRevoke ? `Revoke "${pendingRevoke.name}"?` : ""}
-        description={
-          "Any agent currently using this token will lose access immediately.\nThis cannot be undone."
-        }
-        confirmLabel="Revoke token"
-        variant="destructive"
-        onConfirm={async () => {
-          if (!pendingRevoke) return;
-          await revokePAT(pendingRevoke.token_id);
-          await loadPATs();
-        }}
-      />
+                      <span className="flex min-w-14 shrink-0 flex-col items-end gap-1.5">
+                        <RelativeTime iso={change.changed_at} className="justify-end text-right" />
+                        <ArrowUpRight
+                          className="h-3.5 w-3.5 text-subtle transition-token group-hover:text-link"
+                          aria-hidden
+                        />
+                      </span>
+                    </Link>
+                  </li>
+                );
+              })}
+            </ol>
+            {canLoadMore && (
+              <div className="border-t border-border p-2">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={loadMoreRecent}
+                  loading={recentLoadingMore}
+                  aria-label="Show more recent updates"
+                  className="w-full"
+                >
+                  {recentLoadingMore ? "Loading…" : "Show more"}
+                </Button>
+              </div>
+            )}
+          </Panel>
+        )}
+        </section>
+      </div>
 
       <QuickstartDialog
         open={quickstartOpen}
@@ -726,173 +692,637 @@ export default function HomePage() {
   );
 }
 
-/**
- * Primary "write something" action. Creating a vault is rare/structural;
- * writing a document is the daily job, so this is the marquee accent CTA.
- * One vault → straight to its new-doc form; several → a small vault picker.
- */
-function NewDocAction({ vaults }: { vaults: VaultRow[] }) {
-  const [filter, setFilter] = useState("");
-  if (vaults.length === 1) {
-    return (
-      <Button asChild variant="accent" size="md">
-        <Link to={`/vault/${vaults[0].name}/doc/new`}>
-          <FilePlus className="h-4 w-4" aria-hidden />
-          New document
-        </Link>
-      </Button>
-    );
-  }
-  const showFilter = vaults.length > MENU_FILTER_THRESHOLD;
-  const filtered = filterByText(vaults, filter, (v) => v.name);
+function collectionFromPath(path: string): string {
+  const parts = path.split("/").filter(Boolean);
+  return parts.length > 1 ? parts.slice(0, -1).join(" / ") : "Vault root";
+}
+
+function ContinueWorkingSection({ items }: { items: RecentDocumentView[] }) {
   return (
-    <DropdownMenu.Root onOpenChange={(open) => !open && setFilter("")}>
-      <DropdownMenu.Trigger asChild>
-        <Button variant="accent" size="md">
-          <FilePlus className="h-4 w-4" aria-hidden />
-          New document
-          <ChevronDown className="h-4 w-4 opacity-80" aria-hidden />
-        </Button>
-      </DropdownMenu.Trigger>
-      <DropdownMenu.Portal>
-        <DropdownMenu.Content
-          align="end"
-          sideOffset={6}
-          className="z-[var(--z-popover)] max-h-[60vh] overflow-y-auto min-w-[220px] rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
-        >
-          {showFilter ? (
-            <div className="sticky -top-1 z-10 -mx-1 -mt-1 mb-0.5 border-b border-border bg-surface px-1 pt-1">
-              <MenuFilter value={filter} onChange={setFilter} placeholder="Filter vaults" />
-            </div>
-          ) : (
-            <div className="px-3 py-1.5 coord">Choose a vault</div>
-          )}
-          {filtered.length === 0 ? (
-            <div className="px-3 py-2 text-xs text-foreground-muted">No matches</div>
-          ) : (
-            filtered.map((v) => (
-              <DropdownMenu.Item key={v.id} asChild>
-                <Link
-                  to={`/vault/${v.name}/doc/new`}
-                  className="flex cursor-pointer items-center gap-2 px-3 py-2 text-sm text-foreground outline-none rounded-[var(--radius-sm)] data-[highlighted]:bg-surface-hover"
-                >
-                  <FileText className="h-4 w-4 text-foreground-muted" aria-hidden />
-                  <TooltipText className="truncate">{v.name}</TooltipText>
-                </Link>
-              </DropdownMenu.Item>
-            ))
-          )}
-        </DropdownMenu.Content>
-      </DropdownMenu.Portal>
-    </DropdownMenu.Root>
+    <section aria-labelledby="continue-working-heading">
+      <header className="flex min-h-10 flex-wrap items-center justify-between gap-3 border-b border-border pb-2.5">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <TonalIcon tone="knowledge" size="sm">
+            <Clock3 aria-hidden />
+          </TonalIcon>
+          <h2 id="continue-working-heading" className="text-base font-semibold tracking-tight">
+            Continue working
+          </h2>
+          <Badge variant="default" className="tabular-nums">{items.length}</Badge>
+        </div>
+        <span className="text-xs text-foreground-muted">Recent on this browser</span>
+      </header>
+
+      <ul className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+        {items.map((item) => (
+          <li key={`${item.vault}:${item.path}`} className="min-w-0">
+            <Panel className="h-full">
+              <Link
+                to={`/vault/${encodeURIComponent(item.vault)}/doc/${encodeURIComponent(item.path)}`}
+                className="group grid min-h-20 grid-cols-[1.75rem_minmax(0,1fr)] items-center gap-2.5 px-3 py-3 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+              >
+                <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-[var(--radius-sm)] border border-border bg-surface-2 text-link" aria-hidden>
+                  <FileClock className="h-3.5 w-3.5" aria-hidden />
+                </span>
+                <span className="min-w-0">
+                  <span className="flex min-w-0 items-center gap-2">
+                    <span className="min-w-0 flex-1 truncate text-sm font-semibold tracking-tight text-foreground transition-colors group-hover:text-link">
+                      {item.title}
+                    </span>
+                    <ArrowUpRight className="h-3.5 w-3.5 shrink-0 text-subtle transition-token group-hover:text-link" aria-hidden />
+                  </span>
+                  <span className="mt-1 flex min-w-0 items-center gap-1.5 text-xs text-foreground-muted">
+                    <TooltipText className="max-w-24 shrink-0 truncate font-medium text-link">
+                      {item.vault}
+                    </TooltipText>
+                    <ChevronRight className="h-3 w-3 shrink-0 text-subtle" aria-hidden />
+                    <span className="min-w-0 flex-1 truncate" title={collectionFromPath(item.path)}>
+                      {collectionFromPath(item.path)}
+                    </span>
+                    <span aria-hidden>·</span>
+                    <span className="sr-only">Viewed </span>
+                    <RelativeTime iso={item.viewedAt} className="shrink-0" />
+                  </span>
+                </span>
+              </Link>
+            </Panel>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 
-function RailStat({
+function recentActionLabel(action?: string): string {
+  if (action === "create" || action === "created") return "created this document";
+  if (action === "move" || action === "moved") return "moved this document";
+  return "updated this document";
+}
+
+function HomeWorkspaceHeader({
+  vaultCount,
+  loading,
+  indexedCount,
+  indexingPending,
+  indexingAbandoned,
+}: {
+  vaultCount: number;
+  loading: boolean;
+  indexedCount: number | null;
+  indexingPending: number;
+  indexingAbandoned: number;
+}) {
+  const indexLabel = indexingAbandoned > 0
+    ? `${indexingAbandoned.toLocaleString()} need attention`
+    : indexingPending > 0
+      ? `${indexingPending.toLocaleString()} indexing`
+      : indexedCount !== null
+        ? `${indexedCount.toLocaleString()} indexed`
+        : null;
+  const indexTone = indexingAbandoned > 0
+    ? "bg-warning"
+    : indexingPending > 0
+      ? "bg-info"
+      : "bg-success";
+
+  return (
+    <header
+      className="border-b border-border pb-5 pt-2"
+      aria-labelledby="home-workspace-heading"
+    >
+      <div className="flex flex-col gap-5 sm:flex-row sm:items-end sm:justify-between">
+        <div className="min-w-0">
+          <h1
+            id="home-workspace-heading"
+            className="text-2xl font-semibold tracking-tight text-foreground sm:text-3xl"
+          >
+            Your <span className="brand-gradient">workspace</span>
+          </h1>
+          <p className="mt-1.5 max-w-2xl text-sm leading-relaxed text-foreground-muted">
+            Open a Vault, catch up on recent changes, or complete the remaining setup.
+          </p>
+        </div>
+
+        <dl
+          className="flex min-h-10 flex-wrap items-end gap-x-4 gap-y-2 text-sm sm:justify-end"
+          role="status"
+          aria-live="polite"
+        >
+          <div className="min-w-20">
+            <dt className="text-xs text-foreground-muted">Vault access</dt>
+            <dd className="mt-0.5 font-semibold tabular-nums text-foreground">
+              {loading ? "Loading…" : `${vaultCount.toLocaleString()} available`}
+            </dd>
+          </div>
+          {indexLabel && (
+            <div className="min-w-28 border-l border-border pl-4">
+              <dt className="text-xs text-foreground-muted">Knowledge index</dt>
+              <dd className="mt-0.5 flex items-center gap-2 font-semibold tabular-nums text-foreground">
+                <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${indexTone}`} aria-hidden />
+                {indexLabel}
+              </dd>
+            </div>
+          )}
+        </dl>
+      </div>
+    </header>
+  );
+}
+
+function HomeAgentConnectPanel({
+  completed,
+  tokenReady,
+  tokenCount,
+  workspaceReady,
+  onConnect,
+  onDismiss,
+}: {
+  completed: number;
+  tokenReady: boolean;
+  tokenCount: number;
+  workspaceReady: boolean;
+  onConnect: () => void;
+  onDismiss: () => void;
+}) {
+  return (
+    <Panel variant="workspace" aria-labelledby="home-agent-connect-heading">
+      <div className="flex items-start justify-between gap-3 border-b border-border bg-surface-2/60 px-4 py-3">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <TonalIcon tone="info" size="sm">
+            <PlugZap aria-hidden />
+          </TonalIcon>
+          <div className="min-w-0">
+            <h2 id="home-agent-connect-heading" className="text-sm font-semibold text-foreground">
+              Connect an agent
+            </h2>
+            <p className="mt-0.5 text-xs text-foreground-muted">
+              {completed} of 3 complete
+            </p>
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-1">
+          <Badge variant="pending">needs setup</Badge>
+          <button
+            type="button"
+            onClick={onDismiss}
+            className="min-h-8 cursor-pointer rounded-[var(--radius-sm)] px-2 text-xs text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+          >
+            Hide
+          </button>
+        </div>
+      </div>
+
+      <div className="p-4">
+        <p className="text-sm leading-relaxed text-foreground">
+          {tokenReady
+            ? `${tokenCount.toLocaleString()} access token${tokenCount === 1 ? " is" : "s are"} ready. Add AKB to an agent and use it once to complete setup.`
+            : "Create access, choose your coding agent, and copy a ready-to-use connection command."}
+        </p>
+        <p className="mt-1.5 text-xs leading-relaxed text-foreground-muted">
+          {workspaceReady
+            ? "Your Vaults and knowledge are ready. The connection becomes active after the agent reaches AKB once."
+            : "You can connect now and add Vaults or knowledge alongside the rest of setup."}
+        </p>
+        <div className="mt-4 flex flex-wrap items-center gap-3">
+          {tokenReady ? (
+            <Button asChild variant="accent" size="sm">
+              <Link to="/settings?tab=tokens">
+                Finish connection
+                <ArrowRight className="h-3.5 w-3.5" aria-hidden />
+              </Link>
+            </Button>
+          ) : (
+            <Button variant="accent" size="sm" onClick={onConnect}>
+              <PlugZap className="h-3.5 w-3.5" aria-hidden />
+              Connect agent
+            </Button>
+          )}
+          <Link
+            to="/settings?tab=tokens"
+            className="inline-flex min-h-9 items-center rounded-[var(--radius-sm)] text-xs text-link transition-token hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+          >
+            Manage connections
+          </Link>
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+function HomeSetupPanel({
+  loading,
+  completed,
+  hasVault,
+  hasKnowledge,
+  hasConnectedAgent,
+  tokenReady,
+  writableVault,
+  onConnect,
+  onDismiss,
+}: {
+  loading: boolean;
+  completed: number;
+  hasVault: boolean;
+  hasKnowledge: boolean;
+  hasConnectedAgent: boolean;
+  tokenReady: boolean;
+  writableVault?: VaultRow;
+  onConnect: () => void;
+  onDismiss: () => void;
+}) {
+  const nextStep = !hasVault ? "vault" : !hasKnowledge ? "knowledge" : "agent";
+
+  return (
+    <Panel variant="workspace" aria-labelledby="home-setup-heading" aria-busy={loading}>
+      <div className="border-b border-border bg-surface-2/60 px-4 py-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-2.5">
+            <TonalIcon tone="info" size="sm">
+              <PlugZap aria-hidden />
+            </TonalIcon>
+            <div>
+              <h2 id="home-setup-heading" className="text-sm font-semibold text-foreground">
+                Finish setup
+              </h2>
+              <p className="mt-0.5 text-xs text-foreground-muted">
+                {loading ? "Checking workspace…" : `${completed} of 3 complete`}
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onDismiss}
+            className="min-h-8 shrink-0 cursor-pointer rounded-[var(--radius-sm)] px-2 text-xs text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+          >
+            Hide
+          </button>
+        </div>
+        <div
+          className="mt-3 h-1.5 overflow-hidden rounded-full bg-surface"
+          role="progressbar"
+          aria-label="Workspace setup progress"
+          aria-valuemin={0}
+          aria-valuemax={3}
+          aria-valuenow={loading ? undefined : completed}
+        >
+          <span
+            className="block h-full rounded-full bg-primary transition-token"
+            style={{ width: `${loading ? 0 : (completed / 3) * 100}%` }}
+          />
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="space-y-3 p-4" aria-hidden>
+          {Array.from({ length: 3 }).map((_, index) => (
+            <div key={index} className="flex items-center gap-3">
+              <span className="h-7 w-7 rounded-[var(--radius-sm)] bg-surface-muted" />
+              <span className="h-3 flex-1 rounded bg-surface-muted" />
+            </div>
+          ))}
+        </div>
+      ) : (
+        <ol className="divide-y divide-border">
+          <SetupRow
+            title="Open a vault"
+            description="Choose a knowledge space to work in."
+            complete={hasVault}
+            current={nextStep === "vault"}
+            action={
+              nextStep === "vault" ? (
+                <Button asChild variant="accent" size="sm">
+                  <Link to="/vault">Open Vaults</Link>
+                </Button>
+              ) : undefined
+            }
+          />
+          <SetupRow
+            title="Add knowledge"
+            description="Add a document, table, file, or bundle."
+            complete={hasKnowledge}
+            current={nextStep === "knowledge"}
+            action={
+              nextStep === "knowledge" ? (
+                <Button asChild variant="accent" size="sm">
+                  <Link to={writableVault ? `/vault/${writableVault.name}` : "/vault"}>
+                    {writableVault ? "Add knowledge" : "Open Vaults"}
+                  </Link>
+                </Button>
+              ) : undefined
+            }
+          />
+          <SetupRow
+            title="Connect an agent"
+            description={
+              tokenReady
+                ? "Your token is ready; use it from an agent once."
+                : "Create access and add AKB to your coding agent."
+            }
+            complete={hasConnectedAgent}
+            current={nextStep === "agent"}
+            action={
+              nextStep === "agent" ? (
+                tokenReady ? (
+                  <Button asChild variant="accent" size="sm">
+                    <Link to="/settings?tab=tokens">Finish connection</Link>
+                  </Button>
+                ) : (
+                  <Button variant="accent" size="sm" onClick={onConnect}>
+                    Connect agent
+                  </Button>
+                )
+              ) : undefined
+            }
+          />
+        </ol>
+      )}
+    </Panel>
+  );
+}
+
+function SetupRow({
+  title,
+  description,
+  complete,
+  current,
+  action,
+}: {
+  title: string;
+  description: string;
+  complete: boolean;
+  current: boolean;
+  action?: ReactNode;
+}) {
+  return (
+    <li
+      className="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-3 px-4 py-3"
+      aria-current={current ? "step" : undefined}
+    >
+      <TonalIcon tone={complete ? "success" : current ? "info" : "neutral"} size="sm">
+        {complete ? <Check aria-hidden /> : <Circle aria-hidden />}
+      </TonalIcon>
+      <div className="min-w-0">
+        <div className="flex min-h-7 flex-wrap items-center justify-between gap-2">
+          <span className="text-sm font-medium text-foreground">{title}</span>
+          {complete && <Badge variant="success">Complete</Badge>}
+        </div>
+        <p className="mt-0.5 text-xs leading-relaxed text-foreground-muted">{description}</p>
+        {action && <div className="mt-3">{action}</div>}
+      </div>
+    </li>
+  );
+}
+
+function WorkspaceSummary({
+  loading,
+  vaultCount,
+  ownedCount,
+  editableCount,
+  readOnlyCount,
+  favoriteCount,
+  archivedCount,
+  tokenCount,
+  hasConnectedAgent,
+  showAgentStatus,
+  indexedCount,
+  indexingPending,
+  indexingAbandoned,
+  showSetupLink,
+  onShowSetup,
+}: {
+  loading: boolean;
+  vaultCount: number;
+  ownedCount: number;
+  editableCount: number;
+  readOnlyCount: number;
+  favoriteCount: number;
+  archivedCount: number;
+  tokenCount: number;
+  hasConnectedAgent: boolean;
+  showAgentStatus: boolean;
+  indexedCount: number | null;
+  indexingPending: number;
+  indexingAbandoned: number;
+  showSetupLink: boolean;
+  onShowSetup: () => void;
+}) {
+  const value = (count: number) => loading ? "—" : count.toLocaleString();
+  const indexText = indexingAbandoned > 0
+    ? `${indexingAbandoned.toLocaleString()} items need attention`
+    : indexingPending > 0
+      ? `${indexingPending.toLocaleString()} items are indexing`
+      : indexedCount !== null
+        ? `${indexedCount.toLocaleString()} chunks indexed`
+        : "Index status unavailable";
+  const agentText = hasConnectedAgent
+    ? "Agent connection active"
+    : tokenCount > 0
+      ? `${tokenCount.toLocaleString()} token${tokenCount === 1 ? "" : "s"} ready`
+      : "No agent connection yet";
+
+  return (
+    <Panel variant="workspace" aria-labelledby="workspace-summary-heading" aria-busy={loading}>
+      <div className="flex items-center justify-between gap-3 border-b border-border bg-surface-2/60 px-4 py-3">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <TonalIcon tone="data" size="sm">
+            <Database aria-hidden />
+          </TonalIcon>
+          <div>
+            <h2 id="workspace-summary-heading" className="text-sm font-semibold text-foreground">
+              Workspace
+            </h2>
+            <p className="mt-0.5 text-xs text-foreground-muted">Access and connection status</p>
+          </div>
+        </div>
+        <Badge variant="default" className="tabular-nums">{value(vaultCount)} total</Badge>
+      </div>
+
+      <dl className="grid grid-cols-3 divide-x divide-border border-b border-border">
+        <CompactStat label="Owned" value={value(ownedCount)} />
+        <CompactStat label="Shared edit" value={value(editableCount)} />
+        <CompactStat label="Read only" value={value(readOnlyCount)} />
+      </dl>
+
+      <div className="divide-y divide-border">
+        <StatusLine
+          icon={<Database aria-hidden />}
+          tone={indexingAbandoned > 0 ? "warning" : indexingPending > 0 ? "info" : "success"}
+          label="Knowledge index"
+          value={indexText}
+        />
+        {showAgentStatus && (
+          <StatusLine
+            icon={<PlugZap aria-hidden />}
+            tone={hasConnectedAgent ? "success" : tokenCount > 0 ? "info" : "neutral"}
+            label="Agent access"
+            value={agentText}
+          />
+        )}
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-4 py-2.5 text-xs">
+        <span className="text-foreground-muted">
+          {favoriteCount.toLocaleString()} favorites
+          {archivedCount > 0 ? ` · ${archivedCount.toLocaleString()} archived` : ""}
+        </span>
+        <div className="flex items-center gap-3">
+          {showSetupLink && (
+            <button
+              type="button"
+              onClick={onShowSetup}
+              className="cursor-pointer rounded-[var(--radius-sm)] text-link transition-token hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+            >
+              Show setup
+            </button>
+          )}
+          <Link
+            to="/vault"
+            className="rounded-[var(--radius-sm)] text-link transition-token hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+          >
+            Open Vaults
+          </Link>
+          <Link
+            to="/settings?tab=tokens"
+            className="rounded-[var(--radius-sm)] text-link transition-token hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+          >
+            Connections
+          </Link>
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+function CompactStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 px-3 py-3 text-center">
+      <dt className="truncate text-xs text-foreground-muted" title={label}>{label}</dt>
+      <dd className="mt-1 text-base font-semibold tabular-nums text-foreground">{value}</dd>
+    </div>
+  );
+}
+
+function StatusLine({
+  icon,
+  tone,
   label,
   value,
-  to,
 }: {
+  icon: ReactNode;
+  tone: "neutral" | "info" | "success" | "warning";
   label: string;
-  value: number | string;
-  to?: string;
+  value: string;
 }) {
-  const display = String(value);
-  const body = (
-    <>
-      <dt className="coord group-hover:text-primary transition-colors">{label}</dt>
-      <dd className="text-xl font-normal tabular-nums text-foreground group-hover:text-primary transition-colors">
-        {display}
-      </dd>
-    </>
-  );
-  if (to) {
-    return (
-      <Link
-        to={to}
-        className="group flex items-baseline justify-between px-4 py-3 hover:bg-surface-muted transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-      >
-        {body}
-      </Link>
-    );
-  }
   return (
-    <div className="flex items-baseline justify-between px-4 py-3">{body}</div>
+    <div className="flex items-center gap-3 px-4 py-3">
+      <TonalIcon tone={tone} size="sm">{icon}</TonalIcon>
+      <div className="min-w-0">
+        <div className="text-xs font-medium text-foreground">{label}</div>
+        <div className="mt-0.5 truncate text-xs text-foreground-muted" title={value}>{value}</div>
+      </div>
+    </div>
   );
 }
 
-// How many calendar days the rail sparkline spans.
-const SPARK_DAYS = 14;
-
-/**
- * The single rail data-viz: thin day-bucketed bars of recent write activity
- * (teal, with the most recent active day tipped in accent). Built entirely
- * from the recent[] already in state — no extra fetch. Suppressed when the
- * signal is too sparse to read as a shape, so the rail never carries a row of
- * dead zero-height bars on a quiet account. Purely decorative: the bars are
- * aria-hidden with an sr-only summary.
- */
-function ActivitySparkline({ recent }: { recent: RecentRow[] }) {
-  const { bars, total, activeDays } = useMemo(() => {
-    const counts = new Array(SPARK_DAYS).fill(0);
-    const now = new Date();
-    const startOfToday = new Date(
-      now.getFullYear(),
-      now.getMonth(),
-      now.getDate(),
-    ).getTime();
-    const dayMs = 86_400_000;
-    const seen = new Set<number>();
-    let n = 0;
-    for (const c of recent) {
-      if (!c.changed_at) continue;
-      const t = new Date(c.changed_at).getTime();
-      if (Number.isNaN(t)) continue;
-      const idx = SPARK_DAYS - 1 - Math.floor((startOfToday - t) / dayMs);
-      if (idx < 0 || idx >= SPARK_DAYS) continue;
-      counts[idx] += 1;
-      seen.add(idx);
-      n += 1;
-    }
-    return { bars: counts, total: n, activeDays: seen.size };
-  }, [recent]);
-
-  // Need at least a few changes across more than one day to read as a trend.
-  if (total < 3 || activeDays < 2) return null;
-
-  const max = Math.max(...bars);
-  let tip = -1;
-  for (let i = bars.length - 1; i >= 0; i--) {
-    if (bars[i] > 0) {
-      tip = i;
-      break;
-    }
-  }
+function HomeVaultCard({
+  vault,
+  metrics,
+  favorite,
+  onToggleFavorite,
+}: {
+  vault: VaultRow;
+  metrics?: VaultMetrics;
+  favorite: boolean;
+  onToggleFavorite: () => void;
+}) {
+  const contentMetrics = metrics
+    ? [
+        { label: "Documents", shortLabel: "Docs", type: "document", value: metrics.document_count ?? 0 },
+        { label: "Tables", shortLabel: "Tables", type: "table", value: metrics.table_count ?? 0 },
+        { label: "Files", shortLabel: "Files", type: "file", value: metrics.file_count ?? 0 },
+      ]
+    : null;
 
   return (
-    <div className="border-b border-border px-4 pt-3 pb-2.5">
-      <div className="flex h-8 items-end gap-[3px]" aria-hidden>
-        {bars.map((n, i) => (
-          <span key={i} className="flex h-full flex-1 items-end">
-            <span
-              className="w-full rounded-t-[2px]"
-              style={{
-                height: n === 0 ? "2px" : `${Math.max(12, Math.round((n / max) * 100))}%`,
-                opacity: n === 0 ? 0.55 : 1,
-                backgroundColor:
-                  n === 0
-                    ? "var(--color-border)"
-                    : i === tip
-                      ? "var(--color-accent)"
-                      : "var(--color-primary)",
-              }}
-            />
-          </span>
-        ))}
-      </div>
-      <span className="sr-only">
-        {total} recent change{total === 1 ? "" : "s"} across the last {SPARK_DAYS} days
-      </span>
-    </div>
+    <Panel inset={false} className="home-vault-card card-hover relative h-full overflow-hidden">
+      <Link
+        to={`/vault/${vault.name}`}
+        className="group flex h-full min-h-32 flex-col p-3 pr-11 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+      >
+        <div className="flex min-w-0 items-center gap-2">
+          <h3
+            className="min-w-0 truncate text-sm font-semibold tracking-tight text-foreground transition-colors group-hover:text-link"
+            title={vault.name}
+          >
+            {vault.name}
+          </h3>
+          {vault.status === "archived" && <Badge variant="archived">archived</Badge>}
+        </div>
+
+        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+          {vault.role && <RoleBadge role={vault.role} />}
+          <RelativeTime iso={metrics?.last_activity} fallback="No activity" />
+        </div>
+
+        <p className="mt-2 line-clamp-1 text-xs leading-relaxed text-foreground-muted">
+          {vault.description || "A shared knowledge space for your team and connected agents."}
+        </p>
+
+        <dl className="mt-auto flex items-center gap-3 border-t border-border pt-2">
+          {contentMetrics ? (
+            contentMetrics.map((metric) => {
+              const Icon = recentIcon(metric.type);
+              const tone = recentTone(metric.type);
+              return (
+                <div
+                  key={metric.label}
+                  className="flex min-w-0 items-center gap-1"
+                  title={`${metric.label}: ${metric.value.toLocaleString()}`}
+                >
+                  <dt className="sr-only">{metric.shortLabel}</dt>
+                  <span
+                    className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-[var(--radius-sm)]"
+                    style={{
+                      color: tone,
+                      backgroundColor: `color-mix(in srgb, ${tone} 12%, transparent)`,
+                    }}
+                    aria-hidden
+                  >
+                    <Icon className="h-2.5 w-2.5" aria-hidden />
+                  </span>
+                  <dd className="text-xs font-semibold tabular-nums text-foreground">
+                    {metric.value.toLocaleString()}
+                  </dd>
+                </div>
+              );
+            })
+          ) : (
+            Array.from({ length: 3 }).map((_, index) => (
+              <div
+                key={index}
+                className="flex items-center gap-1"
+                aria-hidden
+              >
+                <span className="block h-4 w-4 animate-pulse rounded bg-surface-muted" />
+                <span className="block h-3 w-6 animate-pulse rounded bg-surface-muted" />
+              </div>
+            ))
+          )}
+        </dl>
+      </Link>
+      <button
+        type="button"
+        onClick={onToggleFavorite}
+        aria-pressed={favorite}
+        aria-label={favorite ? `Remove ${vault.name} from favorites` : `Add ${vault.name} to favorites`}
+        className={`absolute right-2 top-2 grid h-9 w-9 place-items-center rounded-[var(--radius-sm)] transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface ${
+          favorite
+            ? "bg-surface-selected text-surface-selected-foreground"
+            : "text-foreground-muted hover:bg-surface-hover hover:text-foreground"
+        }`}
+      >
+        <Star className={`h-3.5 w-3.5 ${favorite ? "fill-current" : ""}`} aria-hidden />
+      </button>
+    </Panel>
   );
 }

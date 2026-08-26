@@ -1,8 +1,8 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
-import DocumentNewPage from "../document-new";
+import { MemoryRouter } from "react-router-dom";
+import { DocumentCreateDialog } from "@/components/document-create-dialog";
 
 const putDocument = vi.fn();
 
@@ -20,22 +20,47 @@ vi.mock("@/contexts/vault-refresh-context", () => ({
 }));
 
 vi.mock("@/components/markdown-editor", () => ({
-  default: ({ onChange }: { onChange: (body: string, ids: string[]) => void }) => (
-    <textarea
-      aria-label="Document body"
-      onChange={(event) => onChange(event.target.value, [])}
-    />
+  default: ({
+    onChange,
+    onUploadingChange,
+  }: {
+    onChange: (body: string, ids: string[]) => void;
+    onUploadingChange?: (uploading: boolean) => void;
+  }) => (
+    <>
+      <textarea
+        aria-label="Document body"
+        onChange={(event) => onChange(event.target.value, [])}
+      />
+      <input
+        aria-label="Local image"
+        type="file"
+        accept="image/*"
+        onChange={(event) => {
+          if (!event.currentTarget.files?.length) return;
+          onUploadingChange?.(true);
+          onChange("![Local image](/api/assets/pending)", []);
+        }}
+      />
+    </>
   ),
 }));
 
-function renderPage() {
-  return render(
-    <MemoryRouter initialEntries={["/vault/my-v/doc/new?collection=overview"]}>
-      <Routes>
-        <Route path="/vault/:name/doc/new" element={<DocumentNewPage />} />
-      </Routes>
+function renderPage(initialCollection = "overview") {
+  const onOpenChange = vi.fn();
+  const onCreated = vi.fn();
+  const result = render(
+    <MemoryRouter>
+      <DocumentCreateDialog
+        open
+        vault="my-v"
+        initialCollection={initialCollection}
+        onOpenChange={onOpenChange}
+        onCreated={onCreated}
+      />
     </MemoryRouter>,
   );
+  return { ...result, onOpenChange, onCreated };
 }
 
 afterEach(() => {
@@ -43,7 +68,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe("DocumentNewPage reserved collection feedback", () => {
+describe("DocumentCreateDialog reserved collection feedback", () => {
   it("rejects overview before submit and enables create after a valid replacement", async () => {
     const user = userEvent.setup();
     renderPage();
@@ -64,5 +89,88 @@ describe("DocumentNewPage reserved collection feedback", () => {
     expect(screen.getByText(/new collection/i)).toBeInTheDocument();
     expect(collection).not.toHaveAttribute("aria-invalid");
     expect(create).toBeEnabled();
+  });
+
+  it("guards a dirty draft before closing", async () => {
+    const user = userEvent.setup();
+    const { onOpenChange } = renderPage("notes");
+
+    await user.type(screen.getByLabelText(/^title/i), "Unfinished note");
+    await user.click(screen.getByRole("button", { name: /close document composer/i }));
+
+    expect(screen.getByRole("dialog", { name: /discard this draft/i })).toBeInTheDocument();
+    expect(onOpenChange).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: /discard draft/i }));
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("does not dismiss the authoring workbench from a background interaction", () => {
+    const { onOpenChange } = renderPage("notes");
+
+    fireEvent.pointerDown(document.body);
+
+    expect(screen.getByRole("dialog", { name: /new document/i })).toBeInTheDocument();
+    expect(onOpenChange).not.toHaveBeenCalled();
+  });
+
+  it("stays open when focus returns from a native image picker", () => {
+    const { onOpenChange } = renderPage("notes");
+    const dialog = screen.getByRole("dialog", { name: /new document/i });
+    const picker = screen.getByLabelText(/local image/i);
+
+    fireEvent.focusOut(dialog, { relatedTarget: document.body });
+    fireEvent.change(picker, {
+      target: { files: [new File(["image"], "diagram.png", { type: "image/png" })] },
+    });
+    fireEvent.pointerDown(document.body);
+
+    expect(screen.getByRole("dialog", { name: /new document/i })).toBeInTheDocument();
+    expect(onOpenChange).not.toHaveBeenCalledWith(false);
+  });
+
+  it("still closes a clean workbench through Escape", async () => {
+    const user = userEvent.setup();
+    const { onOpenChange } = renderPage("notes");
+
+    await user.keyboard("{Escape}");
+
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("keeps document properties available through the details inspector", async () => {
+    const user = userEvent.setup();
+    renderPage("notes");
+
+    const toggle = screen.getByRole("button", { name: /show document details/i });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+    await user.click(toggle);
+
+    expect(screen.getByRole("complementary", { name: /document details/i })).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /hide document details/i })).toHaveLength(2);
+  });
+
+  it("creates through the existing API contract and returns the document path", async () => {
+    const user = userEvent.setup();
+    putDocument.mockResolvedValueOnce({ path: "notes/a-note.md" });
+    const { onCreated } = renderPage("notes");
+
+    await user.type(screen.getByLabelText(/^title/i), "A note");
+    await user.type(screen.getByLabelText(/document body/i), "Knowledge worth keeping");
+    await user.click(screen.getByRole("button", { name: /create document/i }));
+
+    await waitFor(() => {
+      expect(putDocument).toHaveBeenCalledWith(
+        expect.objectContaining({
+          vault: "my-v",
+          collection: "notes",
+          title: "A note",
+          content: "Knowledge worth keeping",
+          type: "note",
+        }),
+      );
+      expect(onCreated).toHaveBeenCalledWith("notes/a-note.md");
+    });
   });
 });

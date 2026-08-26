@@ -400,7 +400,7 @@ export const ActivityLoading: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("Loading…")).toBeInTheDocument();
+    await expect(await canvas.findByText("Loading activity…")).toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
 };

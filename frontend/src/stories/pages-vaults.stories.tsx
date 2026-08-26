@@ -48,15 +48,27 @@ export const IndexWithExistingVaults: Story = {
         http.get(`${API}/my/vaults`, () =>
           HttpResponse.json({ vaults: [{ id: "v-akb", name: "akb", role: "owner" }, { id: "v-research", name: "research", role: "writer" }] }),
         ),
+        http.get(`${API}/vaults/templates`, () => HttpResponse.json(templates)),
       ],
     },
   },
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("Select a vault")).toBeInTheDocument();
+    await expect(
+      await canvas.findByRole("heading", {
+        name: "Open a vault. Everything else follows.",
+      }),
+    ).toBeInTheDocument();
+    await expect(await canvas.findByLabelText("2 vaults available")).toBeInTheDocument();
+    await expect((await canvas.findAllByText("Vaults")).length).toBeGreaterThan(1);
+    await expect(canvas.queryByText("Collections")).not.toBeInTheDocument();
     await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
     await expect(await canvas.findByRole("navigation", { name: "Vaults" })).toBeInTheDocument();
+    const createButtons = await canvas.findAllByRole("button", { name: "New vault" });
+    await userEvent.click(createButtons[createButtons.length - 1]);
+    await expect(await within(document.body).findByRole("dialog")).toHaveTextContent("Create a vault");
+    await userEvent.keyboard("{Escape}");
   },
 };
 
@@ -74,6 +86,7 @@ export const IndexEmpty: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
+    await expect(await canvas.findByRole("heading", { name: "Create your first vault." })).toBeInTheDocument();
     await expect((await canvas.findAllByText("No vaults yet")).length).toBeGreaterThan(0);
     await expect(await canvas.findByRole("navigation", { name: "Vaults" })).toBeInTheDocument();
   },
@@ -175,6 +188,11 @@ export const OverviewEmptyOnboarding: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(await canvas.findByText("This vault is just getting started")).toBeInTheDocument();
+    await expect(await canvas.findByRole("link", { name: /Describe this vault/i })).toBeInTheDocument();
+    await expect(await canvas.findByRole("link", { name: /Connect an agent/i })).toBeInTheDocument();
+    await expect(await canvas.findByRole("button", { name: /Import knowledge bundle/i })).toBeInTheDocument();
+    await expect(await canvas.findByRole("region", { name: "empty Vault overview" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("complementary", { name: "Vault overview details" })).toBeInTheDocument();
     await expect(await canvas.findByRole("navigation", { name: "Vaults" })).toBeInTheDocument();
     await expect(await canvas.findByRole("tree", { name: "empty explorer" })).toBeInTheDocument();
   },

@@ -15,7 +15,13 @@ import { useVaultFavorites } from "@/hooks/use-vault-favorites";
 import { VaultChip } from "@/components/ui/vault-chip";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { roleIcon } from "@/lib/roles";
-import { SCOPES, type RoleScope, inScope, readScope, writeScope } from "@/lib/vault-scope";
+import {
+  SCOPES,
+  type RoleScope,
+  inScope,
+  readScope,
+  writeScope,
+} from "@/lib/vault-scope";
 import {
   Tooltip,
   TooltipContent,
@@ -42,12 +48,14 @@ import { cn } from "@/lib/utils";
 export function VaultRail({
   current,
   onRefetchReady,
+  onCreateVault,
   collapsed,
   onToggleCollapsed,
   width,
 }: {
   current: string;
   onRefetchReady?: (refetch: () => void) => void;
+  onCreateVault: () => void;
   collapsed: boolean;
   onToggleCollapsed: () => void;
   /** Requested rail width (px) from VaultShell's drag-resize; applied only in
@@ -77,9 +85,13 @@ export function VaultRail({
 
   const q = filter.trim().toLowerCase();
   // Role scope applies to BOTH modes; the name filter is expanded-only.
-  const scoped = useMemo(() => vaults.filter((v) => inScope(v.role, scope)), [vaults, scope]);
+  const scoped = useMemo(
+    () => vaults.filter((v) => inScope(v.role, scope)),
+    [vaults, scope],
+  );
   const filtered = useMemo(
-    () => (q ? scoped.filter((v) => v.name?.toLowerCase().includes(q)) : scoped),
+    () =>
+      q ? scoped.filter((v) => v.name?.toLowerCase().includes(q)) : scoped,
     [scoped, q],
   );
 
@@ -87,15 +99,17 @@ export function VaultRail({
   // Deriving from the LIVE list means a favorited-but-deleted/revoked vault id
   // simply never matches — no ghost rows.
   const partition = (list: VaultSummary[]) => {
-    const favs = list.filter((v) => isFavorite(v.id)).sort((a, b) => favOrder(a.id) - favOrder(b.id));
+    const favs = list
+      .filter((v) => isFavorite(v.id))
+      .sort((a, b) => favOrder(a.id) - favOrder(b.id));
     const others = list.filter((v) => !isFavorite(v.id));
     return { favs, others };
   };
 
   const headBtn =
-    "text-foreground-muted hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:cursor-default disabled:opacity-50";
+    "inline-flex h-7 w-7 items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted hover:bg-surface-hover hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:cursor-default disabled:opacity-50";
   const railBtn =
-    "flex h-9 w-9 items-center justify-center rounded-[var(--radius-md)] text-foreground-muted hover:text-foreground hover:bg-surface-hover transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer disabled:cursor-default disabled:opacity-50";
+    "flex h-8 w-8 items-center justify-center rounded-[var(--radius-md)] text-foreground-muted hover:text-foreground hover:bg-surface-hover transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer disabled:cursor-default disabled:opacity-50";
 
   // ── Collapsed: a thin icon rail (favorites first) ───────────────────
   if (collapsed) {
@@ -107,7 +121,7 @@ export function VaultRail({
           aria-label="Vaults"
           className="w-14 shrink-0 h-full flex flex-col bg-surface border-r border-border"
         >
-          <div className="shrink-0 flex flex-col items-center gap-1 py-2 border-b border-border">
+          <div className="flex h-10 shrink-0 items-center justify-center border-b border-border">
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
@@ -122,16 +136,23 @@ export function VaultRail({
               </TooltipTrigger>
               <TooltipContent side="right">Expand vault list</TooltipContent>
             </Tooltip>
+          </div>
+          <div className="flex shrink-0 justify-center py-2">
             <Tooltip>
               <TooltipTrigger asChild>
-                <Link to="/vault/new" aria-label="New vault" className={railBtn}>
+                <button
+                  type="button"
+                  onClick={onCreateVault}
+                  aria-label="New vault"
+                  className={railBtn}
+                >
                   <Plus className="h-4 w-4" aria-hidden />
-                </Link>
+                </button>
               </TooltipTrigger>
               <TooltipContent side="right">New vault</TooltipContent>
             </Tooltip>
           </div>
-          <ul className="flex-1 overflow-y-auto rail-scroll py-2 flex flex-col items-center gap-1">
+          <ul className="flex-1 overflow-y-auto rail-scroll rail-scroll-centered py-2 flex flex-col items-center gap-1">
             {ordered.length === 0 ? (
               <li className="coord py-2" aria-live="polite">
                 {loading ? "…" : "—"}
@@ -156,9 +177,11 @@ export function VaultRail({
                             }
                           }}
                           className={cn(
-                            "relative flex h-11 w-11 items-center justify-center rounded-[var(--radius-md)] transition-token",
+                            "relative flex h-10 w-10 items-center justify-center rounded-[var(--radius-md)] transition-token",
                             "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                            active ? "bg-surface-selected ring-2 ring-primary" : "hover:bg-surface-hover",
+                            active
+                              ? "bg-surface-selected ring-2 ring-primary"
+                              : "hover:bg-surface-hover",
                           )}
                         >
                           <VaultChip name={v.name} size="md" />
@@ -204,7 +227,10 @@ export function VaultRail({
         )}
       >
         {active && (
-          <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-primary" aria-hidden />
+          <span
+            className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-primary"
+            aria-hidden
+          />
         )}
         <Link
           to={`/vault/${v.name}`}
@@ -217,7 +243,7 @@ export function VaultRail({
             }
           }}
           className={cn(
-            "flex min-w-0 flex-1 items-center gap-2 pl-3 h-9 text-sm transition-colors rounded-[var(--radius-sm)]",
+            "flex h-8 min-w-0 flex-1 items-center gap-2 rounded-[var(--radius-sm)] pl-3 text-sm transition-colors",
             "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
             active ? "text-surface-selected-foreground" : "text-foreground",
           )}
@@ -239,10 +265,17 @@ export function VaultRail({
               : "text-foreground-muted opacity-0 hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100",
           )}
         >
-          <Star className={cn("h-3.5 w-3.5", fav && "fill-current")} aria-hidden />
+          <Star
+            className={cn("h-3.5 w-3.5", fav && "fill-current")}
+            aria-hidden
+          />
         </button>
         {RoleIcon && (
-          <span title={roleLabel} className="shrink-0 pr-2 text-foreground-muted" aria-hidden>
+          <span
+            title={roleLabel}
+            className="shrink-0 pr-2 text-foreground-muted"
+            aria-hidden
+          >
             <RoleIcon className="h-3.5 w-3.5" aria-hidden />
           </span>
         )}
@@ -256,9 +289,9 @@ export function VaultRail({
       style={{ width }}
       className="shrink-0 h-full flex flex-col bg-surface"
     >
-      <div className="flex items-center justify-between h-9 px-3 shrink-0 border-b border-border">
+      <div className="flex h-10 shrink-0 items-center justify-between border-b border-border px-3">
         <span className="coord-ink">Vaults</span>
-        <div className="flex items-center gap-2.5">
+        <div className="flex items-center gap-0.5">
           <button
             type="button"
             onClick={refetch}
@@ -267,7 +300,10 @@ export function VaultRail({
             aria-label="Refresh vaults"
             className={headBtn}
           >
-            <RefreshCw className={cn("h-3 w-3", loading && "animate-spin")} aria-hidden />
+            <RefreshCw
+              className={cn("h-3 w-3", loading && "animate-spin")}
+              aria-hidden
+            />
           </button>
           <button
             type="button"
@@ -275,13 +311,22 @@ export function VaultRail({
             aria-pressed={showScope}
             title="Filter by role"
             aria-label="Filter by role"
-            className={cn(headBtn, scope !== "all" && "text-primary hover:text-primary")}
+            className={cn(
+              headBtn,
+              scope !== "all" && "text-primary hover:text-primary",
+            )}
           >
             <Filter className="h-3.5 w-3.5" aria-hidden />
           </button>
-          <Link to="/vault/new" title="New vault" aria-label="New vault" className={headBtn}>
+          <button
+            type="button"
+            onClick={onCreateVault}
+            title="New vault"
+            aria-label="New vault"
+            className={headBtn}
+          >
             <Plus className="h-3.5 w-3.5" aria-hidden />
-          </Link>
+          </button>
           <button
             type="button"
             onClick={onToggleCollapsed}
@@ -346,7 +391,9 @@ export function VaultRail({
         ) : filtered.length === 0 ? (
           <div className="px-3 py-2">
             <p className="coord">
-              {scope !== "all" ? "No vaults match this role filter" : "No matches"}
+              {scope !== "all"
+                ? "No vaults match this role filter"
+                : "No matches"}
             </p>
             {scope !== "all" && (
               <button
@@ -369,7 +416,9 @@ export function VaultRail({
             {others.length > 0 && (
               <section aria-label="All vaults">
                 {favs.length > 0 && (
-                  <h3 className="mt-1 border-t border-border px-3 pt-2 pb-0.5 coord">All vaults</h3>
+                  <h3 className="mt-1 border-t border-border px-3 pt-2 pb-0.5 coord">
+                    All vaults
+                  </h3>
                 )}
                 <ul>{others.map(renderRow)}</ul>
               </section>

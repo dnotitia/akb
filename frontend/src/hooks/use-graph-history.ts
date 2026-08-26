@@ -4,6 +4,8 @@ import { useCallback, useEffect, useState } from "react";
 export interface RecentEntry {
   doc_id: string;
   title: string;
+  kind?: "document" | "table" | "file";
+  uri?: string;
 }
 
 export interface SavedView {

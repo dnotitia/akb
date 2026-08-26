@@ -1148,12 +1148,172 @@ export async function discardAsset(vault: string, fileId: string): Promise<void>
   await throwJsonApiError(res);
 }
 
+// ── Vault files ──
+export type FileUploadStage = "preparing" | "uploading" | "confirming";
+
+export interface VaultFileUploadOptions {
+  collection?: string;
+  description?: string;
+  onStageChange?: (stage: FileUploadStage) => void;
+}
+
+export interface VaultFileUploadResult {
+  kind: "file";
+  uri: string;
+  vault: string;
+  name: string;
+  collection?: string | null;
+  mime_type: string;
+  size_bytes: number;
+  content_hash?: string;
+  version?: string | null;
+}
+
+/**
+ * Complete the backend's presigned file flow from the browser: reserve the
+ * file record, PUT the bytes directly to object storage, then certify the
+ * upload. The stage callback keeps the modal honest during the multi-request
+ * operation without exposing storage implementation details in its copy.
+ */
+export async function uploadVaultFile(
+  vault: string,
+  file: File,
+  options: VaultFileUploadOptions = {},
+): Promise<VaultFileUploadResult> {
+  const mimeType = file.type || "application/octet-stream";
+  const params = new URLSearchParams({
+    filename: file.name,
+    mime_type: mimeType,
+  });
+  const collection = options.collection?.trim();
+  const description = options.description?.trim();
+  if (collection) params.set("collection", collection);
+  if (description) params.set("description", description);
+
+  options.onStageChange?.("preparing");
+  const prepare = await authenticatedFetch(
+    `${API_BASE}/files/${encodeURIComponent(vault)}/upload?${params}`,
+    { method: "POST" },
+  );
+  if (!prepare.ok) await throwJsonApiError(prepare);
+  const reservation = (await prepare.json()) as {
+    uri: string;
+    upload_url: string;
+    deduplicated?: boolean;
+  };
+  const fileIdMatch = reservation.uri?.match(/\/file\/([^/?#]+)$/);
+  const fileId = fileIdMatch ? decodeURIComponent(fileIdMatch[1]) : "";
+  if (!fileId || !reservation.upload_url) {
+    throw new Error("The server returned an incomplete upload reservation.");
+  }
+
+  try {
+    if (!reservation.deduplicated) {
+      options.onStageChange?.("uploading");
+      const transfer = await fetch(reservation.upload_url, {
+        method: "PUT",
+        headers: { "Content-Type": mimeType },
+        body: file,
+      });
+      if (!transfer.ok) {
+        throw new Error(`File transfer failed (${transfer.status}).`);
+      }
+    }
+
+    options.onStageChange?.("confirming");
+    const confirm = await authenticatedFetch(
+      `${API_BASE}/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}/confirm`,
+      { method: "POST" },
+    );
+    if (!confirm.ok) await throwJsonApiError(confirm);
+    return confirm.json();
+  } catch (error) {
+    // Best-effort rollback: pending reservations are otherwise cleaned by the
+    // backend worker, but immediate cleanup lets a user retry the same file now.
+    try {
+      await authenticatedFetch(
+        `${API_BASE}/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}`,
+        { method: "DELETE" },
+        { unauthorized: "preserve-session" },
+      );
+    } catch {
+      // The original transfer/confirmation error is the useful one to surface.
+    }
+    throw error;
+  }
+}
+
+// ── Vault tables ──
+export interface VaultTableColumnInput {
+  name: string;
+  type: string;
+  required?: boolean;
+  unique?: boolean;
+}
+
+export interface VaultTableCreateInput {
+  name: string;
+  description?: string;
+  collection?: string;
+  columns: VaultTableColumnInput[];
+}
+
+export interface VaultTableCreateResult {
+  kind?: "table";
+  uri?: string;
+  vault?: string;
+  name?: string;
+  table?: string;
+  created?: boolean;
+}
+
+export const createVaultTable = (
+  vault: string,
+  input: VaultTableCreateInput,
+) =>
+  api<VaultTableCreateResult>(`/tables/${encodeURIComponent(vault)}`, {
+    method: "POST",
+    body: JSON.stringify({
+      ...input,
+      description: input.description?.trim() || "",
+      collection: input.collection?.trim() || undefined,
+    }),
+  });
+
 // ── Browse ──
 export const browseVault = (vault: string, collection?: string, depth = 1) => {
   const p = new URLSearchParams({ depth: String(depth) });
   if (collection) p.set("collection", collection);
   return api<{ vault: string; path: string; items: any[] }>(`/browse/${vault}?${p}`);
 };
+
+export interface KnowledgeImportResult {
+  format: string;
+  vault: string;
+  created: number;
+  skipped: number;
+  failed: number;
+  uris: string[];
+  skipped_paths: string[];
+  reserved: string[];
+  errors: Array<{ path: string; error: string }>;
+}
+
+/** Import an OKF-compatible ZIP without forcing the JSON content type used by
+ *  `api()`. The browser owns the multipart boundary for this FormData body. */
+export async function importKnowledgeBundle(
+  vault: string,
+  file: File,
+): Promise<KnowledgeImportResult> {
+  const body = new FormData();
+  body.append("file", file);
+  const res = await authenticatedFetch(
+    `${API_BASE}/vaults/${encodeURIComponent(vault)}/import?format=okf&status=active`,
+    { method: "POST", body },
+  );
+  if (!res.ok) await throwJsonApiError(res);
+  return res.json();
+}
 
 // ── Search ──
 // `total` is the legacy alias of `returned` (kept until the SPA / agent
@@ -1247,7 +1407,10 @@ export const getGraph = (vault: string, docPath?: string, hops = 2, limit = 50) 
   // depth). The frontend mirrors the rename so call sites stay
   // self-documenting.
   const p = new URLSearchParams({ hops: String(hops), limit: String(limit) });
-  if (docPath) p.set("uri", _docUri(vault, docPath));
+  // Focused graph search can start from documents, tables, or files. Existing
+  // document callers pass a vault-relative path; typed resources pass their
+  // canonical URI so the same backend endpoint can center the BFS correctly.
+  if (docPath) p.set("uri", docPath.startsWith("akb://") ? docPath : _docUri(vault, docPath));
   else p.set("vault", vault);
   return api<{ nodes: GraphApiNode[]; edges: GraphApiEdge[] }>(`/graph?${p}`);
 };
@@ -1317,7 +1480,11 @@ export interface RelationRow {
   name?: string;
 }
 export const getRelations = (vault: string, docPath: string) => {
-  const p = new URLSearchParams({ uri: _docUri(vault, docPath) });
+  // The relations endpoint accepts any typed resource URI. Document callers
+  // still pass a vault-relative path; graph callers can pass a canonical
+  // table/file URI without it being accidentally rewritten as a doc URI.
+  const uri = docPath.startsWith("akb://") ? docPath : _docUri(vault, docPath);
+  const p = new URLSearchParams({ uri });
   return api<{ uri: string; relations: RelationRow[] }>(`/relations?${p}`);
 };
 
@@ -1374,6 +1541,8 @@ export interface ActivityEntry {
   author_name?: string;
   subject?: string;
   summary?: string;
+  /** Native activity responses use `date`; legacy/imported responses may use `timestamp`. */
+  date?: string;
   timestamp?: string;
   files?: Array<{ path: string; change?: string }>;
 }

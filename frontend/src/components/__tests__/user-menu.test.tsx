@@ -47,6 +47,13 @@ describe("UserMenu", () => {
     await waitFor(() => expect(screen.getByText("Settings")).toBeTruthy());
   });
 
+  it("opens without locking the document scrollbar", async () => {
+    await open();
+
+    expect(document.body).not.toHaveAttribute("data-scroll-locked");
+    expect(document.body.style.pointerEvents).toBe("");
+  });
+
   it("keeps a rejected sign-out visible inside the open menu", async () => {
     vi.mocked(logoutOrdinarySession).mockRejectedValueOnce(new Error("Sign-out unavailable"));
     const user = await open();
