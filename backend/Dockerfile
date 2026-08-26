@@ -18,10 +18,9 @@ RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/* \
 
 WORKDIR /app
 
-COPY pyproject.toml .
-RUN pip install --no-cache-dir .
-
 COPY . .
+RUN pip install --no-cache-dir .
+RUN /usr/local/bin/python -I -B -c "import app.cli; import mcp_server"
 
 # Create vault storage directory
 RUN mkdir -p /data/vaults
