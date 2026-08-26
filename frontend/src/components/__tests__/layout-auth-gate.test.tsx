@@ -1,4 +1,10 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -92,8 +98,32 @@ describe("Layout — auth gate", () => {
 
     expect(await screen.findByTestId("home")).toBeTruthy();
     const headerRow = screen.getByRole("banner").firstElementChild;
-    expect(headerRow).toHaveClass("w-full", "px-3");
+    expect(headerRow).toHaveClass("w-full");
+    expect(headerRow).not.toHaveClass("px-3");
     expect(headerRow).not.toHaveClass("xl:px-12", "2xl:px-16");
+  });
+
+  it("moves desktop entry points into an expanded workspace sidebar", async () => {
+    vi.mocked(api.getToken).mockReturnValue("fake-jwt");
+    renderAt("/");
+
+    expect(await screen.findByTestId("home")).toBeTruthy();
+    const sidebar = screen.getByTestId("app-sidebar");
+    const navigation = within(sidebar).getByRole("navigation", {
+      name: "Workspace navigation",
+    });
+
+    expect(sidebar).toHaveAttribute("data-compact", "false");
+    expect(sidebar).toHaveClass("lg:w-52");
+    expect(
+      within(navigation).getByRole("link", { name: "Home" }),
+    ).toHaveAttribute("aria-current", "page");
+    expect(
+      within(navigation).getByRole("link", { name: "Vaults" }),
+    ).toHaveAttribute("href", "/vault");
+    expect(
+      within(navigation).getByRole("link", { name: "Search" }),
+    ).toHaveAttribute("href", "/search");
   });
 
   it("does not reserve a second root scrollbar gutter for vault workspaces", async () => {
@@ -102,6 +132,11 @@ describe("Layout — auth gate", () => {
 
     expect(await screen.findByTestId("vault-settings")).toBeTruthy();
     expect(document.documentElement).toHaveClass("vault-workspace-scroll-lock");
+    expect(screen.getByTestId("app-sidebar")).toHaveAttribute(
+      "data-compact",
+      "true",
+    );
+    expect(screen.getByTestId("app-sidebar")).toHaveClass("lg:w-14");
   });
 
   it("accepts a verified SSO cookie session without any local token", async () => {

@@ -371,7 +371,7 @@ export default function HomePage() {
   // Vaults and change history close; the rail only carries setup and compact
   // workspace context that is not repeated in the ledgers.
   return (
-    <div className="fade-up mx-auto w-full max-w-[1600px] space-y-6 px-4 sm:px-6 lg:px-12 xl:px-16 2xl:px-20">
+    <div className="fade-up w-full space-y-6">
       <HomeWorkspaceHeader
         vaultCount={vaults.length}
         loading={vaultsLoading}
@@ -380,17 +380,17 @@ export default function HomePage() {
         indexingAbandoned={indexingAbandoned}
       />
 
-      <div className="grid grid-cols-1 items-start gap-5 xl:grid-cols-[minmax(0,1fr)_320px]">
+      <div className="grid grid-cols-1 items-start gap-5 2xl:grid-cols-[minmax(0,1fr)_320px]">
         {continueWorking.length > 0 && (
-          <div className="order-2 min-w-0 xl:col-start-1 xl:row-start-1">
+          <div className="order-2 min-w-0 2xl:col-start-1 2xl:row-start-1">
             <ContinueWorkingSection items={continueWorking} />
           </div>
         )}
 
         <section
           id="vaults"
-          className={`order-1 min-w-0 scroll-mt-24 xl:col-start-1 ${
-            continueWorking.length > 0 ? "xl:row-start-2" : "xl:row-start-1"
+          className={`order-1 min-w-0 scroll-mt-24 2xl:col-start-1 ${
+            continueWorking.length > 0 ? "2xl:row-start-2" : "2xl:row-start-1"
           }`}
           aria-busy={vaultsLoading}
         >
@@ -473,8 +473,8 @@ export default function HomePage() {
         </section>
 
         <aside
-          className={`order-3 space-y-4 xl:col-start-2 xl:row-start-1 ${
-            continueWorking.length > 0 ? "xl:row-span-3" : "xl:row-span-2"
+          className={`order-3 space-y-4 2xl:col-start-2 2xl:row-start-1 ${
+            continueWorking.length > 0 ? "2xl:row-span-3" : "2xl:row-span-2"
           }`}
           aria-label="Workspace setup and summary"
         >
@@ -525,8 +525,8 @@ export default function HomePage() {
 
         <section
           id="recent"
-          className={`order-4 scroll-mt-24 xl:col-start-1 ${
-            continueWorking.length > 0 ? "xl:row-start-3" : "xl:row-start-2"
+          className={`order-4 scroll-mt-24 2xl:col-start-1 ${
+            continueWorking.length > 0 ? "2xl:row-start-3" : "2xl:row-start-2"
           }`}
           aria-busy={recentLoading}
         >

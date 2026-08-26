@@ -234,10 +234,14 @@ an `sr-only` summary, never the only signal.
   deliberate). Section gaps `gap-y-10`, card padding `p-4`, list row `py-3`,
   dense row `py-1.5`.
 - **Application shell**: the global app header always spans the full viewport
-  with only a fixed 12px control-safe inset; it never inherits the page-level
-  responsive gutters. Standard route content still uses shared responsive
-  gutters (`px-4 sm:px-6 lg:px-8 xl:px-12 2xl:px-16`). Page mastheads span that
-  available width; their working content is constrained by
+  and aligns its brand slot with a persistent desktop app sidebar. The sidebar
+  is a 13rem labelled entry rail on ordinary routes and contracts to a 3.5rem
+  icon rail beside the existing Vault/Collections navigator on Vault routes;
+  mobile keeps the same Home/Vault entry points as compact header controls
+  instead of reserving sidebar width. Standard route content uses asymmetric
+  responsive gutters: a compact reading inset at the left and a wider right
+  action gutter aligned with the trailing edge of global Search. Page mastheads
+  span that available width; their working content is constrained by
   `<PageShell>` (`narrow` / `compact` / `wide` / `full`) according to reading
   and task density. The vault workspace remains full-bleed with its persistent
   navigation columns and its own content-width rules. The root reserves a
@@ -251,13 +255,13 @@ an `sr-only` summary, never the only signal.
   plus a soft shadow, not heavy fills. `divide-y divide-border` for list rows.
 - **Home working set**: Home is a workspace dashboard and optional onboarding
   surface, never a second search page. Global semantic search belongs to the app
-  header; advanced filters stay on the Search route. Home adds a second adaptive
-  16–80px inset inside the shell gutter: mobile keeps the compact 16–24px tier,
-  while desktop steps through 48–80px so the dashboard remains broad without
-  crowding the viewport edge. The Home container itself stops at 1600px and is
-  centered, keeping its right edge near the global Search control on ultrawide
-  displays instead of stretching toward the account actions. It opens with a
-  cardless masthead anchored by a
+  header; advanced filters stay on the Search route. Home uses the application
+  shell gutter directly—never a second nested inset or a 1600px cap—so ultrawide
+  screens keep the dashboard's right edge aligned with global Search rather than
+  leaving a large dead band. Its context rail joins the primary column from the
+  `2xl` tier, after the labelled app sidebar leaves enough working width for four
+  Vault cards; narrower desktop widths stack context below the primary ledger.
+  It opens with a cardless masthead anchored by a
   neutral hairline: one `brand-gradient` word in the title, a plain-language
   description, and labelled Vault/index facts rather than floating badges. A
   browser-local, user-scoped Continue working strip appears only when real
@@ -477,8 +481,9 @@ Compose pages from these instead of re-writing patterns inline.
 | `Tabs` / `Tooltip` / `Skeleton`                        | segmented control / hint / loading placeholder.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `Logo` + `.feature-tile`/`.feat-*`                     | brand lockup + per-capability gradient tiles.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
-Shell: `Layout` (glass `app-header` + content) and `VaultShell` (header + content,
-collection tree in a left slide-over toggled by the Tree button / ⌘\).
+Shell: `Layout` (glass `app-header` + responsive `AppSidebar` + content) and
+`VaultShell` (header + content, collection tree in a left slide-over toggled by
+the Tree button / ⌘\).
 
 Member invitation is a two-stage permission console within `Dialog`: searchable
 AKB accounts form the left ledger; the selected identity and descriptive role

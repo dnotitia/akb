@@ -1,6 +1,7 @@
 import { Link, Outlet, Navigate, useLocation } from "react-router-dom";
 import { useEffect, useLayoutEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { Boxes, House, type LucideIcon } from "lucide-react";
 import {
   clearPrivateAssetCache,
   getAuthConfig,
@@ -13,6 +14,7 @@ import { UserMenu } from "@/components/user-menu";
 import { Logo } from "@/components/logo";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { GlobalSearchDialog } from "@/components/global-search-dialog";
+import { AppSidebar } from "@/components/app-sidebar";
 import { appRouteBoundaryForPath } from "@/app-route-contract";
 import { CurrentUserProvider } from "@/contexts/current-user-context";
 
@@ -78,7 +80,8 @@ export function Layout() {
       try {
         const verified = await getMe({ redirectOnUnauthorized: false });
         if (disposed) return;
-        const identityChanged = identityFingerprint(verified) !== activeFingerprint;
+        const identityChanged =
+          identityFingerprint(verified) !== activeFingerprint;
         // SSO cookies are shared across tabs and are intentionally invisible
         // to JavaScript. After every foreground proof, clear query state so a
         // replaced identity or changed server-side ACL cannot inherit data
@@ -132,7 +135,9 @@ export function Layout() {
   if (session.status === "checking" || revalidating) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background text-foreground">
-        <div className="coord" role="status" aria-live="polite">Verifying session…</div>
+        <div className="coord" role="status" aria-live="polite">
+          Verifying session…
+        </div>
       </div>
     );
   }
@@ -141,7 +146,8 @@ export function Layout() {
     // Preserve where the user was headed so /auth can return them there after
     // signing in (deep-linked / shared URLs don't dump everyone on home).
     const dest = location.pathname + location.search;
-    const to = dest && dest !== "/" ? `/auth?next=${encodeURIComponent(dest)}` : "/auth";
+    const to =
+      dest && dest !== "/" ? `/auth?next=${encodeURIComponent(dest)}` : "/auth";
     return <Navigate to={to} replace />;
   }
   // Vault workspace routes lock to viewport height (own internal scroll). Other
@@ -162,85 +168,140 @@ export function Layout() {
       </a>
       {/* ── Glass app header ───────────────────────────────────────── */}
       <header className="app-header sticky top-0 z-40 shrink-0">
-        {/* One responsive horizontal system across Home and task routes. */}
-        <div className="flex h-14 w-full items-center px-3">
-          {/* The brand stays visually independent. Search-corpus status belongs
-              with the Home search affordance rather than the identity lockup. */}
-          <div className="flex min-w-0 items-center">
+        <div className="flex h-14 w-full items-center">
+          {/* This slot follows the sidebar width so the brand and navigation
+              share one stable left edge across document and Vault routes. */}
+          <div
+            className={`flex shrink-0 items-center px-3 ${
+              wide ? "lg:w-14 lg:justify-center lg:px-0" : "lg:w-52"
+            }`}
+          >
             <Link
               to="/"
               aria-label="AKB home"
               className="shrink-0 rounded-[var(--radius-md)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
             >
-              <Logo size={28} subtitle variant="header" />
+              <Logo
+                size={28}
+                wordmark={!wide}
+                subtitle={!wide}
+                variant="header"
+              />
             </Link>
           </div>
 
-          {/* This is a real global-search surface, not a shortcut to /search.
-              Advanced mode and vault/type filters remain on the full page. */}
-          <CurrentUserProvider user={session.user}>
-            <GlobalSearchDialog />
-          </CurrentUserProvider>
+          <div className="flex min-w-0 flex-1 items-center pr-3">
+            {/* This is a real global-search surface, not a shortcut to /search.
+                Advanced mode and vault/type filters remain on the full page. */}
+            <CurrentUserProvider user={session.user}>
+              <GlobalSearchDialog />
+            </CurrentUserProvider>
 
-          {/* Nav + actions */}
-          <nav aria-label="Primary" className="ml-4 flex items-center gap-1">
-            <NavLink to="/" active={location.pathname === "/"} name="Home" />
-            <NavLink
-              to="/vault"
-              active={location.pathname.startsWith("/vault") && location.pathname !== "/vault/new"}
-              name="Vaults"
-            />
-            <div className="mx-1.5 h-6 w-px bg-border" aria-hidden />
-            <UserMenu initialUser={session.user} />
-          </nav>
+            {/* The persistent sidebar owns desktop entry points. Compact icon
+                links remain in the header only where that rail is hidden. */}
+            <nav
+              aria-label="Primary mobile navigation"
+              className="ml-2 flex items-center gap-1 lg:hidden"
+            >
+              <MobileNavLink
+                to="/"
+                active={location.pathname === "/"}
+                name="Home"
+                icon={House}
+              />
+              <MobileNavLink
+                to="/vault"
+                active={location.pathname.startsWith("/vault")}
+                name="Vaults"
+                icon={Boxes}
+              />
+            </nav>
+
+            <div className="ml-3 flex shrink-0 items-center justify-end border-l border-border pl-3 lg:w-28">
+              <UserMenu initialUser={session.user} />
+            </div>
+          </div>
         </div>
       </header>
 
-      {/* Content */}
-      <main id="main" tabIndex={-1} className={wide ? "flex-1 min-h-0 animate-in focus:outline-none" : "flex-1 animate-in focus:outline-none"}>
-        {wide ? (
-          <CurrentUserProvider user={session.user}>
-            <ErrorBoundary resetKeys={[location.pathname, location.search]}>
-              <Outlet context={{ health }} />
-            </ErrorBoundary>
-          </CurrentUserProvider>
-        ) : (
-          <div className="w-full px-4 py-8 sm:px-6 lg:px-8 xl:px-12 2xl:px-16">
-            <CurrentUserProvider user={session.user}>
-              <ErrorBoundary resetKeys={[location.pathname, location.search]}>
-                <Outlet context={{ health }} />
-              </ErrorBoundary>
-            </CurrentUserProvider>
-          </div>
-        )}
-      </main>
+      <div className={wide ? "flex min-h-0 flex-1" : "flex flex-1"}>
+        <AppSidebar compact={wide} />
 
-      {/* Footer — hidden on vault workspace routes (viewport-locked) */}
-      {!wide && (
-        <footer className="border-t border-border">
-          <div className="flex w-full items-center justify-between px-4 py-3 sm:px-6 lg:px-8 xl:px-12 2xl:px-16">
-            <div className="coord">© Dnotitia · Seahorse</div>
-            <div className="coord hidden md:block">Agent Knowledgebase</div>
-            <div className="coord">v1.0</div>
-          </div>
-        </footer>
-      )}
+        <div
+          className={
+            wide
+              ? "flex min-h-0 min-w-0 flex-1 flex-col"
+              : "flex min-w-0 flex-1 flex-col"
+          }
+        >
+          {/* Content */}
+          <main
+            id="main"
+            tabIndex={-1}
+            className={
+              wide
+                ? "min-h-0 flex-1 animate-in focus:outline-none"
+                : "flex-1 animate-in focus:outline-none"
+            }
+          >
+            {wide ? (
+              <CurrentUserProvider user={session.user}>
+                <ErrorBoundary resetKeys={[location.pathname, location.search]}>
+                  <Outlet context={{ health }} />
+                </ErrorBoundary>
+              </CurrentUserProvider>
+            ) : (
+              <div className="w-full px-4 py-8 sm:px-6 lg:pl-8 lg:pr-28 xl:pl-12 xl:pr-32 2xl:pl-16 2xl:pr-36">
+                <CurrentUserProvider user={session.user}>
+                  <ErrorBoundary
+                    resetKeys={[location.pathname, location.search]}
+                  >
+                    <Outlet context={{ health }} />
+                  </ErrorBoundary>
+                </CurrentUserProvider>
+              </div>
+            )}
+          </main>
+
+          {/* Footer — hidden on vault workspace routes (viewport-locked) */}
+          {!wide && (
+            <footer className="border-t border-border">
+              <div className="flex w-full items-center justify-between px-4 py-3 sm:px-6 lg:pl-8 lg:pr-28 xl:pl-12 xl:pr-32 2xl:pl-16 2xl:pr-36">
+                <div className="coord">© Dnotitia · Seahorse</div>
+                <div className="coord hidden md:block">Agent Knowledgebase</div>
+                <div className="coord">v1.0</div>
+              </div>
+            </footer>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
 
-function NavLink({ to, active, name }: { to: string; active: boolean; name: string }) {
+function MobileNavLink({
+  to,
+  active,
+  name,
+  icon: Icon,
+}: {
+  to: string;
+  active: boolean;
+  name: string;
+  icon: LucideIcon;
+}) {
   return (
     <Link
       to={to}
+      aria-label={name}
       aria-current={active ? "page" : undefined}
-      className={`rounded-[var(--radius-md)] px-3 py-1.5 text-sm font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
+      className={`flex h-9 w-9 items-center justify-center rounded-[var(--radius-md)] transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
         active
           ? "bg-surface-selected text-surface-selected-foreground"
           : "text-foreground-muted hover:text-foreground hover:bg-surface-hover"
       }`}
     >
-      {name}
+      <Icon className="h-4 w-4" aria-hidden />
     </Link>
   );
 }
