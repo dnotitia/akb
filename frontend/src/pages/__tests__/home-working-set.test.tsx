@@ -61,7 +61,7 @@ const CURRENT_USER = {
 function TestLayout() {
   return (
     <CurrentUserProvider user={CURRENT_USER}>
-      <Outlet context={{ health: null }} />
+      <Outlet context={{ indexingStatus: null }} />
     </CurrentUserProvider>
   );
 }

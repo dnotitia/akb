@@ -236,7 +236,13 @@ an `sr-only` summary, never the only signal.
 - **Application shell**: the global app header always spans the full viewport.
   Its 13rem brand slot keeps the complete AKB lockup visible and the global
   Search entry stable even when the persistent desktop app sidebar changes
-  density. The sidebar is a 13rem labelled entry rail on ordinary routes and
+  density. From `lg`, a fixed 11rem status slot immediately left of Search
+  surfaces active indexing or failed work across only the Vaults the current
+  user can read. The slot remains reserved when caught up so polling never
+  shifts Search, while its single atomic live-status announces complete phrases
+  without competing badge regions. Partial Vault-health responses render
+  lower-bound counts with a `+`; the system-wide `/health` total must never be
+  presented as the user's workspace state. The sidebar is a 13rem labelled entry rail on ordinary routes and
   can be collapsed to a persistent 3.5rem icon rail with an explicitly labelled
   toggle. The user's choice is remembered locally. Vault routes always use the same 3.5rem icon
   rail beside the existing Vault/Collections navigator;
@@ -267,7 +273,9 @@ an `sr-only` summary, never the only signal.
   Vault cards; narrower desktop widths stack context below the primary ledger.
   It opens with a cardless masthead anchored by a
   neutral hairline: one `brand-gradient` word in the title, a plain-language
-  description, and labelled Vault/index facts rather than floating badges. A
+  description, and labelled Vault/index facts rather than floating badges. The
+  Home index fact consumes the same reader-scoped aggregate as the app-header
+  status, not the system-wide operational counter. A
   32px dashboard gutter separates the primary ledger from its context rail and
   carries through the vertical section rhythm; section anchors keep 16px before
   their first bounded content surface so neighbouring information does not read
@@ -325,6 +333,25 @@ an `sr-only` summary, never the only signal.
   `rail-scroll` treatment rather than platform-default gray scrollbar slabs.
   Narrow layouts return to one document flow and restore card spacing for
   separation.
+  The expanded Vaults and Collections rails use the same two-tier control
+  grammar: an `h-10` labelled header with refresh/create/collapse actions, then
+  an `h-8` icon-led filter field. Root creation belongs in that header rather
+  than at the end of a scrollable tree. Its single create menu and every
+  Collection overflow menu share the same document / upload / table /
+  Collection vocabulary, with the target Collection preselected in each modal.
+  Collection rows keep the human name and one overflow trigger only—never a
+  second line of icon counts or sibling action icons that squeeze the name.
+  When a Collection mixes resource kinds, or one kind exceeds the 20-row
+  preview, Documents / Tables / Files become peer disclosure rows with a quiet
+  tabular count. Each open group renders 20 rows initially and reveals 50 more
+  per request; a resource-type filter bypasses unrelated kinds, so a large
+  document set can never bury tables or files at the end of the tree. A final
+  300-row progressive guard prevents one action from mounting a multi-thousand
+  node Vault. Small single-kind Collections stay flat and compact. The details
+  action is the stable place to review the complete typed counts and Collection
+  summary and, when supported by the connected backend, edit it.
+  Older backends keep the current summary readable
+  and surface an explicit compatibility notice instead of failing silently.
   A read-only permission notice is a flush, full-width policy bar directly above
   the three panes, with a bottom hairline and no card margin or rounded shell.
   In the primary form column, each governance section uses a cardless section
@@ -421,22 +448,38 @@ commits` control and `Full commit log` route. Below `xl`, the work area stacks
   document location and technical metadata. The
   main column is a Git-style framed file viewer with Rendered / Raw / Edit modes
   and only an 8–12px outer gutter in read mode. Details is closed by default and
-  opens as a 20–22rem right overlay inspector: it never reserves canvas width or
+  opens as a 24rem right overlay inspector: it never reserves canvas width or
   reflows the document. On narrow screens it gains a dismissible backdrop;
   backdrop click, Close, and Escape dismiss it and return focus to the Details
-  trigger. The inspector owns properties, outline, relations, version history,
-  publish state, and destructive actions. Retrieval metadata does not interrupt
+  trigger. The inspector treats Info, Outline, Relations, and History as four
+  peer views below one fixed header; the selected view owns all remaining panel
+  height instead of sitting beneath a permanently expanded Properties block.
+  Publish state and destructive actions stay inside Info, so they do not tax the
+  reading height of Outline, Relations, or History. Retrieval metadata does not interrupt
   the reading flow. Rendered headings, paragraphs, lists, and quotes share one
   centered 64rem measure so their left and right edges stay aligned regardless
   of font size; Korean-heavy technical documents still use most of the file
   frame without creating a one-sided void. Code, tables, and media may use the
   full workspace. The
-  file toolbar keeps logical line count and UTF-8 byte size at the left, exposes
-  Copy in both Rendered and Raw views, and keeps the Rendered / Raw / Edit mode
-  control right-aligned. The
+  file toolbar keeps logical line count and UTF-8 byte size at the left, uses
+  its flexible middle slot for a labelled single-line document summary when
+  metadata and horizontal space are available, exposes Copy in both Rendered
+  and Raw views, and keeps the Rendered / Raw / Edit mode control right-aligned.
+  Bound and disclose summary overflow through the shared tooltip text primitive;
+  hide the compact summary when horizontal space is constrained, while Details /
+  Info remains the complete metadata view at every breakpoint. The
   document title is the compact workspace-header H1 and is not repeated as a
   page hero; path, author, commit, age, and History share one dense file-context
-  row immediately above the content surface.
+  row immediately above the content surface. Never add another vertical summary
+  band before the file viewer, and omit the compact summary entirely when older
+  backends return no value.
+  Composer images use a 10 MB transfer ceiling and the asset service's 12 MP /
+  8,192px decode boundary. The client automatically fits oversized still PNG,
+  JPEG, and WebP images to that resolution before upload so a highly compressed
+  camera photo is not rejected based on decoded size alone; animated GIFs are
+  never flattened silently. Upload errors stay inside the editor with an
+  announced reason and explicit recovery: Retry appears only for transient
+  failures, while Choose another and Dismiss are always available.
   A document opened from Search uses this same reader inside a route-backed
   preview dialog rather than replacing the result ledger. The dialog leaves the
   persistent Vault navigation visible on wide screens, becomes full-screen on

@@ -282,6 +282,22 @@ describe("DocumentPage view toggle", () => {
     expect(details).toHaveAttribute("aria-hidden", "false");
     expect(details).toHaveClass("translate-x-0");
     expect(detailsToggle).toHaveAttribute("aria-expanded", "true");
+    expect(details).toHaveClass("lg:w-96");
+
+    const detailViews = screen.getByRole("tablist", { name: "Document detail views" });
+    const infoTab = screen.getByRole("tab", { name: "Info" });
+    expect(detailViews).toContainElement(infoTab);
+    expect(infoTab).toHaveAttribute("aria-selected", "true");
+    const infoPanel = screen.getByRole("tabpanel", { name: "Info" });
+    expect(infoPanel).toHaveClass("min-h-0", "flex-1", "overflow-y-auto");
+
+    await user.click(screen.getByRole("tab", { name: /^Outline/ }));
+    expect(screen.getByRole("heading", { level: 3, name: "On this page" })).toBeVisible();
+    expect(screen.getByRole("tabpanel", { name: /^Outline/ })).toHaveClass(
+      "min-h-0",
+      "flex-1",
+      "overflow-y-auto",
+    );
 
     await user.click(screen.getByRole("button", { name: "Hide document details" }));
     expect(details).toHaveAttribute("aria-hidden", "true");
@@ -310,6 +326,36 @@ describe("DocumentPage view toggle", () => {
     );
     // The raw <pre> should NOT be present.
     expect(screen.queryByTestId("doc-raw")).not.toBeInTheDocument();
+  });
+
+  it("merges a compact summary into the document viewer toolbar without opening Details", async () => {
+    getDocumentMock.mockResolvedValue(
+      makeDoc({ summary: "A concise orientation to the document before the full body begins." }),
+    );
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    const summary = await screen.findByRole("note", { name: "Document summary" });
+    expect(summary).toHaveClass("hidden", "lg:flex", "flex-1", "border-l");
+    expect(summary).toHaveTextContent("Summary");
+    expect(summary).toHaveTextContent(
+      "A concise orientation to the document before the full body begins.",
+    );
+    const statistics = screen.getByLabelText("Document statistics: 3 lines, 20 Bytes");
+    const copyMarkdown = screen.getByRole("button", { name: "Copy markdown" });
+    expect(summary.parentElement).toContainElement(statistics);
+    expect(summary.parentElement?.nextElementSibling).toBe(copyMarkdown);
+    expect(screen.queryByRole("region", { name: "Document summary" })).not.toBeInTheDocument();
+    expect(document.getElementById("document-details-panel")).toHaveAttribute(
+      "aria-hidden",
+      "true",
+    );
+  });
+
+  it("omits the reading summary when the backend does not provide one", async () => {
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await screen.findByRole("heading", { level: 2, name: "BodyHeading" });
+    expect(screen.queryByRole("note", { name: "Document summary" })).not.toBeInTheDocument();
   });
 
   it("counts logical lines and UTF-8 bytes", async () => {

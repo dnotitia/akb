@@ -1,17 +1,24 @@
-import { Link, useLocation } from "react-router-dom";
-import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link, useLocation, useNavigate } from "react-router-dom";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
   ChevronDown,
   ChevronRight,
   FilePlus,
   FileText,
   FolderPlus,
+  Info,
   Lock,
+  MoreHorizontal,
   Paperclip,
-  RotateCw,
+  PanelLeftClose,
+  Plus,
+  RefreshCw,
+  Search,
   Sparkles,
   Table,
   Trash2,
+  Upload,
 } from "lucide-react";
 import { Alert } from "@/components/ui/alert";
 import { SkillBadge } from "@/components/ui/skill-badge";
@@ -20,23 +27,35 @@ import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import { useOpenDocumentCreateDialog } from "@/contexts/document-create-dialog-context";
 import {
   activePathFromRoute,
-  countDocs,
   filterTree,
+  filterTreeByKind,
   flattenVisible,
+  kindGroupKey,
   leafHref,
+  RESOURCE_PREVIEW_SIZE,
+  type ResourceKind,
+  type FlatKindGroupRow,
+  type FlatMoreRow,
   type FlatRow,
 } from "@/lib/tree-route";
 import { getVaultInfo } from "@/lib/api";
 import { recentTone } from "@/lib/recent";
 import { isReservedCollection } from "@/lib/skill";
 import { CreateCollectionDialog } from "@/components/create-collection-dialog";
+import {
+  CollectionDetailsDialog,
+  type CollectionResourceCounts,
+} from "@/components/collection-details-dialog";
 import { DeleteCollectionDialog } from "@/components/delete-collection-dialog";
+import { FileUploadDialog } from "@/components/file-upload-dialog";
+import { TableCreateDialog } from "@/components/table-create-dialog";
+import { SelectMenu } from "@/components/ui/select-menu";
+import { parseFileUri } from "@/lib/uri";
 
 const PAGE_SIZE = 10;
 const TYPEAHEAD_TIMEOUT_MS = 500;
-/** Soft cap on rendered rows to keep first paint fast on very large
- *  vaults. Users can opt into rendering all rows. */
-const TREE_RENDER_CAP = 300;
+const TREE_RENDER_PAGE = 300;
+const RESOURCE_PAGE_SIZE = 50;
 
 /**
  * Left-rail explorer — single collection-rooted tree. Documents, tables,
@@ -64,12 +83,15 @@ export interface VaultExplorerProps {
    * the parent needs the handle to share it with siblings.
    */
   onRefetchReady?: (refetch: () => void) => void;
+  /** Collapse the collection column from the shared sidebar header. */
+  onCollapse?: () => void;
 }
 
 export function VaultExplorer({
   vault,
   onMutation,
   onRefetchReady,
+  onCollapse,
 }: VaultExplorerProps) {
   const { tree, loading, error, refetch } = useVaultTree(vault);
   const openCreateDocument = useOpenDocumentCreateDialog();
@@ -88,8 +110,16 @@ export function VaultExplorer({
   }, [onRefetchReady, refetch]);
   const { expanded, toggle, revealAncestorsOf } = useExpandedPaths(vault);
   const { pathname } = useLocation();
+  const navigate = useNavigate();
   const [filter, setFilter] = useState("");
-  const [uncapped, setUncapped] = useState(false);
+  const [kindFilter, setKindFilter] = useState<ResourceKind | "all">("all");
+  const [collapsedKindGroups, setCollapsedKindGroups] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [kindLimits, setKindLimits] = useState<Map<string, number>>(
+    () => new Map(),
+  );
+  const [renderLimit, setRenderLimit] = useState(TREE_RENDER_PAGE);
   const listRef = useRef<HTMLDivElement | null>(null);
 
   // Role-gated affordances. We fetch the role on mount/vault-change rather
@@ -127,9 +157,35 @@ export function VaultExplorer({
   const [deleteTarget, setDeleteTarget] = useState<{
     path: string;
     docCount: number;
+    tableCount: number;
     fileCount: number;
     subCollectionCount: number;
   } | null>(null);
+  const [detailsTarget, setDetailsTarget] = useState<{
+    path: string;
+    summary?: string | null;
+    counts: CollectionResourceCounts;
+    editable: boolean;
+  } | null>(null);
+  const [uploadCollection, setUploadCollection] = useState<string | null>(null);
+  const [tableCollection, setTableCollection] = useState<string | null>(null);
+  const mutationTriggerRef = useRef<HTMLElement | null>(null);
+
+  const rememberMutationTrigger = useCallback(() => {
+    if (document.activeElement instanceof HTMLElement) {
+      mutationTriggerRef.current = document.activeElement;
+    }
+  }, []);
+
+  const openUpload = useCallback((collection: string) => {
+    rememberMutationTrigger();
+    setUploadCollection(collection);
+  }, [rememberMutationTrigger]);
+
+  const openTableCreate = useCallback((collection: string) => {
+    rememberMutationTrigger();
+    setTableCollection(collection);
+  }, [rememberMutationTrigger]);
 
   const activeSig = useMemo(() => activePathFromRoute(pathname, tree), [pathname, tree]);
 
@@ -140,40 +196,106 @@ export function VaultExplorer({
     }
   }, [activeSig, revealAncestorsOf]);
 
-  const filtered = useMemo(() => {
+  const kindFiltered = useMemo(() => {
     if (!tree) return tree;
+    return filterTreeByKind(tree, kindFilter);
+  }, [tree, kindFilter]);
+
+  const filtered = useMemo(() => {
+    if (!kindFiltered) return kindFiltered;
     const q = filter.trim().toLowerCase();
-    return q ? filterTree(tree, q) : tree;
-  }, [tree, filter]);
+    return q ? filterTree(kindFiltered, q) : kindFiltered;
+  }, [kindFiltered, filter]);
 
   const forceOpen = filter.length > 0;
 
   /** Total row count (unfiltered) for the empty-state check. */
   const total = useMemo<number>(() => {
-    if (!tree) return 0;
-    let c = 0;
-    for (const n of tree) {
-      if (n.kind === "collection") c += countDocs(n);
-      else c += 1;
-    }
-    return c;
+    return tree ? countTreeNodes(tree) : 0;
   }, [tree]);
+
+  const resourceCounts = useMemo(
+    () => countResourceKinds(tree ?? []),
+    [tree],
+  );
+  const resourceTotal =
+    resourceCounts.document + resourceCounts.table + resourceCounts.file;
+  const kindOptions = useMemo(
+    () => [
+      {
+        value: "all",
+        label: "All",
+        hint: `${resourceTotal.toLocaleString()} resources`,
+      },
+      {
+        value: "document",
+        label: "Documents",
+        hint: `${resourceCounts.document.toLocaleString()} documents`,
+      },
+      {
+        value: "table",
+        label: "Tables",
+        hint: `${resourceCounts.table.toLocaleString()} tables`,
+      },
+      {
+        value: "file",
+        label: "Files",
+        hint: `${resourceCounts.file.toLocaleString()} files`,
+      },
+    ],
+    [resourceCounts, resourceTotal],
+  );
 
   /** Full flattened row list (without cap). */
   const fullRows = useMemo<FlatRow[]>(
-    () => (filtered ? flattenVisible(filtered, expanded, forceOpen) : []),
-    [filtered, expanded, forceOpen],
+    () =>
+      filtered
+          ? flattenVisible(filtered, expanded, forceOpen, {
+            collapsedKindGroups,
+            kindLimits,
+            activeSig,
+          })
+        : [],
+    [filtered, expanded, forceOpen, collapsedKindGroups, kindLimits, activeSig],
   );
 
-  /** Capped rows — soft cap applied unless the user opts in, or unless
-   *  a filter is active (the user is hunting for a specific match and a
-   *  cap could hide it). */
+  /** Progressive global cap prevents a single interaction from mounting an
+   * entire multi-thousand-row tree. Per-kind previews handle the common case;
+   * this is the final guard for vaults with many expanded collections. */
   const visibleRows = useMemo<FlatRow[]>(() => {
-    if (filter || uncapped) return fullRows;
-    return fullRows.length > TREE_RENDER_CAP
-      ? fullRows.slice(0, TREE_RENDER_CAP)
-      : fullRows;
-  }, [fullRows, uncapped, filter]);
+    return fullRows.slice(0, renderLimit);
+  }, [fullRows, renderLimit]);
+
+  useEffect(() => {
+    setRenderLimit(TREE_RENDER_PAGE);
+    setKindLimits(new Map());
+  }, [filter, kindFilter, vault]);
+
+  useEffect(() => {
+    setCollapsedKindGroups(new Set());
+  }, [vault]);
+
+  const toggleKindGroup = useCallback((parentPath: string, kind: ResourceKind) => {
+    const key = kindGroupKey(parentPath, kind);
+    setCollapsedKindGroups((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
+  const showMoreKind = useCallback((parentPath: string, kind: ResourceKind) => {
+    const key = kindGroupKey(parentPath, kind);
+    setKindLimits((current) => {
+      const next = new Map(current);
+      next.set(
+        key,
+        (current.get(key) ?? RESOURCE_PREVIEW_SIZE) + RESOURCE_PAGE_SIZE,
+      );
+      return next;
+    });
+  }, []);
 
   const focusAt = useCallback((i: number) => {
     const clamped = Math.max(0, Math.min(i, visibleRows.length - 1));
@@ -203,7 +325,17 @@ export function VaultExplorer({
         case "ArrowLeft": {
           if (idx < 0) return;
           const row = visibleRows[idx];
-          if (row.node.kind !== "collection") return;
+          if (row.type === "kind-group") {
+            if (e.key === "ArrowRight" && !row.isOpen) {
+              toggleKindGroup(row.parentPath, row.kind);
+            }
+            if (e.key === "ArrowLeft" && row.isOpen) {
+              toggleKindGroup(row.parentPath, row.kind);
+            }
+            e.preventDefault();
+            return;
+          }
+          if (row.type !== "node" || row.node.kind !== "collection") return;
           const isOpen = forceOpen || expanded.has(row.node.path);
           if (e.key === "ArrowRight" && !isOpen) toggle(row.node.path);
           if (e.key === "ArrowLeft" && isOpen) toggle(row.node.path);
@@ -227,33 +359,90 @@ export function VaultExplorer({
         }
       }
     },
-    [visibleRows, focusAt, forceOpen, expanded, toggle],
+    [
+      visibleRows,
+      focusAt,
+      forceOpen,
+      expanded,
+      toggle,
+      toggleKindGroup,
+    ],
   );
+
+  const headBtn =
+    "inline-flex h-7 w-7 items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted hover:bg-surface-hover hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:cursor-default disabled:opacity-50";
 
   return (
     <aside
-      className="flex flex-col h-full overflow-hidden text-sm bg-background"
+      className="flex flex-col h-full overflow-hidden text-sm bg-surface"
       aria-label={`${vault} collections`}
     >
-      <div className="border-b border-border px-2 py-1.5 shrink-0 flex items-center gap-1.5">
-        <input
-          type="search"
-          placeholder="Filter in vault…"
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-          className="flex-1 min-w-0 h-9 px-2.5 rounded-[var(--radius-md)] bg-surface border border-border text-xs text-foreground placeholder:text-foreground-muted focus:outline-none focus:border-primary focus-visible:ring-2 focus-visible:ring-ring transition-colors"
-          aria-label="Filter tree"
-        />
-        <button
-          type="button"
-          onClick={() => refetch()}
-          aria-label="Refresh"
-          title="Refresh"
-          className="shrink-0 inline-flex h-9 w-9 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface text-foreground-muted hover:text-foreground hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-        >
-          <RotateCw className="h-3.5 w-3.5" aria-hidden />
-        </button>
+      <div className="flex h-10 shrink-0 items-center justify-between border-b border-border px-3">
+        <span className="coord-ink">Collections</span>
+        <div className="flex items-center gap-0.5">
+          <button
+            type="button"
+            onClick={() => refetch()}
+            disabled={loading}
+            aria-label="Refresh collections"
+            title="Refresh collections"
+            className={headBtn}
+          >
+            <RefreshCw className={loading ? "h-3 w-3 animate-spin" : "h-3 w-3"} aria-hidden />
+          </button>
+          {canWrite && (
+            <RootCreateMenu
+              triggerClassName={headBtn}
+              onCreateDocument={() => openCreateDocument()}
+              onUploadFile={() => openUpload("")}
+              onCreateTable={() => openTableCreate("")}
+              onCreateCollection={() => openCreate(null)}
+            />
+          )}
+          {onCollapse && (
+            <button
+              type="button"
+              onClick={onCollapse}
+              title="Collapse tree (⌘\\)"
+              aria-label="Collapse collection tree"
+              aria-expanded={true}
+              className={headBtn}
+            >
+              <PanelLeftClose className="h-4 w-4" aria-hidden />
+            </button>
+          )}
+        </div>
       </div>
+
+      {total > 0 && (
+        <div className="shrink-0 border-b border-border px-2 py-1.5">
+          <div className="grid grid-cols-[minmax(0,1fr)_6.5rem] gap-1.5">
+            <div className="relative min-w-0">
+              <Search
+                className="pointer-events-none absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-foreground-muted"
+                aria-hidden
+              />
+              <input
+                type="search"
+                placeholder="Filter resources"
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+                className="h-8 w-full rounded-[var(--radius-md)] border border-border bg-background pl-6 pr-2 text-xs text-foreground placeholder:text-foreground-muted transition-colors focus:border-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                aria-label="Filter resources"
+              />
+            </div>
+            <SelectMenu
+              value={kindFilter}
+              onValueChange={(value) =>
+                setKindFilter(value as ResourceKind | "all")
+              }
+              options={kindOptions}
+              aria-label="Resource type"
+              className="h-8 bg-background px-2 text-xs"
+            />
+          </div>
+        </div>
+      )}
 
       <div
         ref={listRef}
@@ -269,75 +458,86 @@ export function VaultExplorer({
             No collections yet — the tree fills in with your first document.
           </div>
         )}
-        {!loading && !error && total > 0 && visibleRows.length === 0 && filter && (
-          <div className="coord px-3 py-1.5" role="status">— No matches —</div>
+        {!loading && !error && total > 0 && visibleRows.length === 0 && (
+          <div className="coord px-3 py-2" role="status">
+            No resources match these filters.
+          </div>
         )}
 
         {!loading && !error &&
-          visibleRows.map((r) => (
-            <Fragment key={r.sig}>
-              {r.kindHeader && <KindGroupLabel kind={r.kindHeader} depth={r.depth} />}
+          visibleRows.map((row) => {
+            if (row.type === "kind-group") {
+              return (
+                <KindGroupRow
+                  key={row.sig}
+                  row={row}
+                  onToggle={() => toggleKindGroup(row.parentPath, row.kind)}
+                />
+              );
+            }
+            if (row.type === "more") {
+              return (
+                <KindMoreRow
+                  key={row.sig}
+                  row={row}
+                  onShowMore={() => showMoreKind(row.parentPath, row.kind)}
+                />
+              );
+            }
+            return (
               <TreeRow
-              node={r.node}
-              depth={r.depth}
-              sig={r.sig}
-              isOpen={r.isOpen}
-              isActive={r.sig === activeSig}
-              vault={vault}
-              onToggle={toggle}
-              canWrite={canWrite}
-              onCreateDoc={(node) =>
-                openCreateDocument({ collection: node.path })
-              }
-              onCreateSubCollection={(node) => openCreate(node.path)}
-              onDeleteCollection={(node) =>
-                setDeleteTarget({
-                  path: node.path,
-                  docCount: countDocs(node),
-                  // TODO: the in-memory tree currently flattens files
-                  // to vault root (see use-vault-tree.ts buildTree),
-                  // so a collection's true file count isn't available
-                  // client-side. The server's 409 response will
-                  // surface the real count if the user picks
-                  // empty-mode on a collection that secretly has files.
-                  fileCount: 0,
-                  // The tree already nests sub-collections under their
-                  // parent, so this is a pure local walk. Critical for
-                  // the nested-parent case: when the user clicks trash
-                  // on a synthesized parent, this drives the dialog into
-                  // cascade mode and shows the strengthened banner.
-                  subCollectionCount: countSubCollections(node),
-                })
-              }
+                key={row.sig}
+                node={row.node}
+                depth={row.depth}
+                sig={row.sig}
+                isOpen={row.isOpen}
+                isActive={row.sig === activeSig}
+                vault={vault}
+                onToggle={toggle}
+                canWrite={canWrite}
+                onCreateDoc={(node) =>
+                  openCreateDocument({ collection: node.path })
+                }
+                onUploadFile={(node) => openUpload(node.path)}
+                onCreateTable={(node) => openTableCreate(node.path)}
+                onCreateSubCollection={(node) => openCreate(node.path)}
+                onOpenDetails={(node) => {
+                  const counts = countCollectionResources(node);
+                  setDetailsTarget({
+                    path: node.path,
+                    summary: node.raw?.summary,
+                    counts,
+                    editable: canWrite && !isReservedCollection(node.path),
+                  });
+                }}
+                onDeleteCollection={(node) => {
+                  const counts = countCollectionResources(node);
+                  setDeleteTarget({
+                    path: node.path,
+                    docCount: counts.documents,
+                    tableCount: counts.tables,
+                    fileCount: counts.files,
+                    subCollectionCount: countSubCollections(node),
+                  });
+                }}
               />
-            </Fragment>
-          ))}
+            );
+          })}
 
-        {!loading && !error && !filter && !uncapped &&
+        {!loading && !error &&
           fullRows.length > visibleRows.length && (
             <button
               type="button"
-              onClick={() => setUncapped(true)}
+              onClick={() =>
+                setRenderLimit((current) => current + TREE_RENDER_PAGE)
+              }
               className="w-full coord px-3 py-2 text-left hover:bg-surface-hover hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background cursor-pointer"
             >
-              ↓ Show {fullRows.length - visibleRows.length} more
+              Show next {Math.min(TREE_RENDER_PAGE, fullRows.length - visibleRows.length)} of{" "}
+              {(fullRows.length - visibleRows.length).toLocaleString()}
             </button>
           )}
 
-        {/* Once real knowledge exists, keep a discoverable root-collection
-            action at the bottom of the tree. In the empty state the main
-            onboarding already owns the next action, matching the quiet mockup
-            rather than showing two competing ways to begin. */}
-        {!loading && !error && total > 0 && canWrite && (
-          <button
-            type="button"
-            onClick={() => openCreate(null)}
-            className="w-full inline-flex items-center gap-1.5 px-3 py-1.5 text-left text-foreground-muted hover:bg-surface-hover hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-          >
-            <FolderPlus className="h-3 w-3" aria-hidden />
-            <span className="coord">+ New collection</span>
-          </button>
-        )}
       </div>
 
       {/* Mutation dialogs. Mounted unconditionally so portals stay
@@ -362,6 +562,7 @@ export function VaultExplorer({
         vault={vault}
         path={deleteTarget?.path ?? ""}
         docCount={deleteTarget?.docCount ?? 0}
+        tableCount={deleteTarget?.tableCount ?? 0}
         fileCount={deleteTarget?.fileCount ?? 0}
         subCollectionCount={deleteTarget?.subCollectionCount ?? 0}
         open={deleteTarget !== null}
@@ -370,6 +571,49 @@ export function VaultExplorer({
         }}
         onDeleted={() => {
           handleMutation();
+        }}
+      />
+      <CollectionDetailsDialog
+        vault={vault}
+        path={detailsTarget?.path ?? ""}
+        summary={detailsTarget?.summary}
+        counts={detailsTarget?.counts ?? { documents: 0, tables: 0, files: 0 }}
+        editable={detailsTarget?.editable ?? false}
+        open={detailsTarget !== null}
+        onOpenChange={(next) => {
+          if (!next) setDetailsTarget(null);
+        }}
+        onUpdated={() => {
+          handleMutation();
+        }}
+      />
+      <FileUploadDialog
+        open={uploadCollection !== null}
+        onOpenChange={(next) => {
+          if (!next) setUploadCollection(null);
+        }}
+        vault={vault}
+        initialCollection={uploadCollection ?? ""}
+        returnFocusRef={mutationTriggerRef}
+        onUploaded={(file) => {
+          handleMutation();
+          const parsed = parseFileUri(file.uri);
+          if (parsed) {
+            navigate(`/vault/${vault}/file/${encodeURIComponent(parsed.id)}`);
+          }
+        }}
+      />
+      <TableCreateDialog
+        open={tableCollection !== null}
+        onOpenChange={(next) => {
+          if (!next) setTableCollection(null);
+        }}
+        vault={vault}
+        initialCollection={tableCollection ?? ""}
+        returnFocusRef={mutationTriggerRef}
+        onCreated={(tableName) => {
+          handleMutation();
+          navigate(`/vault/${vault}/table/${encodeURIComponent(tableName)}`);
         }}
       />
     </aside>
@@ -392,6 +636,8 @@ interface RowProps {
   /** Fired when the user clicks the trash icon on a collection row.
    *  Parent decides which dialog to open and seeds it with counts. */
   onDeleteCollection?: (node: TreeNode) => void;
+  /** Open the collection metadata and resource-count inspector. */
+  onOpenDetails?: (node: TreeNode) => void;
   /** Fired when the user clicks the `+` (new sub-collection) icon on a
    *  collection row. Parent opens the create dialog with this node's
    *  path prefilled as the parent. */
@@ -399,15 +645,18 @@ interface RowProps {
   /** Fired when the user clicks the doc icon on a collection row. Parent
    *  routes to the new-document page with this collection prefilled. */
   onCreateDoc?: (node: TreeNode) => void;
+  /** Open the file uploader with this collection preselected. */
+  onUploadFile?: (node: TreeNode) => void;
+  /** Open the table builder with this collection preselected. */
+  onCreateTable?: (node: TreeNode) => void;
 }
 
 const TreeRow = memo(function TreeRow({
-  node, depth, sig, isOpen, isActive, vault, onToggle, canWrite, onDeleteCollection, onCreateSubCollection, onCreateDoc,
+  node, depth, sig, isOpen, isActive, vault, onToggle, canWrite, onDeleteCollection, onOpenDetails, onCreateSubCollection, onCreateDoc, onUploadFile, onCreateTable,
 }: RowProps) {
   const indent = { paddingLeft: `${depth * 12 + 12}px` };
 
   if (node.kind === "collection") {
-    const count = countDocs(node);
     const ChevronIcon = isOpen ? ChevronDown : ChevronRight;
     // The reserved `overview` collection holds the vault guide. The backend
     // rejects writes into it, so the tree shows it read-only (locked, no row
@@ -426,7 +675,7 @@ const TreeRow = memo(function TreeRow({
           data-sig={sig}
           onClick={() => onToggle(node.path)}
           style={indent}
-          className={`flex-1 min-w-0 flex items-center gap-1.5 pr-2 py-1.5 min-h-9 text-left transition-colors hover:bg-surface-hover focus:bg-surface-hover focus:outline-none cursor-pointer ${
+          className={`flex min-h-11 min-w-0 flex-1 items-center gap-1.5 py-1.5 pr-1 text-left transition-colors hover:bg-surface-hover focus:bg-surface-hover focus:outline-none cursor-pointer ${
             isActive ? "bg-surface-selected text-surface-selected-foreground" : ""
           }`}
         >
@@ -434,68 +683,58 @@ const TreeRow = memo(function TreeRow({
             className="h-3 w-3 shrink-0 text-foreground-muted group-hover:text-link transition-colors"
             aria-hidden
           />
-          <span
-            title={node.raw?.summary ? `${node.name} — ${node.raw.summary}` : node.name}
-            className="truncate font-medium tracking-tight text-[13px]"
-          >
-            {node.name}
-          </span>
-          {isReserved && (
-            <span
-              title="System collection — managed via vault settings"
-              className="inline-flex shrink-0 items-center"
-              style={{ color: "var(--color-primary)" }}
-            >
-              <Lock className="h-3 w-3" aria-hidden />
-              <span className="sr-only">System collection</span>
+          <span className="min-w-0 flex-1">
+            <span className="flex min-w-0 items-center gap-1">
+              <span
+                title={node.raw?.summary ? `${node.name} — ${node.raw.summary}` : node.name}
+                className="block min-w-0 flex-1 truncate font-medium tracking-tight text-[13px]"
+              >
+                {node.name}
+              </span>
+              {isReserved && (
+                <span
+                  title="System collection — managed via vault settings"
+                  className="inline-flex shrink-0 items-center"
+                  style={{ color: "var(--color-primary)" }}
+                >
+                  <Lock className="h-3 w-3" aria-hidden />
+                  <span className="sr-only">System collection</span>
+                </span>
+              )}
             </span>
-          )}
-          {count > 0 && <span className="coord ml-auto shrink-0 tabular-nums">{count}</span>}
+          </span>
         </button>
-        {!isReserved && canWrite && onCreateDoc && (
-          <button
-            type="button"
-            onClick={(e) => {
-              // Stop the row's expand-toggle from also firing.
-              e.stopPropagation();
-              onCreateDoc(node);
-            }}
-            title={`New document in ${node.path}`}
-            aria-label={`Create document in ${node.path}`}
-            className="shrink-0 px-2 inline-flex items-center justify-center text-foreground-muted hover:text-link transition-colors cursor-pointer opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus:opacity-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-          >
-            <FilePlus className="h-3 w-3" aria-hidden />
-          </button>
-        )}
-        {!isReserved && canWrite && onCreateSubCollection && (
-          <button
-            type="button"
-            onClick={(e) => {
-              // Stop the row's expand-toggle from also firing.
-              e.stopPropagation();
-              onCreateSubCollection(node);
-            }}
-            title={`New sub-collection in ${node.path}`}
-            aria-label={`Create sub-collection in ${node.path}`}
-            className="shrink-0 px-2 inline-flex items-center justify-center text-foreground-muted hover:text-link transition-colors cursor-pointer opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus:opacity-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-          >
-            <FolderPlus className="h-3 w-3" aria-hidden />
-          </button>
-        )}
-        {!isReserved && canWrite && onDeleteCollection && (
-          <button
-            type="button"
-            onClick={(e) => {
-              // Stop the row's expand-toggle from also firing.
-              e.stopPropagation();
-              onDeleteCollection(node);
-            }}
-            title={`Delete ${node.path}`}
-            aria-label={`Delete collection ${node.path}`}
-            className="shrink-0 px-2 inline-flex items-center justify-center text-foreground-muted hover:text-destructive transition-colors cursor-pointer opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus:opacity-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-          >
-            <Trash2 className="h-3 w-3" aria-hidden />
-          </button>
+        {onOpenDetails && (
+          <CollectionActionsMenu
+            node={node}
+            editable={Boolean(canWrite && !isReserved)}
+            onOpenDetails={() => onOpenDetails(node)}
+            onCreateDoc={
+              !isReserved && canWrite && onCreateDoc
+                ? () => onCreateDoc(node)
+                : undefined
+            }
+            onUploadFile={
+              !isReserved && canWrite && onUploadFile
+                ? () => onUploadFile(node)
+                : undefined
+            }
+            onCreateTable={
+              !isReserved && canWrite && onCreateTable
+                ? () => onCreateTable(node)
+                : undefined
+            }
+            onCreateSubCollection={
+              !isReserved && canWrite && onCreateSubCollection
+                ? () => onCreateSubCollection(node)
+                : undefined
+            }
+            onDelete={
+              !isReserved && canWrite && onDeleteCollection
+                ? () => onDeleteCollection(node)
+                : undefined
+            }
+          />
         )}
       </div>
     );
@@ -554,7 +793,7 @@ const TreeRow = memo(function TreeRow({
   );
 });
 
-/* ── Kind-group label (Documents / Tables / Files) ────────────────────────── */
+/* ── Resource-kind disclosure rows ───────────────────────────────────────── */
 
 const KIND_LABEL: Partial<Record<NodeKind, string>> = {
   document: "Documents",
@@ -562,23 +801,64 @@ const KIND_LABEL: Partial<Record<NodeKind, string>> = {
   file: "Files",
 };
 
-/**
- * A muted, non-interactive group heading rendered above the first row of each
- * leaf-kind run when a collection mixes kinds (Sentence case per the design
- * system). `role="presentation"` + no `data-sig` keeps it out of the tree's
- * roving keyboard nav and the aria-tree row set — it's purely a visual divider.
- */
-function KindGroupLabel({ kind, depth }: { kind: NodeKind; depth: number }) {
-  const label = KIND_LABEL[kind];
-  if (!label) return null;
+function KindGroupRow({
+  row,
+  onToggle,
+}: {
+  row: FlatKindGroupRow;
+  onToggle: () => void;
+}) {
+  const label = KIND_LABEL[row.kind] ?? "Resources";
+  const ChevronIcon = row.isOpen ? ChevronDown : ChevronRight;
   return (
-    <div
-      role="presentation"
-      style={{ paddingLeft: `${depth * 12 + 12}px` }}
-      className="coord px-2 pt-2 pb-0.5 select-none"
+    <button
+      type="button"
+      role="treeitem"
+      aria-level={row.depth + 1}
+      aria-expanded={row.isOpen}
+      aria-label={`${label}, ${row.count.toLocaleString()} ${row.count === 1 ? "item" : "items"}`}
+      data-sig={row.sig}
+      onClick={onToggle}
+      style={{ paddingLeft: `${row.depth * 12 + 12}px` }}
+      className="group flex min-h-8 w-full items-center gap-1.5 border-y border-border bg-surface-2 px-2 py-1 text-left text-xs font-medium text-foreground transition-colors hover:bg-surface-hover hover:text-link focus:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
     >
-      {label}
-    </div>
+      <ChevronIcon
+        className="h-3 w-3 shrink-0 text-foreground-muted transition-colors group-hover:text-link"
+        aria-hidden
+      />
+      <span className="min-w-0 flex-1 truncate">{label}</span>
+      <span className="shrink-0 tabular-nums text-foreground-muted">
+        {row.count.toLocaleString()}
+      </span>
+    </button>
+  );
+}
+
+function KindMoreRow({
+  row,
+  onShowMore,
+}: {
+  row: FlatMoreRow;
+  onShowMore: () => void;
+}) {
+  const remaining = row.totalCount - row.visibleCount;
+  const next = Math.min(RESOURCE_PAGE_SIZE, remaining);
+  const label = KIND_LABEL[row.kind]?.toLowerCase() ?? "resources";
+  return (
+    <button
+      type="button"
+      role="treeitem"
+      aria-level={row.depth + 1}
+      data-sig={row.sig}
+      onClick={onShowMore}
+      style={{ paddingLeft: `${row.depth * 12 + 12}px` }}
+      className="flex min-h-9 w-full items-center pr-2 py-1.5 text-left text-xs font-medium text-link transition-colors hover:bg-surface-hover hover:text-link-hover focus:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+    >
+      Show {next.toLocaleString()} more {label}
+      <span className="ml-auto pl-2 tabular-nums text-foreground-muted">
+        {remaining.toLocaleString()} left
+      </span>
+    </button>
   );
 }
 
@@ -600,13 +880,209 @@ function countSubCollections(node: TreeNode): number {
   return n;
 }
 
+function countCollectionResources(node: TreeNode): CollectionResourceCounts {
+  const counts: CollectionResourceCounts = { documents: 0, tables: 0, files: 0 };
+  const visit = (current: TreeNode) => {
+    if (current.kind === "document") counts.documents += 1;
+    else if (current.kind === "table") counts.tables += 1;
+    else if (current.kind === "file") counts.files += 1;
+    current.children?.forEach(visit);
+  };
+  node.children?.forEach(visit);
+  return counts;
+}
+
+function countTreeNodes(nodes: TreeNode[]): number {
+  let total = 0;
+  const visit = (node: TreeNode) => {
+    total += 1;
+    node.children?.forEach(visit);
+  };
+  nodes.forEach(visit);
+  return total;
+}
+
+function countResourceKinds(nodes: TreeNode[]): Record<ResourceKind, number> {
+  const counts: Record<ResourceKind, number> = {
+    document: 0,
+    table: 0,
+    file: 0,
+  };
+  const visit = (node: TreeNode) => {
+    if (node.kind !== "collection") counts[node.kind] += 1;
+    node.children?.forEach(visit);
+  };
+  nodes.forEach(visit);
+  return counts;
+}
+
+function CollectionActionsMenu({
+  node,
+  editable,
+  onOpenDetails,
+  onCreateDoc,
+  onUploadFile,
+  onCreateTable,
+  onCreateSubCollection,
+  onDelete,
+}: {
+  node: TreeNode;
+  editable: boolean;
+  onOpenDetails: () => void;
+  onCreateDoc?: () => void;
+  onUploadFile?: () => void;
+  onCreateTable?: () => void;
+  onCreateSubCollection?: () => void;
+  onDelete?: () => void;
+}) {
+  const hasWriteActions = Boolean(
+    onCreateDoc || onUploadFile || onCreateTable || onCreateSubCollection || onDelete,
+  );
+  const itemClass =
+    "flex cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-hover";
+
+  return (
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger asChild>
+        <button
+          type="button"
+          title={`Collection actions for ${node.path}`}
+          aria-label={`Collection actions for ${node.path}`}
+          className="inline-flex min-h-11 w-8 shrink-0 items-center justify-center text-foreground-muted transition-colors hover:bg-surface-hover hover:text-link focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+        >
+          <MoreHorizontal className="h-4 w-4" aria-hidden />
+        </button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content
+          align="start"
+          side="right"
+          sideOffset={4}
+          className="z-[var(--z-popover)] min-w-48 overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
+        >
+          {hasWriteActions && (
+            <DropdownMenu.Label className="px-2.5 pb-1 pt-1 text-xs font-medium text-foreground-muted">
+              Add to collection
+            </DropdownMenu.Label>
+          )}
+          {onCreateDoc && (
+            <DropdownMenu.Item onSelect={onCreateDoc} className={itemClass}>
+              <FilePlus className="h-4 w-4 text-foreground-muted" aria-hidden />
+              New document
+            </DropdownMenu.Item>
+          )}
+          {onUploadFile && (
+            <DropdownMenu.Item onSelect={onUploadFile} className={itemClass}>
+              <Upload className="h-4 w-4 text-foreground-muted" aria-hidden />
+              Upload file
+            </DropdownMenu.Item>
+          )}
+          {onCreateTable && (
+            <DropdownMenu.Item onSelect={onCreateTable} className={itemClass}>
+              <Table className="h-4 w-4 text-foreground-muted" aria-hidden />
+              New table
+            </DropdownMenu.Item>
+          )}
+          {onCreateSubCollection && (
+            <DropdownMenu.Item onSelect={onCreateSubCollection} className={itemClass}>
+              <FolderPlus className="h-4 w-4 text-foreground-muted" aria-hidden />
+              New sub-collection
+            </DropdownMenu.Item>
+          )}
+          {hasWriteActions && <DropdownMenu.Separator className="my-1 h-px bg-border" />}
+          <DropdownMenu.Item onSelect={onOpenDetails} className={itemClass}>
+            <Info className="h-4 w-4 text-foreground-muted" aria-hidden />
+            {editable ? "View or edit summary" : "View details"}
+          </DropdownMenu.Item>
+          {onDelete && (
+            <>
+              <DropdownMenu.Separator className="my-1 h-px bg-border" />
+              <DropdownMenu.Item
+                onSelect={onDelete}
+                className={`${itemClass} text-destructive data-[highlighted]:bg-destructive-soft`}
+              >
+                <Trash2 className="h-4 w-4" aria-hidden />
+                Delete collection
+              </DropdownMenu.Item>
+            </>
+          )}
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  );
+}
+
+function RootCreateMenu({
+  triggerClassName,
+  onCreateDocument,
+  onUploadFile,
+  onCreateTable,
+  onCreateCollection,
+}: {
+  triggerClassName: string;
+  onCreateDocument: () => void;
+  onUploadFile: () => void;
+  onCreateTable: () => void;
+  onCreateCollection: () => void;
+}) {
+  const itemClass =
+    "flex cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-hover";
+  return (
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger asChild>
+        <button
+          type="button"
+          aria-label="Create in vault"
+          title="Create in vault"
+          className={triggerClassName}
+        >
+          <Plus className="h-3.5 w-3.5" aria-hidden />
+        </button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content
+          align="end"
+          sideOffset={4}
+          className="z-[var(--z-popover)] min-w-48 overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
+        >
+          <DropdownMenu.Label className="px-2.5 pb-1 pt-1 text-xs font-medium text-foreground-muted">
+            Create at Vault root
+          </DropdownMenu.Label>
+          <DropdownMenu.Item onSelect={onCreateDocument} className={itemClass}>
+            <FilePlus className="h-4 w-4 text-foreground-muted" aria-hidden />
+            New document
+          </DropdownMenu.Item>
+          <DropdownMenu.Item onSelect={onUploadFile} className={itemClass}>
+            <Upload className="h-4 w-4 text-foreground-muted" aria-hidden />
+            Upload file
+          </DropdownMenu.Item>
+          <DropdownMenu.Item onSelect={onCreateTable} className={itemClass}>
+            <Table className="h-4 w-4 text-foreground-muted" aria-hidden />
+            New table
+          </DropdownMenu.Item>
+          <DropdownMenu.Item onSelect={onCreateCollection} className={itemClass}>
+            <FolderPlus className="h-4 w-4 text-foreground-muted" aria-hidden />
+            New collection
+          </DropdownMenu.Item>
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  );
+}
+
 function findNextByPrefix(rows: FlatRow[], start: number, prefix: string): number {
   const n = rows.length;
   for (let i = 0; i < n; i++) {
     const k = (start + i) % n;
-    if (rows[k].node.name.toLowerCase().startsWith(prefix)) return k;
+    if (rowLabel(rows[k]).toLowerCase().startsWith(prefix)) return k;
   }
   return -1;
+}
+
+function rowLabel(row: FlatRow): string {
+  if (row.type === "node") return row.node.name;
+  if (row.type === "kind-group") return KIND_LABEL[row.kind] ?? "Resources";
+  return `Show more ${KIND_LABEL[row.kind] ?? "resources"}`;
 }
 
 function cssEscape(s: string): string {

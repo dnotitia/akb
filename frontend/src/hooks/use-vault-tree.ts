@@ -41,11 +41,10 @@ interface BrowseItem {
  * misnomer "depth=2" (= "include documents"); this code requests the
  * unbounded subtree explicitly so the tree builder sees every node.
  *
- * Scaling note: assumes the vault fits in a single browse response
- * comfortably. The largest real vault today holds ~30 items; when (if) a
- * vault grows past a few thousand, switch the initial call to `depth=1`
- * and add a per-collection lazy-load on expand. Not implemented now
- * because it would be unreachable code under current sizes.
+ * Compatibility note: older backends expose no cursor or kind filter, so the
+ * client still requests the full subtree. VaultExplorer limits DOM work with
+ * kind disclosures and progressive pages. True network/memory scaling will
+ * require a future browse contract with collection + kind + cursor inputs.
  */
 export function useVaultTree(vault: string | undefined) {
   const [items, setItems] = useState<BrowseItem[] | null>(null);

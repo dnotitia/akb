@@ -71,10 +71,12 @@ import remarkGfm from "remark-gfm";
 import { AssetImage } from "@/components/asset-image";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { ApiError, discardAsset, uploadAsset } from "@/lib/api";
+import { discardAsset, uploadAsset } from "@/lib/api";
 import {
   assetIdFromUrl,
+  classifyEditorImageUploadFailure,
   EDITOR_IMAGE_MIME_TYPES,
+  prepareEditorImage,
   validateEditorImage,
 } from "@/lib/image-assets";
 import { cn, sanitizeLinkUrl } from "@/lib/utils";
@@ -440,15 +442,19 @@ interface EditorToolbarProps {
   uploadingImage: boolean;
   onChooseImages: (files: File[]) => void;
   appearance: "framed" | "canvas" | "workspace";
+  imageInputRef: React.RefObject<HTMLInputElement | null>;
 }
 
-function EditorToolbar({ uploadingImage, onChooseImages, appearance }: EditorToolbarProps) {
+function EditorToolbar({
+  uploadingImage,
+  onChooseImages,
+  appearance,
+  imageInputRef,
+}: EditorToolbarProps) {
   // useEditorState re-renders on editor changes so active states stay in sync;
   // useEditorRef gives a stable handle for the mutating callbacks.
   const editor = useEditorRef();
   const state = useEditorState();
-  const imageInputRef = React.useRef<HTMLInputElement>(null);
-
   // Active mark lookup — editor.api.marks() returns the marks that would apply
   // at the current selection (null when none).
   const marks = (state.api.marks() ?? {}) as Record<string, unknown>;
@@ -693,6 +699,7 @@ export function MarkdownEditor({
     kind: "error" | "queued";
   } | null>(null);
   const uploadControllerRef = React.useRef<AbortController | null>(null);
+  const imageInputRef = React.useRef<HTMLInputElement>(null);
   const uploadInFlightRef = React.useRef(false);
   const deferredImageFilesRef = React.useRef<File[]>([]);
   const unclaimedAssetIdsRef = React.useRef(new Set<string>());
@@ -816,8 +823,12 @@ export function MarkdownEditor({
       try {
         for (const [index, file] of files.entries()) {
           currentFileIndex = index;
-          setUploadingName(file.name);
-          const asset = await uploadAsset(vault, file, controller.signal);
+          setUploadingName(`Checking ${file.name}`);
+          const prepared = await prepareEditorImage(file);
+          setUploadingName(
+            prepared.optimized ? `Uploading optimized ${file.name}` : file.name,
+          );
+          const asset = await uploadAsset(vault, prepared.file, controller.signal);
           const assetId = assetIdFromUrl(asset.url);
           if (!assetId || assetId !== asset.id) {
             throw new Error("The image upload returned an invalid asset URL.");
@@ -850,15 +861,17 @@ export function MarkdownEditor({
           (error instanceof DOMException && error.name === "AbortError");
         failed = true;
         if (!aborted && mountedRef.current) {
-          const message =
-            error instanceof ApiError || error instanceof Error
-              ? error.message
-              : "The image could not be uploaded.";
+          const failure = classifyEditorImageUploadFailure(
+            error,
+            files[currentFileIndex],
+          );
           const deferred = deferredImageFilesRef.current.splice(0);
           setUploadFailure({
-            files: [...files.slice(currentFileIndex), ...deferred],
-            message,
-            retryable: true,
+            files: failure.retryable
+              ? [...files.slice(currentFileIndex), ...deferred]
+              : [],
+            message: failure.message,
+            retryable: failure.retryable,
             kind: "error",
           });
         } else if (mountedRef.current && deferredImageFilesRef.current.length > 0) {
@@ -984,6 +997,7 @@ export function MarkdownEditor({
           uploadingImage={uploadingImage}
           onChooseImages={(files) => void uploadImages(files)}
           appearance={appearance}
+          imageInputRef={imageInputRef}
         />
       )}
       {uploadingImage && (
@@ -1008,33 +1022,43 @@ export function MarkdownEditor({
           title={uploadFailure.kind === "queued" ? "Images waiting to upload" : "Image upload failed"}
           className="border-x border-t-0"
         >
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <span>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <span className="min-w-0 flex-1">
               {uploadFailure.message}
               {uploadFailure.files.length > 1
                 ? ` ${uploadFailure.files.length} images remain in this batch.`
                 : ""}
             </span>
-            {uploadFailure.retryable ? (
+            <div className="flex flex-wrap items-center gap-1.5">
+              {uploadFailure.retryable && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void uploadImages(uploadFailure.files)}
+                >
+                  <RotateCcw className="h-3.5 w-3.5" aria-hidden />
+                  {uploadFailure.kind === "queued" ? "Upload" : "Retry"}
+                </Button>
+              )}
               <Button
                 type="button"
                 variant="outline"
                 size="sm"
-                onClick={() => void uploadImages(uploadFailure.files)}
+                onClick={() => imageInputRef.current?.click()}
               >
-                <RotateCcw className="h-3.5 w-3.5" aria-hidden />
-                {uploadFailure.kind === "queued" ? "Upload" : "Retry"}
+                <ImagePlus className="h-3.5 w-3.5" aria-hidden />
+                Choose another
               </Button>
-            ) : (
               <Button
                 type="button"
-                variant="outline"
+                variant="ghost"
                 size="sm"
                 onClick={() => setUploadFailure(null)}
               >
                 Dismiss
               </Button>
-            )}
+            </div>
           </div>
         </Alert>
       )}

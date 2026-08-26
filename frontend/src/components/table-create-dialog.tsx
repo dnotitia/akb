@@ -48,12 +48,14 @@ export function TableCreateDialog({
   open,
   onOpenChange,
   vault,
+  initialCollection = "",
   onCreated,
   returnFocusRef,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   vault: string;
+  initialCollection?: string;
   onCreated: (tableName: string) => void;
   returnFocusRef?: RefObject<HTMLElement | null>;
 }) {
@@ -68,7 +70,10 @@ export function TableCreateDialog({
   const [error, setError] = useState("");
 
   useEffect(() => {
-    if (open) return;
+    if (open) {
+      setCollection(initialCollection.trim());
+      return;
+    }
     setName("");
     setDescription("");
     setCollection("");
@@ -76,7 +81,7 @@ export function TableCreateDialog({
     nextColumnKey.current = 2;
     setSubmitted(false);
     setError("");
-  }, [open]);
+  }, [open, initialCollection]);
 
   const tableNameError = identifierError(name, "Table name");
   const columnErrors = columns.map((column, index) =>

@@ -9,7 +9,13 @@ export function DocumentOutline({
   articleEl: HTMLElement | null;
 }) {
   const { headings, activeSlug } = useDocOutline(markdown, { root: articleEl });
-  if (headings.length === 0) return null;
+  if (headings.length === 0) {
+    return (
+      <p className="text-sm leading-relaxed text-foreground-muted">
+        No headings in this document yet.
+      </p>
+    );
+  }
 
   // Normalize so the shallowest level sits flush-left, even if the doc starts
   // at H2 or uses only H3/H4.
