@@ -86,6 +86,29 @@ describe("Layout — auth gate", () => {
     expect(screen.queryByTestId("home")).toBeNull();
   });
 
+  it("requires a Bearer token before entering through legacy hybrid mode", async () => {
+    vi.mocked(api.getAuthConfig).mockResolvedValue({
+      available: true,
+      schema_version: 1,
+      auth_mode: "hybrid",
+      local_auth: { enabled: true },
+      keycloak: { enabled: true, browser_session_ready: false },
+      providers: [{
+        provider_type: "legacy-keycloak-oidc",
+        alias: "legacy-keycloak",
+        display_name: "SSO",
+        login_url: "/api/v1/auth/keycloak/login",
+      }],
+      mcp_oauth: { enabled: true },
+    });
+    vi.mocked(api.getToken).mockReturnValue(null);
+
+    renderAt("/");
+
+    expect(await screen.findByTestId("auth-page")).toBeTruthy();
+    expect(api.getMe).not.toHaveBeenCalled();
+  });
+
   it("renders the outlet only after the local token is verified", async () => {
     vi.mocked(api.getToken).mockReturnValue("fake-jwt");
     renderAt("/");

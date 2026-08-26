@@ -161,7 +161,7 @@ export default function SettingsPage() {
       : "profile";
   const localPasswordEnabled =
     authConfig?.available === true &&
-    authConfig.auth_mode === "local" &&
+    (authConfig.auth_mode === "local" || authConfig.auth_mode === "hybrid") &&
     authConfig.local_auth.enabled;
   const mcpOauthEnabled =
     authConfig?.available === true && authConfig.mcp_oauth.enabled;

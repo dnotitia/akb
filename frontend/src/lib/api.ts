@@ -1,12 +1,15 @@
 const API_BASE = "/api/v1";
 
 export type AuthMode = "local" | "sso";
+export type PublicAuthMode = AuthMode | "hybrid";
 
 let _token: string | null = null;
 let _authMode: AuthMode | null = null;
 let _authSessionGeneration = 0;
 const SAFE_AUTH_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 const LOCAL_TOKEN_STORAGE_KEY = "akb_token";
+const LEGACY_SSO_SESSION_KEY = "akb_legacy_sso";
+const LEGACY_SSO_ID_TOKEN_KEY = "akb_legacy_kc_id_token";
 
 const PRIVATE_ASSET_CACHE_MAX_ENTRIES = 32;
 const PRIVATE_ASSET_CACHE_MAX_BYTES = 64 * 1024 * 1024;
@@ -58,6 +61,54 @@ export function setToken(t: string | null) {
   }
   _token = t;
   writeStoredToken(t);
+}
+
+/**
+ * Temporary compatibility marker for the pre-browser-session Keycloak flow.
+ * The legacy backend exchanges a one-time callback code for the same Bearer
+ * JWT used by local login, so transport remains `local`; this marker exists
+ * only to choose the matching RP-initiated logout route. Session storage keeps
+ * the optional Keycloak hint scoped to the tab that completed the redirect.
+ */
+export function markLegacySsoSession(idToken?: unknown) {
+  try {
+    sessionStorage.setItem(LEGACY_SSO_SESSION_KEY, "1");
+    if (
+      typeof idToken === "string" &&
+      idToken.length > 0 &&
+      idToken.length <= 16_384 &&
+      !hasControlCharacters(idToken)
+    ) {
+      sessionStorage.setItem(LEGACY_SSO_ID_TOKEN_KEY, idToken);
+    } else {
+      sessionStorage.removeItem(LEGACY_SSO_ID_TOKEN_KEY);
+    }
+  } catch {
+    // The Bearer session remains usable when storage is blocked; only the
+    // seamless Keycloak logout hint is lost.
+  }
+}
+
+export function clearLegacySsoSession() {
+  try {
+    sessionStorage.removeItem(LEGACY_SSO_SESSION_KEY);
+    sessionStorage.removeItem(LEGACY_SSO_ID_TOKEN_KEY);
+  } catch {
+    // Best effort; the AKB Bearer token is cleared independently.
+  }
+}
+
+function legacySsoLogoutUrl(): string | null {
+  try {
+    if (sessionStorage.getItem(LEGACY_SSO_SESSION_KEY) !== "1") return null;
+    const hint = sessionStorage.getItem(LEGACY_SSO_ID_TOKEN_KEY);
+    const search = new URLSearchParams();
+    if (hint) search.set("id_token_hint", hint);
+    const query = search.toString();
+    return `${API_BASE}/auth/keycloak/logout${query ? `?${query}` : ""}`;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -190,6 +241,7 @@ function withAuthCarrier(headers: HeadersInit | undefined, method: string): Head
 function expireUnauthorizedSession(redirect: boolean) {
   if (_authMode === "local" || getToken() !== null) {
     setToken(null);
+    clearLegacySsoSession();
   } else {
     _authSessionGeneration += 1;
     clearPrivateAssetCache();
@@ -328,8 +380,8 @@ export interface AuthProviderOption {
 
 export interface AuthConfig {
   available: boolean;
-  schema_version: 2 | null;
-  auth_mode: AuthMode | null;
+  schema_version: 1 | 2 | null;
+  auth_mode: PublicAuthMode | null;
   local_auth: { enabled: boolean };
   keycloak: {
     enabled: boolean;
@@ -375,7 +427,7 @@ function hasControlCharacters(value: string): boolean {
   });
 }
 
-export function parseAuthConfig(value: unknown): AuthConfig {
+function parseV2AuthConfig(value: unknown): AuthConfig | null {
   const root = record(value);
   const localAuth = record(root?.local_auth);
   const keycloak = record(root?.keycloak);
@@ -400,14 +452,14 @@ export function parseAuthConfig(value: unknown): AuthConfig {
     (keycloak.browser_session_ready && !keycloak.enabled) ||
     (mode === "local" && providerValues.length !== 0)
   ) {
-    return AUTH_CONFIG_UNAVAILABLE;
+    return null;
   }
   const aliases = new Set<string>();
   const providers: AuthProviderOption[] = [];
   for (const value of providerValues) {
     const provider = record(value);
     if (!hasExactKeys(provider, ["provider_type", "alias", "display_name", "login_url"])) {
-      return AUTH_CONFIG_UNAVAILABLE;
+      return null;
     }
     const providerType = provider.provider_type;
     const alias = provider.alias;
@@ -427,7 +479,7 @@ export function parseAuthConfig(value: unknown): AuthConfig {
       (!keycloak.browser_session_ready && loginUrl !== null) ||
       (keycloak.browser_session_ready && loginUrl !== `/api/v1/auth/sso/${alias}/login`)
     ) {
-      return AUTH_CONFIG_UNAVAILABLE;
+      return null;
     }
     aliases.add(alias);
     providers.push({
@@ -451,6 +503,73 @@ export function parseAuthConfig(value: unknown): AuthConfig {
   };
 }
 
+/**
+ * Exact adapter for the last unversioned hybrid contract shipped before the
+ * server-custodied SSO transition. Do not broaden this parser: unknown legacy
+ * shapes must continue to fail closed instead of being guessed into policy.
+ */
+function parseLegacyHybridAuthConfig(value: unknown): AuthConfig | null {
+  const root = record(value);
+  const localAuth = record(root?.local_auth);
+  const keycloak = record(root?.keycloak);
+  const mcpOauth = record(root?.mcp_oauth);
+  const keycloakEnabled = keycloak?.enabled;
+  const loginUrl = keycloak?.login_url;
+  const ssoOnly = keycloak?.sso_only;
+  const enrollmentMode = keycloak?.enrollment_mode;
+  if (
+    !hasExactKeys(root, ["local_auth", "keycloak", "mcp_oauth"]) ||
+    !hasExactKeys(localAuth, ["enabled"]) ||
+    !hasExactKeys(keycloak, ["enabled", "enrollment_mode", "login_url", "sso_only"]) ||
+    !hasExactKeys(mcpOauth, ["enabled"]) ||
+    typeof localAuth.enabled !== "boolean" ||
+    typeof keycloakEnabled !== "boolean" ||
+    typeof ssoOnly !== "boolean" ||
+    !["open", "invite_only", "disabled"].includes(String(enrollmentMode)) ||
+    typeof mcpOauth.enabled !== "boolean" ||
+    loginUrl !== (keycloakEnabled ? "/api/v1/auth/keycloak/login" : null) ||
+    (ssoOnly && !keycloakEnabled)
+  ) {
+    return null;
+  }
+
+  // `sso_only` was a server-owned presentation policy. Its recovery escape is
+  // intentionally not revived: when set, the compatibility client exposes no
+  // local form even if the old payload also reports local_auth.enabled=true.
+  const localEnabled = localAuth.enabled && !ssoOnly;
+  if (!localEnabled && !keycloakEnabled) return null;
+
+  return {
+    available: true,
+    schema_version: 1,
+    auth_mode: keycloakEnabled ? "hybrid" : "local",
+    local_auth: { enabled: localEnabled },
+    keycloak: {
+      enabled: keycloakEnabled,
+      // Legacy Keycloak exchanges into a Bearer JWT. It is intentionally not
+      // represented as the v2 HttpOnly browser-session transport.
+      browser_session_ready: false,
+    },
+    providers: keycloakEnabled
+      ? [{
+          provider_type: "legacy-keycloak-oidc",
+          alias: "legacy-keycloak",
+          display_name: "SSO",
+          login_url: "/api/v1/auth/keycloak/login",
+        }]
+      : [],
+    mcp_oauth: { enabled: mcpOauth.enabled },
+  };
+}
+
+export function parseAuthConfig(value: unknown): AuthConfig {
+  return (
+    parseV2AuthConfig(value) ??
+    parseLegacyHybridAuthConfig(value) ??
+    AUTH_CONFIG_UNAVAILABLE
+  );
+}
+
 /** Versioned public capabilities. Any transport/schema error is deny-all. */
 export async function getAuthConfig(): Promise<AuthConfig> {
   try {
@@ -458,7 +577,7 @@ export async function getAuthConfig(): Promise<AuthConfig> {
     if (!response.ok) return AUTH_CONFIG_UNAVAILABLE;
     const config = parseAuthConfig(await response.json());
     if (config.available && config.auth_mode !== null) {
-      configureAuthTransport(config.auth_mode);
+      configureAuthTransport(config.auth_mode === "hybrid" ? "local" : config.auth_mode);
     }
     return config;
   } catch {
@@ -890,8 +1009,12 @@ export interface OrdinaryLogoutResult {
 export async function logoutOrdinarySession(): Promise<OrdinaryLogoutResult> {
   const mode = _authMode === "sso" ? "sso" : "local";
   if (mode === "local") {
+    const legacyLogout = legacySsoLogoutUrl();
     setToken(null);
-    return { mode, logout_url: "/auth" };
+    clearLegacySsoSession();
+    return legacyLogout
+      ? { mode: "sso", logout_url: legacyLogout }
+      : { mode, logout_url: "/auth" };
   }
   const response = await authenticatedFetch(
     `${API_BASE}/auth/logout`,
@@ -927,6 +1050,14 @@ export async function logoutOrdinarySession(): Promise<OrdinaryLogoutResult> {
   clearPrivateAssetCache();
   return { mode, logout_url: navigation.href };
 }
+
+/** Redeem the legacy one-time Keycloak callback code for an AKB Bearer JWT. */
+export const keycloakExchange = (code: string) =>
+  fetch(`${API_BASE}/auth/keycloak/exchange`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code }),
+  }).then(parseAuthResponse);
 
 export const createPAT = (name: string, scopes?: string[], expires_days?: number) =>
   api<any>("/auth/tokens", { method: "POST", body: JSON.stringify({ name, scopes, expires_days }) });

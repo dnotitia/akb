@@ -4,6 +4,7 @@ import { ArrowRight, Database, Boxes, GitBranch } from "lucide-react";
 import {
   authLogin,
   authRegister,
+  clearLegacySsoSession,
   getAuthConfig,
   getMe,
   getToken,
@@ -53,15 +54,16 @@ export default function AuthPage() {
   const next = safeNext(new URLSearchParams(window.location.search).get("next"));
   const localAuthEnabled =
     authConfig?.available === true &&
-    authConfig.auth_mode === "local" &&
+    (authConfig.auth_mode === "local" || authConfig.auth_mode === "hybrid") &&
     authConfig.local_auth.enabled;
   const ssoConfigEnabled =
     authConfig?.available === true &&
-    authConfig.auth_mode === "sso" &&
+    (authConfig.auth_mode === "sso" || authConfig.auth_mode === "hybrid") &&
     authConfig.keycloak.enabled;
   const ssoProviders = ssoConfigEnabled ? authConfig.providers : [];
   const usableSsoProviders =
-    ssoConfigEnabled && authConfig.keycloak.browser_session_ready
+    ssoConfigEnabled &&
+    (authConfig.schema_version === 1 || authConfig.keycloak.browser_session_ready)
       ? ssoProviders.filter((provider) => provider.login_url !== null)
       : [];
 
@@ -134,6 +136,7 @@ export default function AuthPage() {
         return;
       }
       setToken(r.token);
+      clearLegacySsoSession();
       try {
         if ("PasswordCredential" in window) {
           const cred = new PasswordCredential({ id: username, password });
@@ -261,7 +264,12 @@ export default function AuthPage() {
             )}
 
             {usableSsoProviders.length > 0 && (
-              <div className="space-y-3">
+              <div
+                className={cn(
+                  "space-y-3",
+                  localAuthEnabled && "mt-6 border-t border-border pt-6",
+                )}
+              >
                 {usableSsoProviders.map((provider) => (
                   <Button
                     key={provider.alias}
