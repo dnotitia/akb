@@ -36,7 +36,7 @@ export const ReadyNoQuery: Story = {
     const canvas = within(canvasElement);
     await expect(await canvas.findByRole("heading", { name: "Suggested searches" })).toBeInTheDocument();
     await expect(canvas.getByRole("search", { name: "Search all vaults" })).toBeInTheDocument();
-    await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("navigation", { name: "Workspace navigation" })).toBeInTheDocument();
     await expect(canvas.queryByRole("navigation", { name: "Vaults" })).not.toBeInTheDocument();
   },
 };
@@ -57,7 +57,7 @@ export const SemanticResults: Story = {
     const canvas = within(canvasElement);
     await expect(await canvas.findByText("AKB Guide")).toBeInTheDocument();
     await expect(canvas.getByText("storybook.png")).toBeInTheDocument();
-    await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("navigation", { name: "Workspace navigation" })).toBeInTheDocument();
   },
 };
 
@@ -76,7 +76,7 @@ export const SemanticNoResults: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(await canvas.findByRole("heading", { name: /No results/i })).toBeInTheDocument();
-    await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("navigation", { name: "Workspace navigation" })).toBeInTheDocument();
   },
 };
 
@@ -95,7 +95,7 @@ export const SemanticDegraded: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(await canvas.findByText(/Search is degraded/i)).toBeInTheDocument();
-    await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("navigation", { name: "Workspace navigation" })).toBeInTheDocument();
   },
 };
 
@@ -116,7 +116,7 @@ export const SemanticError: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(await canvas.findByText(/Vector store unavailable/i)).toBeInTheDocument();
-    await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("navigation", { name: "Workspace navigation" })).toBeInTheDocument();
   },
 };
 
@@ -136,7 +136,7 @@ export const LiteralResults: Story = {
     const canvas = within(canvasElement);
     await expect(await canvas.findByText("Token runbook")).toBeInTheDocument();
     await expect(canvas.getByText(/Rotate a personal access token/i)).toBeInTheDocument();
-    await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("navigation", { name: "Workspace navigation" })).toBeInTheDocument();
   },
 };
 
@@ -156,7 +156,7 @@ export const ScopedVaultSearch: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(await canvas.findByRole("navigation", { name: "Vaults" })).toBeInTheDocument();
-    await expect(await canvas.findByRole("tree", { name: "akb explorer" })).toBeInTheDocument();
-    await expect(canvas.getByText("Search all vaults")).toBeInTheDocument();
+    await expect(await canvas.findByRole("navigation", { name: "Collections (collapsed)" })).toBeInTheDocument();
+    await expect(canvas.getByRole("link", { name: /All vaults/i })).toBeInTheDocument();
   },
 };

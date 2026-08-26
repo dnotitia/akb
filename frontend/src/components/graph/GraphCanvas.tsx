@@ -1,7 +1,6 @@
 // frontend/src/components/graph/GraphCanvas.tsx
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import ForceGraph2D, { type ForceGraphMethods } from "react-force-graph-2d";
-import { Pause, Play, Maximize2, Minus, Plus, Boxes, Crosshair } from "lucide-react";
 import { useTheme } from "@/hooks/use-theme";
 import {
   RELATION_DASH,
@@ -12,7 +11,6 @@ import {
   type GraphColors,
 } from "./graph-types";
 import { endpointUri, degreeMap, impactCones } from "./use-graph-data";
-import { KindSwatch, RelationSwatch } from "./graph-swatches";
 import {
   groupColor,
   forceCluster,
@@ -72,6 +70,9 @@ function traceNode(ctx: CanvasRenderingContext2D, kind: GraphNode["kind"], x: nu
 
 export interface GraphCanvasHandle {
   centerOnNode: (uri: string) => void;
+  fit: () => void;
+  zoomIn: () => void;
+  zoomOut: () => void;
 }
 
 interface Props {
@@ -161,19 +162,19 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   // App sans stack for canvas labels — read once (theme-independent).
   const [fontSans] = useState(() => readFontSans());
   // Snap (don't animate) the layout when the OS asks for reduced motion.
-  const [frozen, setFrozen] = useState(() => prefersReducedMotion());
+  const [frozen] = useState(() => prefersReducedMotion());
   // Latest frozen flag, read inside the cluster/expand reheat path without
   // making those effects depend on it — so Freeze/Resume never reinstalls the
   // forces, yet a reheat still respects the live state (reduced-motion Resume).
   const frozenRef = useRef(frozen);
   frozenRef.current = frozen;
-  const [clustered, setClustered] = useState(true);
+  const clustered = true;
   // Impact-analysis mode: when on + a node selected, light its directed
   // STRUCTURAL dependency cone (teal, outgoing) + dependent cone (orange,
   // incoming) and dim the rest — "what does this depend on, and what depends
   // on it" before an edit/delete. Client-side (edges carry directed
   // source/target + relation); no backend.
-  const [impactMode, setImpactMode] = useState(false);
+  const impactMode = false;
   const [hovered, setHovered] = useState<string>();
   const [size, setSize] = useState({ w: 0, h: 0 });
 
@@ -271,6 +272,11 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         fgRef.current?.centerAt(n.x, n.y, 400);
         fgRef.current?.zoom(Math.max(fgRef.current?.zoom() || 1, 1.5), 400);
       },
+      fit: () => fgRef.current?.zoomToFit(400, 60),
+      zoomIn: () =>
+        fgRef.current?.zoom((fgRef.current?.zoom() || 1) * 1.25, 200),
+      zoomOut: () =>
+        fgRef.current?.zoom((fgRef.current?.zoom() || 1) * 0.8, 200),
     }),
     [nodes],
   );
@@ -870,56 +876,6 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       role="img"
       aria-label={`Knowledge graph: ${nodes.length} nodes, ${edges.length} edges`}
     >
-      <div className="absolute top-3 left-3 z-[var(--z-raised)] flex gap-1">
-        <CanvasButton
-          onClick={() => setClustered((c) => !c)}
-          label={clustered ? "Hide clusters" : "Show clusters"}
-          icon={Boxes}
-          active={clustered}
-        />
-        <CanvasButton
-          onClick={() => setImpactMode((m) => !m)}
-          label={impactMode ? "Exit impact mode" : "Impact mode (select a node to see its deps)"}
-          icon={Crosshair}
-          active={impactMode}
-        />
-        <CanvasButton
-          onClick={() => setFrozen((f) => !f)}
-          label={frozen ? "Resume" : "Freeze"}
-          icon={frozen ? Play : Pause}
-        />
-        <CanvasButton
-          onClick={() => fgRef.current?.zoomToFit(400, 60)}
-          label="Fit"
-          icon={Maximize2}
-        />
-        <CanvasButton
-          onClick={() => fgRef.current?.zoom((fgRef.current?.zoom() || 1) * 0.8, 200)}
-          label="Zoom out"
-          icon={Minus}
-        />
-        <CanvasButton
-          onClick={() => fgRef.current?.zoom((fgRef.current?.zoom() || 1) * 1.25, 200)}
-          label="Zoom in"
-          icon={Plus}
-        />
-      </div>
-      {impactMode && (
-        <div className="absolute top-14 left-3 z-[var(--z-raised)] rounded-[var(--radius-md)] border border-border bg-surface/90 backdrop-blur px-2.5 py-1.5 shadow-sm text-[11px] text-foreground-muted">
-          <div className="flex items-center gap-3">
-            <span className="flex items-center gap-1.5">
-              <span className="inline-block h-2.5 w-2.5 rounded-full bg-[var(--color-primary)]" aria-hidden />
-              depends&nbsp;on
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="inline-block h-2.5 w-2.5 rounded-full bg-[var(--color-accent)]" aria-hidden />
-              dependents
-            </span>
-            {!selected && <span className="text-foreground-muted/70">— select a node</span>}
-          </div>
-        </div>
-      )}
-      <GraphLegend />
       <ForceGraph2D
         ref={fgRef as never}
         graphData={graphData as never}
@@ -989,90 +945,3 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     </div>
   );
 });
-
-/** Static legend: node kinds + the structural-vs-associative edge encoding.
- *  Collapsible so it never competes with the graph; tokens only (no hex). */
-function GraphLegend() {
-  const [open, setOpen] = useState(true);
-  return (
-    <div className="absolute bottom-3 right-3 z-[var(--z-raised)]">
-      {open ? (
-        <div className="rounded-[var(--radius-md)] border border-border bg-surface/90 backdrop-blur px-3 py-2 shadow-sm text-[11px] text-foreground-muted">
-          <div className="flex items-center justify-between gap-4 mb-1.5">
-            <span className="font-medium text-foreground">Legend</span>
-            <button
-              type="button"
-              onClick={() => setOpen(false)}
-              aria-label="Hide legend"
-              className="text-foreground-muted hover:text-foreground cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              <Minus className="h-3 w-3" aria-hidden />
-            </button>
-          </div>
-          <ul className="space-y-1">
-            <li className="flex items-center gap-2">
-              <KindSwatch kind="document" />
-              Document
-            </li>
-            <li className="flex items-center gap-2">
-              <KindSwatch kind="table" />
-              Table
-            </li>
-            <li className="flex items-center gap-2">
-              <KindSwatch kind="file" />
-              File
-            </li>
-            <li className="flex items-center gap-2 pt-1">
-              <RelationSwatch relation="depends_on" />
-              Structural
-            </li>
-            <li className="flex items-center gap-2">
-              <RelationSwatch relation="references" />
-              Associative
-            </li>
-          </ul>
-        </div>
-      ) : (
-        <button
-          type="button"
-          onClick={() => setOpen(true)}
-          aria-label="Show legend"
-          title="Legend"
-          className="inline-flex items-center justify-center h-8 w-8 rounded-[var(--radius-md)] border border-border bg-surface shadow-sm text-foreground-muted hover:text-foreground hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-        >
-          <Boxes className="h-3 w-3" aria-hidden />
-        </button>
-      )}
-    </div>
-  );
-}
-
-function CanvasButton({
-  onClick,
-  label,
-  icon: Icon,
-  active = false,
-}: {
-  onClick: () => void;
-  label: string;
-  icon: React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
-  /** Renders a pressed/accent state for toggle buttons. */
-  active?: boolean;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      title={label}
-      aria-label={label}
-      aria-pressed={active}
-      className={`inline-flex items-center justify-center h-8 w-8 rounded-[var(--radius-md)] border shadow-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background transition-colors cursor-pointer ${
-        active
-          ? "bg-surface-selected border-primary text-surface-selected-foreground"
-          : "bg-surface border-border text-foreground-muted hover:text-foreground hover:bg-surface-hover"
-      }`}
-    >
-      <Icon className="h-3 w-3" aria-hidden />
-    </button>
-  );
-}

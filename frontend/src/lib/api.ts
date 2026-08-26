@@ -1407,7 +1407,10 @@ export const getGraph = (vault: string, docPath?: string, hops = 2, limit = 50) 
   // depth). The frontend mirrors the rename so call sites stay
   // self-documenting.
   const p = new URLSearchParams({ hops: String(hops), limit: String(limit) });
-  if (docPath) p.set("uri", _docUri(vault, docPath));
+  // Focused graph search can start from documents, tables, or files. Existing
+  // document callers pass a vault-relative path; typed resources pass their
+  // canonical URI so the same backend endpoint can center the BFS correctly.
+  if (docPath) p.set("uri", docPath.startsWith("akb://") ? docPath : _docUri(vault, docPath));
   else p.set("vault", vault);
   return api<{ nodes: GraphApiNode[]; edges: GraphApiEdge[] }>(`/graph?${p}`);
 };
@@ -1477,7 +1480,11 @@ export interface RelationRow {
   name?: string;
 }
 export const getRelations = (vault: string, docPath: string) => {
-  const p = new URLSearchParams({ uri: _docUri(vault, docPath) });
+  // The relations endpoint accepts any typed resource URI. Document callers
+  // still pass a vault-relative path; graph callers can pass a canonical
+  // table/file URI without it being accidentally rewritten as a doc URI.
+  const uri = docPath.startsWith("akb://") ? docPath : _docUri(vault, docPath);
+  const p = new URLSearchParams({ uri });
   return api<{ uri: string; relations: RelationRow[] }>(`/relations?${p}`);
 };
 

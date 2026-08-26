@@ -172,6 +172,17 @@ describe("Layout — auth gate", () => {
     expect(screen.getByTestId("app-sidebar")).toHaveClass("lg:w-14");
   });
 
+  it("gives the advanced search route a full-height, unpadded workspace", async () => {
+    vi.mocked(api.getToken).mockReturnValue("fake-jwt");
+    renderAt("/search");
+
+    const searchPage = await screen.findByTestId("search-page");
+    expect(document.documentElement).toHaveClass("vault-workspace-scroll-lock");
+    expect(screen.getByRole("main")).toHaveClass("min-h-0", "flex-1");
+    expect(searchPage.parentElement).toBe(screen.getByRole("main"));
+    expect(screen.queryByRole("contentinfo")).toBeNull();
+  });
+
   it("accepts a verified SSO cookie session without any local token", async () => {
     vi.mocked(api.getAuthConfig).mockResolvedValue({
       available: true,

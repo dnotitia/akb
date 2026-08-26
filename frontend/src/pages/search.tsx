@@ -31,7 +31,6 @@ import { searchDocs, grepDocs, listVaults, type GrepDoc } from "@/lib/api";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Panel } from "@/components/ui/panel";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { Skeleton } from "@/components/ui/skeleton";
 import { VaultScopePicker } from "@/components/vault-scope-picker";
@@ -354,10 +353,15 @@ export default function SearchPage() {
     setRecentSearches([]);
   }
 
-  const isShortQuery =
-    q.trim().length > 0 && q.trim().length <= 6 && !/\s/.test(q.trim());
+  const normalizedQuery = q.trim();
+  const looksLikeIdentifier =
+    normalizedQuery.length >= 2 &&
+    normalizedQuery.length <= 24 &&
+    !/\s/.test(normalizedQuery) &&
+    (/[0-9_.:/-]/.test(normalizedQuery) ||
+      normalizedQuery === normalizedQuery.toUpperCase());
   const showLiteralHint =
-    mode === "dense" && isShortQuery && searched && !loading;
+    mode === "dense" && looksLikeIdentifier && searched && !loading;
   const allTypesActive = activeTypes.size === ALL_TYPES.length;
   const knownTypes = new Set<string>(ALL_TYPES);
   const typeFilteredDense = allTypesActive
@@ -423,9 +427,21 @@ export default function SearchPage() {
   const visibleRecentSearches = scopedVault
     ? recentSearches.filter((search) => search.vaults.includes(scopedVault))
     : recentSearches;
+  const resultStatus = loading
+    ? "Searching…"
+    : error
+      ? "Search unavailable"
+      : !searched
+        ? "Ready to search"
+        : mode === "dense"
+          ? denseCountSummary
+          : literalCountSummary;
 
   return (
-    <div data-testid="search-workspace" className="w-full max-w-none">
+    <div
+      data-testid="search-workspace"
+      className="flex h-full min-h-0 w-full max-w-none flex-col overflow-hidden bg-background"
+    >
       <h1 className="sr-only">Search</h1>
       <p role="status" aria-live="polite" className="sr-only">
         {loading
@@ -439,15 +455,14 @@ export default function SearchPage() {
                 : `${resultCount} results for ${q}`}
       </p>
 
-      <Panel
-        variant="workspace"
-        inset={false}
-        className="min-h-[30rem] w-full overflow-hidden border-border-strong shadow-sm"
+      <section
+        aria-label="Search workspace"
+        className="flex min-h-0 flex-1 flex-col overflow-hidden"
       >
-        <section aria-label="Search workspace">
+        <header className="relative z-[var(--z-sticky)] shrink-0 border-b border-border bg-surface">
           <form
             data-testid="search-command-header"
-            className="border-b border-border-strong bg-surface p-2.5 sm:p-3"
+            className="flex min-h-14 flex-wrap items-center gap-2 px-3 py-2.5 sm:px-4 lg:px-5"
             onSubmit={(event) => {
               event.preventDefault();
               commitQuery(draft);
@@ -462,8 +477,7 @@ export default function SearchPage() {
                 ? "Semantic search matches meaning and keywords."
                 : "Literal search matches exact text or a regular expression."}
             </span>
-            <div className="flex flex-col gap-2 sm:flex-row">
-              <div className="flex h-11 min-w-0 flex-1 items-center rounded-[var(--radius-md)] border border-border-strong bg-background px-3 transition-token focus-within:border-primary focus-within:ring-2 focus-within:ring-ring">
+            <div className="flex h-10 min-w-0 flex-1 basis-72 items-center rounded-[var(--radius-md)] border border-border-strong bg-surface-2 px-3 shadow-xs transition-token focus-within:border-primary focus-within:bg-background focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2 focus-within:ring-offset-surface">
                 <SearchIcon
                   className="mr-2.5 h-4 w-4 shrink-0 text-foreground-muted"
                   aria-hidden
@@ -485,7 +499,7 @@ export default function SearchPage() {
                       commitQuery("");
                     }
                   }}
-                  className="min-w-0 flex-1 appearance-none bg-transparent text-base text-foreground placeholder:text-foreground-muted focus:outline-none [&::-webkit-search-cancel-button]:hidden"
+                  className="min-w-0 flex-1 appearance-none bg-transparent text-sm text-foreground placeholder:text-foreground-muted focus:outline-none [&::-webkit-search-cancel-button]:hidden"
                 />
                 {draft && !loading && (
                   <button
@@ -497,27 +511,11 @@ export default function SearchPage() {
                     Clear
                   </button>
                 )}
-              </div>
-              <Button
-                type="submit"
-                variant="accent"
-                size="md"
-                loading={loading}
-                className="h-11 shrink-0 px-5 sm:min-w-24"
-              >
-                Search
-              </Button>
             </div>
-          </form>
-
-          <div
-            data-testid="search-tool-row"
-            className="flex min-h-12 flex-wrap items-center justify-between gap-2 border-b border-border-strong bg-surface-2/60 px-3 py-1.5 sm:justify-start sm:px-4"
-          >
             <div
               role="group"
               aria-label="Search mode"
-              className="inline-flex h-9 items-center rounded-[var(--radius-md)] border border-border bg-surface p-0.5"
+              className="inline-flex h-10 shrink-0 items-center rounded-[var(--radius-md)] border border-border bg-background p-1"
             >
               <button
                 type="button"
@@ -541,48 +539,6 @@ export default function SearchPage() {
               </button>
             </div>
 
-            <div className="hidden h-6 w-px bg-border sm:block" aria-hidden />
-
-            <div
-              data-testid="search-scope-row"
-              className="order-3 flex min-w-0 basis-full flex-wrap items-center gap-2 sm:order-none sm:basis-auto sm:flex-1"
-            >
-              {scopedVault ? (
-                <>
-                  <div
-                    aria-label={`Search scope: ${scopedVault}`}
-                    className="inline-flex h-9 min-w-0 items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface px-2.5 text-xs text-foreground"
-                  >
-                    <FolderSearch
-                      className="h-3.5 w-3.5 shrink-0 text-foreground-muted"
-                      aria-hidden
-                    />
-                    <span className="truncate">{scopedVault}</span>
-                    <Badge variant="outline">Fixed</Badge>
-                  </div>
-                  <Link
-                    to={allVaultsHref}
-                    className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-[var(--radius-md)] px-2.5 text-xs font-medium text-link transition-token hover:bg-surface-hover hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    All vaults
-                    <ExternalLink className="h-3.5 w-3.5" aria-hidden />
-                  </Link>
-                </>
-              ) : vaults.length > 0 ? (
-                <VaultScopePicker
-                  vaults={vaults}
-                  selected={scopeVaults}
-                  onChange={setScopeVaults}
-                  className="min-w-0 [&_button[aria-label^='Search_scope']]:h-9"
-                />
-              ) : (
-                <div className="inline-flex h-9 items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface px-2.5 text-xs text-foreground-muted">
-                  <FolderSearch className="h-3.5 w-3.5" aria-hidden />
-                  All accessible vaults
-                </div>
-              )}
-            </div>
-
             {mode === "dense" && (
               <button
                 type="button"
@@ -591,7 +547,7 @@ export default function SearchPage() {
                 aria-controls="search-filter-tray"
                 onClick={() => setFiltersOpen((open) => !open)}
                 className={cn(
-                  "inline-flex h-9 cursor-pointer items-center gap-2 rounded-[var(--radius-md)] border px-3 text-xs font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                  "inline-flex h-10 cursor-pointer items-center gap-2 rounded-[var(--radius-md)] border px-3 text-xs font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                   filtersOpen || activeFilterCount > 0
                     ? "border-border-strong bg-surface-selected text-surface-selected-foreground"
                     : "border-border bg-surface text-foreground-muted hover:border-border-strong hover:bg-surface-hover hover:text-foreground",
@@ -604,6 +560,70 @@ export default function SearchPage() {
                 )}
               </button>
             )}
+
+            <Button
+              type="submit"
+              variant="default"
+              size="md"
+              loading={loading}
+              className="h-10 shrink-0 px-4"
+            >
+              Search
+            </Button>
+          </form>
+
+          <div
+            data-testid="search-tool-row"
+            className="flex min-h-10 flex-wrap items-center justify-between gap-x-4 gap-y-2 border-t border-border px-3 py-1.5 text-xs sm:px-4 lg:px-5"
+          >
+            <div
+              data-testid="search-scope-row"
+              className="flex min-w-0 flex-1 flex-wrap items-center gap-2 text-foreground-muted"
+            >
+              <span className="shrink-0 font-medium text-foreground">Search in</span>
+              {scopedVault ? (
+                <>
+                  <div
+                    aria-label={`Search scope: ${scopedVault}`}
+                    className="inline-flex h-8 min-w-0 items-center gap-2 rounded-[var(--radius-sm)] border border-border bg-background px-2.5 text-xs text-foreground"
+                  >
+                    <FolderSearch
+                      className="h-3.5 w-3.5 shrink-0 text-foreground-muted"
+                      aria-hidden
+                    />
+                    <span className="truncate">{scopedVault}</span>
+                    <Badge variant="outline">Fixed</Badge>
+                  </div>
+                  <Link
+                    to={allVaultsHref}
+                    className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-[var(--radius-sm)] px-2 text-xs font-medium text-link transition-token hover:bg-surface-hover hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    All vaults
+                    <ExternalLink className="h-3.5 w-3.5" aria-hidden />
+                  </Link>
+                </>
+              ) : vaults.length > 0 ? (
+                <VaultScopePicker
+                  vaults={vaults}
+                  selected={scopeVaults}
+                  onChange={setScopeVaults}
+                  className="min-w-0 [&_button[aria-label^='Search_scope']]:h-8 [&_button[aria-label^='Search_scope']]:rounded-[var(--radius-sm)] [&_button[aria-label^='Search_scope']]:text-xs"
+                />
+              ) : (
+                <div className="inline-flex h-8 items-center gap-2 rounded-[var(--radius-sm)] border border-border bg-background px-2.5 text-xs text-foreground-muted">
+                  <FolderSearch className="h-3.5 w-3.5" aria-hidden />
+                  All accessible vaults
+                </div>
+              )}
+            </div>
+
+            <div className="flex w-full shrink-0 items-center justify-between gap-2 text-foreground-muted sm:w-auto sm:justify-start">
+              <span className="tabular-nums">{resultStatus}</span>
+              <span className="hidden sm:inline" aria-hidden>·</span>
+              <span className="hidden sm:inline">
+                {mode === "dense" ? "Meaning and context" : "Exact text or regex"}
+              </span>
+            </div>
           </div>
 
           {filtersOpen && mode === "dense" && (
@@ -736,12 +756,13 @@ export default function SearchPage() {
               )}
             </aside>
           )}
+        </header>
 
           <div
             role="region"
             aria-label="Search results"
             data-testid="search-results-pane"
-            className="min-h-[24rem] min-w-0 bg-surface"
+            className="rail-scroll min-h-0 min-w-0 flex-1 overflow-y-auto bg-surface"
           >
             {degraded && (
               <Alert
@@ -887,34 +908,9 @@ export default function SearchPage() {
 
             {!loading && !error && hasResults && (
               <section aria-labelledby="search-results-heading">
-                <div className="flex min-h-12 flex-wrap items-center justify-between gap-3 border-b border-border-strong bg-surface-2/60 px-4 py-2 sm:px-5">
-                  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
-                    <h2
-                      id="search-results-heading"
-                      className="text-sm font-semibold text-foreground"
-                    >
-                      Top matches
-                    </h2>
-                    <span className="max-w-full truncate text-sm text-foreground-muted">
-                      for “{q}”
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs tabular-nums text-foreground-muted">
-                      {mode === "dense"
-                        ? denseCountSummary
-                        : literalCountSummary}
-                    </span>
-                    <Badge variant="outline">
-                      {mode === "dense" ? (
-                        <Sparkles className="h-3 w-3" aria-hidden />
-                      ) : (
-                        <Braces className="h-3 w-3" aria-hidden />
-                      )}
-                      {mode === "dense" ? "Semantic" : "Literal"}
-                    </Badge>
-                  </div>
-                </div>
+                <h2 id="search-results-heading" className="sr-only">
+                  Results for {q}
+                </h2>
                 {mode === "dense" ? (
                   <DenseResultList items={visibleDense} />
                 ) : (
@@ -923,8 +919,7 @@ export default function SearchPage() {
               </section>
             )}
           </div>
-        </section>
-      </Panel>
+      </section>
     </div>
   );
 }
@@ -975,15 +970,16 @@ function SearchStartState({
   const hasDocuments = visibleDocuments.length > 0;
 
   return (
-    <div>
-      {(hasSearches || hasDocuments) && (
-        <div
-          className={cn(
-            "grid border-b border-border-strong bg-surface",
-            hasSearches && hasDocuments && "lg:grid-cols-2",
-          )}
-        >
-          {hasSearches && (
+    <div className="min-h-full bg-surface-2/40 px-3 py-6 sm:px-5 lg:py-8">
+      <div className="mx-auto w-full max-w-6xl overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface shadow-xs">
+        {(hasSearches || hasDocuments) && (
+          <div
+            className={cn(
+              "grid border-b border-border-strong bg-surface",
+              hasSearches && hasDocuments && "lg:grid-cols-2",
+            )}
+          >
+            {hasSearches && (
             <section aria-labelledby="recent-searches-heading">
               <div className="flex min-h-11 items-center justify-between gap-3 border-b border-border bg-surface-2/60 px-4 sm:px-5">
                 <div className="flex min-w-0 items-center gap-2">
@@ -1011,7 +1007,7 @@ function SearchStartState({
                     onClick={() => onRepeatSearch(search)}
                     className="group flex min-h-14 w-full cursor-pointer items-center gap-3 px-4 py-2.5 text-left transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-5"
                   >
-                    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-md)] bg-surface-2 text-foreground-muted transition-colors group-hover:text-link">
+                    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface-2 text-foreground-muted transition-colors group-hover:text-link">
                       <SearchIcon className="h-4 w-4" aria-hidden />
                     </span>
                     <span className="min-w-0 flex-1">
@@ -1038,9 +1034,9 @@ function SearchStartState({
                 ))}
               </div>
             </section>
-          )}
+            )}
 
-          {hasDocuments && (
+            {hasDocuments && (
             <section
               aria-labelledby="recent-documents-heading"
               className={cn(hasSearches && "border-t border-border lg:border-l lg:border-t-0")}
@@ -1068,7 +1064,7 @@ function SearchStartState({
                       state={documentPreviewState(location, returnFocusId)}
                       className="group flex min-h-14 items-center gap-3 px-4 py-2.5 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-5"
                     >
-                      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-md)] bg-surface-2 text-foreground-muted transition-colors group-hover:text-link">
+                      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface-2 text-foreground-muted transition-colors group-hover:text-link">
                         <FileText className="h-4 w-4" aria-hidden />
                       </span>
                       <span className="min-w-0 flex-1">
@@ -1088,54 +1084,55 @@ function SearchStartState({
                 })}
               </div>
             </section>
-          )}
-        </div>
-      )}
-
-      <section>
-        <div className="flex min-h-11 items-center justify-between gap-3 border-b border-border bg-surface-2/60 px-4 sm:px-5">
-          <div>
-            <h2
-              id="search-start-heading"
-              className="text-xs font-semibold text-foreground"
-            >
-              Suggested searches
-            </h2>
-            <p className="mt-0.5 hidden text-xs text-foreground-muted sm:block">
-              Start with an outcome, topic, or question.
-            </p>
+            )}
           </div>
-          <span className="text-xs text-foreground-muted">
-            {mode === "dense" ? "Meaning and context" : "Exact text or regex"}
-          </span>
-        </div>
-        <div
-          aria-label="Suggested searches"
-          className="grid divide-y divide-border sm:grid-cols-3 sm:divide-x sm:divide-y-0"
-        >
-          {SUGGESTED_QUERIES.map((suggestion) => (
-            <button
-              key={suggestion}
-              type="button"
-              aria-label={suggestion}
-              onClick={() => onSuggestion(suggestion)}
-              className="group flex min-h-14 w-full cursor-pointer items-center gap-3 px-4 text-left transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-5"
-            >
-              <SearchIcon
-                className="h-4 w-4 shrink-0 text-foreground-muted"
-                aria-hidden
-              />
-              <span className="min-w-0 flex-1 truncate text-sm text-foreground">
-                {suggestion}
-              </span>
-              <ArrowUpRight
-                className="hidden h-3.5 w-3.5 shrink-0 text-foreground-muted transition-colors group-hover:text-link lg:block"
-                aria-hidden
-              />
-            </button>
-          ))}
-        </div>
-      </section>
+        )}
+
+        <section>
+          <div className="flex min-h-11 items-center justify-between gap-3 border-b border-border bg-surface-2/60 px-4 sm:px-5">
+            <div>
+              <h2
+                id="search-start-heading"
+                className="text-xs font-semibold text-foreground"
+              >
+                Suggested searches
+              </h2>
+              <p className="mt-0.5 hidden text-xs text-foreground-muted sm:block">
+                Start with an outcome, topic, or question.
+              </p>
+            </div>
+            <span className="text-xs text-foreground-muted">
+              {mode === "dense" ? "Meaning and context" : "Exact text or regex"}
+            </span>
+          </div>
+          <div
+            aria-label="Suggested searches"
+            className="grid divide-y divide-border sm:grid-cols-3 sm:divide-x sm:divide-y-0"
+          >
+            {SUGGESTED_QUERIES.map((suggestion) => (
+              <button
+                key={suggestion}
+                type="button"
+                aria-label={suggestion}
+                onClick={() => onSuggestion(suggestion)}
+                className="group flex min-h-14 w-full cursor-pointer items-center gap-3 px-4 text-left transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-5"
+              >
+                <SearchIcon
+                  className="h-4 w-4 shrink-0 text-foreground-muted"
+                  aria-hidden
+                />
+                <span className="min-w-0 flex-1 truncate text-sm text-foreground">
+                  {suggestion}
+                </span>
+                <ArrowUpRight
+                  className="hidden h-3.5 w-3.5 shrink-0 text-foreground-muted transition-colors group-hover:text-link lg:block"
+                  aria-hidden
+                />
+              </button>
+            ))}
+          </div>
+        </section>
+      </div>
     </div>
   );
 }
@@ -1170,7 +1167,7 @@ function DenseResultList({ items }: { items: DenseResult[] }) {
               }
               className="group grid grid-cols-[2rem_minmax(0,1fr)] gap-3 px-4 py-3 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:grid-cols-[2rem_minmax(0,1fr)_auto] sm:px-5"
             >
-              <span className="flex h-8 w-8 items-center justify-center rounded-[var(--radius-md)] bg-surface-2 text-foreground-muted transition-colors group-hover:text-link">
+              <span className="flex h-8 w-8 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface-2 text-foreground-muted transition-colors group-hover:text-link">
                 <SourceIcon className="h-4 w-4" aria-hidden />
               </span>
 
@@ -1249,7 +1246,7 @@ function LiteralResultList({ items }: { items: GrepDoc[] }) {
             )}
             className="group grid grid-cols-[2rem_minmax(0,1fr)] gap-3 px-4 py-3 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:grid-cols-[2rem_minmax(0,1fr)_6.5rem] sm:px-5"
           >
-            <span className="flex h-8 w-8 items-center justify-center rounded-[var(--radius-md)] bg-surface-2 text-foreground-muted transition-colors group-hover:text-link">
+            <span className="flex h-8 w-8 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface-2 text-foreground-muted transition-colors group-hover:text-link">
               <FileText className="h-4 w-4" aria-hidden />
             </span>
 

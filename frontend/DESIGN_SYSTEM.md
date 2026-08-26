@@ -363,6 +363,32 @@ commits` control and `Full commit log` route. Below `xl`, the work area stacks
   workspace surface reaches the viewport while real content remains
   content-sized. Small screens retain an outer inset and stack every ledger and
   context section into one document flow.
+- **Graph workspace**: Graph is a search-first relationship explorer, not a
+  settings page or dashboard. It runs full-bleed inside `VaultShell` with no
+  repeated page masthead. A connected two-row command bar owns the Vault-scoped
+  resource search, Graph/List view switch, on-demand Filters, saved views,
+  focused-neighborhood breadcrumb, hop control, and honest resource/relation
+  counts. Types, relation kinds, hidden resources, and orphan decluttering live
+  behind Filters rather than in a permanent left rail; hop depth appears only
+  after a resource becomes the focus. The graph canvas owns the remaining
+  workspace, with only a compact bottom zoom/fit group and collapsed visual key.
+  Selecting a node opens a 23rem overlay inspector and never resizes or reheats
+  the canvas. The inspector prioritizes direct relationships and the explicit
+  Open / Focus actions; summary, preview, and metadata progressively disclose
+  below them. Whole-Vault search changes to a focused neighborhood while click
+  selection remains highlight-only. A first-class List view is the keyboard and
+  assistive-technology source of truth, progressively revealing at most 50 rows
+  at a time. Drag, double-click, and right-click remain accelerators only; every
+  essential action has a visible single-pointer/keyboard route. Mobile defaults
+  to List and presents the inspector over a dismissible backdrop. Empty Vault,
+  filtered-empty, load failure, and resources-without-relationships are distinct
+  stable states. When resources exist but no edges do, preserve the canvas and
+  keep every isolated resource selectable; a compact non-blocking notice explains
+  why no lines are present, while List remains an explicit alternate view. A
+  desktop visit always opens the primary Graph view rather than restoring a stale
+  List preference; mobile still defaults to List. The full graph continues to use
+  the existing overview/neighborhood/search/relations endpoints, hides absent
+  optional metadata from older backends, and never surfaces Graph health.
 - **Members workspace**: Members uses the same bordered file-workspace grammar
   as document reading without forcing a document-sized canvas. On desktop, the
   connected roster and access inspector sit inside one inset workspace frame
@@ -529,18 +555,25 @@ capped; empty, loading, filtered-empty, and retry states retain the same panel
 boundary so the workspace does not jump between states.
 
 Search is an advanced, single-ledger workbench rather than a hero or a permanent
-two-pane inspector. One connected workspace follows the global search panel's
-grammar: a strongly bounded query field and Search action, a thin tool row for
-Semantic / Literal mode and Vault scope, an on-demand filter tray, then a
+two-pane inspector. It uses the Graph explorer's full-bleed, viewport-locked
+workspace grammar instead of sitting inside a second route card or page inset.
+A connected two-row command bar leads the page: the first row owns the strongly
+bounded query field, Semantic / Literal mode, on-demand Filters, and Search
+action; the thinner second row owns Vault scope plus honest loading/result
+status. The remaining height belongs to one independently scrolling,
 full-working-width results ledger. Source-kind and document-type facets stay
 behind the labelled Filters control and appear only after results provide useful
 counts; active filters remain visible through the control's count badge. This
 keeps refinement close to the query without allowing a fixed rail to tax every
 result row or compete with the collapsed Collections rail. On narrow screens,
-mode and Filters stay together on the first tool row while Vault scope moves to
-a full-width second row; scope identity must never be truncated out between
-adjacent controls. From `sm`, all three return to one compact row. The results
-canvas owns all empty, loading, no-result, degraded, filtered-empty, retry, and
+the first row wraps controls below the query without separating mode from its
+label; Vault scope and status stack within the second row rather than truncating
+between adjacent controls. Before a query runs, the results canvas uses a quiet
+`surface-2` field and centers recent/suggested re-entry content in one bounded
+ledger, preserving clear side gutters and separation from the command bar. Once
+results exist, that inner cap disappears and rows use the full working width.
+The results canvas owns all empty, loading,
+no-result, degraded, filtered-empty, retry, and
 ranked-list states inside the same stable boundary. Its empty state reuses the
 global panel's Suggested searches ledger, but real re-entry context leads when it is
 available: user-scoped browser search history and recently viewed documents are

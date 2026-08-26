@@ -88,7 +88,7 @@ function SearchLocationProbe() {
 }
 
 describe("SearchPage · semantic (dense) mode", () => {
-  it("keeps command, compact tools, and the empty ledger inside one full-width workspace", async () => {
+  it("uses a full-height two-row command workspace with a stable results ledger", async () => {
     const user = userEvent.setup();
     renderAt("/search");
 
@@ -96,17 +96,28 @@ describe("SearchPage · semantic (dense) mode", () => {
     const commandHeader = screen.getByTestId("search-command-header");
     const suggestions = await screen.findByLabelText("Suggested searches");
 
-    expect(workspace).toHaveClass("w-full", "max-w-none");
-    expect(commandHeader).toHaveClass("bg-surface", "border-b");
+    expect(workspace).toHaveClass(
+      "h-full",
+      "w-full",
+      "max-w-none",
+      "overflow-hidden",
+    );
+    expect(commandHeader).toHaveClass("flex", "min-h-14");
     expect(workspace.contains(commandHeader)).toBe(true);
     expect(workspace.contains(suggestions)).toBe(true);
     expect(screen.getByRole("group", { name: "Search mode" })).toBeTruthy();
     expect(screen.getByRole("region", { name: "Search results" })).toBeTruthy();
+    expect(screen.getByTestId("search-tool-row")).toHaveClass(
+      "min-h-10",
+      "border-t",
+    );
     expect(screen.getByTestId("search-scope-row")).toHaveClass(
-      "order-3",
-      "basis-full",
-      "sm:order-none",
-      "sm:flex-1",
+      "flex-1",
+      "flex-wrap",
+    );
+    expect(screen.getByTestId("search-results-pane")).toHaveClass(
+      "flex-1",
+      "overflow-y-auto",
     );
     await user.click(
       screen.getByRole("button", { name: "Filter by document type" }),

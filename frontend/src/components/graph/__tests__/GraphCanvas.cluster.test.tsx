@@ -1,21 +1,18 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import React from "react";
-import { render, screen, fireEvent, cleanup } from "@testing-library/react";
+import { render, screen, cleanup } from "@testing-library/react";
 
 // Capture the simulation methods + props the component drives, by stubbing
 // react-force-graph-2d with a ref-forwarding placeholder (jsdom can't run the
 // real canvas engine).
 const d3Force = vi.fn();
 const d3ReheatSimulation = vi.fn();
-let lastProps: Record<string, unknown> = {};
-
 vi.mock("react-force-graph-2d", () => ({
   __esModule: true,
   default: React.forwardRef(function FGMock(
-    props: Record<string, unknown>,
+    _props: Record<string, unknown>,
     ref: React.Ref<unknown>,
   ) {
-    lastProps = props;
     React.useImperativeHandle(ref, () => ({
       d3Force,
       d3ReheatSimulation,
@@ -47,7 +44,6 @@ const baseProps = {
 beforeEach(() => {
   d3Force.mockClear();
   d3ReheatSimulation.mockClear();
-  lastProps = {};
 });
 afterEach(cleanup);
 
@@ -65,26 +61,9 @@ describe("GraphCanvas — cluster wiring", () => {
     expect(d3ReheatSimulation).toHaveBeenCalled();
   });
 
-  it("toggling clusters off nulls the forces and flips aria-pressed", () => {
+  it("keeps canvas controls outside the renderer while retaining its accessible label", () => {
     render(<GraphCanvas {...baseProps} />);
-
-    const onBtn = screen.getByRole("button", { name: /hide clusters/i });
-    expect(onBtn).toHaveAttribute("aria-pressed", "true");
-
-    d3Force.mockClear();
-    fireEvent.click(onBtn);
-
-    const clusterCalls = d3Force.mock.calls.filter((c) => c[0] === "cluster");
-    expect(clusterCalls.length).toBeGreaterThan(0);
-    // every cluster + collide call after toggling off must remove the force
-    expect(clusterCalls.every((c) => c[1] === null)).toBe(true);
-    expect(
-      d3Force.mock.calls.filter((c) => c[0] === "collide").every((c) => c[1] === null),
-    ).toBe(true);
-
-    expect(screen.getByRole("button", { name: /show clusters/i })).toHaveAttribute(
-      "aria-pressed",
-      "false",
-    );
+    expect(screen.getByRole("img", { name: /knowledge graph: 0 nodes, 0 edges/i })).toBeTruthy();
+    expect(screen.queryByRole("button")).toBeNull();
   });
 });

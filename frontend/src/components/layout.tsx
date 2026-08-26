@@ -133,6 +133,8 @@ export function Layout() {
   }, [activeFingerprint, activeUser, queryClient]);
 
   const wide = appRouteBoundaryForPath(location.pathname) === "vault-shell";
+  const isSearchWorkspace = location.pathname === "/search";
+  const viewportLocked = wide || isSearchWorkspace;
   const sidebarCompact = wide || sidebarCollapsed;
   const { data: health } = useHealth(session.status === "authenticated");
 
@@ -147,9 +149,9 @@ export function Layout() {
 
   useLayoutEffect(() => {
     const root = document.documentElement;
-    root.classList.toggle("vault-workspace-scroll-lock", wide);
+    root.classList.toggle("vault-workspace-scroll-lock", viewportLocked);
     return () => root.classList.remove("vault-workspace-scroll-lock");
-  }, [wide]);
+  }, [viewportLocked]);
 
   if (session.status === "checking" || revalidating) {
     return (
@@ -169,9 +171,9 @@ export function Layout() {
       dest && dest !== "/" ? `/auth?next=${encodeURIComponent(dest)}` : "/auth";
     return <Navigate to={to} replace />;
   }
-  // Vault workspace routes lock to viewport height (own internal scroll). Other
-  // routes keep natural document scroll with the footer at the bottom.
-  const rootClass = wide
+  // Canvas-style workspaces lock to viewport height and own their internal
+  // scroll. Document-flow routes keep natural page scroll and the footer.
+  const rootClass = viewportLocked
     ? "h-screen flex flex-col overflow-hidden bg-background text-foreground"
     : "min-h-screen flex flex-col bg-background text-foreground";
 
@@ -243,7 +245,7 @@ export function Layout() {
         </div>
       </header>
 
-      <div className={wide ? "flex min-h-0 flex-1" : "flex flex-1"}>
+      <div className={viewportLocked ? "flex min-h-0 flex-1" : "flex flex-1"}>
         <AppSidebar
           compact={sidebarCompact}
           collapsible={!wide}
@@ -252,7 +254,7 @@ export function Layout() {
 
         <div
           className={
-            wide
+            viewportLocked
               ? "flex min-h-0 min-w-0 flex-1 flex-col"
               : "flex min-w-0 flex-1 flex-col"
           }
@@ -262,12 +264,12 @@ export function Layout() {
             id="main"
             tabIndex={-1}
             className={
-              wide
+              viewportLocked
                 ? "min-h-0 flex-1 animate-in focus:outline-none"
                 : "flex-1 animate-in focus:outline-none"
             }
           >
-            {wide ? (
+            {viewportLocked ? (
               <CurrentUserProvider user={session.user}>
                 <ErrorBoundary resetKeys={[location.pathname, location.search]}>
                   <Outlet context={{ health }} />
@@ -286,8 +288,8 @@ export function Layout() {
             )}
           </main>
 
-          {/* Footer — hidden on vault workspace routes (viewport-locked) */}
-          {!wide && (
+          {/* Footer — hidden while a viewport-locked workspace owns scrolling. */}
+          {!viewportLocked && (
             <footer className="border-t border-border">
               <div className="flex w-full items-center justify-between px-4 py-3 sm:px-6 lg:px-8 xl:px-12 2xl:px-36">
                 <div className="coord">© Dnotitia · Seahorse</div>

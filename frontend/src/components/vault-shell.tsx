@@ -437,7 +437,7 @@ export function VaultShell() {
               showBack={false}
             />
 
-            {isGraph || isDocument ? (
+            {isGraph || isDocument || isSearch ? (
               <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden bg-background">
                 <ErrorBoundary resetKeys={[location.pathname]}>
                   <Outlet />
@@ -460,7 +460,7 @@ export function VaultShell() {
                       ? "min-h-full xl:h-full xl:min-h-0"
                       : isOverview
                         ? "min-h-full px-2 py-3 lg:p-0"
-                        : isActivity || isPublications || isSearch
+                        : isActivity || isPublications
                           ? "px-3 py-5 lg:px-4 lg:py-6 xl:px-5"
                           : "px-5 py-5 lg:px-7 lg:py-6 xl:px-8",
                   )}
