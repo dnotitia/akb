@@ -4,7 +4,6 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Search,
-  Settings2,
   type LucideIcon,
 } from "lucide-react";
 import { Link, useLocation } from "react-router-dom";
@@ -109,22 +108,6 @@ export function AppSidebar({
               selected={item.active(pathname)}
             />
           ))}
-        </nav>
-
-        <nav
-          aria-label="Account navigation"
-          className={cn(
-            "mt-auto border-t border-border p-2",
-            compact && "flex justify-center",
-          )}
-        >
-          <AppSidebarLink
-            to="/settings"
-            label="Account settings"
-            icon={Settings2}
-            compact={compact}
-            selected={pathname === "/settings"}
-          />
         </nav>
       </aside>
     </TooltipProvider>
