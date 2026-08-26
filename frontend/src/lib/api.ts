@@ -1131,6 +1131,7 @@ export interface CollectionDeleteResult {
   deleted_docs: number;
   deleted_files: number;
   deleted_sub_collections: number;
+  deleted_tables?: number;
 }
 
 export interface CollectionNotEmptyDetail {
@@ -1138,6 +1139,7 @@ export interface CollectionNotEmptyDetail {
   doc_count: number;
   file_count: number;
   sub_collection_count: number;
+  table_count?: number;
 }
 
 export const createCollection = (vault: string, path: string, summary?: string) =>
@@ -1145,6 +1147,23 @@ export const createCollection = (vault: string, path: string, summary?: string) 
     method: "POST",
     body: JSON.stringify({ path, summary }),
   });
+
+/**
+ * Update collection metadata on backends that implement the collection PATCH
+ * contract. Older AKB servers only expose POST + DELETE and answer 404/405;
+ * callers must keep their view usable and surface an upgrade hint instead of
+ * treating that compatibility response as a generic failure.
+ */
+export const updateCollection = (vault: string, path: string, summary: string | null) => {
+  const segs = path.split("/").map(encodeURIComponent).join("/");
+  return api<CollectionCreateResult>(
+    `/collections/${encodeURIComponent(vault)}/${segs}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ summary }),
+    },
+  );
+};
 
 export const deleteCollection = (vault: string, path: string, recursive: boolean) => {
   // Path may contain '/' — backend uses {path:path} catch-all. Encode segments

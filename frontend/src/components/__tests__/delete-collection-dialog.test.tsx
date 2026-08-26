@@ -102,12 +102,13 @@ describe("DeleteCollectionDialog", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
-  it("cascade mode body text displays doc and file counts", () => {
+  it("cascade mode body text displays document, table, and file counts", () => {
     render(
       <DeleteCollectionDialog
         vault="v"
         path="x"
         docCount={3}
+        tableCount={2}
         fileCount={1}
         subCollectionCount={0}
         open
@@ -119,6 +120,7 @@ describe("DeleteCollectionDialog", () => {
     // Search the dialog content for "3 document" and "1 file" substrings.
     const dialog = screen.getByRole("dialog");
     expect(dialog.textContent?.toLowerCase()).toContain("3 document");
+    expect(dialog.textContent?.toLowerCase()).toContain("2 table");
     expect(dialog.textContent?.toLowerCase()).toContain("1 file");
   });
 

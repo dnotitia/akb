@@ -9,14 +9,15 @@ import {
   getToken,
   type CurrentUser,
 } from "@/lib/api";
-import { useHealth } from "@/hooks/use-health";
 import { UserMenu } from "@/components/user-menu";
 import { Logo } from "@/components/logo";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { GlobalSearchDialog } from "@/components/global-search-dialog";
+import { HeaderIndexingStatus } from "@/components/header-indexing-status";
 import { AppSidebar } from "@/components/app-sidebar";
 import { appRouteBoundaryForPath } from "@/app-route-contract";
 import { CurrentUserProvider } from "@/contexts/current-user-context";
+import { useAccessibleIndexingHealth } from "@/hooks/use-accessible-indexing-health";
 
 const APP_SIDEBAR_COMPACT_KEY = "akb_app_sidebar_compact";
 
@@ -137,7 +138,10 @@ export function Layout() {
   const isSearchWorkspace = location.pathname === "/search";
   const viewportLocked = wide || isSearchWorkspace;
   const sidebarCompact = wide || sidebarCollapsed;
-  const { data: health } = useHealth(session.status === "authenticated");
+  const { data: indexingStatus } = useAccessibleIndexingHealth(
+    session.status === "authenticated",
+    activeUser?.user_id,
+  );
 
   function setSidebarCompact(compact: boolean) {
     setSidebarCollapsed(compact);
@@ -219,11 +223,14 @@ export function Layout() {
           </div>
 
           <div className="flex min-w-0 flex-1 items-center pr-3">
-            {/* This is a real global-search surface, not a shortcut to /search.
-                Advanced mode and vault/type filters remain on the full page. */}
-            <CurrentUserProvider user={session.user}>
-              <GlobalSearchDialog />
-            </CurrentUserProvider>
+            <div className="ml-auto flex min-w-0 items-center gap-2">
+              <HeaderIndexingStatus status={indexingStatus} />
+              {/* This is a real global-search surface, not a shortcut to /search.
+                  Advanced mode and vault/type filters remain on the full page. */}
+              <CurrentUserProvider user={session.user}>
+                <GlobalSearchDialog />
+              </CurrentUserProvider>
+            </div>
 
             {/* The persistent sidebar owns desktop entry points. Compact icon
                 links remain in the header only where that rail is hidden. */}
@@ -279,7 +286,7 @@ export function Layout() {
             {viewportLocked ? (
               <CurrentUserProvider user={session.user}>
                 <ErrorBoundary resetKeys={[location.pathname, location.search]}>
-                  <Outlet context={{ health }} />
+                  <Outlet context={{ indexingStatus }} />
                 </ErrorBoundary>
               </CurrentUserProvider>
             ) : (
@@ -288,7 +295,7 @@ export function Layout() {
                   <ErrorBoundary
                     resetKeys={[location.pathname, location.search]}
                   >
-                    <Outlet context={{ health }} />
+                    <Outlet context={{ indexingStatus }} />
                   </ErrorBoundary>
                 </CurrentUserProvider>
               </div>

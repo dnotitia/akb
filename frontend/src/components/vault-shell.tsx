@@ -348,23 +348,11 @@ export function VaultShell() {
                 className="shrink-0 h-full flex flex-col min-h-0"
                 style={{ width: desktopNav ? tree.width : mobileTreeWidth }}
               >
-                <div className="flex h-10 shrink-0 items-center justify-between border-b border-border px-3">
-                  <span className="coord-ink">Collections</span>
-                  <button
-                    type="button"
-                    onClick={() => setEffectiveTreeVisible(false)}
-                    title="Collapse tree (⌘\\)"
-                    aria-label="Collapse collection tree"
-                    aria-expanded={true}
-                    className="text-foreground-muted hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-                  >
-                    <PanelLeftClose className="h-4 w-4" aria-hidden />
-                  </button>
-                </div>
                 <div className="flex-1 min-h-0">
                   <VaultExplorer
                     vault={name}
                     onRefetchReady={onTreeRefetchReady}
+                    onCollapse={() => setEffectiveTreeVisible(false)}
                   />
                 </div>
               </div>

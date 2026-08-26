@@ -317,6 +317,8 @@ describe("MarkdownEditor image insertion", () => {
     expect(apiMocks.uploadAsset).toHaveBeenCalledTimes(2);
 
     expect(screen.getByText("Image upload failed")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Choose another" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Dismiss" })).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(apiMocks.uploadAsset).toHaveBeenCalledTimes(4));
     expect(apiMocks.uploadAsset.mock.calls.map((call) => call[1])).toEqual([
@@ -325,6 +327,27 @@ describe("MarkdownEditor image insertion", () => {
       files[1],
       files[2],
     ]);
+  });
+
+  it("does not offer a futile retry for a server size rejection", async () => {
+    apiMocks.uploadAsset.mockRejectedValue(
+      Object.assign(new Error("Image dimensions are too large"), { status: 413 }),
+    );
+    const { container } = render(
+      <MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />,
+    );
+
+    fireEvent.change(container.querySelector('input[type="file"]')!, {
+      target: {
+        files: [new File(["small compressed image"], "phone.jpg", { type: "image/jpeg" })],
+      },
+    });
+
+    expect(await screen.findByText(/10 MB, 12 MP, or 8,192 pixels/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Choose another" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByText(/10 MB, 12 MP, or 8,192 pixels/)).toBeNull();
   });
 
   it("prevents default file-drop navigation and retains a batch dropped during upload", async () => {

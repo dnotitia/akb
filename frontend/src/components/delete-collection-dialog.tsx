@@ -20,6 +20,7 @@ interface DeleteCollectionDialogProps {
   vault: string;
   path: string;
   docCount: number;
+  tableCount?: number;
   fileCount: number;
   /**
    * Number of descendant collection rows under this path. Surfaces the
@@ -35,7 +36,7 @@ interface DeleteCollectionDialogProps {
 
 /** Two-mode delete dialog for collections.
  *
- *  - Empty mode (`docCount + fileCount + subCollectionCount === 0`):
+ *  - Empty mode (`docCount + tableCount + fileCount + subCollectionCount === 0`):
  *    one-click confirm.
  *  - Cascade mode (any count > 0): requires the user to type the collection
  *    path exactly before the destructive button enables, and shows a
@@ -53,11 +54,12 @@ export function DeleteCollectionDialog({
   vault,
   path,
   docCount,
+  tableCount = 0,
   fileCount,
   subCollectionCount,
   onDeleted,
 }: DeleteCollectionDialogProps) {
-  const isCascade = docCount + fileCount + subCollectionCount > 0;
+  const isCascade = docCount + tableCount + fileCount + subCollectionCount > 0;
   const [typed, setTyped] = useState("");
   const [working, setWorking] = useState(false);
   const [error, setError] = useState("");
@@ -110,6 +112,9 @@ export function DeleteCollectionDialog({
   const items: string[] = [];
   if (docCount > 0) {
     items.push(`${docCount} document${docCount === 1 ? "" : "s"}`);
+  }
+  if (tableCount > 0) {
+    items.push(`${tableCount} table${tableCount === 1 ? "" : "s"}`);
   }
   if (fileCount > 0) {
     items.push(`${fileCount} file${fileCount === 1 ? "" : "s"}`);

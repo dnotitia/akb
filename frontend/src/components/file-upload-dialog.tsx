@@ -36,12 +36,14 @@ export function FileUploadDialog({
   open,
   onOpenChange,
   vault,
+  initialCollection = "",
   onUploaded,
   returnFocusRef,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   vault: string;
+  initialCollection?: string;
   onUploaded: (file: VaultFileUploadResult) => void;
   returnFocusRef?: RefObject<HTMLElement | null>;
 }) {
@@ -55,14 +57,17 @@ export function FileUploadDialog({
   const [error, setError] = useState("");
 
   useEffect(() => {
-    if (open) return;
+    if (open) {
+      setCollection(initialCollection.trim());
+      return;
+    }
     setFile(null);
     setCollection("");
     setDescription("");
     setDragging(false);
     setStage("preparing");
     setError("");
-  }, [open]);
+  }, [open, initialCollection]);
 
   function choose(next: File | null) {
     if (!next) return;

@@ -108,7 +108,7 @@ export default function DocumentPage({
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
-  const [detailsTab, setDetailsTab] = useState<"outline" | "relations" | "history">("outline");
+  const [detailsTab, setDetailsTab] = useState<"info" | "outline" | "relations" | "history">("info");
   const detailsToggleRef = useRef<HTMLButtonElement | null>(null);
   const detailsCloseRef = useRef<HTMLButtonElement | null>(null);
   // Plate manages its own state; we remount via `editorKey` when hydrating
@@ -892,7 +892,7 @@ export default function DocumentPage({
                 aria-hidden={!detailsOpen}
                 inert={!detailsOpen}
                 className={cn(
-                  "absolute inset-y-0 right-0 z-[var(--z-overlay)] flex w-full max-w-md flex-col overflow-hidden border-l border-border bg-surface shadow-xl transition-transform duration-[var(--duration-base)] ease-[var(--ease-out)] lg:w-80 xl:w-88",
+                  "absolute inset-y-0 right-0 z-[var(--z-overlay)] flex w-full max-w-lg flex-col overflow-hidden border-l border-border bg-surface shadow-xl transition-transform duration-[var(--duration-base)] ease-[var(--ease-out)] lg:w-96",
                   detailsOpen
                     ? "translate-x-0"
                     : "pointer-events-none translate-x-full",
@@ -915,7 +915,38 @@ export default function DocumentPage({
                 </Button>
               </div>
 
-              <section aria-labelledby="document-properties-heading" className="shrink-0 border-b border-border px-4 py-4">
+              <Tabs
+                value={detailsTab}
+                onValueChange={(value) => setDetailsTab(value as typeof detailsTab)}
+                className="flex min-h-0 flex-1 flex-col"
+              >
+                <TabsList
+                  aria-label="Document detail views"
+                  className="mx-4 mt-3 w-[calc(100%-2rem)] shrink-0"
+                >
+                  <TabsTrigger value="info" className="min-w-0 flex-1 gap-1 px-2 text-xs">
+                    <Info className="h-3.5 w-3.5" aria-hidden />
+                    Info
+                  </TabsTrigger>
+                  <TabsTrigger value="outline" className="min-w-0 flex-1 gap-1 px-2 text-xs">
+                    <ListTree className="h-3.5 w-3.5" aria-hidden />
+                    Outline
+                    <span className="coord tabular-nums">{headingSlugs.length}</span>
+                  </TabsTrigger>
+                  <TabsTrigger value="relations" className="min-w-0 flex-1 gap-1 px-2 text-xs">
+                    <Link2 className="h-3.5 w-3.5" aria-hidden />
+                    Relations
+                    {visibleRelationCount > 0 && <span className="coord tabular-nums">{visibleRelationCount}</span>}
+                  </TabsTrigger>
+                  <TabsTrigger value="history" className="min-w-0 flex-1 gap-1 px-2 text-xs">
+                    <History className="h-3.5 w-3.5" aria-hidden />
+                    History
+                    {provenance.length > 0 && <span className="coord tabular-nums">{provenance.length}</span>}
+                  </TabsTrigger>
+                </TabsList>
+
+                <TabsContent value="info" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 pt-3 rail-scroll">
+              <section aria-labelledby="document-properties-heading">
                 <div className="mb-3 flex items-center justify-between gap-3">
                   <h3 id="document-properties-heading" className="flex items-center gap-2 text-sm font-semibold text-foreground">
                     <Info className="h-4 w-4 text-link" aria-hidden />
@@ -1000,30 +1031,27 @@ export default function DocumentPage({
                 )}
               </section>
 
-              <Tabs
-                value={detailsTab}
-                onValueChange={(value) => setDetailsTab(value as typeof detailsTab)}
-                className="flex min-h-0 flex-1 flex-col"
-              >
-                <TabsList className="mx-4 mt-4 w-[calc(100%-2rem)] shrink-0">
-                  <TabsTrigger value="outline" className="min-w-0 flex-1 gap-1 px-2 text-xs">
-                    <ListTree className="h-3.5 w-3.5" aria-hidden />
-                    Outline
-                    <span className="coord tabular-nums">{headingSlugs.length}</span>
-                  </TabsTrigger>
-                  <TabsTrigger value="relations" className="min-w-0 flex-1 gap-1 px-2 text-xs">
-                    <Link2 className="h-3.5 w-3.5" aria-hidden />
-                    Relations
-                    {visibleRelationCount > 0 && <span className="coord tabular-nums">{visibleRelationCount}</span>}
-                  </TabsTrigger>
-                  <TabsTrigger value="history" className="min-w-0 flex-1 gap-1 px-2 text-xs">
-                    <History className="h-3.5 w-3.5" aria-hidden />
-                    History
-                    {provenance.length > 0 && <span className="coord tabular-nums">{provenance.length}</span>}
-                  </TabsTrigger>
-                </TabsList>
+                  {canWrite && !isHistorical && (
+                    <div className="mt-4 border-t border-border pt-3">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="w-full justify-start text-destructive hover:bg-destructive-soft hover:text-destructive-soft-foreground"
+                        onClick={() => setDeleteOpen(true)}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" aria-hidden />
+                        Delete document
+                      </Button>
+                    </div>
+                  )}
+                </TabsContent>
 
                 <TabsContent value="outline" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 pt-3 rail-scroll">
+                  <div className="mb-3 border-b border-border pb-3">
+                    <h3 className="text-sm font-semibold text-foreground">On this page</h3>
+                    <p className="mt-0.5 text-xs text-foreground-muted">Jump to a heading without leaving the document.</p>
+                  </div>
                   <DocumentOutline markdown={doc.content || ""} articleEl={articleEl} />
                 </TabsContent>
                 <TabsContent value="relations" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 pt-3 rail-scroll">
@@ -1038,6 +1066,10 @@ export default function DocumentPage({
                   />
                 </TabsContent>
                 <TabsContent value="history" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 pt-3 rail-scroll">
+                  <div className="mb-3 border-b border-border pb-3">
+                    <h3 className="text-sm font-semibold text-foreground">Version history</h3>
+                    <p className="mt-0.5 text-xs text-foreground-muted">Select a commit to inspect that version.</p>
+                  </div>
                   {historyError ? (
                     <Alert variant="destructive">Failed to load history.</Alert>
                   ) : (
@@ -1054,21 +1086,6 @@ export default function DocumentPage({
                   )}
                 </TabsContent>
               </Tabs>
-
-              {canWrite && !isHistorical && (
-                <div className="shrink-0 border-t border-border p-3">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className="w-full justify-start text-destructive hover:bg-destructive-soft hover:text-destructive-soft-foreground"
-                    onClick={() => setDeleteOpen(true)}
-                  >
-                    <Trash2 className="h-3.5 w-3.5" aria-hidden />
-                    Delete document
-                  </Button>
-                </div>
-              )}
               </aside>
             </>
           )}

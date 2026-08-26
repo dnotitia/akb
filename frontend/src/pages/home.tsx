@@ -35,7 +35,7 @@ import {
   getAuthConfig,
 } from "@/lib/api";
 import { recentIcon, recentTone } from "@/lib/recent";
-import type { HealthSnapshot } from "@/hooks/use-health";
+import type { AccessibleIndexingStatus } from "@/hooks/use-accessible-indexing-health";
 import { useCurrentUser } from "@/contexts/current-user-context";
 import {
   readRecentDocumentViews,
@@ -85,7 +85,9 @@ interface VaultMetrics {
 }
 
 export default function HomePage() {
-  const { health } = useOutletContext<{ health: HealthSnapshot | null }>();
+  const { indexingStatus } = useOutletContext<{
+    indexingStatus: AccessibleIndexingStatus | null;
+  }>();
   const currentUser = useCurrentUser();
   const [vaults, setVaults] = useState<VaultRow[]>([]);
   const [vaultsLoading, setVaultsLoading] = useState(true);
@@ -330,12 +332,10 @@ export default function HomePage() {
     toggleFavorite(v.id);
   }
 
-  const indexUpsert = health?.vector_store?.backfill?.upsert;
-  const indexedCount = indexUpsert?.indexed ?? null;
-  const indexingAbandoned = indexUpsert?.abandoned ?? 0;
-  const indexingPending = indexUpsert
-    ? Math.max(0, (indexUpsert.pending ?? 0) - indexingAbandoned)
-    : 0;
+  const indexedCount = indexingStatus?.indexed ?? null;
+  const indexingAbandoned = indexingStatus?.abandoned ?? 0;
+  const indexingPending = indexingStatus?.pending ?? 0;
+  const indexingIncomplete = indexingStatus?.incomplete ?? false;
   const hasVault = vaults.length > 0;
   const writableVault = vaults.find(
     (vault) => vault.status !== "archived" && vault.role !== "reader",
@@ -378,6 +378,7 @@ export default function HomePage() {
         indexedCount={indexedCount}
         indexingPending={indexingPending}
         indexingAbandoned={indexingAbandoned}
+        indexingIncomplete={indexingIncomplete}
       />
 
       <div className="grid grid-cols-1 items-start gap-x-8 gap-y-8 2xl:grid-cols-[minmax(0,1fr)_320px]">
@@ -517,6 +518,7 @@ export default function HomePage() {
             indexedCount={indexedCount}
             indexingPending={indexingPending}
             indexingAbandoned={indexingAbandoned}
+            indexingIncomplete={indexingIncomplete}
             showSetupLink={!setupComplete && setupDismissed}
             onShowSetup={showSetup}
           />
@@ -765,21 +767,26 @@ function HomeWorkspaceHeader({
   indexedCount,
   indexingPending,
   indexingAbandoned,
+  indexingIncomplete,
 }: {
   vaultCount: number;
   loading: boolean;
   indexedCount: number | null;
   indexingPending: number;
   indexingAbandoned: number;
+  indexingIncomplete: boolean;
 }) {
+  const suffix = indexingIncomplete ? "+" : "";
   const indexLabel = indexingAbandoned > 0
-    ? `${indexingAbandoned.toLocaleString()} need attention`
+    ? `${indexingAbandoned.toLocaleString()}${suffix} need attention`
     : indexingPending > 0
-      ? `${indexingPending.toLocaleString()} indexing`
-      : indexedCount !== null
+      ? `${indexingPending.toLocaleString()}${suffix} indexing`
+      : indexedCount !== null && !indexingIncomplete
         ? `${indexedCount.toLocaleString()} indexed`
-        : null;
-  const indexTone = indexingAbandoned > 0
+        : indexingIncomplete
+          ? "Status unavailable"
+          : null;
+  const indexTone = indexingAbandoned > 0 || indexingIncomplete
     ? "bg-warning"
     : indexingPending > 0
       ? "bg-info"
@@ -1087,6 +1094,7 @@ function WorkspaceSummary({
   indexedCount,
   indexingPending,
   indexingAbandoned,
+  indexingIncomplete,
   showSetupLink,
   onShowSetup,
 }: {
@@ -1103,15 +1111,17 @@ function WorkspaceSummary({
   indexedCount: number | null;
   indexingPending: number;
   indexingAbandoned: number;
+  indexingIncomplete: boolean;
   showSetupLink: boolean;
   onShowSetup: () => void;
 }) {
   const value = (count: number) => loading ? "—" : count.toLocaleString();
+  const suffix = indexingIncomplete ? "+" : "";
   const indexText = indexingAbandoned > 0
-    ? `${indexingAbandoned.toLocaleString()} items need attention`
+    ? `${indexingAbandoned.toLocaleString()}${suffix} items need attention`
     : indexingPending > 0
-      ? `${indexingPending.toLocaleString()} items are indexing`
-      : indexedCount !== null
+      ? `${indexingPending.toLocaleString()}${suffix} items are indexing`
+      : indexedCount !== null && !indexingIncomplete
         ? `${indexedCount.toLocaleString()} chunks indexed`
         : "Index status unavailable";
   const agentText = hasConnectedAgent
@@ -1146,7 +1156,13 @@ function WorkspaceSummary({
       <div className="divide-y divide-border">
         <StatusLine
           icon={<Database aria-hidden />}
-          tone={indexingAbandoned > 0 ? "warning" : indexingPending > 0 ? "info" : "success"}
+          tone={indexingAbandoned > 0 || indexingIncomplete
+            ? "warning"
+            : indexingPending > 0
+              ? "info"
+              : indexedCount === null
+                ? "neutral"
+                : "success"}
           label="Knowledge index"
           value={indexText}
         />

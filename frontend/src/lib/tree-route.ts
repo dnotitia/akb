@@ -87,17 +87,71 @@ export function filterTree(nodes: TreeNode[], q: string): TreeNode[] {
   return out;
 }
 
-export interface FlatRow {
+export type ResourceKind = Exclude<NodeKind, "collection">;
+
+export interface FlatNodeRow {
+  type: "node";
   node: TreeNode;
   depth: number;
   sig: string;
   /** True iff this collection is currently expanded. `false` for leaves. */
   isOpen: boolean;
-  /** When set, render a kind-group label ("Documents"/"Tables"/"Files") just
-   *  above this row. Populated only on the first row of each leaf-kind group,
-   *  and only inside a parent that actually mixes ≥2 leaf kinds — a doc-only
-   *  collection stays unlabeled. Purely visual; not a focusable tree row. */
-  kindHeader?: NodeKind;
+}
+
+export interface FlatKindGroupRow {
+  type: "kind-group";
+  kind: ResourceKind;
+  parentPath: string;
+  depth: number;
+  sig: string;
+  count: number;
+  isOpen: boolean;
+}
+
+export interface FlatMoreRow {
+  type: "more";
+  kind: ResourceKind;
+  parentPath: string;
+  depth: number;
+  sig: string;
+  visibleCount: number;
+  totalCount: number;
+}
+
+export type FlatRow = FlatNodeRow | FlatKindGroupRow | FlatMoreRow;
+
+export const RESOURCE_PREVIEW_SIZE = 20;
+
+const RESOURCE_KIND_ORDER: ResourceKind[] = ["document", "table", "file"];
+
+export function kindGroupKey(parentPath: string, kind: ResourceKind): string {
+  return `${parentPath || "$root"}:${kind}`;
+}
+
+export function filterTreeByKind(
+  nodes: TreeNode[],
+  kind: ResourceKind | "all",
+): TreeNode[] {
+  if (kind === "all") return nodes;
+  const out: TreeNode[] = [];
+  for (const node of nodes) {
+    if (node.kind === "collection") {
+      const children = filterTreeByKind(node.children ?? [], kind);
+      if (children.length > 0) out.push({ ...node, children });
+    } else if (node.kind === kind) {
+      out.push(node);
+    }
+  }
+  return out;
+}
+
+interface FlattenVisibleOptions {
+  /** Groups are open by default. Keys in this set are explicitly collapsed. */
+  collapsedKindGroups?: ReadonlySet<string>;
+  /** Per-group visible leaf limits; absent groups use RESOURCE_PREVIEW_SIZE. */
+  kindLimits?: ReadonlyMap<string, number>;
+  /** Keep the current route visible even when it falls beyond a preview. */
+  activeSig?: string | null;
 }
 
 /**
@@ -113,28 +167,91 @@ export function flattenVisible(
   nodes: TreeNode[],
   expanded: Set<string>,
   forceOpen: boolean,
+  options: FlattenVisibleOptions = {},
 ): FlatRow[] {
   const out: FlatRow[] = [];
-  const visit = (list: TreeNode[], depth: number) => {
-    // Label kind groups only when this sibling list mixes ≥2 leaf kinds
-    // (sub-collections don't count) — a doc-only collection stays unlabeled so
-    // the common case carries no extra chrome. The list is already sorted
-    // collection→document→table→file, so each kind arrives in one contiguous run.
-    const leafKinds = new Set<NodeKind>();
-    for (const n of list) if (n.kind !== "collection") leafKinds.add(n.kind);
-    const grouped = leafKinds.size >= 2;
-    let prevLeafKind: NodeKind | null = null;
-    for (const n of list) {
+  const collapsed = options.collapsedKindGroups ?? new Set<string>();
+  const limits = options.kindLimits ?? new Map<string, number>();
+
+  const pushNode = (node: TreeNode, depth: number, isOpen = false) => {
+    out.push({
+      type: "node",
+      node,
+      depth,
+      sig: signatureOf(node),
+      isOpen,
+    });
+  };
+
+  const visit = (list: TreeNode[], depth: number, parentPath: string) => {
+    // Collections keep their natural hierarchy. Resource kinds become peer
+    // disclosure rows only when the sibling set mixes kinds or is too large to
+    // scan safely. A small single-kind collection stays compact.
+    const collections = list.filter((node) => node.kind === "collection");
+    const leaves = list.filter((node) => node.kind !== "collection");
+
+    for (const n of collections) {
       const isOpen = n.kind === "collection" && (forceOpen || expanded.has(n.path));
-      let kindHeader: NodeKind | undefined;
-      if (grouped && n.kind !== "collection" && n.kind !== prevLeafKind) {
-        kindHeader = n.kind;
+      pushNode(n, depth, isOpen);
+      if (isOpen && n.children) visit(n.children, depth + 1, n.path);
+    }
+
+    const presentKinds = RESOURCE_KIND_ORDER.filter((kind) =>
+      leaves.some((leaf) => leaf.kind === kind),
+    );
+    const shouldGroup =
+      presentKinds.length > 1 || leaves.length > RESOURCE_PREVIEW_SIZE;
+
+    if (!shouldGroup) {
+      for (const leaf of leaves) pushNode(leaf, depth);
+      return;
+    }
+
+    for (const kind of presentKinds) {
+      const kindLeaves = leaves.filter((leaf) => leaf.kind === kind);
+      const key = kindGroupKey(parentPath, kind);
+      const activeLeaf = options.activeSig
+        ? kindLeaves.find((leaf) => signatureOf(leaf) === options.activeSig)
+        : undefined;
+      const isOpen = forceOpen || Boolean(activeLeaf) || !collapsed.has(key);
+      out.push({
+        type: "kind-group",
+        kind,
+        parentPath,
+        depth,
+        sig: `kind-group:${key}`,
+        count: kindLeaves.length,
+        isOpen,
+      });
+      if (!isOpen) continue;
+
+      const previewCount = Math.min(
+        Math.max(limits.get(key) ?? RESOURCE_PREVIEW_SIZE, RESOURCE_PREVIEW_SIZE),
+        kindLeaves.length,
+      );
+      const visibleLeaves = kindLeaves.slice(0, previewCount);
+      if (
+        activeLeaf &&
+        !visibleLeaves.some((leaf) => signatureOf(leaf) === options.activeSig)
+      ) {
+        visibleLeaves.push(activeLeaf);
       }
-      if (n.kind !== "collection") prevLeafKind = n.kind;
-      out.push({ node: n, depth, sig: signatureOf(n), isOpen, kindHeader });
-      if (isOpen && n.children) visit(n.children, depth + 1);
+      for (const leaf of visibleLeaves) {
+        pushNode(leaf, depth + 1);
+      }
+      if (visibleLeaves.length < kindLeaves.length) {
+        out.push({
+          type: "more",
+          kind,
+          parentPath,
+          depth: depth + 1,
+          sig: `kind-more:${key}`,
+          visibleCount: visibleLeaves.length,
+          totalCount: kindLeaves.length,
+        });
+      }
     }
   };
-  visit(nodes, 0);
+  visit(nodes, 0, "");
   return out;
 }

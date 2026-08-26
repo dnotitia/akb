@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { getDocument } from "@/lib/api";
 import { MarkdownRender } from "@/components/markdown-render";
 import { Alert } from "@/components/ui/alert";
+import { TooltipText } from "@/components/ui/tooltip-text";
 import { cn } from "@/lib/utils";
 
 type ViewMode = "rendered" | "raw";
@@ -136,6 +137,7 @@ export function DocumentView({
         onCopyRaw={copyRaw}
         lineCount={contentStats.lineCount}
         byteCount={contentStats.byteCount}
+        summary={doc.summary}
       />
 
       {/* ── Doc body ──────────────────────────────────────────────── */}
@@ -208,6 +210,7 @@ interface TabStripProps {
   onCopyRaw: () => void;
   lineCount: number;
   byteCount: number;
+  summary?: string | null;
 }
 
 function TabStrip({
@@ -219,6 +222,7 @@ function TabStrip({
   onCopyRaw,
   lineCount,
   byteCount,
+  summary,
 }: TabStripProps) {
   const tabs: Array<{
     key: ViewMode | "extra";
@@ -259,13 +263,33 @@ function TabStrip({
     >
       {fileAppearance && (
         <>
-          <div
-            aria-label={`Document statistics: ${formatLineCount(lineCount)}, ${formatByteSize(byteCount)}`}
-            className="mr-auto inline-flex min-h-8 shrink-0 items-center gap-2 text-xs tabular-nums text-foreground-muted"
-          >
-            <span>{formatLineCount(lineCount)}</span>
-            <span aria-hidden>·</span>
-            <span>{formatByteSize(byteCount)}</span>
+          <div className="mr-auto flex min-w-0 flex-1 items-center gap-3">
+            <div
+              aria-label={`Document statistics: ${formatLineCount(lineCount)}, ${formatByteSize(byteCount)}`}
+              className="inline-flex min-h-8 shrink-0 items-center gap-2 text-xs tabular-nums text-foreground-muted"
+            >
+              <span>{formatLineCount(lineCount)}</span>
+              <span aria-hidden>·</span>
+              <span>{formatByteSize(byteCount)}</span>
+            </div>
+            {summary && (
+              <div
+                role="note"
+                aria-label="Document summary"
+                className="hidden min-w-0 flex-1 items-center gap-2 border-l border-border pl-3 lg:flex"
+              >
+                <span className="coord shrink-0 font-medium text-foreground-muted">
+                  Summary
+                </span>
+                <TooltipText
+                  as="p"
+                  tip={summary}
+                  className="truncate text-xs leading-relaxed text-foreground-muted"
+                >
+                  {summary}
+                </TooltipText>
+              </div>
+            )}
           </div>
           <button
             type="button"
