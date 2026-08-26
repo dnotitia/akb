@@ -74,6 +74,25 @@ describe("AssetImage", () => {
     await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith("blob:private-image"));
   });
 
+  it("uses paragraph-safe loading markup for protected markdown images", () => {
+    apiMocks.getAssetBlob.mockReturnValue(new Promise(() => {}));
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    render(
+      <MarkdownRender
+        markdown={`![Architecture diagram](${ASSET_URL})`}
+        assetContext={{ mode: "authenticated", vault: "team" }}
+      />,
+    );
+
+    const loading = screen.getByRole("status", {
+      name: "Loading image: Architecture diagram",
+    });
+    expect(loading.tagName).toBe("SPAN");
+    expect(loading.closest("p")).not.toBeNull();
+    expect(consoleError).not.toHaveBeenCalled();
+  });
+
   it("shows an unavailable state when a live private request is aborted", async () => {
     apiMocks.getAssetBlob.mockRejectedValue(new DOMException("Aborted", "AbortError"));
 
