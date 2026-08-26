@@ -405,6 +405,32 @@ CREATE TABLE IF NOT EXISTS vault_access (
 CREATE INDEX IF NOT EXISTS idx_vault_access_user ON vault_access(user_id);
 CREATE INDEX IF NOT EXISTS idx_vault_access_vault ON vault_access(vault_id);
 
+-- Why a (vault, user) pair has the role vault_access holds. One row per
+-- independent basis; vault_access above is the materialization of the strongest
+-- of them, recomputed in the same transaction as the write that changed one.
+-- 'direct' is the basis every human grant carries. Ownership, public_access,
+-- system administration and the vault write policy are decided on separate
+-- branches of check_vault_access and are deliberately not contributions.
+CREATE TABLE IF NOT EXISTS vault_access_contributions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    vault_id UUID NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role TEXT NOT NULL,
+    source_key TEXT NOT NULL,  -- 'direct', or an opaque '<namespace>:<id>'
+    granted_by UUID REFERENCES users(id),
+    revision BIGINT NOT NULL DEFAULT 1,  -- monotonic per (vault, user, source)
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (vault_id, user_id, source_key),
+    CONSTRAINT vault_access_contributions_role_check
+        CHECK (role IN ('reader', 'writer', 'admin')),
+    CONSTRAINT vault_access_contributions_source_key_check
+        CHECK (
+            length(source_key) BETWEEN 1 AND 255
+            AND source_key !~ '[[:space:]]'
+        )
+);
+
 -- ============================================================
 -- Collections (L1 - directory-level metadata cache)
 -- ============================================================
