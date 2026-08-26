@@ -38,6 +38,7 @@ from app.services.access_service import (
     delete_user_account,
     delete_vault,
     get_vault_info,
+    explain_vault_access,
     grant_access,
     list_accessible_vaults,
     list_all_users_admin,
@@ -70,10 +71,23 @@ router = APIRouter()
 class GrantRequest(NFCModel):
     user: str
     role: str  # reader, writer, admin
+    # The basis on which the role is held. Omit it and the grant is `direct`,
+    # which is what every grant was before bases could coexist. A rule-driven
+    # grantor names its own key so it can later withdraw its own reason without
+    # deleting anybody else's.
+    source_key: str | None = None
+    # Monotonic per (vault, user, source). A retry carrying a revision no newer
+    # than the stored one is a no-op rather than an overwrite.
+    revision: int | None = None
 
 
 class RevokeRequest(NFCModel):
     user: str
+    # Omit it and the person is out of the vault — every basis goes, which is
+    # what this endpoint has always meant. Name one and only that basis is
+    # withdrawn, so the user may be downgraded rather than removed.
+    source_key: str | None = None
+    revision: int | None = None
 
 
 class TransferRequest(NFCModel):
@@ -227,12 +241,28 @@ async def vault_members(vault: str, user: AuthenticatedUser = Depends(get_curren
 
 @router.post("/vaults/{vault}/grant", summary="Grant vault access to a user")
 async def grant(vault: str, req: GrantRequest, user: AuthenticatedUser = Depends(get_current_user)):
-    return await grant_access(user.user_id, vault, req.user, req.role)
+    kwargs = {} if req.source_key is None else {"source_key": req.source_key}
+    return await grant_access(
+        user.user_id, vault, req.user, req.role, revision=req.revision, **kwargs,
+    )
 
 
 @router.post("/vaults/{vault}/revoke", summary="Revoke vault access from a user")
 async def revoke(vault: str, req: RevokeRequest, user: AuthenticatedUser = Depends(get_current_user)):
-    return await revoke_access(user.user_id, vault, req.user)
+    return await revoke_access(
+        user.user_id, vault, req.user,
+        source_key=req.source_key, revision=req.revision,
+    )
+
+
+@router.get(
+    "/vaults/{vault}/access/{username}",
+    summary="Explain why a user holds the role they hold on a vault",
+)
+async def explain_access(
+    vault: str, username: str, user: AuthenticatedUser = Depends(get_current_user),
+):
+    return await explain_vault_access(user.user_id, vault, username)
 
 
 @router.post("/vaults/{vault}/transfer", summary="Transfer vault ownership")

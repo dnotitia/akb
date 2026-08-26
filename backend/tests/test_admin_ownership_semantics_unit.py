@@ -37,16 +37,56 @@ class _FakeTransaction:
 
 
 class _FakeConn:
-    """Answers the exact queries transfer_ownership runs, records writes."""
+    """Answers the exact queries transfer_ownership runs, records writes.
+
+    The member row is now derived from the bases behind it, so the fake keeps
+    both planes rather than only recording statements: the transfer's outcome —
+    the former owner demoted to `admin`, the new owner out of the member plane —
+    is a property of what the recompute produces, and a fake that swallowed the
+    contribution writes would assert nothing about it.
+    """
 
     def __init__(self, *, vault_owner: uuid.UUID):
         self.vault_owner = vault_owner
         self.executed: list[tuple[str, tuple]] = []
+        # (vault_id, user_id, source_key) -> role
+        self.contributions: dict[tuple, str] = {}
+        # (vault_id, user_id) -> role
+        self.access: dict[tuple, str] = {}
 
     def transaction(self):
         return _FakeTransaction()
 
+    async def fetchval(self, query: str, *args):
+        q = " ".join(query.split())
+        if q.startswith("SELECT id FROM vaults"):
+            return VAULT_ID
+        if q.startswith("SELECT role FROM vault_access WHERE"):
+            return self.access.get((args[0], args[1]))
+        if "DELETE FROM vault_access_contributions" in q:
+            gone = [
+                k for k in self.contributions
+                if k[0] == args[0] and k[1] == args[1]
+            ]
+            for key in gone:
+                del self.contributions[key]
+            return len(gone)
+        raise AssertionError(f"unexpected fetchval: {q}")
+
+    async def fetch(self, query: str, *args):
+        q = " ".join(query.split())
+        if "FROM vault_access_contributions" in q:
+            return [
+                {"role": role, "granted_by": None}
+                for (vault_id, user_id, _), role in self.contributions.items()
+                if vault_id == args[0] and user_id == args[1]
+            ]
+        raise AssertionError(f"unexpected fetch: {q}")
+
     async def fetchrow(self, query: str, *args):
+        if "FROM vault_access_contributions" in query:
+            role = self.contributions.get((args[0], args[1], args[2]))
+            return None if role is None else {"role": role, "revision": 1}
         if "FROM vaults" in query:
             return {"id": VAULT_ID, "owner_id": self.vault_owner}
         if "FROM users" in query:
@@ -54,7 +94,14 @@ class _FakeConn:
         raise AssertionError(f"unexpected fetchrow: {query}")
 
     async def execute(self, query: str, *args):
-        self.executed.append((" ".join(query.split()), args))
+        q = " ".join(query.split())
+        self.executed.append((q, args))
+        if q.startswith("INSERT INTO vault_access_contributions"):
+            self.contributions[(args[1], args[2], args[4])] = args[3]
+        elif q.startswith("INSERT INTO vault_access "):
+            self.access[(args[1], args[2])] = args[3]
+        elif q.startswith("DELETE FROM vault_access WHERE"):
+            self.access.pop((args[0], args[1]), None)
 
 
 class _FakeAcquire:
@@ -134,6 +181,11 @@ async def test_admin_initiated_transfer_succeeds_for_unowned_vault(
     assert (VAULT_ID, OWNER_ID, "admin") in role_sync.grants
     assert (VAULT_ID, NEW_OWNER_ID, "admin") in role_sync.grants
     assert events == ["access.transfer_ownership"]
+    # One person handing a vault to another is a `direct` basis, and the new
+    # owner leaves the member plane entirely — ownership is decided on
+    # vaults.owner_id, and a leftover member row is a second, weaker answer.
+    assert conn.contributions == {(VAULT_ID, OWNER_ID, "direct"): "admin"}
+    assert conn.access == {(VAULT_ID, OWNER_ID): "admin"}
 
 
 async def test_owner_initiated_transfer_still_detects_lost_race(

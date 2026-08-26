@@ -22,6 +22,17 @@ from app.models.vault_scope import VaultScope, current_token_uuid, current_vault
 from app.repositories import vault_write_policy_repo as write_policy_repo
 from app.repositories.events_repo import emit_event
 from app.repositories.vault_files_repo import confirmed_file_predicate
+from app.services.access_contributions import (
+    DIRECT_SOURCE_KEY,
+    ROLE_HIERARCHY,
+    InvalidSourceKey,
+    apply_contribution,
+    effective_role,
+    list_contributions,
+    remove_all_contributions,
+    remove_contribution,
+    validate_source_key,
+)
 from app.services.account_markers import is_retired_recovery_admin_password
 from app.services.account_service import presented_issuer_or_none
 from app.services.edge_boundary import edge_scope_sql, vault_uri_prefix
@@ -32,7 +43,6 @@ from app.util.errors import NOT_FOUND, err
 
 logger = logging.getLogger("akb.access")
 
-ROLE_HIERARCHY = {"owner": 4, "admin": 3, "writer": 2, "reader": 1}
 VALID_ROLES = set(ROLE_HIERARCHY.keys())
 VALID_PUBLIC_ACCESS = {"none", "reader", "writer"}
 
@@ -493,10 +503,25 @@ async def get_user_role(user_id: str, vault_name: str) -> str | None:
 
 async def grant_access(
     granter_id: str, vault_name: str, target_username: str, role: str,
+    *, source_key: str = DIRECT_SOURCE_KEY, revision: int | None = None,
 ) -> dict:
-    """Grant vault access to a user. Granter must be owner or admin."""
+    """Grant vault access to a user. Granter must be owner or admin.
+
+    `source_key` names the basis on which the role is held. It defaults to
+    `direct`, so a caller that does not name one keeps its exact previous
+    behaviour. A rule-driven grantor names its own key and can then withdraw
+    that basis later without touching anybody else's — which is the only way an
+    automated revoke stops deleting access that was never its to remove.
+
+    The returned `role` is the requested one; `effective_role` is what the user
+    now holds, which is higher when a stronger basis already exists.
+    """
     if role not in VALID_ROLES or role == "owner":
         raise ForbiddenError(f"Invalid role: {role}. Use: reader, writer, admin")
+    try:
+        source_key = validate_source_key(source_key)
+    except InvalidSourceKey as e:
+        raise ValidationError(str(e)) from e
 
     # Verify granter has permission BEFORE the mutation transaction. The
     # actual mutation re-acquires a FOR UPDATE row lock on the vault to
@@ -535,34 +560,78 @@ async def grant_access(
             )
             if not target:
                 raise NotFoundError("User", target_username)
-            await conn.execute(
-                """
-                INSERT INTO vault_access (id, vault_id, user_id, role, granted_by)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (vault_id, user_id)
-                DO UPDATE SET role = $4, granted_by = $5
-                """,
-                uuid.uuid4(), vault["id"], target["id"], role, granter_uid,
+            outcome = await apply_contribution(
+                conn, vault["id"], target["id"], role,
+                source_key=source_key, granted_by=granter_uid, revision=revision,
             )
+            # "the writer basis was recorded" and "this user is now a writer"
+            # are different facts once bases can coexist, and only both
+            # effective roles separate them. A subscriber that reads `role`
+            # alone would act on a change that did not happen.
             await emit_event(
                 conn, "access.grant",
                 vault_id=vault["id"],
                 resource_uri=vault_uri(vault_name),
                 actor_id=str(granter_uid),
-                payload={"vault": vault_name, "user": target_username, "role": role},
+                payload={
+                    "vault": vault_name,
+                    "user": target_username,
+                    "role": role,
+                    "source_key": source_key,
+                    "effective_role": outcome.effective_role,
+                    "previous_effective_role": outcome.previous_effective_role,
+                    "applied": outcome.applied,
+                },
             )
 
     # PG-native RBAC: GRANT akb_vault_<vid>_<role> TO akb_user_<uid>.
     # Best-effort — reconciler covers drift.
-    await get_role_sync().on_grant(vault["id"], target["id"], role)
+    #
+    # The EFFECTIVE role, not the requested one: granting `reader` to somebody a
+    # rule already made a `writer` must not demote them in PostgreSQL, or the
+    # database layer would disagree with every application read.
+    if outcome.effective_role is not None:
+        await get_role_sync().on_grant(
+            vault["id"], target["id"], outcome.effective_role,
+        )
 
     logger.info("Granted %s role to %s on vault %s", role, target_username, vault_name)
-    return {"vault": vault_name, "user": target_username, "role": role, "granted": True}
+    return {
+        "vault": vault_name,
+        "user": target_username,
+        "role": role,
+        "source_key": source_key,
+        "effective_role": outcome.effective_role,
+        # False for a replay: the stored basis was already newer, so nothing
+        # moved. `granted` stays True because the requested state holds.
+        "applied": outcome.applied,
+        "granted": True,
+    }
 
 
-async def revoke_access(revoker_id: str, vault_name: str, target_username: str) -> dict:
-    """Revoke vault access from a user. Revoker must be owner or admin."""
+async def revoke_access(
+    revoker_id: str, vault_name: str, target_username: str,
+    *, source_key: str | None = None, revision: int | None = None,
+) -> dict:
+    """Revoke vault access from a user. Revoker must be owner or admin.
+
+    With no `source_key` this keeps meaning exactly what it has always meant:
+    the person is out of the vault, so every basis goes. Removing only the
+    `direct` one would leave an administrator's revoke silently ineffective
+    against a rule-driven basis — the button would report success and the person
+    would keep the access.
+
+    With a `source_key` only that basis is withdrawn, which is what a rule-driven
+    grantor does when its rule stops applying. Other bases survive, so the user
+    may be *downgraded* rather than removed, and `revoked` alone does not mean
+    they can no longer reach the vault. `effective_role` is the fact.
+    """
     await check_vault_access(revoker_id, vault_name, required_role="admin")
+    if source_key is not None:
+        try:
+            source_key = validate_source_key(source_key)
+        except InvalidSourceKey as e:
+            raise ValidationError(str(e)) from e
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -598,23 +667,51 @@ async def revoke_access(revoker_id: str, vault_name: str, target_username: str) 
                 raise ForbiddenError(
                     "Cannot revoke owner's access. Use transfer_ownership instead."
                 )
-            await conn.execute(
-                "DELETE FROM vault_access WHERE vault_id = $1 AND user_id = $2",
-                vault["id"], target["id"],
-            )
+            if source_key is None:
+                outcome = await remove_all_contributions(
+                    conn, vault["id"], target["id"],
+                )
+            else:
+                outcome = await remove_contribution(
+                    conn, vault["id"], target["id"],
+                    source_key=source_key, revision=revision,
+                )
+            # `source_key: null` means every basis went — an administrator
+            # removing the person, not a rule withdrawing its own reason.
             await emit_event(
                 conn, "access.revoke",
                 vault_id=vault["id"],
                 resource_uri=vault_uri(vault_name),
                 actor_id=str(revoker_uid),
-                payload={"vault": vault_name, "user": target_username},
+                payload={
+                    "vault": vault_name,
+                    "user": target_username,
+                    "source_key": source_key,
+                    "effective_role": outcome.effective_role,
+                    "previous_effective_role": outcome.previous_effective_role,
+                    "applied": outcome.applied,
+                },
             )
 
-    # PG-native RBAC: REVOKE all vault group memberships from akb_user_<uid>.
-    await get_role_sync().on_revoke(vault["id"], target["id"])
+    # PG-native RBAC. A surviving basis is a DOWNGRADE, not a removal: revoking
+    # all memberships there while the catalog still holds `reader` would take
+    # away in the database what the application still grants.
+    if outcome.effective_role is None:
+        await get_role_sync().on_revoke(vault["id"], target["id"])
+    else:
+        await get_role_sync().on_grant(
+            vault["id"], target["id"], outcome.effective_role,
+        )
 
     logger.info("Revoked access for %s on vault %s", target_username, vault_name)
-    return {"vault": vault_name, "user": target_username, "revoked": True}
+    return {
+        "vault": vault_name,
+        "user": target_username,
+        "source_key": source_key,
+        "effective_role": outcome.effective_role,
+        "applied": outcome.applied,
+        "revoked": True,
+    }
 
 
 # ── Vault members ────────────────────────────────────────────
@@ -662,6 +759,85 @@ async def list_vault_members(user_id: str, vault_name: str) -> list[dict]:
 
 
 # ── User-accessible vaults ──────────────────────────────────
+
+async def explain_vault_access(
+    actor_id: str, vault_name: str, target_username: str,
+) -> dict:
+    """Why this user holds the role they hold on this vault.
+
+    `list_vault_members` answers *who*, and it answers it incompletely: it
+    returns the owner plus one member row each, so a user reachable through
+    `public_access`, system administration or a write-policy bypass is simply
+    not in the list. That already reads as the audience when it is not, and it
+    gets worse once a member's role has a reason the list cannot show.
+
+    Two planes, kept apart on purpose. `contributions` are the bases behind the
+    member row; everything under `non_member_paths` is decided on a separate
+    branch of `check_vault_access` and is not a contribution — "revoke the
+    ownership contribution" is not a sentence.
+
+    Explaining somebody else requires `admin`, because the answer can be "they
+    are a system administrator". Explaining yourself requires `reader`.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        target = await conn.fetchrow(
+            "SELECT id, username FROM users WHERE username = $1", target_username,
+        )
+        if not target:
+            raise NotFoundError("User", target_username)
+
+    explaining_self = str(target["id"]) == str(actor_id)
+    await check_vault_access(
+        actor_id, vault_name,
+        required_role="reader" if explaining_self else "admin",
+    )
+
+    async with pool.acquire() as conn:
+        vault = await conn.fetchrow(
+            "SELECT id, name, owner_id, status, public_access FROM vaults WHERE name = $1",
+            vault_name,
+        )
+        if not vault:
+            raise NotFoundError("Vault", vault_name)
+        contributions = await list_contributions(conn, vault["id"], target["id"])
+        stored_role = await conn.fetchval(
+            "SELECT role FROM vault_access WHERE vault_id = $1 AND user_id = $2",
+            vault["id"], target["id"],
+        )
+        is_admin = await conn.fetchval(
+            "SELECT is_admin FROM users WHERE id = $1", target["id"],
+        )
+        policy = await write_policy_repo.get_policy(vault["id"], conn=conn)
+
+    derived = effective_role(c["role"] for c in contributions)
+    return {
+        "vault": vault_name,
+        "user": target["username"],
+        # What the member plane says, and what it is derived from. They are
+        # reported separately rather than as one number: if they ever disagree
+        # the recompute is broken, and collapsing them would hide exactly that.
+        "effective_role": stored_role,
+        "derived_role": derived,
+        "contributions": [
+            {
+                "source_key": c["source_key"],
+                "role": c["role"],
+                "revision": c["revision"],
+                "granted_by": c["granted_by_username"],
+                "since": c["created_at"].isoformat() if c["created_at"] else None,
+                "updated_at": c["updated_at"].isoformat() if c["updated_at"] else None,
+            }
+            for c in contributions
+        ],
+        "non_member_paths": {
+            "owner": vault["owner_id"] == target["id"],
+            "system_admin": bool(is_admin),
+            "public_access": vault["public_access"] or "none",
+            "write_policy_managed_by": policy["managed_by"] if policy else None,
+        },
+    }
+
 
 async def list_accessible_vaults(user_id: str) -> list[dict]:
     """List all vaults the user has access to, with their role."""
@@ -961,18 +1137,17 @@ async def transfer_ownership(owner_id: str, vault_name: str, new_owner_username:
                 "UPDATE vaults SET owner_id = $1 WHERE id = $2",
                 new_owner["id"], vault["id"],
             )
-            await conn.execute(
-                """
-                INSERT INTO vault_access (id, vault_id, user_id, role, granted_by)
-                VALUES ($1, $2, $3, 'admin', $4)
-                ON CONFLICT (vault_id, user_id) DO UPDATE SET role = 'admin'
-                """,
-                uuid.uuid4(), vault["id"], vault["owner_id"], new_owner["id"],
+            # The former owner keeps `admin`, on the `direct` basis: this is one
+            # person handing a vault to another, which is exactly what `direct`
+            # means. The new owner leaves the member plane entirely — every
+            # basis, because ownership is decided on `vaults.owner_id` and a
+            # leftover member row would be a second, weaker answer to the same
+            # question.
+            await apply_contribution(
+                conn, vault["id"], vault["owner_id"], "admin",
+                source_key=DIRECT_SOURCE_KEY, granted_by=new_owner["id"],
             )
-            await conn.execute(
-                "DELETE FROM vault_access WHERE vault_id = $1 AND user_id = $2",
-                vault["id"], new_owner["id"],
-            )
+            await remove_all_contributions(conn, vault["id"], new_owner["id"])
             await emit_event(
                 conn, "access.transfer_ownership",
                 vault_id=vault["id"],
@@ -1842,8 +2017,12 @@ async def delete_user_account(user_id: str) -> dict:
     async with pool.acquire() as conn:
         # Detach residual references rather than deleting the artifacts
         await conn.execute("UPDATE vault_access SET granted_by = NULL WHERE granted_by = $1", uid)
+        await conn.execute(
+            "UPDATE vault_access_contributions SET granted_by = NULL WHERE granted_by = $1",
+            uid,
+        )
         await conn.execute("UPDATE publications SET created_by = NULL WHERE created_by = $1", uid)
-        # CASCADE handles tokens + vault_access.user_id
+        # CASCADE handles tokens + vault_access.user_id + the bases behind it
         await conn.execute("DELETE FROM users WHERE id = $1", uid)
 
     # PG-native RBAC: drop akb_user_<uid>. Owned vault group roles
