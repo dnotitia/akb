@@ -233,11 +233,12 @@ an `sr-only` summary, never the only signal.
 - **Spacing = Tailwind's 4px ramp** (no custom `--spacing` token — the absence is
   deliberate). Section gaps `gap-y-10`, card padding `p-4`, list row `py-3`,
   dense row `py-1.5`.
-- **Application shell**: the global app header always spans the full viewport
-  and aligns its brand slot with a persistent desktop app sidebar. The sidebar
-  is a 13rem labelled entry rail on ordinary routes and can be collapsed to a
-  persistent 3.5rem icon rail with an explicitly labelled toggle. The user's
-  choice is remembered locally. Vault routes always use the same 3.5rem icon
+- **Application shell**: the global app header always spans the full viewport.
+  Its 13rem brand slot keeps the complete AKB lockup visible and the global
+  Search entry stable even when the persistent desktop app sidebar changes
+  density. The sidebar is a 13rem labelled entry rail on ordinary routes and
+  can be collapsed to a persistent 3.5rem icon rail with an explicitly labelled
+  toggle. The user's choice is remembered locally. Vault routes always use the same 3.5rem icon
   rail beside the existing Vault/Collections navigator;
   mobile keeps the same Home/Vault entry points as compact header controls
   instead of reserving sidebar width. Standard route content uses equal

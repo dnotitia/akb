@@ -144,6 +144,10 @@ describe("Layout — auth gate", () => {
     expect(
       screen.getByRole("button", { name: "Expand sidebar" }),
     ).toHaveAttribute("aria-expanded", "false");
+    const brandLink = screen.getByRole("link", { name: "AKB home" });
+    expect(brandLink.parentElement).toHaveClass("lg:w-52");
+    expect(within(brandLink).getByText("AKB")).toBeVisible();
+    expect(within(brandLink).getByText("AGENT KNOWLEDGEBASE")).toBeVisible();
     expect(localStorage.getItem("akb_app_sidebar_compact")).toBe("true");
   });
 

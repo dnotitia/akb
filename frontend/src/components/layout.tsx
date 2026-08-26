@@ -190,13 +190,10 @@ export function Layout() {
       {/* ── Glass app header ───────────────────────────────────────── */}
       <header className="app-header sticky top-0 z-40 shrink-0">
         <div className="flex h-14 w-full items-center">
-          {/* This slot follows the sidebar width so the brand and navigation
-              share one stable left edge across document and Vault routes. */}
-          <div
-            className={`flex shrink-0 items-center px-3 ${
-              sidebarCompact ? "lg:w-14 lg:justify-center lg:px-0" : "lg:w-52"
-            }`}
-          >
+          {/* Keep the brand lockup stable while the navigation rail changes
+              density. Collapsing navigation must not remove product identity
+              or shift the global-search entry point. */}
+          <div className="flex shrink-0 items-center px-3 lg:w-52">
             <Link
               to="/"
               aria-label="AKB home"
@@ -204,8 +201,8 @@ export function Layout() {
             >
               <Logo
                 size={28}
-                wordmark={!sidebarCompact}
-                subtitle={!sidebarCompact}
+                wordmark
+                subtitle
                 variant="header"
               />
             </Link>
