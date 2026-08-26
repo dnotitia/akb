@@ -18,6 +18,8 @@ import { AppSidebar } from "@/components/app-sidebar";
 import { appRouteBoundaryForPath } from "@/app-route-contract";
 import { CurrentUserProvider } from "@/contexts/current-user-context";
 
+const APP_SIDEBAR_COMPACT_KEY = "akb_app_sidebar_compact";
+
 function identityFingerprint(user: CurrentUser): string {
   return JSON.stringify([
     user.user_id,
@@ -39,6 +41,13 @@ export function Layout() {
     | { status: "unauthenticated"; user: null }
   >({ status: "checking", user: null });
   const [revalidating, setRevalidating] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem(APP_SIDEBAR_COMPACT_KEY) === "true";
+    } catch {
+      return false;
+    }
+  });
 
   useEffect(() => {
     let cancelled = false;
@@ -124,7 +133,17 @@ export function Layout() {
   }, [activeFingerprint, activeUser, queryClient]);
 
   const wide = appRouteBoundaryForPath(location.pathname) === "vault-shell";
+  const sidebarCompact = wide || sidebarCollapsed;
   const { data: health } = useHealth(session.status === "authenticated");
+
+  function setSidebarCompact(compact: boolean) {
+    setSidebarCollapsed(compact);
+    try {
+      localStorage.setItem(APP_SIDEBAR_COMPACT_KEY, String(compact));
+    } catch {
+      // Storage can be disabled. The current session still keeps the choice.
+    }
+  }
 
   useLayoutEffect(() => {
     const root = document.documentElement;
@@ -173,7 +192,7 @@ export function Layout() {
               share one stable left edge across document and Vault routes. */}
           <div
             className={`flex shrink-0 items-center px-3 ${
-              wide ? "lg:w-14 lg:justify-center lg:px-0" : "lg:w-52"
+              sidebarCompact ? "lg:w-14 lg:justify-center lg:px-0" : "lg:w-52"
             }`}
           >
             <Link
@@ -183,8 +202,8 @@ export function Layout() {
             >
               <Logo
                 size={28}
-                wordmark={!wide}
-                subtitle={!wide}
+                wordmark={!sidebarCompact}
+                subtitle={!sidebarCompact}
                 variant="header"
               />
             </Link>
@@ -225,7 +244,11 @@ export function Layout() {
       </header>
 
       <div className={wide ? "flex min-h-0 flex-1" : "flex flex-1"}>
-        <AppSidebar compact={wide} />
+        <AppSidebar
+          compact={sidebarCompact}
+          collapsible={!wide}
+          onCompactChange={setSidebarCompact}
+        />
 
         <div
           className={
@@ -251,7 +274,7 @@ export function Layout() {
                 </ErrorBoundary>
               </CurrentUserProvider>
             ) : (
-              <div className="w-full px-4 py-8 sm:px-6 lg:pl-8 lg:pr-28 xl:pl-12 xl:pr-32 2xl:pl-16 2xl:pr-36">
+              <div className="w-full px-4 py-8 sm:px-6 lg:px-8 xl:px-12 2xl:px-36">
                 <CurrentUserProvider user={session.user}>
                   <ErrorBoundary
                     resetKeys={[location.pathname, location.search]}
@@ -266,7 +289,7 @@ export function Layout() {
           {/* Footer — hidden on vault workspace routes (viewport-locked) */}
           {!wide && (
             <footer className="border-t border-border">
-              <div className="flex w-full items-center justify-between px-4 py-3 sm:px-6 lg:pl-8 lg:pr-28 xl:pl-12 xl:pr-32 2xl:pl-16 2xl:pr-36">
+              <div className="flex w-full items-center justify-between px-4 py-3 sm:px-6 lg:px-8 xl:px-12 2xl:px-36">
                 <div className="coord">© Dnotitia · Seahorse</div>
                 <div className="coord hidden md:block">Agent Knowledgebase</div>
                 <div className="coord">v1.0</div>

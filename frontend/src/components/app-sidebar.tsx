@@ -1,4 +1,12 @@
-import { Boxes, House, Search, Settings2, type LucideIcon } from "lucide-react";
+import {
+  Boxes,
+  House,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Search,
+  Settings2,
+  type LucideIcon,
+} from "lucide-react";
 import { Link, useLocation } from "react-router-dom";
 import {
   Tooltip,
@@ -34,8 +42,17 @@ const PRIMARY_ITEMS: Array<{
   },
 ];
 
-export function AppSidebar({ compact }: { compact: boolean }) {
+export function AppSidebar({
+  compact,
+  collapsible = false,
+  onCompactChange,
+}: {
+  compact: boolean;
+  collapsible?: boolean;
+  onCompactChange?: (compact: boolean) => void;
+}) {
   const { pathname } = useLocation();
+  const toggleLabel = compact ? "Expand sidebar" : "Collapse sidebar";
 
   return (
     <TooltipProvider delayDuration={250}>
@@ -47,11 +64,43 @@ export function AppSidebar({ compact }: { compact: boolean }) {
           compact ? "lg:w-14" : "lg:w-52",
         )}
       >
+        {(!compact || collapsible) && (
+          <div
+            className={cn(
+              "flex h-11 shrink-0 items-center border-b border-border px-2",
+              compact ? "justify-center" : "justify-between",
+            )}
+          >
+            {!compact && <span className="coord px-2">Workspace</span>}
+            {collapsible && onCompactChange && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label={toggleLabel}
+                    aria-expanded={!compact}
+                    aria-controls="workspace-navigation"
+                    onClick={() => onCompactChange(!compact)}
+                    className="flex h-8 w-8 items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+                  >
+                    {compact ? (
+                      <PanelLeftOpen className="h-4 w-4" aria-hidden />
+                    ) : (
+                      <PanelLeftClose className="h-4 w-4" aria-hidden />
+                    )}
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="right">{toggleLabel}</TooltipContent>
+              </Tooltip>
+            )}
+          </div>
+        )}
+
         <nav
+          id="workspace-navigation"
           aria-label="Workspace navigation"
           className={cn("flex flex-col gap-1 p-2", compact && "items-center")}
         >
-          {!compact && <p className="coord px-2 pb-1 pt-1.5">Workspace</p>}
           {PRIMARY_ITEMS.map((item) => (
             <AppSidebarLink
               key={item.to}

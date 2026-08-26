@@ -235,12 +235,15 @@ an `sr-only` summary, never the only signal.
   dense row `py-1.5`.
 - **Application shell**: the global app header always spans the full viewport
   and aligns its brand slot with a persistent desktop app sidebar. The sidebar
-  is a 13rem labelled entry rail on ordinary routes and contracts to a 3.5rem
-  icon rail beside the existing Vault/Collections navigator on Vault routes;
+  is a 13rem labelled entry rail on ordinary routes and can be collapsed to a
+  persistent 3.5rem icon rail with an explicitly labelled toggle. The user's
+  choice is remembered locally. Vault routes always use the same 3.5rem icon
+  rail beside the existing Vault/Collections navigator;
   mobile keeps the same Home/Vault entry points as compact header controls
-  instead of reserving sidebar width. Standard route content uses asymmetric
-  responsive gutters: a compact reading inset at the left and a wider right
-  action gutter aligned with the trailing edge of global Search. Page mastheads
+  instead of reserving sidebar width. Standard route content uses equal
+  responsive gutters after the sidebar; at the `2xl` tier both sides retain the
+  9rem action gutter aligned with the trailing edge of global Search. Collapsing
+  the sidebar changes available canvas width, never the content inset. Page mastheads
   span that available width; their working content is constrained by
   `<PageShell>` (`narrow` / `compact` / `wide` / `full`) according to reading
   and task density. The vault workspace remains full-bleed with its persistent

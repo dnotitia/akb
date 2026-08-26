@@ -1,5 +1,6 @@
 import {
   cleanup,
+  fireEvent,
   render,
   screen,
   waitFor,
@@ -56,6 +57,7 @@ function renderAt(path: string, queryClient = new QueryClient()) {
 describe("Layout — auth gate", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
     vi.mocked(api.getAuthConfig).mockResolvedValue({
       available: true,
       schema_version: 2,
@@ -124,6 +126,37 @@ describe("Layout — auth gate", () => {
     expect(
       within(navigation).getByRole("link", { name: "Search" }),
     ).toHaveAttribute("href", "/search");
+    expect(
+      screen.getByRole("button", { name: "Collapse sidebar" }),
+    ).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("collapses the workspace sidebar and remembers the preference", async () => {
+    vi.mocked(api.getToken).mockReturnValue("fake-jwt");
+    renderAt("/");
+
+    expect(await screen.findByTestId("home")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+
+    const sidebar = screen.getByTestId("app-sidebar");
+    expect(sidebar).toHaveAttribute("data-compact", "true");
+    expect(sidebar).toHaveClass("lg:w-14");
+    expect(
+      screen.getByRole("button", { name: "Expand sidebar" }),
+    ).toHaveAttribute("aria-expanded", "false");
+    expect(localStorage.getItem("akb_app_sidebar_compact")).toBe("true");
+  });
+
+  it("uses equal desktop content gutters outside the sidebar", async () => {
+    vi.mocked(api.getToken).mockReturnValue("fake-jwt");
+    renderAt("/");
+
+    expect(await screen.findByTestId("home")).toBeTruthy();
+    expect(screen.getByRole("main").firstElementChild).toHaveClass(
+      "lg:px-8",
+      "xl:px-12",
+      "2xl:px-36",
+    );
   });
 
   it("does not reserve a second root scrollbar gutter for vault workspaces", async () => {
