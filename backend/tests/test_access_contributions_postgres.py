@@ -710,3 +710,123 @@ async def test_the_explanation_reports_a_recompute_that_fell_behind(env):
     )
     assert explained["effective_role"] == "reader"
     assert explained["derived_role"] == "admin"
+
+
+# ── The PostgreSQL half, with the real RoleSync ───────────────────────
+#
+# Every gate above records what `role_sync` was TOLD. That is not the same
+# question as what PostgreSQL then ALLOWS, and the difference is the one class
+# of authorization bug that cannot be seen from the application: `akb_sql` is
+# gated by membership in `akb_vault_<vid>_<scope>`, not by `vault_access`.
+# `test_role_sync.py` says it plainly — mocks do not catch GRANT semantics — so
+# these two use the real thing against the real server.
+
+
+class _LiveEnv(_Env):
+    """`_Env`, except a vault also gets the three PostgreSQL group roles that
+    real vault creation gives it.
+
+    The SQL-only fixture above is enough while `role_sync` is a recorder. With
+    the real one, a vault whose group roles were never created makes every
+    `on_grant` fail — and it fails *quietly*, because the hook is best-effort
+    by design ("reconciler covers drift"). That silence is what makes asserting
+    PostgreSQL state, rather than the call, the point of these two tests.
+    """
+
+    async def vault(self, name: str, owner_id: uuid.UUID) -> uuid.UUID:
+        vault_id = await super().vault(name, owner_id)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await self.role_sync.on_vault_create_in_conn(
+                    conn, vault_id, owner_user_id=owner_id,
+                )
+        return vault_id
+
+
+@pytest.fixture
+async def live_role_sync(monkeypatch):
+    from app.services.role_sync import RoleSync
+
+    async with _fresh_database() as pool:
+        role_sync = RoleSync(pool)
+        monkeypatch.setattr(access_service, "get_pool", lambda: pool)
+        monkeypatch.setattr(access_service, "get_role_sync", lambda: role_sync)
+        yield _LiveEnv(pool, role_sync)
+
+
+async def _pg_membership(env, vault_id, user_id) -> set[str]:
+    """The scopes PostgreSQL actually grants this user on this vault."""
+    from app.services.role_sync import user_role_name, vault_group_role_name
+
+    member = user_role_name(user_id)
+    held = set()
+    async with env.pool.acquire() as conn:
+        for scope in ("reader", "writer", "admin"):
+            group = vault_group_role_name(vault_id, scope)
+            direct = await conn.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_auth_members m
+                    JOIN pg_roles g ON g.oid = m.roleid
+                    JOIN pg_roles u ON u.oid = m.member
+                    WHERE g.rolname = $1 AND u.rolname = $2
+                )
+                """,
+                group, member,
+            )
+            if direct:
+                held.add(scope)
+    return held
+
+
+async def test_a_downgrade_reaches_postgres_as_a_downgrade(live_role_sync):
+    """Removing one basis must leave the weaker membership standing.
+
+    Revoking every group membership here — which is what the old `on_revoke`
+    path would do — takes away in the database what the catalog still grants,
+    and no application-level test can see it.
+    """
+    env = live_role_sync
+    name, vault_id, owner, member, granter = await _fixture(env, "pgdown")
+    member_name = await env.pool.fetchval(
+        "SELECT username FROM users WHERE id = $1", member,
+    )
+
+    await access_service.grant_access(str(granter), name, member_name, "reader")
+    assert await _pg_membership(env, vault_id, member) == {"reader"}
+
+    await access_service.grant_access(
+        str(granter), name, member_name, "writer", source_key="team:alpha",
+    )
+    assert await _pg_membership(env, vault_id, member) == {"writer"}
+
+    await access_service.revoke_access(
+        str(granter), name, member_name, source_key="team:alpha",
+    )
+    # The catalog says reader. PostgreSQL must agree — not "gone", not "writer".
+    assert await env.stored_role(vault_id, member) == "reader"
+    assert await _pg_membership(env, vault_id, member) == {"reader"}
+
+    # And the administrator's revoke takes it all, in both planes.
+    await access_service.revoke_access(str(granter), name, member_name)
+    assert await env.stored_role(vault_id, member) is None
+    assert await _pg_membership(env, vault_id, member) == set()
+
+
+async def test_a_weaker_grant_does_not_demote_in_postgres(live_role_sync):
+    """Granting `reader` to somebody a rule already made `admin` must not
+    reach PostgreSQL as a demotion."""
+    env = live_role_sync
+    name, vault_id, owner, member, granter = await _fixture(env, "pgweak")
+    member_name = await env.pool.fetchval(
+        "SELECT username FROM users WHERE id = $1", member,
+    )
+
+    await access_service.grant_access(
+        str(granter), name, member_name, "admin", source_key="team:alpha",
+    )
+    assert await _pg_membership(env, vault_id, member) == {"admin"}
+
+    await access_service.grant_access(str(granter), name, member_name, "reader")
+    assert await env.stored_role(vault_id, member) == "admin"
+    assert await _pg_membership(env, vault_id, member) == {"admin"}
