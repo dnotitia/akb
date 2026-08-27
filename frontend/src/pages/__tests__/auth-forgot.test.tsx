@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
+import userEvent from "@testing-library/user-event";
 
 import { AUTH_CONFIG_UNAVAILABLE, getAuthConfig } from "@/lib/api";
 import AuthForgotPage from "../auth-forgot";
@@ -22,6 +23,19 @@ afterEach(() => {
 });
 
 describe("AuthForgotPage", () => {
+  it("replaces a failed policy lookup with a retryable error", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getAuthConfig)
+      .mockRejectedValueOnce(new Error("Policy service unavailable"))
+      .mockResolvedValueOnce(AUTH_CONFIG_UNAVAILABLE);
+
+    render(<MemoryRouter><AuthForgotPage /></MemoryRouter>);
+
+    expect(await screen.findByText("Policy service unavailable")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByRole("heading", { name: /password recovery unavailable/i })).toBeInTheDocument();
+  });
+
   it("renders password guidance only for validated local mode", async () => {
     vi.mocked(getAuthConfig).mockResolvedValue({
       available: true,

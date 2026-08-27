@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, within, cleanup } from "@testing-library/react";
+import { render, screen, within, cleanup, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { VaultExplorer } from "@/components/vault-explorer";
@@ -158,6 +158,28 @@ describe("VaultExplorer — rendering", () => {
 });
 
 describe("VaultExplorer — interaction", () => {
+  it("preserves the current tree while a manual refresh is pending", async () => {
+    let resolveRefresh: ((value: typeof sample) => void) | undefined;
+    browseMock
+      .mockResolvedValueOnce(sample)
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        resolveRefresh = resolve;
+      }));
+    const user = userEvent.setup();
+    renderAt("/vault/v");
+
+    const architecture = await screen.findByRole("button", { name: /^architecture/i });
+    await user.click(screen.getByRole("button", { name: "Refresh collections" }));
+
+    expect(architecture).toBeInTheDocument();
+    expect(screen.getByRole("tree", { name: /v explorer/ })).toHaveAttribute("aria-busy", "true");
+
+    resolveRefresh?.(sample);
+    await waitFor(() => {
+      expect(screen.getByRole("tree", { name: /v explorer/ })).not.toHaveAttribute("aria-busy");
+    });
+  });
+
   it("toggles a collection on click", async () => {
     const user = userEvent.setup();
     renderAt("/vault/v");

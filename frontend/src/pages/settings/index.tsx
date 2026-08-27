@@ -23,6 +23,8 @@ import {
 } from "@/components/ui/tabs";
 import { PageHeader } from "@/components/ui/page-header";
 import { PageShell } from "@/components/ui/page-shell";
+import { LoadingState } from "@/components/ui/loading-state";
+import { Skeleton } from "@/components/ui/skeleton";
 import { RoleBadge } from "@/components/status-badge";
 import { cn } from "@/lib/utils";
 import { ProfileSection, type User } from "./profile-section";
@@ -147,7 +149,7 @@ export default function SettingsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user, searchParams, users]);
 
-  if (!user) return null;
+  if (!user) return <SettingsPageLoading />;
 
   // Active tab synced to `?tab=` so Profile/Tokens/etc. are deep-linkable.
   // `admin` is only a valid value when the viewer is an admin — otherwise
@@ -174,14 +176,7 @@ export default function SettingsPage() {
 
   return (
     <PageShell
-      header={
-        <PageHeader
-          eyebrow="Personal workspace"
-          title="Account settings"
-          subtitle="Manage how you appear, how agents connect, and how AKB looks on this device."
-          className="mb-7"
-        />
-      }
+      header={<SettingsPageHeader />}
       contentWidth="full"
     >
       <Tabs
@@ -277,6 +272,75 @@ export default function SettingsPage() {
           )}
         </div>
       </Tabs>
+    </PageShell>
+  );
+}
+
+function SettingsPageHeader() {
+  return (
+    <PageHeader
+      eyebrow="Personal workspace"
+      title="Account settings"
+      subtitle="Manage how you appear, how agents connect, and how AKB looks on this device."
+      className="mb-7"
+    />
+  );
+}
+
+function SettingsPageLoading() {
+  return (
+    <PageShell header={<SettingsPageHeader />} contentWidth="full">
+      <LoadingState
+        label="Loading account settings"
+        className="grid items-start gap-5 lg:grid-cols-[16.5rem_minmax(0,1fr)] xl:gap-8 xl:grid-cols-[18rem_minmax(0,1fr)]"
+      >
+        <aside className="min-w-0 rounded-[var(--radius-md)] border border-border bg-surface p-4 shadow-xs xl:p-5">
+          <div className="border-b border-border pb-5">
+            <Skeleton className="h-3 w-16 rounded-[var(--radius-sm)]" />
+            <div className="mt-3 flex items-center gap-3">
+              <Skeleton className="h-11 w-11 shrink-0 rounded-full" />
+              <div className="min-w-0 flex-1 space-y-2">
+                <Skeleton className="h-4 w-3/4 rounded-[var(--radius-sm)]" />
+                <Skeleton className="h-3 w-1/2 rounded-[var(--radius-sm)]" />
+              </div>
+            </div>
+            <Skeleton className="mt-3 h-3 w-4/5 rounded-[var(--radius-sm)]" />
+          </div>
+          <div className="mt-4 space-y-2">
+            {[0, 1, 2].map((item) => (
+              <div key={item} className="flex items-center gap-3 rounded-[var(--radius-md)] px-3 py-2.5">
+                <Skeleton className="h-8 w-8 shrink-0 rounded-[var(--radius-md)]" />
+                <div className="min-w-0 flex-1 space-y-2">
+                  <Skeleton className="h-3.5 w-2/3 rounded-[var(--radius-sm)]" />
+                  <Skeleton className="h-3 w-4/5 rounded-[var(--radius-sm)]" />
+                </div>
+              </div>
+            ))}
+          </div>
+        </aside>
+
+        <div className="min-w-0 space-y-6">
+          {[0, 1].map((section) => (
+            <section
+              key={section}
+              className="overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm"
+            >
+              <div className="border-b border-border px-5 py-4 sm:px-6">
+                <Skeleton className="h-5 w-36 rounded-[var(--radius-sm)]" />
+                <Skeleton className="mt-2 h-3 w-2/3 rounded-[var(--radius-sm)]" />
+              </div>
+              <div className="grid gap-5 p-5 sm:grid-cols-2 sm:p-6">
+                {[0, 1, 2, 3].map((field) => (
+                  <div key={field} className="space-y-2">
+                    <Skeleton className="h-3 w-24 rounded-[var(--radius-sm)]" />
+                    <Skeleton className="h-10 w-full rounded-[var(--radius-md)]" />
+                  </div>
+                ))}
+              </div>
+            </section>
+          ))}
+        </div>
+      </LoadingState>
     </PageShell>
   );
 }

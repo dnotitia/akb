@@ -61,6 +61,8 @@ import { MarkdownEditorFallback } from "@/components/markdown-editor-fallback";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { PublishOptionsDialog } from "@/components/publish-options-dialog";
 import { TooltipText } from "@/components/ui/tooltip-text";
+import { LoadingState } from "@/components/ui/loading-state";
+import { Skeleton } from "@/components/ui/skeleton";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import { RelationsPanel } from "@/components/relations/relations-panel";
 import { relationIsInVault } from "@/components/relations/relation-row-utils";
@@ -487,12 +489,7 @@ export default function DocumentPage({
   }
 
   if (!doc) {
-    return (
-      <div className="py-8 coord">
-        <Loader2 className="h-4 w-4 inline animate-spin mr-2" aria-hidden />
-        Loading…
-      </div>
-    );
+    return <DocumentPageLoading presentation={presentation} />;
   }
 
   async function handleUnpublish() {
@@ -1148,6 +1145,62 @@ export default function DocumentPage({
         }}
       />
     </>
+  );
+}
+
+function DocumentPageLoading({ presentation }: { presentation: "page" | "preview" }) {
+  return (
+    <LoadingState
+      label="Loading document"
+      className="flex h-full min-h-0 flex-col overflow-hidden bg-background"
+    >
+      <div className="flex h-full min-h-0 flex-col overflow-hidden">
+        <header
+          className={cn(
+            "flex h-16 shrink-0 items-center gap-3 border-b border-border bg-surface pl-3 sm:pl-4 lg:pl-5",
+            presentation === "preview" ? "pr-12 sm:pr-14" : "pr-3 sm:pr-4 lg:pr-5",
+          )}
+        >
+          <Skeleton className="hidden h-9 w-9 shrink-0 rounded-[var(--radius-md)] sm:block" />
+          <div className="min-w-0 flex-1 space-y-2">
+            <Skeleton className="h-5 w-2/3 max-w-56 rounded-[var(--radius-sm)]" />
+            <Skeleton className="h-3 w-1/2 max-w-40 rounded-[var(--radius-sm)]" />
+          </div>
+          <div className="flex shrink-0 gap-2">
+            <Skeleton className="h-8 w-20 rounded-[var(--radius-md)]" />
+            <Skeleton className="hidden h-8 w-24 rounded-[var(--radius-md)] sm:block" />
+          </div>
+        </header>
+
+        <div className="min-h-0 flex-1 overflow-hidden">
+          <main className="h-full overflow-hidden bg-background p-2 sm:p-3">
+            <div className="mb-3 flex min-h-11 items-center gap-3 rounded-[var(--radius-lg)] border border-border bg-surface px-3 shadow-xs">
+              <Skeleton className="h-4 w-4 shrink-0 rounded-[var(--radius-sm)]" />
+              <Skeleton className="h-3 w-2/3 max-w-64 rounded-[var(--radius-sm)]" />
+              <Skeleton className="ml-auto hidden h-3 w-32 rounded-[var(--radius-sm)] sm:block" />
+            </div>
+
+            <section className="min-h-[32rem] overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm">
+              <div className="flex min-h-11 items-center gap-2 border-b border-border bg-surface-2/60 px-3">
+                <Skeleton className="h-7 w-24 rounded-[var(--radius-sm)]" />
+                <Skeleton className="h-7 w-16 rounded-[var(--radius-sm)]" />
+                <Skeleton className="ml-auto h-3 w-28 rounded-[var(--radius-sm)]" />
+              </div>
+              <div className="mx-auto max-w-4xl space-y-4 px-5 py-8 sm:px-8 lg:px-12">
+                <Skeleton className="h-8 w-3/5 rounded-[var(--radius-md)]" />
+                <Skeleton className="h-4 w-full rounded-[var(--radius-sm)]" />
+                <Skeleton className="h-4 w-11/12 rounded-[var(--radius-sm)]" />
+                <Skeleton className="h-4 w-4/5 rounded-[var(--radius-sm)]" />
+                <Skeleton className="mt-7 h-6 w-2/5 rounded-[var(--radius-md)]" />
+                <Skeleton className="h-4 w-full rounded-[var(--radius-sm)]" />
+                <Skeleton className="h-4 w-5/6 rounded-[var(--radius-sm)]" />
+                <Skeleton className="mt-6 h-32 w-full rounded-[var(--radius-lg)]" />
+              </div>
+            </section>
+          </main>
+        </div>
+      </div>
+    </LoadingState>
   );
 }
 

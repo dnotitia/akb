@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { ArrowLeft, Loader2 } from "lucide-react";
+import { ArrowLeft } from "lucide-react";
 import { Logo } from "@/components/logo";
 import {
   getAuthConfig,
@@ -8,6 +8,7 @@ import {
   markLegacySsoSession,
   setToken,
 } from "@/lib/api";
+import { InlineLoadingState } from "@/components/ui/loading-state";
 
 /**
  * Compatibility callback for the exact pre-v2 Keycloak contract. Current v2
@@ -102,10 +103,12 @@ export default function AuthCallbackPage() {
 
   if (state === "checking") {
     return (
-      <div className="relative flex min-h-screen items-center justify-center bg-background text-foreground">
-        <div className="flex flex-col items-center gap-4 text-sm text-foreground-muted" role="status" aria-live="polite">
-          <Loader2 className="h-6 w-6 animate-spin text-primary" aria-hidden />
-          <span>Completing sign-in…</span>
+      <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background p-6 text-foreground">
+        <div className="hero-glow flex w-full max-w-md flex-col items-center gap-8 text-center">
+          <Logo size={40} subtitle />
+          <div className="w-full rounded-[var(--radius-lg)] border border-border bg-surface p-8 shadow-lg">
+            <InlineLoadingState label="Completing sign-in…" className="py-8" />
+          </div>
         </div>
       </div>
     );
