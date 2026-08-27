@@ -19,6 +19,7 @@ from app.db.postgres import get_pool
 from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError
 from app.models.document import (
     DOC_STATUSES,
+    BrowseContext,
     BrowseItem,
     BrowseResponse,
     DocumentPutRequest,
@@ -52,7 +53,7 @@ from app.services.native_revision_service import (
 )
 from app.services.resource_hash import HASH_ALGORITHM
 from app.services.role_sync import get_role_sync
-from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri
+from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri, vault_uri
 from app.util.text import (
     doc_path,
     like_escape,
@@ -986,15 +987,36 @@ class NativeDocumentService(DocumentService):
     ) -> BrowseResponse:
         """Return the legacy browse envelope with Native document Heads."""
         prefix = normalize_collection_path(collection) if collection is not None else ""
-        vault_id = await self._vault_id(vault)
+        pool = await self._pool()
+        vault_row = await VaultRepository(pool).get_by_name(vault)
+        if vault_row is None:
+            raise NotFoundError("Vault", vault)
+        vault_id = vault_row["id"]
+        collection_repo = CollectionRepository(pool)
+        if prefix:
+            collection_row = await collection_repo.get_by_path(vault_id, prefix)
+            context = BrowseContext(
+                type="collection",
+                uri=coll_uri(vault, prefix),
+                name=(collection_row or {}).get("name") or prefix.rsplit("/", 1)[-1],
+                path=prefix,
+                summary=(collection_row or {}).get("summary"),
+            )
+        else:
+            context = BrowseContext(
+                type="vault",
+                uri=vault_uri(vault),
+                name=vault,
+                path="",
+                description=vault_row.get("description"),
+            )
         show_docs = content_type in ("all", "documents")
         show_tables = content_type in ("all", "tables")
         show_files = content_type in ("all", "files")
 
         items: list[BrowseItem] = []
         if show_docs:
-            pool = await self._pool()
-            for row in await CollectionRepository(pool).list_by_vault(vault_id):
+            for row in await collection_repo.list_by_vault(vault_id):
                 if prefix and not row["path"].startswith(prefix + "/"):
                     continue
                 items.append(
@@ -1037,7 +1059,13 @@ class NativeDocumentService(DocumentService):
 
         browse_path = prefix
         hint = self._browse_hint(vault, prefix or None, items)
-        return BrowseResponse(vault=vault, path=browse_path, items=items, hint=hint)
+        return BrowseResponse(
+            vault=vault,
+            path=browse_path,
+            context=context,
+            items=items,
+            hint=hint,
+        )
 
     async def create_vault(
         self,

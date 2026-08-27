@@ -529,6 +529,8 @@ function schemaLines(): string[] {
     "  path: string;",
     "  title: string;",
     "  collection?: string | null;",
+    "  collection_summary?: string | null;",
+    "  vault_description?: string | null;",
     "  doc_type?: string | null;",
     "  summary?: string | null;",
     "  tags: string[];",

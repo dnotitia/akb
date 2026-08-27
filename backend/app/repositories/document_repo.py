@@ -843,6 +843,19 @@ class CollectionRepository:
             )
             return [dict(r) for r in rows]
 
+    async def get_by_path(self, vault_id: uuid.UUID, path: str) -> dict | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT path, name, summary, doc_count, last_updated
+                  FROM collections
+                 WHERE vault_id = $1 AND path = $2
+                """,
+                vault_id,
+                path,
+            )
+            return dict(row) if row else None
+
     async def increment_count(self, collection_id: uuid.UUID, now: datetime, conn=None) -> None:
         sql = "UPDATE collections SET doc_count = doc_count + 1, last_updated = $1 WHERE id = $2"
         if conn is not None:

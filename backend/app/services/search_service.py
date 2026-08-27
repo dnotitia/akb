@@ -927,6 +927,46 @@ class SearchService:
                         "collection": r["collection"],
                     }
 
+            # Parent descriptions are response context only. Fetch them from
+            # the source-of-truth catalog after hit selection so they do not
+            # create vector points or influence retrieval/rerank scores.
+            vault_names = sorted({m["vault"] for m in meta.values()})
+            collection_paths = sorted({
+                m["collection"] for m in meta.values() if m.get("collection")
+            })
+            if vault_names:
+                rows = await conn.fetch(
+                    """
+                    SELECT v.name AS vault_name,
+                           v.description AS vault_description,
+                           c.path AS collection_path,
+                           c.summary AS collection_summary
+                      FROM vaults v
+                      LEFT JOIN collections c
+                        ON c.vault_id = v.id
+                       AND c.path = ANY($2::text[])
+                     WHERE v.name = ANY($1::text[])
+                    """,
+                    vault_names,
+                    collection_paths,
+                )
+                vault_descriptions: dict[str, str | None] = {}
+                collection_summaries: dict[tuple[str, str], str | None] = {}
+                for row in rows:
+                    vault_descriptions[row["vault_name"]] = row["vault_description"]
+                    if row["collection_path"] is not None:
+                        collection_summaries[(row["vault_name"], row["collection_path"])] = row[
+                            "collection_summary"
+                        ]
+                for item in meta.values():
+                    item["vault_description"] = vault_descriptions.get(item["vault"])
+                    collection_path = item.get("collection")
+                    item["collection_summary"] = (
+                        collection_summaries.get((item["vault"], collection_path))
+                        if collection_path
+                        else None
+                    )
+
         from app.services.uri_service import doc_uri, table_uri, file_uri
 
         results: list[SearchResult] = []
@@ -952,6 +992,8 @@ class SearchService:
                     uri=uri,
                     vault=m["vault"], path=m["path"], title=m["title"],
                     collection=m.get("collection"),
+                    collection_summary=m.get("collection_summary"),
+                    vault_description=m.get("vault_description"),
                     doc_type=m["doc_type"], summary=m["summary"],
                     tags=m["tags"], score=h.score,
                     matched_section=(strip_chunk_metadata_header(h.content) or "")[:500] or None,

@@ -210,12 +210,29 @@ class BrowseItem(BaseModel):
     version: str | None = None
 
 
+class BrowseContext(BaseModel):
+    """Metadata for the browse root itself.
+
+    Collection summaries describe why a collection exists; they are context
+    for the resources beneath it, not searchable resources of their own.
+    Vault descriptions serve the same purpose at the vault root.
+    """
+
+    type: Literal["vault", "collection"]
+    uri: str
+    name: str
+    path: str
+    summary: str | None = None
+    description: str | None = None
+
+
 class BrowseResponse(BaseModel):
     """Response for akb_browse."""
 
     kind: Literal["document"] = "document"
     vault: str
     path: str
+    context: BrowseContext | None = None
     items: list[BrowseItem]
     hint: str | None = None
 
@@ -234,6 +251,8 @@ class SearchResult(BaseModel):
     path: str
     title: str
     collection: str | None = None                     # containing collection (null at vault root)
+    collection_summary: str | None = None             # parent collection intent; not part of search scoring
+    vault_description: str | None = None              # containing vault intent; not part of search scoring
     doc_type: str | None = None
     summary: str | None = None
     tags: list[str] = Field(default_factory=list)

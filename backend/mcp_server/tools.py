@@ -300,9 +300,11 @@ TOOLS = [
             "0 = direct children only (no descent), N = descend N collection levels, "
             "-1 = entire subtree. Collection rows are always emitted as navigation "
             "aids regardless of depth.\n\n"
-            "Response is slim by default (no `summary` field) so large vaults "
-            "(70+ collections) fit in the agent's context window. Returns "
-            "{vault, path, items, total, returned, truncated?, hint?}."
+            "The response includes metadata for the current browse root in `context`, "
+            "and collection items include `summary` by default so agents understand "
+            "their intended purpose. Other resource summaries stay opt-in so large "
+            "vaults fit in the agent's context window. Returns "
+            "{vault, path, context, items, total, returned, truncated?, hint?}."
         ),
         inputSchema={
             "type": "object",
@@ -346,7 +348,13 @@ TOOLS = [
                 "filter": {"type": "string", "description": "Substring filter on item name/path (case-insensitive)."},
                 "limit": {"type": "integer", "description": "Cap returned item count."},
                 "offset": {"type": "integer", "description": "Skip first N items (default 0)."},
-                "include_summary": {"type": "boolean", "description": "Include the per-item summary field (default false, drops to keep payload small)."},
+                "include_summary": {
+                    "type": "boolean",
+                    "description": (
+                        "Include document, table, and file summaries. Collection "
+                        "summaries and browse-root context are always included."
+                    ),
+                },
                 "include_hashes": {
                     "type": "boolean",
                     "description": (
@@ -372,7 +380,9 @@ TOOLS = [
             "BM25 sparse (keyword) via Reciprocal Rank Fusion. Handles both natural-language "
             "questions and short keyword queries well. For exact string / regex matches "
             "(code, URLs, version numbers) prefer akb_grep. Returns each hit's `uri`; "
-            "use akb_drill_down or akb_get with that URI for full content. "
+            "`collection_summary` and `vault_description` describe the hit's parent "
+            "context but do not affect matching or ranking. "
+            "Use akb_drill_down or akb_get with that URI for full content. "
             "Response reports `returned` (in `results`) and `total_matches` (size of the "
             "deduped prefetch pool — NOT a corpus-wide hit count; vector ANN is top-K only). "
             "When `truncated=true` the prefetch pool was capped, meaning the corpus may hold "

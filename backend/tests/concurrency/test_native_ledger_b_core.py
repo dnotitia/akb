@@ -3198,8 +3198,9 @@ async def test_native_browse_uses_native_heads_for_collection_root_and_depth():
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
             await conn.execute(
                 """
-                INSERT INTO collections (vault_id, path, name)
-                VALUES ($1, 'guides', 'guides'), ($1, 'guides/nested', 'nested')
+                INSERT INTO collections (vault_id, path, name, summary)
+                VALUES ($1, 'guides', 'guides', 'Guides for operators'),
+                       ($1, 'guides/nested', 'nested', 'Detailed guides')
                 """,
                 vault_id,
             )
@@ -3240,6 +3241,9 @@ async def test_native_browse_uses_native_heads_for_collection_root_and_depth():
         )
 
         root = await service.browse(vault, depth=0)
+        assert root.context is not None
+        assert root.context.type == "vault"
+        assert root.context.uri == f"akb://{vault}"
         assert {item.path for item in root.items if item.type == "document"} == {"root.md"}
         assert {item.path for item in root.items if item.type == "collection"} == {
             "guides",
@@ -3247,6 +3251,11 @@ async def test_native_browse_uses_native_heads_for_collection_root_and_depth():
         }
 
         collection_root = await service.browse(vault, collection="guides", depth=0)
+        assert collection_root.context is not None
+        assert collection_root.context.type == "collection"
+        assert collection_root.context.name == "guides"
+        assert collection_root.context.path == "guides"
+        assert collection_root.context.summary == "Guides for operators"
         assert {item.path for item in collection_root.items if item.type == "document"} == {
             "guides/direct.md",
         }
