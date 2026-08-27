@@ -15,7 +15,12 @@ import {
 import { MarkdownPlugin } from "@platejs/markdown";
 import { toggleList, ListStyleType } from "@platejs/list";
 import { upsertLink } from "@platejs/link";
-import { insertTable } from "@platejs/table";
+import {
+  insertTable,
+  insertTableColumn,
+  insertTableRow,
+} from "@platejs/table";
+import { TrailingBlockPlugin } from "@platejs/utils";
 import {
   Bold,
   Italic,
@@ -37,6 +42,9 @@ import {
   Loader2,
   Pilcrow,
   RotateCcw,
+  Rows3,
+  Columns3,
+  CornerDownLeft,
   Trash2,
   X,
 } from "lucide-react";
@@ -163,14 +171,143 @@ function ListItemElement(props: PlateElementProps) {
 }
 
 function TableElement(props: PlateElementProps) {
+  const editor = useEditorRef();
+  const editorLifecycle = React.useContext(EditorAssetLifecycleContext);
+
+  const withTablePath = (action: (path: number[]) => void) => {
+    const path = editor.api.findPath(props.element);
+    if (!path) return;
+    action(path);
+  };
+
+  const focusEditor = () => {
+    // Keep pointer and keyboard users in the authoring flow after a block
+    // action instead of leaving focus stranded on the caption toolbar.
+    requestAnimationFrame(() => editorLifecycle?.focusEditor());
+  };
+
+  const continueBelow = () => {
+    withTablePath((path) => {
+      const nextPath = [...path];
+      nextPath[nextPath.length - 1] += 1;
+      const nextEntry = editor.api.node(nextPath);
+      const nextType = (nextEntry?.[0] as { type?: string } | undefined)?.type;
+      if (nextType !== ParagraphPlugin.key) {
+        editor.tf.insertNodes(
+          { type: ParagraphPlugin.key, children: [{ text: "" }] },
+          { at: nextPath },
+        );
+      }
+      editor.tf.select(editor.api.start(nextPath));
+      focusEditor();
+    });
+  };
+
+  const deleteCurrentTable = () => {
+    withTablePath((path) => {
+      editor.tf.removeNodes({ at: path });
+      // TrailingBlockPlugin covers a terminal table. If another block follows,
+      // it shifts into the removed table's path and becomes the natural target.
+      if (!editor.api.node(path)) {
+        editor.tf.insertNodes(
+          { type: ParagraphPlugin.key, children: [{ text: "" }] },
+          { at: path },
+        );
+      }
+      editor.tf.select(editor.api.start(path));
+      focusEditor();
+    });
+  };
+
   // Wide tables scroll within themselves instead of pushing the whole
   // authoring surface into a page-level horizontal scroll.
   return (
     <PlateElement
       {...props}
-      as="table"
-      className="my-4 w-full border border-border text-sm block overflow-x-auto max-w-full"
-    />
+      as="div"
+      className="my-4 max-w-full overflow-x-auto"
+    >
+      <table
+        aria-label={editorLifecycle?.readOnly ? "Table" : "Editable table"}
+        className="!table !overflow-visible w-full min-w-[36rem] border-collapse border border-border text-sm"
+      >
+        {!editorLifecycle?.readOnly && (
+          <caption
+            contentEditable={false}
+            className="caption-top border-b border-border bg-surface-2 px-2 py-1.5 text-left"
+          >
+            <div className="flex min-w-max items-center justify-between gap-3">
+              <span className="inline-flex items-center gap-1.5 px-1 text-xs font-medium text-foreground-muted">
+                <TableIcon className="h-3.5 w-3.5" aria-hidden />
+                Table
+              </span>
+              <div className="flex items-center gap-1" role="toolbar" aria-label="Table actions">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 px-2"
+                  title="Add row to the end"
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => {
+                    withTablePath((path) => {
+                      insertTableRow(editor, { at: path, select: true });
+                      focusEditor();
+                    });
+                  }}
+                >
+                  <Rows3 className="h-3.5 w-3.5" aria-hidden />
+                  Row
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 px-2"
+                  title="Add column to the end"
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => {
+                    withTablePath((path) => {
+                      insertTableColumn(editor, { at: path, select: true });
+                      focusEditor();
+                    });
+                  }}
+                >
+                  <Columns3 className="h-3.5 w-3.5" aria-hidden />
+                  Column
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 px-2"
+                  title="Move the cursor to a paragraph below this table"
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={continueBelow}
+                >
+                  <CornerDownLeft className="h-3.5 w-3.5" aria-hidden />
+                  Continue below
+                </Button>
+                <span className="mx-0.5 h-4 w-px bg-border" aria-hidden />
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Delete table"
+                  title="Delete table (you can undo this action)"
+                  className="h-8 w-8 text-foreground-muted hover:bg-destructive/10 hover:text-destructive"
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={deleteCurrentTable}
+                >
+                  <Trash2 className="h-3.5 w-3.5" aria-hidden />
+                </Button>
+              </div>
+            </div>
+          </caption>
+        )}
+        <tbody>{props.children}</tbody>
+      </table>
+    </PlateElement>
   );
 }
 
@@ -196,6 +333,8 @@ interface EditorAssetLifecycle {
   vault: string;
   document?: string;
   commit?: string;
+  readOnly?: boolean;
+  focusEditor: () => void;
 }
 
 const EditorAssetLifecycleContext = React.createContext<EditorAssetLifecycle | null>(null);
@@ -208,46 +347,60 @@ function ImageElement(props: PlateElementProps) {
     caption?: Array<{ text?: string }>;
   };
   const alt = element.caption?.map((part) => part.text || "").join("") || "";
+
+  const removeImage = () => {
+    const path = editor.api.findPath(props.element);
+    if (!path) return;
+    editor.tf.removeNodes({ at: path });
+    if (!editor.api.node(path)) {
+      editor.tf.insertNodes(
+        { type: ParagraphPlugin.key, children: [{ text: "" }] },
+        { at: path },
+      );
+    }
+    editor.tf.select(editor.api.start(path));
+    requestAnimationFrame(() => assetLifecycle?.focusEditor());
+  };
+
   return (
     <PlateElement {...props} className="my-4">
-      <figure contentEditable={false} className="group relative m-0">
-        <AssetImage
-          src={element.url}
-          alt={alt}
-          assetContext={
-            assetLifecycle
-              ? {
-                  mode: "authenticated",
-                  vault: assetLifecycle.vault,
-                  document: assetLifecycle.document,
-                  commit: assetLifecycle.commit,
-                }
-              : undefined
-          }
-          className="my-0 max-h-[70vh] object-contain"
-        />
+      <figure contentEditable={false} className="group m-0">
+        <div className="relative mx-auto w-fit max-w-full">
+          <AssetImage
+            src={element.url}
+            alt={alt}
+            assetContext={
+              assetLifecycle
+                ? {
+                    mode: "authenticated",
+                    vault: assetLifecycle.vault,
+                    document: assetLifecycle.document,
+                    commit: assetLifecycle.commit,
+                  }
+                : undefined
+            }
+            className="my-0 max-h-[70vh] max-w-full object-contain"
+          />
+          {!assetLifecycle?.readOnly && (
+            <Button
+              type="button"
+              variant="secondary"
+              size="icon"
+              aria-label={alt ? `Remove image: ${alt}` : "Remove image"}
+              title="Remove image"
+              className="absolute right-2 top-2 h-8 w-8 border border-border bg-surface/90 text-foreground-muted shadow-sm backdrop-blur-sm hover:border-border-strong hover:bg-surface hover:text-foreground"
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={removeImage}
+            >
+              <X className="h-4 w-4" aria-hidden />
+            </Button>
+          )}
+        </div>
         {alt && (
           <figcaption className="mt-1.5 text-center text-xs text-foreground-muted">
             {alt}
           </figcaption>
         )}
-        <Button
-          type="button"
-          variant="destructive"
-          size="icon"
-          aria-label={alt ? `Remove image: ${alt}` : "Remove image"}
-          title="Remove image"
-          className="absolute right-2 top-2 h-8 w-8 opacity-0 shadow-sm group-hover:opacity-100 group-focus-within:opacity-100 focus:opacity-100"
-          onMouseDown={(event) => event.preventDefault()}
-          onClick={() => {
-            const path = editor.api.findPath(props.element);
-            if (path) {
-              editor.tf.removeNodes({ at: path });
-            }
-          }}
-        >
-          <Trash2 className="h-4 w-4" aria-hidden />
-        </Button>
       </figure>
       {props.children}
     </PlateElement>
@@ -303,11 +456,17 @@ const plugins = [
   CodeSyntaxPlugin,
   ListPlugin,
   LinkPlugin,
-  TablePlugin,
+  // Markdown/GFM has no merged-cell representation. Keeping table editing in
+  // rectangular mode makes row/column transforms deterministic and prevents
+  // an unround-trippable editor state.
+  TablePlugin.configure({ options: { disableMerge: true } }),
   TableRowPlugin,
   TableCellPlugin,
   TableCellHeaderPlugin,
   ImagePlugin,
+  // Full editors must always have a text block after terminal atomic blocks
+  // (tables, images, rules). This is the keyboard and pointer escape route.
+  TrailingBlockPlugin,
   // Marks
   BoldPlugin,
   ItalicPlugin,
@@ -700,6 +859,7 @@ export function MarkdownEditor({
   } | null>(null);
   const uploadControllerRef = React.useRef<AbortController | null>(null);
   const imageInputRef = React.useRef<HTMLInputElement>(null);
+  const editorSurfaceRef = React.useRef<HTMLDivElement | null>(null);
   const uploadInFlightRef = React.useRef(false);
   const deferredImageFilesRef = React.useRef<File[]>([]);
   const unclaimedAssetIdsRef = React.useRef(new Set<string>());
@@ -765,7 +925,18 @@ export function MarkdownEditor({
     components,
     value: (ed) => {
       try {
-        return ed.getApi(MarkdownPlugin).markdown.deserialize(value || "");
+        const nodes = ed.getApi(MarkdownPlugin).markdown.deserialize(value || "");
+        const lastNode = nodes.at(-1) as { type?: string } | undefined;
+        // Initial markdown is deserialized before the normalizer's first edit.
+        // Seed the same invariant that TrailingBlockPlugin maintains later so
+        // a document loaded with a terminal table/image is immediately escapable.
+        if (lastNode?.type !== ParagraphPlugin.key) {
+          return [
+            ...nodes,
+            { type: ParagraphPlugin.key, children: [{ text: "" }] },
+          ];
+        }
+        return nodes;
       } catch (err) {
         // Plate's mdast deserializer can throw on malformed input
         // (unsupported HTML, broken tables, etc). Surface the editor with
@@ -907,8 +1078,14 @@ export function MarkdownEditor({
   );
 
   const assetLifecycle = React.useMemo(
-    () => ({ vault, document, commit }),
-    [commit, document, vault],
+    () => ({
+      vault,
+      document,
+      commit,
+      readOnly,
+      focusEditor: () => editorSurfaceRef.current?.focus(),
+    }),
+    [commit, document, readOnly, vault],
   );
 
   const handleImageDragOver = React.useCallback(
@@ -1063,6 +1240,9 @@ export function MarkdownEditor({
         </Alert>
       )}
       <PlateContent
+        ref={(node) => {
+          editorSurfaceRef.current = node as HTMLDivElement | null;
+        }}
         autoFocus={autoFocus}
         readOnly={readOnly}
         placeholder={placeholder}

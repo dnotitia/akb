@@ -55,6 +55,7 @@
     "@platejs/list": "~53.0.2",
     "@platejs/markdown": "~53.0.4",
     "@platejs/table": "~53.0.0",
+    "@platejs/utils": "~53.0.3",
     "@radix-ui/react-avatar": "^1.1.11",
     "@radix-ui/react-dialog": "^1.1.15",
     "@radix-ui/react-dropdown-menu": "^2.1.16",

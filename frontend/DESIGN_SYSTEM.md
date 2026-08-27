@@ -497,6 +497,16 @@ commits` control and `Full commit log` route. Below `xl`, the work area stacks
   never flattened silently. Upload errors stay inside the editor with an
   announced reason and explicit recovery: Retry appears only for transient
   failures, while Choose another and Dismiss are always available.
+  Tables and images are atomic authoring blocks, so the editor always maintains
+  a trailing paragraph as a keyboard and pointer escape route. An editable table
+  owns one compact caption toolbar with labelled Row, Column, and Continue below
+  actions plus a spatially separated Delete table control; GFM tables remain
+  rectangular because merged cells cannot round-trip to Markdown. Removing a
+  table restores focus to the following text block and remains reversible through
+  editor Undo. Image removal is an always-discoverable neutral `X` inset at the
+  image's own top-right corner—not the document measure's edge—and returns focus
+  to the nearest text block. All block controls are omitted in read-only mode,
+  use Lucide icons, expose accessible names, and never rely on hover alone.
   A document opened from Search uses this same reader inside a route-backed
   preview dialog rather than replacing the result ledger. The dialog leaves the
   persistent Vault navigation visible on wide screens, becomes full-screen on

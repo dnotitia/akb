@@ -159,7 +159,11 @@ describe("MarkdownEditor image insertion", () => {
     );
 
     await screen.findByRole("img", { name: "diagram" });
-    fireEvent.click(screen.getByRole("button", { name: "Remove image: diagram" }));
+    const removeButton = screen.getByRole("button", { name: "Remove image: diagram" });
+    expect(removeButton.querySelector(".lucide-x")).not.toBeNull();
+    expect(removeButton).toHaveClass("right-2", "top-2");
+    expect(removeButton).not.toHaveClass("opacity-0");
+    fireEvent.click(removeButton);
 
     await waitFor(() => expect(screen.queryByRole("img", { name: "diagram" })).toBeNull());
     await waitFor(() =>
