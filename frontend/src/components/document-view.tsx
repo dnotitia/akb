@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Check, Code2, Copy, Eye, Pencil } from "lucide-react";
+import { Check, Code2, Copy, Eye } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { getDocument } from "@/lib/api";
 import { MarkdownRender } from "@/components/markdown-render";
@@ -17,14 +17,6 @@ interface DocumentViewProps {
   /** Controlled view — provide this + onViewChange to sync with URL params */
   view?: ViewMode;
   onViewChange?: (next: ViewMode) => void;
-  /**
-   * Optional extra segmented-control tab appended after RENDERED/RAW.
-   * The parent owns the click handler — DocumentView does not switch
-   * its own view state when the extra tab is clicked. Used by
-   * DocumentPage to inject the body-editor entry point without
-   * folding the editor into this read-focused component.
-   */
-  extraTab?: { label: string; onClick: () => void };
   /**
    * Optional git commit hash. When set, the body is fetched at that
    * commit via getDocument(..., version) and the queryKey carries the
@@ -57,7 +49,6 @@ export function DocumentView({
   docId,
   view: viewProp,
   onViewChange,
-  extraTab,
   version,
   appearance = "plain",
 }: DocumentViewProps) {
@@ -123,12 +114,11 @@ export function DocumentView({
          WAI-ARIA tabs pattern: ArrowLeft/ArrowRight (and Home/End)
          move focus between tabs; Enter/Space activates. Each tab
          points at its panel via aria-controls so screen readers
-         announce the relationship. The extra tab (e.g. EDIT) is
-         a navigation trigger, not a panel, so it owns no panel id. */}
+         announce the relationship. Editing is a document action in
+         the workspace header, not a third read-mode tab. */}
       <TabStrip
         view={view}
         onSelect={setView}
-        extraTab={extraTab}
         appearance={appearance}
         copiedRaw={copiedRaw}
         onCopyRaw={copyRaw}
@@ -230,7 +220,6 @@ function DocumentViewLoading({ appearance }: { appearance: "plain" | "file" }) {
 interface TabStripProps {
   view: ViewMode;
   onSelect: (next: ViewMode) => void;
-  extraTab?: { label: string; onClick: () => void };
   appearance: "plain" | "file";
   copiedRaw: boolean;
   onCopyRaw: () => void;
@@ -242,7 +231,6 @@ interface TabStripProps {
 function TabStrip({
   view,
   onSelect,
-  extraTab,
   appearance,
   copiedRaw,
   onCopyRaw,
@@ -251,7 +239,7 @@ function TabStrip({
   summary,
 }: TabStripProps) {
   const tabs: Array<{
-    key: ViewMode | "extra";
+    key: ViewMode;
     label: string;
     selected: boolean;
     onActivate: () => void;
@@ -260,9 +248,6 @@ function TabStrip({
     { key: "rendered", label: "Rendered", selected: view === "rendered", onActivate: () => onSelect("rendered"), icon: Eye },
     { key: "raw", label: "Raw", selected: view === "raw", onActivate: () => onSelect("raw"), icon: Code2 },
   ];
-  if (extraTab) {
-    tabs.push({ key: "extra", label: extraTab.label, selected: false, onActivate: extraTab.onClick, icon: Pencil });
-  }
 
   function onKey(e: React.KeyboardEvent<HTMLButtonElement>, idx: number) {
     let next: number;
@@ -345,7 +330,6 @@ function TabStrip({
         )}
       >
         {tabs.map((t, i) => {
-          const isPanelTab = t.key !== "extra";
           const Icon = t.icon;
           const cls = cn(
             "inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded-[var(--radius-sm)] transition-token cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
@@ -359,9 +343,9 @@ function TabStrip({
             <button
               key={t.key}
               role="tab"
-              id={isPanelTab ? `docview-tab-${t.key}` : undefined}
+              id={`docview-tab-${t.key}`}
               aria-selected={t.selected}
-              aria-controls={isPanelTab ? `docview-panel-${t.key}` : undefined}
+              aria-controls={`docview-panel-${t.key}`}
               tabIndex={t.selected || (!tabs.some((x) => x.selected) && i === 0) ? 0 : -1}
               onClick={t.onActivate}
               onKeyDown={(e) => onKey(e, i)}

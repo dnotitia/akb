@@ -1187,6 +1187,40 @@ export const getDocument = (vault: string, id: string, version?: string) => {
 };
 export const updateDocument = (vault: string, id: string, data: any) =>
   api<any>(`/documents/${vault}/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(data) });
+
+export interface DocumentMoveInput {
+  collection?: string;
+  slug?: string;
+  message?: string;
+}
+
+export interface DocumentMoveResult {
+  kind: "document_write";
+  uri: string;
+  vault: string;
+  path: string;
+  commit_hash: string;
+  current_commit?: string | null;
+  previous_commit?: string | null;
+  action?: string | null;
+}
+
+/** Move a document without changing its stable resource identity.
+ *
+ * The backend owns Git history, old-URI aliases, relationships, publications,
+ * and destination collision checks. Callers must navigate to `result.path`
+ * rather than predicting the server-normalized destination.
+ */
+export const moveDocument = (
+  vault: string,
+  id: string,
+  data: DocumentMoveInput,
+) =>
+  api<DocumentMoveResult>(
+    `/documents/${encodeURIComponent(vault)}/${encodeURIComponent(id)}/move`,
+    { method: "POST", body: JSON.stringify(data) },
+  );
+
 export const deleteDocument = (vault: string, id: string) =>
   api<any>(`/documents/${vault}/${encodeURIComponent(id)}`, { method: "DELETE" });
 

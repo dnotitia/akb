@@ -651,8 +651,8 @@ function buildComponents(markdown: string, assetContext?: AssetContext): Compone
 
     /* ── Tables ───────────────────────────────────────────────── */
     table: ({ node: _node, children, ...props }) => (
-      <div className="my-5 overflow-x-auto max-w-full rounded-[var(--radius-lg)] border border-border">
-        <table className="min-w-full border-collapse text-[0.92em]" {...props}>
+      <div className="akb-md-table my-5 overflow-x-auto rounded-[var(--radius-lg)] border border-border">
+        <table className="w-max min-w-full border-collapse text-[0.92em]" {...props}>
           {children}
         </table>
       </div>
