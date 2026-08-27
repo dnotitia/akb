@@ -214,6 +214,33 @@ def test_record_tool_marks_error_outcome(audit_dir):
     assert row["code"] == "NOT_FOUND"
 
 
+def test_record_tool_records_protocol_facts_without_peer_metadata(audit_dir):
+    class _U:
+        username, user_id = "alice", "u1"
+
+    audit_log.record_tool(
+        "akb_search",
+        {"vault": "v", "session_id": "opaque-session", "client_info": "client-info"},
+        _U(),
+        {"results": []},
+        protocol={
+            "protocol_generation": "modern",
+            "protocol_revision": "2026-07-28",
+            "auth_method": "pat",
+        },
+    )
+    audit_log.flush()
+    raw = (audit_dir / f"akb-audit-{_today()}.jsonl").read_text(encoding="utf-8")
+    row = json.loads(raw)
+    assert row["meta"] == {
+        "protocol_generation": "modern",
+        "protocol_revision": "2026-07-28",
+        "auth_method": "pat",
+    }
+    assert "opaque-session" not in raw
+    assert "client-info" not in raw
+
+
 def test_never_raises_on_unwritable_dir(tmp_path, monkeypatch):
     blocker = tmp_path / "afile"
     blocker.write_text("not a dir")

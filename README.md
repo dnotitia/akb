@@ -12,7 +12,7 @@
 
 [![License: BSL 1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](./LICENSE)
 [![npm: akb-mcp](https://img.shields.io/npm/v/akb-mcp.svg?label=npm%3A%20akb-mcp)](https://www.npmjs.com/package/akb-mcp)
-[![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP-orange.svg)](https://modelcontextprotocol.io)
+[![MCP](https://img.shields.io/badge/MCP-2026--07--28%20%2B%20legacy-orange.svg)](https://modelcontextprotocol.io)
 
 ## Works with
 
@@ -29,6 +29,21 @@ optional **MCP OAuth Resource Server** path turned on (via Keycloak as
 the AS — see [`docs/mcp-clients/web-connectors.md`](./docs/mcp-clients/web-connectors.md))
 also accept Claude Code's `mcp add --transport http` + `mcp login` flow
 end-to-end, without a PAT.
+
+## MCP protocol compatibility
+
+AKB keeps one tool and authorization core behind two protocol adapters:
+
+| Surface | Modern | Legacy |
+|---|---|---|
+| Direct HTTP `/mcp/` | `2026-07-28` stateless `server/discover` and per-request `_meta` with `Mcp-Protocol-Version` / `Mcp-Method` (and `Mcp-Name` for named calls) | `2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25` initialize + `Mcp-Session-Id` lifecycle |
+| `akb-mcp` stdio proxy | `2026-07-28` discovery and per-request metadata | `2025-06-18` initialize |
+
+The proxy answers either handshake locally and normalizes backend calls to the
+modern stateless contract when available. Legacy backend sessions are used
+only during a rolling upgrade when modern discovery is unavailable. A process
+cannot mix generations, and unsupported revisions or conflicting protocol
+evidence fail closed before a tool or local-file operation runs.
 
 ## Plugins
 

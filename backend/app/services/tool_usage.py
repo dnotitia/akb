@@ -249,7 +249,8 @@ def record(
 
     Raw ``args`` are NOT stored — they carry document bodies, search queries and
     SQL. Only ``vault`` is lifted out, the same "honest, lossy" choice
-    ``audit_log`` made for its ``target``.
+    ``audit_log`` made for its ``target``. The session correlation value is a
+    one-way digest so the opaque transport session identifier is not retained.
     """
     global _dropped
     try:
@@ -276,7 +277,7 @@ def record(
             tool=_clip(name) or "",
             actor_id=_clip(getattr(user, "user_id", None)),
             actor=_clip(getattr(user, "username", None)),
-            session_id=_clip(session_id),
+            session_id=_session_ref(session_id),
             vault=_clip(vault_of_call(name, args)),
             outcome=outcome,
             code=_clip(code),
@@ -315,6 +316,15 @@ _DIGEST = 16
 # which is the event-loop stall class this service dies of. Sampling a bounded
 # prefix keeps the cost flat regardless of what a caller sends.
 _SCAN_MAX = 4096
+
+
+def _session_ref(value: Any) -> str | None:
+    """Return a stable, non-reversible correlation key for a session id."""
+    if value is None:
+        return None
+    raw = value if isinstance(value, str) else str(value)
+    digest = hashlib.sha256(f"akb-mcp-session:{raw}".encode("utf-8", "replace")).hexdigest()
+    return f"sha256:{digest}"
 
 
 def _clip(v: Any) -> str | None:

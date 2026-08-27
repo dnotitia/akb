@@ -87,7 +87,7 @@ itAsync("initialize rejects an unsupported protocol version instead of echoing i
   assert.equal(proxy._initialized, false);
 });
 
-itAsync("backend initialize negotiates vault-guide preflight without dropping client capabilities", async () => {
+itAsync("backend modern discovery carries vault-guide preflight without dropping client capabilities", async () => {
   const proxy = newProxy();
   const original = {
     protocolVersion: "2025-06-18",
@@ -99,20 +99,28 @@ itAsync("backend initialize negotiates vault-guide preflight without dropping cl
   };
   proxy._clientInitParams = original;
   let forwarded;
-  proxy._rpc = async (method, params) => {
-    assert.equal(method, "initialize");
-    forwarded = params;
-    return {};
+  proxy._rpc = async (method, params, options) => {
+    assert.equal(method, "server/discover");
+    assert.equal(options.protocolMode, "modern");
+    forwarded = proxy._modernizeParams(params);
+    return { supportedVersions: ["2026-07-28"] };
   };
 
   assert.equal(await proxy._ensureBackend(), true);
-  assert.deepEqual(forwarded.capabilities.roots, { listChanged: true });
   assert.deepEqual(
-    forwarded.capabilities.experimental["example.test/feature"],
+    forwarded._meta["io.modelcontextprotocol/clientCapabilities"].roots,
+    { listChanged: true },
+  );
+  assert.deepEqual(
+    forwarded._meta["io.modelcontextprotocol/clientCapabilities"].experimental[
+      "example.test/feature"
+    ],
     { version: 2 },
   );
   assert.deepEqual(
-    forwarded.capabilities.experimental["io.dnotitia.akb/vault-skill-preflight"],
+    forwarded._meta["io.modelcontextprotocol/clientCapabilities"].experimental[
+      "io.dnotitia.akb/vault-skill-preflight"
+    ],
     { version: 2 },
   );
   assert.equal(

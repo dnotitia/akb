@@ -241,7 +241,8 @@ def test_session_and_duration_are_recorded(enabled):
         session_id="sess-1", duration_ms=42, is_write=False,
     )
     row = tool_usage.drain(1)[0]
-    assert row.session_id == "sess-1"
+    assert row.session_id == tool_usage._session_ref("sess-1")
+    assert "sess-1" not in row.session_id
     assert row.duration_ms == 42
     assert row.is_write is False
 
@@ -997,7 +998,7 @@ def test_serialisation_failure_records_the_call_exactly_once(monkeypatch, tmp_pa
     assert len(usage) == 1, f"usage recorded {len(usage)} times for one call"
     assert len(audit) == 1, f"audit recorded {len(audit)} times for one call"
     # The caller still gets a well-formed error envelope.
-    assert "error" in out[0].text
+    assert "error" in out.content[0].text
 
 
 def test_lifecycle_starts_and_stops_the_workers():

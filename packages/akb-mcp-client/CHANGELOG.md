@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.3.0 — dual-generation MCP bridge
+
+The stdio proxy now exposes both supported client surfaces in one process:
+legacy clients use the existing `2025-06-18` initialize contract, while modern
+clients use `2026-07-28` `server/discover` plus per-request metadata. The first
+client request fixes the generation for that process; initialize/discover
+mixing and malformed or unsupported modern envelopes are rejected without
+forwarding or local-file side effects.
+
+Backend calls are normalized to the 2026-07-28 stateless request contract and
+carry the method/name headers required by that wire. A narrowly scoped legacy
+backend session is retained only when discovery proves the peer is an older
+rolling-upgrade backend. Modern discovery and legacy initialize are answered
+locally, so either client remains registered while the backend is unavailable.
+
 ## 2.2.2 — strict MCP protocol boundary
 
 The stdio proxy now rejects an `initialize` request that names an unsupported

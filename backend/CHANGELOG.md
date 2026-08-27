@@ -7,6 +7,18 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Added dual-era MCP protocol support
+
+The backend now uses the pinned MCP 2.1.0 SDK and serves the 2026-07-28
+stateless request envelope alongside the supported legacy initialize/session
+revisions (`2024-11-05`, `2025-03-26`, `2025-06-18`, and `2025-11-25`) on the
+same authenticated `/mcp/` endpoint. Modern requests carry their own client
+metadata and never create or reuse a session; legacy sessions remain bound to
+the principal that initialized them. Header/body generation mismatches,
+unsupported revisions, and cross-generation requests fail before tool
+dispatch. Tool validation, authorization, RBAC, audit, and side effects stay
+in the shared dispatcher.
+
 ### Added collection intent to browse and search responses
 
 `akb_browse` now returns metadata for its current vault or collection root,

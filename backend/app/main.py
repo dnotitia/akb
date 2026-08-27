@@ -142,7 +142,8 @@ async def lifespan(app: FastAPI):
             start_workers()
         else:
             start_api_runtime()
-        yield
+        async with mcp_app.run():
+            yield
     finally:
         if runtime_started:
             if role == "all":

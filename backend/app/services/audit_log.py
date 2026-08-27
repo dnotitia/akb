@@ -389,7 +389,15 @@ def _record_grep_replace_receipts(args: dict, user, result) -> None:
         )
 
 
-def record_tool(name: str, args: dict, user, result, *, is_write: bool = False) -> None:
+def record_tool(
+    name: str,
+    args: dict,
+    user,
+    result,
+    *,
+    is_write: bool = False,
+    protocol: dict[str, str] | None = None,
+) -> None:
     """Audit one MCP tool call from the dispatch chokepoint. ``user`` is the
     resolved _MCPUser; ``result`` is the handler's return envelope (or the
     final error envelope) — outcome is derived from it.
@@ -418,6 +426,13 @@ def record_tool(name: str, args: dict, user, result, *, is_write: bool = False) 
         code = result.get("code")
     if name == "akb_grep" and is_write:
         _record_grep_replace_receipts(args, user, result)
+    audit_meta = {
+        "protocol_generation": protocol["protocol_generation"],
+        "protocol_revision": protocol["protocol_revision"],
+        "auth_method": protocol["auth_method"],
+    } if protocol is not None else {}
+    if name == "akb_grep" and is_write:
+        audit_meta.update(_grep_replace_meta(args, result) or {})
     record(
         action=name,
         actor=getattr(user, "username", None),
@@ -426,7 +441,7 @@ def record_tool(name: str, args: dict, user, result, *, is_write: bool = False) 
         target=(_target_of(args) if isinstance(args, dict) else None),
         outcome=outcome,
         code=code,
-        meta=(_grep_replace_meta(args, result) if name == "akb_grep" and is_write else None),
+        meta=audit_meta or None,
     )
 
 
