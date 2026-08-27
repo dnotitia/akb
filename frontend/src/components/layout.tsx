@@ -18,6 +18,8 @@ import { AppSidebar } from "@/components/app-sidebar";
 import { appRouteBoundaryForPath } from "@/app-route-contract";
 import { CurrentUserProvider } from "@/contexts/current-user-context";
 import { useAccessibleIndexingHealth } from "@/hooks/use-accessible-indexing-health";
+import { InlineLoadingState, LoadingState } from "@/components/ui/loading-state";
+import { Skeleton } from "@/components/ui/skeleton";
 
 const APP_SIDEBAR_COMPACT_KEY = "akb_app_sidebar_compact";
 
@@ -159,13 +161,7 @@ export function Layout() {
   }, [viewportLocked]);
 
   if (session.status === "checking") {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-background text-foreground">
-        <div className="coord" role="status" aria-live="polite">
-          Verifying session…
-        </div>
-      </div>
-    );
+    return <AppShellLoading />;
   }
 
   if (session.status === "unauthenticated") {
@@ -185,13 +181,11 @@ export function Layout() {
   return (
     <div className={rootClass} aria-busy={revalidating || undefined}>
       {revalidating && (
-        <div
-          className="fixed inset-0 z-[var(--z-toast)] flex items-center justify-center bg-background/95 backdrop-blur-sm"
-          role="status"
-          aria-live="polite"
-        >
-          <div className="coord">Verifying session…</div>
-        </div>
+        <InlineLoadingState
+          label="Refreshing access…"
+          size="sm"
+          className="fixed left-1/2 top-2 z-[var(--z-toast)] -translate-x-1/2 rounded-full border border-border bg-surface px-3 py-1.5 shadow-md"
+        />
       )}
       {/* Skip link — first focusable element; jumps keyboard/SR users past the
           header chrome to the page content on every route. */}
@@ -315,6 +309,61 @@ export function Layout() {
         </div>
       </div>
     </div>
+  );
+}
+
+function AppShellLoading() {
+  return (
+    <LoadingState label="Verifying session" className="min-h-screen bg-background text-foreground">
+      <div className="flex min-h-screen flex-col">
+        <header className="app-header shrink-0">
+          <div className="flex h-14 w-full items-center">
+            <div className="flex shrink-0 items-center px-3 lg:w-52">
+              <Logo size={28} wordmark subtitle variant="header" />
+            </div>
+            <div className="ml-auto flex min-w-0 items-center gap-3 pr-3">
+              <Skeleton className="hidden h-8 w-44 rounded-[var(--radius-md)] sm:block" />
+              <Skeleton className="h-9 w-9 rounded-full" />
+            </div>
+          </div>
+        </header>
+
+        <div className="flex min-h-0 flex-1">
+          <aside className="hidden w-52 shrink-0 border-r border-border bg-surface lg:block">
+            <div className="space-y-2 p-3">
+              {[0, 1, 2, 3].map((item) => (
+                <div key={item} className="flex h-10 items-center gap-3 rounded-[var(--radius-md)] px-2">
+                  <Skeleton className="h-8 w-8 shrink-0 rounded-[var(--radius-md)]" />
+                  <Skeleton className="h-3.5 w-24 rounded-[var(--radius-sm)]" />
+                </div>
+              ))}
+            </div>
+          </aside>
+
+          <main className="min-w-0 flex-1 px-4 py-8 sm:px-6 lg:px-8 xl:px-12 2xl:px-36">
+            <div className="border-b border-border pb-6">
+              <Skeleton className="h-3 w-28 rounded-[var(--radius-sm)]" />
+              <Skeleton className="mt-4 h-9 w-64 max-w-full rounded-[var(--radius-md)]" />
+              <Skeleton className="mt-3 h-4 w-full max-w-xl rounded-[var(--radius-sm)]" />
+            </div>
+            <div className="mt-8 grid gap-6 xl:grid-cols-[minmax(0,1fr)_21rem]">
+              <div className="space-y-6">
+                <section className="rounded-[var(--radius-lg)] border border-border bg-surface p-5 shadow-sm">
+                  <Skeleton className="h-5 w-36 rounded-[var(--radius-sm)]" />
+                  <div className="mt-5 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                    {[0, 1, 2].map((item) => (
+                      <Skeleton key={item} className="h-28 rounded-[var(--radius-lg)]" />
+                    ))}
+                  </div>
+                </section>
+                <Skeleton className="h-64 rounded-[var(--radius-lg)] border border-border" />
+              </div>
+              <Skeleton className="h-80 rounded-[var(--radius-lg)] border border-border" />
+            </div>
+          </main>
+        </div>
+      </div>
+    </LoadingState>
   );
 }
 

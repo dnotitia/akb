@@ -15,6 +15,19 @@ now include their parent collection summary and vault description. These
 fields are hydrated from the catalog after retrieval, so they add context
 without creating collection index records or affecting ranking.
 
+### Aligned resource deletion with Vault permission boundaries
+
+Recursive collection deletion can no longer be used by a Vault writer to
+drop a table that requires administrator access on the dedicated table
+endpoint. REST and MCP collection deletion now derive the table-drop
+capability from the authenticated Vault role and reject the whole operation
+before any mutation when the caller lacks it.
+
+The web app now exposes permission-aware delete actions for documents, files,
+and tables in both resource viewers and the Vault explorer. Table deletion
+requires exact-name confirmation and identifies affected rows, while every
+successful deletion refreshes the explorer and returns the user to the Vault.
+
 ### Fixed repeated production-scale BM25 rebuilds and bounded rebuild memory
 
 The BM25 refresher no longer compares all non-null chunks with the smaller set

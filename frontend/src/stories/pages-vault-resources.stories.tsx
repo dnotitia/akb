@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, within } from "storybook/test";
+import { expect, userEvent, within } from "storybook/test";
 import { delay, http, HttpResponse } from "msw";
 import {
   API,
@@ -31,6 +31,19 @@ const resourceShellHandlers = [
   defaultVaultInfoHandler,
   http.get("/health/vault/akb", () => HttpResponse.json(vaultHealth)),
 ];
+
+const storyFilePreviewUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(`
+  <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720">
+    <rect width="1200" height="720" fill="#edf5f7"/>
+    <rect x="96" y="88" width="1008" height="544" rx="28" fill="#ffffff" stroke="#c8ced6" stroke-width="4"/>
+    <rect x="140" y="136" width="920" height="72" rx="14" fill="#004059"/>
+    <rect x="140" y="248" width="312" height="304" rx="18" fill="#e0eef2"/>
+    <rect x="488" y="248" width="572" height="44" rx="12" fill="#dfe3e8"/>
+    <rect x="488" y="320" width="492" height="28" rx="10" fill="#ebeef2"/>
+    <rect x="488" y="372" width="536" height="28" rx="10" fill="#ebeef2"/>
+    <rect x="488" y="448" width="196" height="56" rx="14" fill="#c44a1e"/>
+  </svg>
+`)}`;
 
 async function expectVaultShell(canvasElement: HTMLElement) {
   const canvas = within(canvasElement);
@@ -123,6 +136,18 @@ export const TablePreview: Story = {
     const canvas = within(canvasElement);
     await expect(await canvas.findByRole("heading", { name: "releases" })).toBeInTheDocument();
     await expect(await canvas.findByText("0.6.0")).toBeInTheDocument();
+    await userEvent.click(canvas.getByRole("button", { name: "Schema" }));
+    const schema = canvas.getByRole("complementary", { name: "Table schema" });
+    const schemaCanvas = within(schema);
+    await expect(schema).toBeVisible();
+    await expect(schemaCanvas.getByRole("table")).toBeVisible();
+    await expect(schemaCanvas.getByRole("columnheader", { name: "Column" })).toBeVisible();
+    await expect(schemaCanvas.getByRole("columnheader", { name: "Data type" })).toBeVisible();
+    await expect(schemaCanvas.getByRole("columnheader", { name: "Constraints" })).toBeVisible();
+    await expect(schemaCanvas.getByText("Primary key")).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
+    await expect(canvas.queryByRole("complementary", { name: "Table schema" })).not.toBeInTheDocument();
+    await expect(canvas.getByRole("button", { name: "Schema" })).toHaveFocus();
     await expectVaultShell(canvasElement);
   },
 };
@@ -146,7 +171,7 @@ export const TableEmpty: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("No rows")).toBeInTheDocument();
+    await expect(await canvas.findByText("No rows yet")).toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
 };
@@ -205,7 +230,11 @@ export const FileReady: Story = {
         ...resourceShellHandlers,
         http.get(`${API}/files/akb`, () => HttpResponse.json({ items: storyFiles })),
         http.get(`${API}/files/akb/f-storybook/download`, () =>
-          HttpResponse.json({ download_url: "https://files.example.test/storybook.png" }),
+          HttpResponse.json({
+            download_url: storyFilePreviewUrl,
+            mime_type: "image/png",
+            size_bytes: 184320,
+          }),
         ),
       ],
     },
@@ -214,7 +243,8 @@ export const FileReady: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(await canvas.findByRole("heading", { name: "storybook.png" })).toBeInTheDocument();
-    await expect(await canvas.findByText("Inline preview pending")).toBeInTheDocument();
+    await expect(await canvas.findByRole("img", { name: "storybook.png" })).toBeInTheDocument();
+    await expect(canvas.queryByRole("button", { name: "Schema" })).not.toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
 };

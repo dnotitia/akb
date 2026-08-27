@@ -8,6 +8,7 @@ import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
+import { LoadingState } from "@/components/ui/loading-state";
 import { SkillBadge } from "@/components/ui/skill-badge";
 import { Panel } from "@/components/ui/panel";
 import { WorkspaceSectionHeader } from "@/components/ui/workspace-section-header";
@@ -147,7 +148,9 @@ export function SkillSection({
               in the external git repository that owns this content instead.
             </Alert>
           ) : loading ? (
-            <Skeleton className="h-40 w-full" />
+            <LoadingState label="Loading vault guide">
+              <Skeleton className="h-40 w-full rounded-[var(--radius-lg)]" />
+            </LoadingState>
           ) : !doc ? (
             <Alert variant="warning">
               The vault guide is missing. It is restored automatically by the

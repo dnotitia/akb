@@ -1161,8 +1161,9 @@ TOOLS = [
         name="akb_delete_collection",
         description=(
             "Delete a collection. If empty, removes the metadata row. If non-empty, requires "
-            "recursive=true to cascade delete every document and file under the path. "
-            "Cascade emits one git commit for the entire batch. Writer or higher role."
+            "recursive=true to cascade delete every document, file, and table under the path. "
+            "Cascade emits one git commit for the document batch. Writer or higher role; "
+            "admin or higher when any table is included."
         ),
         inputSchema={
             "type": "object",

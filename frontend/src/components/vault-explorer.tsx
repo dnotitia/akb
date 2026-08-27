@@ -21,6 +21,8 @@ import {
   Upload,
 } from "lucide-react";
 import { Alert } from "@/components/ui/alert";
+import { LoadingState } from "@/components/ui/loading-state";
+import { Skeleton } from "@/components/ui/skeleton";
 import { SkillBadge } from "@/components/ui/skill-badge";
 import { useVaultTree, useExpandedPaths, type NodeKind, type TreeNode } from "@/hooks/use-vault-tree";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
@@ -38,7 +40,12 @@ import {
   type FlatMoreRow,
   type FlatRow,
 } from "@/lib/tree-route";
-import { getVaultInfo } from "@/lib/api";
+import {
+  deleteDocument,
+  deleteVaultFile,
+  deleteVaultTable,
+  getVaultInfo,
+} from "@/lib/api";
 import { recentTone } from "@/lib/recent";
 import { isReservedCollection } from "@/lib/skill";
 import { CreateCollectionDialog } from "@/components/create-collection-dialog";
@@ -51,6 +58,12 @@ import { FileUploadDialog } from "@/components/file-upload-dialog";
 import { TableCreateDialog } from "@/components/table-create-dialog";
 import { SelectMenu } from "@/components/ui/select-menu";
 import { parseFileUri } from "@/lib/uri";
+import { ResourceActionsMenu } from "@/components/resource-actions-menu";
+import {
+  ResourceDeleteDialog,
+  type DeletableResourceKind,
+} from "@/components/resource-delete-dialog";
+import { ROLE_RANK, type Role } from "@/lib/roles";
 
 const PAGE_SIZE = 10;
 const TYPEAHEAD_TIMEOUT_MS = 500;
@@ -93,7 +106,7 @@ export function VaultExplorer({
   onRefetchReady,
   onCollapse,
 }: VaultExplorerProps) {
-  const { tree, loading, error, refetch } = useVaultTree(vault);
+  const { tree, loading, refreshing, error, refetch } = useVaultTree(vault);
   const openCreateDocument = useOpenDocumentCreateDialog();
   const refreshCtx = useVaultRefresh();
   // Prefer the explicit prop; otherwise fall back to context. This lets
@@ -127,21 +140,34 @@ export function VaultExplorer({
   // (`VaultShell`) doesn't have it cached and adding a redundant fetch in
   // the shell would slow first paint. document.tsx uses the same pattern.
   const [vaultRole, setVaultRole] = useState<string | null>(null);
+  const [vaultReadOnly, setVaultReadOnly] = useState(true);
   useEffect(() => {
     let alive = true;
+    setVaultRole(null);
+    setVaultReadOnly(true);
     getVaultInfo(vault)
       .then((d) => {
-        if (alive) setVaultRole(d?.role || null);
+        if (alive) {
+          setVaultRole(d?.role || null);
+          setVaultReadOnly(Boolean(d?.is_archived || d?.is_external_git));
+        }
       })
       .catch(() => {
-        if (alive) setVaultRole(null);
+        if (alive) {
+          setVaultRole(null);
+          setVaultReadOnly(true);
+        }
       });
     return () => {
       alive = false;
     };
   }, [vault]);
   const canWrite =
-    vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner";
+    !vaultReadOnly &&
+    (vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner");
+  const canAdmin =
+    !vaultReadOnly &&
+    (ROLE_RANK[vaultRole as Role] ?? 0) >= ROLE_RANK.admin;
 
   // Dialog state.
   const [createOpen, setCreateOpen] = useState(false);
@@ -169,6 +195,13 @@ export function VaultExplorer({
   } | null>(null);
   const [uploadCollection, setUploadCollection] = useState<string | null>(null);
   const [tableCollection, setTableCollection] = useState<string | null>(null);
+  const [resourceDeleteTarget, setResourceDeleteTarget] = useState<{
+    kind: DeletableResourceKind;
+    name: string;
+    ref: string;
+    rowCount: number;
+    active: boolean;
+  } | null>(null);
   const mutationTriggerRef = useRef<HTMLElement | null>(null);
 
   const rememberMutationTrigger = useCallback(() => {
@@ -383,12 +416,12 @@ export function VaultExplorer({
           <button
             type="button"
             onClick={() => refetch()}
-            disabled={loading}
+            disabled={loading || refreshing}
             aria-label="Refresh collections"
             title="Refresh collections"
             className={headBtn}
           >
-            <RefreshCw className={loading ? "h-3 w-3 animate-spin" : "h-3 w-3"} aria-hidden />
+            <RefreshCw className={loading || refreshing ? "h-3 w-3 animate-spin" : "h-3 w-3"} aria-hidden />
           </button>
           {canWrite && (
             <RootCreateMenu
@@ -448,23 +481,24 @@ export function VaultExplorer({
         ref={listRef}
         role="tree"
         aria-label={`${vault} explorer`}
+        aria-busy={loading || refreshing || undefined}
         onKeyDown={onKeyDown}
         className="flex-1 overflow-y-auto"
       >
-        {loading && <div className="coord px-3 py-3" role="status" aria-live="polite">— Loading —</div>}
+        {loading && <VaultExplorerLoading />}
         {error && <Alert variant="destructive" className="m-2">{error}</Alert>}
-        {!loading && !error && total === 0 && (
+        {!loading && total === 0 && (
           <div className="px-3 py-4 text-xs leading-relaxed text-foreground-muted" role="status">
             No collections yet — the tree fills in with your first document.
           </div>
         )}
-        {!loading && !error && total > 0 && visibleRows.length === 0 && (
+        {!loading && total > 0 && visibleRows.length === 0 && (
           <div className="coord px-3 py-2" role="status">
             No resources match these filters.
           </div>
         )}
 
-        {!loading && !error &&
+        {!loading &&
           visibleRows.map((row) => {
             if (row.type === "kind-group") {
               return (
@@ -495,6 +529,7 @@ export function VaultExplorer({
                 vault={vault}
                 onToggle={toggle}
                 canWrite={canWrite}
+                canAdmin={canAdmin}
                 onCreateDoc={(node) =>
                   openCreateDocument({ collection: node.path })
                 }
@@ -520,11 +555,20 @@ export function VaultExplorer({
                     subCollectionCount: countSubCollections(node),
                   });
                 }}
+                onDeleteResource={(node) => {
+                  setResourceDeleteTarget({
+                    kind: node.kind as DeletableResourceKind,
+                    name: node.name,
+                    ref: node.path,
+                    rowCount: Number(node.raw?.row_count || 0),
+                    active: `${node.kind}:${node.path}` === activeSig,
+                  });
+                }}
               />
             );
           })}
 
-        {!loading && !error &&
+        {!loading &&
           fullRows.length > visibleRows.length && (
             <button
               type="button"
@@ -573,6 +617,28 @@ export function VaultExplorer({
           handleMutation();
         }}
       />
+      {resourceDeleteTarget && (
+        <ResourceDeleteDialog
+          open
+          onOpenChange={(next) => {
+            if (!next) setResourceDeleteTarget(null);
+          }}
+          kind={resourceDeleteTarget.kind}
+          name={resourceDeleteTarget.name}
+          rowCount={resourceDeleteTarget.rowCount}
+          onConfirm={async () => {
+            if (resourceDeleteTarget.kind === "document") {
+              await deleteDocument(vault, resourceDeleteTarget.ref);
+            } else if (resourceDeleteTarget.kind === "file") {
+              await deleteVaultFile(vault, resourceDeleteTarget.ref);
+            } else {
+              await deleteVaultTable(vault, resourceDeleteTarget.ref);
+            }
+            handleMutation();
+            if (resourceDeleteTarget.active) navigate(`/vault/${vault}`);
+          }}
+        />
+      )}
       <CollectionDetailsDialog
         vault={vault}
         path={detailsTarget?.path ?? ""}
@@ -620,6 +686,19 @@ export function VaultExplorer({
   );
 }
 
+function VaultExplorerLoading() {
+  return (
+    <LoadingState label="Loading collections" className="space-y-1 px-2 py-2">
+      {[0, 1, 2, 3, 4, 5].map((item) => (
+        <div key={item} className="flex h-8 items-center gap-2 px-1" style={{ paddingLeft: `${4 + (item % 3) * 12}px` }}>
+          <Skeleton className="h-4 w-4 shrink-0 rounded-[var(--radius-sm)]" />
+          <Skeleton className={item % 2 === 0 ? "h-3 w-28 rounded-[var(--radius-sm)]" : "h-3 w-20 rounded-[var(--radius-sm)]"} />
+        </div>
+      ))}
+    </LoadingState>
+  );
+}
+
 /* ── Row renderer (memoized on primitives) ────────────────────────────────── */
 
 interface RowProps {
@@ -633,9 +712,13 @@ interface RowProps {
   /** Writer+ unlocks per-row destructive affordances (collection rows
    *  only for now). Readers see the row unchanged. */
   canWrite?: boolean;
+  /** Admin+ is required for physical table deletion. */
+  canAdmin?: boolean;
   /** Fired when the user clicks the trash icon on a collection row.
    *  Parent decides which dialog to open and seeds it with counts. */
   onDeleteCollection?: (node: TreeNode) => void;
+  /** Open the matching document/file/table deletion flow. */
+  onDeleteResource?: (node: TreeNode) => void;
   /** Open the collection metadata and resource-count inspector. */
   onOpenDetails?: (node: TreeNode) => void;
   /** Fired when the user clicks the `+` (new sub-collection) icon on a
@@ -652,7 +735,7 @@ interface RowProps {
 }
 
 const TreeRow = memo(function TreeRow({
-  node, depth, sig, isOpen, isActive, vault, onToggle, canWrite, onDeleteCollection, onOpenDetails, onCreateSubCollection, onCreateDoc, onUploadFile, onCreateTable,
+  node, depth, sig, isOpen, isActive, vault, onToggle, canWrite, canAdmin, onDeleteCollection, onDeleteResource, onOpenDetails, onCreateSubCollection, onCreateDoc, onUploadFile, onCreateTable,
 }: RowProps) {
   const indent = { paddingLeft: `${depth * 12 + 12}px` };
 
@@ -662,6 +745,7 @@ const TreeRow = memo(function TreeRow({
     // rejects writes into it, so the tree shows it read-only (locked, no row
     // actions) rather than offering affordances that would 403.
     const isReserved = isReservedCollection(node.path);
+    const containsTables = countCollectionResources(node).tables > 0;
     return (
       <div
         role="treeitem"
@@ -730,7 +814,10 @@ const TreeRow = memo(function TreeRow({
                 : undefined
             }
             onDelete={
-              !isReserved && canWrite && onDeleteCollection
+              !isReserved &&
+              canWrite &&
+              (canAdmin || !containsTables) &&
+              onDeleteCollection
                 ? () => onDeleteCollection(node)
                 : undefined
             }
@@ -749,47 +836,65 @@ const TreeRow = memo(function TreeRow({
   // shape in a flat list. (Was text-accent ORANGE for table/file/skill, which
   // was off-system + spent the one-marquee-orange budget.) Skill = teal.
   const leafTone = isSkill ? "var(--color-primary)" : recentTone(node.kind);
+  const canDeleteResource =
+    !isSkill &&
+    Boolean(onDeleteResource) &&
+    (node.kind === "table" ? Boolean(canAdmin) : Boolean(canWrite));
 
   return (
-    <Link
-      to={href}
-      data-sig={sig}
-      role="treeitem"
-      aria-level={depth + 1}
-      aria-current={isActive ? "page" : undefined}
-      aria-selected={isActive}
-      style={indent}
-      className={`flex items-center gap-1.5 pr-2 py-1.5 min-h-9 group transition-colors hover:bg-surface-hover focus:bg-surface-hover focus:outline-none ${
-        isActive ? "bg-surface-selected text-surface-selected-foreground border-l-2 border-primary -ml-[2px]" : ""
-      }`}
-    >
-      {/* Tinted icon chip — the same kind-swatch grammar Home + the vault
-          overview use, so a doc vs table vs file is pre-attentive here too
-          (was a bare 12px glyph, the one surface that dropped the chip). */}
-      <span
-        className="inline-flex h-4 w-4 items-center justify-center rounded-[var(--radius-sm)] shrink-0"
-        style={{
-          color: leafTone,
-          backgroundColor: `color-mix(in srgb, ${leafTone} 12%, transparent)`,
-        }}
-        aria-hidden
+    <div role="none" className="group flex min-h-9 items-stretch focus-within:bg-surface-hover">
+      <Link
+        to={href}
+        data-sig={sig}
+        role="treeitem"
+        aria-level={depth + 1}
+        aria-current={isActive ? "page" : undefined}
+        aria-selected={isActive}
+        style={indent}
+        className={`flex min-h-9 min-w-0 flex-1 items-center gap-1.5 py-1.5 pr-1 transition-colors hover:bg-surface-hover focus:bg-surface-hover focus:outline-none ${
+          isActive ? "-ml-[2px] border-l-2 border-primary bg-surface-selected text-surface-selected-foreground" : ""
+        }`}
       >
-        <LeafIcon className="h-2.5 w-2.5" aria-hidden />
-      </span>
-      {/* The chip is aria-hidden, so name kind to assistive tech in words
-          (otherwise a SR user hears the bare title with no type). */}
-      <span className="sr-only">
-        {node.kind === "document"
-          ? isSkill
-            ? "Skill: "
-            : "Document: "
-          : node.kind === "table"
-            ? "Table: "
-            : "File: "}
-      </span>
-      <span title={node.name} className="truncate min-w-0 text-[13px] group-hover:text-link">{node.name}</span>
-      {isSkill && <SkillBadge defined className="ml-auto shrink-0" />}
-    </Link>
+        {/* Tinted icon chip — the same kind-swatch grammar Home + the vault
+            overview use, so a doc vs table vs file is pre-attentive here too
+            (was a bare 12px glyph, the one surface that dropped the chip). */}
+        <span
+          className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-[var(--radius-sm)]"
+          style={{
+            color: leafTone,
+            backgroundColor: `color-mix(in srgb, ${leafTone} 12%, transparent)`,
+          }}
+          aria-hidden
+        >
+          <LeafIcon className="h-2.5 w-2.5" aria-hidden />
+        </span>
+        {/* The chip is aria-hidden, so name kind to assistive tech in words
+            (otherwise a SR user hears the bare title with no type). */}
+        <span className="sr-only">
+          {node.kind === "document"
+            ? isSkill
+              ? "Skill: "
+              : "Document: "
+            : node.kind === "table"
+              ? "Table: "
+              : "File: "}
+        </span>
+        <span title={node.name} className="min-w-0 truncate text-[13px] group-hover:text-link">
+          {node.name}
+        </span>
+        {isSkill && <SkillBadge defined className="ml-auto shrink-0" />}
+      </Link>
+      {canDeleteResource && (
+        <ResourceActionsMenu
+          resourceName={node.name}
+          deleteLabel={`Delete ${node.kind}`}
+          onDelete={() => onDeleteResource?.(node)}
+          side="right"
+          align="start"
+          className="h-9 w-9 rounded-none opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"
+        />
+      )}
+    </div>
   );
 });
 

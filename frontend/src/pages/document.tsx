@@ -30,7 +30,6 @@ import {
   PanelRightOpen,
   Pencil,
   Share2,
-  Trash2,
 } from "lucide-react";
 import {
   authenticatedFetch,
@@ -61,11 +60,15 @@ import { MarkdownEditorFallback } from "@/components/markdown-editor-fallback";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { PublishOptionsDialog } from "@/components/publish-options-dialog";
 import { TooltipText } from "@/components/ui/tooltip-text";
+import { LoadingState } from "@/components/ui/loading-state";
+import { Skeleton } from "@/components/ui/skeleton";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import { RelationsPanel } from "@/components/relations/relations-panel";
 import { relationIsInVault } from "@/components/relations/relation-row-utils";
 import { useCurrentUser } from "@/contexts/current-user-context";
 import { recordRecentDocumentView } from "@/lib/recent-document-views";
+import { ResourceActionsMenu } from "@/components/resource-actions-menu";
+import { ResourceDeleteDialog } from "@/components/resource-delete-dialog";
 
 // Plate is heavy (~hundreds of KB gzipped); lazy-load so the read-only path
 // (Rendered / Raw) stays cheap.
@@ -104,6 +107,7 @@ export default function DocumentPage({
   const [articleEl, setArticleEl] = useState<HTMLElement | null>(null);
   const [vaultRole, setVaultRole] = useState<string | null>(null);
   const [vaultKind, setVaultKind] = useState<"normal" | "mirror" | "error" | null>(null);
+  const [vaultReadOnly, setVaultReadOnly] = useState(true);
   const [editOpen, setEditOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
@@ -196,14 +200,17 @@ export default function DocumentPage({
     if (!name) return;
     setVaultRole(null);
     setVaultKind(null);
+    setVaultReadOnly(true);
     getVaultInfo(name)
       .then((d) => {
         setVaultRole(d?.role || null);
         setVaultKind(d?.is_external_git ? "mirror" : "normal");
+        setVaultReadOnly(Boolean(d?.is_archived || d?.is_external_git));
       })
       .catch(() => {
         setVaultRole(null);
         setVaultKind("error");
+        setVaultReadOnly(true);
       });
   }, [name]);
 
@@ -487,12 +494,7 @@ export default function DocumentPage({
   }
 
   if (!doc) {
-    return (
-      <div className="py-8 coord">
-        <Loader2 className="h-4 w-4 inline animate-spin mr-2" aria-hidden />
-        Loading…
-      </div>
-    );
+    return <DocumentPageLoading presentation={presentation} />;
   }
 
   async function handleUnpublish() {
@@ -533,6 +535,7 @@ export default function DocumentPage({
     (doc.created_by && !isUuid(doc.created_by) ? doc.created_by : null);
   const canWrite =
     vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner";
+  const canDelete = canWrite && !vaultReadOnly && !isHistorical;
 
   const closeDetails = () => {
     setDetailsOpen(false);
@@ -630,6 +633,13 @@ export default function DocumentPage({
                 <Maximize2 className="h-4 w-4" aria-hidden />
                 <span className="hidden lg:inline">Full page</span>
               </Button>
+            )}
+            {canDelete && !inEditMode && (
+              <ResourceActionsMenu
+                resourceName={doc.title || fileName}
+                deleteLabel="Delete document"
+                onDelete={() => setDeleteOpen(true)}
+              />
             )}
             {inEditMode ? (
               <>
@@ -1031,20 +1041,6 @@ export default function DocumentPage({
                 )}
               </section>
 
-                  {canWrite && !isHistorical && (
-                    <div className="mt-4 border-t border-border pt-3">
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        className="w-full justify-start text-destructive hover:bg-destructive-soft hover:text-destructive-soft-foreground"
-                        onClick={() => setDeleteOpen(true)}
-                      >
-                        <Trash2 className="h-3.5 w-3.5" aria-hidden />
-                        Delete document
-                      </Button>
-                    </div>
-                  )}
                 </TabsContent>
 
                 <TabsContent value="outline" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 pt-3 rail-scroll">
@@ -1112,15 +1108,11 @@ export default function DocumentPage({
         onPublished={(slug) => setDocOverride({ ...doc, is_public: true, public_slug: slug })}
       />
 
-      <ConfirmDialog
+      <ResourceDeleteDialog
         open={deleteOpen}
         onOpenChange={setDeleteOpen}
-        title={`Delete "${doc.title || doc.path}"?`}
-        description={
-          "The document, its embeddings, and its publication links are removed.\nGit history of the file is preserved in the vault repo.\nThis cannot be undone from the UI."
-        }
-        confirmLabel="Delete document"
-        variant="destructive"
+        kind="document"
+        name={doc.title || doc.path}
         onConfirm={async () => {
           await deleteDocument(name!, docId);
           refetchTree();
@@ -1148,6 +1140,62 @@ export default function DocumentPage({
         }}
       />
     </>
+  );
+}
+
+function DocumentPageLoading({ presentation }: { presentation: "page" | "preview" }) {
+  return (
+    <LoadingState
+      label="Loading document"
+      className="flex h-full min-h-0 flex-col overflow-hidden bg-background"
+    >
+      <div className="flex h-full min-h-0 flex-col overflow-hidden">
+        <header
+          className={cn(
+            "flex h-16 shrink-0 items-center gap-3 border-b border-border bg-surface pl-3 sm:pl-4 lg:pl-5",
+            presentation === "preview" ? "pr-12 sm:pr-14" : "pr-3 sm:pr-4 lg:pr-5",
+          )}
+        >
+          <Skeleton className="hidden h-9 w-9 shrink-0 rounded-[var(--radius-md)] sm:block" />
+          <div className="min-w-0 flex-1 space-y-2">
+            <Skeleton className="h-5 w-2/3 max-w-56 rounded-[var(--radius-sm)]" />
+            <Skeleton className="h-3 w-1/2 max-w-40 rounded-[var(--radius-sm)]" />
+          </div>
+          <div className="flex shrink-0 gap-2">
+            <Skeleton className="h-8 w-20 rounded-[var(--radius-md)]" />
+            <Skeleton className="hidden h-8 w-24 rounded-[var(--radius-md)] sm:block" />
+          </div>
+        </header>
+
+        <div className="min-h-0 flex-1 overflow-hidden">
+          <main className="h-full overflow-hidden bg-background p-2 sm:p-3">
+            <div className="mb-3 flex min-h-11 items-center gap-3 rounded-[var(--radius-lg)] border border-border bg-surface px-3 shadow-xs">
+              <Skeleton className="h-4 w-4 shrink-0 rounded-[var(--radius-sm)]" />
+              <Skeleton className="h-3 w-2/3 max-w-64 rounded-[var(--radius-sm)]" />
+              <Skeleton className="ml-auto hidden h-3 w-32 rounded-[var(--radius-sm)] sm:block" />
+            </div>
+
+            <section className="min-h-[32rem] overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm">
+              <div className="flex min-h-11 items-center gap-2 border-b border-border bg-surface-2/60 px-3">
+                <Skeleton className="h-7 w-24 rounded-[var(--radius-sm)]" />
+                <Skeleton className="h-7 w-16 rounded-[var(--radius-sm)]" />
+                <Skeleton className="ml-auto h-3 w-28 rounded-[var(--radius-sm)]" />
+              </div>
+              <div className="mx-auto max-w-4xl space-y-4 px-5 py-8 sm:px-8 lg:px-12">
+                <Skeleton className="h-8 w-3/5 rounded-[var(--radius-md)]" />
+                <Skeleton className="h-4 w-full rounded-[var(--radius-sm)]" />
+                <Skeleton className="h-4 w-11/12 rounded-[var(--radius-sm)]" />
+                <Skeleton className="h-4 w-4/5 rounded-[var(--radius-sm)]" />
+                <Skeleton className="mt-7 h-6 w-2/5 rounded-[var(--radius-md)]" />
+                <Skeleton className="h-4 w-full rounded-[var(--radius-sm)]" />
+                <Skeleton className="h-4 w-5/6 rounded-[var(--radius-sm)]" />
+                <Skeleton className="mt-6 h-32 w-full rounded-[var(--radius-lg)]" />
+              </div>
+            </section>
+          </main>
+        </div>
+      </div>
+    </LoadingState>
   );
 }
 

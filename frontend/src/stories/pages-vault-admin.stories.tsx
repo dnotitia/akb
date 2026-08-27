@@ -46,7 +46,11 @@ const adminShellHandlers = [
 async function expectVaultShell(canvasElement: HTMLElement) {
   const canvas = within(canvasElement);
   await expect(await canvas.findByRole("navigation", { name: "Vaults" })).toBeInTheDocument();
-  await expect(await canvas.findByRole("tree", { name: "akb explorer" })).toBeInTheDocument();
+  // Operational Vault routes intentionally start with Collections folded so
+  // their ledger/form owns the working width. The reveal control is the stable
+  // shell contract for Publications, Activity, Members, and Settings.
+  await expect(await canvas.findByRole("button", { name: "Show collection tree" })).toBeInTheDocument();
+  await expect(canvas.queryByRole("tree", { name: "akb explorer" })).not.toBeInTheDocument();
 }
 
 export const PublicationsList: Story = {
@@ -107,7 +111,9 @@ export const PublicationsLoading: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("Loading…")).toBeInTheDocument();
+    await expect(
+      await canvas.findByRole("status", { name: "Loading published links" }),
+    ).toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
 };
@@ -400,7 +406,9 @@ export const ActivityLoading: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("Loading activity…")).toBeInTheDocument();
+    await expect(
+      await canvas.findByRole("status", { name: "Loading activity" }),
+    ).toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
 };

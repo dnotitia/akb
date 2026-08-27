@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, within, cleanup } from "@testing-library/react";
+import { render, screen, within, cleanup, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { VaultExplorer } from "@/components/vault-explorer";
@@ -14,6 +14,9 @@ vi.mock("@/lib/api", () => ({
   updateCollection: vi.fn(),
   uploadVaultFile: vi.fn(),
   createVaultTable: vi.fn(),
+  deleteDocument: vi.fn(),
+  deleteVaultFile: vi.fn(),
+  deleteVaultTable: vi.fn(),
   ApiError: class ApiError extends Error {
     status?: number;
   },
@@ -158,6 +161,28 @@ describe("VaultExplorer — rendering", () => {
 });
 
 describe("VaultExplorer — interaction", () => {
+  it("preserves the current tree while a manual refresh is pending", async () => {
+    let resolveRefresh: ((value: typeof sample) => void) | undefined;
+    browseMock
+      .mockResolvedValueOnce(sample)
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        resolveRefresh = resolve;
+      }));
+    const user = userEvent.setup();
+    renderAt("/vault/v");
+
+    const architecture = await screen.findByRole("button", { name: /^architecture/i });
+    await user.click(screen.getByRole("button", { name: "Refresh collections" }));
+
+    expect(architecture).toBeInTheDocument();
+    expect(screen.getByRole("tree", { name: /v explorer/ })).toHaveAttribute("aria-busy", "true");
+
+    resolveRefresh?.(sample);
+    await waitFor(() => {
+      expect(screen.getByRole("tree", { name: /v explorer/ })).not.toHaveAttribute("aria-busy");
+    });
+  });
+
   it("toggles a collection on click", async () => {
     const user = userEvent.setup();
     renderAt("/vault/v");
@@ -296,6 +321,27 @@ describe("VaultExplorer — role gating", () => {
     expect(screen.getByRole("menuitem", { name: /upload file/i })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /new table/i })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /new sub-collection/i })).toBeInTheDocument();
+    // This collection contains a table, so Writer cannot use collection
+    // deletion to bypass the table endpoint's Admin requirement.
+    expect(screen.queryByRole("menuitem", { name: /delete collection/i })).not.toBeInTheDocument();
+  });
+
+  it("shows document/file delete actions to writers and table actions to admins", async () => {
+    const user = userEvent.setup();
+    vaultInfoMock.mockResolvedValue({ role: "writer" });
+    const view = renderAt("/vault/v");
+    await user.click(await screen.findByRole("button", { name: /^architecture/i }));
+
+    expect(screen.getByRole("button", { name: "Actions for Schema" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Actions for diagram.png" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Actions for owners" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Actions for audit_log" })).not.toBeInTheDocument();
+
+    view.unmount();
+    vaultInfoMock.mockResolvedValue({ role: "admin" });
+    renderAt("/vault/v");
+    expect(await screen.findByRole("button", { name: "Actions for audit_log" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /collection actions for architecture/i }));
     expect(screen.getByRole("menuitem", { name: /delete collection/i })).toBeInTheDocument();
   });
 

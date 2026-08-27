@@ -295,7 +295,7 @@ describe("Layout — auth gate", () => {
 
     window.dispatchEvent(new Event("focus"));
 
-    expect(await screen.findByText("Verifying session…")).toBeTruthy();
+    expect(await screen.findByText("Refreshing access…")).toBeTruthy();
     expect(screen.getByTestId("home")).toBe(mountedWorkspace);
     resolveForeground?.({
       user_id: "user-2",
@@ -308,7 +308,7 @@ describe("Layout — auth gate", () => {
     });
     await waitFor(() => expect(api.getMe).toHaveBeenCalledTimes(2));
     await waitFor(() => {
-      expect(screen.queryByText("Verifying session…")).toBeNull();
+      expect(screen.queryByText("Refreshing access…")).toBeNull();
     });
     expect(screen.getByTestId("home")).toBe(mountedWorkspace);
     expect(queryClient.getQueryData(["private", "alice"])).toBeUndefined();

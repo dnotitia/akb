@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { browseVault } from "@/lib/api";
 import { isReservedCollection } from "@/lib/skill";
 import { parseFileUri } from "@/lib/uri";
@@ -47,8 +47,10 @@ interface BrowseItem {
  * require a future browse contract with collection + kind + cursor inputs.
  */
 export function useVaultTree(vault: string | undefined) {
-  const [items, setItems] = useState<BrowseItem[] | null>(null);
+  const [snapshot, setSnapshot] = useState<{ vault: string; items: BrowseItem[] } | null>(null);
+  const snapshotRef = useRef<{ vault: string; items: BrowseItem[] } | null>(null);
   const [error, setError] = useState<string>("");
+  const [refreshing, setRefreshing] = useState(false);
   // Counter bumped on every refetch invocation so the underlying
   // effect re-runs even when `vault` is unchanged (manual refresh,
   // post-mutation invalidate).
@@ -62,22 +64,41 @@ export function useVaultTree(vault: string | undefined) {
   // user fires refetch twice before the first resolves), we don't want
   // a late response to clobber the newer state.
   useEffect(() => {
-    if (!vault) return;
+    if (!vault) {
+      snapshotRef.current = null;
+      setSnapshot(null);
+      setRefreshing(false);
+      setError("");
+      return;
+    }
     let alive = true;
-    setItems(null);
+    const hasCurrentSnapshot = snapshotRef.current?.vault === vault;
+    setRefreshing(hasCurrentSnapshot);
     setError("");
     browseVault(vault, undefined, -1)
-      .then((d) => { if (alive) setItems(d.items as BrowseItem[]); })
-      .catch((e) => { if (alive) setError(e.message || String(e)); });
+      .then((d) => {
+        if (!alive) return;
+        const next = { vault, items: d.items as BrowseItem[] };
+        snapshotRef.current = next;
+        setSnapshot(next);
+      })
+      .catch((e) => {
+        if (alive) setError(e.message || String(e));
+      })
+      .finally(() => {
+        if (alive) setRefreshing(false);
+      });
     return () => { alive = false; };
   }, [vault, refetchTick]);
+
+  const items = snapshot && snapshot.vault === vault ? snapshot.items : null;
 
   const tree = useMemo<TreeNode[] | null>(() => {
     if (!items) return null;
     return buildTree(items);
   }, [items]);
 
-  return { tree, loading: items === null && !error, error, refetch };
+  return { tree, loading: items === null && !error, refreshing, error, refetch };
 }
 
 export function buildTree(items: BrowseItem[]): TreeNode[] {

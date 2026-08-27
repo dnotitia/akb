@@ -9,6 +9,8 @@ import { Input } from "@/components/ui/input";
 import { Panel, PanelHeader } from "@/components/ui/panel";
 import { Logo } from "@/components/logo";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { LoadingState } from "@/components/ui/loading-state";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   adminLocalLogin,
   adminLogout,
@@ -112,7 +114,7 @@ export default function AdminPage() {
           </div>
 
           {(configQuery.isPending || (config?.available && sessionQuery.isPending)) && (
-            <p className="text-sm text-foreground-muted" role="status">Verifying admin policy…</p>
+            <AdminPolicyLoading />
           )}
 
           {unavailable && (
@@ -269,7 +271,7 @@ function SsoProviderControl() {
   }
 
   if (catalogQuery.isPending) {
-    return <p className="text-sm text-foreground-muted" role="status">Loading SSO providers…</p>;
+    return <SsoProvidersLoading />;
   }
   if (catalogQuery.isError || !catalog) {
     return <Alert variant="destructive">SSO provider configuration could not be loaded.</Alert>;
@@ -356,6 +358,46 @@ function SsoProviderControl() {
         </form>
       </Panel>
     </div>
+  );
+}
+
+function AdminPolicyLoading() {
+  return (
+    <LoadingState label="Verifying admin policy">
+      <div className="space-y-4">
+        <div className="rounded-[var(--radius-lg)] border border-border bg-surface-2 p-4">
+          <Skeleton className="h-4 w-36 rounded-[var(--radius-sm)]" />
+          <Skeleton className="mt-3 h-3 w-52 rounded-[var(--radius-sm)]" />
+          <Skeleton className="mt-4 h-3 w-28 rounded-[var(--radius-sm)]" />
+        </div>
+        <Skeleton className="h-10 w-full rounded-[var(--radius-md)]" />
+      </div>
+    </LoadingState>
+  );
+}
+
+function SsoProvidersLoading() {
+  return (
+    <LoadingState label="Loading SSO providers" className="space-y-4">
+      <div>
+        <Skeleton className="h-6 w-40 rounded-[var(--radius-md)]" />
+        <Skeleton className="mt-2 h-4 w-3/4 rounded-[var(--radius-sm)]" />
+      </div>
+      <div className="overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface">
+        <div className="border-b border-border p-4">
+          <Skeleton className="h-4 w-36 rounded-[var(--radius-sm)]" />
+        </div>
+        {[0, 1].map((item) => (
+          <div key={item} className="flex items-center gap-4 border-b border-border p-4 last:border-b-0">
+            <div className="min-w-0 flex-1 space-y-2">
+              <Skeleton className="h-4 w-40 rounded-[var(--radius-sm)]" />
+              <Skeleton className="h-3 w-64 max-w-full rounded-[var(--radius-sm)]" />
+            </div>
+            <Skeleton className="h-9 w-20 rounded-[var(--radius-md)]" />
+          </div>
+        ))}
+      </div>
+    </LoadingState>
   );
 }
 
