@@ -41,6 +41,7 @@ from app.services.uri_service import doc_uri, parse_uri, split_uri
 from app.services.access_service import (
     authorized_vault, authorized_vault_id, check_vault_access, check_vault_scope, grant_access,
     revoke_access, list_vault_members, list_accessible_vaults, get_vault_info,
+    explain_vault_access,
     reset_authorized_vault, search_users, transfer_ownership, archive_vault,
 )
 from app.services.auth_service import resolve_mcp_authorization, token_has_scope
@@ -234,6 +235,9 @@ _TOOL_SCOPES: dict[str, str] = {
     "akb_list_vaults": _READ_SCOPE,
     "akb_vault_info": _READ_SCOPE,
     "akb_vault_members": _READ_SCOPE,
+    # A read: it reports the reasons behind a role, and reporting a reason is
+    # never authority to change one.
+    "akb_explain_access": _READ_SCOPE,
     "akb_search_users": _READ_SCOPE,
     "akb_browse": _READ_SCOPE,
     "akb_get": _READ_SCOPE,
@@ -1382,12 +1386,33 @@ async def _handle_vault_members(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_grant")
 async def _handle_grant(args: dict, uid: str, user: _MCPUser) -> dict:
-    return await grant_access(uid, args["vault"], args["user"], args["role"])
+    # `source_key` is forwarded only when the caller named one, so an agent that
+    # does not know about bases keeps the exact behaviour it had: the service
+    # default is `direct`. Passing None instead would override that default with
+    # a value the service never meant to receive.
+    kwargs: dict = {}
+    if args.get("source_key") is not None:
+        kwargs["source_key"] = args["source_key"]
+    return await grant_access(
+        uid, args["vault"], args["user"], args["role"],
+        revision=args.get("revision"), **kwargs,
+    )
 
 
 @_h("akb_revoke")
 async def _handle_revoke(args: dict, uid: str, user: _MCPUser) -> dict:
-    return await revoke_access(uid, args["vault"], args["user"])
+    # Here the absent key is itself the meaning — no source key is the
+    # administrator's revoke, which removes every basis — so it is passed
+    # straight through rather than being filtered out like the grant default.
+    return await revoke_access(
+        uid, args["vault"], args["user"],
+        source_key=args.get("source_key"), revision=args.get("revision"),
+    )
+
+
+@_h("akb_explain_access")
+async def _handle_explain_access(args: dict, uid: str, user: _MCPUser) -> dict:
+    return await explain_vault_access(uid, args["vault"], args["user"])
 
 
 @_h("akb_search_users")

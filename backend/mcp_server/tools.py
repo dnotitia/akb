@@ -1055,7 +1055,11 @@ TOOLS = [
     ),
     Tool(
         name="akb_grant",
-        description="Grant vault access to a user. You must be owner or admin of the vault.",
+        description=(
+            "Grant vault access to a user. You must be owner or admin of the vault. "
+            "A rule-driven grantor should name its own source_key so it can later "
+            "withdraw its own reason without deleting anybody else's."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -1066,13 +1070,61 @@ TOOLS = [
                     "description": "Role to grant",
                     "enum": ["reader", "writer", "admin"],
                 },
+                "source_key": {
+                    "type": "string",
+                    "description": (
+                        "The basis on which the role is held, as '<namespace>:<id>'. "
+                        "Omit it and the grant is 'direct', which is what every grant "
+                        "was before bases could coexist."
+                    ),
+                },
+                "revision": {
+                    "type": "integer",
+                    "description": (
+                        "Monotonic per (vault, user, source). A retry carrying a "
+                        "revision no newer than the stored one is a no-op rather "
+                        "than an overwrite."
+                    ),
+                },
             },
             "required": ["vault", "user", "role"],
         },
     ),
     Tool(
         name="akb_revoke",
-        description="Revoke a user's vault access. You must be owner or admin.",
+        description=(
+            "Revoke a user's vault access. You must be owner or admin. "
+            "Omit source_key and the person is out of the vault entirely; name one "
+            "and only that basis is withdrawn, which may downgrade rather than remove."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "vault": {"type": "string", "description": "Vault name"},
+                "user": {"type": "string", "description": "Target username"},
+                "source_key": {
+                    "type": "string",
+                    "description": (
+                        "Withdraw only this basis. Omit it and EVERY basis goes — "
+                        "an administrator's revoke, which must not leave the person "
+                        "holding rule-given access."
+                    ),
+                },
+                "revision": {
+                    "type": "integer",
+                    "description": "Monotonic per (vault, user, source); a stale one is a no-op.",
+                },
+            },
+            "required": ["vault", "user"],
+        },
+    ),
+    Tool(
+        name="akb_explain_access",
+        description=(
+            "Explain why a user holds the role they hold on a vault: every "
+            "independent basis, and the effective role derived from them. "
+            "A member list shows the result, never the reasons."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
