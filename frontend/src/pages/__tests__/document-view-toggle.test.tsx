@@ -404,6 +404,28 @@ describe("DocumentPage view toggle", () => {
     expect(updateDocumentMock).not.toHaveBeenCalled();
   });
 
+  it("returns focus to the edit Cancel action when discard confirmation is dismissed", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "owner" });
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await user.click(await screen.findByRole("button", { name: "Edit" }));
+    await user.type(
+      await screen.findByRole("textbox", { name: "Document body (markdown)" }),
+      "unsaved",
+    );
+    const pageCancel = screen.getByRole("button", { name: "Cancel" });
+    await user.click(pageCancel);
+    await screen.findByRole("heading", { name: "Discard unsaved changes?" });
+
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => expect(pageCancel).toHaveFocus());
+    expect(
+      screen.getByRole("textbox", { name: "Document body (markdown)" }),
+    ).toBeInTheDocument();
+  });
+
   it("merges a compact summary into the document viewer toolbar without opening Details", async () => {
     getDocumentMock.mockResolvedValue(
       makeDoc({ summary: "A concise orientation to the document before the full body begins." }),

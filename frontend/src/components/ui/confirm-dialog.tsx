@@ -1,4 +1,4 @@
-import { useEffect, useId, useState, type ReactNode } from "react";
+import { useEffect, useId, useState, type ReactNode, type RefObject } from "react";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -26,6 +26,7 @@ interface ConfirmDialogProps {
   busy?: boolean;
   confirmationText?: string;
   confirmationLabel?: string;
+  returnFocusRef?: RefObject<HTMLElement | null>;
 }
 
 export function ConfirmDialog({
@@ -40,6 +41,7 @@ export function ConfirmDialog({
   busy = false,
   confirmationText,
   confirmationLabel = "Type the name to confirm permanent deletion",
+  returnFocusRef,
 }: ConfirmDialogProps) {
   const [internalBusy, setInternalBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -75,7 +77,13 @@ export function ConfirmDialog({
 
   return (
     <Dialog open={open} onOpenChange={(o) => !isBusy && onOpenChange(o)}>
-      <DialogContent>
+      <DialogContent
+        onCloseAutoFocus={(event) => {
+          if (!returnFocusRef?.current) return;
+          event.preventDefault();
+          returnFocusRef.current.focus();
+        }}
+      >
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
           {description && (

@@ -14,8 +14,11 @@ import {
 } from "platejs/react";
 import { MarkdownPlugin } from "@platejs/markdown";
 import { toggleList, ListStyleType } from "@platejs/list";
-import { upsertLink } from "@platejs/link";
+import { unwrapLink, upsertLink } from "@platejs/link";
+import { toggleCodeBlock } from "@platejs/code-block";
 import {
+  deleteColumn,
+  deleteRow,
   insertTable,
   insertTableColumn,
   insertTableRow,
@@ -47,6 +50,10 @@ import {
   CornerDownLeft,
   Trash2,
   X,
+  Pencil,
+  Replace,
+  Rows2,
+  Columns2,
 } from "lucide-react";
 import {
   BlockquotePlugin,
@@ -79,7 +86,18 @@ import remarkGfm from "remark-gfm";
 import { AssetImage } from "@/components/asset-image";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { discardAsset, uploadAsset } from "@/lib/api";
+import { normalizeEditorLinkUrl } from "@/lib/editor-link";
 import {
   assetIdFromUrl,
   classifyEditorImageUploadFailure,
@@ -166,10 +184,6 @@ function ListElement(props: PlateElementProps) {
   return <PlateElement {...props} as={Tag} className={cls} />;
 }
 
-function ListItemElement(props: PlateElementProps) {
-  return <PlateElement {...props} as="li" className="leading-7" />;
-}
-
 function TableElement(props: PlateElementProps) {
   const editor = useEditorRef();
   const editorLifecycle = React.useContext(EditorAssetLifecycleContext);
@@ -184,6 +198,21 @@ function TableElement(props: PlateElementProps) {
     // Keep pointer and keyboard users in the authoring flow after a block
     // action instead of leaving focus stranded on the caption toolbar.
     requestAnimationFrame(() => editorLifecycle?.focusEditor());
+  };
+
+  const ensureCellSelection = (tablePath: number[]) => {
+    const cellEntry = editor.api.above({
+      match: (node) => {
+        const type = (node as { type?: string } | null)?.type;
+        return type === TableCellPlugin.key || type === TableCellHeaderPlugin.key;
+      },
+    });
+    const belongsToThisTable =
+      cellEntry &&
+      tablePath.every((segment, index) => cellEntry[1][index] === segment);
+    if (!belongsToThisTable) {
+      editor.tf.select(editor.api.start([...tablePath, 0, 0]));
+    }
   };
 
   const continueBelow = () => {
@@ -281,6 +310,42 @@ function TableElement(props: PlateElementProps) {
                   variant="ghost"
                   size="sm"
                   className="h-8 px-2"
+                  title="Remove the selected row"
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => {
+                    withTablePath((path) => {
+                      ensureCellSelection(path);
+                      deleteRow(editor);
+                      focusEditor();
+                    });
+                  }}
+                >
+                  <Rows2 className="h-3.5 w-3.5" aria-hidden />
+                  Remove row
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 px-2"
+                  title="Remove the selected column"
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => {
+                    withTablePath((path) => {
+                      ensureCellSelection(path);
+                      deleteColumn(editor);
+                      focusEditor();
+                    });
+                  }}
+                >
+                  <Columns2 className="h-3.5 w-3.5" aria-hidden />
+                  Remove column
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 px-2"
                   title="Move the cursor to a paragraph below this table"
                   onMouseDown={(event) => event.preventDefault()}
                   onClick={continueBelow}
@@ -335,6 +400,7 @@ interface EditorAssetLifecycle {
   commit?: string;
   readOnly?: boolean;
   focusEditor: () => void;
+  requestImageReplacement: (path: number[]) => void;
 }
 
 const EditorAssetLifecycleContext = React.createContext<EditorAssetLifecycle | null>(null);
@@ -347,6 +413,11 @@ function ImageElement(props: PlateElementProps) {
     caption?: Array<{ text?: string }>;
   };
   const alt = element.caption?.map((part) => part.text || "").join("") || "";
+  const [descriptionOpen, setDescriptionOpen] = React.useState(false);
+  const [descriptionDraft, setDescriptionDraft] = React.useState(alt);
+  const [descriptionError, setDescriptionError] = React.useState("");
+
+  React.useEffect(() => setDescriptionDraft(alt), [alt]);
 
   const removeImage = () => {
     const path = editor.api.findPath(props.element);
@@ -360,6 +431,26 @@ function ImageElement(props: PlateElementProps) {
     }
     editor.tf.select(editor.api.start(path));
     requestAnimationFrame(() => assetLifecycle?.focusEditor());
+  };
+
+  const saveDescription = () => {
+    const next = descriptionDraft.trim();
+    if (!next) {
+      setDescriptionError("Describe the image so it remains understandable without sight.");
+      return;
+    }
+    const path = editor.api.findPath(props.element);
+    if (!path) return;
+    editor.tf.setNodes({ caption: [{ text: next }] }, { at: path });
+    setDescriptionError("");
+    setDescriptionOpen(false);
+    requestAnimationFrame(() => assetLifecycle?.focusEditor());
+  };
+
+  const replaceImage = () => {
+    const path = editor.api.findPath(props.element);
+    if (!path) return;
+    assetLifecycle?.requestImageReplacement(path);
   };
 
   return (
@@ -382,18 +473,48 @@ function ImageElement(props: PlateElementProps) {
             className="my-0 max-h-[70vh] max-w-full object-contain"
           />
           {!assetLifecycle?.readOnly && (
-            <Button
-              type="button"
-              variant="secondary"
-              size="icon"
-              aria-label={alt ? `Remove image: ${alt}` : "Remove image"}
-              title="Remove image"
-              className="absolute right-2 top-2 h-8 w-8 border border-border bg-surface/90 text-foreground-muted shadow-sm backdrop-blur-sm hover:border-border-strong hover:bg-surface hover:text-foreground"
-              onMouseDown={(event) => event.preventDefault()}
-              onClick={removeImage}
-            >
-              <X className="h-4 w-4" aria-hidden />
-            </Button>
+            <div className="absolute right-2 top-2 flex items-center gap-1 rounded-[var(--radius-md)] border border-border bg-surface/90 p-1 shadow-sm backdrop-blur-sm">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                aria-label={alt ? `Edit image description: ${alt}` : "Edit image description"}
+                title="Edit image description"
+                className="h-7 w-7 text-foreground-muted hover:bg-surface-hover hover:text-foreground"
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => {
+                  setDescriptionDraft(alt);
+                  setDescriptionError("");
+                  setDescriptionOpen(true);
+                }}
+              >
+                <Pencil className="h-3.5 w-3.5" aria-hidden />
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                aria-label={alt ? `Replace image: ${alt}` : "Replace image"}
+                title="Replace image"
+                className="h-7 w-7 text-foreground-muted hover:bg-surface-hover hover:text-foreground"
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={replaceImage}
+              >
+                <Replace className="h-3.5 w-3.5" aria-hidden />
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                aria-label={alt ? `Remove image: ${alt}` : "Remove image"}
+                title="Remove image"
+                className="h-7 w-7 text-foreground-muted hover:bg-destructive/10 hover:text-destructive"
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={removeImage}
+              >
+                <X className="h-3.5 w-3.5" aria-hidden />
+              </Button>
+            </div>
           )}
         </div>
         {alt && (
@@ -403,6 +524,47 @@ function ImageElement(props: PlateElementProps) {
         )}
       </figure>
       {props.children}
+      <Dialog open={descriptionOpen} onOpenChange={setDescriptionOpen}>
+        <DialogContent
+          className="sm:max-w-md"
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            assetLifecycle?.focusEditor();
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle>Image description</DialogTitle>
+            <DialogDescription>
+              This text is used as the image alt text and visible caption.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Label htmlFor="editor-image-description">Description</Label>
+            <Input
+              id="editor-image-description"
+              value={descriptionDraft}
+              onChange={(event) => {
+                setDescriptionDraft(event.target.value);
+                if (descriptionError) setDescriptionError("");
+              }}
+              aria-invalid={descriptionError ? true : undefined}
+              aria-describedby={descriptionError ? "editor-image-description-error" : undefined}
+              autoFocus
+            />
+            {descriptionError && (
+              <p id="editor-image-description-error" role="alert" className="text-xs text-destructive">
+                {descriptionError}
+              </p>
+            )}
+          </div>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setDescriptionOpen(false)}>
+              Cancel
+            </Button>
+            <Button type="button" onClick={saveDescription}>Save description</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </PlateElement>
   );
 }
@@ -586,13 +748,15 @@ function RibbonButton({ label, active, disabled, onClick, children }: RibbonButt
       aria-label={label}
       aria-pressed={active}
       disabled={disabled}
+      tabIndex={-1}
+      data-editor-toolbar-button
       title={label}
       // Prevent the editor from losing its selection when the button is pressed.
       onMouseDown={(e) => e.preventDefault()}
       onClick={onClick}
       className={cn(TOOLBAR_BTN, active && TOOLBAR_BTN_ACTIVE)}
     >
-      {children}
+      <span aria-hidden="true" className="contents">{children}</span>
     </button>
   );
 }
@@ -600,6 +764,7 @@ function RibbonButton({ label, active, disabled, onClick, children }: RibbonButt
 interface EditorToolbarProps {
   uploadingImage: boolean;
   onChooseImages: (files: File[]) => void;
+  onOpenImagePicker: () => void;
   appearance: "framed" | "canvas" | "workspace";
   imageInputRef: React.RefObject<HTMLInputElement | null>;
 }
@@ -607,6 +772,7 @@ interface EditorToolbarProps {
 function EditorToolbar({
   uploadingImage,
   onChooseImages,
+  onOpenImagePicker,
   appearance,
   imageInputRef,
 }: EditorToolbarProps) {
@@ -614,6 +780,15 @@ function EditorToolbar({
   // useEditorRef gives a stable handle for the mutating callbacks.
   const editor = useEditorRef();
   const state = useEditorState();
+  const toolbarRef = React.useRef<HTMLDivElement>(null);
+  const [linkOpen, setLinkOpen] = React.useState(false);
+  const [linkUrl, setLinkUrl] = React.useState("");
+  const [linkText, setLinkText] = React.useState("");
+  const [linkError, setLinkError] = React.useState("");
+  const linkSelectionRef = React.useRef(editor.selection);
+  const linkUrlInputRef = React.useRef<HTMLInputElement>(null);
+  const linkUrlId = React.useId();
+  const linkTextId = React.useId();
   // Active mark lookup — editor.api.marks() returns the marks that would apply
   // at the current selection (null when none).
   const marks = (state.api.marks() ?? {}) as Record<string, unknown>;
@@ -625,6 +800,25 @@ function EditorToolbar({
     ? ((blockEntry[0] as { type?: string }).type ?? ParagraphPlugin.key)
     : undefined;
   const isBlock = (type: string) => blockType === type;
+  const blockNode = blockEntry?.[0] as {
+    listStyleType?: string;
+  } | undefined;
+  const codeBlockEntry = state.api.above({
+    match: (node) =>
+      typeof node === "object" &&
+      node !== null &&
+      "type" in node &&
+      (node as { type?: string }).type === CodeBlockPlugin.key,
+  });
+  const linkEntry = state.api.above({
+    match: (node) =>
+      typeof node === "object" &&
+      node !== null &&
+      "type" in node &&
+      (node as { type?: string }).type === LinkPlugin.key,
+  });
+  const canUndo = state.history.undos.length > 0;
+  const canRedo = state.history.redos.length > 0;
 
   const toggleMark = (key: string) => editor.tf.toggleMark(key);
 
@@ -642,11 +836,47 @@ function EditorToolbar({
     });
   };
 
-  const onLink = () => {
-    // Only meaningful on a non-collapsed selection; upsertLink wraps it.
-    if (state.api.isExpanded()) {
-      upsertLink(editor, { url: "https://" });
+  const openLinkEditor = () => {
+    linkSelectionRef.current = editor.selection;
+    const currentLink = linkEntry?.[0] as { url?: string } | undefined;
+    const selectedText = editor.selection
+      ? editor.api.string(editor.selection)
+      : "";
+    setLinkUrl(currentLink?.url ?? "");
+    setLinkText(
+      linkEntry
+        ? editor.api.string(linkEntry[1])
+        : selectedText,
+    );
+    setLinkError("");
+    setLinkOpen(true);
+  };
+
+  const applyLink = () => {
+    const normalizedUrl = normalizeEditorLinkUrl(linkUrl);
+    if (!normalizedUrl) {
+      setLinkError("Enter an http(s), email, phone, anchor, or relative URL.");
+      requestAnimationFrame(() => linkUrlInputRef.current?.focus());
+      return;
     }
+    if (linkSelectionRef.current) editor.tf.select(linkSelectionRef.current);
+    const text = linkText.trim() || normalizedUrl;
+    const inserted = upsertLink(editor, {
+      url: normalizedUrl,
+      text,
+      skipValidation: true,
+    });
+    if (!inserted) {
+      setLinkError("The link could not be applied at this cursor position.");
+      return;
+    }
+    setLinkOpen(false);
+  };
+
+  const removeCurrentLink = () => {
+    if (linkSelectionRef.current) editor.tf.select(linkSelectionRef.current);
+    unwrapLink(editor);
+    setLinkOpen(false);
   };
 
   const onTable = () => {
@@ -657,11 +887,53 @@ function EditorToolbar({
     ? "inline-flex items-center gap-0.5 border-r border-border pr-1.5 last:border-r-0 last:pr-0"
     : TOOLBAR_GROUP;
 
+  React.useLayoutEffect(() => {
+    const buttons = toolbarRef.current?.querySelectorAll<HTMLButtonElement>(
+      "button[data-editor-toolbar-button]:not(:disabled)",
+    );
+    if (!buttons?.length) return;
+    if (!Array.from(buttons).some((button) => button.tabIndex === 0)) {
+      buttons[0].tabIndex = 0;
+    }
+  });
+
+  const handleToolbarKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (!(event.target instanceof HTMLButtonElement)) return;
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    const buttons = Array.from(
+      toolbarRef.current?.querySelectorAll<HTMLButtonElement>(
+        "button[data-editor-toolbar-button]:not(:disabled)",
+      ) ?? [],
+    );
+    if (buttons.length === 0) return;
+    event.preventDefault();
+    const currentIndex = Math.max(0, buttons.indexOf(event.target));
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? buttons.length - 1
+        : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + buttons.length) % buttons.length;
+    for (const button of buttons) button.tabIndex = -1;
+    buttons[nextIndex].tabIndex = 0;
+    buttons[nextIndex].focus();
+  };
+
   return (
     <div
+      ref={toolbarRef}
       contentEditable={false}
       role="toolbar"
       aria-label="Text formatting"
+      aria-orientation="horizontal"
+      onFocusCapture={(event) => {
+        if (!(event.target instanceof HTMLButtonElement)) return;
+        for (const button of toolbarRef.current?.querySelectorAll<HTMLButtonElement>(
+          "button[data-editor-toolbar-button]",
+        ) ?? []) {
+          button.tabIndex = button === event.target ? 0 : -1;
+        }
+      }}
+      onKeyDown={handleToolbarKeyDown}
       className={cn(
         "sticky top-0 z-10 flex flex-wrap items-center gap-1.5",
         "border-b border-border select-none",
@@ -716,12 +988,14 @@ function EditorToolbar({
       <div className={toolbarGroupClass} role="group" aria-label="Lists">
         <RibbonButton
           label="Bulleted list"
+          active={blockNode?.listStyleType === ListStyleType.Disc}
           onClick={() => toggleList(editor, { listStyleType: ListStyleType.Disc })}
         >
           <List className="h-4 w-4" />
         </RibbonButton>
         <RibbonButton
           label="Numbered list"
+          active={blockNode?.listStyleType === ListStyleType.Decimal}
           onClick={() => toggleList(editor, { listStyleType: ListStyleType.Decimal })}
         >
           <ListOrdered className="h-4 w-4" />
@@ -739,8 +1013,8 @@ function EditorToolbar({
         </RibbonButton>
         <RibbonButton
           label="Code block"
-          active={isBlock(CodeBlockPlugin.key)}
-          onClick={() => setBlock(CodeBlockPlugin.key)}
+          active={Boolean(codeBlockEntry)}
+          onClick={() => toggleCodeBlock(editor)}
         >
           <Code2 className="h-4 w-4" />
         </RibbonButton>
@@ -751,7 +1025,11 @@ function EditorToolbar({
 
       {/* Link + table */}
       <div className={toolbarGroupClass} role="group" aria-label="Insert">
-        <RibbonButton label="Insert link on selection" onClick={onLink}>
+        <RibbonButton
+          label={linkEntry ? "Edit link" : "Insert link"}
+          active={Boolean(linkEntry)}
+          onClick={openLinkEditor}
+        >
           <Link2 className="h-4 w-4" />
         </RibbonButton>
         <RibbonButton label="Insert table" onClick={onTable}>
@@ -760,7 +1038,7 @@ function EditorToolbar({
         <RibbonButton
           label={uploadingImage ? "Uploading image" : "Insert image"}
           disabled={uploadingImage}
-          onClick={() => imageInputRef.current?.click()}
+          onClick={onOpenImagePicker}
         >
           {uploadingImage ? (
             <Loader2 className="h-4 w-4 animate-spin" />
@@ -785,15 +1063,105 @@ function EditorToolbar({
 
       {/* History */}
       <div className={toolbarGroupClass} role="group" aria-label="History">
-        <RibbonButton label="Undo" onClick={() => editor.tf.undo()}>
+        <RibbonButton label="Undo" disabled={!canUndo} onClick={() => editor.tf.undo()}>
           <Undo2 className="h-4 w-4" />
         </RibbonButton>
-        <RibbonButton label="Redo" onClick={() => editor.tf.redo()}>
+        <RibbonButton label="Redo" disabled={!canRedo} onClick={() => editor.tf.redo()}>
           <Redo2 className="h-4 w-4" />
         </RibbonButton>
       </div>
+      <Dialog open={linkOpen} onOpenChange={setLinkOpen}>
+        <DialogContent
+          className="sm:max-w-md"
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            editor.tf.focus();
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle>{linkEntry ? "Edit link" : "Insert link"}</DialogTitle>
+            <DialogDescription>
+              Add a safe destination and choose the text readers will see.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor={linkUrlId}>URL</Label>
+              <Input
+                ref={linkUrlInputRef}
+                id={linkUrlId}
+                value={linkUrl}
+                onChange={(event) => {
+                  setLinkUrl(event.target.value);
+                  if (linkError) setLinkError("");
+                }}
+                placeholder="https://example.com"
+                inputMode="url"
+                autoComplete="url"
+                aria-invalid={linkError ? true : undefined}
+                aria-describedby={linkError ? `${linkUrlId}-error` : undefined}
+                autoFocus
+              />
+              {linkError && (
+                <p id={`${linkUrlId}-error`} role="alert" className="text-xs text-destructive">
+                  {linkError}
+                </p>
+              )}
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor={linkTextId}>Text</Label>
+              <Input
+                id={linkTextId}
+                value={linkText}
+                onChange={(event) => setLinkText(event.target.value)}
+                placeholder="Link text"
+              />
+              <p className="text-xs text-foreground-muted">
+                Leave blank to use the destination as the visible text.
+              </p>
+            </div>
+          </div>
+          <DialogFooter className="sm:justify-between">
+            {linkEntry ? (
+              <Button type="button" variant="ghost" className="text-destructive" onClick={removeCurrentLink}>
+                Remove link
+              </Button>
+            ) : (
+              <span aria-hidden />
+            )}
+            <div className="flex flex-col-reverse gap-2 sm:flex-row">
+              <Button type="button" variant="outline" onClick={() => setLinkOpen(false)}>
+                Cancel
+              </Button>
+              <Button type="button" onClick={applyLink}>
+                {linkEntry ? "Save link" : "Insert link"}
+              </Button>
+            </div>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
+}
+
+function nodeText(node: unknown): string {
+  if (!node || typeof node !== "object") return "";
+  if ("text" in node && typeof (node as { text?: unknown }).text === "string") {
+    return (node as { text: string }).text;
+  }
+  const children = (node as { children?: unknown[] }).children;
+  return Array.isArray(children) ? children.map(nodeText).join("") : "";
+}
+
+function valueWithoutEditorTrailingBlock(nodes: readonly unknown[]): unknown[] {
+  if (nodes.length < 2) return [...nodes];
+  const last = nodes.at(-1) as { type?: string } | undefined;
+  const previous = nodes.at(-2) as { type?: string } | undefined;
+  const isEmptyTrailingParagraph =
+    last?.type === ParagraphPlugin.key &&
+    nodeText(last).replace(/[\u200b\ufeff]/g, "").length === 0 &&
+    previous?.type !== ParagraphPlugin.key;
+  return isEmptyTrailingParagraph ? nodes.slice(0, -1) : [...nodes];
 }
 
 // ── Public component ──────────────────────────────────────────────────────
@@ -829,6 +1197,8 @@ export interface MarkdownEditorProps {
   preserveUploadsOnUnmount?: boolean;
   /** Image-node ids from the exact editor snapshot accepted by the server. */
   claimedAssetIds?: readonly string[] | null;
+  /** Temporary image ids recovered with a locally saved new-document draft. */
+  initialUnclaimedAssetIds?: readonly string[];
 }
 
 export function MarkdownEditor({
@@ -848,6 +1218,7 @@ export function MarkdownEditor({
   onUploadingChange,
   preserveUploadsOnUnmount = false,
   claimedAssetIds = null,
+  initialUnclaimedAssetIds = [],
 }: MarkdownEditorProps) {
   const [uploadingImage, setUploadingImage] = React.useState(false);
   const [uploadingName, setUploadingName] = React.useState("");
@@ -856,13 +1227,15 @@ export function MarkdownEditor({
     message: string;
     retryable: boolean;
     kind: "error" | "queued";
+    replacementPath?: number[];
   } | null>(null);
   const uploadControllerRef = React.useRef<AbortController | null>(null);
   const imageInputRef = React.useRef<HTMLInputElement>(null);
+  const replacementPathRef = React.useRef<number[] | null>(null);
   const editorSurfaceRef = React.useRef<HTMLDivElement | null>(null);
   const uploadInFlightRef = React.useRef(false);
   const deferredImageFilesRef = React.useRef<File[]>([]);
-  const unclaimedAssetIdsRef = React.useRef(new Set<string>());
+  const unclaimedAssetIdsRef = React.useRef(new Set(initialUnclaimedAssetIds));
   const discardingAssetIdsRef = React.useRef(new Set<string>());
   const mountedRef = React.useRef(true);
   const onUploadingChangeRef = React.useRef(onUploadingChange);
@@ -961,7 +1334,11 @@ export function MarkdownEditor({
   }, [claimedAssetIds, discardUnclaimedAsset]);
 
   const uploadImages = React.useCallback(
-    async (files: File[], insertionRange = editor.selection) => {
+    async (
+      files: File[],
+      insertionRange = editor.selection,
+      replacementPath?: number[],
+    ) => {
       if (readOnly || uploadInFlightRef.current || files.length === 0) return;
 
       for (const file of files) {
@@ -975,6 +1352,7 @@ export function MarkdownEditor({
             message: `${file.name}: ${validationMessage} No images were uploaded.`,
             retryable: false,
             kind: "error",
+            replacementPath,
           });
           return;
         }
@@ -1016,15 +1394,32 @@ export function MarkdownEditor({
           }
           restoredInsertion = true;
           const alt = file.name.replace(/\.[^.]+$/, "") || "Image";
-          editor.tf.insertNodes(
-            {
-              type: ImagePlugin.key,
-              url: asset.url,
-              caption: [{ text: alt }],
-              children: [{ text: "" }],
-            },
-            { select: true },
-          );
+          if (replacementPath && index === 0) {
+            const target = editor.api.node(replacementPath)?.[0] as {
+              type?: string;
+              url?: string;
+            } | undefined;
+            if (target?.type !== ImagePlugin.key) {
+              throw new Error("The image to replace is no longer available.");
+            }
+            const replacedUrl = target.url;
+            editor.tf.setNodes(
+              { url: asset.url, caption: [{ text: alt }] },
+              { at: replacementPath },
+            );
+            editor.tf.select(replacementPath);
+            discardIfUnclaimed(replacedUrl);
+          } else {
+            editor.tf.insertNodes(
+              {
+                type: ImagePlugin.key,
+                url: asset.url,
+                caption: [{ text: alt }],
+                children: [{ text: "" }],
+              },
+              { select: true },
+            );
+          }
         }
       } catch (error) {
         const aborted =
@@ -1044,13 +1439,15 @@ export function MarkdownEditor({
             message: failure.message,
             retryable: failure.retryable,
             kind: "error",
+            replacementPath,
           });
         } else if (mountedRef.current && deferredImageFilesRef.current.length > 0) {
           setUploadFailure({
             files: deferredImageFilesRef.current.splice(0),
             message: "The current upload was cancelled before the next batch started.",
-            retryable: true,
-            kind: "error",
+              retryable: true,
+              kind: "error",
+              replacementPath,
           });
         }
       } finally {
@@ -1084,6 +1481,10 @@ export function MarkdownEditor({
       commit,
       readOnly,
       focusEditor: () => editorSurfaceRef.current?.focus(),
+      requestImageReplacement: (path: number[]) => {
+        replacementPathRef.current = path;
+        imageInputRef.current?.click();
+      },
     }),
     [commit, document, readOnly, vault],
   );
@@ -1148,7 +1549,9 @@ export function MarkdownEditor({
             // Serialize on every change — for documents in the typical AKB size
             // (single-digit KB markdown), this is well under a millisecond. Move
             // to a debounce only if profiling shows the cost.
-            const md = ed.getApi(MarkdownPlugin).markdown.serialize();
+            const md = ed.getApi(MarkdownPlugin).markdown.serialize({
+              value: valueWithoutEditorTrailingBlock(ed.children) as typeof ed.children,
+            });
             const assetIds: string[] = [];
             const visit = (nodes: unknown[]) => {
               for (const node of nodes) {
@@ -1172,7 +1575,15 @@ export function MarkdownEditor({
       {!readOnly && (
         <EditorToolbar
           uploadingImage={uploadingImage}
-          onChooseImages={(files) => void uploadImages(files)}
+          onChooseImages={(files) => {
+            const replacementPath = replacementPathRef.current ?? undefined;
+            replacementPathRef.current = null;
+            void uploadImages(files, editor.selection, replacementPath);
+          }}
+          onOpenImagePicker={() => {
+            replacementPathRef.current = null;
+            imageInputRef.current?.click();
+          }}
           appearance={appearance}
           imageInputRef={imageInputRef}
         />
@@ -1212,7 +1623,13 @@ export function MarkdownEditor({
                   type="button"
                   variant="outline"
                   size="sm"
-                  onClick={() => void uploadImages(uploadFailure.files)}
+                  onClick={() =>
+                    void uploadImages(
+                      uploadFailure.files,
+                      editor.selection,
+                      uploadFailure.replacementPath,
+                    )
+                  }
                 >
                   <RotateCcw className="h-3.5 w-3.5" aria-hidden />
                   {uploadFailure.kind === "queued" ? "Upload" : "Retry"}
@@ -1222,7 +1639,10 @@ export function MarkdownEditor({
                 type="button"
                 variant="outline"
                 size="sm"
-                onClick={() => imageInputRef.current?.click()}
+                onClick={() => {
+                  replacementPathRef.current = uploadFailure.replacementPath ?? null;
+                  imageInputRef.current?.click();
+                }}
               >
                 <ImagePlus className="h-3.5 w-3.5" aria-hidden />
                 Choose another

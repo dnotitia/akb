@@ -117,6 +117,7 @@ export default function DocumentPage({
   const detailsToggleRef = useRef<HTMLButtonElement | null>(null);
   const detailsCloseRef = useRef<HTMLButtonElement | null>(null);
   const editButtonRef = useRef<HTMLButtonElement | null>(null);
+  const cancelEditButtonRef = useRef<HTMLButtonElement | null>(null);
   const restoreEditFocusRef = useRef(false);
   // Plate manages its own state; we remount via `editorKey` when hydrating
   // a fresh server value rather than treating `value` as controlled.
@@ -648,6 +649,7 @@ export default function DocumentPage({
             {inEditMode ? (
               <>
                 <Button
+                  ref={cancelEditButtonRef}
                   type="button"
                   variant="outline"
                   size="sm"
@@ -1155,6 +1157,7 @@ export default function DocumentPage({
         }
         confirmLabel="Discard changes"
         variant="destructive"
+        returnFocusRef={cancelEditButtonRef}
         onConfirm={() => {
           const next = pendingView;
           setEditingContent(originalContent);

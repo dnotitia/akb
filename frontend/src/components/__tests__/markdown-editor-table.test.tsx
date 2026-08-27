@@ -75,6 +75,25 @@ describe("MarkdownEditor table interactions", () => {
     ).toHaveLength(3);
   });
 
+  it("removes the selected row and column without deleting the whole table", async () => {
+    const user = userEvent.setup();
+    render(
+      <MarkdownEditor value={TABLE_MARKDOWN} vault="team" onChange={vi.fn()} />,
+    );
+
+    await user.click(screen.getByText("Search"));
+    await user.click(screen.getByRole("button", { name: "Remove row" }));
+    expect(
+      within(screen.getByRole("table", { name: "Editable table" })).getAllByRole("row"),
+    ).toHaveLength(1);
+
+    await user.click(screen.getByText("Search"));
+    await user.click(screen.getByRole("button", { name: "Remove column" }));
+    const remainingTable = screen.getByRole("table", { name: "Editable table" });
+    expect(remainingTable.querySelectorAll("th, td")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Delete table" })).toBeVisible();
+  });
+
   it("deletes the entire table and restores an editable cursor target", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();

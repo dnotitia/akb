@@ -19,6 +19,11 @@ import {
 } from "lucide-react";
 import { ApiError, putDocument } from "@/lib/api";
 import { DOC_TYPES, type DocType } from "@/lib/doc-constants";
+import {
+  clearDocumentDraft,
+  loadDocumentDraft,
+  saveDocumentDraft,
+} from "@/lib/document-draft";
 import { isReservedCollection } from "@/lib/skill";
 import { useVaultTree, type TreeNode } from "@/hooks/use-vault-tree";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
@@ -46,6 +51,7 @@ export interface DocumentCreateFormProps {
   onDirtyChange?: (dirty: boolean) => void;
   onCreatingChange?: (creating: boolean) => void;
   onUploadingChange?: (uploading: boolean) => void;
+  onAssetIdsChange?: (assetIds: readonly string[]) => void;
 }
 
 /** Depth-first collection paths for the location suggestions. */
@@ -73,7 +79,9 @@ export function DocumentCreateForm({
   onDirtyChange,
   onCreatingChange,
   onUploadingChange,
+  onAssetIdsChange,
 }: DocumentCreateFormProps) {
+  const restoredDraft = useMemo(() => loadDocumentDraft(vault), [vault]);
   const { tree } = useVaultTree(vault);
   const { refetchTree, refetchVaults } = useVaultRefresh();
   const collectionOptions = useMemo(
@@ -84,19 +92,27 @@ export function DocumentCreateForm({
     [tree],
   );
 
-  const [title, setTitle] = useState("");
-  const [collection, setCollection] = useState(initialCollection);
-  const [type, setType] = useState<DocType>("note");
-  const [domain, setDomain] = useState("");
-  const [summary, setSummary] = useState("");
-  const [tags, setTags] = useState<string[]>([]);
-  const [body, setBody] = useState("");
-  const [bodyAssetIds, setBodyAssetIds] = useState<readonly string[]>([]);
+  const [title, setTitle] = useState(restoredDraft?.title ?? "");
+  const [collection, setCollection] = useState(
+    restoredDraft?.collection ?? initialCollection,
+  );
+  const [type, setType] = useState<DocType>(restoredDraft?.type ?? "note");
+  const [domain, setDomain] = useState(restoredDraft?.domain ?? "");
+  const [summary, setSummary] = useState(restoredDraft?.summary ?? "");
+  const [tags, setTags] = useState<string[]>(restoredDraft?.tags ?? []);
+  const [body, setBody] = useState(restoredDraft?.body ?? "");
+  const [bodyAssetIds, setBodyAssetIds] = useState<readonly string[]>(
+    restoredDraft?.assetIds ?? [],
+  );
   const [claimedAssetIds, setClaimedAssetIds] = useState<readonly string[] | null>(null);
   const [error, setError] = useState("");
   const [invalidField, setInvalidField] = useState<InvalidField>(null);
   const [creating, setCreating] = useState(false);
   const [uploadingImage, setUploadingImage] = useState(false);
+  const [draftStatus, setDraftStatus] = useState<
+    "idle" | "restored" | "saving" | "saved" | "error"
+  >(restoredDraft ? "restored" : "idle");
+  const skipInitialDraftSaveRef = useRef(Boolean(restoredDraft));
   const [detailsOpen, setDetailsOpen] = useState(() =>
     typeof window === "undefined"
       ? true
@@ -132,6 +148,36 @@ export function DocumentCreateForm({
   useEffect(() => onDirtyChange?.(hasUnsavedWork), [hasUnsavedWork, onDirtyChange]);
   useEffect(() => onCreatingChange?.(creating), [creating, onCreatingChange]);
   useEffect(() => onUploadingChange?.(uploadingImage), [uploadingImage, onUploadingChange]);
+  useEffect(() => onAssetIdsChange?.(bodyAssetIds), [bodyAssetIds, onAssetIdsChange]);
+
+  useEffect(() => {
+    if (creating) return;
+    if (skipInitialDraftSaveRef.current) {
+      skipInitialDraftSaveRef.current = false;
+      return;
+    }
+    if (!isDirty) {
+      clearDocumentDraft(vault);
+      setDraftStatus("idle");
+      return;
+    }
+    setDraftStatus("saving");
+    const timer = window.setTimeout(() => {
+      const saved = saveDocumentDraft({
+        vault,
+        title,
+        collection,
+        type,
+        domain,
+        summary,
+        tags,
+        body,
+        assetIds: [...bodyAssetIds],
+      });
+      setDraftStatus(saved ? "saved" : "error");
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [body, bodyAssetIds, collection, creating, domain, isDirty, summary, tags, title, type, vault]);
 
   useEffect(() => {
     const media = window.matchMedia("(min-width: 1024px)");
@@ -212,6 +258,7 @@ export function DocumentCreateForm({
         setClaimedAssetIds(assetIdsToClaim);
       });
       created = true;
+      clearDocumentDraft(vault);
       onCreated(result?.path);
     } catch (caught: unknown) {
       setError(
@@ -281,7 +328,21 @@ export function DocumentCreateForm({
                 aria-hidden
               />
             )}
-            <span>{uploadingImage ? "Uploading image…" : canSubmit ? "Ready to create" : "Draft saved locally"}</span>
+            <span>
+              {uploadingImage
+                ? "Uploading image…"
+                : draftStatus === "restored"
+                  ? "Local draft restored"
+                  : draftStatus === "saving"
+                    ? "Saving draft…"
+                    : draftStatus === "saved"
+                      ? "Draft saved locally"
+                      : draftStatus === "error"
+                        ? "Draft storage unavailable"
+                        : canSubmit
+                          ? "Ready to create"
+                          : "Unsaved draft"}
+            </span>
           </div>
           <Button
             type="button"
@@ -395,7 +456,7 @@ export function DocumentCreateForm({
               >
                 <Suspense fallback={<MarkdownEditorFallback />}>
                   <MarkdownEditor
-                    value=""
+                    value={body}
                     onChange={(markdown, assetIds) => {
                       setBody(markdown);
                       setBodyAssetIds(assetIds);
@@ -411,7 +472,8 @@ export function DocumentCreateForm({
                       setUploadingImage(uploading);
                       if (uploading) setClaimedAssetIds(null);
                     }}
-                    preserveUploadsOnUnmount={creating}
+                    initialUnclaimedAssetIds={restoredDraft?.assetIds}
+                    preserveUploadsOnUnmount
                     claimedAssetIds={claimedAssetIds}
                   />
                 </Suspense>

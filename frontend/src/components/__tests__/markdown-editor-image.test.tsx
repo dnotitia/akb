@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MarkdownEditor } from "@/components/markdown-editor";
 import { EDITOR_IMAGE_MAX_BYTES, validateEditorImage } from "@/lib/image-assets";
 
@@ -161,7 +162,7 @@ describe("MarkdownEditor image insertion", () => {
     await screen.findByRole("img", { name: "diagram" });
     const removeButton = screen.getByRole("button", { name: "Remove image: diagram" });
     expect(removeButton.querySelector(".lucide-x")).not.toBeNull();
-    expect(removeButton).toHaveClass("right-2", "top-2");
+    expect(removeButton.parentElement).toHaveClass("absolute", "right-2", "top-2");
     expect(removeButton).not.toHaveClass("opacity-0");
     fireEvent.click(removeButton);
 
@@ -179,6 +180,83 @@ describe("MarkdownEditor image insertion", () => {
     // An existing image may already be referenced by Git history, so removing
     // its current link must not physically delete the retained bytes.
     expect(apiMocks.discardAsset).not.toHaveBeenCalled();
+  });
+
+  it("edits the image description used by alt text and markdown", async () => {
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <MarkdownEditor
+        value={`![diagram](/api/assets/${ASSET_ID})`}
+        vault="team"
+        onChange={onChange}
+      />,
+    );
+
+    await user.click(
+      await screen.findByRole("button", { name: "Edit image description: diagram" }),
+    );
+    const field = screen.getByLabelText("Description");
+    await user.clear(field);
+    await user.click(screen.getByRole("button", { name: "Save description" }));
+    expect(screen.getByRole("alert")).toHaveTextContent(/describe the image/i);
+
+    await user.type(field, "System architecture diagram");
+    await user.click(screen.getByRole("button", { name: "Save description" }));
+
+    expect(
+      await screen.findByRole("img", { name: "System architecture diagram" }),
+    ).toBeVisible();
+    await waitFor(() =>
+      expect(
+        onChange.mock.calls.some(([markdown]) =>
+          markdown.includes(`![System architecture diagram](/api/assets/${ASSET_ID})`),
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it("replaces an image in place instead of inserting a duplicate", async () => {
+    const replacementId = "1de35742-b719-42ed-b140-623ed81151a2";
+    apiMocks.uploadAsset.mockResolvedValue({
+      id: replacementId,
+      url: `/api/assets/${replacementId}`,
+      name: "replacement.png",
+      mime_type: "image/png",
+      size_bytes: 5,
+    });
+    const onChange = vi.fn();
+    const { container } = render(
+      <MarkdownEditor
+        value={`![diagram](/api/assets/${ASSET_ID})`}
+        vault="team"
+        onChange={onChange}
+        initialUnclaimedAssetIds={[ASSET_ID]}
+      />,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Replace image: diagram" }),
+    );
+    fireEvent.change(container.querySelector('input[type="file"]')!, {
+      target: {
+        files: [new File(["replacement"], "replacement.png", { type: "image/png" })],
+      },
+    });
+
+    expect(await screen.findByRole("img", { name: "replacement" })).toBeVisible();
+    await waitFor(() =>
+      expect(
+        onChange.mock.calls.some(
+          ([markdown, ids]) =>
+            markdown.includes(`/api/assets/${replacementId}`) &&
+            !markdown.includes(`/api/assets/${ASSET_ID}`) &&
+            ids.length === 1,
+        ),
+      ).toBe(true),
+    );
+    expect(screen.getAllByRole("img")).toHaveLength(1);
+    await waitFor(() => expect(apiMocks.discardAsset).toHaveBeenCalledWith("team", ASSET_ID));
   });
 
   it("uses the exact document revision when resolving an existing image", async () => {
