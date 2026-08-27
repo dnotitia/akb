@@ -395,12 +395,6 @@ const PROXY_INSTRUCTIONS =
   "the entire document body. If the document write fails, clean up the uncommitted " +
   "upload with akb_discard_image.";
 
-// Fallback MCP protocol version echoed to the client when its `initialize`
-// request omits one. We otherwise echo the client's requested version.
-const MCP_PROTOCOL_VERSION = LEGACY_PROTOCOL_VERSION;
-
-const modernServerInfo = () => ({ name: "akb-mcp", version: PROXY_VERSION });
-
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -415,7 +409,7 @@ function modernResult(result) {
   output.resultType = output.resultType || "complete";
   output._meta = {
     ...(isObject(output._meta) ? output._meta : {}),
-    [SERVER_INFO_META_KEY]: modernServerInfo(),
+    [SERVER_INFO_META_KEY]: { name: "akb-mcp", version: PROXY_VERSION },
   };
   return output;
 }
@@ -714,7 +708,7 @@ export class AKBProxy {
     // connectivity returns (see the monitor + tools/list_changed path).
     const requestedProtocol =
       params && typeof params.protocolVersion === "string" && params.protocolVersion;
-    if (requestedProtocol && requestedProtocol !== MCP_PROTOCOL_VERSION) {
+    if (requestedProtocol && requestedProtocol !== LEGACY_PROTOCOL_VERSION) {
       // Never claim success by echoing a protocol revision this proxy does
       // not implement.  A client can retry with the explicit supported
       // revision; there is no fallback or downgrade path here.
@@ -724,7 +718,7 @@ export class AKBProxy {
         error: {
           code: INVALID_PARAMS,
           message: "Unsupported protocol version",
-          data: { supported: [MCP_PROTOCOL_VERSION], requested: requestedProtocol },
+          data: { supported: [LEGACY_PROTOCOL_VERSION], requested: requestedProtocol },
         },
       };
     }
@@ -738,7 +732,7 @@ export class AKBProxy {
       jsonrpc: "2.0",
       id,
       result: {
-        protocolVersion: MCP_PROTOCOL_VERSION,
+        protocolVersion: LEGACY_PROTOCOL_VERSION,
         // Advertise listChanged so we can push the real toolset after a
         // degraded (backend-unreachable) tools/list is recovered.
         capabilities: { tools: { listChanged: true } },
@@ -1491,26 +1485,13 @@ export class AKBProxy {
     };
   }
 
-  _backendModernMeta() {
-    return {
-      [PROTOCOL_VERSION_META_KEY]: MODERN_PROTOCOL_VERSION,
-      [CLIENT_CAPABILITIES_META_KEY]: this._clientCapabilities,
-      [CLIENT_INFO_META_KEY]: isObject(this._clientInfo)
-        ? this._clientInfo
-        : { name: "akb-mcp-client", version: PROXY_VERSION },
-    };
-  }
-
   _modernizeParams(params) {
     const source = isObject(params) ? params : {};
     const existing = isObject(source._meta) ? source._meta : {};
-    const backendMeta = this._backendModernMeta();
     const existingCapabilities = isObject(existing[CLIENT_CAPABILITIES_META_KEY])
       ? existing[CLIENT_CAPABILITIES_META_KEY]
       : {};
-    const backendCapabilities = isObject(backendMeta[CLIENT_CAPABILITIES_META_KEY])
-      ? backendMeta[CLIENT_CAPABILITIES_META_KEY]
-      : {};
+    const backendCapabilities = this._clientCapabilities;
     const capabilities = {
       ...backendCapabilities,
       ...existingCapabilities,
@@ -1523,7 +1504,11 @@ export class AKBProxy {
     return {
       ...source,
       _meta: {
-        ...backendMeta,
+        [PROTOCOL_VERSION_META_KEY]: MODERN_PROTOCOL_VERSION,
+        [CLIENT_CAPABILITIES_META_KEY]: backendCapabilities,
+        [CLIENT_INFO_META_KEY]: isObject(this._clientInfo)
+          ? this._clientInfo
+          : { name: "akb-mcp-client", version: PROXY_VERSION },
         ...existing,
         [CLIENT_CAPABILITIES_META_KEY]: capabilities,
       },
@@ -1706,21 +1691,22 @@ export class AKBProxy {
       );
     } catch (error) {
       if (error?.body) {
+        let parsedError;
         try {
-          const parsedError = JSON.parse(error.body);
-          if (parsedError?.error) {
-            const protocolError = new Error(
-              `MCP error ${parsedError.error.code}: ${parsedError.error.message}`,
-            );
-            protocolError.code = parsedError.error.code;
-            protocolError.data = parsedError.error.data;
-            protocolError.statusCode = error.statusCode;
-            protocolError.protocolError = true;
-            protocolError.connectionError = mode === "legacy" && error.statusCode === 404;
-            throw protocolError;
-          }
-        } catch (parseError) {
-          if (parseError?.protocolError) throw parseError;
+          parsedError = JSON.parse(error.body);
+        } catch {
+          parsedError = null;
+        }
+        if (parsedError?.error) {
+          const protocolError = new Error(
+            `MCP error ${parsedError.error.code}: ${parsedError.error.message}`,
+          );
+          protocolError.code = parsedError.error.code;
+          protocolError.data = parsedError.error.data;
+          protocolError.statusCode = error.statusCode;
+          protocolError.protocolError = true;
+          protocolError.connectionError = mode === "legacy" && error.statusCode === 404;
+          throw protocolError;
         }
       }
       throw error;
