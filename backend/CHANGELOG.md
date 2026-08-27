@@ -7,6 +7,14 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Added collection intent to browse and search responses
+
+`akb_browse` now returns metadata for its current vault or collection root,
+and keeps collection summaries in the default slim response. Search results
+now include their parent collection summary and vault description. These
+fields are hydrated from the catalog after retrieval, so they add context
+without creating collection index records or affecting ranking.
+
 ### Aligned resource deletion with Vault permission boundaries
 
 Recursive collection deletion can no longer be used by a Vault writer to

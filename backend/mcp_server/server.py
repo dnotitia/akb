@@ -66,6 +66,7 @@ from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.document_repo import DocumentRepository
 
 from mcp_server.tools import TOOLS
+from mcp_server.response_projection import browse_payload
 from mcp_server.help import _resolve_help
 from mcp_server.instructions import INSTRUCTIONS
 from mcp_server.vault_contract import project_accessible_vault
@@ -732,9 +733,9 @@ async def _handle_delete(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_browse")
 async def _handle_browse(args: dict, uid: str, user: _MCPUser) -> dict:
-    # `summary` is dropped from items by default — it's the largest
-    # field on `BrowseItem` and dominates payload size on
-    # collection-heavy vaults. Opt in with `include_summary=true`.
+    # Resource summaries are dropped by default because they dominate large
+    # browse payloads. Collection summaries remain: they explain the intent
+    # of the navigation target and are not independently indexed.
     #
     # Browse target may be specified two ways: legacy (`vault` +
     # optional `collection`) or canonical (`uri` — vault root or
@@ -764,9 +765,7 @@ async def _handle_browse(args: dict, uid: str, user: _MCPUser) -> dict:
         include_archived=args.get("include_archived", False),
     )
     include_summary = args.get("include_summary")
-    payload = result.model_dump(
-        exclude={"items": {"__all__": {"summary"}}} if not include_summary else None
-    )
+    payload = browse_payload(result, include_summary=bool(include_summary))
 
     needle = _filter_arg(args)
     if needle:

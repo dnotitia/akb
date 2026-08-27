@@ -1464,7 +1464,19 @@ export const deleteVaultTable = (vault: string, tableName: string) =>
 export const browseVault = (vault: string, collection?: string, depth = 1) => {
   const p = new URLSearchParams({ depth: String(depth) });
   if (collection) p.set("collection", collection);
-  return api<{ vault: string; path: string; items: any[] }>(`/browse/${vault}?${p}`);
+  return api<{
+    vault: string;
+    path: string;
+    context?: {
+      type: "vault" | "collection";
+      uri: string;
+      name: string;
+      path: string;
+      summary?: string | null;
+      description?: string | null;
+    } | null;
+    items: any[];
+  }>(`/browse/${vault}?${p}`);
 };
 
 export interface KnowledgeImportResult {

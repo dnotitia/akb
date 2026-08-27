@@ -115,6 +115,7 @@ from app.db.postgres import get_pool
 from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError, WriteBusyError
 from app.models.document import (
     DOC_STATUSES,
+    BrowseContext,
     BrowseItem,
     BrowseResponse,
     DocumentPutRequest,
@@ -147,7 +148,7 @@ from app.services.kg_service import (
 )
 from app.services.resource_hash import HASH_ALGORITHM, compute_text_content_hash
 from app.services.role_sync import get_role_sync
-from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri
+from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri, vault_uri
 from app.services.user_directory import resolve_display_names
 from app.services.write_lane import run_compensation, run_git_write, write_lane
 from app.repositories import table_data_repo
@@ -1743,11 +1744,30 @@ class DocumentService:
         """
         vault_repo, doc_repo, coll_repo = await self._repos()
 
-        vault_id = await vault_repo.get_id_by_name(vault)
         browse_path = collection or ""
+        vault_row = await vault_repo.get_by_name(vault)
 
-        if not vault_id:
+        if not vault_row:
             return BrowseResponse(vault=vault, path=browse_path, items=[])
+        vault_id = vault_row["id"]
+
+        if collection:
+            collection_row = await coll_repo.get_by_path(vault_id, collection)
+            context = BrowseContext(
+                type="collection",
+                uri=coll_uri(vault, collection),
+                name=(collection_row or {}).get("name") or collection.rsplit("/", 1)[-1],
+                path=collection,
+                summary=(collection_row or {}).get("summary"),
+            )
+        else:
+            context = BrowseContext(
+                type="vault",
+                uri=vault_uri(vault),
+                name=vault,
+                path="",
+                description=vault_row.get("description"),
+            )
 
         show_docs = content_type in ("all", "documents")
         show_tables = content_type in ("all", "tables")
@@ -1779,7 +1799,13 @@ class DocumentService:
             ))
 
         hint = self._browse_hint(vault, collection, items)
-        return BrowseResponse(vault=vault, path=browse_path, items=items, hint=hint)
+        return BrowseResponse(
+            vault=vault,
+            path=browse_path,
+            context=context,
+            items=items,
+            hint=hint,
+        )
 
     async def _browse_collections(self, coll_repo, vault: str, vault_id, prefix: str) -> list[BrowseItem]:
         """Emit collection rows. With ``prefix`` empty, emits every
