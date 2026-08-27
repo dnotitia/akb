@@ -43,6 +43,7 @@ import queue
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from app.config import settings
 from app.services._backfill import BackfillRunner
@@ -380,7 +381,7 @@ def _record_grep_replace_receipts(
         target = f"uri={replacement['uri']}"
         if len(target) > _TARGET_MAX:
             target = target[:_TARGET_MAX] + "…"
-        receipt_meta = {
+        receipt_meta: dict[str, Any] = {
             "protocol_generation": protocol["protocol_generation"],
             "protocol_revision": protocol["protocol_revision"],
             "auth_method": protocol["auth_method"],
