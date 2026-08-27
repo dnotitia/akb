@@ -442,16 +442,17 @@ commits` control and `Full commit log` route. Below `xl`, the work area stacks
   exceeds the viewport.
 - **Document workspace**: document routes are full-bleed inside `VaultShell`
   (no generic page padding) and use the same `h-16` workspace header as the new
-  document composer. The header identifies the file and vault and keeps
-  read/edit/detail actions at the right. Do not repeat the raw canonical
-  `akb://` URI in this title bar; the path row and Details context already own
-  document location and technical metadata. The
-  main column is a Git-style framed file viewer with Rendered / Raw / Edit modes
-  and only an 8–12px outer gutter in read mode. Details is closed by default and
-  opens as a 24rem right overlay inspector: it never reserves canvas width or
-  reflows the document. On narrow screens it gains a dismissible backdrop;
-  backdrop click, Close, and Escape dismiss it and return focus to the Details
-  trigger. The inspector treats Info, Outline, Relations, and History as four
+  document composer. The header identifies the file and vault; its right edge
+  keeps one primary `Edit` action next to the resource overflow menu. Do not
+  repeat the raw canonical `akb://` URI in this title bar; the path row and
+  document panel already own location and technical metadata. The
+  main column is a Git-style framed file viewer with Rendered / Raw read modes
+  and only an 8–12px outer gutter in read mode. The document panel is closed by
+  default and opens as a 24rem right overlay from an icon-only toggle at the
+  far right of the dense file-context row, next to History: it never reserves
+  canvas width or reflows the document. On narrow screens it gains a dismissible
+  backdrop; backdrop click, Close, and Escape dismiss it and return focus to the
+  panel toggle. The inspector treats Info, Outline, Relations, and History as four
   peer views below one fixed header; the selected view owns all remaining panel
   height instead of sitting beneath a permanently expanded Properties block.
   Publish state and destructive actions stay inside Info, so they do not tax the
@@ -459,20 +460,36 @@ commits` control and `Full commit log` route. Below `xl`, the work area stacks
   the reading flow. Rendered headings, paragraphs, lists, and quotes share one
   centered 64rem measure so their left and right edges stay aligned regardless
   of font size; Korean-heavy technical documents still use most of the file
-  frame without creating a one-sided void. Code, tables, and media may use the
-  full workspace. The
+  frame without creating a one-sided void. Ordinary tables align to this same
+  measure and scroll horizontally inside their framed wrapper when their columns
+  need more room. Code and media may use the full workspace. The
   file toolbar keeps logical line count and UTF-8 byte size at the left, uses
   its flexible middle slot for a labelled single-line document summary when
   metadata and horizontal space are available, exposes Copy in both Rendered
-  and Raw views, and keeps the Rendered / Raw / Edit mode control right-aligned.
+  and Raw views, and keeps the Rendered / Raw mode control right-aligned. Edit is
+  a document mutation, not a read-mode tab: edit mode replaces the file toolbar
+  with a compact editing-status strip while Cancel / Save changes live in the
+  workspace header. Cancel always exits a clean editor and asks for confirmation
+  before discarding unsaved work.
   Bound and disclose summary overflow through the shared tooltip text primitive;
-  hide the compact summary when horizontal space is constrained, while Details /
+  hide the compact summary when horizontal space is constrained, while the panel's
   Info remains the complete metadata view at every breakpoint. The
   document title is the compact workspace-header H1 and is not repeated as a
   page hero; path, author, commit, age, and History share one dense file-context
   row immediately above the content surface. Never add another vertical summary
   band before the file viewer, and omit the compact summary entirely when older
   backends return no value.
+  The document header overflow exposes Move or rename for every current
+  document instead of hiding the capability from readers or read-only Vaults.
+  When unavailable, the action remains visible with the exact permission,
+  historical-version, mirror, or reserved-guide reason. The move dialog is a
+  destination review rather than a generic metadata form: it shows current and
+  normalized target paths, selects an existing Collection (or Vault root), edits
+  the filename/slug, and accepts an optional Git commit message. Submission
+  preserves entered values on failure; after success the backend-returned path
+  is authoritative, the reader replaces the stale route, and a compact status
+  notice names the destination Collection. Git history, old-URI aliases,
+  relations, and publication rewrites remain backend responsibilities.
   Composer images use a 10 MB transfer ceiling and the asset service's 12 MP /
   8,192px decode boundary. The client automatically fits oversized still PNG,
   JPEG, and WebP images to that resolution before upload so a highly compressed
@@ -480,6 +497,16 @@ commits` control and `Full commit log` route. Below `xl`, the work area stacks
   never flattened silently. Upload errors stay inside the editor with an
   announced reason and explicit recovery: Retry appears only for transient
   failures, while Choose another and Dismiss are always available.
+  Tables and images are atomic authoring blocks, so the editor always maintains
+  a trailing paragraph as a keyboard and pointer escape route. An editable table
+  owns one compact caption toolbar with labelled Row, Column, and Continue below
+  actions plus a spatially separated Delete table control; GFM tables remain
+  rectangular because merged cells cannot round-trip to Markdown. Removing a
+  table restores focus to the following text block and remains reversible through
+  editor Undo. Image removal is an always-discoverable neutral `X` inset at the
+  image's own top-right corner—not the document measure's edge—and returns focus
+  to the nearest text block. All block controls are omitted in read-only mode,
+  use Lucide icons, expose accessible names, and never rely on hover alone.
   A document opened from Search uses this same reader inside a route-backed
   preview dialog rather than replacing the result ledger. The dialog leaves the
   persistent Vault navigation visible on wide screens, becomes full-screen on

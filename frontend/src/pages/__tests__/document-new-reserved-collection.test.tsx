@@ -5,10 +5,13 @@ import { MemoryRouter } from "react-router-dom";
 import { DocumentCreateDialog } from "@/components/document-create-dialog";
 
 const putDocument = vi.fn();
+const discardAsset = vi.fn();
+const ASSET_ID = "123e4567-e89b-42d3-a456-426614174000";
 
 vi.mock("@/lib/api", () => ({
   ApiError: class ApiError extends Error {},
   putDocument: (...args: unknown[]) => putDocument(...args),
+  discardAsset: (...args: unknown[]) => discardAsset(...args),
 }));
 
 vi.mock("@/hooks/use-vault-tree", () => ({
@@ -21,15 +24,18 @@ vi.mock("@/contexts/vault-refresh-context", () => ({
 
 vi.mock("@/components/markdown-editor", () => ({
   default: ({
+    value,
     onChange,
     onUploadingChange,
   }: {
+    value: string;
     onChange: (body: string, ids: string[]) => void;
     onUploadingChange?: (uploading: boolean) => void;
   }) => (
     <>
       <textarea
         aria-label="Document body"
+        value={value}
         onChange={(event) => onChange(event.target.value, [])}
       />
       <input
@@ -39,7 +45,8 @@ vi.mock("@/components/markdown-editor", () => ({
         onChange={(event) => {
           if (!event.currentTarget.files?.length) return;
           onUploadingChange?.(true);
-          onChange("![Local image](/api/assets/pending)", []);
+          onChange(`![Local image](/api/assets/${ASSET_ID})`, [ASSET_ID]);
+          onUploadingChange?.(false);
         }}
       />
     </>
@@ -66,6 +73,7 @@ function renderPage(initialCollection = "overview") {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  window.localStorage.clear();
 });
 
 describe("DocumentCreateDialog reserved collection feedback", () => {
@@ -172,5 +180,47 @@ describe("DocumentCreateDialog reserved collection feedback", () => {
       );
       expect(onCreated).toHaveBeenCalledWith("notes/a-note.md");
     });
+  });
+
+  it("restores an autosaved local draft and clears it on explicit discard", async () => {
+    const user = userEvent.setup();
+    const first = renderPage("notes");
+    await user.type(screen.getByLabelText(/^title/i), "Recovered note");
+    await user.type(screen.getByLabelText(/document body/i), "Recovered body");
+    await screen.findByText(/draft saved locally/i);
+    first.unmount();
+
+    const second = renderPage("notes");
+    expect(screen.getByLabelText(/^title/i)).toHaveValue("Recovered note");
+    expect(screen.getByText(/local draft restored/i)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /close document composer/i }));
+    await user.click(screen.getByRole("button", { name: /discard draft/i }));
+    expect(second.onOpenChange).toHaveBeenCalledWith(false);
+    expect(window.localStorage.length).toBe(0);
+  });
+
+  it("restores temporary image ids and discards them with the saved draft", async () => {
+    const user = userEvent.setup();
+    const first = renderPage("notes");
+    await user.type(screen.getByLabelText(/^title/i), "Draft with image");
+    fireEvent.change(screen.getByLabelText(/local image/i), {
+      target: { files: [new File(["image"], "diagram.png", { type: "image/png" })] },
+    });
+    await screen.findByText(/draft saved locally/i);
+    first.unmount();
+
+    const second = renderPage("notes");
+    expect(screen.getByLabelText(/document body/i)).toHaveValue(
+      `![Local image](/api/assets/${ASSET_ID})`,
+    );
+
+    await user.click(screen.getByRole("button", { name: /close document composer/i }));
+    await user.click(screen.getByRole("button", { name: /discard draft/i }));
+    await waitFor(() => {
+      expect(discardAsset).toHaveBeenCalledWith("my-v", ASSET_ID);
+      expect(second.onOpenChange).toHaveBeenCalledWith(false);
+    });
+    expect(window.localStorage.length).toBe(0);
   });
 });

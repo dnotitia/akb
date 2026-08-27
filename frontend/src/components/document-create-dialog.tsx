@@ -2,6 +2,8 @@ import { useEffect, useState, type CSSProperties, type RefObject } from "react";
 import { DocumentCreateForm } from "@/components/document-create-form";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
+import { discardAsset } from "@/lib/api";
+import { clearDocumentDraft } from "@/lib/document-draft";
 
 export interface DocumentCreateDialogProps {
   open: boolean;
@@ -32,6 +34,7 @@ export function DocumentCreateDialog({
   const [creating, setCreating] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [discardOpen, setDiscardOpen] = useState(false);
+  const [draftAssetIds, setDraftAssetIds] = useState<readonly string[]>([]);
 
   useEffect(() => {
     if (open) return;
@@ -39,6 +42,7 @@ export function DocumentCreateDialog({
     setCreating(false);
     setUploading(false);
     setDiscardOpen(false);
+    setDraftAssetIds([]);
   }, [open]);
 
   function requestClose() {
@@ -94,6 +98,7 @@ export function DocumentCreateDialog({
               onDirtyChange={setDirty}
               onCreatingChange={setCreating}
               onUploadingChange={setUploading}
+              onAssetIdsChange={setDraftAssetIds}
             />
           )}
         </DialogContent>
@@ -110,7 +115,16 @@ export function DocumentCreateDialog({
         }
         confirmLabel="Discard draft"
         variant="destructive"
-        onConfirm={() => onOpenChange(false)}
+        onConfirm={async () => {
+          // Keep temporary uploads alive across an unexpected reload so the
+          // local draft can recover. An explicit discard is the authoritative
+          // cleanup path; the server TTL remains the fallback for failures.
+          await Promise.allSettled(
+            draftAssetIds.map((assetId) => discardAsset(vault, assetId)),
+          );
+          clearDocumentDraft(vault);
+          onOpenChange(false);
+        }}
       />
     </>
   );

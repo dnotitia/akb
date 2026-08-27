@@ -16,6 +16,8 @@ vi.mock("@/lib/api", () => ({
   publishDoc: vi.fn(),
   unpublishDoc: vi.fn(),
   updateDocument: vi.fn(),
+  browseVault: vi.fn(),
+  moveDocument: vi.fn(),
 }));
 
 vi.mock("@/components/markdown-editor", () => ({
@@ -41,6 +43,8 @@ import {
   getDocument,
   getVaultInfo,
   getRelations,
+  browseVault,
+  moveDocument,
   updateDocument,
 } from "@/lib/api";
 
@@ -49,6 +53,8 @@ const deleteDocumentMock = deleteDocument as unknown as ReturnType<typeof vi.fn>
 const getVaultInfoMock = getVaultInfo as unknown as ReturnType<typeof vi.fn>;
 const getRelationsMock = getRelations as unknown as ReturnType<typeof vi.fn>;
 const updateDocumentMock = updateDocument as unknown as ReturnType<typeof vi.fn>;
+const browseVaultMock = browseVault as unknown as ReturnType<typeof vi.fn>;
+const moveDocumentMock = moveDocument as unknown as ReturnType<typeof vi.fn>;
 
 const SAMPLE_CONTENT = "# BodyHeading\n\nworld";
 const UPDATED_COMMIT = "fedcba987654321"; // pragma: allowlist secret — synthetic Git commit
@@ -155,6 +161,8 @@ beforeEach(() => {
   getVaultInfoMock.mockReset();
   getRelationsMock.mockReset();
   updateDocumentMock.mockReset();
+  browseVaultMock.mockReset();
+  moveDocumentMock.mockReset();
 
   getDocumentMock.mockResolvedValue(makeDoc());
   getVaultInfoMock.mockResolvedValue({ role: "reader" });
@@ -162,6 +170,21 @@ beforeEach(() => {
   updateDocumentMock.mockResolvedValue({
     current_commit: UPDATED_COMMIT,
     commit_hash: UPDATED_COMMIT,
+  });
+  browseVaultMock.mockResolvedValue({
+    items: [
+      { type: "collection", path: "notes" },
+      { type: "collection", path: "archive" },
+    ],
+  });
+  moveDocumentMock.mockResolvedValue({
+    kind: "document_write",
+    uri: "akb://v/coll/archive/doc/hello.md",
+    vault: "v",
+    path: "archive/hello.md",
+    commit_hash: UPDATED_COMMIT,
+    current_commit: UPDATED_COMMIT,
+    action: "moved",
   });
   deleteDocumentMock.mockResolvedValue({ deleted: true });
 
@@ -278,7 +301,7 @@ describe("DocumentPage view toggle", () => {
     );
 
     const details = document.getElementById("document-details-panel") as HTMLElement;
-    const detailsToggle = screen.getByRole("button", { name: "Details" });
+    const detailsToggle = screen.getByRole("button", { name: "Open document panel" });
     expect(details).toHaveAttribute("aria-hidden", "true");
     expect(details).toHaveClass("translate-x-full");
     expect(detailsToggle).toHaveAttribute("aria-expanded", "false");
@@ -287,6 +310,7 @@ describe("DocumentPage view toggle", () => {
     expect(details).toHaveAttribute("aria-hidden", "false");
     expect(details).toHaveClass("translate-x-0");
     expect(detailsToggle).toHaveAttribute("aria-expanded", "true");
+    expect(detailsToggle).toHaveAccessibleName("Hide document panel");
     expect(details).toHaveClass("lg:w-96");
 
     const detailViews = screen.getByRole("tablist", { name: "Document detail views" });
@@ -304,7 +328,7 @@ describe("DocumentPage view toggle", () => {
       "overflow-y-auto",
     );
 
-    await user.click(screen.getByRole("button", { name: "Hide document details" }));
+    await user.click(screen.getByRole("button", { name: "Close document panel" }));
     expect(details).toHaveAttribute("aria-hidden", "true");
     await waitFor(() => expect(detailsToggle).toHaveFocus());
 
@@ -331,6 +355,75 @@ describe("DocumentPage view toggle", () => {
     );
     // The raw <pre> should NOT be present.
     expect(screen.queryByTestId("doc-raw")).not.toBeInTheDocument();
+  });
+
+  it("keeps Edit in the document header and exits a clean editor with Cancel", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "owner" });
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    const edit = await screen.findByRole("button", { name: "Edit" });
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
+      "Rendered",
+      "Raw",
+    ]);
+
+    await user.click(edit);
+    expect(await screen.findByText("Editing document")).toBeInTheDocument();
+    expect(screen.queryByRole("tablist", { name: "Document view" })).not.toBeInTheDocument();
+
+    const cancel = screen.getByRole("button", { name: "Cancel" });
+    expect(cancel).toBeEnabled();
+    await user.click(cancel);
+
+    await screen.findByRole("heading", { level: 2, name: "BodyHeading" });
+    expect(screen.getByTestId("location-search")).toHaveTextContent("");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Edit" })).toHaveFocus());
+  });
+
+  it("confirms before Cancel discards body edits and then returns to reading", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "owner" });
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await user.click(await screen.findByRole("button", { name: "Edit" }));
+    const editor = await screen.findByRole("textbox", {
+      name: "Document body (markdown)",
+    });
+    await user.type(editor, "XY");
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(
+      await screen.findByRole("heading", { name: "Discard unsaved changes?" }),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Discard changes" }));
+
+    await screen.findByRole("heading", { level: 2, name: "BodyHeading" });
+    expect(screen.queryByRole("textbox", { name: "Document body (markdown)" })).not.toBeInTheDocument();
+    expect(updateDocumentMock).not.toHaveBeenCalled();
+  });
+
+  it("returns focus to the edit Cancel action when discard confirmation is dismissed", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "owner" });
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await user.click(await screen.findByRole("button", { name: "Edit" }));
+    await user.type(
+      await screen.findByRole("textbox", { name: "Document body (markdown)" }),
+      "unsaved",
+    );
+    const pageCancel = screen.getByRole("button", { name: "Cancel" });
+    await user.click(pageCancel);
+    await screen.findByRole("heading", { name: "Discard unsaved changes?" });
+
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => expect(pageCancel).toHaveFocus());
+    expect(
+      screen.getByRole("textbox", { name: "Document body (markdown)" }),
+    ).toBeInTheDocument();
   });
 
   it("merges a compact summary into the document viewer toolbar without opening Details", async () => {
@@ -404,7 +497,7 @@ describe("DocumentPage view toggle", () => {
 
     renderAt("/vault/v/doc/notes%2Fhello.md");
 
-    await userEvent.setup().click(await screen.findByRole("button", { name: "Details" }));
+    await userEvent.setup().click(await screen.findByRole("button", { name: "Open document panel" }));
     const relationsTab = await screen.findByRole("tab", { name: /^Relations/ });
     expect(relationsTab).toHaveTextContent(/^Relations1$/);
     expect(relationsTab).not.toHaveTextContent("2");
@@ -543,5 +636,47 @@ describe("DocumentPage view toggle", () => {
       expect(deleteDocumentMock).toHaveBeenCalledWith("v", "notes/hello.md"),
     );
     expect(screen.getByTestId("location-pathname")).toHaveTextContent("/vault/v");
+  });
+
+  it("keeps move discoverable for readers and explains why it is unavailable", async () => {
+    const user = userEvent.setup();
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await user.click(await screen.findByRole("button", { name: "Actions for DocTitle" }));
+    const move = screen.getByRole("menuitem", { name: /Move or rename/i });
+    expect(move).toHaveAttribute("aria-disabled", "true");
+    expect(move).toHaveTextContent("Writer access or higher is required.");
+  });
+
+  it("moves a writer to the backend-returned path and names the destination", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    getDocumentMock.mockImplementation(async (_vault: string, path: string) =>
+      makeDoc({ path }),
+    );
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await user.click(await screen.findByRole("button", { name: "Actions for DocTitle" }));
+    await user.click(screen.getByRole("menuitem", { name: "Move or rename" }));
+    await user.click(await screen.findByLabelText("Target collection"));
+    await user.click(screen.getByRole("menuitemradio", { name: "archive" }));
+    await user.click(screen.getByRole("button", { name: "Move document" }));
+
+    await waitFor(() =>
+      expect(moveDocumentMock).toHaveBeenCalledWith(
+        "v",
+        "notes/hello.md",
+        { collection: "archive" },
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("location-pathname")).toHaveTextContent(
+        "/vault/v/doc/archive%2Fhello.md",
+      ),
+    );
+    const movedStatus = (await screen.findByText("Moved to archive")).closest(
+      '[role="status"]',
+    );
+    expect(movedStatus).toHaveTextContent("archive/hello.md");
   });
 });

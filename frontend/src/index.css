@@ -738,9 +738,10 @@ body::before {
 .akb-md .katex-display > .katex { white-space: nowrap; }
 
 /* The document file frame may grow into space reclaimed from either rail.
-   Keep prose scannable without constraining tables, code blocks, or media that
-   benefit from the wider Git-style workspace. */
-.document-reading-flow > :where(h1, h2, h3, h4, h5, h6, p, ul, ol, blockquote) {
+   Keep prose and ordinary tables aligned on one scannable measure. Tables may
+   still overflow horizontally inside their own wrapper when their columns need
+   more room; code blocks and media continue to use the wider workspace. */
+.document-reading-flow > :where(h1, h2, h3, h4, h5, h6, p, ul, ol, blockquote, .akb-md-table) {
   width: 100%;
   max-width: 64rem;
   margin-inline: auto;
