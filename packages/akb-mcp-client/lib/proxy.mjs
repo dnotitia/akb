@@ -1771,7 +1771,9 @@ export class AKBProxy {
     this._write({ jsonrpc: "2.0", method, params: params || {} });
   }
 
-  _writeError(id, code, message) {
-    this._write({ jsonrpc: "2.0", id, error: { code, message } });
+  _writeError(id, code, message, data = undefined) {
+    const error = { code, message };
+    if (data !== undefined) error.data = data;
+    this._write({ jsonrpc: "2.0", id, error });
   }
 }
