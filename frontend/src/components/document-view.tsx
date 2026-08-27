@@ -1,10 +1,12 @@
 import { useMemo, useState } from "react";
-import { Check, Code2, Copy, Eye, Loader2, Pencil } from "lucide-react";
+import { Check, Code2, Copy, Eye, Pencil } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { getDocument } from "@/lib/api";
 import { MarkdownRender } from "@/components/markdown-render";
 import { Alert } from "@/components/ui/alert";
 import { TooltipText } from "@/components/ui/tooltip-text";
+import { LoadingState } from "@/components/ui/loading-state";
+import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 
 type ViewMode = "rendered" | "raw";
@@ -95,12 +97,7 @@ export function DocumentView({
   }
 
   if (isLoading) {
-    return (
-      <div className="py-8 coord" role="status" aria-live="polite">
-        <Loader2 className="h-4 w-4 inline animate-spin mr-2" aria-hidden />
-        Loading…
-      </div>
-    );
+    return <DocumentViewLoading appearance={appearance} />;
   }
 
   if (error || !doc) {
@@ -197,6 +194,35 @@ export function DocumentView({
         </div>
       )}
     </section>
+  );
+}
+
+function DocumentViewLoading({ appearance }: { appearance: "plain" | "file" }) {
+  return (
+    <LoadingState
+      label="Loading document body"
+      className={cn(
+        appearance === "file" &&
+          "min-h-[28rem] overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm",
+      )}
+    >
+      <div className={cn(appearance !== "file" && "py-4")}>
+        <div className="flex min-h-11 items-center gap-2 border-b border-border bg-surface-2/60 px-3">
+          <Skeleton className="h-7 w-24 rounded-[var(--radius-sm)]" />
+          <Skeleton className="h-7 w-16 rounded-[var(--radius-sm)]" />
+          <Skeleton className="ml-auto h-3 w-28 rounded-[var(--radius-sm)]" />
+        </div>
+        <div className="mx-auto max-w-4xl space-y-4 px-5 py-8 sm:px-8 lg:px-12">
+          <Skeleton className="h-8 w-3/5 rounded-[var(--radius-md)]" />
+          <Skeleton className="h-4 w-full rounded-[var(--radius-sm)]" />
+          <Skeleton className="h-4 w-11/12 rounded-[var(--radius-sm)]" />
+          <Skeleton className="h-4 w-4/5 rounded-[var(--radius-sm)]" />
+          <Skeleton className="mt-7 h-6 w-2/5 rounded-[var(--radius-md)]" />
+          <Skeleton className="h-4 w-full rounded-[var(--radius-sm)]" />
+          <Skeleton className="h-4 w-5/6 rounded-[var(--radius-sm)]" />
+        </div>
+      </div>
+    </LoadingState>
   );
 }
 

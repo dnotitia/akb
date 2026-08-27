@@ -38,6 +38,9 @@ export function VaultShell() {
   const navigate = useNavigate();
   const isGraph = location.pathname.endsWith("/graph");
   const isDocument = location.pathname.includes("/doc/");
+  const isTable = location.pathname.includes("/table/");
+  const isFile = location.pathname.includes("/file/");
+  const isResourceViewer = isDocument || isTable || isFile;
   const isPublications = location.pathname.endsWith("/publications");
   const isSearch = location.pathname.endsWith("/search");
   const isMembers = location.pathname.endsWith("/members");
@@ -425,7 +428,7 @@ export function VaultShell() {
               showBack={false}
             />
 
-            {isGraph || isDocument || isSearch ? (
+            {isGraph || isResourceViewer || isSearch ? (
               <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden bg-background">
                 <ErrorBoundary resetKeys={[location.pathname]}>
                   <Outlet />

@@ -493,6 +493,39 @@ commits` control and `Full commit log` route. Below `xl`, the work area stacks
   full-page reader. Rendered / Raw and version changes retain preview state,
   while Edit deliberately promotes to the full page so unsaved work never lives
   in a dismissible reading overlay.
+- **File workspace**: file routes share the Document workspace's full-height,
+  full-bleed resource grammar: one 64px identity header, one 44px context row,
+  and one framed viewer inside an 8–12px canvas gutter. The title is the human
+  filename; the subtitle identifies the resource kind and Vault without
+  repeating the canonical URI. Collection, filename, uploader (when readable),
+  and creation age live in the context row. Format, byte size, and an optional
+  one-line description live in the viewer toolbar, with long descriptions
+  disclosed through `TooltipText`. Download is the single header action. Images,
+  PDF, HTML, JSON, and text use the shared inline preview renderer; unsupported
+  or failed formats retain the same viewer frame and provide a recoverable
+  preview/download state rather than collapsing into a generic empty card.
+  Initial discovery and file-body loading have separate layout-matched
+  `LoadingState` boundaries so the header and frame remain stable while large
+  content arrives.
+- **Table workspace**: table routes use the same resource shell, but the data
+  grid—not schema prose—is the primary canvas. The 64px header owns table
+  identity, read-only state, row/column totals, and a labelled Schema control.
+  The context row carries the table description and honest sample range. A
+  single framed data surface fills the remaining height and owns both horizontal
+  and vertical scrolling; its header and row-index column remain sticky, while
+  cell values use sans/tabular typography unless the value itself is structured
+  data. Responsive layouts preserve the grid via a focusable horizontal-scroll
+  region rather than converting records into unrelated cards. Schema opens as a
+  right overlay inspector and never reduces data width; it returns focus on
+  Close, backdrop click, or Escape. The inspector reads as a compact data
+  dictionary: a three-value overview exposes column, primary-key, and required
+  counts before a semantic `# | Column | Data type | Constraints` table. Every
+  row keeps stored order, identifier, type, and explicit Required/Nullable text
+  on stable visual axes; primary-key rows add both a key icon/label and a
+  restrained teal surface so color is never the only signal. On narrow screens
+  this table scrolls inside the inspector rather than compressing or stacking
+  unlike values. Loading, empty, query-error, and sampled-result states all
+  retain the same outer frame.
 
 ---
 
@@ -556,7 +589,8 @@ Compose pages from these instead of re-writing patterns inline.
 | `VaultChip`                                            | flat tinted **monogram** tile for a vault — a quiet identity anchor, **not** a glossy avatar or a `feat-*` hero. Swatch is a deterministic `--color-cat-*` picked by `hashHue(name) % 6` (the shared FNV-1a from `lib/utils`, §7), so a vault wears **one color** wherever its name appears — Recent rows and the vault directory. Fill `color-mix(in srgb, <cat> 14%, transparent)`, use the small radius token; `sm` (`h-5 w-5`) rides inline in a row, `md` (`h-7 w-7`) anchors a directory row. `aria-hidden` — the readable name always leads. |
 | `Input` / `Textarea` / `Select` / `Label` / `TagInput` | form primitives — pre-rounded, teal focus ring, `aria-[invalid]` hooks.                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `Dialog` / `ConfirmDialog`                             | overlay primitives; creation flows for documents, Vault files, and tables stay modal and preserve the surrounding workspace. `ConfirmDialog` surfaces a rejected `onConfirm` inline (`Alert`) and stays open for retry.                                                                                                                                                                                                                                                                                                                             |
-| `Tabs` / `Tooltip` / `Skeleton`                        | segmented control / hint / loading placeholder.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `Tabs` / `Tooltip` / `Skeleton`                        | segmented control / hint / visual loading placeholder. `Skeleton` is presentation-only and belongs inside `LoadingState`, not as a standalone status.                                                                                                                                                                                                                                                                                                                                                                                               |
+| `LoadingState` / `InlineLoadingState`                  | accessible async feedback. `LoadingState` owns one atomic `role=status`, hides its layout-matched skeleton children from assistive technology, and is used for page/panel/ledger discovery. `InlineLoadingState` is reserved for brief transitions or non-blocking refreshes where a structural skeleton would be misleading.                                                                                                                                                                                                                         |
 | `Logo` + `.feature-tile`/`.feat-*`                     | brand lockup + per-capability gradient tiles.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
 Shell: `Layout` (glass `app-header` + responsive `AppSidebar` + content) and
@@ -665,9 +699,26 @@ filters; opening the global panel by itself never changes browser history.
 
 _Roadmap primitives_ (high-drift inline patterns being extracted): `IndexRow`
 (numbered list row), `ToggleGroup`/`ToggleChip` (segmented selection),
-`MetaList`/`MetaItem` (rail `dl`), `LoadingState` (`role=status` loading line +
-skeleton), `InlineCode` (single-token mono chip). Until shipped, match the
+`MetaList`/`MetaItem` (rail `dl`), `InlineCode` (single-token mono chip). Until shipped, match the
 existing inline pattern and flag for extraction.
+
+### Loading-state contract
+
+- Initial page and panel discovery keeps the final outer shell, masthead, rails,
+  and major content geometry in place. Use a layout-matched skeleton inside one
+  `LoadingState`; never return `null` or replace a whole page with a centered
+  loading word.
+- A refresh, filter change, or background revalidation preserves the last
+  successful content. Mark its owning region `aria-busy` and use
+  `InlineLoadingState` near the initiating control; do not blank the ledger or
+  block unrelated navigation.
+- Loading, empty, error, and ready are distinct states. A failed initial request
+  replaces its skeleton with a recoverable `Alert`; a failed background refresh
+  keeps the prior content and adds an inline error with retry where practical.
+- Skeleton dimensions approximate the final content at every breakpoint so
+  async completion does not cause avoidable layout shift. Skeleton blocks are
+  decorative, contain no fake readable copy, and inherit the global
+  reduced-motion rule.
 
 ---
 
@@ -680,7 +731,7 @@ existing inline pattern and flag for extraction.
 | **Focus ring**                | every interactive element keeps the `focus-visible:ring-2 ring-ring ring-offset-2` pattern (icon buttons included). Never remove it. |
 | **Icon-only button**          | `aria-label` required + `<Icon aria-hidden />`.                                                                                      |
 | **Labels**                    | every input has a visible `<Label>` or an `sr-only` label; placeholder is not a label.                                               |
-| **Async / loading**           | wrap loading + show-once secrets in `role=status aria-live=polite`; surface errors with `role=alert` (the `Alert` primitive).        |
+| **Async / loading**           | Use one `LoadingState` per async boundary (`role=status aria-live=polite`); preserve successful content during refresh, mark its owner `aria-busy`, and surface errors with `Alert`. |
 | **Destructive action**        | `ConfirmDialog`, never `window.confirm()`.                                                                                           |
 | **Reduced motion**            | respected globally — don't override.                                                                                                 |
 

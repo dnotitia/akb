@@ -22,7 +22,9 @@ export function useVaults() {
     setLoading(true);
     listVaults()
       .then((d) => setVaults((d.vaults as VaultSummary[]) || []))
-      .catch(() => setVaults([]))
+      // Preserve the last successful list on a transient refresh failure so
+      // the navigation rail does not collapse beneath the user.
+      .catch(() => {})
       .finally(() => setLoading(false));
   }, []);
 

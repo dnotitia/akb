@@ -4,10 +4,15 @@ import { ArrowLeft } from "lucide-react";
 import { getAuthConfig, getMe, getToken, type AuthConfig } from "@/lib/api";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Logo } from "@/components/logo";
+import { AuthCardLoading } from "@/components/auth-card-loading";
+import { Alert } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
 
 export default function AuthForgotPage() {
   const navigate = useNavigate();
   const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
+  const [configError, setConfigError] = useState("");
+  const [configAttempt, setConfigAttempt] = useState(0);
   const localPasswordHelp =
     authConfig?.available === true &&
     (authConfig.auth_mode === "local" || authConfig.auth_mode === "hybrid") &&
@@ -16,26 +21,35 @@ export default function AuthForgotPage() {
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const config = await getAuthConfig();
-      if (cancelled) return;
-      const hasSessionCandidate =
-        config.available === true &&
-        (config.auth_mode === "sso" || getToken() !== null);
-      if (hasSessionCandidate) {
-        try {
-          await getMe({ redirectOnUnauthorized: false });
-          if (!cancelled) navigate("/", { replace: true });
-          return;
-        } catch {
-          // No active session; render mode-specific recovery guidance.
+      try {
+        setConfigError("");
+        const config = await getAuthConfig();
+        if (cancelled) return;
+        const hasSessionCandidate =
+          config.available === true &&
+          (config.auth_mode === "sso" || getToken() !== null);
+        if (hasSessionCandidate) {
+          try {
+            await getMe({ redirectOnUnauthorized: false });
+            if (!cancelled) navigate("/", { replace: true });
+            return;
+          } catch {
+            // No active session; render mode-specific recovery guidance.
+          }
+        }
+        if (!cancelled) setAuthConfig(config);
+      } catch (caught) {
+        if (!cancelled) {
+          setConfigError(
+            caught instanceof Error ? caught.message : "Authentication options could not be loaded.",
+          );
         }
       }
-      if (!cancelled) setAuthConfig(config);
     })();
     return () => {
       cancelled = true;
     };
-  }, [navigate]);
+  }, [configAttempt, navigate]);
 
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background text-foreground p-6">
@@ -49,10 +63,17 @@ export default function AuthForgotPage() {
         </div>
 
         <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-lg p-7 sm:p-8">
-          {authConfig === null ? (
-            <div className="py-6 text-center coord" role="status" aria-live="polite">
-              Loading authentication options…
+          {configError ? (
+            <div className="space-y-4">
+              <Alert variant="destructive" title="Recovery options unavailable">
+                {configError}
+              </Alert>
+              <Button type="button" variant="outline" className="w-full" onClick={() => setConfigAttempt((value) => value + 1)}>
+                Try again
+              </Button>
             </div>
+          ) : authConfig === null ? (
+            <AuthCardLoading label="Loading authentication options" compact />
           ) : localPasswordHelp ? (
             <>
               <h1 className="font-display text-2xl tracking-tight text-foreground mb-4">

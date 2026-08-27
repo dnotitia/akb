@@ -29,6 +29,8 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { LoadingState } from "@/components/ui/loading-state";
+import { Skeleton } from "@/components/ui/skeleton";
 
 /**
  * The vault column — an always-visible, favoritable, role-aware list of vaults
@@ -385,9 +387,7 @@ export function VaultRail({
 
       <div className="flex-1 overflow-y-auto rail-scroll py-1">
         {vaults.length === 0 ? (
-          <p className="px-3 py-2 coord" aria-live="polite">
-            {loading ? "Loading…" : "No vaults yet"}
-          </p>
+          loading ? <VaultRailLoading /> : <p className="px-3 py-2 coord">No vaults yet</p>
         ) : filtered.length === 0 ? (
           <div className="px-3 py-2">
             <p className="coord">
@@ -427,5 +427,18 @@ export function VaultRail({
         )}
       </div>
     </nav>
+  );
+}
+
+function VaultRailLoading() {
+  return (
+    <LoadingState label="Loading vaults" className="space-y-1 px-2 py-2">
+      {[0, 1, 2, 3].map((item) => (
+        <div key={item} className="flex h-10 items-center gap-2 rounded-[var(--radius-md)] px-1">
+          <Skeleton className="h-8 w-8 shrink-0 rounded-[var(--radius-md)]" />
+          <Skeleton className={item % 2 === 0 ? "h-3.5 w-24 rounded-[var(--radius-sm)]" : "h-3.5 w-32 rounded-[var(--radius-sm)]"} />
+        </div>
+      ))}
+    </LoadingState>
   );
 }

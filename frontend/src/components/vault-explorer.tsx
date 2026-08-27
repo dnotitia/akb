@@ -21,6 +21,8 @@ import {
   Upload,
 } from "lucide-react";
 import { Alert } from "@/components/ui/alert";
+import { LoadingState } from "@/components/ui/loading-state";
+import { Skeleton } from "@/components/ui/skeleton";
 import { SkillBadge } from "@/components/ui/skill-badge";
 import { useVaultTree, useExpandedPaths, type NodeKind, type TreeNode } from "@/hooks/use-vault-tree";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
@@ -93,7 +95,7 @@ export function VaultExplorer({
   onRefetchReady,
   onCollapse,
 }: VaultExplorerProps) {
-  const { tree, loading, error, refetch } = useVaultTree(vault);
+  const { tree, loading, refreshing, error, refetch } = useVaultTree(vault);
   const openCreateDocument = useOpenDocumentCreateDialog();
   const refreshCtx = useVaultRefresh();
   // Prefer the explicit prop; otherwise fall back to context. This lets
@@ -383,12 +385,12 @@ export function VaultExplorer({
           <button
             type="button"
             onClick={() => refetch()}
-            disabled={loading}
+            disabled={loading || refreshing}
             aria-label="Refresh collections"
             title="Refresh collections"
             className={headBtn}
           >
-            <RefreshCw className={loading ? "h-3 w-3 animate-spin" : "h-3 w-3"} aria-hidden />
+            <RefreshCw className={loading || refreshing ? "h-3 w-3 animate-spin" : "h-3 w-3"} aria-hidden />
           </button>
           {canWrite && (
             <RootCreateMenu
@@ -448,23 +450,24 @@ export function VaultExplorer({
         ref={listRef}
         role="tree"
         aria-label={`${vault} explorer`}
+        aria-busy={loading || refreshing || undefined}
         onKeyDown={onKeyDown}
         className="flex-1 overflow-y-auto"
       >
-        {loading && <div className="coord px-3 py-3" role="status" aria-live="polite">— Loading —</div>}
+        {loading && <VaultExplorerLoading />}
         {error && <Alert variant="destructive" className="m-2">{error}</Alert>}
-        {!loading && !error && total === 0 && (
+        {!loading && total === 0 && (
           <div className="px-3 py-4 text-xs leading-relaxed text-foreground-muted" role="status">
             No collections yet — the tree fills in with your first document.
           </div>
         )}
-        {!loading && !error && total > 0 && visibleRows.length === 0 && (
+        {!loading && total > 0 && visibleRows.length === 0 && (
           <div className="coord px-3 py-2" role="status">
             No resources match these filters.
           </div>
         )}
 
-        {!loading && !error &&
+        {!loading &&
           visibleRows.map((row) => {
             if (row.type === "kind-group") {
               return (
@@ -524,7 +527,7 @@ export function VaultExplorer({
             );
           })}
 
-        {!loading && !error &&
+        {!loading &&
           fullRows.length > visibleRows.length && (
             <button
               type="button"
@@ -617,6 +620,19 @@ export function VaultExplorer({
         }}
       />
     </aside>
+  );
+}
+
+function VaultExplorerLoading() {
+  return (
+    <LoadingState label="Loading collections" className="space-y-1 px-2 py-2">
+      {[0, 1, 2, 3, 4, 5].map((item) => (
+        <div key={item} className="flex h-8 items-center gap-2 px-1" style={{ paddingLeft: `${4 + (item % 3) * 12}px` }}>
+          <Skeleton className="h-4 w-4 shrink-0 rounded-[var(--radius-sm)]" />
+          <Skeleton className={item % 2 === 0 ? "h-3 w-28 rounded-[var(--radius-sm)]" : "h-3 w-20 rounded-[var(--radius-sm)]"} />
+        </div>
+      ))}
+    </LoadingState>
   );
 }
 
