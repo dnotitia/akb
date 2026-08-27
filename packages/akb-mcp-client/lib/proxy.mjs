@@ -444,7 +444,7 @@ export class AKBProxy {
     this.msgId = 0;
     this._initialized = false;
     this._clientGeneration = null; // fixed by the first request
-    this._clientCapabilities = null;
+    this._clientCapabilities = {};
     this._clientInfo = null;
     // ── Backend-liveness state (decoupled from client liveness) ──────
     // The client's view of this server must NOT depend on backend
@@ -452,7 +452,6 @@ export class AKBProxy {
     // by the client for the whole session (the VPN-down-at-startup bug).
     // So we answer `initialize` locally and manage the backend session
     // out of band via a background monitor.
-    this._clientInitParams = null; // client initialize params, replayed to backend
     this._backendReady = false; // backend MCP session established
     this._connecting = null; // in-flight backend-connect promise (single-flight lock)
     this._cachedTools = null; // last successful backend tools/list result (raw)
@@ -729,7 +728,6 @@ export class AKBProxy {
         },
       };
     }
-    this._clientInitParams = params || null;
     this._clientCapabilities = isObject(params?.capabilities) ? params.capabilities : {};
     this._clientInfo = isObject(params?.clientInfo) ? params.clientInfo : null;
     this._initialized = true;
@@ -1469,7 +1467,7 @@ export class AKBProxy {
   }
 
   _isLegacyBackendGap(error) {
-    if (this._isConnError(error) || error?.protocolError === false) return false;
+    if (this._isConnError(error)) return false;
     return (
       error?.code === METHOD_NOT_FOUND ||
       error?.statusCode === 404 ||
@@ -1479,13 +1477,7 @@ export class AKBProxy {
   }
 
   _legacyBackendParams() {
-    const source = this._clientInitParams || {};
-    const sourceCapabilities = isObject(this._clientCapabilities)
-      ? this._clientCapabilities
-      : (isObject(source.capabilities) ? source.capabilities : {});
-    const sourceInfo = isObject(this._clientInfo)
-      ? this._clientInfo
-      : (isObject(source.clientInfo) ? source.clientInfo : null);
+    const sourceCapabilities = this._clientCapabilities;
     return {
       protocolVersion: LEGACY_PROTOCOL_VERSION,
       capabilities: {
@@ -1495,22 +1487,17 @@ export class AKBProxy {
           [VAULT_SKILL_PREFLIGHT_CAPABILITY]: { version: 2 },
         },
       },
-      clientInfo: sourceInfo || { name: "akb-mcp-client", version: PROXY_VERSION },
+      clientInfo: this._clientInfo || { name: "akb-mcp-client", version: PROXY_VERSION },
     };
   }
 
   _backendModernMeta() {
-    const source = this._clientInitParams || {};
-    const sourceCapabilities = isObject(source.capabilities) ? source.capabilities : {};
-    const sourceInfo = isObject(source.clientInfo) ? source.clientInfo : null;
     return {
       [PROTOCOL_VERSION_META_KEY]: MODERN_PROTOCOL_VERSION,
-      [CLIENT_CAPABILITIES_META_KEY]: isObject(this._clientCapabilities)
-        ? this._clientCapabilities
-        : sourceCapabilities,
+      [CLIENT_CAPABILITIES_META_KEY]: this._clientCapabilities,
       [CLIENT_INFO_META_KEY]: isObject(this._clientInfo)
         ? this._clientInfo
-        : sourceInfo || { name: "akb-mcp-client", version: PROXY_VERSION },
+        : { name: "akb-mcp-client", version: PROXY_VERSION },
     };
   }
 

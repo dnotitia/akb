@@ -381,11 +381,7 @@ def _record_grep_replace_receipts(
         target = f"uri={replacement['uri']}"
         if len(target) > _TARGET_MAX:
             target = target[:_TARGET_MAX] + "…"
-        receipt_meta: dict[str, Any] = {
-            "protocol_generation": protocol["protocol_generation"],
-            "protocol_revision": protocol["protocol_revision"],
-            "auth_method": protocol["auth_method"],
-        } if protocol is not None else {}
+        receipt_meta: dict[str, Any] = dict(protocol or {})
         receipt_meta.update({
             "commit": replacement.get("commit"),
             "previous_commit": replacement.get("previous_commit"),
@@ -438,11 +434,7 @@ def record_tool(
         code = result.get("code")
     if name == "akb_grep" and is_write:
         _record_grep_replace_receipts(args, user, result, protocol)
-    audit_meta = {
-        "protocol_generation": protocol["protocol_generation"],
-        "protocol_revision": protocol["protocol_revision"],
-        "auth_method": protocol["auth_method"],
-    } if protocol is not None else {}
+    audit_meta = dict(protocol or {})
     if name == "akb_grep" and is_write:
         audit_meta.update(_grep_replace_meta(args, result) or {})
     record(

@@ -97,7 +97,8 @@ itAsync("backend modern discovery carries vault-guide preflight without dropping
     },
     clientInfo: { name: "client", version: "1" },
   };
-  proxy._clientInitParams = original;
+  proxy._clientCapabilities = original.capabilities;
+  proxy._clientInfo = original.clientInfo;
   let forwarded;
   proxy._rpc = async (method, params, options) => {
     assert.equal(method, "server/discover");
