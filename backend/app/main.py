@@ -107,6 +107,7 @@ async def lifespan(app: FastAPI):
         )
     storage_initialized = False
     runtime_started = False
+    mcp_started = False
     try:
         await init_storage()
         storage_initialized = True
@@ -142,8 +143,12 @@ async def lifespan(app: FastAPI):
             start_workers()
         else:
             start_api_runtime()
+        await mcp_app.start()
+        mcp_started = True
         yield
     finally:
+        if mcp_started:
+            await mcp_app.stop()
         if runtime_started:
             if role == "all":
                 await stop_workers()

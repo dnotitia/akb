@@ -34,6 +34,14 @@ const tick = (ms = 10) => new Promise((r) => setTimeout(r, ms));
 function newProxy() {
   return new AKBProxy({ url: "http://akb.test/mcp", pat: "test-pat" });
 }
+async function initializeLegacy(proxy) {
+  proxy._startBackendMonitor = () => {};
+  return proxy._initialize(0, {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "legacy-test", version: "1" },
+  });
+}
 const fileToolNames = [
   "akb_put_file",
   "akb_put_image",
@@ -81,13 +89,13 @@ itAsync("initialize rejects an unsupported protocol version instead of echoing i
     capabilities: {},
   });
 
-  assert.equal(res.error.code, -32602);
+  assert.equal(res.error.code, -32022);
   assert.deepEqual(res.error.data.supported, ["2025-06-18"]);
   assert.equal(res.result, undefined);
   assert.equal(proxy._initialized, false);
 });
 
-itAsync("backend initialize negotiates vault-guide preflight without dropping client capabilities", async () => {
+itAsync("backend modern discover carries legacy client capabilities", async () => {
   const proxy = newProxy();
   const original = {
     protocolVersion: "2025-06-18",
@@ -98,21 +106,30 @@ itAsync("backend initialize negotiates vault-guide preflight without dropping cl
     clientInfo: { name: "client", version: "1" },
   };
   proxy._clientInitParams = original;
+  proxy._protocolGeneration = "legacy";
   let forwarded;
-  proxy._rpc = async (method, params) => {
-    assert.equal(method, "initialize");
-    forwarded = params;
-    return {};
+  proxy._http = async (method, path, body) => {
+    assert.equal(method, "POST");
+    assert.equal(path, "/mcp");
+    forwarded = JSON.parse(body.toString()).params;
+    return {
+      text: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        result: { supportedVersions: ["2026-07-28"] },
+      }),
+      headers: {},
+    };
   };
 
   assert.equal(await proxy._ensureBackend(), true);
-  assert.deepEqual(forwarded.capabilities.roots, { listChanged: true });
+  assert.deepEqual(forwarded._meta["io.modelcontextprotocol/clientCapabilities"].roots, { listChanged: true });
   assert.deepEqual(
-    forwarded.capabilities.experimental["example.test/feature"],
+    forwarded._meta["io.modelcontextprotocol/clientCapabilities"].experimental["example.test/feature"],
     { version: 2 },
   );
   assert.deepEqual(
-    forwarded.capabilities.experimental["io.dnotitia.akb/vault-skill-preflight"],
+    forwarded._meta["io.modelcontextprotocol/clientCapabilities"].experimental["io.dnotitia.akb/vault-skill-preflight"],
     { version: 2 },
   );
   assert.equal(
@@ -208,6 +225,7 @@ itAsync("monitor stays silent on recovery when the list was never degraded", asy
 
 itAsync("vault-guide acknowledgement is attached only to the exact backend retry", async () => {
   const proxy = newProxy();
+  await initializeLegacy(proxy);
   const forwarded = [];
   const challenge = {
     error: "Apply the vault instructions",
@@ -252,6 +270,7 @@ itAsync("vault-guide acknowledgement is attached only to the exact backend retry
 
 itAsync("vault-guide acknowledgement never authorizes an unrelated queued write", async () => {
   const proxy = newProxy();
+  await initializeLegacy(proxy);
   const forwarded = [];
   proxy._forward = async (msg) => {
     forwarded.push(msg);
@@ -304,6 +323,30 @@ itAsync("_forward retries a connection error then surfaces it (process survives)
   assert.equal(proxy._backendReady, false, "marks backend not-ready");
   assert.ok(restarts >= 1, "kicks the reconnect monitor");
   assert.ok(calls >= 3, "attempted the initial call plus retries");
+});
+
+itAsync("_forward surfaces protocol errors without reconnect retries", async () => {
+  const proxy = newProxy();
+  proxy._backendReady = true;
+  let calls = 0;
+  let monitorStarts = 0;
+  proxy._startBackendMonitor = () => { monitorStarts++; };
+  proxy._rpc = async () => {
+    calls++;
+    const error = new Error("MCP protocol error");
+    error.rpcError = {
+      code: -32022,
+      message: "Unsupported protocol version",
+      data: { supported: ["2026-07-28"], requested: "2099-01-01" },
+    };
+    throw error;
+  };
+
+  const response = await proxy._forward({ method: "tools/list", id: 8, params: {} });
+
+  assert.equal(response.error.code, -32022);
+  assert.equal(calls, 1);
+  assert.equal(monitorStarts, 0);
 });
 
 itAsync("_forward recovers on a later attempt once the backend returns", async () => {

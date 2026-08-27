@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.3.0 — dual-generation MCP transport
+
+The proxy now serves the established `2025-06-18` initialize/session stdio
+contract and the `2026-07-28` stateless discovery/request contract, selected by
+the first client request. Backend calls use the modern stateless envelope and
+protocol errors are kept separate from reconnectable transport failures.
+
 ## 2.2.2 — strict MCP protocol boundary
 
 The stdio proxy now rejects an `initialize` request that names an unsupported

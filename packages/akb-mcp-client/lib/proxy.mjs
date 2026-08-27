@@ -366,11 +366,11 @@ const FILE_WRITE_TOOL_NAMES = new Set([
 // Tools where proxy injects a `file` param as alternative to `content`
 const FILE_CONTENT_TOOLS = new Set(["akb_put", "akb_update"]);
 
-// Kept in sync with package.json `version`. Reported to the client in the
-// local `initialize` response, so it must not silently drift on a proxy
-// behaviour change. There is no import of package.json here to keep lib/
-// zero-dependency and load-safe across Node versions.
-const PROXY_VERSION = "2.2.2";
+// Kept in sync with package.json `version`. Reported in both the legacy
+// initialize result and the modern discover metadata, so it must not silently
+// drift on a proxy behaviour change. There is no import of package.json here
+// to keep lib/ zero-dependency and load-safe across Node versions.
+const PROXY_VERSION = "2.3.0";
 const VAULT_SKILL_PREFLIGHT_CAPABILITY =
   "io.dnotitia.akb/vault-skill-preflight";
 const PROXY_INSTRUCTIONS =
@@ -384,26 +384,58 @@ const PROXY_INSTRUCTIONS =
   "the entire document body. If the document write fails, clean up the uncommitted " +
   "upload with akb_discard_image.";
 
-// Fallback MCP protocol version echoed to the client when its `initialize`
-// request omits one. We otherwise echo the client's requested version.
-const MCP_PROTOCOL_VERSION = "2025-06-18";
+// The proxy's public stdio matrix has one modern envelope and one legacy
+// handshake revision. Backend legacy revisions are accepted directly by the
+// HTTP server, but the proxy keeps its established 2025-06-18 surface stable.
+const MCP_PROTOCOL_VERSION = "2026-07-28";
+const MCP_LEGACY_PROTOCOL_VERSION = "2025-06-18";
+const PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion";
+const CLIENT_CAPABILITIES_META_KEY = "io.modelcontextprotocol/clientCapabilities";
+const CLIENT_INFO_META_KEY = "io.modelcontextprotocol/clientInfo";
+const SERVER_INFO_META_KEY = "io.modelcontextprotocol/serverInfo";
+const UNSUPPORTED_PROTOCOL_VERSION = -32022;
+const INVALID_PARAMS = -32602;
+const INVALID_REQUEST = -32600;
+
+class MCPProtocolError extends Error {
+  constructor(error) {
+    super(`MCP error ${error?.code}: ${error?.message || "protocol failure"}`);
+    this.rpcError = error;
+  }
+
+  static invalid(id, message, code = INVALID_REQUEST, data) {
+    const error = { code, message };
+    if (data !== undefined) error.data = data;
+    return {
+      jsonrpc: "2.0",
+      id: id ?? null,
+      error,
+    };
+  }
+}
+
+function encodeRoutingHeader(value) {
+  if (/^[\x20-\x7e]*$/.test(value) && value === value.trim()) return value;
+  return `=?base64?${Buffer.from(value, "utf8").toString("base64")}?=`;
+}
 
 export class AKBProxy {
   constructor({ url, pat, insecure = false }) {
     this.url = new URL(url);
     this.pat = pat;
     this.insecure = insecure;
-    this.sessionId = null;
     this.msgId = 0;
     this._initialized = false;
+    this._protocolGeneration = null; // "legacy" or "modern"
     // ── Backend-liveness state (decoupled from client liveness) ──────
     // The client's view of this server must NOT depend on backend
     // reachability: a stdio MCP server that fails `initialize` is dropped
     // by the client for the whole session (the VPN-down-at-startup bug).
-    // So we answer `initialize` locally and manage the backend session
+    // So we answer `initialize` locally and manage backend reachability
     // out of band via a background monitor.
-    this._clientInitParams = null; // client initialize params, replayed to backend
-    this._backendReady = false; // backend MCP session established
+    this._clientInitParams = null; // legacy client params, projected into modern metadata
+    this._clientMeta = null; // modern request metadata, projected per backend request
+    this._backendReady = false; // backend modern contract reachable
     this._connecting = null; // in-flight backend-connect promise (single-flight lock)
     this._cachedTools = null; // last successful backend tools/list result (raw)
     this._servedDegraded = false; // client was handed a fallback (file-tools-only) list
@@ -458,6 +490,77 @@ export class AKBProxy {
     this._closed = true;
   }
 
+  _unsupportedVersion(id, requested, supported = [MCP_PROTOCOL_VERSION]) {
+    return MCPProtocolError.invalid(
+      id,
+      "Unsupported protocol version",
+      UNSUPPORTED_PROTOCOL_VERSION,
+      { supported, requested: String(requested || "") },
+    );
+  }
+
+  _validateModernRequest(msg) {
+    const { id, method, params } = msg || {};
+    if (method === "initialize") {
+      return this._unsupportedVersion(id, params?.protocolVersion || "", [
+        MCP_LEGACY_PROTOCOL_VERSION,
+      ]);
+    }
+    const meta = params && typeof params === "object" ? params._meta : null;
+    if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+      return MCPProtocolError.invalid(
+        id,
+        "params._meta must be an object carrying the required protocol version and client capabilities",
+        INVALID_PARAMS,
+      );
+    }
+    if (meta[PROTOCOL_VERSION_META_KEY] !== MCP_PROTOCOL_VERSION) {
+      return this._unsupportedVersion(id, meta[PROTOCOL_VERSION_META_KEY]);
+    }
+    if (!(CLIENT_CAPABILITIES_META_KEY in meta)) {
+      return MCPProtocolError.invalid(
+        id,
+        `params._meta is missing the required envelope key ${CLIENT_CAPABILITIES_META_KEY}`,
+        INVALID_PARAMS,
+      );
+    }
+    if (
+      !meta[CLIENT_CAPABILITIES_META_KEY] ||
+      typeof meta[CLIENT_CAPABILITIES_META_KEY] !== "object" ||
+      Array.isArray(meta[CLIENT_CAPABILITIES_META_KEY])
+    ) {
+      return MCPProtocolError.invalid(
+        id,
+        `${CLIENT_CAPABILITIES_META_KEY} must be an object`,
+        INVALID_PARAMS,
+      );
+    }
+    if (method === "notifications/initialized") {
+      return MCPProtocolError.invalid(
+        id,
+        "notifications/initialized is only valid for the legacy initialize/session protocol",
+      );
+    }
+    return null;
+  }
+
+  _validateLegacyRequest(msg) {
+    const { id, method, params } = msg || {};
+    if (method === "server/discover") {
+      return this._unsupportedVersion(id, MCP_PROTOCOL_VERSION, [
+        MCP_LEGACY_PROTOCOL_VERSION,
+      ]);
+    }
+    const meta = params && typeof params === "object" ? params._meta : null;
+    if (meta && typeof meta === "object" && meta[PROTOCOL_VERSION_META_KEY]) {
+      return MCPProtocolError.invalid(
+        id,
+        "modern request metadata cannot be mixed with the legacy initialize/session protocol",
+      );
+    }
+    return null;
+  }
+
   async _handle(msg) {
     // Normalize every inbound string to NFC before anything else sees it.
     // macOS-sourced paths enter here as NFD; letting them reach the
@@ -466,14 +569,44 @@ export class AKBProxy {
       msg = { ...msg, params: nfcDeep(msg.params) };
     }
 
-    const { method, id, params } = msg;
+    if (!msg || typeof msg !== "object" || Array.isArray(msg) || typeof msg.method !== "string") {
+      return MCPProtocolError.invalid(msg?.id, "JSON-RPC request must name a protocol method");
+    }
 
-    if (method === "initialize") {
-      return await this._initialize(id, params);
+    const { method, id, params } = msg;
+    if (this._protocolGeneration === null) {
+      if (method === "initialize") {
+        return await this._initialize(id, params);
+      }
+      if (method === "server/discover") {
+        const protocolError = this._validateModernRequest(msg);
+        if (protocolError) return protocolError;
+        this._protocolGeneration = "modern";
+        this._clientMeta = { ...params._meta };
+      } else {
+        return MCPProtocolError.invalid(
+          id,
+          "The first request must be legacy initialize or modern server/discover",
+        );
+      }
+    } else if (this._protocolGeneration === "legacy") {
+      if (method === "initialize") {
+        return MCPProtocolError.invalid(id, "The protocol generation is already fixed to legacy");
+      }
+      const protocolError = this._validateLegacyRequest(msg);
+      if (protocolError) return protocolError;
+    } else {
+      const protocolError = this._validateModernRequest(msg);
+      if (protocolError) return protocolError;
+      this._clientMeta = { ...params._meta };
     }
 
     if (id === undefined || id === null) {
       return null;
+    }
+
+    if (method === "server/discover") {
+      return await this._discover(id, msg);
     }
 
     if (method === "tools/list") {
@@ -567,34 +700,28 @@ export class AKBProxy {
   }
 
   async _initialize(id, params) {
-    // Answer the handshake LOCALLY — never round-trip to the backend here.
-    // This is the crux of the reconnect fix: the client considers this MCP
-    // server initialized (and keeps it registered for the whole session)
-    // regardless of whether the backend is reachable right now. If the VPN
-    // is down at startup, the server still registers; tools recover once
-    // connectivity returns (see the monitor + tools/list_changed path).
+    if (this._protocolGeneration !== null) {
+      return MCPProtocolError.invalid(id, "The protocol generation is already fixed");
+    }
     const requestedProtocol =
       params && typeof params.protocolVersion === "string" && params.protocolVersion;
-    if (requestedProtocol && requestedProtocol !== MCP_PROTOCOL_VERSION) {
-      // Never claim success by echoing a protocol revision this proxy does
-      // not implement.  A client can retry with the explicit supported
-      // revision; there is no fallback or downgrade path here.
-      return {
-        jsonrpc: "2.0",
+    if (requestedProtocol && requestedProtocol !== MCP_LEGACY_PROTOCOL_VERSION) {
+      return this._unsupportedVersion(
         id,
-        error: {
-          code: -32602,
-          message: "Unsupported protocol version",
-          data: { supported: [MCP_PROTOCOL_VERSION] },
-        },
-      };
+        requestedProtocol,
+        [MCP_LEGACY_PROTOCOL_VERSION],
+      );
     }
+    // Answer the legacy handshake LOCALLY — never round-trip to the backend.
+    // The client remains registered while the modern backend adapter reconnects
+    // independently, including when the backend is down at startup.
+    this._protocolGeneration = "legacy";
+    const protocolVersion = requestedProtocol || MCP_LEGACY_PROTOCOL_VERSION;
     this._clientInitParams = params || null;
     this._initialized = true;
-    // Kick off the backend session + tool prefetch in the background.
+    // Kick off backend reachability + tool prefetch in the background.
     this._startBackendMonitor();
 
-    const protocolVersion = requestedProtocol || MCP_PROTOCOL_VERSION;
     return {
       jsonrpc: "2.0",
       id,
@@ -607,6 +734,86 @@ export class AKBProxy {
         instructions: PROXY_INSTRUCTIONS,
       },
     };
+  }
+
+  async _discover(id, msg) {
+    let response;
+    try {
+      response = await this._forward(msg);
+    } catch (err) {
+      if (!this._isConnError(err)) throw err;
+      response = this._localDiscover(id);
+    }
+    if (response.error) return response;
+    return {
+      ...response,
+      result: this._decorateDiscover(response.result),
+    };
+  }
+
+  _decorateDiscover(result = {}) {
+    return {
+      ...result,
+      supportedVersions: [MCP_PROTOCOL_VERSION],
+      instructions: PROXY_INSTRUCTIONS,
+      resultType: "complete",
+      _meta: {
+        ...(result._meta || {}),
+        [SERVER_INFO_META_KEY]: { name: "akb-mcp", version: PROXY_VERSION },
+      },
+    };
+  }
+
+  _localDiscover(id) {
+    return {
+      jsonrpc: "2.0",
+      id,
+      result: {
+        capabilities: { tools: { listChanged: true } },
+        ttlMs: 300000,
+        cacheScope: "public",
+      },
+    };
+  }
+
+  _backendMeta(meta = null) {
+    const legacyCapabilities = this._clientInitParams?.capabilities;
+    const legacyInfo = this._clientInitParams?.clientInfo;
+    const source = this._clientMeta || {
+      [PROTOCOL_VERSION_META_KEY]: MCP_PROTOCOL_VERSION,
+      [CLIENT_CAPABILITIES_META_KEY]: legacyCapabilities || {},
+      [CLIENT_INFO_META_KEY]: legacyInfo || {
+        name: "akb-mcp-client",
+        version: PROXY_VERSION,
+      },
+    };
+    const provided = meta && typeof meta === "object" ? meta : {};
+    const sourceCapabilities = source[CLIENT_CAPABILITIES_META_KEY];
+    const providedCapabilities = provided[CLIENT_CAPABILITIES_META_KEY];
+    return {
+      ...source,
+      ...provided,
+      [PROTOCOL_VERSION_META_KEY]: MCP_PROTOCOL_VERSION,
+      [CLIENT_CAPABILITIES_META_KEY]: {
+        ...(sourceCapabilities && typeof sourceCapabilities === "object"
+          ? sourceCapabilities
+          : {}),
+        ...(providedCapabilities && typeof providedCapabilities === "object"
+          ? providedCapabilities
+          : {}),
+        experimental: {
+          ...(sourceCapabilities?.experimental || {}),
+          ...(providedCapabilities?.experimental || {}),
+          [VAULT_SKILL_PREFLIGHT_CAPABILITY]: { version: 2 },
+        },
+      },
+    };
+  }
+
+  _legacyToolsResult(result) {
+    const legacy = { tools: result.tools || [] };
+    if (result.nextCursor !== undefined) legacy.nextCursor = result.nextCursor;
+    return legacy;
   }
 
   // Decorate a raw backend tools/list result with the proxy-local file
@@ -633,7 +840,16 @@ export class AKBProxy {
       return { ...t };
     });
     tools.push(...this._fileToolsForClient());
-    return { ...resp, tools };
+    tools.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+    return {
+      ...resp,
+      resultType: "complete",
+      tools,
+      _meta: {
+        ...(resp._meta || {}),
+        [SERVER_INFO_META_KEY]: { name: "akb-mcp", version: PROXY_VERSION },
+      },
+    };
   }
 
   _fileToolsForClient() {
@@ -660,11 +876,18 @@ export class AKBProxy {
     // the whole tools/list on backend unreachability.
     let resp = this._cachedTools;
     if (!resp) {
-      const ok = await this._ensureBackend();
+      let ok;
+      try {
+        ok = await this._ensureBackend();
+      } catch (err) {
+        if (err?.rpcError) return { jsonrpc: "2.0", id, error: err.rpcError };
+        throw err;
+      }
       if (ok) {
         try {
           resp = await this._syncTools();
-        } catch {
+        } catch (err) {
+          if (err?.rpcError) return { jsonrpc: "2.0", id, error: err.rpcError };
           resp = null;
         }
       }
@@ -676,10 +899,22 @@ export class AKBProxy {
       process.stderr.write(
         "[akb-mcp] backend unreachable — serving file tools only; will re-list on recovery\n",
       );
-      return { jsonrpc: "2.0", id, result: { tools: this._fileToolsForClient() } };
+      const degraded = this._decorateTools({ tools: [] });
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: this._protocolGeneration === "legacy" ? this._legacyToolsResult(degraded) : degraded,
+      };
     }
 
-    return { jsonrpc: "2.0", id, result: this._decorateTools(resp) };
+    const decorated = this._decorateTools(resp);
+    return {
+      jsonrpc: "2.0",
+      id,
+      result: this._protocolGeneration === "legacy"
+        ? this._legacyToolsResult(decorated)
+        : decorated,
+    };
   }
 
   // ── File-to-content resolution ─────────────────────────
@@ -795,12 +1030,12 @@ export class AKBProxy {
   }
 
   /**
-   * Touch the backend MCP session before a proxy-local file operation.
+   * Touch the backend MCP endpoint before a proxy-local file operation.
    *
    * Local tools bypass the backend `call_tool` dispatcher, so without this
-   * bridge their first write could commit before the session received the
+   * bridge their first write could commit before the backend received the
    * vault guide. `akb_help` is a reader-authorized, mirror-aware backend call
-   * and therefore reuses the same version/session gate as every native tool.
+   * and therefore reuses the same version/protocol gate as every native tool.
    * A write-only credential receives no payload and remains usable.
    */
   async _fileToolSkillPreflight(vault, acknowledgement = null) {
@@ -1296,51 +1531,50 @@ export class AKBProxy {
     });
   }
 
-  // ── Backend session + reconnect monitor ───────────────────
+  // ── Backend reachability + reconnect monitor ──────────────
 
-  // A connection/session failure that a background reconnect can recover
-  // from — as opposed to a genuine application error we must surface.
-  _isConnError(message) {
-    return /session|404|ECONNREFUSED|ECONNRESET|socket hang up|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|ENETDOWN|ENOTFOUND|EPIPE|timeout|unreachable/i.test(
-      message || "",
+  // A transport failure that a background reconnect can recover from — as
+  // opposed to a protocol or application error that must be surfaced.
+  _isConnError(error) {
+    if (error?.rpcError) return false;
+    if ([502, 503, 504].includes(error?.statusCode)) return true;
+    return /ECONNREFUSED|ECONNRESET|socket hang up|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|ENETDOWN|ENOTFOUND|EPIPE|timeout|unreachable/i.test(
+      error?.message || String(error || ""),
     );
   }
 
-  // Establish the backend MCP session (the `initialize` handshake that
-  // yields an mcp-session-id) if not already up. Single-flight: concurrent
-  // callers share one in-flight attempt. Returns true on success, false on
-  // failure — never throws — so callers can degrade gracefully.
+  // Probe the backend's modern stateless contract if not already reachable.
+  // Single-flight: concurrent callers share one in-flight attempt. Protocol
+  // errors propagate so callers never confuse an incompatible backend with
+  // a recoverable transport outage.
   async _ensureBackend() {
     if (this._backendReady) return true;
     if (this._connecting) return this._connecting;
     this._connecting = (async () => {
       try {
-        const sourceParams = this._clientInitParams || {
-          protocolVersion: MCP_PROTOCOL_VERSION,
-          capabilities: {},
-          clientInfo: { name: "akb-mcp-client", version: PROXY_VERSION },
-        };
-        // Strict vault-guide preflight changes a successful write into a
-        // retry envelope. Advertise support on behalf of this proxy version;
-        // raw/older MCP clients that do not opt in retain additive injection.
-        // Merge rather than replace client capabilities so roots/sampling and
-        // unrelated experimental features survive the bridge unchanged.
-        const sourceCapabilities = sourceParams.capabilities || {};
-        const initParams = {
-          ...sourceParams,
-          capabilities: {
-            ...sourceCapabilities,
-            experimental: {
-              ...(sourceCapabilities.experimental || {}),
-              [VAULT_SKILL_PREFLIGHT_CAPABILITY]: { version: 2 },
+        const discovered = await this._rpc(
+          "server/discover",
+          {},
+          { timeoutMs: this._probeTimeoutMs() },
+        );
+        if (
+          !Array.isArray(discovered.supportedVersions) ||
+          !discovered.supportedVersions.includes(MCP_PROTOCOL_VERSION)
+        ) {
+          throw new MCPProtocolError({
+            code: UNSUPPORTED_PROTOCOL_VERSION,
+            message: "Backend does not advertise the required protocol revision",
+            data: {
+              supported: discovered.supportedVersions || [],
+              requested: MCP_PROTOCOL_VERSION,
             },
-          },
-        };
-        await this._rpc("initialize", initParams, { timeoutMs: this._probeTimeoutMs() });
+          });
+        }
         this._backendReady = true;
         return true;
-      } catch {
+      } catch (err) {
         this._backendReady = false;
+        if (err?.rpcError) throw err;
         return false;
       } finally {
         this._connecting = null;
@@ -1350,19 +1584,19 @@ export class AKBProxy {
   }
 
   // Fetch and cache the backend tool list. Caller is responsible for having
-  // an established session. Uses the short probe timeout.
+  // a reachable backend. Uses the short probe timeout.
   async _syncTools() {
     const resp = await this._rpc("tools/list", {}, { timeoutMs: this._probeTimeoutMs() });
     this._cachedTools = resp;
     return resp;
   }
 
-  // Background loop that keeps trying to (re)establish the backend session
-  // with exponential backoff — effectively forever while the client is
+  // Background loop that keeps trying to reach the backend with exponential
+  // backoff — effectively forever while the client is
   // connected. On (re)connect it refreshes the tool cache and, if the
   // client was previously handed a degraded list, pushes a
   // tools/list_changed notification so the full toolset reappears WITHOUT a
-  // session restart. Idempotent: at most one loop runs at a time.
+  // client session restart. Idempotent: at most one loop runs at a time.
   _startBackendMonitor() {
     if (this._monitorRunning || this._closed) return;
     this._monitorRunning = true;
@@ -1382,8 +1616,8 @@ export class AKBProxy {
             }
             break; // connected + synced; idle until a forward detects a drop
           } catch {
-            // initialize succeeded but tools/list failed — treat as not
-            // ready and keep retrying.
+            // discover succeeded but tools/list failed — treat the backend as
+            // not ready and keep retrying.
             this._backendReady = false;
           }
         }
@@ -1412,12 +1646,14 @@ export class AKBProxy {
         const resp = await this._rpc(msg.method, msg.params || {});
         return { jsonrpc: "2.0", id: msg.id, result: resp };
       } catch (err) {
-        if (this._isConnError(err.message)) {
-          // Drop the dead session and let the background monitor restore
+        if (err?.rpcError) {
+          return { jsonrpc: "2.0", id: msg.id, error: err.rpcError };
+        }
+        if (this._isConnError(err)) {
+          // Mark the backend unavailable and let the background monitor restore
           // it. The proxy process and the client-visible server stay
           // alive, so calls recover once connectivity returns.
           this._backendReady = false;
-          this.sessionId = null;
           this._startBackendMonitor();
 
           if (attempt < maxRetries) {
@@ -1434,20 +1670,26 @@ export class AKBProxy {
 
   async _rpc(method, params, rpcOpts = {}) {
     this.msgId++;
+    const requestParams = {
+      ...(params || {}),
+      _meta: this._backendMeta(params?._meta),
+    };
     const body = JSON.stringify({
       jsonrpc: "2.0",
       id: this.msgId,
       method,
-      params,
+      params: requestParams,
     });
 
     const headers = {
       Authorization: `Bearer ${this.pat}`,
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
+      "mcp-protocol-version": MCP_PROTOCOL_VERSION,
+      "mcp-method": method,
     };
-    if (this.sessionId) {
-      headers["mcp-session-id"] = this.sessionId;
+    if (method === "tools/call" && typeof requestParams.name === "string") {
+      headers["mcp-name"] = encodeRoutingHeader(requestParams.name);
     }
 
     const resp = await this._http(
@@ -1458,10 +1700,6 @@ export class AKBProxy {
       { timeoutMs: rpcOpts.timeoutMs },
     );
 
-    if (resp.headers["mcp-session-id"]) {
-      this.sessionId = resp.headers["mcp-session-id"];
-    }
-
     let parsed;
     try {
       parsed = JSON.parse(resp.text);
@@ -1469,11 +1707,8 @@ export class AKBProxy {
       throw new Error(`Invalid JSON response: ${resp.text.slice(0, 200)}`);
     }
 
-    if (parsed._sessionId) {
-      this.sessionId = parsed._sessionId;
-    }
     if (parsed.error) {
-      throw new Error(`MCP error ${parsed.error.code}: ${parsed.error.message}`);
+      throw new MCPProtocolError(parsed.error);
     }
     return parsed.result || {};
   }

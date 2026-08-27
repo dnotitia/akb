@@ -28,6 +28,14 @@ and tables in both resource viewers and the Vault explorer. Table deletion
 requires exact-name confirmation and identifies affected rows, while every
 successful deletion refreshes the explorer and returns the user to the Vault.
 
+## 0.15.0 — 2026-08-27  *(feat — dual-generation MCP transport)*
+
+The backend now serves the `2026-07-28` stateless MCP envelope alongside the
+allowlisted legacy initialize/session revisions through the exact-pinned MCP
+SDK `2.1.0` and one shared tool/auth core. Legacy sessions are bound to their
+authenticated account principal; generation, revision, and routing mismatches
+fail closed.
+
 ### Fixed repeated production-scale BM25 rebuilds and bounded rebuild memory
 
 The BM25 refresher no longer compares all non-null chunks with the smaller set

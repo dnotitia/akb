@@ -51,7 +51,13 @@ from oidc_fixture import OIDCFixture
 
 LOGGER = logging.getLogger("akb.e2e_runtime")
 SCHEMA_VERSION = 2
-PROTOCOL_REVISION = "2025-06-18"
+PROTOCOL_REVISION = "2026-07-28"
+LEGACY_PROTOCOL_REVISIONS = (
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+    "2025-11-25",
+)
 Scenario = Literal[
     "empty",
     "app-installation-lifecycle",
@@ -379,8 +385,11 @@ class E2ERuntime:
         self._candidate_revision: str | None = None
         self._proxy_version: str | None = None
         self._stdio_initialize_observed = False
+        self._stdio_discover_observed = False
         self._stdio_tools_list_observed = False
+        self._stdio_modern_tools_list_observed = False
         self._stdio_read_call_observed = False
+        self._stdio_modern_read_call_observed = False
         self._stdio_next_id = 2
         self.oidc_fixture: OIDCFixture | None = (
             OIDCFixture(
@@ -459,6 +468,10 @@ class E2ERuntime:
             "source_revision": self._source_revision(),
             "backend_artifact_version": self._backend_version(),
             "protocol_revision": PROTOCOL_REVISION,
+            "protocol_matrix": {
+                "modern": PROTOCOL_REVISION,
+                "legacy": list(LEGACY_PROTOCOL_REVISIONS),
+            },
             "transport": ["http", "stdio"] if self.profile.needs_stdio else ["http"],
             "selected_capabilities": list(self.selected_capabilities),
             "tool_cases": {
@@ -509,8 +522,11 @@ class E2ERuntime:
                     "AKB_PAT": self.config.credentials.pat_env,
                 },
                 "initialize_observed": self._stdio_initialize_observed,
+                "discover_observed": self._stdio_discover_observed,
                 "tools_list_observed": getattr(self, "_stdio_tools_list_observed", False),
+                "modern_tools_list_observed": getattr(self, "_stdio_modern_tools_list_observed", False),
                 "read_call_observed": getattr(self, "_stdio_read_call_observed", False),
+                "modern_read_call_observed": getattr(self, "_stdio_modern_read_call_observed", False),
             }
         if self.oidc_fixture is not None:
             oidc_evidence = self.oidc_fixture.discovery()
@@ -1461,9 +1477,11 @@ class E2ERuntime:
         self._proxy_version = self._artifact_version(self.config.proxy_package_dir)
         return executable
 
-    async def _start_stdio_proxy(self) -> None:
+    async def _start_stdio_proxy(self, generation: Literal["legacy", "modern"] = "legacy") -> None:
         if not self._pat_value:
             raise BlockedRuntimeConfig("stdio capability requires a runtime PAT")
+        if generation not in {"legacy", "modern"}:
+            raise BlockedRuntimeConfig("unsupported stdio protocol generation")
         executable = await self._install_stdio_proxy()
         node = shutil.which("node")
         if node is None:
@@ -1479,17 +1497,34 @@ class E2ERuntime:
         )
         if managed.stdin is None or managed.stdout is None:
             raise BlockedRuntimeConfig("stdio proxy did not expose stdin/stdout pipes")
-        initialize = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": PROTOCOL_REVISION,
-                "capabilities": {},
-                "clientInfo": {"name": "akb-e2e-runtime", "version": "1"},
-            },
-        }
-        managed.stdin.write((json.dumps(initialize, separators=(",", ":")) + "\n").encode())
+        if generation == "legacy":
+            first_request = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "akb-e2e-runtime", "version": "1"},
+                },
+            }
+        else:
+            first_request = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "server/discover",
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": PROTOCOL_REVISION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                        "io.modelcontextprotocol/clientInfo": {
+                            "name": "akb-e2e-runtime",
+                            "version": "1",
+                        },
+                    }
+                },
+            }
+        managed.stdin.write((json.dumps(first_request, separators=(",", ":")) + "\n").encode())
         await managed.stdin.drain()
         try:
             for _ in range(8):
@@ -1503,19 +1538,22 @@ class E2ERuntime:
                     continue
                 if "error" in response:
                     raise ValueError
-                self._stdio_initialize_observed = True
-                initialized = {
-                    "jsonrpc": "2.0",
-                    "method": "notifications/initialized",
-                    "params": {},
-                }
-                managed.stdin.write((json.dumps(initialized, separators=(",", ":")) + "\n").encode())
-                await managed.stdin.drain()
+                if generation == "legacy":
+                    self._stdio_initialize_observed = True
+                    initialized = {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/initialized",
+                        "params": {},
+                    }
+                    managed.stdin.write((json.dumps(initialized, separators=(",", ":")) + "\n").encode())
+                    await managed.stdin.drain()
+                else:
+                    self._stdio_discover_observed = True
                 return
         except (asyncio.TimeoutError, ValueError, json.JSONDecodeError):
             pass
         await self._stop_named_process("stdio")
-        raise BlockedRuntimeConfig("stdio proxy initialize did not cross the process boundary")
+        raise BlockedRuntimeConfig(f"stdio proxy {generation} handshake did not cross the process boundary")
 
     async def _stdio_response(self, expected_id: int) -> dict[str, object]:
         managed = self._children.get("stdio")
@@ -1588,6 +1626,49 @@ class E2ERuntime:
         if not isinstance(read_result, dict) or "error" in read_response:
             raise ProductAssertionFailure("stdio read tool call was not accepted")
         self._stdio_read_call_observed = True
+
+        # A process cannot switch protocol generations after its first
+        # request. Start a fresh installed proxy for the modern arm so the
+        # two observations remain independent and source-comparable.
+        await self._stop_named_process("stdio")
+        self._stdio_next_id = 2
+        await self._start_stdio_proxy("modern")
+        modern_meta = {
+            "io.modelcontextprotocol/protocolVersion": PROTOCOL_REVISION,
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": {
+                "name": "akb-e2e-runtime",
+                "version": "1",
+            },
+        }
+        modern_response = await self._stdio_request(
+            "tools/list",
+            {"_meta": modern_meta},
+        )
+        modern_result = modern_response.get("result")
+        if not isinstance(modern_result, dict) or not isinstance(modern_result.get("tools"), list):
+            raise ProductAssertionFailure("modern stdio tools/list returned an invalid result")
+        modern_names = {
+            item.get("name")
+            for item in modern_result["tools"]
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+        if modern_names != names:
+            raise ProductAssertionFailure("legacy and modern stdio catalogs differ")
+        self._stdio_modern_tools_list_observed = True
+
+        modern_read_response = await self._stdio_request(
+            "tools/call",
+            {
+                "name": "akb_list_vaults",
+                "arguments": {},
+                "_meta": modern_meta,
+            },
+        )
+        modern_read_result = modern_read_response.get("result")
+        if not isinstance(modern_read_result, dict) or "error" in modern_read_response:
+            raise ProductAssertionFailure("modern stdio read tool call was not accepted")
+        self._stdio_modern_read_call_observed = True
 
     @staticmethod
     def _ready_response(status: int, body: bytes) -> bool:
@@ -3041,8 +3122,11 @@ class E2ERuntime:
                 self._fixture_controls.clear()
                 await self._stop_named_process("stdio")
                 self._stdio_initialize_observed = False
+                self._stdio_discover_observed = False
                 self._stdio_tools_list_observed = False
+                self._stdio_modern_tools_list_observed = False
                 self._stdio_read_call_observed = False
+                self._stdio_modern_read_call_observed = False
                 self._stdio_next_id = 2
                 await self._stop_named_process("backend")
                 await self._stop_named_process("embed")

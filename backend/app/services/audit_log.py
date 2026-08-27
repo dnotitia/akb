@@ -355,7 +355,12 @@ def _grep_replace_meta(args: dict, result) -> dict | None:
     }
 
 
-def _record_grep_replace_receipts(args: dict, user, result) -> None:
+def _record_grep_replace_receipts(
+    args: dict,
+    user,
+    result,
+    protocol_metadata: dict[str, str] | None = None,
+) -> None:
     """Emit one compact recovery receipt per committed grep replacement.
 
     The summary tool record cannot identify every document without becoming one
@@ -375,6 +380,11 @@ def _record_grep_replace_receipts(args: dict, user, result) -> None:
         target = f"uri={replacement['uri']}"
         if len(target) > _TARGET_MAX:
             target = target[:_TARGET_MAX] + "…"
+        meta: dict[str, object] = dict(protocol_metadata or {})
+        meta.update({
+            "commit": replacement.get("commit"),
+            "previous_commit": replacement.get("previous_commit"),
+        })
         record(
             action="akb_grep.replace",
             actor=getattr(user, "username", None),
@@ -382,14 +392,19 @@ def _record_grep_replace_receipts(args: dict, user, result) -> None:
             vault=(args.get("vault") if isinstance(args, dict) else None),
             target=target,
             outcome="ok",
-            meta={
-                "commit": replacement.get("commit"),
-                "previous_commit": replacement.get("previous_commit"),
-            },
+            meta=meta,
         )
 
 
-def record_tool(name: str, args: dict, user, result, *, is_write: bool = False) -> None:
+def record_tool(
+    name: str,
+    args: dict,
+    user,
+    result,
+    *,
+    is_write: bool = False,
+    protocol_metadata: dict[str, str] | None = None,
+) -> None:
     """Audit one MCP tool call from the dispatch chokepoint. ``user`` is the
     resolved _MCPUser; ``result`` is the handler's return envelope (or the
     final error envelope) — outcome is derived from it.
@@ -403,7 +418,9 @@ def record_tool(name: str, args: dict, user, result, *, is_write: bool = False) 
     compliance SIEM. A canonical `resource_uri` can't be formed reliably
     from raw dispatch args (e.g. `akb_search` has no resource), so we keep
     an honest, lossy `target` rather than fake a URI. The divergence is
-    intentional; do not try to unify the two."""
+    intentional; do not try to unify the two. ``protocol_metadata`` carries
+    only the generation, exact revision, and authentication method; client
+    metadata and session identifiers are intentionally excluded."""
     if not settings.audit.enabled:
         return
     # Skip reads only when the operator opted out of read logging; unknown
@@ -417,7 +434,11 @@ def record_tool(name: str, args: dict, user, result, *, is_write: bool = False) 
         outcome = "error"
         code = result.get("code")
     if name == "akb_grep" and is_write:
-        _record_grep_replace_receipts(args, user, result)
+        _record_grep_replace_receipts(args, user, result, protocol_metadata)
+    meta = dict(protocol_metadata or {})
+    grep_meta = _grep_replace_meta(args, result) if name == "akb_grep" and is_write else None
+    if grep_meta:
+        meta.update(grep_meta)
     record(
         action=name,
         actor=getattr(user, "username", None),
@@ -426,7 +447,7 @@ def record_tool(name: str, args: dict, user, result, *, is_write: bool = False) 
         target=(_target_of(args) if isinstance(args, dict) else None),
         outcome=outcome,
         code=code,
-        meta=(_grep_replace_meta(args, result) if name == "akb_grep" and is_write else None),
+        meta=meta or None,
     )
 
 

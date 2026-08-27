@@ -112,9 +112,10 @@ For a selected transport profile the supervisor mints one candidate-bound PAT
 in memory, passes it to the real proxy only as the `AKB_PAT` child environment
 value, and exposes only the configured PAT environment-name in descriptor and
 discovery. The private discovery `runtime` object records the exact source
-revision, backend/proxy artifact versions, protocol revision, transport,
-selected capabilities, tool-case coordinates, fixture reset, and whether the
-stdio initialize/tools-list/read probes crossed the process boundary. The
+revision, backend/proxy artifact versions, the modern and allowlisted legacy
+protocol revisions, transport, selected capabilities, tool-case coordinates,
+fixture reset, and whether the separate legacy and modern stdio
+initialize/discover/tools-list/read probes crossed the process boundary. The
 OIDC discovery object exposes issuer/JWKS/token coordinates and variant names,
 never an access token or signing key.
 

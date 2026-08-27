@@ -298,15 +298,15 @@ async def test_v2_tool_list_advertises_ack_only_on_possible_writes(monkeypatch):
     by_name = {tool.name: tool for tool in tools}
 
     assert server_mod.VAULT_SKILL_ACK_ARGUMENT in (
-        by_name["akb_update"].inputSchema["properties"]
+        by_name["akb_update"].input_schema["properties"]
     )
     # akb_grep is normally read-only but becomes a writer when `replace` is
     # present, so its schema must carry the acknowledgement too.
     assert server_mod.VAULT_SKILL_ACK_ARGUMENT in (
-        by_name["akb_grep"].inputSchema["properties"]
+        by_name["akb_grep"].input_schema["properties"]
     )
     assert server_mod.VAULT_SKILL_ACK_ARGUMENT not in (
-        by_name["akb_get"].inputSchema["properties"]
+        by_name["akb_get"].input_schema["properties"]
     )
 
 

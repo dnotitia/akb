@@ -29,7 +29,7 @@ from mcp_server.tools import TOOLS
 def _schema(name: str) -> dict:
     for tool in TOOLS:
         if tool.name == name:
-            return tool.inputSchema
+            return tool.input_schema
     raise AssertionError(f"{name} is not advertised at all")
 
 

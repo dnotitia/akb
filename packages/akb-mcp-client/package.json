@@ -1,6 +1,6 @@
 {
   "name": "akb-mcp",
-  "version": "2.2.2",
+  "version": "2.3.0",
   "mcpName": "io.github.dnotitia/akb",
   "description": "AKB MCP stdio client — connect any AI agent to AKB knowledge base. Zero dependencies, auto-reconnect.",
   "bin": {

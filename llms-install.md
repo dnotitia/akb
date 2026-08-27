@@ -8,6 +8,11 @@ MCP client.
 agent to an **AKB backend**, which speaks MCP over Streamable HTTP. So you
 need two values:
 
+The current proxy supports both the legacy `2025-06-18` initialize/session
+stdio contract and the modern `2026-07-28` stateless discovery/request
+contract. It selects the generation from the first client request and rejects
+mixed or unsupported revisions instead of silently downgrading.
+
 - **`AKB_MCP_URL`** — the AKB backend's MCP endpoint, e.g.
   `https://akb.example.com/mcp/`
 - **`AKB_PAT`** — an AKB Personal Access Token (looks like `akb_...`)

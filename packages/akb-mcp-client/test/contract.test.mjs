@@ -122,6 +122,130 @@ it("envelope adds kind without breaking legacy fields", () => {
   }
 });
 
+const modernMeta = {
+  "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+  "io.modelcontextprotocol/clientCapabilities": {},
+  "io.modelcontextprotocol/clientInfo": { name: "modern-test", version: "1" },
+};
+
+function modernRequest(id, method, params = {}) {
+  return {
+    jsonrpc: "2.0",
+    id,
+    method,
+    params: { ...params, _meta: modernMeta },
+  };
+}
+
+itAsync("modern discover fixes the proxy generation and advertises stateless support", async () => {
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  proxy._forward = async (msg) => ({
+    jsonrpc: "2.0",
+    id: msg.id,
+    result: { supportedVersions: ["2026-07-28"], capabilities: { tools: {} } },
+  });
+
+  const response = await proxy._handle(modernRequest(1, "server/discover"));
+
+  assert.equal(proxy._protocolGeneration, "modern");
+  assert.equal(response.result.supportedVersions[0], "2026-07-28");
+  assert.equal(response.result._meta["io.modelcontextprotocol/serverInfo"].name, "akb-mcp");
+});
+
+itAsync("modern backend requests carry exact routing headers and request metadata", async () => {
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  proxy._protocolGeneration = "modern";
+  proxy._clientMeta = modernMeta;
+  let request;
+  proxy._http = async (method, path, body, headers) => {
+    request = { method, path, body: JSON.parse(body.toString()), headers };
+    return { text: JSON.stringify({ jsonrpc: "2.0", id: 1, result: { ok: true } }), headers: {} };
+  };
+
+  const result = await proxy._rpc("tools/call", { name: "akb_help", arguments: {} });
+
+  assert.deepEqual(result, { ok: true });
+  assert.equal(request.headers["mcp-protocol-version"], "2026-07-28");
+  assert.equal(request.headers["mcp-method"], "tools/call");
+  assert.equal(request.headers["mcp-name"], "akb_help");
+  assert.equal(request.body.params._meta["io.modelcontextprotocol/protocolVersion"], "2026-07-28");
+  assert.deepEqual(
+    request.body.params._meta["io.modelcontextprotocol/clientCapabilities"].experimental[
+      "io.dnotitia.akb/vault-skill-preflight"
+    ],
+    { version: 2 },
+  );
+});
+
+itAsync("legacy initialize remains local and rejects modern discovery mixing", async () => {
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  proxy._startBackendMonitor = () => {};
+
+  const initialized = await proxy._handle({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "legacy-test", version: "1" },
+    },
+  });
+  const mixed = await proxy._handle(modernRequest(2, "server/discover"));
+
+  assert.equal(initialized.result.protocolVersion, "2025-06-18");
+  assert.equal(initialized.result.serverInfo.version, "2.3.0");
+  assert.equal(mixed.error.code, -32022);
+});
+
+itAsync("modern clients cannot send initialize or initialized notifications", async () => {
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  const modern = modernRequest(1, "server/discover");
+  proxy._forward = async (msg) => ({
+    jsonrpc: "2.0",
+    id: msg.id,
+    result: { supportedVersions: ["2026-07-28"] },
+  });
+  await proxy._handle(modern);
+
+  const initialize = await proxy._handle({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "initialize",
+    params: { protocolVersion: "2025-06-18", capabilities: {} },
+  });
+  const initialized = await proxy._handle(modernRequest(3, "notifications/initialized"));
+
+  assert.equal(initialize.error.code, -32022);
+  assert.equal(initialized.error.code, -32600);
+});
+
+itAsync("legacy and modern tool catalogs share tools but keep modern cache metadata private", async () => {
+  const cached = {
+    tools: [{ name: "akb_help", inputSchema: { type: "object", properties: {} } }],
+    resultType: "complete",
+    ttlMs: 300000,
+    cacheScope: "public",
+  };
+  const modern = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  modern._protocolGeneration = "modern";
+  modern._cachedTools = cached;
+  modern._startBackendMonitor = () => {};
+  const legacy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  legacy._protocolGeneration = "legacy";
+  legacy._cachedTools = cached;
+  legacy._startBackendMonitor = () => {};
+
+  const modernList = await modern._toolsList(1, { _meta: modernMeta });
+  const legacyList = await legacy._toolsList(1, {});
+
+  assert.deepEqual(modernList.result.tools, legacyList.result.tools);
+  assert.equal(modernList.result.cacheScope, "public");
+  assert.equal(legacyList.result.cacheScope, undefined);
+  assert.equal(legacyList.result.resultType, undefined);
+  assert.equal(legacyList.result._meta, undefined);
+});
+
 itAsync("_putFile omits initiate hash, uploads bytes, and returns the canonical confirm shape", async () => {
   const directory = await mkdtemp(join(tmpdir(), "akb-mcp-contract-"));
   const filePath = join(directory, "proxy.bin");
@@ -472,6 +596,13 @@ itAsync("proxy-local exact retry acknowledges the guide before writing", async (
     name: "akb_put_image",
     arguments: { vault: "myvault", file_path: "/tmp/example.png" },
   };
+
+  proxy._startBackendMonitor = () => {};
+  await proxy._initialize(0, {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "legacy-test", version: "1" },
+  });
 
   const first = await proxy._handle({
     jsonrpc: "2.0", id: 1, method: "tools/call", params,

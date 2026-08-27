@@ -30,6 +30,22 @@ the AS — see [`docs/mcp-clients/web-connectors.md`](./docs/mcp-clients/web-con
 also accept Claude Code's `mcp add --transport http` + `mcp login` flow
 end-to-end, without a PAT.
 
+### MCP protocol compatibility
+
+The backend release `0.15.0` and `akb-mcp` proxy `2.3.0` expose one shared
+tool and authorization core through both generations:
+
+| Transport | Modern contract | Legacy contract |
+|-----------|-----------------|-----------------|
+| Direct HTTP `/mcp/` | `2026-07-28` stateless `server/discover` and per-request metadata | `2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25` initialize/session lifecycle |
+| `akb-mcp` stdio | `2026-07-28` discovery and request metadata | `2025-06-18` initialize/session surface |
+
+Deploy the backend with both generations before publishing or installing the
+proxy. Existing legacy clients continue using initialize/session, while modern
+clients use stateless requests. Unsupported revisions, generation mixing,
+principal mismatches, and conflicting routing metadata fail closed; the proxy
+does not silently downgrade a modern client.
+
 ## Plugins
 
 Beyond raw MCP access, AKB ships ready-made **agent plugins** for **Claude Code**
@@ -155,7 +171,7 @@ letting the indexing worker re-populate.
 | `akb_list_vaults` / `akb_create_vault` | Vault management |
 | `akb_put` / `akb_get` / `akb_update` / `akb_delete` | Document CRUD (Git commit + indexing) |
 | `akb_put_file` / `akb_get_file` / `akb_update_file` / `akb_delete_file` | File attachments — proxy-side (requires local filesystem) |
-| `akb_put_image` / `akb_discard_image` | Validated inline Markdown images — proxy-side in `akb-mcp` 2.2+ |
+| `akb_put_image` / `akb_discard_image` | Validated inline Markdown images — proxy-side in `akb-mcp` 2.3+ |
 | `akb_create_table` / `akb_alter_table` / `akb_drop_table` / `akb_sql` | Tabular content — per-doc tables + SQL |
 | `akb_browse` | Tree traversal (collection → docs) |
 | `akb_search` / `akb_grep` | Hybrid search (dense + BM25) / literal grep |
@@ -201,7 +217,7 @@ Markdown reference. Remove an image by deleting its Markdown expression; use
 `akb_discard_image` only for an upload that never reached a successful document
 commit. Run `akb_help(topic="images")` for retention and publication behavior.
 
-The image tools require both the matching backend release and `akb-mcp` 2.2 or
+The image tools require both the matching backend release and `akb-mcp` 2.3 or
 newer. For upgrades, deploy the backend first, then publish/install the proxy
 and restart existing MCP processes so they load the updated tool list.
 
@@ -543,6 +559,8 @@ provision with Object Lock and a write-only key for a true immutable trail);
 the local buffer is pruned only after a confirmed upload. Capture is
 best-effort and never raises into the serving path. See
 `config/app.yaml.example` for the full `audit:` block.
+MCP tool lines include the protocol generation, exact revision, and auth
+method; raw credentials, session IDs, and client metadata are not retained.
 
 ### Production deployment
 

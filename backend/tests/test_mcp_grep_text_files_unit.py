@@ -17,17 +17,17 @@ def test_akb_grep_schema_exposes_guarded_text_file_measurement_argument():
     from mcp_server.tools import TOOLS
 
     grep = next(tool for tool in TOOLS if tool.name == "akb_grep")
-    argument = grep.inputSchema["properties"]["measurement_include_text_files"]
+    argument = grep.input_schema["properties"]["measurement_include_text_files"]
 
-    assert grep.inputSchema["properties"]["pattern"]["minLength"] == 1
-    replacement_budget = grep.inputSchema["properties"]["max_replacements"]
+    assert grep.input_schema["properties"]["pattern"]["minLength"] == 1
+    replacement_budget = grep.input_schema["properties"]["max_replacements"]
     assert replacement_budget["default"] == 50
     assert replacement_budget["maximum"] == 1000
     assert (
         "treated literally"
-        in grep.inputSchema["properties"]["replace"]["description"].lower()
+        in grep.input_schema["properties"]["replace"]["description"].lower()
     )
-    assert "does not limit replacement writes" in grep.inputSchema["properties"]["limit"]["description"]
+    assert "does not limit replacement writes" in grep.input_schema["properties"]["limit"]["description"]
     assert argument["type"] == "boolean"
     assert argument["default"] is False
     assert "guarded native" in argument["description"].lower()

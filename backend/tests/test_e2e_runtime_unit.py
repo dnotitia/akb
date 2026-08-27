@@ -22,7 +22,9 @@ from e2e_runtime import (  # noqa: E402
     CapabilityProfile,
     CredentialNames,
     E2ERuntime,
+    LEGACY_PROTOCOL_REVISIONS,
     ManagedProcess,
+    PROTOCOL_REVISION,
     RuntimeConfig,
     _parse_args,
     prepare_private_runtime_root,
@@ -1054,6 +1056,12 @@ def test_transport_profile_exposes_real_proxy_boundary_without_secret(tmp_path):
     assert "akb_runtime_secret" not in serialized
     assert "AKB_E2E_PAT" in serialized
     assert descriptor["evidence"]["transport"] == ["http", "stdio"]
+    assert descriptor["evidence"]["protocol_matrix"] == {
+        "modern": PROTOCOL_REVISION,
+        "legacy": list(LEGACY_PROTOCOL_REVISIONS),
+    }
+    assert descriptor["evidence"]["stdio"]["initialize_observed"] is False
+    assert descriptor["evidence"]["stdio"]["discover_observed"] is False
 
 
 @pytest.mark.asyncio

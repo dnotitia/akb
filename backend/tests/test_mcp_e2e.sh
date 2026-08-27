@@ -39,6 +39,23 @@ PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
 
 [ -n "$PAT" ] && pass "PAT acquired" || { fail "PAT" "could not get PAT"; exit 1; }
 
+# ── 0b. Modern stateless HTTP surface ───────────────────────
+echo ""
+echo "▸ 0b. MCP 2026-07-28 stateless protocol"
+source "$(dirname "${BASH_SOURCE[0]}")/mcp_modern.sh"
+
+MODERN_DISCOVER=$(mcp_modern_discover "$PAT")
+MODERN_VERSIONS=$(echo "$MODERN_DISCOVER" | python3 -c 'import sys,json; print(",".join(json.load(sys.stdin)["result"]["supportedVersions"]))' 2>/dev/null)
+[ "$MODERN_VERSIONS" = "2026-07-28" ] && pass "modern server/discover: $MODERN_VERSIONS" || fail "modern discover" "expected 2026-07-28, got $MODERN_VERSIONS"
+
+MODERN_LIST=$(mcp_modern_list "$PAT" 2)
+MODERN_TOOL_COUNT=$(echo "$MODERN_LIST" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)["result"]["tools"]))' 2>/dev/null)
+[ "$MODERN_TOOL_COUNT" -ge 22 ] 2>/dev/null && pass "modern tools/list returns $MODERN_TOOL_COUNT tools" || fail "modern tools/list" "expected >=22, got $MODERN_TOOL_COUNT"
+
+MODERN_CALL=$(mcp_modern_call "$PAT" akb_help '{"topic":"quickstart"}' 3)
+MODERN_CALL_OK=$(echo "$MODERN_CALL" | python3 -c 'import sys,json; print(bool(json.load(sys.stdin)["result"]["content"]))' 2>/dev/null)
+[ "$MODERN_CALL_OK" = "True" ] && pass "modern tools/call uses shared tool core" || fail "modern tools/call" "missing result content"
+
 # ── 1. MCP Initialize ───────────────────────────────────────
 echo ""
 echo "▸ 1. MCP Protocol"

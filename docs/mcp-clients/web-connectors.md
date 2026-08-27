@@ -5,7 +5,27 @@ This guide is for connecting AKB to an MCP client that speaks the
 claude.ai Custom Connectors, and ChatGPT Custom Connectors. For
 stdio-based clients (Claude Desktop, Codex CLI via `akb-mcp`,
 Claude Code via the stdio proxy), see the project README: the PAT
-flow there is unchanged.
+flow there supports both the established legacy handshake and the modern
+stateless proxy surface.
+
+## Protocol compatibility
+
+The backend's `/mcp/` endpoint supports modern `2026-07-28` stateless
+requests and the production legacy revisions `2024-11-05`, `2025-03-26`,
+`2025-06-18`, and `2025-11-25`. Modern requests carry
+`Mcp-Protocol-Version`, `Mcp-Method`, and per-request `_meta`; they never carry
+`Mcp-Session-Id`. Legacy clients continue with `initialize`,
+`notifications/initialized`, and the session-bound POST/GET/DELETE lifecycle.
+
+The `akb-mcp` 2.3 proxy exposes `2026-07-28` through `server/discover` and
+keeps its public legacy stdio contract at `2025-06-18`. It converts either
+stdio generation to the backend's modern request envelope while preserving
+the same tool catalog, authentication, vault RBAC, and side effects.
+
+For a rolling upgrade, deploy backend `0.15.0` first and then install proxy
+`2.3.0`. Requests that mix generations, revisions, routing metadata, or
+session principals are rejected before tool dispatch; the proxy distinguishes
+these protocol errors from reconnectable backend transport outages.
 
 ## What you need
 
