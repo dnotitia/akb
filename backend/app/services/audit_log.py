@@ -355,7 +355,12 @@ def _grep_replace_meta(args: dict, result) -> dict | None:
     }
 
 
-def _record_grep_replace_receipts(args: dict, user, result) -> None:
+def _record_grep_replace_receipts(
+    args: dict,
+    user,
+    result,
+    protocol: dict[str, str] | None = None,
+) -> None:
     """Emit one compact recovery receipt per committed grep replacement.
 
     The summary tool record cannot identify every document without becoming one
@@ -375,6 +380,15 @@ def _record_grep_replace_receipts(args: dict, user, result) -> None:
         target = f"uri={replacement['uri']}"
         if len(target) > _TARGET_MAX:
             target = target[:_TARGET_MAX] + "…"
+        receipt_meta = {
+            "protocol_generation": protocol["protocol_generation"],
+            "protocol_revision": protocol["protocol_revision"],
+            "auth_method": protocol["auth_method"],
+        } if protocol is not None else {}
+        receipt_meta.update({
+            "commit": replacement.get("commit"),
+            "previous_commit": replacement.get("previous_commit"),
+        })
         record(
             action="akb_grep.replace",
             actor=getattr(user, "username", None),
@@ -382,10 +396,7 @@ def _record_grep_replace_receipts(args: dict, user, result) -> None:
             vault=(args.get("vault") if isinstance(args, dict) else None),
             target=target,
             outcome="ok",
-            meta={
-                "commit": replacement.get("commit"),
-                "previous_commit": replacement.get("previous_commit"),
-            },
+            meta=receipt_meta,
         )
 
 
@@ -425,7 +436,7 @@ def record_tool(
         outcome = "error"
         code = result.get("code")
     if name == "akb_grep" and is_write:
-        _record_grep_replace_receipts(args, user, result)
+        _record_grep_replace_receipts(args, user, result, protocol)
     audit_meta = {
         "protocol_generation": protocol["protocol_generation"],
         "protocol_revision": protocol["protocol_revision"],

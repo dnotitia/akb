@@ -32,7 +32,7 @@ function waitForLine(lines, id, timeoutMs = 3000) {
   });
 }
 
-async function fakeBackend() {
+async function fakeBackend({ legacyOnly = false } = {}) {
   const requests = [];
   const server = createServer(async (req, res) => {
     let raw = "";
@@ -40,8 +40,25 @@ async function fakeBackend() {
     const body = JSON.parse(raw);
     requests.push({ headers: req.headers, body });
 
+    if (legacyOnly && body.method === "server/discover") {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        jsonrpc: "2.0",
+        id: body.id,
+        error: { code: -32600, message: "Bad Request: Missing session ID" },
+      }));
+      return;
+    }
+
     let result;
-    if (body.method === "server/discover") {
+    if (body.method === "initialize") {
+      assert.equal(body.params.protocolVersion, "2025-06-18");
+      result = {
+        protocolVersion: "2025-06-18",
+        capabilities: { tools: { listChanged: true } },
+        serverInfo: { name: "legacy-backend", version: "1" },
+      };
+    } else if (body.method === "server/discover") {
       result = {
         supportedVersions: ["2026-07-28"],
         capabilities: { tools: { listChanged: true } },
@@ -57,7 +74,9 @@ async function fakeBackend() {
     } else {
       result = { content: [{ type: "text", text: "{}" }], isError: false };
     }
-    res.writeHead(200, { "content-type": "application/json" });
+    const headers = { "content-type": "application/json" };
+    if (legacyOnly) headers["mcp-session-id"] = "legacy-session";
+    res.writeHead(200, headers);
     res.end(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }));
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -175,6 +194,31 @@ async function testLegacyProcess() {
   }
 }
 
+async function testLegacyBackendFallback() {
+  const backend = await fakeBackend({ legacyOnly: true });
+  try {
+    const { responses } = await runProxy(backend.url, [
+      { jsonrpc: "2.0", id: 5, method: "server/discover", params: { _meta: MODERN_META } },
+      { jsonrpc: "2.0", id: 6, method: "tools/list", params: { _meta: MODERN_META } },
+    ]);
+    assert.equal(responses[0].result.supportedVersions[0], "2026-07-28");
+    assert.ok(responses[1].result.tools.some((tool) => tool.name === "akb_search"));
+
+    const discover = backend.requests.find((request) => request.body.method === "server/discover");
+    const initialize = backend.requests.find((request) => request.body.method === "initialize");
+    const list = backend.requests.find((request) => request.body.method === "tools/list");
+    assert.ok(discover);
+    assert.ok(initialize, "old backends receive the limited legacy initialize fallback");
+    assert.ok(list);
+    assert.equal(initialize.headers["mcp-protocol-version"], undefined);
+    assert.equal(initialize.headers["mcp-session-id"], undefined);
+    assert.equal(list.headers["mcp-session-id"], "legacy-session");
+    assert.equal(list.headers["mcp-protocol-version"], undefined);
+  } finally {
+    await backend.close();
+  }
+}
+
 async function testGenerationMixingIsFailClosed() {
   const legacy = new AKBProxy({
     url: "http://127.0.0.1/mcp/",
@@ -224,5 +268,6 @@ async function testGenerationMixingIsFailClosed() {
 
 await testModernProcess();
 await testLegacyProcess();
+await testLegacyBackendFallback();
 await testGenerationMixingIsFailClosed();
 console.log("  ✓ stdio modern and legacy processes preserve their client surfaces");

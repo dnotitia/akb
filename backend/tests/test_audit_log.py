@@ -163,6 +163,11 @@ def test_grep_replace_audit_records_commit_recovery_receipts(audit_dir):
             "code": "write_busy",
         },
         is_write=True,
+        protocol={
+            "protocol_generation": "legacy",
+            "protocol_revision": "2025-06-18",
+            "auth_method": "pat",
+        },
     )
 
     rows = [
@@ -172,10 +177,16 @@ def test_grep_replace_audit_records_commit_recovery_receipts(audit_dir):
     assert [row["action"] for row in rows] == ["akb_grep.replace", "akb_grep"]
     assert rows[0]["target"] == "uri=akb://v/doc/a.md"
     assert rows[0]["meta"] == {
+        "protocol_generation": "legacy",
+        "protocol_revision": "2025-06-18",
+        "auth_method": "pat",
         "commit": "new-commit",
         "previous_commit": "parent-commit",
     }
     assert rows[1]["outcome"] == "error"
+    assert rows[1]["meta"]["protocol_generation"] == "legacy"
+    assert rows[1]["meta"]["protocol_revision"] == "2025-06-18"
+    assert rows[1]["meta"]["auth_method"] == "pat"
     assert rows[1]["meta"]["replacement_complete"] is False
     assert rows[1]["meta"]["replaced_docs"] == 1
 

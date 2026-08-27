@@ -1470,7 +1470,12 @@ export class AKBProxy {
 
   _isLegacyBackendGap(error) {
     if (this._isConnError(error) || error?.protocolError === false) return false;
-    return error?.code === METHOD_NOT_FOUND || error?.statusCode === 404 || error?.statusCode === 405;
+    return (
+      error?.code === METHOD_NOT_FOUND ||
+      error?.statusCode === 404 ||
+      error?.statusCode === 405 ||
+      (error?.code === INVALID_REQUEST && /missing session id/i.test(error?.message || ""))
+    );
   }
 
   _legacyBackendParams() {

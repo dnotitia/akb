@@ -36,7 +36,6 @@ from app.services.auth_service import (
 
 
 AKB_USER_SCOPE_KEY = "akb.mcp.user"
-_MODERN_VERSION = MODERN_PROTOCOL_VERSIONS[0]
 
 
 def _www_authenticate_header() -> str:
