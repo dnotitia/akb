@@ -356,6 +356,7 @@ async def run(
                 await collection_service.delete(
                     vault=item["vault_name"], path=item["path"],
                     recursive=False, agent_id=_ACTOR,
+                    allow_table_delete=False,
                 )
                 done["delete_subcollection"] += 1
             except Exception as e:  # noqa: BLE001 — report residue, continue batch

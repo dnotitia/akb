@@ -343,6 +343,49 @@ HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
 [ "$HTTP_CODE" = "403" ] && pass "reader role REST DELETE → 403" \
   || fail "reader DELETE 403" "got HTTP $HTTP_CODE (expected 403)"
 
+# ── 11b. Writer cannot bypass admin-only table deletion ─────
+echo ""
+echo "▸ 11b. Table deletion permission boundary"
+
+# Promote the second account to Writer, then create a table inside a
+# collection as the owner. Writer must be denied both by the dedicated table
+# endpoint and by recursive collection deletion; the table must survive both.
+R=$(mcp_call akb_grant "{\"vault\":\"$VAULT\",\"user\":\"$READER_USER\",\"role\":\"writer\"}" | mcp_result)
+WRITER_GRANTED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('granted',False))" 2>/dev/null)
+[ "$WRITER_GRANTED" = "True" ] && pass "promoted second account to writer" \
+  || fail "grant writer" "granted=$WRITER_GRANTED; raw=$R"
+
+R=$(mcp_call akb_create_table "{\"vault\":\"$VAULT\",\"collection\":\"writer-guard\",\"name\":\"writer_guard_table\",\"columns\":[{\"name\":\"value\",\"type\":\"text\"}]}" | mcp_result)
+GUARD_TABLE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('name',''))" 2>/dev/null)
+[ "$GUARD_TABLE" = "writer_guard_table" ] && pass "seeded table inside writer-guard collection" \
+  || fail "seed guard table" "name=$GUARD_TABLE; raw=$R"
+
+HTTP_CODE=$(curl -sk -o "$REST_BODY" -w "%{http_code}" \
+  -X DELETE "$BASE_URL/api/v1/tables/$VAULT/writer_guard_table" \
+  -H "Authorization: Bearer $PAT2" 2>/dev/null)
+[ "$HTTP_CODE" = "403" ] && pass "writer direct table delete → 403" \
+  || fail "writer table DELETE 403" "got HTTP $HTTP_CODE; body=$(cat "$REST_BODY")"
+
+HTTP_CODE=$(curl -sk -o "$REST_BODY" -w "%{http_code}" \
+  -X DELETE "$BASE_URL/api/v1/collections/$VAULT/writer-guard?recursive=true" \
+  -H "Authorization: Bearer $PAT2" 2>/dev/null)
+[ "$HTTP_CODE" = "403" ] && pass "writer recursive collection delete containing table → 403" \
+  || fail "writer collection table bypass" "got HTTP $HTTP_CODE; body=$(cat "$REST_BODY")"
+
+TABLE_SURVIVED=$(curl -sk "$BASE_URL/api/v1/tables/$VAULT" \
+  -H "Authorization: Bearer $PAT" \
+  | python3 -c 'import sys,json; d=json.load(sys.stdin); print(any(i.get("name")=="writer_guard_table" for i in d.get("items",[])))' 2>/dev/null)
+[ "$TABLE_SURVIVED" = "True" ] && pass "table survives both writer denials" \
+  || fail "table survives writer denial" "table missing after rejected operations"
+
+HTTP_CODE=$(curl -sk -o "$REST_BODY" -w "%{http_code}" \
+  -X DELETE "$BASE_URL/api/v1/collections/$VAULT/writer-guard?recursive=true" \
+  -H "Authorization: Bearer $PAT" 2>/dev/null)
+ADMIN_DELETE=$(python3 -c 'import sys,json; print(json.load(sys.stdin).get("deleted_tables", -1))' <"$REST_BODY" 2>/dev/null)
+[ "$HTTP_CODE" = "200" ] && [ "$ADMIN_DELETE" = "1" ] \
+  && pass "owner recursive collection delete removes one table" \
+  || fail "owner collection table delete" "http=$HTTP_CODE deleted_tables=$ADMIN_DELETE; body=$(cat "$REST_BODY")"
+
 # ── 12. Nested parent delete (prefix semantics) ─────────────
 echo ""
 echo "▸ 12. Nested parent delete"
@@ -394,6 +437,13 @@ NP_MCP_SUB=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)
 [ "$NP_MCP_CODE" = "conflict" ] && [ "$NP_MCP_SUB" -ge 1 ] 2>/dev/null \
   && pass "MCP delete_collection on nested parent → conflict sub_collection_count=$NP_MCP_SUB" \
   || fail "MCP nested not_empty" "code=$NP_MCP_CODE sub_collection_count=$NP_MCP_SUB; raw=$R"
+
+# Clean up the ephemeral Vault even when an earlier assertion failed. The
+# generated test users are intentionally left to the auth lifecycle suites.
+R=$(mcp_call akb_delete_vault "{\"vault\":\"$VAULT\"}" | mcp_result)
+CLEANED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deleted'))" 2>/dev/null)
+[ "$CLEANED" = "True" ] && pass "ephemeral vault cleaned up" \
+  || fail "cleanup vault" "deleted=$CLEANED; raw=$R"
 
 # ── Summary ──────────────────────────────────────────────────
 echo ""

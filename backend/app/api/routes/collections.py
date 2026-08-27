@@ -9,6 +9,7 @@ from app.api.deps import get_current_user
 from app.exceptions import NotFoundError
 from app.models.document import BrowseResponse
 from app.services.access_service import check_vault_access
+from app.services.access_contributions import role_level
 from app.services.auth_service import AuthenticatedUser
 from app.services.collection_service import (
     CollectionNotEmptyError,
@@ -132,13 +133,14 @@ async def delete_collection(
         HEAD endpoint (see plan Task 14+) will expose totals up-front so
         clients can confirm or paginate.
     """
-    await check_vault_access(user.user_id, vault, required_role="writer")
+    access = await check_vault_access(user.user_id, vault, required_role="writer")
     try:
         result = await collection_service.delete(
             vault=vault,
             path=path,
             recursive=recursive,
             agent_id=user.user_id,
+            allow_table_delete=role_level(access.get("role")) >= role_level("admin"),
         )
         return {"kind": "collection_delete", **result}
     except InvalidPathError as exc:

@@ -1086,14 +1086,15 @@ Requires writer role.""",
 
 The `path` is treated as a **prefix**, not a single row. Deleting `P`
 covers the row at `P` (if any) plus every sub-collection, document,
-and file under `P/`.
+file, and table under `P/`.
 
 - Empty mode (default): succeeds only if the row at `P` exists and
   nothing else lives under the prefix. Any sub-collection, document,
-  or file rejects with `not_empty` and the counts.
+  file, or table rejects with `not_empty` and the counts.
 - `recursive=true`: cascade-delete the row at `P` (if any), every
   sub-collection row beneath it, all documents (one git commit), and
-  all files (s3 outbox).
+  all files (s3 outbox). If any table is included, admin or owner role
+  is required and the physical PostgreSQL tables are dropped.
 - A path with no row and no descendants returns a NotFound error.
 
 ## Parameters
@@ -1101,7 +1102,7 @@ and file under `P/`.
 |-------|----------|-------------|
 | vault | ✓ | Vault name |
 | path | ✓ | Collection path (prefix) |
-| recursive | | Default `false`. Set `true` to cascade sub-collections + docs + files. |
+| recursive | | Default `false`. Set `true` to cascade sub-collections + docs + files + tables. |
 
 ## Examples
 ```
@@ -1109,7 +1110,7 @@ akb_delete_collection(vault="eng", path="old-specs")
 akb_delete_collection(vault="eng", path="legacy", recursive=True)
 ```
 
-Requires writer role.""",
+Requires writer role, or admin/owner when the collection contains tables.""",
 
     "akb_delete": """# akb_delete — Delete a Document
 

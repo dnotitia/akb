@@ -1013,6 +1013,7 @@ async def test_p2_archived_vault_blocks_writes(pool):
 @pytest.mark.asyncio
 async def test_p2_collection_delete_handles_tables(pool):
     from app.services import table_service
+    from app.exceptions import ForbiddenError
     from app.services.collection_service import CollectionService, CollectionNotEmptyError
     from app.services.role_sync import RoleSync, set_role_sync, get_role_sync
 
@@ -1032,8 +1033,34 @@ async def test_p2_collection_delete_handles_tables(pool):
         await svc.delete(vault=name, path="specs", recursive=False, agent_id="t")
     assert ei.value.table_count == 1
 
+    # A writer-equivalent caller must not bypass the table endpoint's admin
+    # boundary by deleting its parent collection. The denial happens before
+    # either the registry or physical table is mutated.
+    with pytest.raises(ForbiddenError, match="contains tables requires 'admin'"):
+        await svc.delete(
+            vault=name,
+            path="specs",
+            recursive=True,
+            agent_id="t",
+            allow_table_delete=False,
+        )
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM vault_tables WHERE vault_id = $1", vid,
+        ) == 1
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = $1",
+            table_service.table_data_repo.pg_table_name(name, "items"),
+        ) == 1
+
     # recursive delete actually drops the table (registry + dynamic table)
-    out = await svc.delete(vault=name, path="specs", recursive=True, agent_id="t")
+    out = await svc.delete(
+        vault=name,
+        path="specs",
+        recursive=True,
+        agent_id="t",
+        allow_table_delete=True,
+    )
     assert out["deleted_tables"] == 1
 
     async with pool.acquire() as conn:
