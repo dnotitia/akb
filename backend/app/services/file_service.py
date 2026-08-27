@@ -22,7 +22,7 @@ from urllib.parse import quote
 
 from app.config import settings
 from app.db.postgres import get_pool
-from app.exceptions import AKBError, ConflictError, NotFoundError
+from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError
 from app.repositories import vault_files_repo
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
@@ -926,10 +926,14 @@ class FileService:
         """Return a presigned GET URL for direct download from S3."""
         if self._measurement is not None:
             return await self._measurement.get_download_url(vault_id, file_id)
+        try:
+            fid = uuid.UUID(file_id)
+        except (ValueError, AttributeError):
+            raise ValidationError("file_id must be a UUID") from None
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await vault_files_repo.find_by_id(
-                conn, vault_id, uuid.UUID(file_id),
+                conn, vault_id, fid,
             )
             if (
                 not row
