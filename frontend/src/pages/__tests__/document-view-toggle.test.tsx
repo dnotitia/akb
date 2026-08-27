@@ -37,6 +37,7 @@ vi.mock("@/components/markdown-editor", () => ({
 }));
 
 import {
+  deleteDocument,
   getDocument,
   getVaultInfo,
   getRelations,
@@ -44,6 +45,7 @@ import {
 } from "@/lib/api";
 
 const getDocumentMock = getDocument as unknown as ReturnType<typeof vi.fn>;
+const deleteDocumentMock = deleteDocument as unknown as ReturnType<typeof vi.fn>;
 const getVaultInfoMock = getVaultInfo as unknown as ReturnType<typeof vi.fn>;
 const getRelationsMock = getRelations as unknown as ReturnType<typeof vi.fn>;
 const updateDocumentMock = updateDocument as unknown as ReturnType<typeof vi.fn>;
@@ -85,6 +87,7 @@ function LocationProbe() {
   const loc = useLocation();
   return (
     <>
+      <div data-testid="location-pathname">{loc.pathname}</div>
       <div data-testid="location-search">{loc.search}</div>
       <div data-testid="location-state">{JSON.stringify(loc.state)}</div>
     </>
@@ -148,6 +151,7 @@ function renderPreviewAt(url: string) {
 beforeEach(() => {
   localStorage.clear();
   getDocumentMock.mockReset();
+  deleteDocumentMock.mockReset();
   getVaultInfoMock.mockReset();
   getRelationsMock.mockReset();
   updateDocumentMock.mockReset();
@@ -159,6 +163,7 @@ beforeEach(() => {
     current_commit: UPDATED_COMMIT,
     commit_hash: UPDATED_COMMIT,
   });
+  deleteDocumentMock.mockResolvedValue({ deleted: true });
 
   // /activity is fetched directly via fetch() — stub it to a no-op.
   vi.stubGlobal(
@@ -523,5 +528,20 @@ describe("DocumentPage view toggle", () => {
         expect(screen.getByText("Updated from pinned HEAD")).toBeInTheDocument(),
       { timeout: 5_000 },
     );
+  });
+
+  it("exposes document deletion in the header for writers and leaves the stale route", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await user.click(await screen.findByRole("button", { name: "Actions for DocTitle" }));
+    await user.click(screen.getByRole("menuitem", { name: "Delete document" }));
+    await user.click(screen.getByRole("button", { name: "Delete document" }));
+
+    await waitFor(() =>
+      expect(deleteDocumentMock).toHaveBeenCalledWith("v", "notes/hello.md"),
+    );
+    expect(screen.getByTestId("location-pathname")).toHaveTextContent("/vault/v");
   });
 });

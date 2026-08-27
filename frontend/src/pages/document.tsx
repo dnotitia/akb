@@ -30,7 +30,6 @@ import {
   PanelRightOpen,
   Pencil,
   Share2,
-  Trash2,
 } from "lucide-react";
 import {
   authenticatedFetch,
@@ -68,6 +67,8 @@ import { RelationsPanel } from "@/components/relations/relations-panel";
 import { relationIsInVault } from "@/components/relations/relation-row-utils";
 import { useCurrentUser } from "@/contexts/current-user-context";
 import { recordRecentDocumentView } from "@/lib/recent-document-views";
+import { ResourceActionsMenu } from "@/components/resource-actions-menu";
+import { ResourceDeleteDialog } from "@/components/resource-delete-dialog";
 
 // Plate is heavy (~hundreds of KB gzipped); lazy-load so the read-only path
 // (Rendered / Raw) stays cheap.
@@ -106,6 +107,7 @@ export default function DocumentPage({
   const [articleEl, setArticleEl] = useState<HTMLElement | null>(null);
   const [vaultRole, setVaultRole] = useState<string | null>(null);
   const [vaultKind, setVaultKind] = useState<"normal" | "mirror" | "error" | null>(null);
+  const [vaultReadOnly, setVaultReadOnly] = useState(true);
   const [editOpen, setEditOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
@@ -198,14 +200,17 @@ export default function DocumentPage({
     if (!name) return;
     setVaultRole(null);
     setVaultKind(null);
+    setVaultReadOnly(true);
     getVaultInfo(name)
       .then((d) => {
         setVaultRole(d?.role || null);
         setVaultKind(d?.is_external_git ? "mirror" : "normal");
+        setVaultReadOnly(Boolean(d?.is_archived || d?.is_external_git));
       })
       .catch(() => {
         setVaultRole(null);
         setVaultKind("error");
+        setVaultReadOnly(true);
       });
   }, [name]);
 
@@ -530,6 +535,7 @@ export default function DocumentPage({
     (doc.created_by && !isUuid(doc.created_by) ? doc.created_by : null);
   const canWrite =
     vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner";
+  const canDelete = canWrite && !vaultReadOnly && !isHistorical;
 
   const closeDetails = () => {
     setDetailsOpen(false);
@@ -627,6 +633,13 @@ export default function DocumentPage({
                 <Maximize2 className="h-4 w-4" aria-hidden />
                 <span className="hidden lg:inline">Full page</span>
               </Button>
+            )}
+            {canDelete && !inEditMode && (
+              <ResourceActionsMenu
+                resourceName={doc.title || fileName}
+                deleteLabel="Delete document"
+                onDelete={() => setDeleteOpen(true)}
+              />
             )}
             {inEditMode ? (
               <>
@@ -1028,20 +1041,6 @@ export default function DocumentPage({
                 )}
               </section>
 
-                  {canWrite && !isHistorical && (
-                    <div className="mt-4 border-t border-border pt-3">
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        className="w-full justify-start text-destructive hover:bg-destructive-soft hover:text-destructive-soft-foreground"
-                        onClick={() => setDeleteOpen(true)}
-                      >
-                        <Trash2 className="h-3.5 w-3.5" aria-hidden />
-                        Delete document
-                      </Button>
-                    </div>
-                  )}
                 </TabsContent>
 
                 <TabsContent value="outline" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 pt-3 rail-scroll">
@@ -1109,15 +1108,11 @@ export default function DocumentPage({
         onPublished={(slug) => setDocOverride({ ...doc, is_public: true, public_slug: slug })}
       />
 
-      <ConfirmDialog
+      <ResourceDeleteDialog
         open={deleteOpen}
         onOpenChange={setDeleteOpen}
-        title={`Delete "${doc.title || doc.path}"?`}
-        description={
-          "The document, its embeddings, and its publication links are removed.\nGit history of the file is preserved in the vault repo.\nThis cannot be undone from the UI."
-        }
-        confirmLabel="Delete document"
-        variant="destructive"
+        kind="document"
+        name={doc.title || doc.path}
         onConfirm={async () => {
           await deleteDocument(name!, docId);
           refetchTree();

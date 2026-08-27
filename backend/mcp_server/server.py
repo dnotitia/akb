@@ -1452,16 +1452,18 @@ async def _handle_create_collection(args: dict, uid: str, user: _MCPUser) -> dic
 
 @_h("akb_delete_collection")
 async def _handle_delete_collection(args: dict, uid: str, user: _MCPUser) -> dict:
+    from app.services.access_contributions import role_level
     from app.services.collection_service import (
         CollectionService, CollectionNotEmptyError, InvalidPathError,
     )
-    await check_vault_access(uid, args["vault"], required_role="writer")
+    access = await check_vault_access(uid, args["vault"], required_role="writer")
     svc = CollectionService()
     try:
         return await svc.delete(
             vault=args["vault"], path=args["path"],
             recursive=bool(args.get("recursive", False)),
             agent_id=uid,
+            allow_table_delete=role_level(access.get("role")) >= role_level("admin"),
         )
     except InvalidPathError as exc:
         return err(str(exc), code=INVALID_PATH)

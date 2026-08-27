@@ -1319,6 +1319,15 @@ export interface VaultFileUploadResult {
   version?: string | null;
 }
 
+export interface VaultFileDeleteResult {
+  kind: "file";
+  uri?: string | null;
+  vault: string;
+  collection?: string | null;
+  name: string;
+  deleted: true;
+}
+
 /**
  * Complete the backend's presigned file flow from the browser: reserve the
  * file record, PUT the bytes directly to object storage, then certify the
@@ -1393,6 +1402,12 @@ export async function uploadVaultFile(
   }
 }
 
+export const deleteVaultFile = (vault: string, fileId: string) =>
+  api<VaultFileDeleteResult>(
+    `/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}`,
+    { method: "DELETE" },
+  );
+
 // ── Vault tables ──
 export interface VaultTableColumnInput {
   name: string;
@@ -1417,6 +1432,15 @@ export interface VaultTableCreateResult {
   created?: boolean;
 }
 
+export interface VaultTableDeleteResult {
+  kind: "table";
+  uri: string;
+  vault: string;
+  collection?: string | null;
+  name: string;
+  deleted: true;
+}
+
 export const createVaultTable = (
   vault: string,
   input: VaultTableCreateInput,
@@ -1429,6 +1453,12 @@ export const createVaultTable = (
       collection: input.collection?.trim() || undefined,
     }),
   });
+
+export const deleteVaultTable = (vault: string, tableName: string) =>
+  api<VaultTableDeleteResult>(
+    `/tables/${encodeURIComponent(vault)}/${encodeURIComponent(tableName)}`,
+    { method: "DELETE" },
+  );
 
 // ── Browse ──
 export const browseVault = (vault: string, collection?: string, depth = 1) => {

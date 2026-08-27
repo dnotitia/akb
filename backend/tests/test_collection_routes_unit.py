@@ -83,6 +83,7 @@ def test_delete_adds_only_literal_kind_and_preserves_all_counts(client, monkeypa
             "path": "guides/api",
             "recursive": True,
             "agent_id": "u-collections",
+            "allow_table_delete": False,
         }
         return {
             "ok": True,
@@ -109,6 +110,33 @@ def test_delete_adds_only_literal_kind_and_preserves_all_counts(client, monkeypa
         "deleted_sub_collections": 1,
         "deleted_tables": 0,
     }
+
+
+def test_delete_passes_admin_table_capability(client, monkeypatch):
+    async def _admin(*_args, **_kwargs):
+        return {"role": "admin"}
+
+    async def _delete(**kwargs):
+        assert kwargs["allow_table_delete"] is True
+        return {
+            "ok": True,
+            "collection": "data",
+            "deleted_docs": 0,
+            "deleted_files": 0,
+            "deleted_sub_collections": 0,
+            "deleted_tables": 1,
+        }
+
+    monkeypatch.setattr(collections, "check_vault_access", _admin)
+    monkeypatch.setattr(collections.collection_service, "delete", _delete)
+
+    response = client.delete(
+        "/api/v1/collections/reef/data",
+        params={"recursive": "true"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["deleted_tables"] == 1
 
 
 def test_non_empty_409_keeps_legacy_detail_and_normalized_details(client, monkeypatch):

@@ -1,0 +1,151 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import { VaultRefreshProvider } from "@/contexts/vault-refresh-context";
+import FilePage from "@/pages/file";
+import TablePage from "@/pages/table";
+
+vi.mock("@/lib/api", () => ({
+  authenticatedFetch: vi.fn(),
+  getVaultInfo: vi.fn(),
+  deleteVaultFile: vi.fn(),
+  deleteVaultTable: vi.fn(),
+}));
+
+import {
+  authenticatedFetch,
+  deleteVaultFile,
+  deleteVaultTable,
+  getVaultInfo,
+} from "@/lib/api";
+
+const fetchMock = authenticatedFetch as unknown as ReturnType<typeof vi.fn>;
+const vaultInfoMock = getVaultInfo as unknown as ReturnType<typeof vi.fn>;
+const deleteFileMock = deleteVaultFile as unknown as ReturnType<typeof vi.fn>;
+const deleteTableMock = deleteVaultTable as unknown as ReturnType<typeof vi.fn>;
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function LocationProbe() {
+  return <span data-testid="pathname">{useLocation().pathname}</span>;
+}
+
+function renderRoute(path: string, refetchTree = vi.fn()) {
+  return {
+    refetchTree,
+    ...render(
+      <MemoryRouter initialEntries={[path]}>
+        <VaultRefreshProvider refetchVaults={vi.fn()} refetchTree={refetchTree}>
+          <Routes>
+            <Route path="/vault/:name/file/:id" element={<FilePage />} />
+            <Route path="/vault/:name/table/:table" element={<TablePage />} />
+            <Route path="/vault/:name" element={<div>Vault overview</div>} />
+          </Routes>
+          <LocationProbe />
+        </VaultRefreshProvider>
+      </MemoryRouter>,
+    ),
+  };
+}
+
+beforeEach(() => {
+  fetchMock.mockReset();
+  vaultInfoMock.mockReset();
+  deleteFileMock.mockReset();
+  deleteTableMock.mockReset();
+  deleteFileMock.mockResolvedValue({ deleted: true });
+  deleteTableMock.mockResolvedValue({ deleted: true });
+});
+
+afterEach(() => cleanup());
+
+describe("resource viewer deletion", () => {
+  it("lets a writer delete a file, refreshes the tree, and leaves the stale viewer", async () => {
+    vaultInfoMock.mockResolvedValue({ role: "writer" });
+    fetchMock.mockImplementation((url: string) => {
+      if (url.endsWith("/download")) {
+        return Promise.resolve(jsonResponse({
+          name: "diagram.png",
+          download_url: "https://example.test/diagram.png",
+          mime_type: "image/png",
+        }));
+      }
+      return Promise.resolve(jsonResponse({
+        items: [
+          {
+            uri: "akb://v/file/file-1",
+            name: "diagram.png",
+            mime_type: "image/png",
+          },
+        ],
+      }));
+    });
+    const user = userEvent.setup();
+    const { refetchTree } = renderRoute("/vault/v/file/file-1");
+
+    await user.click(await screen.findByRole("button", { name: "Actions for diagram.png" }));
+    await user.click(screen.getByRole("menuitem", { name: "Delete file" }));
+    await user.click(screen.getByRole("button", { name: "Delete file" }));
+
+    await waitFor(() => expect(deleteFileMock).toHaveBeenCalledWith("v", "file-1"));
+    expect(refetchTree).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("pathname")).toHaveTextContent("/vault/v");
+  });
+
+  it("requires an admin and an exact name before deleting a table", async () => {
+    vaultInfoMock.mockResolvedValue({ role: "admin" });
+    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (init?.method === "POST" && url.endsWith("/sql")) {
+        return Promise.resolve(jsonResponse({
+          items: [{ id: 1, title: "First" }],
+          columns: ["id", "title"],
+          total: 1,
+        }));
+      }
+      return Promise.resolve(jsonResponse({
+        items: [
+          {
+            name: "audit_log",
+            row_count: 1,
+            columns: [{ name: "id", type: "int", primary_key: true }],
+          },
+        ],
+      }));
+    });
+    const user = userEvent.setup();
+    const { refetchTree } = renderRoute("/vault/v/table/audit_log");
+
+    await user.click(await screen.findByRole("button", { name: "Actions for audit_log" }));
+    await user.click(screen.getByRole("menuitem", { name: "Delete table" }));
+    const confirm = screen.getByRole("button", { name: "Delete table" });
+    expect(confirm).toBeDisabled();
+    await user.type(screen.getByLabelText(/type the table name/i), "audit_log");
+    await user.click(confirm);
+
+    await waitFor(() => expect(deleteTableMock).toHaveBeenCalledWith("v", "audit_log"));
+    expect(refetchTree).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("pathname")).toHaveTextContent("/vault/v");
+  });
+
+  it("does not expose table deletion to a writer", async () => {
+    vaultInfoMock.mockResolvedValue({ role: "writer" });
+    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (init?.method === "POST" && url.endsWith("/sql")) {
+        return Promise.resolve(jsonResponse({ items: [], columns: [], total: 0 }));
+      }
+      return Promise.resolve(jsonResponse({
+        items: [{ name: "audit_log", row_count: 0, columns: [] }],
+      }));
+    });
+    renderRoute("/vault/v/table/audit_log");
+
+    await screen.findByRole("heading", { name: "audit_log" });
+    expect(screen.queryByRole("button", { name: "Actions for audit_log" })).not.toBeInTheDocument();
+  });
+});

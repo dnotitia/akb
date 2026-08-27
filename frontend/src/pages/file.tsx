@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import {
   Clock3,
   Download,
@@ -25,13 +25,17 @@ import { Button } from "@/components/ui/button";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TooltipText } from "@/components/ui/tooltip-text";
-import { authenticatedFetch } from "@/lib/api";
+import { ResourceActionsMenu } from "@/components/resource-actions-menu";
+import { ResourceDeleteDialog } from "@/components/resource-delete-dialog";
+import { useVaultRefresh } from "@/contexts/vault-refresh-context";
+import { authenticatedFetch, deleteVaultFile, getVaultInfo } from "@/lib/api";
 import {
   effectiveFileMime,
   filePreviewKind,
   formatFileSize,
 } from "@/lib/file-preview";
 import { parseFileUri } from "@/lib/uri";
+import { canEdit } from "@/lib/roles";
 import { timeAgo } from "@/lib/utils";
 
 interface FileInfo {
@@ -54,12 +58,36 @@ interface FileAccess {
 
 export default function FilePage() {
   const { name: vault, id: fileId } = useParams<{ name: string; id: string }>();
+  const navigate = useNavigate();
+  const { refetchTree } = useVaultRefresh();
   const [info, setInfo] = useState<FileInfo | null>(null);
   const [access, setAccess] = useState<FileAccess | null>(null);
   const [loadError, setLoadError] = useState("");
   const [previewError, setPreviewError] = useState("");
   const [infoLoading, setInfoLoading] = useState(true);
   const [previewLoading, setPreviewLoading] = useState(true);
+  const [canDelete, setCanDelete] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+
+  useEffect(() => {
+    if (!vault) return;
+    let cancelled = false;
+    setCanDelete(false);
+    getVaultInfo(vault)
+      .then((data) => {
+        if (!cancelled) {
+          setCanDelete(
+            canEdit(data?.role) && !data?.is_archived && !data?.is_external_git,
+          );
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setCanDelete(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [vault]);
 
   useEffect(() => {
     if (!vault || !fileId) return;
@@ -148,30 +176,39 @@ export default function FilePage() {
         }
         meta={<Badge variant="outline">{kindLabel}</Badge>}
         actions={
-          access?.download_url ? (
-            <Button asChild size="sm">
-              <a
-                href={access.download_url}
-                target="_blank"
-                rel="noreferrer"
-                download={displayName}
+          <>
+            {access?.download_url ? (
+              <Button asChild size="sm">
+                <a
+                  href={access.download_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  download={displayName}
+                >
+                  <Download className="h-4 w-4" aria-hidden />
+                  <span className="hidden sm:inline">Download</span>
+                </a>
+              </Button>
+            ) : (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                loading={previewLoading}
+                onClick={() => void loadPreview()}
               >
-                <Download className="h-4 w-4" aria-hidden />
-                <span className="hidden sm:inline">Download</span>
-              </a>
-            </Button>
-          ) : (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              loading={previewLoading}
-              onClick={() => void loadPreview()}
-            >
-              {!previewLoading && <RefreshCw className="h-4 w-4" aria-hidden />}
-              <span className="hidden sm:inline">Retry preview</span>
-            </Button>
-          )
+                {!previewLoading && <RefreshCw className="h-4 w-4" aria-hidden />}
+                <span className="hidden sm:inline">Retry preview</span>
+              </Button>
+            )}
+            {canDelete && (
+              <ResourceActionsMenu
+                resourceName={displayName}
+                deleteLabel="Delete file"
+                onDelete={() => setDeleteOpen(true)}
+              />
+            )}
+          </>
         }
       />
 
@@ -267,6 +304,17 @@ export default function FilePage() {
           )}
         </ResourceCanvas>
       </div>
+      <ResourceDeleteDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        kind="file"
+        name={displayName}
+        onConfirm={async () => {
+          await deleteVaultFile(vault!, fileId!);
+          refetchTree();
+          navigate(`/vault/${vault}`);
+        }}
+      />
     </ResourceWorkspace>
   );
 }

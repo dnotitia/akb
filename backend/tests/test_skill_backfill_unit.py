@@ -98,8 +98,18 @@ class _FakeCollectionService:
         self.calls = []
         self.error = error
 
-    async def delete(self, *, vault, path, recursive, agent_id):
-        self.calls.append((vault, path, recursive, agent_id))
+    async def delete(
+        self,
+        *,
+        vault,
+        path,
+        recursive,
+        agent_id,
+        allow_table_delete=False,
+    ):
+        self.calls.append(
+            (vault, path, recursive, agent_id, allow_table_delete)
+        )
         if self.error:
             raise self.error
         return {"ok": True}

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import {
   Asterisk,
   Braces,
@@ -31,7 +31,11 @@ import { Button } from "@/components/ui/button";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TooltipText } from "@/components/ui/tooltip-text";
-import { authenticatedFetch } from "@/lib/api";
+import { ResourceActionsMenu } from "@/components/resource-actions-menu";
+import { ResourceDeleteDialog } from "@/components/resource-delete-dialog";
+import { useVaultRefresh } from "@/contexts/vault-refresh-context";
+import { authenticatedFetch, deleteVaultTable, getVaultInfo } from "@/lib/api";
+import { ROLE_RANK, type Role } from "@/lib/roles";
 import { cn } from "@/lib/utils";
 
 interface Column {
@@ -50,6 +54,8 @@ interface TableInfo {
 
 export default function TablePage() {
   const { name: vault, table } = useParams<{ name: string; table: string }>();
+  const navigate = useNavigate();
+  const { refetchTree } = useVaultRefresh();
   const [info, setInfo] = useState<TableInfo | null>(null);
   const [rows, setRows] = useState<Record<string, unknown>[]>([]);
   const [cols, setCols] = useState<string[]>([]);
@@ -58,9 +64,34 @@ export default function TablePage() {
   const [loading, setLoading] = useState(true);
   const [infoLoading, setInfoLoading] = useState(true);
   const [schemaOpen, setSchemaOpen] = useState(false);
+  const [canDelete, setCanDelete] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
   const schemaToggleRef = useRef<HTMLButtonElement | null>(null);
   const schemaCloseRef = useRef<HTMLButtonElement | null>(null);
   const limit = 50;
+
+  useEffect(() => {
+    if (!vault) return;
+    let cancelled = false;
+    setCanDelete(false);
+    getVaultInfo(vault)
+      .then((data) => {
+        const roleRank = ROLE_RANK[data?.role as Role] ?? 0;
+        if (!cancelled) {
+          setCanDelete(
+            roleRank >= ROLE_RANK.admin &&
+              !data?.is_archived &&
+              !data?.is_external_git,
+          );
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setCanDelete(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [vault]);
 
   const closeSchema = useCallback(() => {
     setSchemaOpen(false);
@@ -192,6 +223,13 @@ export default function TablePage() {
               )}
               <span className="hidden sm:inline">Schema</span>
             </Button>
+            {canDelete && (
+              <ResourceActionsMenu
+                resourceName={table || "Table"}
+                deleteLabel="Delete table"
+                onDelete={() => setDeleteOpen(true)}
+              />
+            )}
           </>
         }
       />
@@ -417,6 +455,18 @@ export default function TablePage() {
           </div>
         </aside>
       </div>
+      <ResourceDeleteDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        kind="table"
+        name={table || "Table"}
+        rowCount={rowCount}
+        onConfirm={async () => {
+          await deleteVaultTable(vault!, table!);
+          refetchTree();
+          navigate(`/vault/${vault}`);
+        }}
+      />
     </ResourceWorkspace>
   );
 }
