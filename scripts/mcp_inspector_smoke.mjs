@@ -177,7 +177,7 @@ function validateProxyLocal(value) {
   const tools = uniqueStrings(proxyLocal.tools, "proxy_local.tools");
   const inputProperties = requireRecord(proxyLocal.input_properties, "proxy_local.input_properties is missing");
   for (const [tool, properties] of Object.entries(inputProperties)) {
-    if (typeof tool !== "string" || tool.length === 0) throw configuration("proxy-local schema metadata names an invalid tool");
+    if (tool.length === 0) throw configuration("proxy-local schema metadata names an invalid tool");
     uniqueStrings(properties, `proxy_local.input_properties.${tool}`);
   }
   return { tools, inputProperties };
@@ -837,7 +837,7 @@ function normalizeSchemaValue(value, removals = new Set()) {
 function hasTopLevelSchemaProperty(schema, property) {
   return isRecord(schema)
     && isRecord(schema.properties)
-    && Object.prototype.hasOwnProperty.call(schema.properties, property);
+    && Object.hasOwn(schema.properties, property);
 }
 
 function toolByName(tools, name) {
@@ -1119,7 +1119,7 @@ export function compareTransports(http, stdio, discovery) {
         };
       }
     }
-    const httpSchema = normalizeSchemaValue(httpTool.inputSchema ?? {}, new Set());
+    const httpSchema = normalizeSchemaValue(httpTool.inputSchema ?? {});
     const stdioSchema = normalizeSchemaValue(stdioTool.inputSchema ?? {}, allowed);
     const schemaMatch = stableStringify(httpSchema) === stableStringify(stdioSchema);
     details.push({ name, schema_match: schemaMatch });
