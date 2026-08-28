@@ -13,6 +13,7 @@ Provides MCP tools for:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import sys
@@ -28,7 +29,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent
+from mcp.types import (
+    CallToolRequestParams,
+    CallToolResult,
+    ListToolsResult,
+    PaginatedRequestParams,
+    TextContent,
+)
+from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSIONS
 
 from app.db.postgres import get_pool, init_db, close_pool
 from app.exceptions import ConflictError, NotFoundError, ValidationError, WriteBusyError
@@ -81,13 +89,34 @@ logger = logging.getLogger("akb.mcp")
 # post-dispatch ``vault_skill`` field they already tolerate.
 VAULT_SKILL_PREFLIGHT_CAPABILITY = "io.dnotitia.akb/vault-skill-preflight"
 VAULT_SKILL_ACK_ARGUMENT = "_vault_skill_ack"
+_request_context: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
+    "akb_mcp_request_context", default=None
+)
+
+
+def _current_request_context() -> Any | None:
+    """Return the MCP 2.x context installed by the request adapter."""
+    return _request_context.get()
 
 
 def _vault_skill_preflight_version() -> int | None:
-    """Negotiated retry-contract version for this MCP session, if any."""
+    """Negotiated retry-contract version for this MCP request, if any.
+
+    Handshake transports expose the client capabilities through
+    ``client_params``. The 2026-07-28 per-request envelope exposes the same
+    fact directly as ``client_capabilities`` because clientInfo is optional.
+    The SDK keeps both views on the request session; read the direct view first
+    so modern requests do not accidentally lose the vault-guide contract.
+    """
     try:
-        params = server.request_context.session.client_params
-        experimental = params.capabilities.experimental if params else None
+        context = _current_request_context()
+        if context is None:
+            return None
+        session = context.session
+        capabilities = session.client_capabilities
+        if capabilities is None and session.client_params is not None:
+            capabilities = session.client_params.capabilities
+        experimental = capabilities.experimental if capabilities else None
         advertised = (experimental or {}).get(VAULT_SKILL_PREFLIGHT_CAPABILITY)
         if not isinstance(advertised, dict):
             return None
@@ -128,6 +157,7 @@ class _MCPUser:
         user_id: str = "00000000-0000-0000-0000-000000000000",
         username: str = "system",
         is_admin: bool = False,
+        auth_method: str = "unknown",
         oauth_scopes: list[str] | None = None,
         token_scopes: frozenset[str] | None = None,
         key_class: str | None = None,
@@ -135,6 +165,7 @@ class _MCPUser:
         self.user_id = user_id
         self.username = username
         self.is_admin = is_admin
+        self.auth_method = auth_method
         # OAuth scopes when the call came in via a Keycloak access token
         # at /mcp; None for PAT / service / fallback. The scope check in
         # `_dispatch` is no-op when this is None — current behaviour for
@@ -150,14 +181,29 @@ _FALLBACK_USER = _MCPUser()
 async def _get_user() -> _MCPUser:
     """Get authenticated user from MCP request context.
 
-    Uses the standard MCP SDK mechanism: server.request_context.request
-    contains the original HTTP Request, from which we extract the
-    Authorization header and apply the MCP credential capability.
+    The HTTP adapter resolves the AKB credential before the SDK transport
+    parses or dispatches the request and stores that result on the request
+    scope. Reading it here keeps the protocol adapters and the business core
+    on one authentication decision. The header fallback is retained for
+    direct/unit callers that construct an SDK request without the AKB adapter.
     """
     try:
-        ctx = server.request_context
+        ctx = _current_request_context()
+        if ctx is None:
+            return _FALLBACK_USER
         request = ctx.request  # Starlette Request object
         if request:
+            scoped_user = request.scope.get("akb.mcp.user")
+            if scoped_user is not None:
+                return _MCPUser(
+                    scoped_user.user_id,
+                    scoped_user.username,
+                    is_admin=scoped_user.is_admin,
+                    auth_method=scoped_user.auth_method,
+                    oauth_scopes=scoped_user.oauth_scopes,
+                    token_scopes=scoped_user.token_scopes,
+                    key_class=scoped_user.key_class,
+                )
             auth_header = request.headers.get("authorization", "")
             if auth_header:
                 user = await resolve_mcp_authorization(auth_header)
@@ -166,6 +212,7 @@ async def _get_user() -> _MCPUser:
                         user.user_id,
                         user.username,
                         is_admin=user.is_admin,
+                        auth_method=user.auth_method,
                         oauth_scopes=user.oauth_scopes,
                         token_scopes=user.token_scopes,
                         key_class=user.key_class,
@@ -193,12 +240,33 @@ def _session_id() -> str | None:
     nullable by construction and must never be treated as a required key.
     """
     try:
-        request = server.request_context.request
+        context = _current_request_context()
+        request = context.request if context is not None else None
         if request:
             return request.headers.get("mcp-session-id")
     except (LookupError, AttributeError):
         pass
     return None
+
+
+def _protocol_context(user: _MCPUser) -> dict[str, str]:
+    """Return non-sensitive protocol facts for audit/tool usage metadata."""
+    try:
+        context = _current_request_context()
+        version = context.protocol_version if context is not None else "unknown"
+    except (LookupError, AttributeError):
+        version = "unknown"
+    if version in MODERN_PROTOCOL_VERSIONS:
+        generation = "modern"
+    elif version in HANDSHAKE_PROTOCOL_VERSIONS:
+        generation = "legacy"
+    else:
+        generation = "unknown"
+    return {
+        "protocol_generation": generation,
+        "protocol_revision": version,
+        "auth_method": user.auth_method,
+    }
 revision_backend = get_revision_backend()
 doc_service = revision_backend.document_service
 search_service = SearchService()
@@ -347,7 +415,7 @@ def _required_scope(name: str, args: dict) -> str:
 # time from the same TOOLS list returned via list_tools, so the
 # "what the agent saw" and "what we accept" can't drift.
 _TOOL_ARG_NAMES: dict[str, set[str]] = {
-    t.name: set((t.inputSchema or {}).get("properties", {}).keys())
+    t.name: set((t.input_schema or {}).get("properties", {}).keys())
     for t in TOOLS
 }
 
@@ -1574,7 +1642,6 @@ async def _handle_set_public(args: dict, uid: str, user: _MCPUser) -> dict:
 
 # ── Tool Handlers ────────────────────────────────────────────
 
-@server.list_tools()
 async def list_tools():
     if _vault_skill_preflight_version() != 2:
         return TOOLS
@@ -1592,7 +1659,7 @@ async def list_tools():
             decorated.append(tool)
             continue
         copied = tool.model_copy(deep=True)
-        copied.inputSchema.setdefault("properties", {})[
+        copied.input_schema.setdefault("properties", {})[
             VAULT_SKILL_ACK_ARGUMENT
         ] = {
             "type": "string",
@@ -1607,8 +1674,7 @@ async def list_tools():
     return decorated
 
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict):
+async def call_tool(name: str, arguments: dict) -> CallToolResult:
     # Capability-v2 acknowledgement is transport metadata expressed as a
     # reserved tool argument so generic MCP clients can send it through their
     # schema-validated call surface.  Remove it before scope checks, auditing,
@@ -1624,6 +1690,7 @@ async def call_tool(name: str, arguments: dict):
     # Resolve the actor once and reuse it for both dispatch and the audit
     # line so the two can't disagree on who made the call.
     user = await _get_user()
+    protocol = _protocol_context(user)
     started = time.perf_counter()
     # Guards the two exits against recording the SAME invocation twice. The
     # encode below sits inside this `try`, so a `json.dumps` failure falls to
@@ -1689,7 +1756,9 @@ async def call_tool(name: str, arguments: dict):
         # lock on the event loop, and neither touches the shared to_thread pool
         # — a stalled audit disk can't freeze the loop or starve bcrypt /
         # document reads.
-        audit_log.record_tool(name, arguments, user, result, is_write=is_write)
+        audit_log.record_tool(
+            name, arguments, user, result, is_write=is_write, protocol=protocol
+        )
         # Independent sink: usage analytics go to PG so they can be grouped, and
         # must NOT inherit the audit flags (audit is off by default and
         # `log_reads` would drop most tool calls).
@@ -1740,7 +1809,9 @@ async def call_tool(name: str, arguments: dict):
         # deliberately do NOT switch this MCP encode to `to_json`: it would shift
         # datetime/enum output for ~6 tools (put/get/update/move/edit/search) and
         # raise on the odd non-UTF8 bytes that `default=str` degrades to a string.
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, default=str))]
+        return CallToolResult(
+            content=[TextContent(type="text", text=json.dumps(result, ensure_ascii=False, default=str))]
+        )
     except Exception as e:
         # Last-resort envelope so the canonical {error, code, ...} shape
         # introduced in 0.5.6 holds for every response path — including
@@ -1760,17 +1831,49 @@ async def call_tool(name: str, arguments: dict):
         # failure lands here after a handler that actually succeeded).
         if not recorded:
             is_write = _required_scope(name, arguments) == _WRITE_SCOPE
-            audit_log.record_tool(name, arguments, user, envelope, is_write=is_write)
+            audit_log.record_tool(
+                name, arguments, user, envelope, is_write=is_write, protocol=protocol
+            )
             tool_usage.record(
                 name, arguments, user, envelope,
                 session_id=_session_id(),
                 duration_ms=int((time.perf_counter() - started) * 1000),
                 is_write=is_write,
             )
-        return [TextContent(
-            type="text",
-            text=json.dumps(envelope, ensure_ascii=False, default=str),
-        )]
+        return CallToolResult(
+            content=[
+                TextContent(
+                    type="text",
+                    text=json.dumps(envelope, ensure_ascii=False, default=str),
+                )
+            ]
+        )
+
+
+async def _list_tools_request(
+    ctx: Any, params: PaginatedRequestParams
+) -> ListToolsResult:
+    """Adapt the canonical catalog to the MCP 2.x request handler API."""
+    token = _request_context.set(ctx)
+    try:
+        return ListToolsResult(tools=await list_tools())
+    finally:
+        _request_context.reset(token)
+
+
+async def _call_tool_request(
+    ctx: Any, params: CallToolRequestParams
+) -> CallToolResult:
+    """Adapt the shared tool/auth core to the MCP 2.x request handler API."""
+    token = _request_context.set(ctx)
+    try:
+        return await call_tool(params.name, params.arguments or {})
+    finally:
+        _request_context.reset(token)
+
+
+server.add_request_handler("tools/list", PaginatedRequestParams, _list_tools_request)
+server.add_request_handler("tools/call", CallToolRequestParams, _call_tool_request)
 
 
 async def _dispatch(name: str, args: dict, user: "_MCPUser"):

@@ -63,7 +63,7 @@ def _dict_value(node: ast.expr, key: str) -> ast.expr:
 def _akb_put_schema_property_names() -> set[str]:
     tree = ast.parse((_MCP / "tools.py").read_text())
     call = _tool_call(tree, "akb_put")
-    schema = _kwarg_value(call, "inputSchema")
+    schema = _kwarg_value(call, "input_schema")
     props = _dict_value(schema, "properties")
     assert isinstance(props, ast.Dict)
     return {k.value for k in props.keys if isinstance(k, ast.Constant)}

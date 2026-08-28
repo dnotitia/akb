@@ -326,7 +326,7 @@ async def test_record_and_flush_write_each_field_to_its_own_column(db, monkeypat
         )
     assert dict(row) == {
         "tool": "akb_probe", "actor_id": "uid-1", "actor": "alice",
-        "session_id": "sess-9", "vault": "vlt", "outcome": "error",
+        "session_id": tool_usage._session_ref("sess-9"), "vault": "vlt", "outcome": "error",
         "code": "NOT_FOUND", "duration_ms": 77, "is_write": True,
     }
     tool_usage.reset()

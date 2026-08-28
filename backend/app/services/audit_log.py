@@ -43,6 +43,7 @@ import queue
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from app.config import settings
 from app.services._backfill import BackfillRunner
@@ -355,7 +356,12 @@ def _grep_replace_meta(args: dict, result) -> dict | None:
     }
 
 
-def _record_grep_replace_receipts(args: dict, user, result) -> None:
+def _record_grep_replace_receipts(
+    args: dict,
+    user,
+    result,
+    protocol: dict[str, str] | None = None,
+) -> None:
     """Emit one compact recovery receipt per committed grep replacement.
 
     The summary tool record cannot identify every document without becoming one
@@ -375,6 +381,11 @@ def _record_grep_replace_receipts(args: dict, user, result) -> None:
         target = f"uri={replacement['uri']}"
         if len(target) > _TARGET_MAX:
             target = target[:_TARGET_MAX] + "…"
+        receipt_meta: dict[str, Any] = dict(protocol or {})
+        receipt_meta.update({
+            "commit": replacement.get("commit"),
+            "previous_commit": replacement.get("previous_commit"),
+        })
         record(
             action="akb_grep.replace",
             actor=getattr(user, "username", None),
@@ -382,14 +393,19 @@ def _record_grep_replace_receipts(args: dict, user, result) -> None:
             vault=(args.get("vault") if isinstance(args, dict) else None),
             target=target,
             outcome="ok",
-            meta={
-                "commit": replacement.get("commit"),
-                "previous_commit": replacement.get("previous_commit"),
-            },
+            meta=receipt_meta,
         )
 
 
-def record_tool(name: str, args: dict, user, result, *, is_write: bool = False) -> None:
+def record_tool(
+    name: str,
+    args: dict,
+    user,
+    result,
+    *,
+    is_write: bool = False,
+    protocol: dict[str, str] | None = None,
+) -> None:
     """Audit one MCP tool call from the dispatch chokepoint. ``user`` is the
     resolved _MCPUser; ``result`` is the handler's return envelope (or the
     final error envelope) — outcome is derived from it.
@@ -417,7 +433,10 @@ def record_tool(name: str, args: dict, user, result, *, is_write: bool = False) 
         outcome = "error"
         code = result.get("code")
     if name == "akb_grep" and is_write:
-        _record_grep_replace_receipts(args, user, result)
+        _record_grep_replace_receipts(args, user, result, protocol)
+    audit_meta = dict(protocol or {})
+    if name == "akb_grep" and is_write:
+        audit_meta.update(_grep_replace_meta(args, result) or {})
     record(
         action=name,
         actor=getattr(user, "username", None),
@@ -426,7 +445,7 @@ def record_tool(name: str, args: dict, user, result, *, is_write: bool = False) 
         target=(_target_of(args) if isinstance(args, dict) else None),
         outcome=outcome,
         code=code,
-        meta=(_grep_replace_meta(args, result) if name == "akb_grep" and is_write else None),
+        meta=audit_meta or None,
     )
 
 
