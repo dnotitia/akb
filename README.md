@@ -393,7 +393,10 @@ secrets are write-only, and an enabled provider must be disabled before
 reconfiguration.
 See the [SSO provider guide](./docs/sso/README.md), the standards-based
 [generic OIDC integration](./docs/sso/providers/oidc.md), and the stricter
-[Keycloak OIDC reference](./docs/sso/providers/keycloak-oidc.md).
+[Keycloak OIDC reference](./docs/sso/providers/keycloak-oidc.md). Existing
+Kubernetes installations should also follow the
+[local-to-SSO cutover runbook](./docs/sso/kubernetes-cutover.md) instead of
+treating `auth_mode` as a rolling one-line configuration change.
 
 The dedicated admin callback stores no Keycloak access, refresh, or ID token.
 It creates a short-lived opaque HttpOnly admin cookie plus a CSRF token;
