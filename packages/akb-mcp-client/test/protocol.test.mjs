@@ -8,6 +8,8 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+import { Client } from "@modelcontextprotocol/client";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { AKBProxy } from "../lib/proxy.mjs";
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -18,6 +20,53 @@ const MODERN_META = {
   "io.modelcontextprotocol/clientCapabilities": {},
   "io.modelcontextprotocol/clientInfo": { name: "modern-test", version: "1" },
 };
+const FILE_TOOL_NAMES = [
+  "akb_put_file",
+  "akb_put_image",
+  "akb_discard_image",
+  "akb_get_file",
+  "akb_update_file",
+  "akb_delete_file",
+];
+const DEFAULT_BACKEND_TOOLS = [{
+  name: "akb_search",
+  description: "search",
+  inputSchema: { type: "object", properties: {} },
+}];
+const RICH_BACKEND_TOOLS = [
+  {
+    name: "akb_search",
+    description: "search",
+    inputSchema: {
+      type: "object",
+      properties: { query: { type: "string" } },
+      additionalProperties: false,
+    },
+    annotations: {
+      title: "Search",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "akb_custom",
+    description: "preserve this tool contract",
+    inputSchema: {
+      type: "object",
+      properties: { mode: { type: "string" } },
+      additionalProperties: false,
+    },
+    annotations: {
+      title: "Custom",
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+];
 
 function waitForLine(lines, id, timeoutMs = 3000) {
   const existing = lines.find((line) => line?.id === id);
@@ -32,7 +81,7 @@ function waitForLine(lines, id, timeoutMs = 3000) {
   });
 }
 
-async function fakeBackend({ legacyOnly = false } = {}) {
+async function fakeBackend({ legacyOnly = false, tools = DEFAULT_BACKEND_TOOLS } = {}) {
   const requests = [];
   const server = createServer(async (req, res) => {
     let raw = "";
@@ -64,13 +113,7 @@ async function fakeBackend({ legacyOnly = false } = {}) {
         capabilities: { tools: { listChanged: true } },
       };
     } else if (body.method === "tools/list") {
-      result = {
-        tools: [{
-          name: "akb_search",
-          description: "search",
-          inputSchema: { type: "object", properties: {} },
-        }],
-      };
+      result = { tools };
     } else {
       result = { content: [{ type: "text", text: "{}" }], isError: false };
     }
@@ -134,6 +177,77 @@ async function runProxy(url, messages) {
   }
 }
 
+async function withExternalModernClient(url, fn, { connectTimeoutMs = 50 } = {}) {
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [proxyEntrypoint, "--url", url, "--pat", "akb_test"],
+    cwd: packageRoot,
+    env: {
+      PATH: process.env.PATH || "",
+      AKB_MCP_CONNECT_TIMEOUT_MS: String(connectTimeoutMs),
+    },
+    stderr: "pipe",
+  });
+  transport.stderr?.resume();
+  const client = new Client(
+    { name: "akb-235-external-parser", version: "1" },
+    { versionNegotiation: { mode: { pin: "2026-07-28" } } },
+  );
+
+  try {
+    await client.connect(transport, { timeout: 3000 });
+    return await fn(client);
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
+async function testModernDegradedProcessWithExternalParser() {
+  await withExternalModernClient("http://127.0.0.1:1/mcp/", async (client) => {
+    const result = await client.listTools();
+
+    assert.equal(result.ttlMs, 0, "degraded modern tools/list is immediately stale");
+    assert.equal(result.cacheScope, "private", "degraded modern tools/list is private");
+    assert.deepEqual(
+      result.tools.map((tool) => tool.name),
+      FILE_TOOL_NAMES,
+      "degraded catalog still exposes only proxy-local file tools",
+    );
+  });
+}
+
+async function testModernReachableProcessWithExternalParser() {
+  const backend = await fakeBackend({ tools: RICH_BACKEND_TOOLS });
+  try {
+    await withExternalModernClient(backend.url, async (client) => {
+      const result = await client.listTools();
+
+      assert.equal(result.ttlMs, 0, "reachable modern tools/list is immediately stale");
+      assert.equal(result.cacheScope, "private", "reachable modern tools/list is private");
+      assert.deepEqual(
+        result.tools.slice(0, RICH_BACKEND_TOOLS.length),
+        RICH_BACKEND_TOOLS,
+        "backend tool schemas, ordering, and annotations are preserved",
+      );
+      assert.deepEqual(
+        result.tools.map((tool) => tool.name),
+        [...RICH_BACKEND_TOOLS.map((tool) => tool.name), ...FILE_TOOL_NAMES],
+        "proxy-local tools remain appended to the backend catalog",
+      );
+      assert.ok(backend.requests.some((request) => request.body.method === "tools/list"));
+      for (const request of backend.requests) {
+        assert.equal(request.headers.authorization, "Bearer akb_test");
+      }
+
+      const toolResult = await client.callTool({ name: "akb_search", arguments: {} });
+      assert.equal(toolResult.ttlMs, undefined, "cache metadata stays on tools/list only");
+      assert.equal(toolResult.cacheScope, undefined, "cache metadata stays on tools/list only");
+    }, { connectTimeoutMs: 1000 });
+  } finally {
+    await backend.close();
+  }
+}
+
 async function testModernProcess() {
   const backend = await fakeBackend();
   try {
@@ -143,7 +257,11 @@ async function testModernProcess() {
     ]);
     assert.equal(responses[0].result.supportedVersions[0], "2026-07-28");
     assert.equal(responses[0].result.resultType, "complete");
+    assert.equal(responses[0].result.ttlMs, undefined);
+    assert.equal(responses[0].result.cacheScope, undefined);
     assert.equal(responses[1].result.resultType, "complete");
+    assert.equal(responses[1].result.ttlMs, 0);
+    assert.equal(responses[1].result.cacheScope, "private");
     assert.ok(responses[1].result.tools.some((tool) => tool.name === "akb_put_file"));
     assert.ok(responses[1].result._meta["io.modelcontextprotocol/serverInfo"]);
 
@@ -182,6 +300,8 @@ async function testLegacyProcess() {
     assert.equal(responses[0].result.protocolVersion, "2025-06-18");
     assert.equal(responses[1].result.resultType, undefined);
     assert.equal(responses[1].result._meta, undefined);
+    assert.equal(responses[1].result.ttlMs, undefined);
+    assert.equal(responses[1].result.cacheScope, undefined);
     assert.ok(responses[1].result.tools.some((tool) => tool.name === "akb_search"));
 
     for (const request of backend.requests) {
@@ -266,6 +386,8 @@ async function testGenerationMixingIsFailClosed() {
   assert.equal(legacyHandshake.error.code, -32022);
 }
 
+await testModernDegradedProcessWithExternalParser();
+await testModernReachableProcessWithExternalParser();
 await testModernProcess();
 await testLegacyProcess();
 await testLegacyBackendFallback();

@@ -414,6 +414,14 @@ function modernResult(result) {
   return output;
 }
 
+function modernToolsListResult(result) {
+  return {
+    ...modernResult(result),
+    ttlMs: 0,
+    cacheScope: "private",
+  };
+}
+
 function legacyResult(result) {
   const output = isObject(result) ? { ...result } : {};
   delete output.resultType;
@@ -649,6 +657,12 @@ export class AKBProxy {
     return this._clientGeneration === "modern" ? modernResult(result) : legacyResult(result);
   }
 
+  _clientToolsListResult(result) {
+    return this._clientGeneration === "modern"
+      ? modernToolsListResult(result)
+      : legacyResult(result);
+  }
+
   _vaultSkillCallKey(params) {
     if (!params?.name || !params.arguments || typeof params.arguments !== "object") {
       return null;
@@ -826,11 +840,11 @@ export class AKBProxy {
       return {
         jsonrpc: "2.0",
         id,
-        result: this._clientResult({ tools: this._fileToolsForClient() }),
+        result: this._clientToolsListResult({ tools: this._fileToolsForClient() }),
       };
     }
 
-    return { jsonrpc: "2.0", id, result: this._clientResult(this._decorateTools(resp)) };
+    return { jsonrpc: "2.0", id, result: this._clientToolsListResult(this._decorateTools(resp)) };
   }
 
   // ── File-to-content resolution ─────────────────────────

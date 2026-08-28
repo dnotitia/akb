@@ -176,6 +176,22 @@ itAsync("tools/list serves the full decorated list from cache", async () => {
   );
 });
 
+itAsync("modern tools/list cache metadata covers degraded and cached catalogs", async () => {
+  const proxy = newProxy();
+  proxy._clientGeneration = "modern";
+  proxy._startBackendMonitor = () => {};
+  proxy._ensureBackend = async () => false;
+
+  const degraded = await proxy._toolsList(4, {});
+  assert.equal(degraded.result.ttlMs, 0, "degraded catalog expires immediately");
+  assert.equal(degraded.result.cacheScope, "private", "degraded catalog is private");
+
+  proxy._cachedTools = { tools: [{ name: "akb_search", inputSchema: { type: "object" } }] };
+  const cached = await proxy._toolsList(5, {});
+  assert.equal(cached.result.ttlMs, 0, "cached catalog expires immediately");
+  assert.equal(cached.result.cacheScope, "private", "cached catalog is private");
+});
+
 // ── background monitor recovers the toolset after an outage ──────────
 
 itAsync("monitor emits tools/list_changed after backend recovers from a degraded list", async () => {
