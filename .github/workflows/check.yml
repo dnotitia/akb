@@ -41,6 +41,12 @@ jobs:
           cache-dependency-path: |
             frontend/pnpm-lock.yaml
             packages/akb-client/pnpm-lock.yaml
+      - name: Install stdio proxy deps
+        working-directory: packages/akb-mcp-client
+        run: npm ci
+      - name: Test stdio proxy
+        working-directory: packages/akb-mcp-client
+        run: npm test
       - name: Install frontend deps
         working-directory: frontend
         # `--ignore-scripts` skips package postinstall hooks. We don't need

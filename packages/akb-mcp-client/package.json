@@ -10,6 +10,9 @@
     "test": "node test/contract.test.mjs && node test/reconnect.test.mjs && node test/protocol.test.mjs"
   },
   "type": "module",
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.0.0"
+  },
   "files": ["bin/", "lib/", "CHANGELOG.md"],
   "keywords": ["mcp", "akb", "knowledge-base", "claude-code", "cursor", "copilot", "ai-agent"],
   "license": "MIT",
