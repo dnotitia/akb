@@ -51,10 +51,6 @@ export class DiagnosticError extends Error {
   }
 }
 
-function usage(message) {
-  return new DiagnosticError(FAILURE_CLASSES.usage, message);
-}
-
 function configuration(message) {
   return new DiagnosticError(FAILURE_CLASSES.usage, message);
 }
@@ -238,7 +234,7 @@ export function validateDescriptor(descriptor, target = "http") {
     throw configuration("descriptor must be a ready schema-v2 descriptor");
   }
   const scenario = requireNonEmptyString(descriptor.scenario, "descriptor scenario is missing");
-  if (!["http", "stdio", "both"].includes(target)) throw usage("target must be http, stdio, or both");
+  if (!["http", "stdio", "both"].includes(target)) throw configuration("target must be http, stdio, or both");
 
   const services = requireRecord(descriptor.services, "descriptor is missing services");
   const app = requireRecord(services.app, "descriptor is missing app service");
@@ -386,7 +382,7 @@ export function parseArguments(argv) {
       allowPositionals: false,
     }));
   } catch {
-    throw usage("invalid command options");
+    throw configuration("invalid command options");
   }
   const result = {
     intent: typeof values.intent === "string" ? values.intent : null,
@@ -395,12 +391,12 @@ export function parseArguments(argv) {
     help: values.help === true,
   };
   if (result.help) return result;
-  if (!["interactive", "smoke"].includes(result.intent)) throw usage("intent must be interactive or smoke");
-  if (!["http", "stdio", "both"].includes(result.target)) throw usage("target must be http, stdio, or both");
+  if (!["interactive", "smoke"].includes(result.intent)) throw configuration("intent must be interactive or smoke");
+  if (!["http", "stdio", "both"].includes(result.target)) throw configuration("target must be http, stdio, or both");
   if (result.intent === "interactive" && result.target === "both") {
-    throw usage("interactive intent accepts one explicit target at a time");
+    throw configuration("interactive intent accepts one explicit target at a time");
   }
-  if (!result.descriptor) throw usage("descriptor path is required");
+  if (!result.descriptor) throw configuration("descriptor path is required");
   return result;
 }
 
@@ -667,7 +663,6 @@ function spawnResult(child, stdout, stderr, code, signal, error = null) {
 export async function runInspectorInvocation({
   info,
   descriptor,
-  target,
   config,
   method,
   representative,
@@ -811,11 +806,10 @@ function observableMatches(publicResult, isError, observable) {
     && publicResult.total >= publicResult.returned;
 }
 
-async function runOperation({ info, descriptor, target, config, method, discovery, runtimeRoot, secrets, spawnProcess }) {
+async function runOperation({ info, descriptor, config, method, discovery, runtimeRoot, secrets, spawnProcess }) {
   const invocation = await runInspectorInvocation({
     info,
     descriptor,
-    target,
     config,
     method,
     representative: discovery.representative,
@@ -987,7 +981,6 @@ async function runTransport({ target, info, descriptor, discovery, credential, r
     const operation = await runOperation({
       info,
       descriptor,
-      target,
       config,
       method,
       discovery,
@@ -1148,7 +1141,6 @@ export async function runInteractive({ info, descriptor, target, fetchImpl = glo
     const result = await runInspectorInvocation({
       info,
       descriptor: validated,
-      target,
       config,
       method: "interactive",
       representative: discovery.representative,
