@@ -675,8 +675,16 @@ export async function runInspectorInvocation({
   });
   if (interactive) {
     child.stdin.end(`${JSON.stringify(config)}\n`);
-    const code = await new Promise((resolveCode) => child.once("close", (value, signal) => resolveCode(value ?? 1)));
-    return spawnResult(child, "", "", code, null);
+    const forwardSignal = (signal) => { child.kill(signal); };
+    process.once("SIGINT", forwardSignal);
+    process.once("SIGTERM", forwardSignal);
+    try {
+      const result = await new Promise((resolveResult) => child.once("close", (value, signal) => resolveResult(spawnResult(child, "", "", value ?? 1, signal))));
+      return result;
+    } finally {
+      process.off("SIGINT", forwardSignal);
+      process.off("SIGTERM", forwardSignal);
+    }
   }
   let stdout = "";
   let stderr = "";
