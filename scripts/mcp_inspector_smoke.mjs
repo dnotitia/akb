@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { parseArgs as parseNodeArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { spawn as nodeSpawn } from "node:child_process";
 
@@ -371,21 +372,28 @@ export function configDigest(config, secrets = []) {
 }
 
 export function parseArguments(argv) {
-  const result = { intent: null, target: null, descriptor: null, help: false };
-  for (let index = 0; index < argv.length; index += 1) {
-    const option = argv[index];
-    if (option === "--help" || option === "-h") {
-      result.help = true;
-      continue;
-    }
-    if (!["--intent", "--target", "--descriptor"].includes(option)) {
-      throw usage("unknown command option");
-    }
-    const value = argv[index + 1];
-    if (!value || value.startsWith("--")) throw usage(`${option} requires a value`);
-    result[option.slice(2)] = value;
-    index += 1;
+  let values;
+  try {
+    ({ values } = parseNodeArgs({
+      args: argv,
+      options: {
+        intent: { type: "string" },
+        target: { type: "string" },
+        descriptor: { type: "string" },
+        help: { type: "boolean", short: "h" },
+      },
+      strict: true,
+      allowPositionals: false,
+    }));
+  } catch {
+    throw usage("invalid command options");
   }
+  const result = {
+    intent: typeof values.intent === "string" ? values.intent : null,
+    target: typeof values.target === "string" ? values.target : null,
+    descriptor: typeof values.descriptor === "string" ? values.descriptor : null,
+    help: values.help === true,
+  };
   if (result.help) return result;
   if (!["interactive", "smoke"].includes(result.intent)) throw usage("intent must be interactive or smoke");
   if (!["http", "stdio", "both"].includes(result.target)) throw usage("target must be http, stdio, or both");
