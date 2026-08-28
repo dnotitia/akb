@@ -1505,7 +1505,6 @@ export class AKBProxy {
       ...source,
       _meta: {
         [PROTOCOL_VERSION_META_KEY]: MODERN_PROTOCOL_VERSION,
-        [CLIENT_CAPABILITIES_META_KEY]: backendCapabilities,
         [CLIENT_INFO_META_KEY]: isObject(this._clientInfo)
           ? this._clientInfo
           : { name: "akb-mcp-client", version: PROXY_VERSION },
