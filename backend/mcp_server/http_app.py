@@ -367,6 +367,35 @@ class MCPApp:
                 )
                 return
 
+            # A legacy transport may create a stateful SDK session only for
+            # its initial initialize handshake. Reject every other sessionless
+            # POST before the manager can mint a transport (and its response
+            # session header). Unsupported carriers continue to the modern
+            # classifier so they receive their typed version error instead.
+            legacy_carrier = (
+                header_version is None
+                or header_version in HANDSHAKE_PROTOCOL_VERSIONS
+            )
+            legacy_initialize = (
+                decoded is not None
+                and decoded.get("method") == "initialize"
+            )
+            if (
+                request.method == "POST"
+                and session_id is None
+                and legacy_carrier
+                and not legacy_initialize
+            ):
+                await _protocol_error(
+                    scope,
+                    receive,
+                    send,
+                    request_id=request_id,
+                    code=INVALID_REQUEST,
+                    message="Missing session ID",
+                )
+                return
+
             routed_receive = _replay_body(body)
 
         manager_send = send

@@ -119,6 +119,61 @@ async def test_modern_and_all_legacy_revisions_share_one_authenticated_endpoint(
 
 
 @pytest.mark.asyncio
+async def test_sessionless_legacy_post_fails_before_session_creation(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
+    alice = _user("alice")
+    monkeypatch.setattr(http_app, "resolve_mcp_authorization", lambda _header: _resolved(alice))
+
+    app = MCPApp()
+    async with app.run():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            modern = await _post(
+                client,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "server/discover",
+                    "params": {"_meta": _modern_meta()},
+                },
+                **{
+                    "mcp-protocol-version": "2026-07-28",
+                    "mcp-method": "server/discover",
+                },
+            )
+            assert modern.status_code == 200
+            assert modern.headers.get("mcp-session-id") is None
+
+            invalid_legacy = await _post(
+                client,
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            )
+            assert invalid_legacy.status_code == 400
+            assert invalid_legacy.json()["error"] == {
+                "code": -32600,
+                "message": "Missing session ID",
+            }
+            assert invalid_legacy.headers.get("mcp-session-id") is None
+
+            initialize = await _post(
+                client,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "legacy", "version": "1"},
+                    },
+                },
+            )
+            assert initialize.status_code == 200
+            assert initialize.headers.get("mcp-session-id")
+
+
+@pytest.mark.asyncio
 async def test_protocol_conflicts_fail_before_dispatch_or_session_creation(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
     alice = _user("alice")
