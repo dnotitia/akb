@@ -217,7 +217,6 @@ test("run-scoped config is sent over stdin and secrets never enter Inspector arg
   const result = await runInspectorInvocation({
     info: { entry: "/private/inspector.js" },
     descriptor: validateDescriptor(d, "http"),
-    target: "http",
     config,
     method: "initialize",
     representative: { tool: "akb_list_vaults", arguments: {} },
