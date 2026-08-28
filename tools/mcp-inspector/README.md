@@ -4,6 +4,11 @@ This private package owns the exact `@modelcontextprotocol/inspector@2.4.0`
 development dependency used by the repository's consumer smoke. It is not a
 runtime dependency of `akb-mcp` and is not published.
 
+The command hands each run's in-memory configuration to the public Inspector
+launcher through a private ephemeral FIFO. It does not use `/dev/stdin`, a
+secret-bearing regular file, or an argv header; the FIFO is removed after the
+child exits.
+
 Install and run the shared repository entrypoint:
 
 ```bash

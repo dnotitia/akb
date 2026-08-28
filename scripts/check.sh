@@ -231,7 +231,7 @@ step "packed SDK consumer proof (@akb/client)"
 
 # ─── MCP Inspector: repository consumer contract ─────────────────
 # The live HTTP+stdio consumer gate runs in the isolated E2E workflow. This
-# cheap contract suite keeps the shared entrypoint, preflight, stdin config,
+# cheap contract suite keeps the shared entrypoint, preflight, private FIFO config,
 # redaction, and stable failure taxonomy executable in every contributor gate.
 step "MCP Inspector consumer contract"
 npm test --prefix tools/mcp-inspector

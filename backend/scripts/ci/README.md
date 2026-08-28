@@ -150,9 +150,11 @@ For an interactive session, use `serve --profile transport-proxy` when the
 stdio target is needed. The Web client is explicitly bound to `127.0.0.1` and
 keeps Inspector's normal launch/session authentication. The command reads the
 credential environment names declared by discovery, mints a run-scoped PAT
-when one is not already present, and sends Inspector configuration through
-stdin. It does not put credentials in argv, a checked-in/generated config, or
-Inspector's persistent OAuth/secret stores.
+when one is not already present, and sends Inspector configuration through a
+private, ephemeral FIFO. The FIFO carries in-memory JSON and is unlinked after
+each child exits; it is not a regular config file. The command does not put
+credentials in argv, a checked-in/generated config, or Inspector's persistent
+OAuth/secret stores.
 
 Smoke pins the modern protocol era and runs, in order, `initialize`,
 `tools/list --strict --format json`, and the discovery-declared read-only

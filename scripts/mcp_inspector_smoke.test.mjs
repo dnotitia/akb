@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawn } from "node:child_process";
 import test from "node:test";
 
 import {
+  createConfigFifo,
   FAILURE_CLASSES,
-  INSPECTOR_CONFIG_STDIN,
   MODERN_PROTOCOL_VERSION,
   buildInspectorConfig,
   classifyInspectorFailure,
@@ -19,6 +23,7 @@ import {
   stableStringify,
   validateDescriptor,
   validateRuntimeDiscovery,
+  writeConfigToFifo,
 } from "./mcp_inspector_smoke.mjs";
 
 const marker = "synthetic-secret-marker";
@@ -165,11 +170,14 @@ test("schema-v2 descriptor is the only target source and requires modern discove
 test("Inspector public executable invocation keeps exact JSON args out of coercion", () => {
   const info = { entry: "/private/inspector/clients/launcher/build/index.js" };
   const representative = { tool: "akb_list_vaults", arguments: { nested: { value: "012" }, enabled: false } };
-  const args = inspectorArguments(info, "tools/call", representative);
+  const args = inspectorArguments(info, "tools/call", representative, {
+    configPath: "/private/run-scoped-inspector/inspector-config.fifo",
+  });
   assert.ok(args.includes("--cli"));
   assert.ok(args.includes("--stored-auth-only"));
   assert.ok(args.includes("--config"));
-  assert.ok(args.includes(INSPECTOR_CONFIG_STDIN));
+  assert.ok(args.includes("/private/run-scoped-inspector/inspector-config.fifo"));
+  assert.equal(args.includes("/dev/stdin"), false);
   assert.equal(args[args.indexOf("--tool-args-json") + 1], JSON.stringify(representative.arguments));
   assert.ok(!args.includes(marker));
 });
@@ -192,18 +200,21 @@ test("Inspector exit classes remain stable", () => {
   assert.equal(classifyInspectorFailure(1, "initialize"), FAILURE_CLASSES.usage);
 });
 
-test("run-scoped config is sent over stdin and secrets never enter Inspector argv", async () => {
+test("run-scoped config uses a private FIFO and secrets never enter Inspector argv", async () => {
   let captured = null;
   const spawnProcess = (_command, args, options) => {
     captured = { args, options };
     const child = new EventEmitter();
-    child.stdin = new EventEmitter();
-    child.stdin.end = (value) => { captured.config = JSON.parse(value); };
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
-    queueMicrotask(() => {
+    const configPath = args[args.indexOf("--config") + 1];
+    void readFile(configPath, "utf8").then((value) => {
+      captured.config = JSON.parse(value);
       child.stdout.emit("data", `${JSON.stringify({ result: { protocolVersion: MODERN_PROTOCOL_VERSION, serverInfo: { name: "akb", version: "1" } } })}\n`);
       child.emit("close", 0, null);
+    }).catch((error) => {
+      child.stderr.emit("data", `${error.code || "config_read_error"}\n`);
+      child.emit("close", 1, null);
     });
     return child;
   };
@@ -214,20 +225,119 @@ test("run-scoped config is sent over stdin and secrets never enter Inspector arg
     http: { url: "http://127.0.0.1:8000/mcp/" },
     representative: { tool: "akb_list_vaults", arguments: {} },
   }, marker, null);
-  const result = await runInspectorInvocation({
-    info: { entry: "/private/inspector.js" },
-    descriptor: validateDescriptor(d, "http"),
-    config,
-    method: "initialize",
+  const runtimeRoot = await mkdtemp(join(tmpdir(), "akb-inspector-handoff-test-"));
+  try {
+    const result = await runInspectorInvocation({
+      info: { entry: "/private/inspector.js" },
+      descriptor: validateDescriptor(d, "http"),
+      config,
+      method: "initialize",
+      representative: { tool: "akb_list_vaults", arguments: {} },
+      runtimeRoot,
+      spawnProcess,
+    });
+    assert.equal(result.code, 0);
+    assert.equal(captured.args.includes(marker), false);
+    assert.equal(captured.args.includes("/dev/stdin"), false);
+    assert.equal(captured.args.includes(join(runtimeRoot, "inspector-config.fifo")), true);
+    assert.equal(captured.config.mcpServers.akb.headers.Authorization, `Bearer ${marker}`);
+    assert.equal(captured.options.env.AKB_E2E_PASSWORD, undefined);
+    assert.equal(captured.options.stdio[0], "ignore");
+    assert.equal(captured.options.env.MCP_INSPECTOR_SECRET_STORE, "memory");
+    await assert.rejects(stat(join(runtimeRoot, "inspector-config.fifo")), { code: "ENOENT" });
+  } finally {
+    await rm(runtimeRoot, { recursive: true, force: true });
+  }
+});
+
+test("a child can reopen the private FIFO and the handoff leaves no config state", async () => {
+  const runtimeRoot = await mkdtemp(join(tmpdir(), "akb-inspector-fifo-regression-"));
+  const fifoPath = join(runtimeRoot, "config.fifo");
+  const config = { marker };
+  let child = null;
+  let stdout = "";
+  let stderr = "";
+  try {
+    await createConfigFifo(fifoPath);
+    child = spawn(process.execPath, [
+      "-e",
+      "const { readFile } = require('node:fs/promises'); readFile(process.argv[1], 'utf8').then(value => process.stdout.write(value)).catch(error => { process.stderr.write(error.code || 'read_error'); process.exitCode = 1; });",
+      fifoPath,
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    const resultPromise = new Promise((resolveResult) => child.once("close", (code, signal) => resolveResult({ code, signal })));
+    await writeConfigToFifo(fifoPath, config, child);
+    const result = await resultPromise;
+    assert.equal(result.code, 0, stderr);
+    assert.deepEqual(JSON.parse(stdout), config);
+    assert.equal((await stat(fifoPath)).isFIFO(), true);
+  } finally {
+    if (child && child.exitCode === null && child.signalCode === null) child.kill();
+    await rm(fifoPath, { force: true });
+    await rm(runtimeRoot, { recursive: true, force: true });
+  }
+  assert.equal(stdout.includes(marker), true);
+  assert.equal(stderr.includes(marker), false);
+  await assert.rejects(stat(fifoPath), { code: "ENOENT" });
+});
+
+test("interactive Inspector also receives config through the private FIFO", async () => {
+  let captured = null;
+  const d = descriptor();
+  const config = buildInspectorConfig("http", { ...validateDescriptor(d, "http"), credentials: d.credentials }, {
+    protocolEra: "modern",
+    protocolVersion: MODERN_PROTOCOL_VERSION,
+    http: { url: "http://127.0.0.1:8000/mcp/" },
     representative: { tool: "akb_list_vaults", arguments: {} },
-    runtimeRoot: "/tmp/run-scoped-inspector",
-    spawnProcess,
-  });
+  }, marker, null);
+  const runtimeRoot = await mkdtemp(join(tmpdir(), "akb-inspector-interactive-test-"));
+  const spawnProcess = (_command, args, options) => {
+    captured = { args, options };
+    const child = new EventEmitter();
+    const configPath = args[args.indexOf("--config") + 1];
+    void readFile(configPath, "utf8").then((value) => {
+      captured.config = JSON.parse(value);
+      child.emit("close", 0, null);
+    });
+    return child;
+  };
+  try {
+    const result = await runInspectorInvocation({
+      info: { entry: "/private/inspector.js" },
+      descriptor: validateDescriptor(d, "http"),
+      config,
+      method: "interactive",
+      representative: { tool: "akb_list_vaults", arguments: {} },
+      runtimeRoot,
+      spawnProcess,
+      interactive: true,
+    });
+    assert.equal(result.code, 0);
+    assert.equal(captured.args.includes("--web"), true);
+    assert.equal(captured.args.includes(marker), false);
+    assert.equal(captured.args.includes(join(runtimeRoot, "inspector-config.fifo")), true);
+    assert.equal(captured.config.mcpServers.akb.headers.Authorization, `Bearer ${marker}`);
+    assert.deepEqual(captured.options.stdio, ["ignore", "inherit", "inherit"]);
+    await assert.rejects(stat(join(runtimeRoot, "inspector-config.fifo")), { code: "ENOENT" });
+  } finally {
+    await rm(runtimeRoot, { recursive: true, force: true });
+  }
+});
+
+test("Linux reproduces the Inspector /dev/stdin reopen failure that the FIFO avoids", {
+  skip: process.platform !== "linux",
+}, async () => {
+  const child = spawn(process.execPath, [
+    "-e",
+    "const { readFile } = require('node:fs/promises'); readFile('/dev/stdin', 'utf8').then(() => process.exitCode = 2).catch(error => { process.stdout.write(error.code || 'read_error'); });",
+  ], { stdio: ["pipe", "pipe", "pipe"] });
+  let stdout = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+  child.stdin.end('{"config":"run-scoped"}\n');
+  const result = await new Promise((resolveResult) => child.once("close", (code, signal) => resolveResult({ code, signal })));
   assert.equal(result.code, 0);
-  assert.equal(captured.args.includes(marker), false);
-  assert.equal(captured.options.env.AKB_E2E_PASSWORD, undefined);
-  assert.equal(captured.config.mcpServers.akb.headers.Authorization, `Bearer ${marker}`);
-  assert.equal(captured.options.env.MCP_INSPECTOR_SECRET_STORE, "memory");
+  assert.equal(stdout, "ENXIO");
 });
 
 test("smoke uses the declared reset, credential, and operation sequence", async () => {
@@ -255,11 +365,10 @@ test("smoke uses the declared reset, credential, and operation sequence", async 
   const spawnProcess = (_command, args, options) => {
     spawnArgs.push({ args, options });
     const child = new EventEmitter();
-    child.stdin = new EventEmitter();
-    child.stdin.end = () => {};
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
-    queueMicrotask(() => {
+    const configPath = args[args.indexOf("--config") + 1];
+    void readFile(configPath, "utf8").then(() => {
       const method = args[args.indexOf("--method") + 1];
       const result = method === "initialize"
         ? { serverInfo: { name: "akb-mcp", version: "2.3.0" }, protocolVersion: MODERN_PROTOCOL_VERSION, capabilities: { tools: {} } }
@@ -269,6 +378,9 @@ test("smoke uses the declared reset, credential, and operation sequence", async 
       child.stderr.emit("data", "diagnostic: akb_minted_pat\n");
       child.stdout.emit("data", `${JSON.stringify({ result })}\n`);
       child.emit("close", 0, null);
+    }).catch((error) => {
+      child.stderr.emit("data", `${error.code || "config_read_error"}\n`);
+      child.emit("close", 1, null);
     });
     return child;
   };
@@ -289,6 +401,7 @@ test("smoke uses the declared reset, credential, and operation sequence", async 
     });
     assert.equal(validated.scenario, "empty");
     assert.equal(output.status, "passed");
+    assert.equal(output.inspector.config_handoff, "private_fifo");
     assert.deepEqual(output.transports.http.operation_order, ["initialize", "tools/list", "tools/call"]);
     assert.equal(output.transports.http.operations[2].observable_match, true);
     assert.equal(output.transports.http.config_digest.startsWith("sha256:"), true);

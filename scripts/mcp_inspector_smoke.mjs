@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { mkdtemp, open, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { parseArgs as parseNodeArgs } from "node:util";
 import { fileURLToPath } from "node:url";
-import { spawn as nodeSpawn } from "node:child_process";
+import { execFile as nodeExecFile, spawn as nodeSpawn } from "node:child_process";
+import { promisify } from "node:util";
 
 export const INSPECTOR_PACKAGE = "@modelcontextprotocol/inspector";
 export const INSPECTOR_VERSION = "2.4.0";
@@ -14,7 +16,7 @@ export const INSPECTOR_BIN = "clients/launcher/build/index.js";
 export const MIN_NODE_VERSION = "22.19.0";
 export const SCHEMA_VERSION = 2;
 export const MODERN_PROTOCOL_VERSION = "2026-07-28";
-export const INSPECTOR_CONFIG_STDIN = "/dev/stdin";
+export const CONFIG_HANDOFF = "private_fifo";
 export const SERVER_NAME = "akb";
 
 export const FAILURE_CLASSES = Object.freeze({
@@ -42,6 +44,9 @@ const SERVER_INFO_META_KEY = "io.modelcontextprotocol/serverInfo";
 const SOURCE_REVISION_RE = /^[0-9a-f]{40,64}$/i;
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MAX_DIAGNOSTIC_CHARS = 4000;
+const CONFIG_FIFO_NAME = "inspector-config.fifo";
+const FIFO_RETRY_DELAY_MS = 10;
+const execFile = promisify(nodeExecFile);
 
 export class DiagnosticError extends Error {
   constructor(failureClass, message, options = {}) {
@@ -289,9 +294,7 @@ export async function loadDescriptor(source) {
 }
 
 async function readStdin() {
-  const chunks = [];
-  for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
-  return Buffer.concat(chunks).toString("utf8");
+  return readFile(0, "utf8");
 }
 
 export async function inspectInstallation({ toolingRoot = TOOLING_ROOT, nodeVersion = process.versions.node } = {}) {
@@ -642,9 +645,16 @@ function childEnvironment(runtimeRoot, descriptor, interactive = false) {
   return environment;
 }
 
-export function inspectorArguments(info, method, representative = null, { interactive = false, strict = false } = {}) {
+export function inspectorArguments(info, method, representative = null, {
+  configPath,
+  interactive = false,
+  strict = false,
+} = {}) {
+  if (typeof configPath !== "string" || configPath.length === 0) {
+    throw configuration("private Inspector config handoff path is missing");
+  }
   const args = [info.entry];
-  args.push(interactive ? "--web" : "--cli", "--config", INSPECTOR_CONFIG_STDIN);
+  args.push(interactive ? "--web" : "--cli", "--config", configPath);
   if (!interactive) {
     args.push("--stored-auth-only", "--server", SERVER_NAME, "--method", method);
     if (strict) args.push("--strict");
@@ -656,8 +666,45 @@ export function inspectorArguments(info, method, representative = null, { intera
   return args;
 }
 
-function spawnResult(child, stdout, stderr, code, signal, error = null) {
-  return { child, stdout, stderr, code, signal, error };
+export async function createConfigFifo(fifoPath) {
+  if (process.platform === "win32") {
+    throw configuration("private FIFO Inspector config handoff is unavailable on Windows");
+  }
+  try {
+    await execFile("mkfifo", ["-m", "600", fifoPath], {
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+      windowsHide: true,
+    });
+    const fifo = await stat(fifoPath);
+    if (!fifo.isFIFO() || (fifo.mode & 0o077) !== 0) throw new Error("invalid FIFO permissions");
+  } catch {
+    throw configuration("could not create the private Inspector config handoff");
+  }
+}
+
+export async function writeConfigToFifo(fifoPath, config, child) {
+  const payload = `${JSON.stringify(config)}\n`;
+  while (child.exitCode == null && child.signalCode == null) {
+    let handle;
+    try {
+      handle = await open(fifoPath, fsConstants.O_WRONLY | fsConstants.O_NONBLOCK);
+    } catch (error) {
+      if (error?.code !== "ENXIO" && error?.code !== "EAGAIN") {
+        throw configuration("could not open the private Inspector config handoff");
+      }
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, FIFO_RETRY_DELAY_MS));
+      continue;
+    }
+    try {
+      await handle.writeFile(payload, "utf8");
+    } catch {
+      throw configuration("could not write the private Inspector config handoff");
+    } finally {
+      await handle.close();
+    }
+    return;
+  }
+  throw configuration("Inspector exited before reading the private config handoff");
 }
 
 export async function runInspectorInvocation({
@@ -670,37 +717,57 @@ export async function runInspectorInvocation({
   spawnProcess = nodeSpawn,
   interactive = false,
 }) {
-  const args = inspectorArguments(info, method, representative, { interactive, strict: method === "tools/list" });
-  const child = spawnProcess(process.execPath, args, {
-    cwd: REPOSITORY_ROOT,
-    env: childEnvironment(runtimeRoot, descriptor, interactive),
-    stdio: interactive ? ["pipe", "inherit", "inherit"] : ["pipe", "pipe", "pipe"],
-  });
-  if (interactive) {
-    child.stdin.end(`${JSON.stringify(config)}\n`);
-    const forwardSignal = (signal) => { child.kill(signal); };
-    process.once("SIGINT", forwardSignal);
-    process.once("SIGTERM", forwardSignal);
-    try {
-      const result = await new Promise((resolveResult) => child.once("close", (value, signal) => resolveResult(spawnResult(child, "", "", value ?? 1, signal))));
-      return result;
-    } finally {
-      process.off("SIGINT", forwardSignal);
-      process.off("SIGTERM", forwardSignal);
+  const fifoPath = join(runtimeRoot, CONFIG_FIFO_NAME);
+  await createConfigFifo(fifoPath);
+  try {
+    const args = inspectorArguments(info, method, representative, {
+      configPath: fifoPath,
+      interactive,
+      strict: method === "tools/list",
+    });
+    const child = spawnProcess(process.execPath, args, {
+      cwd: REPOSITORY_ROOT,
+      env: childEnvironment(runtimeRoot, descriptor, interactive),
+      stdio: interactive ? ["ignore", "inherit", "inherit"] : ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let spawnError = null;
+    if (!interactive) {
+      child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+      child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
     }
+    child.on("error", (error) => { spawnError = error; });
+    const resultPromise = new Promise((resolveResult) => {
+      child.once("close", (code) => {
+        resolveResult({
+          stdout: interactive ? "" : stdout,
+          stderr: interactive ? "" : stderr,
+          code: code ?? 1,
+          error: spawnError,
+        });
+      });
+    });
+    const forwardSignal = (signal) => { child.kill(signal); };
+    if (interactive) {
+      process.once("SIGINT", forwardSignal);
+      process.once("SIGTERM", forwardSignal);
+    }
+    try {
+      await writeConfigToFifo(fifoPath, config, child);
+      return await resultPromise;
+    } catch (error) {
+      if (child.exitCode == null && child.signalCode == null) child.kill?.("SIGTERM");
+      throw error;
+    } finally {
+      if (interactive) {
+        process.off("SIGINT", forwardSignal);
+        process.off("SIGTERM", forwardSignal);
+      }
+    }
+  } finally {
+    await rm(fifoPath, { force: true });
   }
-  let stdout = "";
-  let stderr = "";
-  let spawnError = null;
-  child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-  child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-  child.on("error", (error) => { spawnError = error; });
-  child.stdin.on("error", () => {});
-  child.stdin.end(`${JSON.stringify(config)}\n`);
-  const result = await new Promise((resolveResult) => {
-    child.once("close", (code, signal) => resolveResult(spawnResult(child, stdout, stderr, code ?? 1, signal, spawnError)));
-  });
-  return result;
 }
 
 export function classifyInspectorFailure(code, method, spawnError = null) {
@@ -930,6 +997,15 @@ function notRunTransportEvidence(target, failureClass, discovery = null, reason 
   };
 }
 
+function inspectorEvidence(info) {
+  return info ? {
+    package: info.package,
+    version: info.version,
+    node_version: info.nodeVersion,
+    config_handoff: CONFIG_HANDOFF,
+  } : null;
+}
+
 function smokeFailureOutput(info, target, validated, discovery, resetGeneration, error) {
   const failureClass = failureClassFor(error);
   const targets = target === "both" ? ["http", "stdio"] : [target];
@@ -940,7 +1016,7 @@ function smokeFailureOutput(info, target, validated, discovery, resetGeneration,
     target,
     protocol_era: discovery?.protocolEra ?? "modern",
     protocol_version: discovery?.protocolVersion ?? MODERN_PROTOCOL_VERSION,
-    inspector: info ? { package: info.package, version: info.version, node_version: info.nodeVersion } : null,
+    inspector: inspectorEvidence(info),
     candidate: validated && discovery ? {
       source_revision: discovery.sourceRevision,
       runtime_profile: discovery.profile,
@@ -1103,11 +1179,7 @@ export async function runSmoke({ info, descriptor, target, fetchImpl = globalThi
       target,
       protocol_era: discovery.protocolEra,
       protocol_version: discovery.protocolVersion,
-      inspector: {
-        package: info.package,
-        version: info.version,
-        node_version: info.nodeVersion,
-      },
+      inspector: inspectorEvidence(info),
       candidate: {
         source_revision: discovery.sourceRevision,
         runtime_profile: discovery.profile,
@@ -1175,7 +1247,7 @@ function outputFailure(error, args, info = null) {
     target: args?.target ?? null,
     protocol_era: "modern",
     protocol_version: MODERN_PROTOCOL_VERSION,
-    inspector: info ? { package: info.package, version: info.version, node_version: info.nodeVersion } : null,
+    inspector: inspectorEvidence(info),
     failure_class: failureClass,
     message: messages[failureClass] ?? messages[FAILURE_CLASSES.unexpected],
   };
