@@ -26,6 +26,7 @@ from app.services.app_resource_service import (
 )
 from app.services.table_service import alter_table
 from app.services.role_sync import get_role_sync
+from app.services.uri_service import table_uri
 
 logger = logging.getLogger("akb.app_rollout_worker")
 LEASE_SECONDS = 120
@@ -182,7 +183,14 @@ async def _create_table_owned(conn: Any, target: dict[str, Any], payload: dict[s
     columns = list(payload["columns"])
     pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
     table_id = uuid.uuid4()
-    await table_data_repo.create_dynamic_table(conn, pg_name, columns, vault_name=vault["name"])
+    await table_data_repo.create_dynamic_table(
+        conn,
+        pg_name,
+        columns,
+        vault_name=vault["name"],
+        vault_id=target["vault_id"],
+        resource_uri=table_uri(vault["name"], table_name),
+    )
     await table_registry_repo.insert(
         conn,
         table_id=table_id,

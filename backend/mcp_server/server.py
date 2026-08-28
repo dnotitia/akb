@@ -1223,6 +1223,7 @@ async def _handle_sql(args: dict, uid: str, user: _MCPUser) -> dict:
     return await table_service.execute_sql(
         vault_names=vaults,
         user_id=uid,
+        actor_id=user.username,
         sql=sql,
         is_admin=user.is_admin,
     )

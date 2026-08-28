@@ -153,7 +153,9 @@ class UserSqlExecutor:
       5. Commit (or rollback on exception).
 
     Step 2's role is reset by COMMIT/ROLLBACK, so reuse of the pooled
-    connection across users is safe.
+    connection across users is safe. The transaction-local ``akb.actor_id``
+    GUC carries the authenticated actor to statement-level dynamic-table
+    triggers without exposing the system events table to user SQL roles.
     """
 
     def __init__(self, pool: asyncpg.Pool) -> None:
@@ -163,6 +165,7 @@ class UserSqlExecutor:
         self,
         *,
         user_id: uuid.UUID | str,
+        actor_id: str | None = None,
         sql: str,
         params: list[Any] | None = None,
         fetch: bool | None = None,
@@ -207,6 +210,10 @@ class UserSqlExecutor:
                     # pooled connection might have left a different default
                     # (it shouldn't, but be explicit).
                     await conn.execute("SET LOCAL search_path = public")
+                    await conn.execute(
+                        "SELECT set_config('akb.actor_id', $1, true)",
+                        actor_id if actor_id is not None else str(user_id),
+                    )
                     request_claims = current_request_jwt_claims.get()
                     if request_claims is not None:
                         await conn.execute(

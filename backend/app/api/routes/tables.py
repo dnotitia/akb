@@ -407,6 +407,7 @@ async def execute_sql(vault: str, req: SqlRequest, user: AuthenticatedUser = Dep
         await table_service.execute_sql(
             vault_names=vaults,
             user_id=user.user_id,
+            actor_id=user.username,
             sql=req.sql.strip(),
             params=req.params,
             is_admin=user.is_admin,
@@ -515,6 +516,7 @@ async def update_rows(
         vault_id=access["vault_id"],
         table_name=table,
         user_id=user.user_id,
+        actor_id=user.username,
         body=body,
         is_admin=user.is_admin,
         query_params=list(request.query_params.multi_items()),
@@ -548,6 +550,7 @@ async def delete_rows(
         vault_id=access["vault_id"],
         table_name=table,
         user_id=user.user_id,
+        actor_id=user.username,
         is_admin=user.is_admin,
         query_params=list(request.query_params.multi_items()),
         prefer_header=request.headers.get("prefer"),

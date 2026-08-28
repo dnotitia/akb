@@ -308,6 +308,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "083_edge_vault_boundary.py",  # graph edges are vault-local: owner/source/target authorities agree; legacy rows stay hidden pending reviewed cleanup
         "084_bm25_corpus_revision.py",  # mutation revision replaces mismatched chunk-count/eligible-doc BM25 refresh gate
         "085_vault_access_contributions.py",  # why a pair holds the role it holds: independent grant bases behind the effective vault_access row, backfilled as 'direct' so nothing moves
+        "086_dynamic_table_rows_changed.py",  # statement-level transition-table wake-up events for dynamic table DML
     ):
         if filename in applied:
             continue
