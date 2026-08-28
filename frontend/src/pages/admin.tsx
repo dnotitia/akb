@@ -193,6 +193,7 @@ export default function AdminPage() {
 }
 
 const EMPTY_PROVIDER_FORM = {
+  providerType: "oidc",
   alias: "",
   displayName: "",
   issuer: "",
@@ -227,6 +228,7 @@ function SsoProviderControl() {
 
   function editProvider(provider: AdminSsoProvider) {
     setForm({
+      providerType: provider.provider_type,
       alias: provider.alias,
       displayName: provider.display_name,
       issuer: provider.issuer || "",
@@ -243,9 +245,12 @@ function SsoProviderControl() {
     setNotice("");
     setSubmitting(true);
     const issuer = form.issuer.trim().replace(/\/+$/, "");
+    const providerType = catalog?.supported_provider_types.includes(form.providerType)
+      ? form.providerType
+      : catalog?.supported_provider_types[0] || form.providerType;
     try {
       await configureAdminSsoProvider(form.alias.trim(), {
-        provider_type: "keycloak-oidc",
+        provider_type: providerType,
         display_name: form.displayName.trim(),
         issuer,
         discovery_url: `${issuer}/.well-known/openid-configuration`,
@@ -348,7 +353,7 @@ function SsoProviderControl() {
       )}
 
       <Panel inset={false} flush>
-        <PanelHeader label="Keycloak OIDC provider" />
+        <PanelHeader label="OIDC provider" />
         <form className="grid gap-4 p-4 sm:grid-cols-2" onSubmit={saveProvider}>
           <AdminField label="Alias" id="sso-alias" value={form.alias} onChange={(value) => setField("alias", value)} pattern="[a-z0-9][a-z0-9._-]{0,62}" autoComplete="off" required />
           <AdminField label="Button label" id="sso-display-name" value={form.displayName} onChange={(value) => setField("displayName", value)} maxLength={80} autoComplete="organization" required />

@@ -391,8 +391,9 @@ its ordinary-login option without redeploying AKB. The option becomes a usable
 button only when the server-side browser-session capability is ready. Client
 secrets are write-only, and an enabled provider must be disabled before
 reconfiguration.
-See the [SSO provider guide](./docs/sso/README.md) and the first reference
-integration, [Keycloak OIDC behind Keycloak](./docs/sso/providers/keycloak-oidc.md).
+See the [SSO provider guide](./docs/sso/README.md), the standards-based
+[generic OIDC integration](./docs/sso/providers/oidc.md), and the stricter
+[Keycloak OIDC reference](./docs/sso/providers/keycloak-oidc.md).
 
 The dedicated admin callback stores no Keycloak access, refresh, or ID token.
 It creates a short-lived opaque HttpOnly admin cookie plus a CSRF token;

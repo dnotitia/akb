@@ -645,7 +645,11 @@ class KeycloakProviderControl:
             if definition is None:
                 raise _fail("provider_alias_conflict")
             provider = self._readback(definition, representation)
-            if provider.state == "configuration_error" or provider.issuer is None:
+            if (
+                provider.state == "configuration_error"
+                or provider.issuer is None
+                or not provider.supports_identity_migration
+            ):
                 raise _fail("provider_configuration_invalid")
 
             user_base = (

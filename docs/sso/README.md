@@ -115,8 +115,12 @@ operator. It does not retain the bootstrap credential.
 
 ## Built-in providers
 
+- [Generic OIDC](providers/oidc.md) configures standards-based upstreams from
+  issuer discovery without a vendor-specific provider branch. Microsoft Entra
+  ID and distinct Keycloak realms are covered compatibility fixtures.
 - [Keycloak OIDC behind Keycloak](providers/keycloak-oidc.md) is the first
-  reference contribution.
+  reference contribution and retains its stricter Keycloak endpoint and
+  verified-email profile for compatibility.
 
 Additional OSS providers should follow [Adding a provider](adding-a-provider.md).
 The registry is explicit and code-reviewed; AKB does not load arbitrary

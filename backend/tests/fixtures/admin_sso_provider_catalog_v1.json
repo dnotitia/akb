@@ -3,7 +3,8 @@
   "auth_mode": "sso",
   "control_mode": "direct",
   "supported_provider_types": [
-    "keycloak-oidc"
+    "keycloak-oidc",
+    "oidc"
   ],
   "providers": [
     {

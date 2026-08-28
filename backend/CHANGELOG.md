@@ -7,6 +7,18 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Added standards-based upstream OIDC provider control
+
+Product administrators can now configure a generic `oidc` upstream from its
+exact HTTPS issuer, client ID, and write-only client secret. AKB still asks its
+Keycloak broker to import discovery, but validates the returned issuer and
+HTTPS endpoints, renders only a bounded secure profile, and fingerprints that
+endpoint set so out-of-band drift fails closed. The profile uses authorization
+code flow with PKCE S256, JWKS signature validation, `client_secret_post`, and
+starts disabled. Microsoft Entra ID and distinct upstream Keycloak realms are
+covered as interoperability contracts; the existing Keycloak-specific provider
+remains available for compatibility and its stricter path/claim policy.
+
 ### Made product-admin callback failures recoverable
 
 Expired, malformed, or refused product-admin OIDC callbacks now return the

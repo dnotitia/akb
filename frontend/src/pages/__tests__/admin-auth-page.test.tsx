@@ -79,7 +79,7 @@ const directCatalog = {
   schema_version: 1 as const,
   auth_mode: "sso" as const,
   control_mode: "direct" as const,
-  supported_provider_types: ["keycloak-oidc"],
+  supported_provider_types: ["keycloak-oidc", "oidc"],
   providers: [provider],
 };
 
@@ -266,12 +266,53 @@ describe("AdminPage mode boundary", () => {
 
     await waitFor(() => {
       expect(configureAdminSsoProvider).toHaveBeenCalledWith("partners", {
-        provider_type: "keycloak-oidc",
+        provider_type: "oidc",
         display_name: "Partner SSO",
         issuer: "https://id.example.com/realms/partners",
         discovery_url: "https://id.example.com/realms/partners/.well-known/openid-configuration",
         client_id: "akb-partners",
         client_secret: "one-time-input", // pragma: allowlist secret
+      });
+    });
+  });
+
+  it("configures Microsoft Entra through the generic OIDC provider", async () => {
+    vi.mocked(getAdminAuthConfig).mockResolvedValue(ssoConfig);
+    vi.mocked(getAdminSession).mockResolvedValue({
+      schema_version: 1,
+      auth_mode: "sso",
+      user: {
+        id: "11111111-1111-1111-1111-111111111111",
+        username: "admin",
+        email: "admin@example.com",
+        display_name: "Admin",
+        is_admin: true,
+      },
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.type(await screen.findByLabelText("Alias"), "entra-dn");
+    await user.type(screen.getByLabelText("Button label"), "Microsoft Teams");
+    await user.type(
+      screen.getByLabelText("Upstream issuer"),
+      "https://login.microsoftonline.com/ade9ac17-851e-48d0-ba36-ed99a8d8c07e/v2.0",
+    );
+    await user.type(screen.getByLabelText("Client ID"), "6fd50bdd-9701-4244-a489-0059e8baba49");
+    await user.type(screen.getByLabelText("Client secret"), "one-time-entra-input");
+    await user.click(screen.getByRole("button", { name: /Save disabled configuration/i }));
+
+    await waitFor(() => {
+      expect(configureAdminSsoProvider).toHaveBeenCalledWith("entra-dn", {
+        provider_type: "oidc",
+        display_name: "Microsoft Teams",
+        issuer: "https://login.microsoftonline.com/ade9ac17-851e-48d0-ba36-ed99a8d8c07e/v2.0",
+        discovery_url: (
+          "https://login.microsoftonline.com/ade9ac17-851e-48d0-ba36-ed99a8d8c07e/"
+          + "v2.0/.well-known/openid-configuration"
+        ),
+        client_id: "6fd50bdd-9701-4244-a489-0059e8baba49",
+        client_secret: "one-time-entra-input", // pragma: allowlist secret
       });
     });
   });
