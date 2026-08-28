@@ -131,7 +131,11 @@ function discovery() {
         },
         proxy_local: {
           tools: ["akb_put_file"],
-          input_properties: { akb_put: ["file", "_vault_skill_ack"] },
+          input_properties: {
+            akb_list_vaults: [],
+            akb_put: ["file", "_vault_skill_ack"],
+            akb_delete: ["_vault_skill_ack"],
+          },
         },
       },
     },
@@ -193,10 +197,10 @@ test("credential values are redacted from evidence and config digest", () => {
   assert.equal(stableStringify({ b: 1, a: 2 }), '{"a":2,"b":1}');
 });
 
-// This is the normalized shape of backend/mcp_server/tools.py's akb_put
-// schema; descriptions are intentionally omitted because comparison ignores
-// prose. The proxy input is produced by its real _decorateTools() path after
-// the backend's capability-v2 _vault_skill_ack decoration.
+// These are the normalized shapes of the three shared tools from
+// backend/mcp_server/tools.py. Descriptions are intentionally omitted because
+// comparison ignores prose. The stdio shapes below are produced by the real
+// AKBProxy decoration path after capability-v2 acknowledgement decoration.
 const BACKEND_AKB_PUT_SCHEMA = {
   type: "object",
   properties: {
@@ -219,55 +223,90 @@ const BACKEND_AKB_PUT_SCHEMA = {
 
 const VAULT_SKILL_ACK_SCHEMA = { type: "string", maxLength: 128 };
 
-function actualAkbPutSchemaPair() {
-  const backendTool = { name: "akb_put", inputSchema: structuredClone(BACKEND_AKB_PUT_SCHEMA) };
-  const httpTool = structuredClone(backendTool);
-  const backendForProxy = structuredClone(backendTool);
-  backendForProxy.inputSchema.properties._vault_skill_ack = structuredClone(VAULT_SKILL_ACK_SCHEMA);
+const BACKEND_SHARED_SCHEMAS = {
+  akb_list_vaults: { type: "object", properties: {} },
+  akb_put: BACKEND_AKB_PUT_SCHEMA,
+  akb_delete: {
+    type: "object",
+    properties: { uri: { type: "string" } },
+    required: ["uri"],
+  },
+};
+
+const ACK_REQUIRED_TOOLS = new Set(["akb_put", "akb_delete"]);
+
+function actualSharedSchemaPairs() {
+  const backendTools = Object.entries(BACKEND_SHARED_SCHEMAS).map(([name, inputSchema]) => ({
+    name,
+    inputSchema: structuredClone(inputSchema),
+  }));
+  const httpTools = structuredClone(backendTools);
+  const backendForProxy = structuredClone(backendTools).map((tool) => {
+    if (ACK_REQUIRED_TOOLS.has(tool.name)) {
+      tool.inputSchema.properties._vault_skill_ack = structuredClone(VAULT_SKILL_ACK_SCHEMA);
+    }
+    return tool;
+  });
   const proxy = new AKBProxy({ url: "http://127.0.0.1:8000/mcp/", pat: "test-pat" });
-  const stdioTool = proxy._decorateTools({ tools: [backendForProxy] }).tools.find((tool) => tool.name === "akb_put");
-  return { httpTool, stdioTool };
+  const stdioTools = proxy._decorateTools({ tools: backendForProxy }).tools;
+  return Object.fromEntries(Object.keys(BACKEND_SHARED_SCHEMAS).map((name) => [name, {
+    httpTool: httpTools.find((tool) => tool.name === name),
+    stdioTool: stdioTools.find((tool) => tool.name === name),
+  }]));
 }
 
 function comparisonDiscovery() {
   return {
-    sharedTools: ["akb_put"],
+    sharedTools: ["akb_list_vaults", "akb_put", "akb_delete"],
     proxyLocal: {
       tools: [],
-      inputProperties: { akb_put: ["file", "_vault_skill_ack"] },
+      inputProperties: {
+        akb_list_vaults: [],
+        akb_put: ["file", "_vault_skill_ack"],
+        akb_delete: ["_vault_skill_ack"],
+      },
     },
   };
 }
 
-function comparisonTransport(tool) {
+function comparisonTransport(tools) {
   return {
     evidence: { status: "passed" },
-    tools: [tool],
+    tools,
     publicResult: { vaults: [], total: 0, returned: 0 },
   };
 }
 
-test("backend/proxy akb_put schemas differ only by declared stdio extensions", () => {
-  const { httpTool, stdioTool } = actualAkbPutSchemaPair();
-  assert.equal(httpTool.inputSchema.properties.file, undefined);
-  assert.equal(httpTool.inputSchema.properties._vault_skill_ack, undefined);
-  assert.equal(typeof stdioTool.inputSchema.properties.file, "object");
-  assert.deepEqual(stdioTool.inputSchema.properties._vault_skill_ack, VAULT_SKILL_ACK_SCHEMA);
+test("shared backend/proxy schemas differ only by declared stdio extensions", () => {
+  const pairs = actualSharedSchemaPairs();
+  assert.equal(pairs.akb_list_vaults.httpTool.inputSchema.properties.file, undefined);
+  assert.equal(pairs.akb_list_vaults.stdioTool.inputSchema.properties._vault_skill_ack, undefined);
+  assert.equal(pairs.akb_put.httpTool.inputSchema.properties.file, undefined);
+  assert.equal(pairs.akb_put.httpTool.inputSchema.properties._vault_skill_ack, undefined);
+  assert.equal(typeof pairs.akb_put.stdioTool.inputSchema.properties.file, "object");
+  assert.deepEqual(pairs.akb_put.stdioTool.inputSchema.properties._vault_skill_ack, VAULT_SKILL_ACK_SCHEMA);
+  assert.equal(pairs.akb_delete.httpTool.inputSchema.properties._vault_skill_ack, undefined);
+  assert.deepEqual(pairs.akb_delete.stdioTool.inputSchema.properties._vault_skill_ack, VAULT_SKILL_ACK_SCHEMA);
   const comparison = compareTransports(
-    comparisonTransport(httpTool),
-    comparisonTransport(stdioTool),
+    comparisonTransport(Object.values(pairs).map(({ httpTool }) => httpTool)),
+    comparisonTransport(Object.values(pairs).map(({ stdioTool }) => stdioTool)),
     comparisonDiscovery(),
   );
   assert.equal(comparison.status, "passed");
-  assert.equal(comparison.tools[0].schema_match, true);
+  assert.deepEqual(comparison.tools, [
+    { name: "akb_list_vaults", schema_match: true },
+    { name: "akb_put", schema_match: true },
+    { name: "akb_delete", schema_match: true },
+  ]);
 });
 
 test("declared stdio extensions are removed from matching required entries only", () => {
-  const { httpTool, stdioTool } = actualAkbPutSchemaPair();
-  stdioTool.inputSchema.required.push("file", "_vault_skill_ack");
+  const pairs = actualSharedSchemaPairs();
+  pairs.akb_put.stdioTool.inputSchema.required.push("file", "_vault_skill_ack");
+  pairs.akb_delete.stdioTool.inputSchema.required.push("_vault_skill_ack");
   const comparison = compareTransports(
-    comparisonTransport(httpTool),
-    comparisonTransport(stdioTool),
+    comparisonTransport(Object.values(pairs).map(({ httpTool }) => httpTool)),
+    comparisonTransport(Object.values(pairs).map(({ stdioTool }) => stdioTool)),
     comparisonDiscovery(),
   );
   assert.equal(comparison.status, "passed");
@@ -283,12 +322,37 @@ test("shared schema comparison fails on undeclared or common-schema drift", () =
     ["HTTP extension", (schema) => { schema.properties.file = { type: "string" }; }],
   ];
   for (const [label, mutate] of driftCases) {
-    const { httpTool, stdioTool } = actualAkbPutSchemaPair();
+    const pairs = actualSharedSchemaPairs();
+    const { httpTool, stdioTool } = pairs.akb_put;
     if (label === "HTTP extension") mutate(httpTool.inputSchema);
     else mutate(stdioTool.inputSchema);
     const comparison = compareTransports(
-      comparisonTransport(httpTool),
-      comparisonTransport(stdioTool),
+      comparisonTransport(Object.values(pairs).map(({ httpTool: tool }) => tool)),
+      comparisonTransport(Object.values(pairs).map(({ stdioTool: tool }) => tool)),
+      comparisonDiscovery(),
+    );
+    assert.equal(comparison.status, "failed", label);
+    assert.equal(comparison.failure_class, FAILURE_CLASSES.schema, label);
+  }
+});
+
+test("akb_delete rejects undeclared extension and common-schema drift", () => {
+  const driftCases = [
+    ["undeclared property", (schema) => { schema.properties.unexpected = { type: "string" }; }],
+    ["common type", (schema) => { schema.properties.uri.type = "number"; }],
+    ["common required", (schema) => { schema.required.push("unexpected"); }],
+    ["additionalProperties", (schema) => { schema.additionalProperties = false; }],
+    ["missing declared extension", (schema) => { delete schema.properties._vault_skill_ack; }],
+    ["HTTP extension", (schema) => { schema.properties._vault_skill_ack = { type: "string" }; }],
+  ];
+  for (const [label, mutate] of driftCases) {
+    const pairs = actualSharedSchemaPairs();
+    const { httpTool, stdioTool } = pairs.akb_delete;
+    if (label === "HTTP extension") mutate(httpTool.inputSchema);
+    else mutate(stdioTool.inputSchema);
+    const comparison = compareTransports(
+      comparisonTransport(Object.values(pairs).map(({ httpTool: tool }) => tool)),
+      comparisonTransport(Object.values(pairs).map(({ stdioTool: tool }) => tool)),
       comparisonDiscovery(),
     );
     assert.equal(comparison.status, "failed", label);

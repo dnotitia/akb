@@ -158,10 +158,12 @@ OAuth/secret stores.
 
 The runtime discovery contract lists the exact top-level stdio-only input
 properties under `proxy_local.input_properties`: `file` for the local-file
-document path and `_vault_skill_ack` for the existing capability-v2 retry
-argument. The comparison removes only those declared properties (and matching
-required entries) from the stdio schema; all other schema drift remains a
-portability failure.
+document path on `akb_put`/`akb_update`, and `_vault_skill_ack` for the existing
+capability-v2 retry argument on write tools such as `akb_put`, `akb_delete`, and
+`akb_update`. The read-only `akb_list_vaults` entry is explicitly empty. The
+comparison removes only those declared per-tool properties
+(and matching required entries) from the stdio schema; all other schema drift
+remains a portability failure.
 
 Smoke pins the modern protocol era and runs, in order, `initialize`,
 `tools/list --strict --format json`, and the discovery-declared read-only
