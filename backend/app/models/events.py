@@ -8,10 +8,6 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict
 
 
-EventCursor = str
-EventKind = str
-
-
 class EventTailModel(BaseModel):
     """Reject accidental fields in the wire-level event records."""
 

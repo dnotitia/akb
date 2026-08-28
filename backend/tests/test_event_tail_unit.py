@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
 import pytest
@@ -24,6 +24,20 @@ from app.services.event_tail_service import (
 
 
 VAULT_ID = UUID("11111111-1111-4111-8111-111111111111")
+
+
+def _stream_test_doubles() -> tuple[MagicMock, MagicMock, MagicMock]:
+    connection = MagicMock()
+    connection.add_listener = AsyncMock()
+    connection.remove_listener = AsyncMock()
+    acquire = MagicMock()
+    acquire.__aenter__ = AsyncMock(return_value=connection)
+    acquire.__aexit__ = AsyncMock(return_value=None)
+    pool = MagicMock()
+    pool.acquire.return_value = acquire
+    request = MagicMock()
+    request.is_disconnected = AsyncMock(return_value=False)
+    return pool, connection, request
 
 
 def test_cursor_is_opaque_authenticated_and_scope_bound() -> None:
@@ -64,66 +78,51 @@ def test_start_position_matrix_obeys_header_priority_and_earliest_exclusion() ->
     query = codec.encode(VAULT_ID, (), 7)
     bounds = EventBounds(earliest_id=3, latest_id=20)
 
-    assert (
-        resolve_start_position(
-            codec,
-            VAULT_ID,
-            (),
-            bounds,
-            last_event_id=header,
-            cursor=query,
-            start=None,
-        ).position
-        == 12
-    )
-    assert (
-        resolve_start_position(
-            codec,
-            VAULT_ID,
-            (),
-            bounds,
-            last_event_id=header,
-            cursor="not-a-cursor",
-            start=None,
-        ).position
-        == 12
-    )
-    assert (
-        resolve_start_position(
-            codec,
-            VAULT_ID,
-            (),
-            bounds,
-            last_event_id=None,
-            cursor=query,
-            start=None,
-        ).position
-        == 7
-    )
-    assert (
-        resolve_start_position(
-            codec,
-            VAULT_ID,
-            (),
-            bounds,
-            last_event_id=None,
-            cursor=None,
-            start="earliest",
-        ).position
-        == 2
-    )
-    assert (
-        resolve_start_position(
-            codec,
-            VAULT_ID,
-            (),
-            bounds,
-            last_event_id=None,
-            cursor=None,
-            start=None,
-        ).position
-        == 20
-    )
+    assert resolve_start_position(
+        codec,
+        VAULT_ID,
+        (),
+        bounds,
+        last_event_id=header,
+        cursor=query,
+        start=None,
+    ) == 12
+    assert resolve_start_position(
+        codec,
+        VAULT_ID,
+        (),
+        bounds,
+        last_event_id=header,
+        cursor="not-a-cursor",
+        start=None,
+    ) == 12
+    assert resolve_start_position(
+        codec,
+        VAULT_ID,
+        (),
+        bounds,
+        last_event_id=None,
+        cursor=query,
+        start=None,
+    ) == 7
+    assert resolve_start_position(
+        codec,
+        VAULT_ID,
+        (),
+        bounds,
+        last_event_id=None,
+        cursor=None,
+        start="earliest",
+    ) == 2
+    assert resolve_start_position(
+        codec,
+        VAULT_ID,
+        (),
+        bounds,
+        last_event_id=None,
+        cursor=None,
+        start=None,
+    ) == 20
 
     with pytest.raises(EventCursorError):
         resolve_start_position(
@@ -193,37 +192,6 @@ def test_public_envelopes_require_version_and_reject_internal_fields() -> None:
 async def test_stream_emits_checkpoint_for_skipped_event_and_change_envelope(monkeypatch) -> None:
     from app.services import event_tail_service
 
-    class _Connection:
-        def __init__(self) -> None:
-            self.listeners: list[tuple[str, object]] = []
-
-        async def add_listener(self, channel: str, callback: object) -> None:
-            self.listeners.append((channel, callback))
-
-        async def remove_listener(self, channel: str, callback: object) -> None:
-            self.listeners.remove((channel, callback))
-
-    class _Acquire:
-        def __init__(self, connection: _Connection) -> None:
-            self.connection = connection
-
-        async def __aenter__(self) -> _Connection:
-            return self.connection
-
-        async def __aexit__(self, *_args: object) -> None:
-            return None
-
-    class _Pool:
-        def __init__(self, connection: _Connection) -> None:
-            self.connection = connection
-
-        def acquire(self) -> _Acquire:
-            return _Acquire(self.connection)
-
-    class _Request:
-        async def is_disconnected(self) -> bool:
-            return False
-
     rows = [
         {
             "id": 10,
@@ -242,18 +210,14 @@ async def test_stream_emits_checkpoint_for_skipped_event_and_change_envelope(mon
             "payload": {"operation": "insert"},
         },
     ]
-    connection = _Connection()
-
-    async def get_pool() -> _Pool:
-        return _Pool(connection)
-
-    monkeypatch.setattr(event_tail_service, "get_pool", get_pool)
+    pool, connection, request = _stream_test_doubles()
+    monkeypatch.setattr(event_tail_service, "get_pool", AsyncMock(return_value=pool))
     monkeypatch.setattr(event_tail_service, "list_vault_events", AsyncMock(return_value=rows))
     access = AsyncMock(return_value={"vault_id": VAULT_ID})
     monkeypatch.setattr(event_tail_service, "check_vault_access", access)
 
     stream = event_tail_service._stream_events(
-        _Request(),
+        request,
         user_id="user",
         vault="vault",
         vault_id=VAULT_ID,
@@ -277,7 +241,7 @@ async def test_stream_emits_checkpoint_for_skipped_event_and_change_envelope(mon
     assert change_body["payload"] == {"operation": "insert"}
     assert "id" not in change_body
     assert "vault_id" not in change_body
-    assert not connection.listeners
+    connection.remove_listener.assert_awaited_once()
     assert access.await_count >= 2
 
 
@@ -286,32 +250,8 @@ async def test_stream_closes_without_emitting_after_access_is_revoked(monkeypatc
     from app.exceptions import ForbiddenError
     from app.services import event_tail_service
 
-    class _Connection:
-        async def add_listener(self, *_args: object) -> None:
-            return None
-
-        async def remove_listener(self, *_args: object) -> None:
-            return None
-
-    class _Acquire:
-        async def __aenter__(self) -> _Connection:
-            return _Connection()
-
-        async def __aexit__(self, *_args: object) -> None:
-            return None
-
-    class _Pool:
-        def acquire(self) -> _Acquire:
-            return _Acquire()
-
-    class _Request:
-        async def is_disconnected(self) -> bool:
-            return False
-
-    async def get_pool() -> _Pool:
-        return _Pool()
-
-    monkeypatch.setattr(event_tail_service, "get_pool", get_pool)
+    pool, _connection, request = _stream_test_doubles()
+    monkeypatch.setattr(event_tail_service, "get_pool", AsyncMock(return_value=pool))
     monkeypatch.setattr(
         event_tail_service,
         "list_vault_events",
@@ -335,7 +275,7 @@ async def test_stream_closes_without_emitting_after_access_is_revoked(monkeypatc
     )
 
     stream = event_tail_service._stream_events(
-        _Request(),
+        request,
         user_id="user",
         vault="vault",
         vault_id=VAULT_ID,

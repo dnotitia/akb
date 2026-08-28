@@ -59,13 +59,6 @@ class EventBounds:
     latest_id: int | None
 
 
-@dataclass(frozen=True)
-class TailStart:
-    """Resolved last-inspected position for a tail connection."""
-
-    position: int
-
-
 def _canonical_uuid(value: UUID | str) -> UUID:
     try:
         return value if isinstance(value, UUID) else UUID(str(value))
@@ -178,7 +171,7 @@ def resolve_start_position(
     last_event_id: str | None,
     cursor: str | None,
     start: str | None,
-) -> TailStart:
+) -> int:
     """Resolve the connection position using the public start precedence."""
     if start not in (None, "earliest"):
         raise EventCursorError("invalid event cursor")
@@ -190,13 +183,11 @@ def resolve_start_position(
         decoded_vault, decoded_kinds, position = codec.decode(selected)
         if decoded_vault != _canonical_uuid(vault_id) or decoded_kinds != kinds:
             raise EventCursorError("invalid event cursor")
-        return TailStart(position=position)
+        return position
 
     if start == "earliest":
-        return TailStart(
-            position=max(0, (bounds.earliest_id or 1) - 1),
-        )
-    return TailStart(position=bounds.latest_id or 0)
+        return max(0, (bounds.earliest_id or 1) - 1)
+    return bounds.latest_id or 0
 
 
 def validate_event_gap(
@@ -293,7 +284,7 @@ async def open_tail(
         codec,
         vault_id,
         normalized_kinds,
-        position=resolved.position,
+        position=resolved,
         bounds=bounds,
     )
     stream = _stream_events(
@@ -302,7 +293,7 @@ async def open_tail(
         vault=vault,
         vault_id=vault_id,
         kinds=normalized_kinds,
-        position=resolved.position,
+        position=resolved,
         codec=codec,
     )
     return StreamingResponse(
