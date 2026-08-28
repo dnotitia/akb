@@ -8,6 +8,7 @@ import os
 import uuid
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import asyncpg
 import pytest
@@ -262,7 +263,7 @@ async def test_publisher_fanout_preserves_rows_changed_envelope(monkeypatch):
         redis = _Redis()
         monkeypatch.setattr(events_publisher.settings, "redis_url", "redis://test")
         monkeypatch.setattr(events_publisher, "get_pool", lambda: pool)
-        monkeypatch.setattr(events_publisher, "_client", lambda: _async_value(redis))
+        monkeypatch.setattr(events_publisher, "_client", AsyncMock(return_value=redis))
 
         assert await events_publisher._process_once() == 1
         assert len(redis.calls) == 1
@@ -319,7 +320,7 @@ async def test_publisher_fanout_reaches_a_real_redis_stream(monkeypatch):
         monkeypatch.setattr(events_publisher.settings, "redis_url", redis_url)
         monkeypatch.setattr(events_publisher.settings, "redis_event_stream", stream)
         monkeypatch.setattr(events_publisher, "get_pool", lambda: pool)
-        monkeypatch.setattr(events_publisher, "_client", lambda: _async_value(client))
+        monkeypatch.setattr(events_publisher, "_client", AsyncMock(return_value=client))
         try:
             assert await events_publisher._process_once() == 1
             messages = await client.xrange(stream)
@@ -333,7 +334,3 @@ async def test_publisher_fanout_reaches_a_real_redis_stream(monkeypatch):
         finally:
             await client.delete(stream)
             await client.aclose()
-
-
-async def _async_value(value: Any) -> Any:
-    return value
