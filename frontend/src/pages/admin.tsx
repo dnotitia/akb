@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Link } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -25,6 +25,7 @@ import {
 
 
 export default function AdminPage() {
+  const location = useLocation();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -45,6 +46,8 @@ export default function AdminPage() {
     sessionQuery.data?.auth_mode === config?.auth_mode
       ? sessionQuery.data
       : undefined;
+  const callbackFailed =
+    new URLSearchParams(location.search).get("auth_error") === "sign_in_failed";
 
   async function submitLocal(event: React.FormEvent) {
     event.preventDefault();
@@ -163,6 +166,11 @@ export default function AdminPage() {
 
           {!session && sessionQuery.isSuccess && config?.available && config.auth_mode === "sso" && config.keycloak.enabled && (
             <div className="space-y-4">
+              {callbackFailed && (
+                <Alert variant="destructive">
+                  The product-admin sign-in expired or could not be completed. Start a new sign-in.
+                </Alert>
+              )}
               {error && <Alert variant="destructive">{error}</Alert>}
               <Button type="button" size="lg" className="w-full" onClick={startKeycloak}>
                 Sign in with Keycloak

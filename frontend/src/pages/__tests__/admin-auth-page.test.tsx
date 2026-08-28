@@ -82,13 +82,13 @@ const directCatalog = {
   providers: [provider],
 };
 
-function renderPage() {
+function renderPage(initialEntry = "/admin") {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={["/admin"]}>
+      <MemoryRouter initialEntries={[initialEntry]}>
         <AdminPage />
       </MemoryRouter>
     </QueryClientProvider>,
@@ -128,6 +128,25 @@ describe("AdminPage mode boundary", () => {
     expect(await screen.findByRole("button", { name: /keycloak/i })).toBeInTheDocument();
     expect(screen.queryByLabelText("Username")).toBeNull();
     expect(screen.queryByRole("button", { name: /local/i })).toBeNull();
+  });
+
+  it("turns a failed callback into a clear retry path", async () => {
+    vi.mocked(getAdminAuthConfig).mockResolvedValue(ssoConfig);
+    renderPage("/admin?auth_error=sign_in_failed");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The product-admin sign-in expired or could not be completed. Start a new sign-in.",
+    );
+    expect(screen.getByRole("button", { name: /keycloak/i })).toBeInTheDocument();
+  });
+
+  it("does not echo an arbitrary callback error into the page", async () => {
+    vi.mocked(getAdminAuthConfig).mockResolvedValue(ssoConfig);
+    renderPage("/admin?auth_error=%3Cscript%3Ealert(1)%3C%2Fscript%3E");
+
+    expect(await screen.findByRole("button", { name: /keycloak/i })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText(/script/i)).toBeNull();
   });
 
   it("submits local credentials from the user action and stores the RS256 session", async () => {
