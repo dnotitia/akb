@@ -96,6 +96,7 @@ _LENGTH_CHECK_OPERATORS = {
 }
 
 _REFERENCE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+_DYNAMIC_PG_NAME_RE = re.compile(r"^vt_[a-z0-9_]+$")
 
 _FK_ON_DELETE_SQL = {
     "cascade": "CASCADE",
@@ -462,7 +463,13 @@ def foreign_key_constraint_definition(
 
 
 async def create_dynamic_table(
-    conn, pg_name: str, columns: list[dict], *, vault_name: str | None = None,
+    conn,
+    pg_name: str,
+    columns: list[dict],
+    *,
+    vault_name: str | None = None,
+    vault_id: UUID | str,
+    resource_uri: str,
 ) -> None:
     """Create the data-bearing PG table for a vault table. Caller is
     responsible for sanitising `pg_name` (use `pg_table_name`)."""
@@ -495,6 +502,65 @@ async def create_dynamic_table(
         f"BEFORE UPDATE ON {pg_name} "
         f"FOR EACH ROW EXECUTE FUNCTION akb_set_updated_at()"
     )
+    await install_dynamic_table_rows_changed_triggers(
+        conn,
+        pg_name,
+        vault_id=vault_id,
+        resource_uri=resource_uri,
+    )
+
+
+def _sql_string_literal(value: str) -> str:
+    """Return a safe PostgreSQL E-string literal for trusted DDL metadata."""
+    return "E'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+async def install_dynamic_table_rows_changed_triggers(
+    conn,
+    pg_name: str,
+    *,
+    vault_id: UUID | str,
+    resource_uri: str,
+) -> None:
+    """Install one statement-level transition-table trigger per DML verb."""
+    if not _DYNAMIC_PG_NAME_RE.fullmatch(pg_name):
+        raise ValueError(f"Invalid dynamic table name: {pg_name!r}")
+    if not resource_uri:
+        raise ValueError("resource_uri must be non-empty")
+    vault_uuid = UUID(str(vault_id))
+    for operation, trigger_name, referencing in (
+        (
+            "insert",
+            "akb_rows_changed_insert_trigger",
+            "REFERENCING NEW TABLE AS akb_rows_changed_new",
+        ),
+        (
+            "update",
+            "akb_rows_changed_update_trigger",
+            "REFERENCING OLD TABLE AS akb_rows_changed_old "
+            "NEW TABLE AS akb_rows_changed_new",
+        ),
+        (
+            "delete",
+            "akb_rows_changed_delete_trigger",
+            "REFERENCING OLD TABLE AS akb_rows_changed_old",
+        ),
+    ):
+        function_args = ", ".join(
+            (
+                _sql_string_literal(str(vault_uuid)),
+                _sql_string_literal(resource_uri),
+            )
+        )
+        await conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name} ON {pg_name}")
+        await conn.execute(
+            f"CREATE TRIGGER {trigger_name} "
+            f"AFTER {operation.upper()} ON {pg_name} "
+            f"{referencing} "
+            "FOR EACH STATEMENT "
+            "EXECUTE FUNCTION public.akb_dynamic_table_rows_changed("
+            f"{function_args})"
+        )
 
 
 async def drop_dynamic_table(conn, pg_name: str) -> None:

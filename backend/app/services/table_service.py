@@ -970,7 +970,14 @@ async def create_table(
             try:
                 try:
                     await table_data_repo.create_dynamic_table(
-                        conn, pg_name, columns, vault_name=vault["name"],
+                        conn,
+                        pg_name,
+                        columns,
+                        vault_name=vault["name"],
+                        vault_id=vault_id,
+                        resource_uri=table_uri(
+                            vault["name"], name, collection=collection_path
+                        ),
                     )
                 except asyncpg.DuplicateTableError as e:
                     # The CREATE TABLE itself lost a create/create race past
@@ -1837,6 +1844,7 @@ async def execute_sql(
     *,
     vault_names: list[str],
     user_id: str,
+    actor_id: str,
     sql: str,
     params: list[Any] | None = None,
     is_admin: bool = False,
@@ -1967,6 +1975,7 @@ async def execute_sql(
     try:
         return await get_user_sql_executor().execute(
             user_id=user_id,
+            actor_id=actor_id,
             sql=rewritten,
             params=params,
             is_admin=is_admin,

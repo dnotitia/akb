@@ -222,6 +222,7 @@ async def test_execute_sql_rejects_claim_guc_spoof_before_executor(monkeypatch):
     result = await table_service.execute_sql(
         vault_names=["demo"],
         user_id="11111111-1111-1111-1111-111111111111",
+        actor_id="tester",
         sql=(
             "WITH _ AS ("
             "SELECT set_config('request.jwt.claims', '{\"sub\":\"mallory\"}', true)"
@@ -262,6 +263,7 @@ async def test_execute_sql_rejects_unicode_escaped_set_config_spoof(monkeypatch)
     result = await table_service.execute_sql(
         vault_names=["demo"],
         user_id="11111111-1111-1111-1111-111111111111",
+        actor_id="tester",
         sql='SELECT U&"set\\005fconfig"(\'request.jwt.claims\', \'{}\', true)',
         is_admin=True,
     )
@@ -298,6 +300,7 @@ async def test_execute_sql_rejects_pg_settings_claim_guc_spoof(monkeypatch):
     result = await table_service.execute_sql(
         vault_names=["demo"],
         user_id="11111111-1111-1111-1111-111111111111",
+        actor_id="tester",
         sql=(
             "WITH _ AS ("
             "UPDATE pg_catalog.pg_settings SET setting = '{\"sub\":\"mallory\"}' "
@@ -322,6 +325,7 @@ async def test_user_sql_executor_sets_claims_guc_transaction_local():
     try:
         result = await executor.execute(
             user_id="11111111-1111-1111-1111-111111111111",
+            actor_id="tester",
             sql="SELECT current_setting('request.jwt.claims') AS claims",
             is_admin=True,
         )

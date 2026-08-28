@@ -986,7 +986,7 @@ async def test_p2_archived_vault_blocks_writes(pool):
     vid = await vault_repo.create(name=name, description="x", git_path=f"/tmp/{name}.git", owner_id=admin)
     await get_role_sync().on_vault_create(vid, admin)
     await table_service.create_table(vid, "items", [{"name": "label", "type": "text"}], actor_id="t")
-    await table_service.execute_sql(vault_names=[name], user_id=str(admin),
+    await table_service.execute_sql(vault_names=[name], user_id=str(admin), actor_id="tester",
                                     sql="INSERT INTO items (label) VALUES ('a')", is_admin=True)
 
     # archive the vault (status flip only, no role DDL — as archive_vault does)
@@ -994,12 +994,12 @@ async def test_p2_archived_vault_blocks_writes(pool):
         await conn.execute("UPDATE vaults SET status = 'archived' WHERE id = $1", vid)
 
     # WRITE must be blocked at the app layer
-    w = await table_service.execute_sql(vault_names=[name], user_id=str(admin),
+    w = await table_service.execute_sql(vault_names=[name], user_id=str(admin), actor_id="tester",
                                         sql="INSERT INTO items (label) VALUES ('b')", is_admin=True)
     assert w.get("code") == "vault_archived", f"archived write should be blocked, got {w}"
 
     # READ must still work
-    r = await table_service.execute_sql(vault_names=[name], user_id=str(admin),
+    r = await table_service.execute_sql(vault_names=[name], user_id=str(admin), actor_id="tester",
                                         sql="SELECT label FROM items", is_admin=True)
     assert r.get("total") == 1, f"archived read should still work, got {r}"
 
