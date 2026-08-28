@@ -904,7 +904,7 @@ function failureClassFor(error) {
   return error instanceof DiagnosticError ? error.failureClass : FAILURE_CLASSES.unexpected;
 }
 
-function notRunTransportEvidence(target, failureClass, discovery = null, reason = "common preflight failed") {
+function notRunTransportEvidence(target, failureClass, discovery = null, reason = "common preflight failed", resetGeneration = null) {
   return {
     transport: target,
     status: "not_run",
@@ -916,7 +916,7 @@ function notRunTransportEvidence(target, failureClass, discovery = null, reason 
     operation_order: SMOKE_OPERATIONS,
     operations: SMOKE_OPERATIONS.map((method) => notRunOperation(method, reason)),
     fixture_generation: discovery?.fixtureGeneration ?? null,
-    reset_generation: discovery?.fixtureGeneration ?? null,
+    reset_generation: resetGeneration ?? discovery?.fixtureGeneration ?? null,
   };
 }
 
@@ -940,15 +940,15 @@ function smokeFailureOutput(info, target, validated, discovery, resetGeneration,
       proxy_artifact_version: validated.raw.evidence?.proxy_artifact_version ?? null,
     } : null,
     failure_class: failureClass,
-    transports: Object.fromEntries(targets.map((name) => [name, notRunTransportEvidence(name, failureClass, discovery)])),
+    transports: Object.fromEntries(targets.map((name) => [name, notRunTransportEvidence(name, failureClass, discovery, "common preflight failed", resetGeneration)])),
     comparison: null,
   };
 }
 
-function failedTransportEvidence(target, discovery, error) {
+function failedTransportEvidence(target, discovery, error, resetGeneration) {
   const failureClass = failureClassFor(error);
   return {
-    ...notRunTransportEvidence(target, failureClass, discovery, "transport setup failed"),
+    ...notRunTransportEvidence(target, failureClass, discovery, "transport setup failed", resetGeneration),
     status: "failed",
   };
 }
@@ -1074,7 +1074,7 @@ export async function runSmoke({ info, descriptor, target, fetchImpl = globalThi
         });
       } catch (error) {
         transports[transport] = {
-          evidence: failedTransportEvidence(transport, discovery, error),
+          evidence: failedTransportEvidence(transport, discovery, error, resetGeneration),
           tools: null,
           publicResult: null,
         };
