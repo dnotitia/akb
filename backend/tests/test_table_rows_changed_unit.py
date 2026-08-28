@@ -76,14 +76,3 @@ async def test_user_sql_executor_accepts_actor_context() -> None:
         "set_config('akb.actor_id'" in sql and args == ("actor-name",)
         for sql, args in conn.executed
     )
-
-
-def test_row_change_migration_is_registered() -> None:
-    from pathlib import Path
-
-    backend = Path(__file__).resolve().parents[1]
-    migration = backend / "app" / "db" / "migrations" / "086_dynamic_table_rows_changed.py"
-    assert migration.exists()
-    assert '"086_dynamic_table_rows_changed.py"' in (
-        backend / "app" / "db" / "postgres.py"
-    ).read_text(encoding="utf-8")

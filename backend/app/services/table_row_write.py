@@ -124,7 +124,7 @@ async def update_rows(
     table_name: str,
     user_id: uuid.UUID | str,
     body: Any,
-    actor_id: str | None = None,
+    actor_id: str,
     is_admin: bool = False,
     query_params: Sequence[tuple[str, str]] = (),
     prefer_header: str | None = None,
@@ -159,7 +159,7 @@ async def delete_rows(
     table_name: str,
     user_id: uuid.UUID | str,
     is_admin: bool = False,
-    actor_id: str | None = None,
+    actor_id: str,
     query_params: Sequence[tuple[str, str]] = (),
     prefer_header: str | None = None,
 ) -> RowMutationResponse | dict[str, Any]:
@@ -537,7 +537,7 @@ async def _execute_mutation(
     table_name: str,
     user_id: uuid.UUID | str,
     is_admin: bool,
-    actor_id: str | None = None,
+    actor_id: str,
 ) -> RowMutationResponse | dict[str, Any]:
     try:
         result = await get_user_sql_executor().execute(

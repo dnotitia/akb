@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import sys
 from pathlib import Path
 
@@ -33,9 +32,6 @@ from app.repositories.table_data_repo import (
 from app.services.uri_service import table_uri
 
 logger = logging.getLogger("akb.migration.086")
-
-_DYNAMIC_TABLE_RE = re.compile(r"^vt_[a-z0-9_]+$")
-
 
 async def migrate(conn=None):
     if conn is None:
@@ -56,22 +52,18 @@ async def _run(conn):
         SET search_path = pg_catalog, public
         AS $function$
         DECLARE
-            changed_rows BIGINT;
-            operation TEXT := TG_ARGV[2];
             actor TEXT;
         BEGIN
-            IF operation = 'insert' THEN
-                SELECT COUNT(*) INTO changed_rows FROM akb_rows_changed_new;
-            ELSIF operation = 'update' THEN
-                SELECT COUNT(*) INTO changed_rows FROM akb_rows_changed_new;
-            ELSIF operation = 'delete' THEN
-                SELECT COUNT(*) INTO changed_rows FROM akb_rows_changed_old;
+            IF TG_OP = 'DELETE' THEN
+                IF NOT EXISTS (SELECT 1 FROM akb_rows_changed_old) THEN
+                    RETURN NULL;
+                END IF;
+            ELSIF TG_OP IN ('INSERT', 'UPDATE') THEN
+                IF NOT EXISTS (SELECT 1 FROM akb_rows_changed_new) THEN
+                    RETURN NULL;
+                END IF;
             ELSE
-                RAISE EXCEPTION 'unknown dynamic table row-change operation: %', operation;
-            END IF;
-
-            IF changed_rows = 0 THEN
-                RETURN NULL;
+                RAISE EXCEPTION 'unknown dynamic table row-change operation: %', TG_OP;
             END IF;
 
             actor := NULLIF(current_setting('akb.actor_id', true), '');
@@ -81,7 +73,7 @@ async def _run(conn):
                 'table.rows_changed',
                 TG_ARGV[1],
                 actor,
-                jsonb_build_object('operation', operation)
+                jsonb_build_object('operation', lower(TG_OP))
             );
             RETURN NULL;
         END;
@@ -104,9 +96,6 @@ async def _run(conn):
     skipped = 0
     for row in rows:
         pg_name = pg_table_name(row["vault_name"], row["table_name"])
-        if not _DYNAMIC_TABLE_RE.fullmatch(pg_name):
-            skipped += 1
-            continue
         if not await conn.fetchval(
             "SELECT to_regclass($1) IS NOT NULL", f"public.{pg_name}"
         ):

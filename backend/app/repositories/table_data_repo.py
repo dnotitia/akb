@@ -550,7 +550,6 @@ async def install_dynamic_table_rows_changed_triggers(
             (
                 _sql_string_literal(str(vault_uuid)),
                 _sql_string_literal(resource_uri),
-                _sql_string_literal(operation),
             )
         )
         await conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name} ON {pg_name}")
