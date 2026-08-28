@@ -49,8 +49,8 @@ const FIFO_RETRY_DELAY_MS = 10;
 const execFile = promisify(nodeExecFile);
 
 export class DiagnosticError extends Error {
-  constructor(failureClass, message, options = {}) {
-    super(message, options);
+  constructor(failureClass, message) {
+    super(message);
     this.name = "DiagnosticError";
     this.failureClass = failureClass;
   }
@@ -281,7 +281,7 @@ export async function loadDescriptor(source) {
   const descriptorSource = requireNonEmptyString(source, "descriptor path is required");
   let text;
   try {
-    text = descriptorSource === "-" ? await readStdin() : await readFile(descriptorSource, "utf8");
+    text = descriptorSource === "-" ? await readFile(0, "utf8") : await readFile(descriptorSource, "utf8");
   } catch {
     throw configuration("could not read the runtime descriptor");
   }
@@ -291,10 +291,6 @@ export async function loadDescriptor(source) {
   } catch {
     throw configuration("runtime descriptor is not valid JSON");
   }
-}
-
-async function readStdin() {
-  return readFile(0, "utf8");
 }
 
 export async function inspectInstallation({ toolingRoot = TOOLING_ROOT, nodeVersion = process.versions.node } = {}) {
@@ -448,7 +444,7 @@ export function validateRuntimeDiscovery(descriptor, discovery, target) {
   if (reset.method !== "POST" || reset.url !== descriptor.reset.url || reset.body?.scenario !== descriptor.scenario) {
     throw configuration("runtime discovery reset evidence disagrees with the descriptor");
   }
-  validateCredentialContract(descriptor, discovery, descriptor.appOrigin.toString(), target);
+  const credentialContract = validateCredentialContract(descriptor, discovery, descriptor.appOrigin.toString(), target);
   return {
     sourceRevision,
     profile,
@@ -461,6 +457,9 @@ export function validateRuntimeDiscovery(descriptor, discovery, target) {
     proxyLocal,
     fixtureGeneration: generation,
     fixtureReset: reset,
+    credentialEnv: credentialContract.credentialEnv,
+    login: credentialContract.login,
+    mint: credentialContract.mint,
   };
 }
 
@@ -587,7 +586,7 @@ export async function resolveStdioExecutable(descriptor) {
   return { executable, cwd: rootReal, packageVersion: manifest.version };
 }
 
-export function buildInspectorConfig(target, descriptor, discovery, pat, stdio) {
+export function buildInspectorConfig(target, discovery, pat, stdio) {
   const common = {
     protocolEra: discovery.protocolEra,
     connectionTimeout: 15000,
@@ -1041,7 +1040,7 @@ function failedTransportEvidence(target, discovery, error, resetGeneration) {
 
 async function runTransport({ target, info, descriptor, discovery, credential, runtimeRoot, spawnProcess }) {
   const stdio = target === "stdio" ? await resolveStdioExecutable(descriptor) : null;
-  const config = buildInspectorConfig(target, descriptor, discovery, credential.pat, stdio);
+  const config = buildInspectorConfig(target, discovery, credential.pat, stdio);
   const digest = configDigest(config, credential.secrets);
   const methods = SMOKE_OPERATIONS;
   const operations = [];
@@ -1135,10 +1134,7 @@ export async function runSmoke({ info, descriptor, target, fetchImpl = globalThi
     if (initialContract.sourceRevision !== discovery.sourceRevision || resetGeneration !== discovery.fixtureGeneration) {
       throw configuration("fixture reset changed the candidate or did not report the same generation");
     }
-    credential = await resolveCredential(validated, {
-      ...validateCredentialContract(validated, postResetDiscovery, validated.appOrigin.toString(), target),
-      ...postResetDiscovery,
-    }, fetchImpl);
+    credential = await resolveCredential(validated, discovery, fetchImpl);
   } catch (error) {
     return smokeFailureOutput(info, target, validated, discovery, resetGeneration, error);
   }
@@ -1202,12 +1198,9 @@ export async function runInteractive({ info, descriptor, target, fetchImpl = glo
   await checkReady(validated, fetchImpl);
   const discoveryPayload = await requestJson(validated.services.fixture.discovery.url, { fetchImpl, purpose: "runtime discovery" });
   const discovery = validateRuntimeDiscovery(validated, discoveryPayload, target);
-  const credential = await resolveCredential(validated, {
-    ...validateCredentialContract(validated, discoveryPayload, validated.appOrigin.toString(), target),
-    ...discoveryPayload,
-  }, fetchImpl);
+  const credential = await resolveCredential(validated, discovery, fetchImpl);
   const stdio = target === "stdio" ? await resolveStdioExecutable(validated) : null;
-  const config = buildInspectorConfig(target, validated, discovery, credential.pat, stdio);
+  const config = buildInspectorConfig(target, discovery, credential.pat, stdio);
   const runtimeRoot = await mkdtemp(join(tmpdir(), "akb-mcp-inspector-web-"));
   try {
     const result = await runInspectorInvocation({

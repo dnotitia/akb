@@ -219,7 +219,7 @@ test("run-scoped config uses a private FIFO and secrets never enter Inspector ar
     return child;
   };
   const d = descriptor();
-  const config = buildInspectorConfig("http", { ...validateDescriptor(d, "http"), credentials: d.credentials }, {
+  const config = buildInspectorConfig("http", {
     protocolEra: "modern",
     protocolVersion: MODERN_PROTOCOL_VERSION,
     http: { url: "http://127.0.0.1:8000/mcp/" },
@@ -285,7 +285,7 @@ test("a child can reopen the private FIFO and the handoff leaves no config state
 test("interactive Inspector also receives config through the private FIFO", async () => {
   let captured = null;
   const d = descriptor();
-  const config = buildInspectorConfig("http", { ...validateDescriptor(d, "http"), credentials: d.credentials }, {
+  const config = buildInspectorConfig("http", {
     protocolEra: "modern",
     protocolVersion: MODERN_PROTOCOL_VERSION,
     http: { url: "http://127.0.0.1:8000/mcp/" },
