@@ -996,3 +996,57 @@ def test_non_json_success_operations_keep_their_media_types():
     help_content = schema["paths"]["/api/v1/help/skill-template"]["get"]["responses"]["200"]["content"]
     assert "text/markdown" in help_content
     assert "application/json" not in help_content
+
+
+def test_event_tail_openapi_contract_is_authenticated_typed_sse():
+    operation = app.openapi()["paths"]["/api/v1/events/{vault}"]["get"]
+
+    assert operation["operationId"] == "eventsTail"
+    assert operation["tags"] == ["events"]
+    assert operation["security"] == [{"bearerAuth": []}]
+    assert set(operation["responses"]) >= {"200", "400", "401", "403", "404", "410", "422", "500", "503"}
+    content = operation["responses"]["200"]["content"]
+    assert set(content) == {"text/event-stream"}
+    assert content["text/event-stream"]["schema"] == {
+        "type": "string",
+        "description": "SSE frames carrying change or checkpoint JSON data.",
+    }
+    assert content["text/event-stream"]["x-event-schemas"] == {
+        "change": {"$ref": "#/components/schemas/ChangeEventEnvelopeV1"},
+        "checkpoint": {"$ref": "#/components/schemas/TailCheckpointV1"},
+    }
+
+    params = {(parameter["name"], parameter["in"]): parameter for parameter in operation["parameters"]}
+    assert ("cursor", "query") in params
+    assert ("start", "query") in params
+    assert ("kind", "query") in params
+    assert ("Last-Event-ID", "header") in params
+    assert params[("cursor", "query")]["schema"] == {
+        "$ref": "#/components/schemas/EventCursor",
+    }
+    start_schema = params[("start", "query")]["schema"]
+    start_variants = start_schema.get("anyOf", [start_schema])
+    assert {"const": "earliest", "type": "string"} in start_variants
+    kind_schema = params[("kind", "query")]["schema"]
+    kind_variants = kind_schema.get("anyOf", [kind_schema])
+    assert {
+        "type": "array",
+        "items": {"$ref": "#/components/schemas/EventKind"},
+    } in kind_variants
+    assert params[("Last-Event-ID", "header")]["schema"] == {
+        "$ref": "#/components/schemas/EventCursor",
+    }
+    assert params[("Last-Event-ID", "header")]["required"] is False
+
+    schemas = app.openapi()["components"]["schemas"]
+    assert schemas["EventCursor"]["type"] == "string"
+    assert schemas["EventKind"]["type"] == "string"
+    assert schemas["ChangeEventEnvelopeV1"]["required"] == [
+        "version",
+        "cursor",
+        "occurred_at",
+        "vault",
+        "kind",
+        "payload",
+    ]
+    assert schemas["TailCheckpointV1"]["required"] == ["version", "cursor"]

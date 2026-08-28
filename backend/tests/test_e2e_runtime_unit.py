@@ -345,7 +345,7 @@ def test_suite_summary_uses_last_complete_line_and_fails_closed():
     assert SuiteResult("suite.sh", 0, 0, 0, None, "").gate_failed
     assert SuiteResult("suite.sh", 0, 2, 0, "Results: 2 passed, 0 failed", "").gate_failed is False
     assert SuiteResult("suite.sh", -4, 0, 0, None, "").signal == 4
-    assert len(CURATED_SUITES) == 25
+    assert len(CURATED_SUITES) == 26
 
 
 def test_shell_e2e_manifest_classifies_every_suite_exactly_once():

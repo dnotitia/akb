@@ -29,6 +29,7 @@ from app.api.routes import (
     auth,
     collections,
     documents,
+    events,
     files,
     help as help_routes,
     knowledge,
@@ -341,6 +342,7 @@ app.include_router(app_legacy_adoptions.router, prefix="/api/v1", tags=["app-leg
 app.include_router(app_rollouts.router, prefix="/api/v1", tags=["app-rollouts"])
 app.include_router(access.router, prefix="/api/v1", tags=["access"])
 app.include_router(documents.router, prefix="/api/v1", tags=["documents"])
+app.include_router(events.router, prefix="/api/v1", tags=["events"])
 app.include_router(search.router, prefix="/api/v1", tags=["search"])
 app.include_router(collections.router, prefix="/api/v1")
 app.include_router(knowledge.router, prefix="/api/v1")

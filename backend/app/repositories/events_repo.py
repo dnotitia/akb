@@ -64,6 +64,57 @@ async def emit_event(
     )
 
 
+async def get_vault_event_bounds(
+    conn,
+    vault_id: uuid.UUID | str,
+) -> tuple[int | None, int | None]:
+    """Return the retained ``events.id`` range for one Vault.
+
+    The range deliberately ignores kind filters. A filtered consumer still
+    advances across every retained event, emitting checkpoints for kinds it
+    did not select, so retention-gap validation must use the complete Vault
+    tail rather than only the selected subset.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT MIN(id) AS earliest_id, MAX(id) AS latest_id
+          FROM events
+         WHERE vault_id = $1
+        """,
+        _to_uuid_or_none(vault_id),
+    )
+    return (
+        int(row["earliest_id"]) if row["earliest_id"] is not None else None,
+        int(row["latest_id"]) if row["latest_id"] is not None else None,
+    )
+
+
+async def list_vault_events(
+    conn,
+    vault_id: uuid.UUID | str,
+    *,
+    after_id: int,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Read retained Vault events in their monotonic database order."""
+    if limit < 1:
+        raise ValueError("event batch limit must be positive")
+
+    vault_uuid = _to_uuid_or_none(vault_id)
+    rows = await conn.fetch(
+        """
+        SELECT id, occurred_at, vault_id, kind, resource_uri, actor_id, payload
+          FROM events
+         WHERE vault_id = $1
+           AND id > $2
+         ORDER BY id ASC
+         LIMIT $3
+        """,
+        vault_uuid, after_id, limit,
+    )
+    return [dict(row) for row in rows]
+
+
 def _to_uuid_or_none(v: uuid.UUID | str | None) -> uuid.UUID | None:
     if v is None:
         return None

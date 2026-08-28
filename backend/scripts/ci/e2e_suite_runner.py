@@ -46,6 +46,7 @@ CURATED_SUITES: tuple[str, ...] = (
     "test_okf_export_import_e2e.sh",
     "test_resource_hash_e2e.sh",
     "test_events_emit_e2e.sh",
+    "test_event_tail_e2e.sh",
     "test_s3_delete_outbox_e2e.sh",
     "test_publication_resolution_e2e.sh",
     "test_publications_e2e.sh",

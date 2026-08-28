@@ -138,6 +138,7 @@ OPERATION_TAG_OVERRIDES = {
     ("get", "/api/v1/history/{vault}/{doc_id}"): ["documents"],
     ("get", "/api/v1/diff/{vault}/{doc_id}"): ["documents"],
 }
+EVENT_TAIL_PATH = "/api/v1/events/{vault}"
 NO_SUCCESS_RESPONSE_OPERATIONS = {
     ("get", "/api/v1/auth/keycloak/login"),
     ("get", "/api/v1/auth/keycloak/logout"),
@@ -214,8 +215,27 @@ def _normalize_api_operations(schema: dict[str, Any]) -> None:
             else:
                 operation.setdefault("tags", [_namespace_for_path(path)])
             operation.setdefault("operationId", _operation_id_from_schema(path, method, operation))
+            if method == "get" and path == EVENT_TAIL_PATH:
+                _normalize_event_tail_parameters(operation)
             _ensure_success_response(path, method, operation)
             _ensure_error_responses(operation)
+
+
+def _normalize_event_tail_parameters(operation: dict[str, Any]) -> None:
+    """Point Event Tail inputs at the public cursor/kind components."""
+    for parameter in operation.get("parameters", []):
+        if parameter.get("name") in {"cursor", "Last-Event-ID"}:
+            parameter["schema"] = {"$ref": "#/components/schemas/EventCursor"}
+        elif parameter.get("name") == "kind":
+            parameter["schema"] = {
+                "anyOf": [
+                    {
+                        "type": "array",
+                        "items": {"$ref": "#/components/schemas/EventKind"},
+                    },
+                    {"type": "null"},
+                ]
+            }
 
 
 def _ensure_success_response(path: str, method: str, operation: dict[str, Any]) -> None:
@@ -295,6 +315,38 @@ def _error_description(status: str) -> str:
 
 def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
     return {
+        "EventCursor": {
+            "type": "string",
+            "pattern": r"^ec1\.[A-Za-z0-9_-]+$",
+            "description": "Opaque signed cursor bound to a Vault and exact Event Kind filter set.",
+        },
+        "EventKind": {
+            "type": "string",
+            "pattern": r"^[A-Za-z][A-Za-z0-9]*(?:[._:-][A-Za-z0-9]+)*$",
+            "description": "Stable exact Event Kind identifier.",
+        },
+        "ChangeEventEnvelopeV1": {
+            "type": "object",
+            "required": ["version", "cursor", "occurred_at", "vault", "kind", "payload"],
+            "properties": {
+                "version": {"type": "integer", "enum": [1]},
+                "cursor": {"$ref": "#/components/schemas/EventCursor"},
+                "occurred_at": {"type": "string", "format": "date-time"},
+                "vault": {"type": "string"},
+                "kind": {"$ref": "#/components/schemas/EventKind"},
+                "resource_uri": _nullable_string(),
+                "actor": _nullable_string(),
+                "payload": {"$ref": "#/components/schemas/AkbJsonObject"},
+            },
+        },
+        "TailCheckpointV1": {
+            "type": "object",
+            "required": ["version", "cursor"],
+            "properties": {
+                "version": {"type": "integer", "enum": [1]},
+                "cursor": {"$ref": "#/components/schemas/EventCursor"},
+            },
+        },
         "AkbCollectionSummary": {
             "type": "object",
             "required": ["path", "name", "summary", "doc_count"],
