@@ -2,7 +2,7 @@
 status: accepted
 stage: implementation
 created: 2026-08-13
-updated: 2026-08-14
+updated: 2026-08-28
 ---
 
 # Authentication Mode Boundary
@@ -170,6 +170,9 @@ and policy surfaces.
 - In `sso` mode, ordinary login exposes only enabled, configured OIDC login
   options. Local login, registration, password recovery, and hidden local
   escape paths remain unavailable in both UI and backend policy.
+- Selecting an ordinary upstream provider starts a fresh authentication
+  ceremony. A native Keycloak session from the separate product-admin surface
+  must not satisfy that request or bypass the selected broker alias.
 - If public login options cannot be loaded or validated, ordinary login is
   unavailable; it is not guessed to be local.
 - Product-admin access uses a mode-appropriate bootstrap and recovery path

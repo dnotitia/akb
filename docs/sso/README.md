@@ -136,7 +136,9 @@ The ordinary `akb-web` client maps Keycloak's `identity_provider` user-session
 note into both token profiles. AKB requires that signed alias to equal the
 provider selected in its one-time state, then retains and rechecks the alias in
 the encrypted session envelope; `kc_idp_hint` alone is never an authorization
-boundary.
+boundary. Ordinary provider selection also requests a fresh Keycloak
+authentication ceremony, so a native session left by the separate
+product-admin surface cannot bypass the selected upstream broker.
 An invalid refresh deletes the session; a
 transient Keycloak outage rolls back without converting it into a revocation.
 Production HTTPS uses `__Host-` cookie names with `Secure`, no `Domain`, and
