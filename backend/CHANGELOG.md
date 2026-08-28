@@ -7,6 +7,14 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Made product-admin callback failures recoverable
+
+Expired, malformed, or refused product-admin OIDC callbacks now return the
+browser to `/admin` with a fixed, non-disclosing retry message instead of
+rendering a serialized API error. The one-time browser-binding cookie is
+cleared on failure, while successful callbacks retain the existing short,
+opaque admin session behavior.
+
 ### Added dual-era MCP protocol support
 
 The backend now uses the pinned MCP 2.1.0 SDK and serves the 2026-07-28
