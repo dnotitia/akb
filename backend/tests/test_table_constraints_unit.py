@@ -912,6 +912,7 @@ async def test_executor_translates_pg_23505_to_stable_unique_violation():
     with pytest.raises(UniqueViolationError) as ei:
         await ex.execute(
             user_id="00000000-0000-0000-0000-000000000001",
+            actor_id="tester",
             sql="INSERT INTO vt_demo__events (actor) VALUES ('x')",
             is_admin=True,  # skip SET LOCAL ROLE (needs no real role)
         )
@@ -965,6 +966,7 @@ async def test_execute_sql_surfaces_unique_violation_with_stable_code(monkeypatc
     out = await table_service.execute_sql(
         vault_names=["demo"],
         user_id="u1",
+        actor_id="tester",
         sql="INSERT INTO events (actor) VALUES ('x')",
         is_admin=True,
     )

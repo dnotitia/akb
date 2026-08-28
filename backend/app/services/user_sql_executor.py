@@ -165,7 +165,7 @@ class UserSqlExecutor:
         self,
         *,
         user_id: uuid.UUID | str,
-        actor_id: str | None = None,
+        actor_id: str,
         sql: str,
         params: list[Any] | None = None,
         fetch: bool | None = None,
@@ -212,7 +212,7 @@ class UserSqlExecutor:
                     await conn.execute("SET LOCAL search_path = public")
                     await conn.execute(
                         "SELECT set_config('akb.actor_id', $1, true)",
-                        actor_id if actor_id is not None else str(user_id),
+                        actor_id,
                     )
                     request_claims = current_request_jwt_claims.get()
                     if request_claims is not None:

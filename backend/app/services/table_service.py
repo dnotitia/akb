@@ -1844,7 +1844,7 @@ async def execute_sql(
     *,
     vault_names: list[str],
     user_id: str,
-    actor_id: str | None = None,
+    actor_id: str,
     sql: str,
     params: list[Any] | None = None,
     is_admin: bool = False,
