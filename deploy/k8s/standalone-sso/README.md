@@ -5,6 +5,12 @@ database to the standalone AKB stack. It owns exactly one AKB realm and is not
 the deployment shape for a managed tenant that reuses a platform-owned
 Keycloak.
 
+For a customized existing namespace, first follow the
+[local-to-SSO cutover runbook](../../../docs/sso/kubernetes-cutover.md). This
+directory is a reference resource set, not an in-place migration patch: review
+resource names, selectors, StatefulSets, PVCs, Ingress, and retained companion
+workloads before applying a target-specific overlay.
+
 The bundle implements the product-administrator bootstrap and recovery slice:
 
 1. Keycloak creates one temporary master-realm service account on its first

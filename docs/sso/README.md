@@ -126,6 +126,12 @@ Additional OSS providers should follow [Adding a provider](adding-a-provider.md)
 The registry is explicit and code-reviewed; AKB does not load arbitrary
 Keycloak JSON or runtime Python plugins.
 
+For an existing Kubernetes installation, use the
+[local-to-SSO cutover runbook](kubernetes-cutover.md). It separates broker
+topology, account continuity, the stop-the-world session-epoch bridge,
+provider activation, acceptance gates, and prepared rollback; do not treat
+`auth_mode` as an isolated rolling configuration toggle.
+
 Ordinary browser sessions are server-custodied. The browser receives an opaque
 HttpOnly AKB handle and a readable double-submit CSRF cookie; it never receives
 a Keycloak access, refresh, or ID token and SSO never mints an AKB user JWT.
