@@ -529,8 +529,12 @@ class E2ERuntime:
                         "akb_delete_file",
                     ],
                     "input_properties": {
-                        "akb_put": ["file"],
-                        "akb_update": ["file"],
+                        # Top-level properties accepted by the stdio proxy but
+                        # absent from direct HTTP. `_vault_skill_ack` is the
+                        # existing capability-v2 retry extension; `file` is
+                        # the existing local-filesystem extension.
+                        "akb_put": ["file", "_vault_skill_ack"],
+                        "akb_update": ["file", "_vault_skill_ack"],
                     },
                 },
             },

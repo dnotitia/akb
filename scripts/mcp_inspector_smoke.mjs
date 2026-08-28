@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, readFileSync } from "node:fs";
 import { mkdtemp, open, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -281,7 +281,7 @@ export async function loadDescriptor(source) {
   const descriptorSource = requireNonEmptyString(source, "descriptor path is required");
   let text;
   try {
-    text = descriptorSource === "-" ? await readFile(0, "utf8") : await readFile(descriptorSource, "utf8");
+    text = descriptorSource === "-" ? readFileSync(0, "utf8") : await readFile(descriptorSource, "utf8");
   } catch {
     throw configuration("could not read the runtime descriptor");
   }
@@ -822,16 +822,22 @@ function normalizeSchemaValue(value, removals = new Set()) {
     if (key === "properties" && isRecord(value[key])) {
       output[key] = Object.fromEntries(Object.entries(value[key])
         .filter(([property]) => !removals.has(property))
-        .map(([property, item]) => [property, normalizeSchemaValue(item, new Set())]));
+        .map(([property, item]) => [property, normalizeSchemaValue(item)]));
       continue;
     }
     if (key === "required" && Array.isArray(value[key])) {
-      output[key] = [...value[key]].sort();
+      output[key] = value[key].filter((property) => !removals.has(property)).sort();
       continue;
     }
-    output[key] = normalizeSchemaValue(value[key], new Set());
+    output[key] = normalizeSchemaValue(value[key]);
   }
   return output;
+}
+
+function hasTopLevelSchemaProperty(schema, property) {
+  return isRecord(schema)
+    && isRecord(schema.properties)
+    && Object.prototype.hasOwnProperty.call(schema.properties, property);
 }
 
 function toolByName(tools, name) {
@@ -1088,7 +1094,7 @@ async function runTransport({ target, info, descriptor, discovery, credential, r
   };
 }
 
-function compareTransports(http, stdio, discovery) {
+export function compareTransports(http, stdio, discovery) {
   if (http.evidence.status !== "passed" || stdio.evidence.status !== "passed") {
     return { status: "not_run", reason: "transport operation failed", shared_tools: discovery.sharedTools, proxy_local_tools: discovery.proxyLocal.tools };
   }
@@ -1100,6 +1106,19 @@ function compareTransports(http, stdio, discovery) {
       return { status: "failed", failure_class: FAILURE_CLASSES.unexpected, reason: "declared shared tool is missing", tool: name };
     }
     const allowed = new Set(discovery.proxyLocal.inputProperties[name] ?? []);
+    for (const property of allowed) {
+      if (!hasTopLevelSchemaProperty(stdioTool.inputSchema, property)
+        || hasTopLevelSchemaProperty(httpTool.inputSchema, property)) {
+        return {
+          status: "failed",
+          failure_class: FAILURE_CLASSES.schema,
+          tools: [...details, { name, schema_match: false }],
+          reason: "declared proxy-local input property is not stdio-only",
+          tool: name,
+          property,
+        };
+      }
+    }
     const httpSchema = normalizeSchemaValue(httpTool.inputSchema ?? {}, new Set());
     const stdioSchema = normalizeSchemaValue(stdioTool.inputSchema ?? {}, allowed);
     const schemaMatch = stableStringify(httpSchema) === stableStringify(stdioSchema);

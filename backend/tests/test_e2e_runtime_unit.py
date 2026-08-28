@@ -1084,6 +1084,10 @@ def test_transport_profile_exposes_real_proxy_boundary_without_secret(tmp_path):
     assert descriptor["evidence"]["transport"] == ["http", "stdio"]
     assert descriptor["evidence"]["consumer_smoke"]["http"]["path"] == "/mcp/"
     assert "akb_get_file" in descriptor["evidence"]["consumer_smoke"]["proxy_local"]["tools"]
+    assert descriptor["evidence"]["consumer_smoke"]["proxy_local"]["input_properties"] == {
+        "akb_put": ["file", "_vault_skill_ack"],
+        "akb_update": ["file", "_vault_skill_ack"],
+    }
 
 
 @pytest.mark.asyncio

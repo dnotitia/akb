@@ -156,6 +156,13 @@ each child exits; it is not a regular config file. The command does not put
 credentials in argv, a checked-in/generated config, or Inspector's persistent
 OAuth/secret stores.
 
+The runtime discovery contract lists the exact top-level stdio-only input
+properties under `proxy_local.input_properties`: `file` for the local-file
+document path and `_vault_skill_ack` for the existing capability-v2 retry
+argument. The comparison removes only those declared properties (and matching
+required entries) from the stdio schema; all other schema drift remains a
+portability failure.
+
 Smoke pins the modern protocol era and runs, in order, `initialize`,
 `tools/list --strict --format json`, and the discovery-declared read-only
 `tools/call`. It validates server identity, required tools, strict schema

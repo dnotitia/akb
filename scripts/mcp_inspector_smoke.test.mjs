@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import test from "node:test";
+import { AKBProxy } from "../packages/akb-mcp-client/lib/proxy.mjs";
 
 import {
   createConfigFifo,
@@ -13,6 +14,7 @@ import {
   buildInspectorConfig,
   classifyInspectorFailure,
   configDigest,
+  compareTransports,
   inspectorArguments,
   inspectInstallation,
   nodeVersionMeetsFloor,
@@ -129,7 +131,7 @@ function discovery() {
         },
         proxy_local: {
           tools: ["akb_put_file"],
-          input_properties: { akb_put: ["file"] },
+          input_properties: { akb_put: ["file", "_vault_skill_ack"] },
         },
       },
     },
@@ -189,6 +191,109 @@ test("credential values are redacted from evidence and config digest", () => {
   const digest = configDigest(value, [marker]);
   assert.match(digest, /^sha256:[0-9a-f]{64}$/);
   assert.equal(stableStringify({ b: 1, a: 2 }), '{"a":2,"b":1}');
+});
+
+// This is the normalized shape of backend/mcp_server/tools.py's akb_put
+// schema; descriptions are intentionally omitted because comparison ignores
+// prose. The proxy input is produced by its real _decorateTools() path after
+// the backend's capability-v2 _vault_skill_ack decoration.
+const BACKEND_AKB_PUT_SCHEMA = {
+  type: "object",
+  properties: {
+    parent: { type: "string" },
+    vault: { type: "string" },
+    collection: { type: "string" },
+    slug: { type: "string" },
+    title: { type: "string" },
+    content: { type: "string" },
+    type: { type: "string", default: "note" },
+    status: { type: "string", enum: ["draft", "active", "archived"], default: "draft" },
+    tags: { type: "array", items: { type: "string" } },
+    domain: { type: "string" },
+    summary: { type: "string" },
+    depends_on: { type: "array", items: { type: "string" } },
+    related_to: { type: "array", items: { type: "string" } },
+  },
+  required: ["title", "content"],
+};
+
+const VAULT_SKILL_ACK_SCHEMA = { type: "string", maxLength: 128 };
+
+function actualAkbPutSchemaPair() {
+  const backendTool = { name: "akb_put", inputSchema: structuredClone(BACKEND_AKB_PUT_SCHEMA) };
+  const httpTool = structuredClone(backendTool);
+  const backendForProxy = structuredClone(backendTool);
+  backendForProxy.inputSchema.properties._vault_skill_ack = structuredClone(VAULT_SKILL_ACK_SCHEMA);
+  const proxy = new AKBProxy({ url: "http://127.0.0.1:8000/mcp/", pat: "test-pat" });
+  const stdioTool = proxy._decorateTools({ tools: [backendForProxy] }).tools.find((tool) => tool.name === "akb_put");
+  return { httpTool, stdioTool };
+}
+
+function comparisonDiscovery() {
+  return {
+    sharedTools: ["akb_put"],
+    proxyLocal: {
+      tools: [],
+      inputProperties: { akb_put: ["file", "_vault_skill_ack"] },
+    },
+  };
+}
+
+function comparisonTransport(tool) {
+  return {
+    evidence: { status: "passed" },
+    tools: [tool],
+    publicResult: { vaults: [], total: 0, returned: 0 },
+  };
+}
+
+test("backend/proxy akb_put schemas differ only by declared stdio extensions", () => {
+  const { httpTool, stdioTool } = actualAkbPutSchemaPair();
+  assert.equal(httpTool.inputSchema.properties.file, undefined);
+  assert.equal(httpTool.inputSchema.properties._vault_skill_ack, undefined);
+  assert.equal(typeof stdioTool.inputSchema.properties.file, "object");
+  assert.deepEqual(stdioTool.inputSchema.properties._vault_skill_ack, VAULT_SKILL_ACK_SCHEMA);
+  const comparison = compareTransports(
+    comparisonTransport(httpTool),
+    comparisonTransport(stdioTool),
+    comparisonDiscovery(),
+  );
+  assert.equal(comparison.status, "passed");
+  assert.equal(comparison.tools[0].schema_match, true);
+});
+
+test("declared stdio extensions are removed from matching required entries only", () => {
+  const { httpTool, stdioTool } = actualAkbPutSchemaPair();
+  stdioTool.inputSchema.required.push("file", "_vault_skill_ack");
+  const comparison = compareTransports(
+    comparisonTransport(httpTool),
+    comparisonTransport(stdioTool),
+    comparisonDiscovery(),
+  );
+  assert.equal(comparison.status, "passed");
+});
+
+test("shared schema comparison fails on undeclared or common-schema drift", () => {
+  const driftCases = [
+    ["undeclared property", (schema) => { schema.properties.unexpected = { type: "string" }; }],
+    ["common type", (schema) => { schema.properties.content.type = "number"; }],
+    ["common required", (schema) => { schema.required.push("parent"); }],
+    ["additionalProperties", (schema) => { schema.additionalProperties = false; }],
+    ["missing declared extension", (schema) => { delete schema.properties.file; }],
+    ["HTTP extension", (schema) => { schema.properties.file = { type: "string" }; }],
+  ];
+  for (const [label, mutate] of driftCases) {
+    const { httpTool, stdioTool } = actualAkbPutSchemaPair();
+    if (label === "HTTP extension") mutate(httpTool.inputSchema);
+    else mutate(stdioTool.inputSchema);
+    const comparison = compareTransports(
+      comparisonTransport(httpTool),
+      comparisonTransport(stdioTool),
+      comparisonDiscovery(),
+    );
+    assert.equal(comparison.status, "failed", label);
+    assert.equal(comparison.failure_class, FAILURE_CLASSES.schema, label);
+  }
 });
 
 test("Inspector exit classes remain stable", () => {
@@ -361,6 +466,7 @@ test("smoke uses the declared reset, credential, and operation sequence", async 
     { name: "akb_put", inputSchema: { type: "object", properties: { content: { type: "string" } } } },
     { name: "akb_delete", inputSchema: { type: "object", properties: { uri: { type: "string" } } } },
   ];
+  let schemaFindings = [{ severity: "warning", code: "untyped_schema" }];
   const spawnArgs = [];
   const spawnProcess = (_command, args, options) => {
     spawnArgs.push({ args, options });
@@ -376,7 +482,9 @@ test("smoke uses the declared reset, credential, and operation sequence", async 
           ? { resultType: "complete", ttlMs: 0, cacheScope: "private", tools }
           : { resultType: "complete", content: [{ type: "text", text: JSON.stringify({ vaults: [{ name: "akb_minted_pat" }], total: 1, returned: 1 }) }], isError: false };
       child.stderr.emit("data", "diagnostic: akb_minted_pat\n");
-      child.stdout.emit("data", `${JSON.stringify({ result })}\n`);
+      const envelope = { result };
+      if (method === "tools/list") envelope.schemaFindings = schemaFindings;
+      child.stdout.emit("data", `${JSON.stringify(envelope)}\n`);
       child.emit("close", 0, null);
     }).catch((error) => {
       child.stderr.emit("data", `${error.code || "config_read_error"}\n`);
@@ -404,11 +512,28 @@ test("smoke uses the declared reset, credential, and operation sequence", async 
     assert.equal(output.inspector.config_handoff, "private_fifo");
     assert.deepEqual(output.transports.http.operation_order, ["initialize", "tools/list", "tools/call"]);
     assert.equal(output.transports.http.operations[2].observable_match, true);
+    assert.equal(output.transports.http.operations[1].schema_warning_count, 1);
+    assert.equal(output.transports.http.operations[1].schema_error_count, 0);
+    assert.deepEqual(output.transports.http.operations[1].schema_findings, schemaFindings);
     assert.equal(output.transports.http.config_digest.startsWith("sha256:"), true);
     assert.equal(JSON.stringify(output).includes("akb_minted_pat"), false);
     assert.equal(spawnArgs.length, 3);
     assert.equal(spawnArgs.every(({ args }) => !args.includes("akb_minted_pat")), true);
     assert.equal(calls.some(({ url, options }) => url.endsWith("/reset") && options.method === "POST"), true);
+
+    schemaFindings = [{ severity: "error", code: "invalid_schema" }];
+    const failed = await runSmoke({
+      info: { entry: "/private/inspector.js", package: "@modelcontextprotocol/inspector", version: "2.4.0", nodeVersion: "22.19.0" },
+      descriptor: descriptor(),
+      target: "http",
+      fetchImpl,
+      spawnProcess,
+    });
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.failure_class, FAILURE_CLASSES.schema);
+    assert.equal(failed.transports.http.operations[1].schema_warning_count, 0);
+    assert.equal(failed.transports.http.operations[1].schema_error_count, 1);
+    assert.deepEqual(failed.transports.http.operations[1].schema_findings, schemaFindings);
   } finally {
     if (oldUsername === undefined) delete process.env.AKB_E2E_USERNAME; else process.env.AKB_E2E_USERNAME = oldUsername;
     if (oldPassword === undefined) delete process.env.AKB_E2E_PASSWORD; else process.env.AKB_E2E_PASSWORD = oldPassword;
