@@ -8,7 +8,7 @@ from dataclasses import replace
 import pytest
 
 from app.sso.models import ProviderConfigureSpec
-from app.sso.providers import keycloak_oidc
+from app.sso.providers import generic_oidc, keycloak_oidc
 from app.sso.providers.keycloak_oidc import ProviderDefinitionError
 from app.sso.registry import provider_definition, provider_types
 
@@ -68,10 +68,14 @@ def _readback(representation: dict[str, object]):
 
 
 def test_registry_is_explicit_and_contains_only_the_reference_provider():
-    assert provider_types() == ("keycloak-oidc",)
+    assert provider_types() == ("keycloak-oidc", "oidc")
     definition = provider_definition("keycloak-oidc")
     assert definition.provider_type == "keycloak-oidc"
     assert definition.module is keycloak_oidc
+
+    oidc_definition = provider_definition("oidc")
+    assert oidc_definition.provider_type == "oidc"
+    assert oidc_definition.module is generic_oidc
 
     with pytest.raises(ValueError, match="unsupported_sso_provider_type"):
         provider_definition("arbitrary-keycloak-json")
