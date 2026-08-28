@@ -455,9 +455,11 @@ class E2ERuntime:
         }
         if isinstance(fixture_namespace, str):
             fixture["namespace"] = fixture_namespace
+            fixture["generation"] = fixture_namespace
         evidence: dict[str, object] = {
             "source_revision": self._source_revision(),
             "backend_artifact_version": self._backend_version(),
+            "profile": self.profile.name,
             "protocol_revision": PROTOCOL_REVISION,
             "transport": ["http", "stdio"] if self.profile.needs_stdio else ["http"],
             "selected_capabilities": list(self.selected_capabilities),
@@ -494,6 +496,44 @@ class E2ERuntime:
                 },
             },
             "fixture": fixture,
+            "consumer_smoke": {
+                "protocol_era": "modern",
+                "protocol_version": "2026-07-28",
+                "http": {
+                    "service": "app",
+                    "method": "POST",
+                    "path": "/mcp/",
+                },
+                "required_tools": ["akb_list_vaults", "akb_put", "akb_delete"],
+                "shared_tools": ["akb_list_vaults", "akb_put", "akb_delete"],
+                "representative": {
+                    "tool": "akb_list_vaults",
+                    "read_only": True,
+                    "arguments": {},
+                    "observable": {
+                        "content_type": "json",
+                        "result_type": "object",
+                        "required_keys": ["vaults", "total", "returned"],
+                        "items_key": "vaults",
+                        "count_rule": "total>=returned==items.length",
+                        "is_error": False,
+                    },
+                },
+                "proxy_local": {
+                    "tools": [
+                        "akb_put_file",
+                        "akb_put_image",
+                        "akb_discard_image",
+                        "akb_get_file",
+                        "akb_update_file",
+                        "akb_delete_file",
+                    ],
+                    "input_properties": {
+                        "akb_put": ["file"],
+                        "akb_update": ["file"],
+                    },
+                },
+            },
             "failure_stages": ["provisioning", "product_assertion"],
         }
         if self.profile.needs_stdio:
@@ -532,6 +572,12 @@ class E2ERuntime:
             "scenario": self.config.scenario,
             "app_ready": self.app_ready,
         }
+
+    def fixture_generation(self) -> str | None:
+        """Return the current reset generation without exposing private values."""
+
+        generation = self._fixture_catalog.get("namespace")
+        return generation if isinstance(generation, str) and generation else None
 
     def fixture_discovery(self) -> dict[str, object]:
         """Return sanitized product coordinates and bounded fixture controls."""

@@ -47,6 +47,9 @@ jobs:
       - name: Test stdio proxy
         working-directory: packages/akb-mcp-client
         run: npm test
+      - name: Install MCP Inspector developer tooling
+        working-directory: tools/mcp-inspector
+        run: npm ci
       - name: Install frontend deps
         working-directory: frontend
         # `--ignore-scripts` skips package postinstall hooks. We don't need

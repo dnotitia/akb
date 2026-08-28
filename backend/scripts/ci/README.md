@@ -97,7 +97,7 @@ Operational logs go to stderr and the private runtime log directory. Its
 shape is schema v2:
 
 ```json
-{"schema_version":2,"status":"ready","scenario":"empty","services":{"app":{"origin":"http://127.0.0.1:8000","health":{"method":"GET","url":"http://127.0.0.1:8000/readyz"},"discovery":{"method":"GET","url":"http://127.0.0.1:8000/openapi.json"}},"fixture":{"origin":"http://127.0.0.1:8889","health":{"method":"GET","url":"http://127.0.0.1:8889/health"},"reset":{"method":"POST","url":"http://127.0.0.1:8889/reset","content_type":"application/json","body":{"scenario":"empty"}},"discovery":{"method":"GET","url":"http://127.0.0.1:8889/openapi.json"}}},"credentials":{"username_env":"AKB_E2E_USERNAME","password_env":"AKB_E2E_PASSWORD","login_path":"/api/v1/auth/login"}}
+{"schema_version":2,"status":"ready","scenario":"empty","services":{"app":{"origin":"http://127.0.0.1:8000","health":{"method":"GET","url":"http://127.0.0.1:8000/readyz"},"discovery":{"method":"GET","url":"http://127.0.0.1:8000/openapi.json"}},"fixture":{"origin":"http://127.0.0.1:8889","health":{"method":"GET","url":"http://127.0.0.1:8889/health"},"reset":{"method":"POST","url":"http://127.0.0.1:8889/reset","content_type":"application/json","body":{"scenario":"empty"}},"discovery":{"method":"GET","url":"http://127.0.0.1:8889/discover"}}},"credentials":{"username_env":"AKB_E2E_USERNAME","password_env":"AKB_E2E_PASSWORD","login_path":"/api/v1/auth/login"}}
 ```
 
 Credential values are read only from the named environment variables and are
@@ -123,6 +123,65 @@ transport profile additionally runs the existing proxy contract/reconnect
 tests after the clean install and observes `tools/list` plus a read-only
 `tools/call` through the real child process. Provisioning failures and live
 product-assertion failures are emitted as separate gate events.
+
+### MCP Inspector consumer smoke
+
+The repository-owned MCP Inspector command is a development tool, not a
+second runtime. Install its private, exact-pinned package once in a clean
+checkout:
+
+```bash
+(cd tools/mcp-inspector && npm ci)
+```
+
+The same entrypoint provides a machine-readable smoke and an interactive Web
+diagnostic. It consumes the schema-v2 descriptor printed by the runtime and
+never needs a global Inspector install:
+
+```bash
+npm run --prefix tools/mcp-inspector inspect -- \
+  --intent smoke --target both --descriptor /path/to/descriptor.json
+
+npm run --prefix tools/mcp-inspector inspect -- \
+  --intent interactive --target http --descriptor /path/to/descriptor.json
+```
+
+For an interactive session, use `serve --profile transport-proxy` when the
+stdio target is needed. The Web client is explicitly bound to `127.0.0.1` and
+keeps Inspector's normal launch/session authentication. The command reads the
+credential environment names declared by discovery, mints a run-scoped PAT
+when one is not already present, and sends Inspector configuration through
+stdin. It does not put credentials in argv, a checked-in/generated config, or
+Inspector's persistent OAuth/secret stores.
+
+Smoke pins the modern protocol era and runs, in order, `initialize`,
+`tools/list --strict --format json`, and the discovery-declared read-only
+`tools/call`. It validates server identity, required tools, strict schema
+findings, `isError`, the runtime-declared observable result, and—when both
+transports are selected—shared tool schemas and the public representative
+result. Proxy-local file tools are recorded as local extensions and are not
+required from direct HTTP. This is a modern consumer-portability proof, not a
+complete MCP specification-conformance certification.
+
+The command emits one JSON evidence object. It includes the exact source
+revision, Inspector/Node versions, protocol era, runtime profile,
+fixture/reset generation, per-transport config digest, operation order and
+outcomes. Transport outcomes remain independent when `--target both` is used.
+Its stable failure classes and process exit codes are:
+
+| Exit | Failure class |
+| ---: | --- |
+| 0 | success |
+| 1 | `unexpected_failure` |
+| 2 | `usage_configuration_error` |
+| 3 | `authentication_required` |
+| 4 | `server_unreachable` |
+| 5 | `tool_result_error` |
+| 6 | `schema_portability_error` |
+
+Missing readiness, discovery, reset, credential names, exact representative
+coordinates, or the clean installed `akb-mcp` executable is a configuration
+failure; the command never silently skips it.
 
 For a direct local gate, use the uv-managed Python environment to generate
 per-run values and export them without placing a credential value in the

@@ -137,6 +137,14 @@ if [ "${#missing_installs[@]}" -ne 0 ]; then
 fi
 echo "  node deps present in frontend + packages/akb-client"
 
+if [ ! -f "tools/mcp-inspector/node_modules/@modelcontextprotocol/inspector/package.json" ]; then
+  echo >&2
+  echo "  ✗ MCP Inspector developer tooling is not installed." >&2
+  echo "    Run: (cd tools/mcp-inspector && npm ci)" >&2
+  exit 1
+fi
+echo "  MCP Inspector developer tooling present"
+
 # ─── E2E suite manifest ───────────────────────────────────────────
 # Fails fast when a new shell E2E suite is neither run by the hosted gate nor
 # deliberately deferred with a reviewed reason.
@@ -220,6 +228,13 @@ step "generated type drift (@akb/client)"
 
 step "packed SDK consumer proof (@akb/client)"
 (cd packages/akb-client && pnpm run proof:packed)
+
+# ─── MCP Inspector: repository consumer contract ─────────────────
+# The live HTTP+stdio consumer gate runs in the isolated E2E workflow. This
+# cheap contract suite keeps the shared entrypoint, preflight, stdin config,
+# redaction, and stable failure taxonomy executable in every contributor gate.
+step "MCP Inspector consumer contract"
+npm test --prefix tools/mcp-inspector
 
 # ─── frontend: vitest (unit + RTL + MSW) ──────────────────────────
 # Closes the biggest gate gap: previously a broken test could merge

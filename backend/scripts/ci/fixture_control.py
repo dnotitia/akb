@@ -94,7 +94,13 @@ def create_app(runtime: FixtureRuntime) -> FastAPI:
                 detail="reset scenario does not match the running runtime",
             )
         await runtime.reset_scenario()
-        return {"status": "ready", "scenario": runtime.scenario}
+        response = {"status": "ready", "scenario": runtime.scenario}
+        generation = getattr(runtime, "fixture_generation", None)
+        if callable(generation):
+            value = generation()
+            if isinstance(value, str) and value:
+                response["generation"] = value
+        return response
 
     @app.post("/control")
     async def control(request: ControlRequest) -> dict[str, object]:

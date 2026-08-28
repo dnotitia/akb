@@ -1,0 +1,16 @@
+{
+  "name": "akb-mcp-inspector-tooling",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Private development tooling for the repository-owned MCP consumer smoke.",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "inspect": "node ../../scripts/mcp_inspector_smoke.mjs",
+    "test": "node --test ../../scripts/mcp_inspector_smoke.test.mjs"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/inspector": "2.4.0"
+  }
+}
