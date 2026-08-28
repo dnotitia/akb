@@ -9,10 +9,12 @@ specifically; the proxy has its own log in
 
 ### Fixed upstream provider selection with an existing Keycloak session
 
-Ordinary browser login now requires a fresh authentication ceremony in
-addition to its signed `kc_idp_hint`. A native Keycloak session left by the
+Ordinary browser login now requires a fresh Keycloak authentication ceremony
+in addition to its signed `kc_idp_hint`. A native Keycloak session left by the
 separate product-admin surface can no longer satisfy an upstream-provider
-request and cause the selected broker alias to be skipped.
+request and cause the selected broker alias to be skipped. The request does
+not send `prompt=login`, so the upstream provider can still use its own SSO
+session.
 
 ### Added standards-based upstream OIDC provider control
 

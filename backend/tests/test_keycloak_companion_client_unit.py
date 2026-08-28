@@ -41,9 +41,10 @@ async def test_begin_browser_login_is_nonce_pkce_and_browser_bound(monkeypatch):
     assert query["scope"] == ["openid profile email"]
     assert query["kc_idp_hint"] == ["workforce"]
     # Provider selection must win over any native/broker session already in
-    # the browser (for example, the separate product-admin login).
-    assert query["prompt"] == ["login"]
+    # the browser (for example, the separate product-admin login), without
+    # forcing the upstream provider to discard its own SSO session.
     assert query["max_age"] == ["0"]
+    assert "prompt" not in query
     assert query["code_challenge_method"] == ["S256"]
     assert len(query["code_challenge"][0]) >= 43
     assert len(query["nonce"][0]) >= 20

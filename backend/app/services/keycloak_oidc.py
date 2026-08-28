@@ -246,10 +246,9 @@ class KeycloakOIDC:
             "code_challenge_method": "S256",
             "kc_idp_hint": provider_alias,
             # The browser can carry a native Keycloak session from the
-            # separate product-admin surface.  Without forced reauthentication
-            # Keycloak may satisfy this request from that session and ignore
-            # the selected upstream broker alias.
-            "prompt": "login",
+            # separate product-admin surface.  Force Keycloak to run the
+            # selected broker ceremony again without forwarding prompt=login
+            # and unnecessarily defeating the upstream provider's own SSO.
             "max_age": "0",
         }
         await _store_issue(
