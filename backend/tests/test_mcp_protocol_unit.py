@@ -255,6 +255,50 @@ async def test_legacy_session_is_bound_to_the_initializing_principal(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_legacy_delete_preserves_success_shape_and_invalidates_session(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
+    alice = _user("alice")
+    monkeypatch.setattr(http_app, "resolve_mcp_authorization", lambda _header: _resolved(alice))
+
+    app = MCPApp()
+    async with app.run():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await _post(
+                client,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "legacy", "version": "1"},
+                    },
+                },
+            )
+            session_id = response.headers["mcp-session-id"]
+
+            response = await client.request(
+                "DELETE",
+                "/mcp/",
+                headers={**_headers(), "mcp-session-id": session_id},
+            )
+            assert response.status_code == 200
+            assert response.json() == {"terminated": True}
+            assert response.headers.get("mcp-session-id") is None
+
+            response = await _post(
+                client,
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+                **{"mcp-session-id": session_id},
+            )
+            assert response.status_code == 404
+            assert response.json()["error"]["message"] == "Not Found: Session has been terminated"
+
+
+@pytest.mark.asyncio
 async def test_shared_tool_core_audits_generation_revision_and_auth_method(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
     alice = _user("alice")

@@ -15,7 +15,7 @@ from typing import AsyncIterator
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.types import Receive, Scope, Send
+from starlette.types import Message, Receive, Scope, Send
 
 from mcp.server.auth.middleware.bearer_auth import (
     AuthenticatedUser as MCPAuthenticatedUser,
@@ -36,6 +36,7 @@ from app.services.auth_service import (
 
 
 AKB_USER_SCOPE_KEY = "akb.mcp.user"
+_LEGACY_DELETE_BODY = b'{"terminated":true}'
 
 
 def _www_authenticate_header() -> str:
@@ -148,6 +149,46 @@ def _replay_body(body: bytes) -> Receive:
         return {"type": "http.disconnect"}
 
     return receive
+
+
+def _legacy_delete_response_adapter(send: Send) -> Send:
+    """Keep the pre-SDK success body for a terminated legacy session.
+
+    The SDK correctly invalidates the transport, but its generic DELETE
+    response has no body. AKB's established public endpoint contract returns
+    ``{"terminated": true}`` and does not echo a session header; adapt only a
+    successful legacy termination while leaving all rejection responses intact.
+    """
+
+    status_code: int | None = None
+
+    async def adapted(message: Message) -> None:
+        nonlocal status_code
+        if message.get("type") == "http.response.start":
+            status_code = message.get("status")
+            if status_code == 200:
+                headers: list[tuple[bytes, bytes]] = []
+                has_content_length = False
+                for name, value in message.get("headers", []):
+                    lower_name = name.lower()
+                    if lower_name == b"mcp-session-id":
+                        continue
+                    if lower_name == b"content-length":
+                        value = str(len(_LEGACY_DELETE_BODY)).encode("ascii")
+                        has_content_length = True
+                    headers.append((name, value))
+                if not has_content_length:
+                    headers.append((b"content-length", str(len(_LEGACY_DELETE_BODY)).encode("ascii")))
+                message = {**message, "headers": headers}
+        elif (
+            message.get("type") == "http.response.body"
+            and status_code == 200
+            and not message.get("more_body", False)
+        ):
+            message = {**message, "body": _LEGACY_DELETE_BODY}
+        await send(message)
+
+    return adapted
 
 
 class MCPApp:
@@ -328,7 +369,14 @@ class MCPApp:
 
             routed_receive = _replay_body(body)
 
-        await self._manager().handle_request(scope, routed_receive, send)
+        manager_send = send
+        if (
+            request.method == "DELETE"
+            and session_id
+            and header_version not in MODERN_PROTOCOL_VERSIONS
+        ):
+            manager_send = _legacy_delete_response_adapter(send)
+        await self._manager().handle_request(scope, routed_receive, manager_send)
 
 
 mcp_app = MCPApp()
