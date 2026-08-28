@@ -68,6 +68,7 @@ const provider = {
   client_id: "akb-broker",
   client_secret_configured: true,
   redirect_uri: "https://auth.akb.example.com/realms/akb/broker/workforce/endpoint",
+  post_logout_redirect_uri: "https://auth.akb.example.com/realms/akb/broker/workforce/endpoint/logout_response",
   capabilities: {
     supports_logout: true,
     supports_identity_migration: true,

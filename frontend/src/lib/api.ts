@@ -794,6 +794,7 @@ export interface AdminSsoProvider {
   client_id: string | null;
   client_secret_configured: boolean;
   redirect_uri: string;
+  post_logout_redirect_uri: string;
   capabilities: {
     supports_logout: boolean;
     supports_identity_migration: boolean;
@@ -816,7 +817,7 @@ function parseAdminSsoProvider(value: unknown): AdminSsoProvider {
     !hasExactKeys(provider, [
       "provider_type", "alias", "display_name", "state", "enabled", "issuer",
       "discovery_url", "client_id", "client_secret_configured",
-      "redirect_uri", "capabilities",
+      "redirect_uri", "post_logout_redirect_uri", "capabilities",
     ]) ||
     !hasExactKeys(capabilities, ["supports_logout", "supports_identity_migration"]) ||
     typeof provider.provider_type !== "string" ||
@@ -851,6 +852,10 @@ function parseAdminSsoProvider(value: unknown): AdminSsoProvider {
     !provider.redirect_uri ||
     provider.redirect_uri.length > 2048 ||
     hasControlCharacters(provider.redirect_uri) ||
+    typeof provider.post_logout_redirect_uri !== "string" ||
+    !provider.post_logout_redirect_uri ||
+    provider.post_logout_redirect_uri.length > 2048 ||
+    hasControlCharacters(provider.post_logout_redirect_uri) ||
     ((state === "enabled" || state === "configured_disabled") && (
       provider.issuer === null ||
       provider.discovery_url === null ||
@@ -873,6 +878,7 @@ function parseAdminSsoProvider(value: unknown): AdminSsoProvider {
     client_id: provider.client_id as string | null,
     client_secret_configured: provider.client_secret_configured,
     redirect_uri: provider.redirect_uri,
+    post_logout_redirect_uri: provider.post_logout_redirect_uri,
     capabilities: {
       supports_logout: capabilities.supports_logout,
       supports_identity_migration: capabilities.supports_identity_migration,

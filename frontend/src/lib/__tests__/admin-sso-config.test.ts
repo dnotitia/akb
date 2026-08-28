@@ -1,6 +1,9 @@
+import { readFileSync } from "node:fs";
+
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  type AdminSsoCatalog,
   adminLogout,
   configureAdminSsoProvider,
   getAdminSsoCatalog,
@@ -9,30 +12,11 @@ import {
 } from "../api";
 
 
-const provider = {
-  provider_type: "keycloak-oidc",
-  alias: "workforce",
-  display_name: "Company SSO",
-  state: "configured_disabled",
-  enabled: false,
-  issuer: "https://accounts.example.com/realms/workforce",
-  discovery_url: "https://accounts.example.com/realms/workforce/.well-known/openid-configuration",
-  client_id: "akb-broker",
-  client_secret_configured: true,
-  redirect_uri: "https://auth.akb.example.com/realms/akb/broker/workforce/endpoint",
-  capabilities: {
-    supports_logout: true,
-    supports_identity_migration: true,
-  },
-};
-
-const catalog = {
-  schema_version: 1,
-  auth_mode: "sso",
-  control_mode: "direct",
-  supported_provider_types: ["keycloak-oidc"],
-  providers: [provider],
-};
+const catalog = JSON.parse(readFileSync(
+  "../backend/tests/fixtures/admin_sso_provider_catalog_v1.json",
+  "utf8",
+)) as AdminSsoCatalog;
+const provider = catalog.providers[0];
 
 function response(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -74,6 +58,10 @@ describe("admin SSO provider API", () => {
       ...catalog,
       providers: [{ ...provider, display_name: "unsafe\nlabel" }],
     }],
+    ["unsafe post-logout redirect URI", {
+      ...catalog,
+      providers: [{ ...provider, post_logout_redirect_uri: "https://auth.example.com/logout\nunsafe" }],
+    }],
     ["provider secret field", {
       ...catalog,
       providers: [{ ...provider, client_secret: "leaked" }], // pragma: allowlist secret
@@ -90,8 +78,8 @@ describe("admin SSO provider API", () => {
     const result = await configureAdminSsoProvider("workforce", {
       provider_type: "keycloak-oidc",
       display_name: "Company SSO",
-      issuer: provider.issuer,
-      discovery_url: provider.discovery_url,
+      issuer: provider.issuer!,
+      discovery_url: provider.discovery_url!,
       client_id: "akb-broker",
       client_secret: "write-only-secret", // pragma: allowlist secret
     });
