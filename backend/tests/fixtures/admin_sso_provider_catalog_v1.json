@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "auth_mode": "sso",
+  "control_mode": "direct",
+  "supported_provider_types": [
+    "keycloak-oidc"
+  ],
+  "providers": [
+    {
+      "provider_type": "keycloak-oidc",
+      "alias": "workforce",
+      "display_name": "Company SSO",
+      "state": "configured_disabled",
+      "enabled": false,
+      "issuer": "https://accounts.example.com/realms/workforce",
+      "discovery_url": "https://accounts.example.com/realms/workforce/.well-known/openid-configuration",
+      "client_id": "akb-broker",
+      "client_secret_configured": true,
+      "redirect_uri": "https://auth.akb.example.com/realms/akb/broker/workforce/endpoint",
+      "post_logout_redirect_uri": "https://auth.akb.example.com/realms/akb/broker/workforce/endpoint/logout_response",
+      "capabilities": {
+        "supports_logout": true,
+        "supports_identity_migration": true
+      }
+    }
+  ]
+}
