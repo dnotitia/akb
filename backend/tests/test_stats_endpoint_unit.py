@@ -612,3 +612,61 @@ async def test_the_listener_really_binds_a_second_socket_in_this_process(db, mon
         await listener.stop(timeout=5.0)
 
     assert listener.is_running() is False
+
+
+async def test_a_port_that_cannot_be_bound_stops_the_boot(monkeypatch):
+    """A configured port that will not bind must fail `start()`, loudly.
+
+    Binding inside the serving task would let `start()` return True while the
+    task died on EADDRINUSE — a port misrendered onto one already in use would
+    then produce a pod that passes every probe and has no stats socket, which
+    the platform only discovers as connection errors on its poller. uvicorn
+    reports this by calling `sys.exit(1)`, so the check also proves the
+    SystemExit is converted rather than left to unwind the whole boot.
+    """
+    monkeypatch.delenv(listener.PORT_ENV_VAR, raising=False)
+    monkeypatch.setattr(settings.stats, "host", "127.0.0.1")
+
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+        port = taken.getsockname()[1]
+        monkeypatch.setattr(settings.stats, "port", port)
+
+        with pytest.raises(RuntimeError, match=str(port)):
+            listener.start()
+
+    # Nothing half-composed: a later start() is not confused by the failure,
+    # and stop() has nothing to do.
+    assert listener.is_running() is False
+    assert listener._task is None
+    assert listener._socket is None
+    await asyncio.wait_for(listener.stop(), timeout=2.0)
+
+
+@pytest.mark.parametrize("drain_timeout", [5.0, 0.0], ids=["graceful", "cancelled"])
+async def test_stopping_closes_the_listening_socket(monkeypatch, drain_timeout):
+    """`stop()` leaves no listening socket open, on either drain path.
+
+    A zero budget takes the cancel path, where uvicorn's graceful shutdown —
+    the thing that closes the sockets it was handed — never runs.
+
+    This pins the property, not the line that provides it: today uvicorn closes
+    the socket on the graceful path and the `asyncio.Server` wrapping the fd
+    closes it on the cancel path, so removing `stop()`'s own `close()` still
+    passes. It is a regression guard for the property that the port is free
+    once `stop()` returns, which is what the next process to bind it depends
+    on. Asserted on the socket object because rebinding the port would pass on
+    a leak too — the fd would be released by the collector moments later.
+    """
+    monkeypatch.delenv(listener.PORT_ENV_VAR, raising=False)
+    monkeypatch.setattr(settings.stats, "host", "127.0.0.1")
+    monkeypatch.setattr(settings.stats, "port", _free_port())
+
+    assert listener.start() is True
+    sock = listener._socket
+    assert sock is not None and sock.fileno() != -1
+
+    await listener.stop(timeout=drain_timeout)
+
+    assert sock.fileno() == -1, "the listening socket outlived stop()"

@@ -120,6 +120,11 @@ parse; unifying them is not planned.
 - No port configured (neither `stats.port` nor `AKB_STATS_PORT`) leaves the
   process unchanged; a malformed `AKB_STATS_PORT` fails the boot rather than
   silently disabling the surface.
+- A configured port that cannot be bound fails the boot too. The socket is
+  opened synchronously in `start()`, so a port rendered onto one already in use
+  cannot produce a pod that passes every probe with no stats socket on it.
+- The port is free once `stop()` returns, on the graceful and the cancelled
+  drain path alike.
 - The second listener binds, answers `/stats`, and serves nothing else — API
   paths 404 on that port — while leaving the process signal handlers alone, so
   SIGTERM still reaches the API server.

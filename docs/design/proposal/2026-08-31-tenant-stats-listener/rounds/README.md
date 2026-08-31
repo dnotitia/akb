@@ -67,3 +67,27 @@ The accepted direction is an explicit marker written by the distillation path �
 a fact about the document, which cannot move under it. That change spans this
 repository and the gardener, so the field is omitted until it lands.
 `sampler._distilled_doc_count` is the only thing here that will change.
+
+## 2026-08-31 — Where the stats socket is opened
+
+The first implementation created the serving task and let uvicorn bind inside
+it. Review rejected that: a bind failure — a port rendered onto one already in
+use is the realistic case — left `start()` returning True and the boot
+continuing, producing a pod that passes every probe with no stats socket on it.
+The platform would meet that only as connection errors on its poller, and it is
+the same failure `configured_port` already refuses to allow for a malformed
+value.
+
+The socket is now opened synchronously with `Config.bind_socket()` and handed
+to `serve(sockets=[...])`. uvicorn reports a bind failure by calling
+`sys.exit(1)` rather than raising, so the `SystemExit` is converted to an error
+naming the address — otherwise it would pass every `except Exception` between
+there and the top of the boot and end the process with nothing but a stray log
+line.
+
+Checked while making the change: uvicorn does close the sockets it is handed,
+from the graceful shutdown it reaches after it has started serving; on the
+cancel path the `asyncio.Server` wrapping the fd closes it when collected.
+`stop()` closes it anyway, so the release is timed by the stop rather than by
+the collector. The test pins the property — the port is free once `stop()`
+returns — and not that line specifically; removing it still passes today.

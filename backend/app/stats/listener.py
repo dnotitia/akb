@@ -27,6 +27,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import socket
 from typing import Iterator
 
 import uvicorn
@@ -48,6 +49,13 @@ PORT_ENV_VAR = "AKB_STATS_PORT"
 
 _server: uvicorn.Server | None = None
 _task: asyncio.Task | None = None
+# Held so `stop()` can release it deterministically. Both existing paths do
+# already close it — uvicorn's graceful shutdown closes the sockets it was
+# handed, and on the cancel path the `asyncio.Server` that `loop.create_server`
+# built around this fd closes it when collected — but the second of those is a
+# release timed by the garbage collector, and a listening socket held past the
+# process's own shutdown is what stops the next pod from binding the port.
+_socket: socket.socket | None = None
 
 
 def configured_port() -> int | None:
@@ -131,9 +139,17 @@ def is_running() -> bool:
 def start() -> bool:
     """Bind the stats socket. Returns False when the feature is not configured.
 
+    Raises when a configured port cannot be bound. The socket is opened HERE,
+    synchronously, and not inside the serving task: a bind that fails inside
+    the task would leave `start()` returning True and the boot continuing, so a
+    port misrendered onto one already in use would produce a healthy pod with
+    no stats socket — the exact failure `configured_port` refuses to allow for
+    a malformed value, and one the platform would only notice as connection
+    errors on its poller.
+
     Idempotent: a second call while the listener is up is a no-op.
     """
-    global _server, _task
+    global _server, _task, _socket
 
     port = configured_port()
     if port is None:
@@ -153,26 +169,59 @@ def start() -> bool:
         access_log=False,
         log_level="warning",
     )
-    _server = _NoSignalServer(config)
-    _task = asyncio.create_task(_server.serve(), name="stats_listener")
+    try:
+        sock = config.bind_socket()
+    except SystemExit as exc:
+        # uvicorn logs the OSError and calls sys.exit(1) rather than raising it.
+        # SystemExit derives from BaseException, so it would sail past every
+        # `except Exception` between here and the top of the boot and terminate
+        # the process with no context but a stray log line. Convert it to an
+        # ordinary error that names what could not be bound.
+        raise RuntimeError(
+            f"stats listener could not bind {settings.stats.host}:{port} "
+            f"(see the preceding uvicorn error)"
+        ) from exc
+
+    server = _NoSignalServer(config)
+    try:
+        task = asyncio.create_task(server.serve(sockets=[sock]), name="stats_listener")
+    except BaseException:
+        # The socket is bound but nothing will ever serve it — most plausibly
+        # there is no running loop. Release the port and leave the module
+        # state untouched, so this reads as "never started" rather than as a
+        # listener that exists and answers nothing.
+        sock.close()
+        raise
+    # Published only once there is something to stop.
+    _server, _socket, _task = server, sock, task
     logger.info("stats listener bound on %s:%d", settings.stats.host, port)
     return True
 
 
 async def stop(timeout: float = 5.0) -> None:
     """Ask the listener to drain, then stop waiting once the budget is spent."""
-    global _server, _task
+    global _server, _task, _socket
 
-    server, task = _server, _task
-    _server, _task = None, None
+    server, task, sock = _server, _task, _socket
+    _server, _task, _socket = None, None, None
     if server is not None:
         server.should_exit = True
-    if task is None or task.done():
-        return
+    try:
+        if task is None or task.done():
+            return
 
-    _, pending = await asyncio.wait([task], timeout=timeout)
-    if not pending:
-        return
-    logger.warning("stats listener did not drain in %.1fs; cancelling", timeout)
-    task.cancel()
-    await asyncio.wait([task], timeout=1.0)
+        _, pending = await asyncio.wait([task], timeout=timeout)
+        if not pending:
+            return
+        logger.warning("stats listener did not drain in %.1fs; cancelling", timeout)
+        task.cancel()
+        await asyncio.wait([task], timeout=1.0)
+    finally:
+        # Usually redundant, deliberately kept: `close()` on an already-closed
+        # socket is a no-op, and this makes the release happen HERE rather than
+        # whenever the last reference to uvicorn's server object goes away. On
+        # the cancel path nothing runs uvicorn's shutdown, so without this the
+        # fd survives until the collector reaches the `asyncio.Server` holding
+        # it — an ordering no part of this file controls.
+        if sock is not None:
+            sock.close()
