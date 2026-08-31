@@ -448,8 +448,13 @@ redis_stream_maxlen: 100000
 # free; poll at half the sampler interval or faster, otherwise a phase drift
 # skips whole snapshots. Not a metrics endpoint: no Prometheus dependency, no
 # exposition format.
+#
+# One process only: the socket is bound from the API's lifespan, so every
+# worker of a multi-worker uvicorn would try to bind it and the second would
+# fail the boot. The API runs as one process per pod (Dockerfile CMD), which
+# is the supported shape.
 # stats:
-#   port: 9105                    # unset = the listener is not composed at all; 9105 is the akb-platform default (its tenant-monitor and NetworkPolicy render the same number)
+#   port: 9105                    # unset = the listener is not composed at all. Under akb-platform this is its `akb.statsPort`: one value that becomes this AKB_STATS_PORT, the port the NetworkPolicy admits, and the port the tenant-monitor polls — so the platform sets it, not this file
 #   host: "0.0.0.0"               # the NetworkPolicy, not the bind address, is what makes this safe
 #   sampler_interval_secs: 300    # the only thing that decides what this surface costs
 #   activity_grace_minutes: 5     # settling time after a UTC day closes, before its volume is folded (permanently)
