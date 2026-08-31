@@ -93,7 +93,7 @@ async def grep_documents(
     files_with_matches: bool = Query(False, description="grep -l — URIs with matches"),
     measurement_include_text_files: bool = Query(
         False,
-        description="Guarded native M1 W3b mode: include admitted searchable text Files.",
+        description="Native mode: include admitted searchable text Files.",
     ),
     user: AuthenticatedUser = Depends(get_current_user),
 ):

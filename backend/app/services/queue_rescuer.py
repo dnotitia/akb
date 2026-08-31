@@ -104,6 +104,19 @@ _RESCUE_STATEMENTS = (
         RETURNING 1
     ) SELECT COUNT(*) FROM rescued
     """,
+    """
+    WITH rescued AS (
+        UPDATE native_file_projection_outbox
+           SET completed_at = NOW(), outcome = 'abandoned',
+               claimed_at = NULL, next_attempt_at = NULL,
+               last_error = COALESCE(
+                   last_error, 'claim lease expired after final attempt'
+               )
+         WHERE completed_at IS NULL AND retry_count >= $1
+           AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+        RETURNING 1
+    ) SELECT COUNT(*) FROM rescued
+    """,
 )
 
 

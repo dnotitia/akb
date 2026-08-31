@@ -156,7 +156,7 @@ class NativeRevisionMigrationRepository:
               FROM vaults v
              LEFT JOIN vault_external_git eg ON eg.vault_id = v.id
              WHERE v.id = $1
-               AND v.status = 'active'
+               AND v.status <> 'deleted'
         """
         if conn is not None:
             row = await conn.fetchrow(sql, namespace_id)

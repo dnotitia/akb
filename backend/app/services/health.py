@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import uuid
 
-from app.services import embed_worker, metadata_worker
+from app.services import embed_worker, metadata_worker, native_file_projection
 
 
 async def vault_health(vault_id: uuid.UUID) -> dict:
@@ -21,7 +21,9 @@ async def vault_health(vault_id: uuid.UUID) -> dict:
     adds task-scheduling overhead."""
     backfill = await embed_worker.pending_stats(vault_id)
     metadata = await metadata_worker.pending_stats(vault_id)
+    projection = await native_file_projection.pending_stats(vault_id)
     return {
         "metadata_backfill": metadata,
         "vector_store":      {"backfill": backfill},
+        "native_file_projection": projection,
     }

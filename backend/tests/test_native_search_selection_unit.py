@@ -453,6 +453,75 @@ async def test_native_hydration_verification_and_decode_run_off_event_loop(monke
     assert verify_threads
 
 
+@pytest.mark.asyncio
+async def test_native_file_hydration_preserves_public_file_identity(monkeypatch):
+    from app.services import search_service
+
+    body = b"legacy to native\n"
+    chunk_id = uuid.uuid4()
+    resource_id = uuid.uuid4()
+    row = {
+        "chunk_id": chunk_id,
+        "resource_id": resource_id,
+        "current_path": "files/cutover.txt",
+        "head_revision_id": "a" * 40,
+        "vault_name": "measure",
+        "name": "cutover.txt",
+        "description": "fixture",
+        "mime_type": "text/plain",
+        "collection": "files",
+        "payload_id": uuid.uuid4(),
+        "namespace_id": uuid.uuid4(),
+        "content_profile": "text",
+        "digest": hashlib.sha256(body).hexdigest(),
+        "byte_size": len(body),
+        "encoding": "utf-8",
+        "selected_placement": M1PgBodyStore.selected_placement,
+        "verification_profile": "sha256-size-utf8-v1",
+        "canonical_bytes": body,
+    }
+    pool = _HydrationPool(_HydrationConn(row))
+
+    async def get_test_pool():
+        return pool
+
+    monkeypatch.setattr(search_service, "get_pool", get_test_pool)
+    monkeypatch.setattr(
+        search_service,
+        "_configured_document_source_type",
+        lambda: search_service.NATIVE_DOCUMENT_SOURCE,
+    )
+    loop_thread = threading.get_ident()
+    verify_threads = []
+    original_verify = M1PgBodyStore._verify_row
+
+    def guarded_verify(candidate):
+        verify_threads.append(threading.get_ident())
+        assert threading.get_ident() != loop_thread
+        return original_verify(candidate)
+
+    monkeypatch.setattr(M1PgBodyStore, "_verify_row", staticmethod(guarded_verify))
+    results = await SearchService()._hydrate_hits(
+        [
+            VectorHit(
+                chunk_id=str(chunk_id),
+                source_type="native_file",
+                source_id=str(resource_id),
+                section_path="",
+                content="legacy to native",
+                score=1.0,
+            )
+        ]
+    )
+
+    assert len(results) == 1
+    assert results[0].source_type == "file"
+    assert results[0].uri == f"akb://measure/coll/files/file/{resource_id}"
+    assert results[0].path == "files/cutover.txt"
+    assert results[0].title == "cutover.txt"
+    assert verify_threads
+
+
 class _StubAcquire:
     def __init__(self, conn):
         self.conn = conn

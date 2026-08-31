@@ -713,8 +713,10 @@ async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
     req = DocumentUpdateRequest(
         content=args.get("content"),
         title=args.get("title"),
+        type=args.get("type"),
         status=args.get("status"),
         tags=args.get("tags"),
+        domain=args.get("domain"),
         summary=args.get("summary"),
         depends_on=args.get("depends_on"),
         related_to=args.get("related_to"),

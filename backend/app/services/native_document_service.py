@@ -1,8 +1,11 @@
-"""Measurement-only Document compatibility facade over the native ledger.
+"""Document compatibility facade over the native ledger.
 
 The public Document models intentionally keep their historical commit-shaped
-field names.  Values are native opaque Revision tokens; this service neither
-constructs a Git service nor writes the legacy document projection.
+field names. New Native revisions use opaque Revision tokens. Existing-database
+cutovers may retain frozen historical Git selectors; their Git reader is
+constructed lazily only for an immutable completed bridge mapping. Current
+heads and all new writes remain Native-only, and this service never writes the
+legacy document projection.
 """
 
 from __future__ import annotations
@@ -10,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import NoReturn
 
@@ -36,7 +40,13 @@ from app.models.document import (
 )
 from app.repositories import table_data_repo, table_registry_repo, vault_files_repo
 from app.repositories.document_repo import CollectionRepository
-from app.repositories.native_revision_repo import NativeRevisionRepository
+from app.repositories.native_revision_migration_repo import (
+    NativeRevisionMigrationRepository,
+)
+from app.repositories.native_revision_repo import (
+    NativeRevisionRepository,
+    NativeRevisionSelectorAmbiguousError,
+)
 from app.repositories.vault_repo import VaultRepository
 from app.services import skill_policy
 from app.services.document_service import (
@@ -51,6 +61,7 @@ from app.services.document_service import (
     newest_public_slug,
     validate_vault_name,
 )
+from app.services.git_service import GitService
 from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.kg_service import validate_new_structured_relation_refs
 from app.services.native_revision_service import (
@@ -92,6 +103,7 @@ class NativeDocumentService(DocumentService):
         *,
         pool: asyncpg.Pool | None = None,
         failpoint: Failpoint | None = None,
+        legacy_git: GitService | None = None,
     ):
         # Deliberately do not call DocumentService.__init__: that would create
         # the legacy Git adapter before a request is even served.
@@ -101,6 +113,9 @@ class NativeDocumentService(DocumentService):
         # composition must leave it unset.  Left unset, ``_native`` builds
         # exactly the service it built before this seam existed.
         self._failpoint = failpoint
+        # Do not construct the retained-history bridge on current reads or
+        # writes. It exists only for a completed legacy selector mapping.
+        self._legacy_git = legacy_git
 
     async def _pool(self) -> asyncpg.Pool:
         return self._injected_pool or await get_pool()
@@ -466,12 +481,68 @@ class NativeDocumentService(DocumentService):
         # NativeRevisionService._validate_expected_revision().
         if not 7 <= len(version) <= 40 or any(ch not in "0123456789abcdef" for ch in version):
             raise NotFoundError("Document version", f"{current.path}@{version[:8]}")
-        selected = await (await self._native()).get_revision(
-            namespace_id=vault_id,
-            surface="document",
-            reference=current.path,
-            revision_id=version,
-        )
+        native = await self._native()
+        try:
+            selected = await native.get_revision(
+                namespace_id=vault_id,
+                surface="document",
+                reference=current.path,
+                revision_id=version,
+            )
+        except NotFoundError as native_miss:
+            # Existing-database cutovers preserve public Git selectors even
+            # though each migrated Revision has a new opaque Native ID. Keep
+            # ordinary Native selection first, then use only completed
+            # immutable mappings on a miss. No Git adapter is constructed.
+            mappings = NativeRevisionMigrationRepository(await self._pool())
+            try:
+                if len(version) == 40:
+                    exact = await mappings.exact_mapping(
+                        resource_id=current.resource_id,
+                        legacy_git_oid=version,
+                    )
+                    matches = [] if exact is None else [exact]
+                else:
+                    matches = await mappings.prefix_mappings(
+                        resource_id=current.resource_id,
+                        legacy_git_prefix=version,
+                    )
+            except asyncpg.UndefinedTableError:
+                # Narrow core-schema fixtures have no cutover surface.
+                raise native_miss from None
+            if len(matches) > 1:
+                raise NativeRevisionSelectorAmbiguousError(version)
+            if not matches:
+                raise NotFoundError("Legacy revision selector", version)
+            mapping = matches[0]
+            if mapping.resolution == "native" and mapping.native_revision_id is not None:
+                selected = await native.get_resource_revision(
+                    namespace_id=vault_id,
+                    surface="document",
+                    resource_id=current.resource_id,
+                    revision_id=mapping.native_revision_id,
+                )
+            elif mapping.resolution == "bridge" and mapping.legacy_git_oid is not None:
+                legacy_git = self._legacy_git or GitService()
+                raw = await asyncio.to_thread(
+                    legacy_git.read_file,
+                    vault,
+                    mapping.path_at_revision,
+                    mapping.legacy_git_oid,
+                )
+                if raw is None:
+                    raise NotFoundError(
+                        "Legacy bridge body",
+                        f"{mapping.path_at_revision}@{mapping.legacy_git_oid}",
+                    )
+                selected = replace(
+                    current,
+                    revision_id=mapping.legacy_git_oid,
+                    path=mapping.path_at_revision,
+                    text=raw,
+                )
+            else:
+                raise NotFoundError("Legacy revision selector", version)
         return await self._response(
             vault=vault,
             vault_id=vault_id,

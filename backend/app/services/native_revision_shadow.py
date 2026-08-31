@@ -639,6 +639,7 @@ class NativeRevisionShadowComparator:
 
         activity = document.activity
         cls._validate_legacy_activity(legacy_event, activity)
+        cls._validate_candidate_activity(candidate_event, activity, native_revision_id)
         projected = copy.deepcopy(candidate)
         event = copy.deepcopy(candidate_event)
         event["hash"] = native_revision_id
@@ -680,6 +681,49 @@ class NativeRevisionShadowComparator:
             raise ShadowComparisonError("activity author shape is unsupported")
         projected["events"] = [event]
         return projected
+
+    @staticmethod
+    def _validate_candidate_activity(
+        event: dict[str, Any],
+        activity: LegacyActivitySemantics,
+        native_revision_id: str,
+    ) -> None:
+        """Bind the unprojected Native event before applying a public bridge.
+
+        C9's native genesis is an authority event, while a reconciled Native
+        head already carries the frozen Legacy semantics.  Both are valid
+        inputs to the explicit bridge below; any other actor/action/summary
+        combination must be surfaced rather than overwritten with Legacy
+        values during comparison.
+        """
+        if event.get("hash") != native_revision_id or event.get("projection_revision") != native_revision_id:
+            raise ShadowComparisonError("candidate activity selector is not bound to the native revision")
+        author = event.get("author")
+        if not isinstance(author, dict):
+            raise ShadowComparisonError("candidate activity author shape differs")
+        observed = (
+            event.get("action"),
+            event.get("subject"),
+            event.get("summary"),
+            author.get("id"),
+            author.get("display"),
+        )
+        migration = (
+            "create",
+            None,
+            None,
+            "akb-native-revision-migration",
+            "akb-native-revision-migration",
+        )
+        legacy = (
+            "replace" if activity.action == "update" else activity.action,
+            activity.subject,
+            activity.summary,
+            activity.actor,
+            activity.actor,
+        )
+        if observed not in {migration, legacy}:
+            raise ShadowComparisonError("candidate activity differs from its native envelope")
 
     @staticmethod
     def _validate_legacy_activity(event: dict[str, Any], activity: LegacyActivitySemantics) -> None:
