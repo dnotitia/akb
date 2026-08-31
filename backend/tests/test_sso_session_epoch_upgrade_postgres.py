@@ -29,6 +29,19 @@ _MIGRATION_REGISTRY = _MIGRATION_REGISTRY.split("    ):", 1)[0]
 _CURRENT_MIGRATIONS = re.findall(r'"([0-9]{3}_[^"]+\.py)"', _MIGRATION_REGISTRY)
 _EPOCH_MIGRATION_POSITION = _CURRENT_MIGRATIONS.index("076_sso_session_epoch.py")
 _EXACT_BASE_MIGRATIONS = _CURRENT_MIGRATIONS[:_EPOCH_MIGRATION_POSITION]
+_EXACT_BASE_NATIVE_MIGRATIONS = (
+    "010_external_git_mirror.py",
+    "036_resource_aliases.py",
+    "048_native_revision_core.py",
+    "053_native_revision_m1_pg_body.py",
+    "054_native_revision_searchable_derived.py",
+    "055_native_revision_m1_file_storage.py",
+    "056_native_revision_m1_file_constraints.py",
+    "057_native_revision_m1_payload_placement.py",
+    "059_native_file_searchable_derived.py",
+    "060_native_revision_migration_bridge.py",
+    "061_native_revision_authority.py",
+)
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret
@@ -69,6 +82,17 @@ async def _init_db_regression_database(*, exact_base: bool):
             conn = await asyncpg.connect(target_dsn)
             try:
                 await conn.execute(_EXACT_BASE_INIT_SQL)
+                # The frozen init.sql snapshot does not contain tables added by
+                # migrations, while its schema_migrations ledger represents a
+                # real release where those migrations had run. Materialize the
+                # Native dependency slice before recording that historical
+                # ledger so later migrations see the same database shape.
+                from app.db.postgres import _load_migration
+
+                for filename in _EXACT_BASE_NATIVE_MIGRATIONS:
+                    migration = _load_migration(filename)
+                    assert migration is not None
+                    await migration.migrate(conn=conn)
                 await conn.executemany(
                     "INSERT INTO schema_migrations (filename) VALUES ($1)",
                     [(filename,) for filename in _EXACT_BASE_MIGRATIONS],
