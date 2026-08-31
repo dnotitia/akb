@@ -581,6 +581,11 @@ class NativeRevisionCutoverRepository:
                 )
                 if fence_state != "open":
                     raise CutoverIntegrityError("cutover cannot abort after the Legacy write fence closes")
+                if row["status"] == "planned":
+                    await self._supersede_planned_migration_reservations(
+                        conn,
+                        cutover_id=cutover_id,
+                    )
                 row = await conn.fetchrow(
                     """
                     UPDATE native_revision_cutover_runs
@@ -596,3 +601,58 @@ class NativeRevisionCutoverRepository:
                 )
                 assert row is not None
                 return _run(row)
+
+    @staticmethod
+    async def _supersede_planned_migration_reservations(
+        conn: asyncpg.Connection,
+        *,
+        cutover_id: uuid.UUID,
+    ) -> None:
+        """Release only an aborted cutover's never-applied item reservations."""
+        migration_runs = await conn.fetch(
+            """
+            SELECT migration_run.run_id, migration_run.status
+              FROM native_revision_cutover_vaults cutover_vault
+              JOIN native_revision_migration_runs migration_run
+                ON migration_run.run_id = cutover_vault.migration_run_id
+             WHERE cutover_vault.cutover_id = $1
+             FOR UPDATE OF migration_run
+            """,
+            cutover_id,
+        )
+        if not migration_runs:
+            raise CutoverIntegrityError("planned cutover has no migration runs")
+        if any(run["status"] != "planned" for run in migration_runs):
+            raise CutoverIntegrityError("planned cutover migration run is no longer pending")
+
+        run_ids = [run["run_id"] for run in migration_runs]
+        items = await conn.fetch(
+            """
+            SELECT run_id, status, reservation_active
+              FROM native_revision_migration_items
+             WHERE run_id = ANY($1::uuid[])
+             FOR UPDATE
+            """,
+            run_ids,
+        )
+        if any(item["status"] != "pending" or not item["reservation_active"] for item in items):
+            raise CutoverIntegrityError("planned cutover has non-pending migration inventory")
+
+        await conn.execute(
+            """
+            UPDATE native_revision_migration_items
+               SET reservation_active = FALSE,
+                   updated_at = NOW()
+             WHERE run_id = ANY($1::uuid[])
+            """,
+            run_ids,
+        )
+        await conn.execute(
+            """
+            UPDATE native_revision_migration_runs
+               SET status = 'superseded'
+             WHERE run_id = ANY($1::uuid[])
+               AND status = 'planned'
+            """,
+            run_ids,
+        )

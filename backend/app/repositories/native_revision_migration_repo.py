@@ -278,6 +278,10 @@ class NativeRevisionMigrationRepository:
                 raise MigrationIntegrityError("migration run disappeared during creation")
             if row["inventory_digest"] != inventory_digest:
                 raise MigrationInventoryDriftError()
+            if row["status"] == "superseded":
+                raise MigrationIntegrityError(
+                    "migration run was superseded; plan with a new coverage version"
+                )
             return _run(row)
 
         if conn is not None:
@@ -296,6 +300,19 @@ class NativeRevisionMigrationRepository:
         """Insert the pre-authority inventory, preserving completed work."""
 
         async def _ensure(acquired: asyncpg.Connection) -> list[MigrationItem]:
+            persisted_run = await acquired.fetchrow(
+                """
+                SELECT status
+                  FROM native_revision_migration_runs
+                 WHERE run_id = $1
+                 FOR UPDATE
+                """,
+                run.run_id,
+            )
+            if persisted_run is None:
+                raise MigrationIntegrityError("migration run disappeared during inventory insertion")
+            if persisted_run["status"] == "superseded":
+                raise MigrationIntegrityError("superseded migration run cannot receive inventory")
             result: list[MigrationItem] = []
             for observed in items:
                 document_id = observed["legacy_document_id"]
@@ -503,6 +520,8 @@ class NativeRevisionMigrationRepository:
                 raise MigrationIntegrityError("migration run disappeared during status update")
             if row["status"] == "complete":
                 return _run(row)
+            if row["status"] == "superseded":
+                raise MigrationIntegrityError("superseded migration run cannot change status")
             await acquired.execute(
                 """
                 UPDATE native_revision_migration_runs

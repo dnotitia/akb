@@ -314,6 +314,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "089_native_file_projection_outbox.py",  # durable S3 File mutation reconciliation into Native text projection
         "090_native_revision_vault_purge_fence.py",  # allow an authorized exact-vault lifecycle purge after cutover authority commits
         "091_native_revision_committed_receipt_guard.py",  # freeze a committed cutover's durable authority receipt set
+        "092_native_revision_plan_supersession.py",  # release never-applied aborted-plan reservations for a fresh coverage version
     ):
         if filename in applied:
             continue
