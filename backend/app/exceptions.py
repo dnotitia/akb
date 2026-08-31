@@ -54,8 +54,54 @@ class MirrorMarkerError(AKBError):
 
 
 class ConflictError(AKBError):
-    def __init__(self, message: str):
-        super().__init__(message, status_code=409)
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        hint: str | None = None,
+        details: dict | None = None,
+    ):
+        super().__init__(
+            message,
+            status_code=409,
+            code=code,
+            hint=hint,
+            details=details,
+        )
+
+
+DOCUMENT_TITLE_CONFLICT = "document_title_conflict"
+
+
+class DocumentTitleConflictError(ConflictError):
+    """An interactive write found the same title in one Collection.
+
+    Title uniqueness remains a UI policy, not a storage constraint. The
+    structured payload lets clients offer "open existing" and an explicit
+    keep-both retry without parsing prose or exposing the collision-safe slug.
+    """
+
+    def __init__(
+        self,
+        *,
+        title: str,
+        collection: str,
+        existing_path: str,
+        existing_title: str,
+    ):
+        location = collection or "Vault root"
+        super().__init__(
+            f'A document titled "{title.strip()}" already exists in {location}',
+            code=DOCUMENT_TITLE_CONFLICT,
+            hint="Open the existing document, choose another title or Collection, or explicitly keep both.",
+            details={
+                "title": title.strip(),
+                "collection": collection,
+                "existing_path": existing_path,
+                "existing_title": existing_title,
+            },
+        )
 
 
 class AuthenticationError(AKBError):

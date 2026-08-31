@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -8,17 +8,21 @@ import { CurrentUserProvider } from "@/contexts/current-user-context";
 import DocumentPage from "@/pages/document";
 import { readRecentDocumentViews } from "@/lib/recent-document-views";
 
-vi.mock("@/lib/api", () => ({
-  getDocument: vi.fn(),
-  getVaultInfo: vi.fn(),
-  getRelations: vi.fn(),
-  deleteDocument: vi.fn(),
-  publishDoc: vi.fn(),
-  unpublishDoc: vi.fn(),
-  updateDocument: vi.fn(),
-  browseVault: vi.fn(),
-  moveDocument: vi.fn(),
-}));
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>();
+  return {
+    ...actual,
+    getDocument: vi.fn(),
+    getVaultInfo: vi.fn(),
+    getRelations: vi.fn(),
+    deleteDocument: vi.fn(),
+    publishDoc: vi.fn(),
+    unpublishDoc: vi.fn(),
+    updateDocument: vi.fn(),
+    browseVault: vi.fn(),
+    moveDocument: vi.fn(),
+  };
+});
 
 vi.mock("@/components/markdown-editor", () => ({
   default: ({
@@ -39,6 +43,7 @@ vi.mock("@/components/markdown-editor", () => ({
 }));
 
 import {
+  ApiError,
   deleteDocument,
   getDocument,
   getVaultInfo,
@@ -175,6 +180,7 @@ beforeEach(() => {
     items: [
       { type: "collection", path: "notes" },
       { type: "collection", path: "archive" },
+      { type: "document", path: "notes/hello.md", name: "DocTitle" },
     ],
   });
   moveDocumentMock.mockResolvedValue({
@@ -204,6 +210,22 @@ afterEach(() => {
 });
 
 describe("DocumentPage view toggle", () => {
+  it("keeps the human title primary and moves file identifiers into technical details", async () => {
+    const user = userEvent.setup();
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    const heading = await screen.findByRole("heading", { level: 1, name: "DocTitle" });
+    const header = heading.closest("header");
+    expect(header).not.toBeNull();
+    expect(within(header as HTMLElement).queryByText("hello.md")).not.toBeInTheDocument();
+    expect(screen.getAllByText("notes").length).toBeGreaterThan(0);
+
+    await user.click(screen.getByRole("button", { name: "Open document panel" }));
+    await user.click(screen.getByText("Technical details"));
+    expect(screen.getByText("hello.md")).toBeInTheDocument();
+    expect(screen.getByText("notes/hello.md")).toBeInTheDocument();
+  });
+
   it("records a successful document read for Home resume", async () => {
     getDocumentMock.mockResolvedValue(makeDoc({
       type: "report",
@@ -277,11 +299,15 @@ describe("DocumentPage view toggle", () => {
     const user = userEvent.setup();
     renderAt("/vault/v/doc/notes%2Fhello.md");
 
-    await screen.findByRole("heading", { level: 1, name: "DocTitle" });
+    const heading = await screen.findByRole("heading", { level: 1, name: "DocTitle" });
     expect(screen.getByRole("region", { name: "Document workspace" })).toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Document content" })).toBeInTheDocument();
     expect(screen.getAllByText("abcdef1").length).toBeGreaterThan(0);
-    expect(screen.queryByText("akb://v/coll/notes/doc/hello.md")).not.toBeInTheDocument();
+    expect(
+      within(heading.closest("header") as HTMLElement).queryByText(
+        "akb://v/coll/notes/doc/hello.md",
+      ),
+    ).not.toBeInTheDocument();
 
     const article = screen.getByRole("article");
     expect(article).toHaveClass("w-full", "p-2", "sm:p-3");
@@ -370,6 +396,7 @@ describe("DocumentPage view toggle", () => {
 
     await user.click(edit);
     expect(await screen.findByText("Editing document")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Document title" })).toHaveValue("DocTitle");
     expect(screen.queryByRole("tablist", { name: "Document view" })).not.toBeInTheDocument();
 
     const cancel = screen.getByRole("button", { name: "Cancel" });
@@ -638,14 +665,161 @@ describe("DocumentPage view toggle", () => {
     expect(screen.getByTestId("location-pathname")).toHaveTextContent("/vault/v");
   });
 
-  it("keeps move discoverable for readers and explains why it is unavailable", async () => {
+  it("keeps Move discoverable for readers and does not expose a separate Rename action", async () => {
     const user = userEvent.setup();
     renderAt("/vault/v/doc/notes%2Fhello.md");
 
     await user.click(await screen.findByRole("button", { name: "Actions for DocTitle" }));
-    const move = screen.getByRole("menuitem", { name: /Move or rename/i });
+    const move = screen.getByRole("menuitem", { name: /Move document/i });
+    expect(screen.queryByRole("menuitem", { name: /Rename title/i })).not.toBeInTheDocument();
     expect(move).toHaveAttribute("aria-disabled", "true");
     expect(move).toHaveTextContent("Writer access or higher is required.");
+  });
+
+  it("edits the human title and body in one save without changing the document path", async () => {
+    const user = userEvent.setup();
+    let saved = false;
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    updateDocumentMock.mockImplementation(async () => {
+      saved = true;
+      return {
+        current_commit: UPDATED_COMMIT,
+        commit_hash: UPDATED_COMMIT,
+      };
+    });
+    getDocumentMock.mockImplementation(async () =>
+      makeDoc(
+        saved
+          ? { title: "API contract", content: "Updated contract body" }
+          : {},
+      ),
+    );
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await user.click(await screen.findByRole("button", { name: "Edit" }));
+    const title = screen.getByRole("textbox", { name: "Document title" });
+    const body = screen.getByRole("textbox", { name: "Document body (markdown)" });
+    await user.clear(title);
+    await user.type(title, "API contract");
+    await user.clear(body);
+    await user.type(body, "Updated contract body");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(updateDocumentMock).toHaveBeenCalledWith(
+        "v",
+        "notes/hello.md",
+        {
+          content: "Updated contract body",
+          title: "API contract",
+          title_conflict_policy: "reject",
+        },
+      ),
+    );
+    expect(await screen.findByRole("heading", { level: 1, name: "API contract" })).toBeInTheDocument();
+    expect(screen.getByTestId("location-pathname")).toHaveTextContent(
+      "/vault/v/doc/notes%2Fhello.md",
+    );
+    expect(screen.queryByText("Document renamed")).not.toBeInTheDocument();
+  });
+
+  it("blocks an exact title twin in Edit and requires an explicit keep-both save", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    browseVaultMock.mockResolvedValue({
+      items: [
+        { type: "collection", path: "notes" },
+        { type: "document", path: "notes/hello.md", name: "DocTitle" },
+        { type: "document", path: "notes/api-contract.md", name: "API contract" },
+      ],
+    });
+    getDocumentMock.mockImplementation(async (_vault: string, path: string) =>
+      path === "notes/api-contract.md"
+        ? makeDoc({ path, title: "API contract" })
+        : makeDoc(),
+    );
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await user.click(await screen.findByRole("button", { name: "Edit" }));
+    const title = screen.getByRole("textbox", { name: "Document title" });
+    await user.clear(title);
+    await user.type(title, "API contract");
+    await user.tab();
+    expect(
+      await screen.findByText("“API contract” already exists here"),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    expect(updateDocumentMock).not.toHaveBeenCalled();
+    expect(await screen.findByText("This document already exists")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Open existing" }));
+    expect(
+      await screen.findByRole("heading", {
+        name: "Discard changes and open the existing document?",
+      }),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(screen.getByTestId("location-pathname")).toHaveTextContent(
+      "/vault/v/doc/notes%2Fhello.md",
+    );
+    expect(screen.getByRole("textbox", { name: "Document title" })).toHaveValue(
+      "API contract",
+    );
+
+    await user.click(screen.getByRole("button", { name: "Save duplicate title" }));
+    await waitFor(() =>
+      expect(updateDocumentMock).toHaveBeenCalledWith(
+        "v",
+        "notes/hello.md",
+        { title: "API contract", title_conflict_policy: "allow" },
+      ),
+    );
+  });
+
+  it("recovers from a server-side title race inside the Edit form", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    getDocumentMock.mockImplementation(async (_vault: string, path: string) =>
+      path === "notes/api-contract.md"
+        ? makeDoc({ path, title: "API contract", content: "Different body" })
+        : makeDoc(),
+    );
+    updateDocumentMock
+      .mockRejectedValueOnce(
+        new ApiError("duplicate title", 409, {
+          code: "document_title_conflict",
+          details: {
+            title: "API contract",
+            collection: "notes",
+            existing_path: "notes/api-contract.md",
+            existing_title: "API contract",
+          },
+        }),
+      )
+      .mockResolvedValueOnce({
+        current_commit: UPDATED_COMMIT,
+        commit_hash: UPDATED_COMMIT,
+      });
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await user.click(await screen.findByRole("button", { name: "Edit" }));
+    const title = screen.getByRole("textbox", { name: "Document title" });
+    await user.clear(title);
+    await user.type(title, "API contract");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(
+      await screen.findByText("“API contract” already exists here"),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Save duplicate title" }));
+    await waitFor(() =>
+      expect(updateDocumentMock).toHaveBeenLastCalledWith(
+        "v",
+        "notes/hello.md",
+        { title: "API contract", title_conflict_policy: "allow" },
+      ),
+    );
   });
 
   it("moves a writer to the backend-returned path and names the destination", async () => {
@@ -657,7 +831,7 @@ describe("DocumentPage view toggle", () => {
     renderAt("/vault/v/doc/notes%2Fhello.md");
 
     await user.click(await screen.findByRole("button", { name: "Actions for DocTitle" }));
-    await user.click(screen.getByRole("menuitem", { name: "Move or rename" }));
+    await user.click(screen.getByRole("menuitem", { name: "Move document" }));
     await user.click(await screen.findByLabelText("Target collection"));
     await user.click(screen.getByRole("menuitemradio", { name: "archive" }));
     await user.click(screen.getByRole("button", { name: "Move document" }));
@@ -666,7 +840,7 @@ describe("DocumentPage view toggle", () => {
       expect(moveDocumentMock).toHaveBeenCalledWith(
         "v",
         "notes/hello.md",
-        { collection: "archive" },
+        { collection: "archive", title_conflict_policy: "reject" },
       ),
     );
     await waitFor(() =>
@@ -677,6 +851,7 @@ describe("DocumentPage view toggle", () => {
     const movedStatus = (await screen.findByText("Moved to archive")).closest(
       '[role="status"]',
     );
-    expect(movedStatus).toHaveTextContent("archive/hello.md");
+    expect(movedStatus).toHaveTextContent("title, links, and version history were preserved");
+    expect(movedStatus).not.toHaveTextContent("archive/hello.md");
   });
 });

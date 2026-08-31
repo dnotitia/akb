@@ -67,6 +67,7 @@ def test_post_move_route_gates_writer_and_preserves_greedy_document_path(monkeyp
                 "collection": "archive",
                 "slug": "moved",
                 "message": "archive it",
+                "title_conflict_policy": "allow",
                 "agent_id": "move-route-agent",
             },
         )

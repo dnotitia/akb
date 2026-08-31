@@ -1198,6 +1198,7 @@ export interface DocumentMoveInput {
   collection?: string;
   slug?: string;
   message?: string;
+  title_conflict_policy?: "allow" | "reject";
 }
 
 export interface DocumentMoveResult {

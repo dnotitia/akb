@@ -112,7 +112,14 @@ def _safe_remote_host(url: str) -> str:
 import frontmatter
 
 from app.db.postgres import get_pool
-from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError, WriteBusyError
+from app.exceptions import (
+    AKBError,
+    ConflictError,
+    DocumentTitleConflictError,
+    NotFoundError,
+    ValidationError,
+    WriteBusyError,
+)
 from app.models.document import (
     DOC_STATUSES,
     BrowseContext,
@@ -121,6 +128,7 @@ from app.models.document import (
     DocumentPutRequest,
     DocumentPutResponse,
     DocumentResponse,
+    TitleConflictPolicy,
     DocumentUpdateRequest,
 )
 from app.repositories.document_repo import (
@@ -184,6 +192,9 @@ def build_vault_skill_seed_request(vault: str) -> DocumentPutRequest:
         content=VAULT_SKILL_SEED_TEMPLATE.replace("{vault}", vault),
         type="skill",
         tags=["akb:skill"],
+        # Seeding retains the historical lossless write behavior. Interactive
+        # duplicate guidance is an explicit frontend policy.
+        title_conflict_policy="allow",
     )
 
 
@@ -612,6 +623,21 @@ class DocumentService:
         validate_new_structured_relation_refs(req.vault, req.depends_on)
         validate_new_structured_relation_refs(req.vault, req.related_to)
 
+        if req.title_conflict_policy == "reject":
+            existing = await doc_repo.find_title_conflict(
+                vault_id,
+                normalized_collection,
+                req.title,
+                conn=conn,
+            )
+            if existing:
+                raise DocumentTitleConflictError(
+                    title=req.title,
+                    collection=normalized_collection,
+                    existing_path=existing["path"],
+                    existing_title=existing["title"],
+                )
+
         # Resolve the final path under the (vault, base_path) advisory lock,
         # which serializes writers racing on the same base slug. If the clean
         # path is free, use it (predictable, human-readable). If taken: a
@@ -1002,6 +1028,23 @@ class DocumentService:
                     f"actual {row['current_commit']}"
                 )
 
+            if req.title is not None and req.title_conflict_policy == "reject":
+                collection_path, _ = _split_doc_path(row["path"])
+                existing = await doc_repo.find_title_conflict(
+                    vault_id,
+                    collection_path,
+                    req.title,
+                    exclude_id=row["id"],
+                    conn=conn,
+                )
+                if existing:
+                    raise DocumentTitleConflictError(
+                        title=req.title,
+                        collection=collection_path,
+                        existing_path=existing["path"],
+                        existing_title=existing["title"],
+                    )
+
             response = await self._update_locked(
                 req=req, agent_id=agent_id, vault=vault,
                 vault_id=vault_id, doc_repo=doc_repo, row=row, conn=conn,
@@ -1174,6 +1217,7 @@ class DocumentService:
         self, vault: str, doc_ref: str, *,
         collection: str | None = None, slug: str | None = None,
         message: str | None = None, agent_id: str | None = None,
+        title_conflict_policy: TitleConflictPolicy = "allow",
         skill_internal: bool = False,
     ) -> DocumentPutResponse:
         """Move/rename a document: change its collection and/or slug while
@@ -1237,6 +1281,22 @@ class DocumentService:
                 raise ValidationError(
                     "move is a no-op: the target path equals the current path"
                 )
+
+            if title_conflict_policy == "reject":
+                existing = await doc_repo.find_title_conflict(
+                    vault_id,
+                    new_coll,
+                    row["title"],
+                    exclude_id=pg_doc_id,
+                    conn=conn,
+                )
+                if existing:
+                    raise DocumentTitleConflictError(
+                        title=row["title"],
+                        collection=new_coll,
+                        existing_path=existing["path"],
+                        existing_title=existing["title"],
+                    )
 
             # On-collision suffix (same robust rule as create): if the clean
             # target is taken by a DIFFERENT doc, disambiguate with this doc's

@@ -28,6 +28,7 @@ def test_canonical_seed_request_preserves_legacy_fields_and_body():
         "status": "draft",
         "related_to": [],
         "depends_on": [],
+        "title_conflict_policy": "allow",
     }
 
 

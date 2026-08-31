@@ -17,6 +17,7 @@ from app.util.text import NFCModel
 # typo can't silently land in the frontmatter and DB. ("superseded" was a
 # never-operationalized 4th state and was removed in 0.4.4.)
 DOC_STATUSES = ("draft", "active", "archived")
+TitleConflictPolicy = Literal["allow", "reject"]
 
 
 class DocumentFrontmatter(NFCModel):
@@ -61,6 +62,11 @@ class DocumentPutRequest(NFCModel):
     # path stays stable (overview/vault-skill.md) even when the title
     # is friendly text like "{vault} Guide".
     slug: str | None = None
+    # Compatibility-safe soft uniqueness. Existing MCP/API/import callers omit
+    # this field and retain AKB's historical lossless behaviour. Interactive UI
+    # flows opt into `reject`, surface the existing document, then retry with
+    # `allow` only after the user explicitly chooses to keep a duplicate title.
+    title_conflict_policy: TitleConflictPolicy = "allow"
 
 
 class DocumentUpdateRequest(NFCModel):
@@ -84,6 +90,7 @@ class DocumentUpdateRequest(NFCModel):
     # tracks the document body returned by akb_get; frontmatter-only
     # metadata changes do not change it.
     expected_content_hash: str | None = None
+    title_conflict_policy: TitleConflictPolicy = "allow"
 
 
 class DocumentMoveRequest(NFCModel):
@@ -92,6 +99,7 @@ class DocumentMoveRequest(NFCModel):
     collection: str | None = None
     slug: str | None = None
     message: str | None = None
+    title_conflict_policy: TitleConflictPolicy = "allow"
 
 
 class DocumentEditRequest(NFCModel):

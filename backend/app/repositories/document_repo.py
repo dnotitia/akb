@@ -282,6 +282,41 @@ class DocumentRepository:
             row = await c.fetchrow(sql, vault_id, path)
             return dict(row) if row else None
 
+    async def find_title_conflict(
+        self,
+        vault_id: uuid.UUID,
+        collection_path: str,
+        title: str,
+        *,
+        exclude_id: uuid.UUID | None = None,
+        conn=None,
+    ) -> dict | None:
+        """Find an exact display-title twin in one Collection.
+
+        Equality intentionally uses NFC-normalized persisted text with only
+        outer whitespace ignored. It is case-sensitive and preserves inner
+        whitespace: ``API Guide`` and ``Api  Guide`` may share a derived slug,
+        but are visibly distinct titles and therefore are not a UX conflict.
+        """
+        sql = """
+            SELECT d.id, d.path, d.title, d.content_hash, d.updated_at
+              FROM documents d
+              LEFT JOIN collections c ON c.id = d.collection_id
+             WHERE d.vault_id = $1
+               AND COALESCE(c.path, '') = $2
+               AND btrim(d.title) = btrim($3)
+               AND ($4::uuid IS NULL OR d.id <> $4)
+             ORDER BY d.updated_at DESC, d.id DESC
+             LIMIT 1
+        """
+        args = (vault_id, collection_path, title, exclude_id)
+        if conn is not None:
+            row = await conn.fetchrow(sql, *args)
+        else:
+            async with self.pool.acquire() as own_conn:
+                row = await own_conn.fetchrow(sql, *args)
+        return dict(row) if row else None
+
     async def update_path(
         self, doc_id: uuid.UUID, new_path: str, *, collection_id: uuid.UUID | None,
         now: datetime, commit_hash: str, conn,

@@ -16,7 +16,13 @@ from typing import NoReturn
 import asyncpg
 
 from app.db.postgres import get_pool
-from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError
+from app.exceptions import (
+    AKBError,
+    ConflictError,
+    DocumentTitleConflictError,
+    NotFoundError,
+    ValidationError,
+)
 from app.models.document import (
     DOC_STATUSES,
     BrowseContext,
@@ -25,6 +31,7 @@ from app.models.document import (
     DocumentPutRequest,
     DocumentPutResponse,
     DocumentResponse,
+    TitleConflictPolicy,
     DocumentUpdateRequest,
 )
 from app.repositories import table_data_repo, table_registry_repo, vault_files_repo
@@ -203,6 +210,54 @@ class NativeDocumentService(DocumentService):
                 return candidate
             ordinal += 1
 
+    async def _find_native_title_conflict(
+        self,
+        vault_id: uuid.UUID,
+        collection: str,
+        title: str,
+        *,
+        exclude_resource_id: uuid.UUID | None = None,
+    ) -> tuple[str, str] | None:
+        """Return ``(path, title)`` for an exact title twin in one Collection.
+
+        Native M1 deliberately has no mutable title projection; title lives in
+        immutable revision frontmatter. This compatibility check therefore
+        reads the current revision only when an interactive caller opts into
+        soft uniqueness. The default lossless write path pays no extra cost.
+        """
+        pool = await self._pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT resource_id, current_path, head_revision_id
+                  FROM native_resources
+                 WHERE namespace_id = $1
+                   AND surface = 'document'
+                   AND lifecycle = 'live'
+                 ORDER BY updated_at DESC, resource_id DESC
+                """,
+                vault_id,
+            )
+        native = await self._native()
+        expected_title = to_nfc(title).strip()
+        for row in rows:
+            if exclude_resource_id is not None and row["resource_id"] == exclude_resource_id:
+                continue
+            candidate_collection, _ = split_doc_path(row["current_path"])
+            if candidate_collection != collection:
+                continue
+            snapshot = await native.get_resource_revision(
+                namespace_id=vault_id,
+                surface="document",
+                resource_id=row["resource_id"],
+                revision_id=row["head_revision_id"],
+            )
+            frontmatter, _ = _parse_markdown(snapshot.text)
+            candidate_title = to_nfc(str(frontmatter.get("title") or "")).strip()
+            if candidate_title == expected_title:
+                return snapshot.path, candidate_title
+        return None
+
     async def _created_by_name(self, created_by: str | None) -> str | None:
         if not created_by:
             return None
@@ -321,6 +376,19 @@ class NativeDocumentService(DocumentService):
         collection = normalize_collection_path(req.collection)
         base_path = doc_path(collection, base_slug)
         path_identity = uuid.uuid4()
+        if req.title_conflict_policy == "reject":
+            existing = await self._find_native_title_conflict(
+                vault_id,
+                collection,
+                req.title,
+            )
+            if existing:
+                raise DocumentTitleConflictError(
+                    title=req.title,
+                    collection=collection,
+                    existing_path=existing[0],
+                    existing_title=existing[1],
+                )
         if req.slug and await self._current_path_is_owned(vault_id, base_path):
             raise ConflictError(f"Document already exists at path: {base_path}")
         final_path = (
@@ -425,6 +493,21 @@ class NativeDocumentService(DocumentService):
             raise ValidationError(f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}")
         vault_id, current = await self._current(vault, doc_ref)
         skill_policy.check_update(current.path, req.type, internal=skill_internal)
+        if req.title is not None and req.title_conflict_policy == "reject":
+            collection, _ = split_doc_path(current.path)
+            existing = await self._find_native_title_conflict(
+                vault_id,
+                collection,
+                req.title,
+                exclude_resource_id=current.resource_id,
+            )
+            if existing:
+                raise DocumentTitleConflictError(
+                    title=req.title,
+                    collection=collection,
+                    existing_path=existing[0],
+                    existing_title=existing[1],
+                )
         return await self._update_from_snapshot(
             vault=vault,
             vault_id=vault_id,
@@ -546,6 +629,7 @@ class NativeDocumentService(DocumentService):
         slug: str | None = None,
         message: str | None = None,
         agent_id: str | None = None,
+        title_conflict_policy: TitleConflictPolicy = "allow",
         skill_internal: bool = False,
     ) -> DocumentPutResponse:
         if collection is None and slug is None:
@@ -574,6 +658,22 @@ class NativeDocumentService(DocumentService):
             skill_policy.check_move(current.path, base_path, internal=skill_internal)
             if base_path == current.path:
                 raise ValidationError("move is a no-op: the target path equals the current path")
+            if title_conflict_policy == "reject":
+                frontmatter, _ = _parse_markdown(current.text)
+                current_title = str(frontmatter.get("title") or current.path.rsplit("/", 1)[-1])
+                existing = await self._find_native_title_conflict(
+                    vault_id,
+                    next_collection,
+                    current_title,
+                    exclude_resource_id=current.resource_id,
+                )
+                if existing:
+                    raise DocumentTitleConflictError(
+                        title=current_title,
+                        collection=next_collection,
+                        existing_path=existing[0],
+                        existing_title=existing[1],
+                    )
             next_path = await self._resolve_native_free_path(vault_id, base_path, current.resource_id)
             if requested_slug is not None and next_path != base_path:
                 raise ConflictError(f"Document already exists at path: {base_path}")

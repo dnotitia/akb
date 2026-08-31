@@ -64,6 +64,7 @@ import {
   type DeletableResourceKind,
 } from "@/components/resource-delete-dialog";
 import { ROLE_RANK, type Role } from "@/lib/roles";
+import { documentTitleKey } from "@/lib/document-title-conflict";
 
 const PAGE_SIZE = 10;
 const TYPEAHEAD_TIMEOUT_MS = 500;
@@ -249,6 +250,10 @@ export function VaultExplorer({
 
   const resourceCounts = useMemo(
     () => countResourceKinds(tree ?? []),
+    [tree],
+  );
+  const duplicateDocumentPaths = useMemo(
+    () => findDuplicateDocumentPaths(tree ?? []),
     [tree],
   );
   const resourceTotal =
@@ -530,6 +535,7 @@ export function VaultExplorer({
                 onToggle={toggle}
                 canWrite={canWrite}
                 canAdmin={canAdmin}
+                showDocumentDisambiguator={duplicateDocumentPaths.has(row.node.path)}
                 onCreateDoc={(node) =>
                   openCreateDocument({ collection: node.path })
                 }
@@ -714,6 +720,8 @@ interface RowProps {
   canWrite?: boolean;
   /** Admin+ is required for physical table deletion. */
   canAdmin?: boolean;
+  /** Show a secondary file identifier only when sibling document titles collide. */
+  showDocumentDisambiguator?: boolean;
   /** Fired when the user clicks the trash icon on a collection row.
    *  Parent decides which dialog to open and seeds it with counts. */
   onDeleteCollection?: (node: TreeNode) => void;
@@ -735,7 +743,7 @@ interface RowProps {
 }
 
 const TreeRow = memo(function TreeRow({
-  node, depth, sig, isOpen, isActive, vault, onToggle, canWrite, canAdmin, onDeleteCollection, onDeleteResource, onOpenDetails, onCreateSubCollection, onCreateDoc, onUploadFile, onCreateTable,
+  node, depth, sig, isOpen, isActive, vault, onToggle, canWrite, canAdmin, showDocumentDisambiguator, onDeleteCollection, onDeleteResource, onOpenDetails, onCreateSubCollection, onCreateDoc, onUploadFile, onCreateTable,
 }: RowProps) {
   const indent = { paddingLeft: `${depth * 12 + 12}px` };
 
@@ -840,9 +848,16 @@ const TreeRow = memo(function TreeRow({
     !isSkill &&
     Boolean(onDeleteResource) &&
     (node.kind === "table" ? Boolean(canAdmin) : Boolean(canWrite));
+  const documentDisambiguator =
+    node.kind === "document" && showDocumentDisambiguator
+      ? compactDocumentIdentifier(node.path)
+      : null;
 
   return (
-    <div role="none" className="group flex min-h-9 items-stretch focus-within:bg-surface-hover">
+    <div
+      role="none"
+      className={`group flex items-stretch focus-within:bg-surface-hover ${documentDisambiguator ? "min-h-11" : "min-h-9"}`}
+    >
       <Link
         to={href}
         data-sig={sig}
@@ -879,8 +894,16 @@ const TreeRow = memo(function TreeRow({
               ? "Table: "
               : "File: "}
         </span>
-        <span title={node.name} className="min-w-0 truncate text-[13px] group-hover:text-link">
-          {node.name}
+        <span className="min-w-0 flex-1">
+          <span title={node.name} className="block truncate text-[13px] group-hover:text-link">
+            {node.name}
+          </span>
+          {documentDisambiguator && (
+            <span className="mt-0.5 block truncate font-mono text-xs text-foreground-muted">
+              <span className="sr-only">File identifier: </span>
+              {documentDisambiguator}
+            </span>
+          )}
         </span>
         {isSkill && <SkillBadge defined className="ml-auto shrink-0" />}
       </Link>
@@ -983,6 +1006,44 @@ function countSubCollections(node: TreeNode): number {
     }
   }
   return n;
+}
+
+/**
+ * Duplicate titles are only ambiguous among document siblings. Keep ordinary
+ * rows single-line; reveal a compact technical discriminator only for the
+ * small set that cannot otherwise be told apart.
+ */
+function findDuplicateDocumentPaths(nodes: TreeNode[]): Set<string> {
+  const duplicates = new Set<string>();
+
+  const visitSiblings = (siblings: TreeNode[]) => {
+    const byTitle = new Map<string, TreeNode[]>();
+    for (const node of siblings) {
+      if (node.kind !== "document") continue;
+      const key = documentTitleKey(node.name);
+      const group = byTitle.get(key) ?? [];
+      group.push(node);
+      byTitle.set(key, group);
+    }
+    for (const group of byTitle.values()) {
+      if (group.length < 2) continue;
+      group.forEach((node) => duplicates.add(node.path));
+    }
+    siblings
+      .filter((node) => node.kind === "collection")
+      .forEach((node) => visitSiblings(node.children ?? []));
+  };
+
+  visitSiblings(nodes);
+  return duplicates;
+}
+
+function compactDocumentIdentifier(path: string): string {
+  const fileName = path.split("/").pop() || path;
+  const stem = fileName.replace(/\.md$/i, "");
+  const generatedSuffix = stem.match(/^(.*)-([0-9a-f]{8,32})$/i);
+  if (!generatedSuffix) return stem;
+  return `${generatedSuffix[1]} · ${generatedSuffix[2].slice(0, 4)}`;
 }
 
 function countCollectionResources(node: TreeNode): CollectionResourceCounts {

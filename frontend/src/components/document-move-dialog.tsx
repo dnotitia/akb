@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
-  ArrowDown,
+  ArrowRight,
+  ChevronRight,
   FileText,
-  FolderTree,
   GitCommitHorizontal,
 } from "lucide-react";
 import {
@@ -12,8 +12,8 @@ import {
   moveDocument,
   type DocumentMoveResult,
 } from "@/lib/api";
-import { previewDocumentSlug } from "@/lib/document-move";
 import { isReservedCollection } from "@/lib/skill";
+import { DocumentTitleConflictNotice } from "@/components/document-title-conflict-notice";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -28,6 +28,11 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { SelectMenu, type SelectOption } from "@/components/ui/select-menu";
+import {
+  documentTitleConflictFromError,
+  findDocumentTitleConflict,
+  type DocumentTitleConflict,
+} from "@/lib/document-title-conflict";
 
 interface DocumentMoveDialogProps {
   open: boolean;
@@ -36,6 +41,13 @@ interface DocumentMoveDialogProps {
   path: string;
   title: string;
   onMoved: (result: DocumentMoveResult) => void;
+  onOpenDocument?: (path: string) => void;
+}
+
+interface BrowseDocument {
+  type: "document";
+  name: string;
+  path: string;
 }
 
 function splitDocumentPath(path: string) {
@@ -49,15 +61,19 @@ function splitDocumentPath(path: string) {
       };
 }
 
+function locationLabel(collection: string) {
+  return collection || "Vault root";
+}
+
 function moveErrorMessage(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
   const status = error instanceof ApiError ? error.status : null;
 
   if (status === 409 || /already exists|\b409\b/i.test(message)) {
-    return "A document already uses that file name in the selected collection. Choose another file name.";
+    return "The destination changed before the move completed. Refresh the Collections list and try again.";
   }
   if (/move is a no-op|target path equals/i.test(message)) {
-    return "Choose a different collection or file name.";
+    return "Choose a different Collection.";
   }
   if (status === 403 || /forbidden|required role|writer access/i.test(message)) {
     return "Your access changed. Writer access or higher is required to move this document.";
@@ -68,7 +84,7 @@ function moveErrorMessage(error: unknown) {
     /\b405 method not allowed\b/i.test(message) ||
     /^404 not found$/i.test(message.trim())
   ) {
-    return "Move or rename is not available on this server yet.";
+    return "Document move is not available on this server yet.";
   }
   return message || "The document could not be moved. Review the destination and try again.";
 }
@@ -80,15 +96,18 @@ export function DocumentMoveDialog({
   path,
   title,
   onMoved,
+  onOpenDocument,
 }: DocumentMoveDialogProps) {
   const current = useMemo(() => splitDocumentPath(path), [path]);
   const [collection, setCollection] = useState(current.collection);
-  const [fileName, setFileName] = useState(current.slug);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [moving, setMoving] = useState(false);
   const [discardOpen, setDiscardOpen] = useState(false);
+  const [serverConflict, setServerConflict] = useState<DocumentTitleConflict | null>(null);
   const hydratedPathRef = useRef(path);
+  const errorRef = useRef<HTMLDivElement | null>(null);
+  const conflictRef = useRef<HTMLDivElement | null>(null);
 
   const collectionsQuery = useQuery({
     queryKey: ["document-move-collections", vault],
@@ -102,9 +121,9 @@ export function DocumentMoveDialog({
     if (!open) return;
     hydratedPathRef.current = path;
     setCollection(current.collection);
-    setFileName(current.slug);
     setMessage("");
     setError("");
+    setServerConflict(null);
     setMoving(false);
   }, [current.collection, current.slug, open, path]);
 
@@ -130,15 +149,35 @@ export function DocumentMoveDialog({
     ];
   }, [collectionsQuery.data?.items, current.collection]);
 
-  const normalizedSlug = previewDocumentSlug(fileName);
+  const documents = useMemo<BrowseDocument[]>(
+    () =>
+      (collectionsQuery.data?.items || []).filter(
+        (item): item is BrowseDocument =>
+          item?.type === "document" &&
+          typeof item.name === "string" &&
+          typeof item.path === "string",
+      ),
+    [collectionsQuery.data?.items],
+  );
+
   const destinationPath = collection
-    ? `${collection}/${normalizedSlug}.md`
-    : `${normalizedSlug}.md`;
-  const destinationChanged = destinationPath !== path;
-  const isDirty =
-    collection !== current.collection ||
-    fileName !== current.slug ||
-    message.trim().length > 0;
+    ? `${collection}/${current.slug}.md`
+    : `${current.slug}.md`;
+  const destinationChanged = collection !== current.collection;
+  const isDirty = destinationChanged || message.trim().length > 0;
+
+  const pathCollision = useMemo(
+    () =>
+      documents.find(
+        (item) => item.path !== path && item.path === destinationPath,
+      ) ?? null,
+    [destinationPath, documents, path],
+  );
+  const localConflict = useMemo(
+    () => findDocumentTitleConflict(documents, title, collection, path),
+    [collection, documents, path, title],
+  );
+  const titleConflict = serverConflict ?? localConflict;
 
   function requestClose() {
     if (moving) return;
@@ -146,20 +185,23 @@ export function DocumentMoveDialog({
     else onOpenChange(false);
   }
 
-  async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!fileName.trim()) {
-      setError("Enter a file name.");
-      return;
-    }
+  function openExistingDocument(existingPath: string) {
+    onOpenChange(false);
+    onOpenDocument?.(existingPath);
+  }
+
+  async function performMove(titleConflictPolicy: "allow" | "reject") {
     if (!destinationChanged) {
-      setError("Choose a different collection or file name.");
+      setError("Choose a different Collection.");
+      window.requestAnimationFrame(() => errorRef.current?.focus());
       return;
     }
 
-    const payload: { collection?: string; slug?: string; message?: string } = {};
-    if (collection !== current.collection) payload.collection = collection;
-    if (normalizedSlug !== current.slug) payload.slug = fileName.trim();
+    const payload: {
+      collection: string;
+      message?: string;
+      title_conflict_policy: "allow" | "reject";
+    } = { collection, title_conflict_policy: titleConflictPolicy };
     if (message.trim()) payload.message = message.trim();
 
     setMoving(true);
@@ -168,8 +210,16 @@ export function DocumentMoveDialog({
     try {
       result = await moveDocument(vault, hydratedPathRef.current, payload);
     } catch (nextError) {
+      const conflict = documentTitleConflictFromError(nextError);
+      if (conflict) {
+        setServerConflict(conflict);
+        setMoving(false);
+        window.requestAnimationFrame(() => conflictRef.current?.focus());
+        return;
+      }
       setError(moveErrorMessage(nextError));
       setMoving(false);
+      window.requestAnimationFrame(() => errorRef.current?.focus());
       return;
     }
 
@@ -179,6 +229,15 @@ export function DocumentMoveDialog({
     setMoving(false);
     onMoved(result);
     onOpenChange(false);
+  }
+
+  async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (titleConflict) {
+      window.requestAnimationFrame(() => conflictRef.current?.focus());
+      return;
+    }
+    await performMove("reject");
   }
 
   return (
@@ -202,78 +261,131 @@ export function DocumentMoveDialog({
         >
           <form onSubmit={handleSubmit}>
             <DialogHeader className="border-b border-border px-5 py-4 pr-14 sm:px-6">
-              <DialogTitle>Move or rename document</DialogTitle>
+              <DialogTitle>Move document</DialogTitle>
               <DialogDescription>
-                Change where “{title}” lives without losing its identity or version history.
+                Choose a new Collection. The title, stable file identity, links, and version history stay unchanged.
               </DialogDescription>
             </DialogHeader>
 
-            <div className="space-y-5 px-5 py-5 sm:px-6">
-              <section aria-label="Location change" className="overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-xs">
-                <div className="flex items-center gap-3 px-3.5 py-3">
-                  <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-md)] bg-surface-2 text-foreground-muted">
+            <div className="max-h-[min(70vh,44rem)] space-y-5 overflow-y-auto px-5 py-5 rail-scroll sm:px-6">
+              <section
+                aria-label="Document destination"
+                className="overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-xs"
+              >
+                <div className="flex items-start gap-3 px-4 py-3.5">
+                  <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[var(--radius-md)] bg-surface-selected text-surface-selected-foreground">
                     <FileText className="h-4 w-4" aria-hidden />
                   </span>
                   <div className="min-w-0">
-                    <p className="text-xs font-medium text-foreground-muted">Current location</p>
-                    <code className="block truncate font-mono text-sm text-foreground" title={path}>{path}</code>
+                    <p className="text-xs font-medium text-foreground-muted">Document</p>
+                    <p className="truncate font-display text-base font-semibold text-foreground" title={title}>
+                      {title}
+                    </p>
+                    <p className="mt-0.5 text-xs text-foreground-muted">
+                      Moving changes location only.
+                    </p>
                   </div>
                 </div>
-                <div className="flex h-7 items-center border-y border-border bg-surface-2 px-4 text-foreground-muted">
-                  <ArrowDown className="h-3.5 w-3.5" aria-hidden />
-                  <span className="ml-2 text-xs">Destination preview</span>
-                </div>
-                <div className="flex items-center gap-3 bg-surface-selected px-3.5 py-3 text-surface-selected-foreground">
-                  <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-primary/20 bg-surface">
-                    <FolderTree className="h-4 w-4" aria-hidden />
-                  </span>
-                  <code className="min-w-0 truncate font-mono text-sm font-medium" title={destinationPath}>
-                    {destinationPath}
-                  </code>
+                <div className="grid border-t border-border bg-surface-2 sm:grid-cols-[minmax(0,1fr)_2.5rem_minmax(0,1fr)]">
+                  <div className="min-w-0 px-4 py-3">
+                    <p className="text-xs text-foreground-muted">Current location</p>
+                    <p className="mt-0.5 truncate text-sm font-medium text-foreground" title={locationLabel(current.collection)}>
+                      {locationLabel(current.collection)}
+                    </p>
+                  </div>
+                  <div className="hidden items-center justify-center border-x border-border text-foreground-muted sm:flex">
+                    <ArrowRight className="h-4 w-4" aria-hidden />
+                  </div>
+                  <div className="min-w-0 border-t border-border px-4 py-3 sm:border-t-0">
+                    <p className="text-xs text-foreground-muted">Destination</p>
+                    <p className="mt-0.5 truncate text-sm font-semibold text-link" title={locationLabel(collection)}>
+                      {locationLabel(collection)}
+                    </p>
+                  </div>
                 </div>
               </section>
 
-              <div className="grid gap-4 sm:grid-cols-2">
-                <div className="space-y-1.5">
-                  <Label htmlFor="document-move-collection">Target collection</Label>
-                  <SelectMenu
-                    id="document-move-collection"
-                    value={collection}
-                    onValueChange={(value) => {
-                      setCollection(value);
-                      setError("");
-                    }}
-                    options={collectionOptions}
-                    placeholder={collectionsQuery.isPending ? "Loading collections…" : "Select a collection"}
-                    disabled={collectionsQuery.isPending || collectionsQuery.isError || moving}
-                    searchable
-                    searchPlaceholder="Filter collections…"
-                    mono
-                  />
-                  <p className="text-xs leading-relaxed text-foreground-muted">
-                    Choose Vault root to move the document outside every collection.
-                  </p>
-                </div>
-
-                <div className="space-y-1.5">
-                  <Label htmlFor="document-move-filename">File name</Label>
-                  <Input
-                    id="document-move-filename"
-                    value={fileName}
-                    onChange={(event) => {
-                      setFileName(event.currentTarget.value);
-                      setError("");
-                    }}
-                    autoFocus
-                    disabled={moving}
-                    aria-invalid={Boolean(error && !fileName.trim()) || undefined}
-                    aria-describedby="document-move-filename-help"
-                  />
-                  <p id="document-move-filename-help" className="text-xs leading-relaxed text-foreground-muted">
-                    The .md extension is added automatically. The document title stays unchanged.
-                  </p>
-                </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="document-move-collection">Target collection</Label>
+                <SelectMenu
+                  id="document-move-collection"
+                  value={collection}
+                  onValueChange={(value) => {
+                    setCollection(value);
+                    setError("");
+                    setServerConflict(null);
+                  }}
+                  options={collectionOptions}
+                  placeholder={collectionsQuery.isPending ? "Loading collections…" : "Select a collection"}
+                  disabled={collectionsQuery.isPending || collectionsQuery.isError || moving}
+                  searchable
+                  searchPlaceholder="Filter collections…"
+                />
+                <p className="text-xs leading-relaxed text-foreground-muted">
+                  Choose Vault root to move the document outside every collection.
+                </p>
               </div>
+
+              {pathCollision && !titleConflict && (
+                <Alert variant="info" title="The system path is already in use">
+                  <p>
+                    “{pathCollision.name}” resolves to the same technical slug. AKB will
+                    assign a collision-safe path automatically; the visible title stays unchanged.
+                  </p>
+                </Alert>
+              )}
+
+              {titleConflict && (
+                <div ref={conflictRef} tabIndex={-1} className="focus:outline-none">
+                  <DocumentTitleConflictNotice
+                    conflict={titleConflict}
+                    onOpenExisting={
+                      onOpenDocument
+                        ? () => openExistingDocument(titleConflict.existingPath)
+                        : undefined
+                    }
+                    onChooseAlternative={() => {
+                      setServerConflict(null);
+                      document.getElementById("document-move-collection")?.focus();
+                    }}
+                    chooseAlternativeLabel="Choose another Collection"
+                    onKeepBoth={() => performMove("allow")}
+                    keepBothLabel="Keep both and move"
+                    keepingBoth={moving}
+                  />
+                </div>
+              )}
+
+              <details className="group rounded-[var(--radius-lg)] border border-border bg-surface">
+                <summary className="flex min-h-10 cursor-pointer list-none items-center gap-2 rounded-[var(--radius-lg)] px-3 text-sm font-medium text-foreground transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                  <ChevronRight
+                    className="h-4 w-4 shrink-0 text-foreground-muted transition-transform group-open:rotate-90"
+                    aria-hidden
+                  />
+                  Review technical paths
+                </summary>
+                <dl className="space-y-3 border-t border-border bg-surface-2 px-4 py-3 text-xs">
+                  <div>
+                    <dt className="text-foreground-muted">Current path</dt>
+                    <dd className="mt-1 overflow-x-auto">
+                      <code className="font-mono text-foreground">{path}</code>
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-foreground-muted">
+                      {pathCollision ? "Requested path" : "Expected path"}
+                    </dt>
+                    <dd className="mt-1 overflow-x-auto">
+                      <code className="font-mono text-foreground">{destinationPath}</code>
+                    </dd>
+                    {pathCollision && (
+                      <p className="mt-1 text-foreground-muted">
+                        The server will return the final collision-safe path after the move.
+                      </p>
+                    )}
+                  </div>
+                </dl>
+              </details>
 
               <div className="space-y-1.5">
                 <Label htmlFor="document-move-message">
@@ -298,7 +410,7 @@ export function DocumentMoveDialog({
               {collectionsQuery.isError && (
                 <Alert variant="destructive" title="Collections could not be loaded">
                   <span>
-                    You can still rename this document in its current location, or retry loading other destinations.
+                    Retry before choosing a destination.
                   </span>
                   <Button
                     type="button"
@@ -311,7 +423,11 @@ export function DocumentMoveDialog({
                   </Button>
                 </Alert>
               )}
-              {error && <Alert variant="destructive">{error}</Alert>}
+              {error && (
+                <div ref={errorRef} tabIndex={-1} className="focus:outline-none">
+                  <Alert variant="destructive">{error}</Alert>
+                </div>
+              )}
             </div>
 
             <DialogFooter className="border-t border-border bg-surface-2 px-5 py-4 sm:px-6">
@@ -325,8 +441,9 @@ export function DocumentMoveDialog({
                 disabled={
                   moving ||
                   collectionsQuery.isPending ||
-                  !fileName.trim() ||
-                  !destinationChanged
+                  collectionsQuery.isError ||
+                  !destinationChanged ||
+                  Boolean(titleConflict)
                 }
               >
                 {moving ? "Moving…" : "Move document"}
@@ -340,7 +457,7 @@ export function DocumentMoveDialog({
         open={discardOpen}
         onOpenChange={setDiscardOpen}
         title="Discard destination changes?"
-        description="The document has not moved yet. Your selected collection, file name, and commit message will be lost."
+        description="The document has not moved yet. Your selected Collection and commit message will be lost."
         confirmLabel="Discard changes"
         variant="destructive"
         onConfirm={() => {
