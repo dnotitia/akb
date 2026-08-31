@@ -467,6 +467,68 @@ def test_ensure_local_bare_fetches_when_upstream_advances(git_http, tmp_path):
     assert "doc.md" in tree and "extra.md" in tree
 
 
+def test_fetch_remote_refuses_stale_poller_promotion_after_retirement(
+    git_http, tmp_path, monkeypatch,
+):
+    """A fetch staged before retirement must never advance the retained HEAD.
+
+    ``fetch_to_ref`` is the poller's network/staging boundary.  Pause at that
+    seam, finish the offline marker retirement, then resume the stale poller:
+    only its temporary ref may exist; the manual vault's published ``HEAD``
+    must remain the frozen ref.
+    """
+    from app.exceptions import MirrorMarkerError
+
+    git = _mirror_git(git_http, tmp_path)
+    url, head1 = git_http.add_repo("retired-fetch", {"doc.md": "one\n"})
+    vault_name = f"retired-fetch-{uuid.uuid4().hex[:8]}"
+    git.clone_mirror(vault_name, url, "main", None)
+    head2 = git_http.publish_change("retired-fetch", "doc.md", "two\n")
+    assert head2 != head1
+
+    original_fetch = git._ext_runner.fetch_to_ref
+
+    def fetch_then_finish_retirement(*args, **kwargs):
+        original_fetch(*args, **kwargs)
+        git.quarantine_external_mirror_marker(vault_name, expected_ref=head1)
+        git.finalize_external_mirror_retirement(vault_name, expected_ref=head1)
+
+    monkeypatch.setattr(git._ext_runner, "fetch_to_ref", fetch_then_finish_retirement)
+
+    with pytest.raises(MirrorMarkerError, match="external-git mirror is no longer active"):
+        git.fetch_remote(vault_name, url, "main", None)
+
+    bare = _mirror_bare(tmp_path, vault_name)
+    assert git.current_commit(vault_name) == head1
+    assert not (bare / "akb-external-mirror").exists()
+    assert not (bare / "akb-external-mirror-retiring").exists()
+
+
+def test_stale_sync_cannot_rearm_a_completed_retired_mirror(git_http, tmp_path):
+    """A later stale reconcile cannot recreate the mirror marker after handoff."""
+    from app.exceptions import MirrorMarkerError
+
+    git = _mirror_git(git_http, tmp_path)
+    service = ExternalGitService(git=git)
+    url, head1 = git_http.add_repo("retired-rearm", {"doc.md": "one\n"})
+    vault_name = f"retired-rearm-{uuid.uuid4().hex[:8]}"
+    assert service.ensure_local_bare(vault_name, None, head1, url, "main", None) == (
+        "cloned",
+        head1,
+    )
+    git.quarantine_external_mirror_marker(vault_name, expected_ref=head1)
+    git.finalize_external_mirror_retirement(vault_name, expected_ref=head1)
+    head2 = git_http.publish_change("retired-rearm", "doc.md", "two\n")
+
+    with pytest.raises(MirrorMarkerError, match="external-git mirror marker is missing"):
+        service.ensure_local_bare(vault_name, head1, head2, url, "main", None)
+
+    bare = _mirror_bare(tmp_path, vault_name)
+    assert git.current_commit(vault_name) == head1
+    assert not (bare / "akb-external-mirror").exists()
+    assert not (bare / "akb-external-mirror-retiring").exists()
+
+
 def test_is_healthy_repo(git_http, tmp_path):
     """Structural soundness probe: absent → False, healthy clone → True,
     objects dropped → False."""
@@ -694,8 +756,9 @@ def test_ensure_local_bare_reclones_after_structure_finding(git_http, tmp_path):
 # `clone_mirror` only writes the marker on a fresh clone, so a mirror created
 # before the marker existed has none — `_is_mirror` is False and its reads
 # fall through to GitPython (fail-open). The DB (`vault_external_git`) is the
-# authoritative mirror list; the startup backfill re-stamps the on-disk marker,
-# and `ensure_local_bare` self-heals any miss. Tests use `git init --bare` via
+# authoritative mirror list; the startup backfill re-stamps the on-disk marker.
+# `ensure_local_bare` deliberately refuses a missing marker rather than letting
+# a stale poller re-arm a retired manual vault. Tests use `git init --bare` via
 # the local in-process git fixture (no real network); the fixture host pins
 # GIT_TERMINAL_PROMPT=0 in the runner's sealed env, and we also set it for the
 # fixture's own non-runner git calls as a belt.
@@ -886,7 +949,12 @@ def test_backfill_mirror_markers_unconditional_and_fail_fast(git_http, tmp_path,
     assert "failv" in str(boot_err.value)
 
 
-def test_ensure_local_bare_self_heals_missing_marker(git_http, tmp_path, monkeypatch):
+def test_ensure_local_bare_requires_authoritative_backfill_for_a_missing_marker(
+    git_http, tmp_path, monkeypatch,
+):
+    from app.exceptions import MirrorMarkerError
+    from app.services.external_git_service import _stamp_mirror_markers
+
     monkeypatch.setenv("GIT_TERMINAL_PROMPT", "0")
     git = _mirror_git(git_http, tmp_path)
     svc = ExternalGitService(git=git)
@@ -898,9 +966,13 @@ def test_ensure_local_bare_self_heals_missing_marker(git_http, tmp_path, monkeyp
     (_mirror_bare(tmp_path, "healv") / "akb-external-mirror").unlink()
     assert git._is_mirror("healv") is False
 
-    # A normal reconcile pass on an UNCHANGED mirror must re-stamp the marker
-    # (self-heal belt) — the unchanged fast path would otherwise perpetuate the
-    # marker-less, fail-open state forever.
+    # A stale reconcile may not recreate a missing marker itself: completed
+    # retirement intentionally leaves the retained manual vault marker-less.
+    with pytest.raises(MirrorMarkerError, match="marker is missing"):
+        svc.ensure_local_bare("healv", head, head, url, "main", None)
+
+    # The DB-authoritative startup sweep is the sole marker-restoration path.
+    assert _stamp_mirror_markers(git, ["healv"]) == (1, [])
     action, sha2 = svc.ensure_local_bare("healv", head, head, url, "main", None)
     assert action == "unchanged" and sha2 == head
     assert git._is_mirror("healv") is True

@@ -117,6 +117,7 @@ async def _fresh_schema(*, cutover_migrations: bool = True):
                     "091_native_revision_committed_receipt_guard.py",
                     "092_native_revision_plan_supersession.py",
                     "093_external_git_retirement.py",
+                    "094_native_revision_completed_reservation_transfer.py",
                 ]
             )
         for filename in filenames:
@@ -1084,6 +1085,66 @@ async def test_plan_supersession_migration_releases_legacy_aborted_reservations(
         assert fresh.vaults[0].migration_run_id != prior_run_id
 
 
+async def test_completed_reservation_transfer_migration_upgrades_aborted_applied_cutover(tmp_path):
+    """Migration 094 releases only an eligible completed reservation on demand."""
+    async with _fresh_schema(cutover_migrations=False) as pool:
+        async with pool.acquire() as conn:
+            for filename in (
+                "088_native_revision_existing_cutover.py",
+                "089_native_file_projection_outbox.py",
+                "090_native_revision_vault_purge_fence.py",
+                "091_native_revision_committed_receipt_guard.py",
+                "092_native_revision_plan_supersession.py",
+                "093_external_git_retirement.py",
+            ):
+                await _load(filename).migrate(conn=conn)
+
+        git = GitService(storage_path=str(tmp_path / "git-legacy-aborted-complete"))
+        vault = await _manual_vault(pool, git, label="legacy-aborted-complete")
+        cutover = NativeRevisionCutover(
+            pool,
+            backfill=NativeRevisionBackfill(pool, git=git),
+            verifier=_FixtureVerifier(pool),
+        )
+        prior = await cutover.plan(
+            vaults=[vault],
+            coverage_version="fixture-legacy-aborted-complete-v1",
+        )
+        prior_run_id = prior.vaults[0].migration_run_id
+        assert (await cutover.apply(prior.cutover_id)).status == "applied"
+        assert (await cutover.abort(prior.cutover_id)).aborted_from_status == "applied"
+
+        # Before 094, its deliberate transfer attempt is still blocked by the
+        # older check constraint, and the failed fresh plan rolls back intact.
+        with pytest.raises(
+            asyncpg.CheckViolationError,
+            match="native_revision_migration_items_reservation_state_check",
+        ):
+            await cutover.plan(
+                vaults=[vault],
+                coverage_version="fixture-legacy-aborted-complete-v2",
+            )
+
+        async with pool.acquire() as conn:
+            await _load("094_native_revision_completed_reservation_transfer.py").migrate(conn=conn)
+
+        fresh = await cutover.plan(
+            vaults=[vault],
+            coverage_version="fixture-legacy-aborted-complete-v2",
+        )
+        assert fresh.vaults[0].migration_run_id != prior_run_id
+        assert (await cutover.apply(fresh.cutover_id)).status == "applied"
+
+        async with pool.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT reservation_active FROM native_revision_migration_items WHERE run_id = $1",
+                    prior_run_id,
+                )
+                is False
+            )
+
+
 async def test_deleted_vault_external_git_sidecar_blocks_authority_outside_retained_inventory(tmp_path):
     """A deleted vault is not migratable, but its sidecar still blocks authority."""
     async with _fresh_schema() as pool:
@@ -1862,6 +1923,8 @@ async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop
             "090_native_revision_vault_purge_fence.py",
             "091_native_revision_committed_receipt_guard.py",
             "092_native_revision_plan_supersession.py",
+            "093_external_git_retirement.py",
+            "094_native_revision_completed_reservation_transfer.py",
         }
         assert cutover_files <= registered
 
@@ -1886,6 +1949,8 @@ async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop
                 "090_native_revision_vault_purge_fence.py",
                 "091_native_revision_committed_receipt_guard.py",
                 "092_native_revision_plan_supersession.py",
+                "093_external_git_retirement.py",
+                "094_native_revision_completed_reservation_transfer.py",
             ]
             assert await conn.fetchval("SELECT state FROM native_revision_legacy_write_fence") == "open"
             assert await conn.fetchval("SELECT to_regclass('public.native_file_projection_outbox') IS NOT NULL") is True
@@ -1899,7 +1964,7 @@ async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop
                     "SELECT count(*) FROM schema_migrations WHERE filename = ANY($1::text[])",
                     list(cutover_files),
                 )
-                == 5
+                == 7
             )
 
 
@@ -1984,6 +2049,141 @@ async def test_abort_preserves_additive_evidence_and_keeps_legacy_writes_open(tm
                 "UPDATE documents SET title = 'Legacy remains writable' WHERE vault_id = $1",
                 vault.namespace_id,
             )
+
+
+@pytest.mark.parametrize(
+    ("verify_before_abort", "expected_abort_status"),
+    [(False, "applied"), (True, "verified")],
+    ids=["applied", "verified"],
+)
+async def test_aborted_completed_cutover_transfers_reservations_without_duplicate_history(
+    tmp_path,
+    verify_before_abort,
+    expected_abort_status,
+):
+    """A later coverage plan adopts completed work from an aborted cutover.
+
+    The original native Resource/revisions and immutable Legacy mappings stay
+    owned by the completed run.  Only the active `(resource, legacy head)`
+    reservation moves to the replacement run, so the fresh cutover can apply
+    without a duplicate history or a second link to the old run.
+    """
+    async with _fresh_schema() as pool:
+        git = GitService(storage_path=str(tmp_path / "git-aborted-completed-transfer"))
+        vault = await _manual_vault(
+            pool,
+            git,
+            label=f"aborted-completed-transfer-{expected_abort_status}",
+        )
+        cutover = NativeRevisionCutover(
+            pool,
+            backfill=NativeRevisionBackfill(pool, git=git),
+            verifier=NativeRevisionCutoverVerifier(pool, git=git),
+        )
+
+        prior = await cutover.plan(
+            vaults=[vault],
+            coverage_version=f"fixture-aborted-completed-{expected_abort_status}-v1",
+        )
+        prior_run_id = prior.vaults[0].migration_run_id
+        assert (await cutover.apply(prior.cutover_id)).status == "applied"
+        if verify_before_abort:
+            assert (await cutover.verify(prior.cutover_id)).status == "verified"
+
+        async with pool.acquire() as conn:
+            native_resource_count = await conn.fetchval("SELECT count(*) FROM native_resources")
+            native_revision_count = await conn.fetchval("SELECT count(*) FROM native_revisions")
+            mappings_before = [
+                (row["resource_id"], row["legacy_git_oid"], row["run_id"])
+                for row in await conn.fetch(
+                    """
+                    SELECT resource_id, legacy_git_oid, run_id
+                      FROM legacy_revision_mappings
+                     ORDER BY resource_id, legacy_git_oid
+                    """
+                )
+            ]
+            assert mappings_before
+
+        aborted = await cutover.abort(prior.cutover_id)
+        assert aborted.status == "aborted"
+        assert aborted.aborted_from_status == expected_abort_status
+
+        fresh = await cutover.plan(
+            vaults=[vault],
+            coverage_version=f"fixture-aborted-completed-{expected_abort_status}-v2",
+        )
+        fresh_run_id = fresh.vaults[0].migration_run_id
+        assert fresh.cutover_id != prior.cutover_id
+        assert fresh_run_id != prior_run_id
+        assert (await cutover.apply(fresh.cutover_id)).status == "applied"
+        assert (await cutover.verify(fresh.cutover_id)).status == "verified"
+
+        # The transfer is single-owner, not a uniqueness bypass: while the
+        # replacement cutover remains applicable, another coverage attempt for
+        # the same `(Resource, Legacy head)` still collides at PostgreSQL.
+        with pytest.raises(
+            asyncpg.UniqueViolationError,
+            match="native_revision_migration_items_active_resource_head_key",
+        ):
+            await cutover.plan(
+                vaults=[vault],
+                coverage_version=f"fixture-aborted-completed-{expected_abort_status}-v3",
+            )
+
+        async with pool.acquire() as conn:
+            assert await conn.fetchval("SELECT count(*) FROM native_resources") == native_resource_count
+            assert await conn.fetchval("SELECT count(*) FROM native_revisions") == native_revision_count
+            mappings_after = [
+                (row["resource_id"], row["legacy_git_oid"], row["run_id"])
+                for row in await conn.fetch(
+                    """
+                    SELECT resource_id, legacy_git_oid, run_id
+                      FROM legacy_revision_mappings
+                     ORDER BY resource_id, legacy_git_oid
+                    """
+                )
+            ]
+            assert mappings_after == mappings_before
+            assert {row[2] for row in mappings_after} == {prior_run_id}
+
+            prior_item = await conn.fetchrow(
+                """
+                SELECT status, reservation_active, native_head_revision_id
+                  FROM native_revision_migration_items
+                 WHERE run_id = $1
+                """,
+                prior_run_id,
+            )
+            fresh_item = await conn.fetchrow(
+                """
+                SELECT status, reservation_active, native_head_revision_id
+                  FROM native_revision_migration_items
+                 WHERE run_id = $1
+                """,
+                fresh_run_id,
+            )
+            assert prior_item is not None and fresh_item is not None
+            assert prior_item["status"] == fresh_item["status"] == "complete"
+            assert prior_item["reservation_active"] is False
+            assert fresh_item["reservation_active"] is True
+            assert prior_item["native_head_revision_id"] == fresh_item["native_head_revision_id"]
+
+            links = {
+                (row["cutover_id"], row["migration_run_id"])
+                for row in await conn.fetch(
+                    """
+                    SELECT cutover_id, migration_run_id
+                      FROM native_revision_cutover_vaults
+                     WHERE namespace_id = $1
+                    """,
+                    vault.namespace_id,
+                )
+            }
+            assert links == {
+                (prior.cutover_id, prior_run_id),
+                (fresh.cutover_id, fresh_run_id),
+            }
 
 
 async def test_product_shadow_verifier_checks_real_git_and_native_reads(tmp_path):

@@ -166,6 +166,15 @@ class ExternalGitService:
             logger.info("Bootstrap clone: vault=%s host=%s", vault_name, host)
             sha = self.git.clone_mirror(vault_name, remote_url, branch, auth_token)
             return ("cloned", sha)
+        # A normal marker is written only by a fresh clone or the
+        # DB-authoritative startup backfill. Do NOT recreate it from this stale
+        # poller snapshot: after a completed retirement the retained bare is a
+        # manual vault and an old reconcile must neither clean it up nor make it
+        # eligible for a later fetch publication.
+        if not self.git._is_mirror(vault_name) and last_synced_sha is not None:
+            raise MirrorMarkerError(
+                "external-git mirror marker is missing; refusing to sync"
+            )
         # Findings are value-less enum-style codes → safe to log.
         findings = self.git.inspect_mirror_structure(vault_name, remote_url, branch)
         if last_synced_sha is None or findings or not self.git.is_healthy_repo(vault_name):
@@ -197,26 +206,6 @@ class ExternalGitService:
                     "re-clone in a loop (systemic git/inspector incompatibility)"
                 )
             return ("cloned", sha)
-        # Self-heal belt: this bare is a trusted, existing mirror we
-        # are about to keep (unchanged or fetched — not re-cloned). ensure_local_bare
-        # is only ever called for a DB-registered mirror, so if it predates the
-        # marker (created before the marker existed, or missed by the startup
-        # backfill) stamp it now — otherwise _is_mirror stays False and this
-        # mirror's reads keep falling through to GitPython. The unchanged fast
-        # path below would otherwise perpetuate the marker-less state forever.
-        # Idempotent + cheap (a fast lstat when already marked); the
-        # clone/re-clone paths above get their marker from clone_mirror instead.
-        self.git.mark_as_mirror(vault_name)
-        # Fail-CLOSED: confirm the marker now reads back as a
-        # genuine mirror before we KEEP (and serve reads from) this bare. An
-        # abnormal marker entry already made mark_as_mirror raise; this also
-        # refuses the pathological "mark returned but _is_mirror is still False"
-        # case rather than letting the mirror's reads fall open to GitPython.
-        if not self.git._is_mirror(vault_name):
-            raise MirrorMarkerError(
-                f"external-git mirror {vault_name!r} could not establish its "
-                "on-disk marker; refusing to serve"
-            )
         # Treat the mirror as unchanged ONLY when the ls-remote hint, the
         # recorded cursor, AND the LOCAL materialized ref all agree. If the local
         # ref is missing or differs (e.g. a prior partial reconcile advanced the

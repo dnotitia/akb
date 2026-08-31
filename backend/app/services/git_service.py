@@ -465,6 +465,21 @@ class GitService:
         if _marker_state(bare / _RETIRING_MIRROR_MARKER) == "valid":
             raise MirrorMarkerError("external-git mirror retirement is incomplete")
 
+    @staticmethod
+    def _require_active_external_mirror_publication(bare: Path) -> None:
+        """Prove a staged external fetch may still publish into ``bare``.
+
+        A fetch receives objects and a namespaced temporary ref outside the
+        vault lock. Its branch-ref promotion is the persistent publication
+        boundary, so re-read both markers while the lock is held: a retirement
+        tombstone blocks the handoff window and an absent normal marker means a
+        completed retirement returned this bare to manual ownership.
+        """
+        if _marker_state(bare / _RETIRING_MIRROR_MARKER) == "valid":
+            raise MirrorMarkerError("external-git mirror retirement is incomplete")
+        if _marker_state(bare / _MIRROR_MARKER) != "valid":
+            raise MirrorMarkerError("external-git mirror is no longer active")
+
     def _use_mirror_reader(self, vault_name: str) -> bool:
         """Decide how a READ on ``vault_name`` must be served, fail-CLOSED.
 
@@ -1034,6 +1049,11 @@ class GitService:
         if bare_path.exists():
             raise FileExistsError(f"Vault already exists: {vault_name}")
         with self._vault_write_lock(vault_name):
+            # The initial existence check is only a fast failure. Re-check at
+            # the publication lock boundary so a staged clone never lands over
+            # a vault retained or created while this caller waited for the lock.
+            if bare_path.exists():
+                raise FileExistsError(f"Vault already exists: {vault_name}")
             # Age-qualified sweep INSIDE the lock: only reap leftover
             # temp clone dirs older than the clone timeout, so a concurrent
             # same-vault clone's ACTIVE temp is never deleted. Same-vault clones
@@ -1056,6 +1076,8 @@ class GitService:
                 # outside storage. ``bare_path`` doesn't exist yet — ``_contained``
                 # resolves its existing parents lexically, which is what we want.
                 self._contained(bare_path)
+                if bare_path.exists():
+                    raise FileExistsError(f"Vault already exists: {vault_name}")
                 # Atomic within storage_path (same filesystem). bare_path was
                 # asserted absent above / removed by a sterile re-clone caller.
                 os.rename(tmp, bare_path)
@@ -1105,6 +1127,12 @@ class GitService:
 
         # Brief critical section: promote tmp ref → branch ref, read the sha.
         with self._vault_write_lock(vault_name):
+            # Network I/O above deliberately runs without this lock. Re-resolve
+            # the live bare and its mirror/retirement authority immediately
+            # before promotion, so a stale poller cannot overwrite the HEAD of
+            # a retained manual vault after retirement finishes.
+            bare_path = self._retirement_bare(vault_name)
+            self._require_active_external_mirror_publication(bare_path)
             self._ext_runner.update_ref(bare_path, f"refs/heads/{vbranch}", tmp_ref)
             self._ext_runner.delete_ref_quiet(bare_path, tmp_ref)
             return self._ext_runner.rev_parse(bare_path, f"refs/heads/{vbranch}")

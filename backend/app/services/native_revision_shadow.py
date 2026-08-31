@@ -94,6 +94,15 @@ class MigrationReadRepository(Protocol):
 
     async def list_items(self, run_id: uuid.UUID) -> list[MigrationItem]: ...
 
+    async def is_completed_reservation_transfer(
+        self,
+        *,
+        owner_run_id: uuid.UUID,
+        replacement_run_id: uuid.UUID,
+        legacy_document_id: uuid.UUID,
+        native_head_revision_id: str,
+    ) -> bool: ...
+
     async def exact_mapping(
         self,
         *,
@@ -1352,7 +1361,16 @@ class NativeRevisionShadowComparator:
                 if current_item is None or self._value(current_item, "native_head_revision_id") != native_id:
                     raise ShadowComparisonError("current-run mapping has no matching completed migration item")
             elif current_item is not None:
-                raise ShadowComparisonError("current-run item attempts to re-home an immutable mapping")
+                if (
+                    self._value(current_item, "native_head_revision_id") != native_id
+                    or not await self.repository.is_completed_reservation_transfer(
+                        owner_run_id=owner_run_uuid,
+                        replacement_run_id=comparison_run_id,
+                        legacy_document_id=document.resource_id,
+                        native_head_revision_id=native_id,
+                    )
+                ):
+                    raise ShadowComparisonError("current-run item attempts to re-home an immutable mapping")
             ordered_private = [private_mappings[entry.legacy_git_oid] for entry in document.lineage]
             native_parent_bindings: list[dict[str, Any]] = []
             prior_native: dict[str, Any] | None = None
