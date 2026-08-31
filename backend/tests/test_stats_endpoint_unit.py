@@ -17,6 +17,7 @@ import json
 import logging
 import signal
 import socket
+import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -662,6 +663,7 @@ def health_app(monkeypatch, tmp_path):
         events_publisher,
         external_git_poller,
         metadata_worker,
+        native_file_projection,
         queue_rescuer,
         sparse_encoder,
         vault_backfill,
@@ -676,6 +678,7 @@ def health_app(monkeypatch, tmp_path):
     monkeypatch.setattr(queue_rescuer, "snapshot", dict)
     monkeypatch.setattr(vault_backfill, "pending_stats", _async_return({}))
     monkeypatch.setattr(sparse_encoder, "stats_snapshot", _async_return({}))
+    monkeypatch.setattr(native_file_projection, "pending_stats", _async_return({}))
     for module in (external_git_poller, asset_gc_worker, metadata_worker, events_publisher):
         monkeypatch.setattr(module, "pending_stats", _async_return({}))
     return main
@@ -709,6 +712,44 @@ async def test_health_omits_the_queue_head_age_when_nothing_is_pending(health_ap
     result = await health_app.health(user=None)
 
     assert "oldest_pending_enqueued_at" not in result
+
+
+async def test_health_surfaces_native_file_projection_exhaustion_as_degraded(health_app, monkeypatch):
+    """A terminal S3-to-Native intent must not look like a healthy projection."""
+    from app.services import native_file_projection
+
+    diagnostic = {
+        "pending": 0,
+        "retrying": 0,
+        "exhausted": 0,
+        "abandoned": 1,
+        "status": "degraded",
+    }
+    monkeypatch.setattr(native_file_projection, "pending_stats", _async_return(diagnostic))
+
+    result = await health_app.health(user=None)
+
+    assert result["native_file_projection"] == diagnostic
+
+
+async def test_vault_health_surfaces_native_file_projection_diagnostics(monkeypatch):
+    from app.services import embed_worker, health as health_service, metadata_worker, native_file_projection
+
+    vault_id = uuid.uuid4()
+    diagnostic = {
+        "pending": 1,
+        "retrying": 0,
+        "exhausted": 1,
+        "abandoned": 0,
+        "status": "degraded",
+    }
+    monkeypatch.setattr(embed_worker, "pending_stats", _async_return({"upsert": {}}))
+    monkeypatch.setattr(metadata_worker, "pending_stats", _async_return({}))
+    monkeypatch.setattr(native_file_projection, "pending_stats", _async_return(diagnostic))
+
+    result = await health_service.vault_health(vault_id)
+
+    assert result["native_file_projection"] == diagnostic
 
 
 # ── the socket itself ────────────────────────────────────────────────────

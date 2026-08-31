@@ -17,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 import asyncpg
 
 from app.config import settings
+from app.db.postgres import get_pool
 from app.services._backfill import MAX_RETRIES, next_attempt_delay
 from app.services.adapters import s3_adapter
 from app.services.m1_pg_body_store import M1PgBodyStore, M1_PG_TEXT_MAX_BYTES
@@ -49,6 +50,114 @@ def validate_native_text_file(payload: bytes, *, digest: str, byte_size: int) ->
         return payload.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
         raise ValueError("File is not valid UTF-8 Native searchable text") from exc
+
+
+async def _pending_stats(
+    pool: asyncpg.Pool,
+    namespace_id: uuid.UUID | None = None,
+) -> dict[str, int | str]:
+    """Return the durable projection queue state without inferring freshness.
+
+    ``exhausted`` is deliberately separate from terminal ``abandoned``: it is
+    the final claimed attempt while its lease is still in force.  That makes a
+    process death at the retry boundary visible before ``queue_rescuer`` turns
+    it into the terminal, operator-requeueable state.
+    """
+    params: list[object] = [MAX_RETRIES]
+    scope = ""
+    if namespace_id is not None:
+        params.append(namespace_id)
+        scope = "AND namespace_id = $2"
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"""
+            SELECT COUNT(*) FILTER (WHERE completed_at IS NULL)::int AS pending,
+                   COUNT(*) FILTER (
+                       WHERE completed_at IS NULL
+                         AND retry_count > 0
+                         AND retry_count < $1
+                   )::int AS retrying,
+                   COUNT(*) FILTER (
+                       WHERE completed_at IS NULL
+                         AND retry_count >= $1
+                   )::int AS exhausted,
+                   COUNT(*) FILTER (
+                       WHERE completed_at IS NOT NULL
+                         AND outcome = 'abandoned'
+                   )::int AS abandoned
+              FROM native_file_projection_outbox
+             WHERE TRUE {scope}
+            """,
+            *params,
+        )
+    pending = int(row["pending"])
+    exhausted = int(row["exhausted"])
+    abandoned = int(row["abandoned"])
+    return {
+        "pending": pending,
+        "retrying": int(row["retrying"]),
+        "exhausted": exhausted,
+        "abandoned": abandoned,
+        # A requeued intent is still awaiting an authority-checked worker pass;
+        # only an empty durable queue is actually healthy/fresh.
+        "status": "degraded" if exhausted or abandoned else "reconciling" if pending else "ok",
+    }
+
+
+async def pending_stats(namespace_id: uuid.UUID | None = None) -> dict[str, int | str]:
+    """Operator-facing projection state for global and vault health surfaces."""
+    return await _pending_stats(await get_pool(), namespace_id)
+
+
+async def _requeue_abandoned(
+    pool: asyncpg.Pool,
+    *,
+    namespace_id: uuid.UUID,
+    file_id: uuid.UUID | None = None,
+) -> int:
+    """Re-open only terminal intents in one explicit namespace.
+
+    This does not read or mutate S3, catalogue rows, or Native resources.  It
+    preserves the intent identity so the worker's existing idempotent mutation
+    IDs protect re-entry, and lets the normal worker re-check the authoritative
+    File catalogue and S3 bytes before it projects anything.
+    """
+    params: list[object] = [namespace_id]
+    scope = ""
+    if file_id is not None:
+        params.append(file_id)
+        scope = "AND file_id = $2"
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            UPDATE native_file_projection_outbox
+               SET claimed_at = NULL, retry_count = 0, next_attempt_at = NOW(),
+                   completed_at = NULL, outcome = NULL, last_error = NULL
+             WHERE namespace_id = $1
+               AND completed_at IS NOT NULL
+               AND outcome = 'abandoned'
+               {scope}
+            RETURNING file_id
+            """,
+            *params,
+        )
+    return len(rows)
+
+
+async def requeue_abandoned(
+    *,
+    namespace_id: uuid.UUID,
+    file_id: uuid.UUID | None = None,
+) -> int:
+    """Operator entry point for idempotently requeueing abandoned intents.
+
+    An explicit namespace is required.  Supplying a file ID narrows recovery
+    to one File; omitting it reconciles only the selected vault's terminal
+    projection intents.
+    """
+    return await _requeue_abandoned(
+        await get_pool(), namespace_id=namespace_id, file_id=file_id,
+    )
 
 
 async def enqueue_native_file_projection(
@@ -149,6 +258,21 @@ class NativeFileProjectionWorker:
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
         self.native = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
+
+    async def pending_stats(self, namespace_id: uuid.UUID | None = None) -> dict[str, int | str]:
+        """Return queue diagnostics using this worker's pool (tests/operators)."""
+        return await _pending_stats(self.pool, namespace_id)
+
+    async def requeue_abandoned(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        file_id: uuid.UUID | None = None,
+    ) -> int:
+        """Idempotently requeue terminal intents through the normal worker path."""
+        return await _requeue_abandoned(
+            self.pool, namespace_id=namespace_id, file_id=file_id,
+        )
 
     async def _claim_one(self) -> dict | None:
         async with self.pool.acquire() as conn:

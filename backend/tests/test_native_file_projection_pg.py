@@ -266,3 +266,193 @@ async def test_file_text_binary_text_delete_projection_is_durable_and_idempotent
                 file_id,
             )
         assert tuple(deleted) == (file_id, "deleted", "deleted", 5)
+
+
+async def test_final_projection_claim_is_visible_as_exhausted_until_its_lease_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The last claim is diagnostic, but cannot be requeued while it is live."""
+    async with _fresh_schema() as pool:
+        monkeypatch.setattr(settings, "document_revision_backend", "postgres_native")
+        monkeypatch.setattr(projection, "MAX_RETRIES", 1)
+        payload = b"final claim lease\n"
+        async with pool.acquire() as conn:
+            vault_name = f"native-file-projection-final-claim-{uuid.uuid4().hex}"
+            vault_id = await conn.fetchval(
+                """
+                INSERT INTO vaults (name, git_path, status)
+                VALUES ($1, $2, 'active')
+                RETURNING id
+                """,
+                vault_name,
+                f"/tmp/{vault_name}.git",
+            )
+
+        file_id = uuid.uuid4()
+        worker = projection.NativeFileProjectionWorker(pool)
+        await _publish_source(
+            pool,
+            file_id=file_id,
+            vault_id=vault_id,
+            payload=payload,
+            mime_type="text/plain",
+            s3_key="fixture/final-claim",
+        )
+
+        claim = await worker._claim_one()
+
+        assert claim is not None
+        assert claim["retry_count"] == 1
+        assert claim["claimed_at"] is not None
+        assert await worker.pending_stats(namespace_id=vault_id) == {
+            "pending": 1,
+            "retrying": 0,
+            "exhausted": 1,
+            "abandoned": 0,
+            "status": "degraded",
+        }
+        # The claim owns its lease until it either completes/fails or the
+        # queue rescuer turns an expired lease into terminal abandonment.
+        assert await worker.requeue_abandoned(
+            namespace_id=vault_id, file_id=file_id,
+        ) == 0
+
+
+async def test_abandoned_projection_is_visible_requeued_and_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient S3 read failure stays diagnosable until an explicit requeue.
+
+    Requeue is intentionally only a state transition: before the worker runs
+    again there is still no Native resource, so it cannot be mistaken for a
+    fresh projection.
+    """
+    async with _fresh_schema() as pool:
+        monkeypatch.setattr(settings, "document_revision_backend", "postgres_native")
+        monkeypatch.setattr(projection, "MAX_RETRIES", 2)
+        monkeypatch.setattr(projection, "next_attempt_delay", lambda _attempt: 0)
+        payload = b"recoverable native file text\n"
+        failures = {"remaining": 2}
+
+        def flaky_chunks(key: str):
+            assert key == "fixture/recovery"
+            if failures["remaining"]:
+                failures["remaining"] -= 1
+                raise OSError("temporary S3 read failure")
+            return iter((payload,))
+
+        monkeypatch.setattr(projection.s3_adapter, "iter_chunks", flaky_chunks)
+        async with pool.acquire() as conn:
+            vault_name = f"native-file-projection-recovery-{uuid.uuid4().hex}"
+            vault_id = await conn.fetchval(
+                """
+                INSERT INTO vaults (name, git_path, status)
+                VALUES ($1, $2, 'active')
+                RETURNING id
+                """,
+                vault_name,
+                f"/tmp/{vault_name}.git",
+            )
+
+        file_id = uuid.uuid4()
+        worker = projection.NativeFileProjectionWorker(pool)
+        await _publish_source(
+            pool,
+            file_id=file_id,
+            vault_id=vault_id,
+            payload=payload,
+            mime_type="text/plain",
+            s3_key="fixture/recovery",
+        )
+
+        assert await worker.process_once() == 0
+        assert await worker.process_once() == 0
+        async with pool.acquire() as conn:
+            terminal = await conn.fetchrow(
+                """
+                SELECT retry_count, claimed_at, next_attempt_at, completed_at,
+                       outcome, last_error
+                  FROM native_file_projection_outbox
+                 WHERE file_id = $1
+                """,
+                file_id,
+            )
+        assert terminal is not None
+        assert terminal["retry_count"] == 2
+        assert terminal["claimed_at"] is None
+        assert terminal["next_attempt_at"] is None
+        assert terminal["completed_at"] is not None
+        assert terminal["outcome"] == "abandoned"
+        assert terminal["last_error"] == "OSError"
+        assert await worker.pending_stats(namespace_id=vault_id) == {
+            "pending": 0,
+            "retrying": 0,
+            "exhausted": 0,
+            "abandoned": 1,
+            "status": "degraded",
+        }
+
+        # Scope must be explicit; a mistaken namespace cannot revive an intent.
+        assert await worker.requeue_abandoned(
+            namespace_id=uuid.uuid4(), file_id=file_id,
+        ) == 0
+        assert await worker.requeue_abandoned(
+            namespace_id=vault_id, file_id=file_id,
+        ) == 1
+        # A second operator request leaves the already-requeued row untouched.
+        assert await worker.requeue_abandoned(
+            namespace_id=vault_id, file_id=file_id,
+        ) == 0
+        assert await worker.pending_stats(namespace_id=vault_id) == {
+            "pending": 1,
+            "retrying": 0,
+            "exhausted": 0,
+            "abandoned": 0,
+            "status": "reconciling",
+        }
+        async with pool.acquire() as conn:
+            requeued = await conn.fetchrow(
+                """
+                SELECT retry_count, claimed_at, next_attempt_at, completed_at,
+                       outcome, last_error
+                  FROM native_file_projection_outbox
+                 WHERE file_id = $1
+                """,
+                file_id,
+            )
+            resource_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM native_resources WHERE resource_id = $1",
+                file_id,
+            )
+        assert requeued is not None
+        assert requeued["retry_count"] == 0
+        assert requeued["claimed_at"] is None
+        assert requeued["next_attempt_at"] is not None
+        assert requeued["completed_at"] is None
+        assert requeued["outcome"] is None
+        assert requeued["last_error"] is None
+        assert resource_count == 0
+
+        assert await worker.process_once() == 1
+        async with pool.acquire() as conn:
+            projected = await conn.fetchrow(
+                """
+                SELECT pm.digest, o.outcome
+                  FROM native_resources r
+                  JOIN native_revisions nr ON nr.revision_id = r.head_revision_id
+                  JOIN native_payload_manifests pm
+                    ON pm.payload_manifest_id = nr.payload_manifest_id
+                  JOIN native_file_projection_outbox o ON o.file_id = r.resource_id
+                 WHERE r.resource_id = $1
+                """,
+                file_id,
+            )
+        assert projected is not None
+        assert tuple(projected) == (_sha(payload), "created")
+        assert await worker.pending_stats(namespace_id=vault_id) == {
+            "pending": 0,
+            "retrying": 0,
+            "exhausted": 0,
+            "abandoned": 0,
+            "status": "ok",
+        }
