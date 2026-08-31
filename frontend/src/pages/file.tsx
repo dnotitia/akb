@@ -27,8 +27,15 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { ResourceActionsMenu } from "@/components/resource-actions-menu";
 import { ResourceDeleteDialog } from "@/components/resource-delete-dialog";
+import { PublicationSuccessBanner } from "@/components/publication-success-banner";
+import { PublishOptionsDialog } from "@/components/publish-options-dialog";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
-import { authenticatedFetch, deleteVaultFile, getVaultInfo } from "@/lib/api";
+import {
+  authenticatedFetch,
+  deleteVaultFile,
+  getVaultInfo,
+  type Publication,
+} from "@/lib/api";
 import {
   effectiveFileMime,
   filePreviewKind,
@@ -68,6 +75,8 @@ export default function FilePage() {
   const [previewLoading, setPreviewLoading] = useState(true);
   const [canDelete, setCanDelete] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [publishOpen, setPublishOpen] = useState(false);
+  const [published, setPublished] = useState<Publication | null>(null);
 
   useEffect(() => {
     if (!vault) return;
@@ -204,6 +213,8 @@ export default function FilePage() {
             {canDelete && (
               <ResourceActionsMenu
                 resourceName={displayName}
+                publishLabel={info?.uri ? "Publish file" : undefined}
+                onPublish={info?.uri ? () => setPublishOpen(true) : undefined}
                 deleteLabel="Delete file"
                 onDelete={() => setDeleteOpen(true)}
               />
@@ -211,6 +222,15 @@ export default function FilePage() {
           </>
         }
       />
+
+      {published && (
+        <PublicationSuccessBanner
+          vault={vault!}
+          publication={published}
+          resourceLabel="File"
+          onDismiss={() => setPublished(null)}
+        />
+      )}
 
       <div className="relative min-h-0 flex-1 overflow-hidden">
         <ResourceCanvas>
@@ -313,6 +333,17 @@ export default function FilePage() {
           await deleteVaultFile(vault!, fileId!);
           refetchTree();
           navigate(`/vault/${vault}`);
+        }}
+      />
+      <PublishOptionsDialog
+        open={publishOpen}
+        onOpenChange={setPublishOpen}
+        vault={vault!}
+        resourceType="file"
+        resourceUri={info?.uri}
+        resourceName={displayName}
+        onPublished={(_slug, publication) => {
+          if (publication) setPublished(publication);
         }}
       />
     </ResourceWorkspace>

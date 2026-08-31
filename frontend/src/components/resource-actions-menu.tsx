@@ -1,5 +1,5 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import { FilePenLine, MoreHorizontal, Trash2 } from "lucide-react";
+import { FilePenLine, MoreHorizontal, Share2, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -7,6 +7,8 @@ interface ResourceActionsMenuProps {
   resourceName: string;
   deleteLabel?: string;
   onDelete?: () => void;
+  publishLabel?: string;
+  onPublish?: () => void;
   onMoveOrRename?: () => void;
   moveDisabledReason?: string;
   className?: string;
@@ -24,6 +26,8 @@ export function ResourceActionsMenu({
   resourceName,
   deleteLabel,
   onDelete,
+  publishLabel,
+  onPublish,
   onMoveOrRename,
   moveDisabledReason,
   className,
@@ -31,8 +35,9 @@ export function ResourceActionsMenu({
   align = "end",
 }: ResourceActionsMenuProps) {
   const showMoveAction = Boolean(onMoveOrRename || moveDisabledReason);
+  const showPublishAction = Boolean(publishLabel && onPublish);
   const showDeleteAction = Boolean(deleteLabel && onDelete);
-  if (!showMoveAction && !showDeleteAction) return null;
+  if (!showMoveAction && !showPublishAction && !showDeleteAction) return null;
 
   return (
     <DropdownMenu.Root>
@@ -81,7 +86,16 @@ export function ResourceActionsMenu({
               </span>
             </DropdownMenu.Item>
           )}
-          {showMoveAction && showDeleteAction && (
+          {showPublishAction && (
+            <DropdownMenu.Item
+              onSelect={onPublish}
+              className="flex cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-hover"
+            >
+              <Share2 className="h-4 w-4 text-link" aria-hidden />
+              {publishLabel}
+            </DropdownMenu.Item>
+          )}
+          {(showMoveAction || showPublishAction) && showDeleteAction && (
             <DropdownMenu.Separator className="my-1 h-px bg-border" />
           )}
           {showDeleteAction && (

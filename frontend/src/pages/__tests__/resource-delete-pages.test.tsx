@@ -8,22 +8,38 @@ import TablePage from "@/pages/table";
 
 vi.mock("@/lib/api", () => ({
   authenticatedFetch: vi.fn(),
+  createPublication: vi.fn(),
+  createPublicationSnapshot: vi.fn(),
+  deletePublication: vi.fn(),
   getVaultInfo: vi.fn(),
+  getDocument: vi.fn(),
+  listPublications: vi.fn(),
+  previewTablePublicationQuery: vi.fn(),
   deleteVaultFile: vi.fn(),
   deleteVaultTable: vi.fn(),
 }));
 
 import {
   authenticatedFetch,
+  createPublication,
+  createPublicationSnapshot,
+  deletePublication,
   deleteVaultFile,
   deleteVaultTable,
   getVaultInfo,
+  listPublications,
+  previewTablePublicationQuery,
 } from "@/lib/api";
 
 const fetchMock = authenticatedFetch as unknown as ReturnType<typeof vi.fn>;
 const vaultInfoMock = getVaultInfo as unknown as ReturnType<typeof vi.fn>;
 const deleteFileMock = deleteVaultFile as unknown as ReturnType<typeof vi.fn>;
 const deleteTableMock = deleteVaultTable as unknown as ReturnType<typeof vi.fn>;
+const createPublicationMock = createPublication as unknown as ReturnType<typeof vi.fn>;
+const snapshotMock = createPublicationSnapshot as unknown as ReturnType<typeof vi.fn>;
+const deletePublicationMock = deletePublication as unknown as ReturnType<typeof vi.fn>;
+const listPublicationsMock = listPublications as unknown as ReturnType<typeof vi.fn>;
+const previewPublicationMock = previewTablePublicationQuery as unknown as ReturnType<typeof vi.fn>;
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -61,6 +77,11 @@ beforeEach(() => {
   deleteTableMock.mockReset();
   deleteFileMock.mockResolvedValue({ deleted: true });
   deleteTableMock.mockResolvedValue({ deleted: true });
+  listPublicationsMock.mockResolvedValue({ publications: [] });
+  createPublicationMock.mockResolvedValue({});
+  snapshotMock.mockResolvedValue({});
+  deletePublicationMock.mockResolvedValue({ deleted: 1 });
+  previewPublicationMock.mockResolvedValue({ columns: [], items: [], total: 0 });
 });
 
 afterEach(() => cleanup());
@@ -90,12 +111,40 @@ describe("resource viewer deletion", () => {
     const { refetchTree } = renderRoute("/vault/v/file/file-1");
 
     await user.click(await screen.findByRole("button", { name: "Actions for diagram.png" }));
+    expect(screen.getByRole("menuitem", { name: "Publish file" })).toBeInTheDocument();
     await user.click(screen.getByRole("menuitem", { name: "Delete file" }));
     await user.click(screen.getByRole("button", { name: "Delete file" }));
 
     await waitFor(() => expect(deleteFileMock).toHaveBeenCalledWith("v", "file-1"));
     expect(refetchTree).toHaveBeenCalledTimes(1);
     expect(screen.getByTestId("pathname")).toHaveTextContent("/vault/v");
+  });
+
+  it("does not expose file publication or deletion to a reader", async () => {
+    vaultInfoMock.mockResolvedValue({ role: "reader" });
+    fetchMock.mockImplementation((url: string) => {
+      if (url.endsWith("/download")) {
+        return Promise.resolve(jsonResponse({
+          name: "diagram.png",
+          download_url: "https://example.test/diagram.png",
+          mime_type: "image/png",
+        }));
+      }
+      return Promise.resolve(jsonResponse({
+        items: [{
+          uri: "akb://v/file/file-1",
+          name: "diagram.png",
+          mime_type: "image/png",
+        }],
+      }));
+    });
+    renderRoute("/vault/v/file/file-1");
+
+    await screen.findByRole("heading", { name: "diagram.png" });
+    await waitFor(() => expect(vaultInfoMock).toHaveBeenCalledWith("v"));
+    expect(
+      screen.queryByRole("button", { name: "Actions for diagram.png" }),
+    ).not.toBeInTheDocument();
   });
 
   it("requires an admin and an exact name before deleting a table", async () => {
@@ -133,19 +182,49 @@ describe("resource viewer deletion", () => {
     expect(screen.getByTestId("pathname")).toHaveTextContent("/vault/v");
   });
 
-  it("does not expose table deletion to a writer", async () => {
+  it("lets a writer publish a table without exposing admin-only deletion", async () => {
     vaultInfoMock.mockResolvedValue({ role: "writer" });
     fetchMock.mockImplementation((url: string, init?: RequestInit) => {
       if (init?.method === "POST" && url.endsWith("/sql")) {
         return Promise.resolve(jsonResponse({ items: [], columns: [], total: 0 }));
       }
       return Promise.resolve(jsonResponse({
-        items: [{ name: "audit_log", row_count: 0, columns: [] }],
+        items: [{
+          name: "audit_log",
+          row_count: 0,
+          columns: [{ name: "event", type: "text" }],
+        }],
+      }));
+    });
+    const user = userEvent.setup();
+    renderRoute("/vault/v/table/audit_log");
+
+    await screen.findByRole("heading", { name: "audit_log" });
+    await user.click(screen.getByRole("button", { name: "Actions for audit_log" }));
+    expect(screen.getByRole("menuitem", { name: "Publish table" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Delete table" })).not.toBeInTheDocument();
+  });
+
+  it("does not expose table publication or deletion to a reader", async () => {
+    vaultInfoMock.mockResolvedValue({ role: "reader" });
+    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (init?.method === "POST" && url.endsWith("/sql")) {
+        return Promise.resolve(jsonResponse({ items: [], columns: [], total: 0 }));
+      }
+      return Promise.resolve(jsonResponse({
+        items: [{
+          name: "audit_log",
+          row_count: 0,
+          columns: [{ name: "event", type: "text" }],
+        }],
       }));
     });
     renderRoute("/vault/v/table/audit_log");
 
     await screen.findByRole("heading", { name: "audit_log" });
-    expect(screen.queryByRole("button", { name: "Actions for audit_log" })).not.toBeInTheDocument();
+    await waitFor(() => expect(vaultInfoMock).toHaveBeenCalledWith("v"));
+    expect(
+      screen.queryByRole("button", { name: "Actions for audit_log" }),
+    ).not.toBeInTheDocument();
   });
 });
