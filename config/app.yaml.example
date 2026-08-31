@@ -449,7 +449,7 @@ redis_stream_maxlen: 100000
 # skips whole snapshots. Not a metrics endpoint: no Prometheus dependency, no
 # exposition format.
 # stats:
-#   port: 9100                    # unset = the listener is not composed at all
+#   port: 9105                    # unset = the listener is not composed at all; 9105 is the akb-platform default (its tenant-monitor and NetworkPolicy render the same number)
 #   host: "0.0.0.0"               # the NetworkPolicy, not the bind address, is what makes this safe
 #   sampler_interval_secs: 300    # the only thing that decides what this surface costs
 #   activity_grace_minutes: 5     # settling time after a UTC day closes, before its volume is folded (permanently)
