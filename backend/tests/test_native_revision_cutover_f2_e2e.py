@@ -536,7 +536,7 @@ async def test_real_legacy_seed_stops_then_backfills_same_database_and_git(
             host="127.0.0.1",
             port=15432,
             user="akb",
-            password="akb",
+            password="akb",  # pragma: allowlist secret
             database="akb",
         )
         try:
@@ -583,7 +583,7 @@ async def test_real_legacy_seed_stops_then_backfills_same_database_and_git(
             host="127.0.0.1",
             port=15432,
             user="akb",
-            password="akb",
+            password="akb",  # pragma: allowlist secret
             database="akb",
             min_size=1,
             max_size=4,
