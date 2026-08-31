@@ -508,6 +508,21 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
         "vector_store": vs_info,
     }
 
+    # Queue-head age, promoted to the top level because it is a named term in
+    # the tenant-monitoring contract and that contract must not depend on the
+    # internal shape of the operational blob below it — `vector_store.backfill`
+    # is free to be reorganised, this key is not. It is also the one indexing
+    # signal an external poller needs, so it stays on the unauthenticated half
+    # of this response alongside the other backlog counters.
+    #
+    # Omitted when the queue is empty: there is no oldest item, and a 0 or an
+    # epoch timestamp would render as an unboundedly stale queue.
+    backfill = vs_info.get("backfill")
+    if isinstance(backfill, dict):
+        upsert = backfill.get("upsert")
+        if isinstance(upsert, dict) and upsert.get("oldest_pending_enqueued_at") is not None:
+            result["oldest_pending_enqueued_at"] = upsert["oldest_pending_enqueued_at"]
+
     # Sensitive operational internals — authenticated callers only:
     #  - PG-RBAC hook-failure counters + last reconcile outcome (silent
     #    role-sync drift); lets dashboards / oncall see it without grepping logs.

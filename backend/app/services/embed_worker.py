@@ -354,7 +354,13 @@ async def pending_stats(vault_id=None) -> dict:
                                      AND vector_abandoned_at IS NULL
                                      AND vector_retry_count > 0)                                                AS retrying,
                     COUNT(*) FILTER (WHERE vector_indexed_at IS NULL AND vector_abandoned_at IS NOT NULL)       AS abandoned,
-                    COUNT(*) FILTER (WHERE vector_indexed_at IS NOT NULL)                                       AS indexed
+                    COUNT(*) FILTER (WHERE vector_indexed_at IS NOT NULL)                                       AS indexed,
+                    -- Age of the head of the queue. Folded into the aggregate
+                    -- that is already scanning this table so it costs nothing;
+                    -- a separate MIN() would be a second pass. NULL when the
+                    -- queue is empty, which the caller keeps as absence.
+                    MIN(created_at) FILTER (WHERE vector_indexed_at IS NULL
+                                            AND vector_abandoned_at IS NULL)                                    AS oldest_pending
                   FROM chunks
                 """,
             )
@@ -367,7 +373,9 @@ async def pending_stats(vault_id=None) -> dict:
                                      AND vector_abandoned_at IS NULL
                                      AND vector_retry_count > 0)                                                AS retrying,
                     COUNT(*) FILTER (WHERE vector_indexed_at IS NULL AND vector_abandoned_at IS NOT NULL)       AS abandoned,
-                    COUNT(*) FILTER (WHERE vector_indexed_at IS NOT NULL)                                       AS indexed
+                    COUNT(*) FILTER (WHERE vector_indexed_at IS NOT NULL)                                       AS indexed,
+                    MIN(created_at) FILTER (WHERE vector_indexed_at IS NULL
+                                            AND vector_abandoned_at IS NULL)                                    AS oldest_pending
                   FROM chunks
                  WHERE vault_id = $1
                 """,
@@ -382,6 +390,11 @@ async def pending_stats(vault_id=None) -> dict:
             "indexed":   int(chunk_row["indexed"]),
         },
     }
+    # Absent, not epoch and not 0: an empty queue has no oldest item, and a
+    # zero timestamp would age forever on whatever dashboard consumed it.
+    oldest_pending = chunk_row["oldest_pending"]
+    if oldest_pending is not None:
+        stats["upsert"]["oldest_pending_enqueued_at"] = oldest_pending.isoformat()
     if vault_id is None:
         # Do this after releasing the chunks stats connection. Holding one pool
         # slot while awaiting another can deadlock /health under concurrent probes.
