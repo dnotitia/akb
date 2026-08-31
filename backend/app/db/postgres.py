@@ -312,6 +312,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "087_tenant_activity_daily.py",  # closed-once daily activity windows served by /stats; NULL counts mean "not computable", never 0
         "088_native_revision_existing_cutover.py",  # group existing vault-scoped Native backfills for fixture-led cutover verification
         "089_native_file_projection_outbox.py",  # durable S3 File mutation reconciliation into Native text projection
+        "090_native_revision_vault_purge_fence.py",  # allow an authorized exact-vault lifecycle purge after cutover authority commits
     ):
         if filename in applied:
             continue

@@ -179,6 +179,18 @@ class NativeRevisionCutover:
         async with self.pool.acquire() as acquired:
             return list(await acquired.fetch(sql))
 
+    async def _persisted_external_git_count(
+        self,
+        *,
+        conn: asyncpg.Connection | None = None,
+    ) -> int:
+        """Count every external-Git sidecar, including retired vault rows."""
+        sql = "SELECT COUNT(*) FROM vault_external_git"
+        if conn is not None:
+            return int(await conn.fetchval(sql))
+        async with self.pool.acquire() as acquired:
+            return int(await acquired.fetchval(sql))
+
     @asynccontextmanager
     async def _hold_git_write_fences(
         self,
@@ -670,6 +682,7 @@ class NativeRevisionCutover:
         vaults = await self.repository.list_vaults(cutover_id, conn=conn)
         files = await self.repository.list_files(cutover_id, conn=conn)
         exclusions = await self.repository.list_exclusions(cutover_id, conn=conn)
+        persisted_external_git_count = await self._persisted_external_git_count(conn=conn)
         retained = await self._retained_vault_inventory(conn=conn)
 
         planned_ids = {item.namespace_id for item in vaults}
@@ -687,7 +700,7 @@ class NativeRevisionCutover:
                     raise CutoverVerificationError("retained vault classification drifted after planning")
             elif row["id"] not in vault_by_id:
                 raise CutoverVerificationError("retained vault classification drifted after planning")
-        if any(row["external_git"] for row in retained):
+        if persisted_external_git_count:
             raise CutoverVerificationError("cutover authority cannot commit while persisted external Git vaults remain")
         if exclusions:
             raise CutoverVerificationError("cutover exclusion inventory drifted after external Git retirement")

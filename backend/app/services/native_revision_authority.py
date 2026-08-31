@@ -273,15 +273,13 @@ async def _verified_cutover_binding(
             "native_authority_cutover_not_verified",
             "Existing-database Native authority requires one verified cutover",
         )
+    # The cutover receipt survives a source-vault lifecycle delete, while its
+    # live migration run correctly cascades with that retired vault.
     vaults = await conn.fetch(
         """
         SELECT v.namespace_id, v.migration_run_id, v.fixed_git_oid,
-               v.inventory_digest, v.verification_digest, v.status,
-               m.status AS migration_status
+               v.inventory_digest, v.verification_digest, v.status
           FROM native_revision_cutover_vaults v
-          JOIN native_revision_migration_runs m
-            ON m.run_id = v.migration_run_id
-           AND m.namespace_id = v.namespace_id
          WHERE v.cutover_id = $1
          ORDER BY v.namespace_id
         """,
@@ -289,7 +287,6 @@ async def _verified_cutover_binding(
     )
     if not vaults or any(
         row["status"] != "verified"
-        or row["migration_status"] != "complete"
         or not isinstance(row["verification_digest"], str)
         for row in vaults
     ):

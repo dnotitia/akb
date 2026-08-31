@@ -20,7 +20,7 @@ from git import Repo
 
 from app.db import postgres
 import app.services.native_revision_cutover as cutover_module
-from app.services.git_service import GitService
+from app.services.git_service import FixedRefHistoryError, GitService
 from app.services.native_revision_backfill import NativeRevisionBackfill
 from app.services.native_revision_authority import (
     NativeAuthorityError,
@@ -96,6 +96,7 @@ async def _fresh_schema(*, cutover_migrations: bool = True):
                 [
                     "088_native_revision_existing_cutover.py",
                     "089_native_file_projection_outbox.py",
+                    "090_native_revision_vault_purge_fence.py",
                 ]
             )
         for filename in filenames:
@@ -461,6 +462,60 @@ async def test_archived_external_mirror_blocks_authority_without_poisoning_manua
             assert await conn.fetchval("SELECT count(*) FROM native_revision_existing_authority") == 0
 
 
+async def test_deleted_vault_external_git_sidecar_blocks_authority_outside_retained_inventory(tmp_path):
+    """A deleted vault is not migratable, but its sidecar still blocks authority."""
+    async with _fresh_schema() as pool:
+        git = GitService(storage_path=str(tmp_path / "git-deleted-sidecar"))
+        manual = await _manual_vault(pool, git, label="deleted-sidecar-manual")
+
+        async with pool.acquire() as conn:
+            deleted_vault_id = await conn.fetchval(
+                """
+                INSERT INTO vaults (name, git_path, status)
+                VALUES ($1, $2, 'deleted')
+                RETURNING id
+                """,
+                f"cutover-deleted-sidecar-{uuid.uuid4().hex}",
+                "/tmp/deleted-sidecar.git",
+            )
+            await conn.execute(
+                """
+                INSERT INTO vault_external_git (vault_id, remote_url, remote_branch)
+                VALUES ($1, 'https://git.example.invalid/deleted-sidecar.git', 'main')
+                """,
+                deleted_vault_id,
+            )
+
+        cutover = NativeRevisionCutover(
+            pool,
+            backfill=NativeRevisionBackfill(pool, git=git),
+            verifier=_FixtureVerifier(pool),
+        )
+        planned = await cutover.plan(
+            vaults=[manual],
+            coverage_version="fixture-deleted-external-sidecar-v1",
+        )
+        assert [item.namespace_id for item in planned.vaults] == [manual.namespace_id]
+        assert planned.exclusions == ()
+        await cutover.apply(planned.cutover_id)
+        await cutover.verify(planned.cutover_id)
+
+        with pytest.raises(
+            CutoverVerificationError,
+            match="persisted external Git vaults remain",
+        ):
+            await cutover.commit(
+                planned.cutover_id,
+                identity=_identity("deleted-external-sidecar"),
+            )
+
+        async with pool.acquire() as conn:
+            assert await conn.fetchval("SELECT count(*) FROM native_revision_existing_authority") == 0
+            assert await conn.fetchval(
+                "SELECT state FROM native_revision_legacy_write_fence WHERE fence_key = TRUE"
+            ) == "open"
+
+
 async def test_commit_rejects_an_omitted_eligible_file_and_leaves_writes_open(tmp_path):
     async with _fresh_schema() as pool:
         git = GitService(storage_path=str(tmp_path / "git-omitted-file"))
@@ -780,6 +835,137 @@ async def test_authority_mint_is_the_boundary_and_fences_external_git_race(tmp_p
             )
 
 
+async def test_authorized_vault_delete_purges_only_its_post_cutover_legacy_rows(
+    monkeypatch,
+    tmp_path,
+):
+    """The authorized whole-vault lifecycle delete is narrower than direct SQL."""
+    async with _fresh_schema() as pool:
+        from app.config import settings
+        from app.db import postgres as postgres_module
+        from app.services import access_service, index_service
+
+        git_root = tmp_path / "git-authorized-vault-delete"
+        git = GitService(storage_path=str(git_root))
+        vault = await _manual_vault(pool, git, label="authorized-vault-delete")
+        retained_file_data = b"authorized vault delete file\x00"
+        retained_file_id, retained_file_key = await _confirmed_file(
+            pool,
+            namespace_id=vault.namespace_id,
+            label="retained.bin",
+            data=retained_file_data,
+            mime_type="application/octet-stream",
+        )
+        owner_id = uuid.uuid4()
+        async with pool.acquire() as conn:
+            vault_name = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault.namespace_id)
+            document_id = await conn.fetchval(
+                "SELECT id FROM documents WHERE vault_id = $1",
+                vault.namespace_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO resource_aliases (vault_id, resource_type, old_ref, resource_id)
+                VALUES ($1, 'document', 'legacy-document.md', $2)
+                """,
+                vault.namespace_id,
+                document_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO users (id, username, email, password_hash, is_admin)
+                VALUES ($1, $2, $3, 'fixture', TRUE)
+                """,
+                owner_id,
+                f"cutover-delete-owner-{owner_id.hex}",
+                f"cutover-delete-owner-{owner_id.hex}@example.invalid",
+            )
+
+        cutover = NativeRevisionCutover(
+            pool,
+            backfill=NativeRevisionBackfill(pool, git=git),
+            verifier=_FixtureVerifier(pool),
+            file_reader=lambda key: {
+                retained_file_key: retained_file_data,
+            }[key],
+        )
+        planned = await cutover.plan(
+            vaults=[vault],
+            coverage_version="fixture-authorized-vault-delete-v1",
+        )
+        await cutover.apply(planned.cutover_id)
+        await cutover.verify(planned.cutover_id)
+        identity = _identity("authorized-vault-delete")
+        await cutover.commit(
+            planned.cutover_id,
+            identity=identity,
+        )
+
+        async with pool.acquire() as conn:
+            with pytest.raises(
+                asyncpg.ObjectNotInPrerequisiteStateError,
+                match="Legacy revision writes are fenced",
+            ):
+                await conn.execute("DELETE FROM documents WHERE vault_id = $1", vault.namespace_id)
+            with pytest.raises(
+                asyncpg.ObjectNotInPrerequisiteStateError,
+                match="Legacy revision writes are fenced",
+            ):
+                await conn.execute("DELETE FROM resource_aliases WHERE vault_id = $1", vault.namespace_id)
+
+        class _RoleSync:
+            async def on_vault_delete(self, vault_id: uuid.UUID) -> None:
+                assert vault_id == vault.namespace_id
+
+        async def _no_policy(*_args, **_kwargs):
+            return None
+
+        async def _no_chunk_cleanup(*_args, **_kwargs) -> None:
+            return None
+
+        async def _no_source_chunk_cleanup(*_args, **_kwargs) -> None:
+            return None
+
+        monkeypatch.setattr(postgres_module, "_pool", pool)
+        monkeypatch.setattr(access_service, "get_role_sync", _RoleSync)
+        monkeypatch.setattr(access_service.write_policy_repo, "get_policy", _no_policy)
+        monkeypatch.setattr(index_service, "delete_vault_chunks", _no_chunk_cleanup)
+        monkeypatch.setattr(index_service, "_drop_source_chunks_with_outbox", _no_source_chunk_cleanup)
+        monkeypatch.setattr(settings, "git_storage_path", str(git_root))
+        monkeypatch.setattr(settings, "s3_endpoint_url", None)
+
+        assert await access_service.delete_vault(str(owner_id), vault_name) == {
+            "deleted": True,
+            "vault": vault_name,
+        }
+
+        async with pool.acquire() as conn:
+            assert await conn.fetchval("SELECT COUNT(*) FROM vaults WHERE id = $1", vault.namespace_id) == 0
+            assert await conn.fetchval("SELECT COUNT(*) FROM documents WHERE vault_id = $1", vault.namespace_id) == 0
+            assert await conn.fetchval("SELECT COUNT(*) FROM resource_aliases WHERE vault_id = $1", vault.namespace_id) == 0
+            assert await conn.fetchval("SELECT COUNT(*) FROM vault_files WHERE id = $1", retained_file_id) == 0
+            assert await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM native_revision_cutover_vaults
+                 WHERE cutover_id = $1 AND namespace_id = $2
+                """,
+                planned.cutover_id,
+                vault.namespace_id,
+            ) == 1
+            assert await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM native_revision_cutover_files
+                 WHERE cutover_id = $1 AND file_id = $2
+                """,
+                planned.cutover_id,
+                retained_file_id,
+            ) == 1
+            assert await consume_or_validate_existing_database_authority(
+                conn,
+                identity=identity,
+            ) == "cutover_validated"
+
+
 async def test_committed_cutover_preserves_vault_activity_for_deleted_and_recreated_documents(tmp_path):
     async with _fresh_schema() as pool:
         git = GitService(storage_path=str(tmp_path / "git-frozen-vault-activity"))
@@ -897,6 +1083,23 @@ async def test_committed_cutover_preserves_vault_activity_for_deleted_and_recrea
                 == expected_by_path[path]
             )
 
+        class _UnreadableFixedRefGit(GitService):
+            def manual_fixed_ref_vault_log(self, *_args, **_kwargs):
+                raise FixedRefHistoryError("fixture cannot read committed fixed graph")
+
+        with pytest.raises(FixedRefHistoryError, match="cannot read committed fixed graph"):
+            await NativeRevisionBackend(
+                pool=pool,
+                legacy_git=_UnreadableFixedRefGit(
+                    storage_path=str(tmp_path / "git-unreadable-frozen-activity")
+                ),
+            ).vault_activity(
+                vault_name,
+                max_count=20,
+                since=None,
+                path=None,
+            )
+
 
 async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop(
     monkeypatch,
@@ -907,6 +1110,7 @@ async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop
         cutover_files = {
             "088_native_revision_existing_cutover.py",
             "089_native_file_projection_outbox.py",
+            "090_native_revision_vault_purge_fence.py",
         }
         assert cutover_files <= registered
 
@@ -928,6 +1132,7 @@ async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop
             assert loaded == [
                 "088_native_revision_existing_cutover.py",
                 "089_native_file_projection_outbox.py",
+                "090_native_revision_vault_purge_fence.py",
             ]
             assert await conn.fetchval("SELECT state FROM native_revision_legacy_write_fence") == "open"
             assert await conn.fetchval("SELECT to_regclass('public.native_file_projection_outbox') IS NOT NULL") is True
@@ -941,7 +1146,7 @@ async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop
                     "SELECT count(*) FROM schema_migrations WHERE filename = ANY($1::text[])",
                     list(cutover_files),
                 )
-                == 2
+                == 3
             )
 
 

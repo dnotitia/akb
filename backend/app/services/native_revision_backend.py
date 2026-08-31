@@ -230,17 +230,14 @@ class NativeRevisionBackend:
                         existing["files"].append(changed)
                         known_files.add(signature)
         if fixed_ref is not None:
-            try:
-                events = await asyncio.to_thread(
-                    self._legacy_git.manual_fixed_ref_vault_log,
-                    vault,
-                    fixed_ref,
-                    max_count=max_count,
-                    since=None if since is None else since.isoformat(),
-                    path=path,
-                )
-            except FixedRefHistoryError:
-                return [], mapped_native_ids
+            events = await asyncio.to_thread(
+                self._legacy_git.manual_fixed_ref_vault_log,
+                vault,
+                fixed_ref,
+                max_count=max_count,
+                since=None if since is None else since.isoformat(),
+                path=path,
+            )
             return events, mapped_native_ids
         return list(bridged_by_hash.values()), mapped_native_ids
 
