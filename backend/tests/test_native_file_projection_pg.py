@@ -141,9 +141,15 @@ async def test_file_text_binary_text_delete_projection_is_durable_and_idempotent
             lambda key: iter((payloads[key],)),
         )
         async with pool.acquire() as conn:
+            vault_name = f"native-file-projection-{uuid.uuid4().hex}"
             vault_id = await conn.fetchval(
-                "INSERT INTO vaults (name, status) VALUES ($1, 'active') RETURNING id",
-                f"native-file-projection-{uuid.uuid4().hex}",
+                """
+                INSERT INTO vaults (name, git_path, status)
+                VALUES ($1, $2, 'active')
+                RETURNING id
+                """,
+                vault_name,
+                f"/tmp/{vault_name}.git",
             )
         file_id = uuid.uuid4()
         worker = projection.NativeFileProjectionWorker(pool)
