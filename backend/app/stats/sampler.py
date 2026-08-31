@@ -41,9 +41,14 @@ from app.services._backfill import BackfillRunner
 logger = logging.getLogger("akb.stats_sampler")
 
 # Bumped only for a breaking change to the payload shape. An additive optional
-# field does not bump it and may ship producer-first; anything else has to
-# reach consumers before it ships here, because an unrecognised version makes
-# them reject the whole snapshot rather than read the fields they know.
+# field does not bump it, but it is not free either: `schema_v1.json` closes
+# every object (`additionalProperties: false`), so the field lands in the
+# schema in the same change and a consumer that validates against its vendored
+# copy rejects the payload until it re-syncs (the platform's decoder ignores
+# unknown fields and its sync check flags the drift, so there it is a re-copy,
+# not an outage). Anything else has to reach consumers before it ships here,
+# because an unrecognised version makes them reject the whole snapshot rather
+# than read the fields they know.
 SCHEMA_VERSION = 1
 
 
@@ -174,6 +179,12 @@ async def _activity_counts(conn, window_start: datetime, window_end: datetime):
     and every count would come back 0 — a number that looks like "a quiet day"
     and would be frozen as one forever, since the fold is permanent. All three
     are reported unknown instead.
+
+    Known limit: tracking switched ON part-way through a day (a config change
+    plus a restart) leaves that day's rows starting mid-day, and nothing here
+    can tell a late start from a quiet morning; the window folds as the floor
+    it can see. Documented rather than guarded — it needs an operator action
+    on that exact day, and a guard would need a record of when tracking began.
     """
     if not settings.tool_usage.enabled:
         return None, None, None
