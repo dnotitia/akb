@@ -260,25 +260,24 @@ async def _distilled_doc_count(conn) -> int | None:
     The cross-repo design leaves "what counts as distilled" open and assigns
     the question to this repository, which has no marker to answer it with:
     nothing in the schema, the document metadata, or the write path records
-    that a document was produced by distillation. The only adjacent signal is
-    `vault_write_policy.managed_by`, a free-text owner label whose values
-    ("gardener:distill", "collector:acme-jira") are set by whoever provisions
-    the policy — a naming convention, not a fact the database enforces.
+    that a document was produced by distillation.
 
     So this reports unknown. It is a nullable field precisely so that an
     undecided definition can be represented honestly; returning `COUNT(*)` of a
     guessed predicate would publish a number nobody can defend, and the
     dashboard would render it as measured.
 
-    **This is a stub awaiting a per-document marker.** Counting the documents
-    of vaults whose `managed_by` label starts with `gardener:` was considered
-    and rejected: it counts everything in such a vault, including what a person
-    wrote there by hand, and re-pointing a vault at a different owner would
-    silently reclassify its whole history. The accepted direction is an
-    explicit marker written by the distillation path itself, which is a fact
-    about the document and cannot move under it. That spans this repository and
-    the gardener, so it is deliberately not in this change; when it lands, this
-    function is the only thing here that changes.
+    **This is a stub awaiting a per-document marker.** The one adjacent signal,
+    `vault_write_policy.managed_by`, was considered and rejected: counting the
+    documents of vaults whose label starts with `gardener:` sweeps in whatever
+    a person wrote there by hand, and because the label is free text set at
+    provisioning ("gardener:distill", "collector:acme-jira") rather than a fact
+    the database enforces, re-pointing a vault reclassifies its whole history.
+    The accepted direction is an explicit marker written by the distillation
+    path itself, which is a fact about the document and cannot move under it.
+    That spans this repository and the gardener, so it is deliberately not in
+    this change; when it lands, this function is the only thing here that
+    changes.
     """
     return None
 
