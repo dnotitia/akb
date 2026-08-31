@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -204,6 +204,22 @@ afterEach(() => {
 });
 
 describe("DocumentPage view toggle", () => {
+  it("keeps the human title primary and moves file identifiers into technical details", async () => {
+    const user = userEvent.setup();
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    const heading = await screen.findByRole("heading", { level: 1, name: "DocTitle" });
+    const header = heading.closest("header");
+    expect(header).not.toBeNull();
+    expect(within(header as HTMLElement).queryByText("hello.md")).not.toBeInTheDocument();
+    expect(screen.getAllByText("notes").length).toBeGreaterThan(0);
+
+    await user.click(screen.getByRole("button", { name: "Open document panel" }));
+    await user.click(screen.getByText("Technical details"));
+    expect(screen.getByText("hello.md")).toBeInTheDocument();
+    expect(screen.getByText("notes/hello.md")).toBeInTheDocument();
+  });
+
   it("records a successful document read for Home resume", async () => {
     getDocumentMock.mockResolvedValue(makeDoc({
       type: "report",
@@ -277,11 +293,15 @@ describe("DocumentPage view toggle", () => {
     const user = userEvent.setup();
     renderAt("/vault/v/doc/notes%2Fhello.md");
 
-    await screen.findByRole("heading", { level: 1, name: "DocTitle" });
+    const heading = await screen.findByRole("heading", { level: 1, name: "DocTitle" });
     expect(screen.getByRole("region", { name: "Document workspace" })).toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Document content" })).toBeInTheDocument();
     expect(screen.getAllByText("abcdef1").length).toBeGreaterThan(0);
-    expect(screen.queryByText("akb://v/coll/notes/doc/hello.md")).not.toBeInTheDocument();
+    expect(
+      within(heading.closest("header") as HTMLElement).queryByText(
+        "akb://v/coll/notes/doc/hello.md",
+      ),
+    ).not.toBeInTheDocument();
 
     const article = screen.getByRole("article");
     expect(article).toHaveClass("w-full", "p-2", "sm:p-3");
@@ -638,14 +658,44 @@ describe("DocumentPage view toggle", () => {
     expect(screen.getByTestId("location-pathname")).toHaveTextContent("/vault/v");
   });
 
-  it("keeps move discoverable for readers and explains why it is unavailable", async () => {
+  it("keeps title rename and move discoverable for readers with clear reasons", async () => {
     const user = userEvent.setup();
     renderAt("/vault/v/doc/notes%2Fhello.md");
 
     await user.click(await screen.findByRole("button", { name: "Actions for DocTitle" }));
-    const move = screen.getByRole("menuitem", { name: /Move or rename/i });
+    const rename = screen.getByRole("menuitem", { name: /Rename title/i });
+    const move = screen.getByRole("menuitem", { name: /Move document/i });
+    expect(rename).toHaveAttribute("aria-disabled", "true");
+    expect(rename).toHaveTextContent("Writer access or higher is required.");
     expect(move).toHaveAttribute("aria-disabled", "true");
     expect(move).toHaveTextContent("Writer access or higher is required.");
+  });
+
+  it("renames the human title without changing the document path", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await user.click(await screen.findByRole("button", { name: "Actions for DocTitle" }));
+    await user.click(screen.getByRole("menuitem", { name: "Rename title" }));
+
+    const title = screen.getByLabelText(/Document title/i);
+    await user.clear(title);
+    await user.type(title, "API contract");
+    await user.click(screen.getByRole("button", { name: "Rename" }));
+
+    await waitFor(() =>
+      expect(updateDocumentMock).toHaveBeenCalledWith(
+        "v",
+        "notes/hello.md",
+        { title: "API contract", title_conflict_policy: "reject" },
+      ),
+    );
+    expect(await screen.findByRole("heading", { level: 1, name: "API contract" })).toBeInTheDocument();
+    expect(screen.getByTestId("location-pathname")).toHaveTextContent(
+      "/vault/v/doc/notes%2Fhello.md",
+    );
+    expect(screen.getByText("Document renamed")).toBeInTheDocument();
   });
 
   it("moves a writer to the backend-returned path and names the destination", async () => {
@@ -657,7 +707,7 @@ describe("DocumentPage view toggle", () => {
     renderAt("/vault/v/doc/notes%2Fhello.md");
 
     await user.click(await screen.findByRole("button", { name: "Actions for DocTitle" }));
-    await user.click(screen.getByRole("menuitem", { name: "Move or rename" }));
+    await user.click(screen.getByRole("menuitem", { name: "Move document" }));
     await user.click(await screen.findByLabelText("Target collection"));
     await user.click(screen.getByRole("menuitemradio", { name: "archive" }));
     await user.click(screen.getByRole("button", { name: "Move document" }));
@@ -666,7 +716,7 @@ describe("DocumentPage view toggle", () => {
       expect(moveDocumentMock).toHaveBeenCalledWith(
         "v",
         "notes/hello.md",
-        { collection: "archive" },
+        { collection: "archive", title_conflict_policy: "reject" },
       ),
     );
     await waitFor(() =>
@@ -677,6 +727,7 @@ describe("DocumentPage view toggle", () => {
     const movedStatus = (await screen.findByText("Moved to archive")).closest(
       '[role="status"]',
     );
-    expect(movedStatus).toHaveTextContent("archive/hello.md");
+    expect(movedStatus).toHaveTextContent("title, links, and version history were preserved");
+    expect(movedStatus).not.toHaveTextContent("archive/hello.md");
   });
 });

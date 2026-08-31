@@ -172,9 +172,12 @@ def exception_envelope(e: Exception) -> dict:
     if isinstance(e, NotFoundError):
         return err(str(e), code=NOT_FOUND)
     if isinstance(e, ConflictError):
-        if e.code == NATIVE_REVISION_SELECTOR_AMBIGUOUS:
-            return err(str(e), code=NATIVE_REVISION_SELECTOR_AMBIGUOUS)
-        return err(str(e), code=CONFLICT)
+        return err(
+            str(e),
+            code=e.code or CONFLICT,
+            hint=e.hint,
+            **(e.details or {}),
+        )
     if isinstance(e, InvalidColumnTypeError):
         return err(
             str(e),

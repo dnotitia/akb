@@ -1,5 +1,5 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import { FilePenLine, MoreHorizontal, Trash2 } from "lucide-react";
+import { FolderInput, MoreHorizontal, Pencil, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -7,7 +7,11 @@ interface ResourceActionsMenuProps {
   resourceName: string;
   deleteLabel?: string;
   onDelete?: () => void;
-  onMoveOrRename?: () => void;
+  renameLabel?: string;
+  onRename?: () => void;
+  renameDisabledReason?: string;
+  moveLabel?: string;
+  onMove?: () => void;
   moveDisabledReason?: string;
   className?: string;
   side?: "top" | "right" | "bottom" | "left";
@@ -24,15 +28,20 @@ export function ResourceActionsMenu({
   resourceName,
   deleteLabel,
   onDelete,
-  onMoveOrRename,
+  renameLabel,
+  onRename,
+  renameDisabledReason,
+  moveLabel,
+  onMove,
   moveDisabledReason,
   className,
   side = "bottom",
   align = "end",
 }: ResourceActionsMenuProps) {
-  const showMoveAction = Boolean(onMoveOrRename || moveDisabledReason);
+  const showRenameAction = Boolean(renameLabel && (onRename || renameDisabledReason));
+  const showMoveAction = Boolean(moveLabel && (onMove || moveDisabledReason));
   const showDeleteAction = Boolean(deleteLabel && onDelete);
-  if (!showMoveAction && !showDeleteAction) return null;
+  if (!showRenameAction && !showMoveAction && !showDeleteAction) return null;
 
   return (
     <DropdownMenu.Root>
@@ -55,24 +64,50 @@ export function ResourceActionsMenu({
           sideOffset={4}
           className="z-[var(--z-popover)] min-w-48 overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
         >
+          {showRenameAction && (
+            <DropdownMenu.Item
+              aria-disabled={renameDisabledReason ? true : undefined}
+              onSelect={(event) => {
+                if (renameDisabledReason || !onRename) {
+                  event.preventDefault();
+                  return;
+                }
+                onRename();
+              }}
+              className={cn(
+                "flex cursor-pointer select-none items-start gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-hover",
+                renameDisabledReason && "cursor-not-allowed opacity-50",
+              )}
+            >
+              <Pencil className="mt-0.5 h-4 w-4 shrink-0 text-link" aria-hidden />
+              <span className="min-w-0">
+                <span className="block font-medium">{renameLabel}</span>
+                {renameDisabledReason && (
+                  <span className="mt-0.5 block max-w-64 text-xs leading-snug text-foreground-muted">
+                    {renameDisabledReason}
+                  </span>
+                )}
+              </span>
+            </DropdownMenu.Item>
+          )}
           {showMoveAction && (
             <DropdownMenu.Item
               aria-disabled={moveDisabledReason ? true : undefined}
               onSelect={(event) => {
-                if (moveDisabledReason || !onMoveOrRename) {
+                if (moveDisabledReason || !onMove) {
                   event.preventDefault();
                   return;
                 }
-                onMoveOrRename();
+                onMove();
               }}
               className={cn(
                 "flex cursor-pointer select-none items-start gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-hover",
                 moveDisabledReason && "cursor-not-allowed opacity-50",
               )}
             >
-              <FilePenLine className="mt-0.5 h-4 w-4 shrink-0 text-link" aria-hidden />
+              <FolderInput className="mt-0.5 h-4 w-4 shrink-0 text-link" aria-hidden />
               <span className="min-w-0">
-                <span className="block font-medium">Move or rename</span>
+                <span className="block font-medium">{moveLabel}</span>
                 {moveDisabledReason && (
                   <span className="mt-0.5 block max-w-64 text-xs leading-snug text-foreground-muted">
                     {moveDisabledReason}
@@ -81,7 +116,7 @@ export function ResourceActionsMenu({
               </span>
             </DropdownMenu.Item>
           )}
-          {showMoveAction && showDeleteAction && (
+          {(showRenameAction || showMoveAction) && showDeleteAction && (
             <DropdownMenu.Separator className="my-1 h-px bg-border" />
           )}
           {showDeleteAction && (

@@ -129,6 +129,26 @@ describe("VaultExplorer — rendering", () => {
     expect(screen.getByRole("treeitem", { name: "Files, 1 item" })).toBeInTheDocument();
   });
 
+  it("shows a compact file identifier only for duplicate sibling document titles", async () => {
+    browseMock.mockResolvedValueOnce({
+      vault: "v",
+      path: "",
+      items: [
+        { type: "collection", name: "runbooks", path: "runbooks" },
+        { type: "document", name: "Incident response", path: "runbooks/incident-response.md" },
+        { type: "document", name: "Incident response", path: "runbooks/incident-response-2f3df21c.md" },
+      ],
+    });
+    const user = userEvent.setup();
+    renderAt("/vault/v");
+
+    await user.click(await screen.findByRole("button", { name: /^runbooks/i }));
+
+    expect(screen.getAllByRole("treeitem", { name: /Incident response/ })).toHaveLength(2);
+    expect(screen.getByText("incident-response")).toBeInTheDocument();
+    expect(screen.getByText("incident-response · 2f3d")).toBeInTheDocument();
+  });
+
   it("opens a stable details view for the collection summary", async () => {
     const user = userEvent.setup();
     renderAt("/vault/v");

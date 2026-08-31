@@ -114,6 +114,7 @@ async def move_document(
         collection=req.collection,
         slug=req.slug,
         message=req.message,
+        title_conflict_policy=req.title_conflict_policy,
         agent_id=user.username,
     )
 

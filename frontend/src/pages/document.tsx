@@ -13,6 +13,7 @@ import {
   ArrowLeft,
   Box,
   CheckCircle2,
+  ChevronRight,
   Clock3,
   ExternalLink,
   FileText,
@@ -69,6 +70,7 @@ import { recordRecentDocumentView } from "@/lib/recent-document-views";
 import { ResourceActionsMenu } from "@/components/resource-actions-menu";
 import { ResourceDeleteDialog } from "@/components/resource-delete-dialog";
 import { DocumentMoveDialog } from "@/components/document-move-dialog";
+import { DocumentRenameDialog } from "@/components/document-rename-dialog";
 
 // Plate is heavy (~hundreds of KB gzipped); lazy-load so the read-only path
 // (Rendered / Raw) stays cheap.
@@ -109,6 +111,7 @@ export default function DocumentPage({
   const [vaultKind, setVaultKind] = useState<"normal" | "mirror" | "error" | null>(null);
   const [vaultReadOnly, setVaultReadOnly] = useState(true);
   const [editOpen, setEditOpen] = useState(false);
+  const [renameOpen, setRenameOpen] = useState(false);
   const [moveOpen, setMoveOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
@@ -130,7 +133,8 @@ export default function DocumentPage({
   const [claimedAssetIds, setClaimedAssetIds] = useState<readonly string[] | null>(null);
   const [bodyError, setBodyError] = useState("");
   const [savedAt, setSavedAt] = useState<number | null>(null);
-  const [moveNotice, setMoveNotice] = useState<{ collection: string; path: string } | null>(null);
+  const [moveNotice, setMoveNotice] = useState<{ collection: string } | null>(null);
+  const [renameNotice, setRenameNotice] = useState(false);
   // Plate's markdown roundtrip is not byte-identity: adopt the first
   // post-hydration emission as the new `originalContent` baseline so the
   // editor doesn't flash "UNSAVED" the moment it mounts.
@@ -143,6 +147,12 @@ export default function DocumentPage({
     const timer = window.setTimeout(() => setMoveNotice(null), 4_500);
     return () => window.clearTimeout(timer);
   }, [moveNotice]);
+
+  useEffect(() => {
+    if (!renameNotice) return;
+    const timer = window.setTimeout(() => setRenameNotice(false), 4_500);
+    return () => window.clearTimeout(timer);
+  }, [renameNotice]);
 
   const docId = id ? decodeURIComponent(id) : "";
   const visibleRelationCount = useMemo(
@@ -549,7 +559,7 @@ export default function DocumentPage({
   const fileName = doc.path?.split("/").pop() || doc.title || "Document";
   const collectionPath = doc.path?.includes("/")
     ? doc.path.slice(0, doc.path.lastIndexOf("/"))
-    : "Root";
+    : "Vault root";
   const isUuid = (value: string) =>
     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
   const authorName =
@@ -559,6 +569,12 @@ export default function DocumentPage({
     vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner";
   const moveDisabledReason = documentMoveDisabledReason({
     path: doc.path,
+    vaultRole,
+    vaultKind,
+    vaultReadOnly,
+    isHistorical,
+  });
+  const renameDisabledReason = documentTitleRenameDisabledReason({
     vaultRole,
     vaultKind,
     vaultReadOnly,
@@ -608,8 +624,6 @@ export default function DocumentPage({
                 )}
               </div>
               <p className="truncate text-xs text-foreground-muted">
-                <span className="font-mono">{fileName}</span>
-                <span aria-hidden> · </span>
                 {presentation === "preview" ? (
                   <Link
                     to={`/vault/${name}`}
@@ -620,8 +634,13 @@ export default function DocumentPage({
                     {name}
                   </Link>
                 ) : (
-                  <span className="font-medium text-foreground">{name}</span>
+                  <span className="inline-flex items-center gap-1 font-medium text-foreground">
+                    <Box className="h-3 w-3" aria-hidden />
+                    {name}
+                  </span>
                 )}
+                <span aria-hidden> · </span>
+                <span>{collectionPath}</span>
               </p>
             </div>
           </div>
@@ -680,7 +699,11 @@ export default function DocumentPage({
                 )}
                 <ResourceActionsMenu
                   resourceName={doc.title || fileName}
-                  onMoveOrRename={moveDisabledReason ? undefined : () => setMoveOpen(true)}
+                  renameLabel="Rename title"
+                  onRename={renameDisabledReason ? undefined : () => setRenameOpen(true)}
+                  renameDisabledReason={renameDisabledReason || undefined}
+                  moveLabel="Move document"
+                  onMove={moveDisabledReason ? undefined : () => setMoveOpen(true)}
                   moveDisabledReason={moveDisabledReason || undefined}
                   deleteLabel={canDelete ? "Delete document" : undefined}
                   onDelete={canDelete ? () => setDeleteOpen(true) : undefined}
@@ -741,11 +764,7 @@ export default function DocumentPage({
               <div className="mb-3 flex min-h-11 min-w-0 items-center gap-3 rounded-[var(--radius-lg)] border border-border bg-surface px-3 shadow-xs">
                 <div className="flex min-w-0 items-center gap-2 text-xs text-foreground-muted">
                   <FolderTree className="h-3.5 w-3.5 shrink-0 text-link" aria-hidden />
-                  <span className="truncate">
-                    <span className="font-medium text-foreground">{collectionPath}</span>
-                    <span aria-hidden> / </span>
-                    <span className="font-mono">{fileName}</span>
-                  </span>
+                  <span className="truncate font-medium text-foreground">{collectionPath}</span>
                   {authorName && (
                     <span className="hidden shrink-0 items-center gap-1.5 border-l border-border pl-3 xl:inline-flex">
                       <span
@@ -966,7 +985,7 @@ export default function DocumentPage({
                     </PropertyRow>
                   )}
                   <PropertyRow label="Collection">
-                    <TooltipText as="span" tip={collectionPath} className="block truncate font-mono text-foreground">
+                    <TooltipText as="span" tip={collectionPath} className="block truncate text-foreground">
                       {collectionPath}
                     </TooltipText>
                   </PropertyRow>
@@ -996,6 +1015,37 @@ export default function DocumentPage({
                     <code className="font-mono text-foreground">{commitShort || "—"}</code>
                   </PropertyRow>
                 </dl>
+
+                <details className="group mt-4 border-t border-border pt-3">
+                  <summary className="flex min-h-8 cursor-pointer list-none items-center gap-2 rounded-[var(--radius-md)] px-1 text-xs font-medium text-foreground transition-token hover:bg-surface-hover hover:text-link focus:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                    <ChevronRight
+                      className="h-3.5 w-3.5 shrink-0 text-foreground-muted transition-transform group-open:rotate-90"
+                      aria-hidden
+                    />
+                    Technical details
+                  </summary>
+                  <dl className="mt-2 space-y-2.5 rounded-[var(--radius-md)] bg-surface-2 px-3 py-2.5 text-xs">
+                    <PropertyRow label="File name">
+                      <TooltipText as="span" tip={fileName} className="block truncate font-mono text-foreground">
+                        {fileName}
+                      </TooltipText>
+                    </PropertyRow>
+                    <PropertyRow label="Path">
+                      <TooltipText as="span" tip={doc.path} className="block truncate font-mono text-foreground">
+                        {doc.path}
+                      </TooltipText>
+                    </PropertyRow>
+                    <PropertyRow label="URI">
+                      <TooltipText
+                        as="span"
+                        tip={docUri(name!, doc.path)}
+                        className="block truncate font-mono text-foreground"
+                      >
+                        {docUri(name!, doc.path)}
+                      </TooltipText>
+                    </PropertyRow>
+                  </dl>
+                </details>
 
                 {!isHistorical && (
                   <div className="mt-4 grid grid-cols-2 gap-2">
@@ -1067,6 +1117,33 @@ export default function DocumentPage({
         </div>
       </section>
 
+      <DocumentRenameDialog
+        open={renameOpen}
+        onOpenChange={setRenameOpen}
+        vault={name!}
+        docId={docId}
+        path={doc.path}
+        title={doc.title || fileName}
+        onOpenDocument={(existingPath) => {
+          const nextSearch = new URLSearchParams(searchParams);
+          nextSearch.delete("commit");
+          nextSearch.delete("view");
+          const search = nextSearch.toString();
+          navigate(
+            {
+              pathname: `/vault/${name}/doc/${encodeURIComponent(existingPath)}`,
+              search: search ? `?${search}` : "",
+            },
+            { state: routeLocation.state },
+          );
+        }}
+        onRenamed={(nextTitle) => {
+          setDocOverride({ ...doc, title: nextTitle });
+          setRenameNotice(true);
+          refetchTree();
+        }}
+      />
+
       <FrontmatterEditDialog
         open={editOpen}
         onOpenChange={setEditOpen}
@@ -1085,6 +1162,19 @@ export default function DocumentPage({
         vault={name!}
         path={doc.path}
         title={doc.title || fileName}
+        onOpenDocument={(existingPath) => {
+          const nextSearch = new URLSearchParams(searchParams);
+          nextSearch.delete("commit");
+          nextSearch.delete("view");
+          const search = nextSearch.toString();
+          navigate(
+            {
+              pathname: `/vault/${name}/doc/${encodeURIComponent(existingPath)}`,
+              search: search ? `?${search}` : "",
+            },
+            { state: routeLocation.state },
+          );
+        }}
         onMoved={(result) => {
           const changedAt = new Date().toISOString();
           const nextDoc = {
@@ -1110,7 +1200,7 @@ export default function DocumentPage({
           const nextCollection = result.path.includes("/")
             ? result.path.slice(0, result.path.lastIndexOf("/"))
             : "Vault root";
-          setMoveNotice({ collection: nextCollection, path: result.path });
+          setMoveNotice({ collection: nextCollection });
 
           const nextSearch = new URLSearchParams(searchParams);
           nextSearch.delete("commit");
@@ -1181,9 +1271,25 @@ export default function DocumentPage({
           <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-success" aria-hidden />
           <div className="min-w-0">
             <p className="font-semibold">Moved to {moveNotice.collection}</p>
-            <code className="mt-0.5 block truncate font-mono text-xs text-foreground-muted" title={moveNotice.path}>
-              {moveNotice.path}
-            </code>
+            <p className="mt-0.5 text-xs text-foreground-muted">
+              The document title, links, and version history were preserved.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {renameNotice && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed bottom-4 right-4 z-[var(--z-toast)] flex max-w-sm items-start gap-3 rounded-[var(--radius-lg)] border border-success/30 bg-surface px-4 py-3 text-sm text-foreground shadow-lg"
+        >
+          <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-success" aria-hidden />
+          <div className="min-w-0">
+            <p className="font-semibold">Document renamed</p>
+            <p className="mt-0.5 text-xs text-foreground-muted">
+              Its stable file identity, links, and version history were preserved.
+            </p>
           </div>
         </div>
       )}
@@ -1199,18 +1305,14 @@ interface DocumentMovePermissionState {
   isHistorical: boolean;
 }
 
-function documentMoveDisabledReason({
-  path,
+function documentTitleRenameDisabledReason({
   vaultRole,
   vaultKind,
   vaultReadOnly,
   isHistorical,
-}: DocumentMovePermissionState) {
-  if (path === VAULT_SKILL_PATH) {
-    return "The Vault guide has a reserved location and cannot be moved.";
-  }
+}: Omit<DocumentMovePermissionState, "path">) {
   if (isHistorical) {
-    return "Return to the latest version before moving this document.";
+    return "Return to the latest version before renaming this document.";
   }
   if (vaultKind === "error") {
     return "Permissions could not be verified. Refresh the page and try again.";
@@ -1225,6 +1327,25 @@ function documentMoveDisabledReason({
     return "Writer access or higher is required.";
   }
   return null;
+}
+
+function documentMoveDisabledReason({
+  path,
+  vaultRole,
+  vaultKind,
+  vaultReadOnly,
+  isHistorical,
+}: DocumentMovePermissionState) {
+  if (path === VAULT_SKILL_PATH) {
+    return "The Vault guide has a reserved location and cannot be moved.";
+  }
+  const reason = documentTitleRenameDisabledReason({
+    vaultRole,
+    vaultKind,
+    vaultReadOnly,
+    isHistorical,
+  });
+  return reason?.replace("renaming", "moving") ?? null;
 }
 
 function DocumentPageLoading({ presentation }: { presentation: "page" | "preview" }) {

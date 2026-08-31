@@ -5,17 +5,28 @@ import { MemoryRouter } from "react-router-dom";
 import { DocumentCreateDialog } from "@/components/document-create-dialog";
 
 const putDocument = vi.fn();
+const getDocument = vi.fn();
 const discardAsset = vi.fn();
 const ASSET_ID = "123e4567-e89b-42d3-a456-426614174000";
+const vaultTreeState = vi.hoisted(() => ({ tree: [] as unknown[] }));
 
 vi.mock("@/lib/api", () => ({
-  ApiError: class ApiError extends Error {},
+  ApiError: class ApiError extends Error {
+    status: number;
+    detail: unknown;
+    constructor(message: string, status: number, detail: unknown) {
+      super(message);
+      this.status = status;
+      this.detail = detail;
+    }
+  },
   putDocument: (...args: unknown[]) => putDocument(...args),
+  getDocument: (...args: unknown[]) => getDocument(...args),
   discardAsset: (...args: unknown[]) => discardAsset(...args),
 }));
 
 vi.mock("@/hooks/use-vault-tree", () => ({
-  useVaultTree: () => ({ tree: [] }),
+  useVaultTree: () => ({ tree: vaultTreeState.tree }),
 }));
 
 vi.mock("@/contexts/vault-refresh-context", () => ({
@@ -73,6 +84,7 @@ function renderPage(initialCollection = "overview") {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  vaultTreeState.tree = [];
   window.localStorage.clear();
 });
 
@@ -176,10 +188,52 @@ describe("DocumentCreateDialog reserved collection feedback", () => {
           title: "A note",
           content: "Knowledge worth keeping",
           type: "note",
+          title_conflict_policy: "reject",
         }),
       );
       expect(onCreated).toHaveBeenCalledWith("notes/a-note.md");
     });
+  });
+
+  it("blocks an exact same-Collection title until duplicate creation is explicit", async () => {
+    vaultTreeState.tree = [
+      {
+        kind: "collection",
+        name: "notes",
+        path: "notes",
+        children: [
+          {
+            kind: "document",
+            name: "A note",
+            path: "notes/a-note.md",
+          },
+        ],
+      },
+    ];
+    getDocument.mockResolvedValueOnce({ content: "Same body" });
+    putDocument.mockResolvedValueOnce({ path: "notes/a-note-abcd1234.md" });
+    const user = userEvent.setup();
+    const { onCreated } = renderPage("notes");
+
+    await user.type(screen.getByLabelText(/^title/i), "A note");
+    await user.type(screen.getByLabelText(/document body/i), "Same body");
+
+    expect(screen.getByRole("alert")).toHaveTextContent("already exists here");
+    expect(putDocument).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: /create document/i }));
+    expect(await screen.findByText("This document already exists")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Create duplicate" }));
+
+    await waitFor(() =>
+      expect(putDocument).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "A note",
+          collection: "notes",
+          title_conflict_policy: "allow",
+        }),
+      ),
+    );
+    expect(onCreated).toHaveBeenCalledWith("notes/a-note-abcd1234.md");
   });
 
   it("restores an autosaved local draft and clears it on explicit discard", async () => {

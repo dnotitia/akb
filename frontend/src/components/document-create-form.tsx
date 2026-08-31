@@ -17,7 +17,7 @@ import {
   Tags,
   X,
 } from "lucide-react";
-import { ApiError, putDocument } from "@/lib/api";
+import { ApiError, getDocument, putDocument } from "@/lib/api";
 import { DOC_TYPES, type DocType } from "@/lib/doc-constants";
 import {
   clearDocumentDraft,
@@ -28,6 +28,7 @@ import { isReservedCollection } from "@/lib/skill";
 import { useVaultTree, type TreeNode } from "@/hooks/use-vault-tree";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import { MarkdownEditorFallback } from "@/components/markdown-editor-fallback";
+import { DocumentTitleConflictNotice } from "@/components/document-title-conflict-notice";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -38,6 +39,12 @@ import { SelectMenu } from "@/components/ui/select-menu";
 import { TagInput } from "@/components/ui/tag-input";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
+import {
+  documentTitleConflictFromError,
+  findDocumentTitleConflict,
+  type DocumentTitleCandidate,
+  type DocumentTitleConflict,
+} from "@/lib/document-title-conflict";
 
 const MarkdownEditor = lazy(() => import("@/components/markdown-editor"));
 
@@ -60,6 +67,17 @@ function collectCollectionPaths(nodes: TreeNode[], out: string[] = []): string[]
     if (node.kind !== "collection") continue;
     out.push(node.path);
     if (node.children) collectCollectionPaths(node.children, out);
+  }
+  return out;
+}
+
+function collectDocuments(
+  nodes: TreeNode[],
+  out: DocumentTitleCandidate[] = [],
+): DocumentTitleCandidate[] {
+  for (const node of nodes) {
+    if (node.kind === "document") out.push({ name: node.name, path: node.path });
+    if (node.children) collectDocuments(node.children, out);
   }
   return out;
 }
@@ -106,6 +124,7 @@ export function DocumentCreateForm({
   );
   const [claimedAssetIds, setClaimedAssetIds] = useState<readonly string[] | null>(null);
   const [error, setError] = useState("");
+  const [serverConflict, setServerConflict] = useState<DocumentTitleConflict | null>(null);
   const [invalidField, setInvalidField] = useState<InvalidField>(null);
   const [creating, setCreating] = useState(false);
   const [uploadingImage, setUploadingImage] = useState(false);
@@ -120,6 +139,7 @@ export function DocumentCreateForm({
   );
   const titleRef = useRef<HTMLInputElement>(null);
   const collectionRef = useRef<HTMLInputElement>(null);
+  const conflictRef = useRef<HTMLDivElement>(null);
 
   const collectionTrimmed = collection.trim();
   const isExistingCollection = collectionOptions.includes(collectionTrimmed);
@@ -134,6 +154,12 @@ export function DocumentCreateForm({
         path.toLowerCase().includes(collectionTrimmed.toLowerCase()),
     )
     .slice(0, 6);
+  const documents = useMemo(() => collectDocuments(tree ?? []), [tree]);
+  const localConflict = useMemo(
+    () => findDocumentTitleConflict(documents, title, collectionTrimmed),
+    [collectionTrimmed, documents, title],
+  );
+  const titleConflict = serverConflict ?? localConflict;
 
   const isDirty =
     title.trim() !== "" ||
@@ -210,8 +236,7 @@ export function DocumentCreateForm({
     }, 0);
   }
 
-  async function handleSubmit(event: React.FormEvent) {
-    event.preventDefault();
+  function validateDraft() {
     if (creating || uploadingImage) return;
 
     setError("");
@@ -219,23 +244,47 @@ export function DocumentCreateForm({
     const nextTitle = title.trim();
     const nextCollection = collection.trim();
 
-    if (!nextTitle) return fail("title", "Title is required.");
-    if (nextTitle.length > 256) return fail("title", "Title is too long (256 chars max).");
-    if (!nextCollection) return fail("collection", "Collection is required.");
+    if (!nextTitle) {
+      fail("title", "Title is required.");
+      return;
+    }
+    if (nextTitle.length > 256) {
+      fail("title", "Title is too long (256 chars max).");
+      return;
+    }
+    if (!nextCollection) {
+      fail("collection", "Collection is required.");
+      return;
+    }
     if (!/^[a-z0-9_-]+(?:\/[a-z0-9_-]+)*$/.test(nextCollection)) {
-      return fail(
+      fail(
         "collection",
         "Collection must use lowercase letters, digits, hyphens, underscores, and / only.",
       );
+      return;
     }
     if (isReservedCollection(nextCollection)) {
-      return fail(
+      fail(
         "collection",
         "'overview' is a system collection reserved for the vault guide. Pick a different collection.",
       );
+      return;
     }
-    if (!hasMeaningfulMarkdown(body)) return fail("body", "Body cannot be empty.");
-    if (body.length > 1_000_000) return fail("body", "Body is too large (1 MB max).");
+    if (!hasMeaningfulMarkdown(body)) {
+      fail("body", "Body cannot be empty.");
+      return;
+    }
+    if (body.length > 1_000_000) {
+      fail("body", "Body is too large (1 MB max).");
+      return;
+    }
+    return { nextTitle, nextCollection };
+  }
+
+  async function performCreate(titleConflictPolicy: "allow" | "reject") {
+    const validated = validateDraft();
+    if (!validated) return;
+    const { nextTitle, nextCollection } = validated;
 
     const assetIdsToClaim = bodyAssetIds;
     let created = false;
@@ -250,6 +299,7 @@ export function DocumentCreateForm({
         tags,
         domain: domain.trim() || undefined,
         summary: summary.trim() || undefined,
+        title_conflict_policy: titleConflictPolicy,
       });
       refetchTree();
       refetchVaults();
@@ -261,6 +311,12 @@ export function DocumentCreateForm({
       clearDocumentDraft(vault);
       onCreated(result?.path);
     } catch (caught: unknown) {
+      const conflict = documentTitleConflictFromError(caught);
+      if (conflict) {
+        setServerConflict(conflict);
+        window.requestAnimationFrame(() => conflictRef.current?.focus());
+        return;
+      }
       setError(
         caught instanceof ApiError
           ? caught.message
@@ -271,6 +327,25 @@ export function DocumentCreateForm({
     } finally {
       if (!created) setCreating(false);
     }
+  }
+
+  async function handleSubmit(event: React.FormEvent) {
+    event.preventDefault();
+    if (titleConflict) {
+      try {
+        const existing = await getDocument(vault, titleConflict.existingPath);
+        setServerConflict({
+          ...titleConflict,
+          exactContent:
+            typeof existing?.content === "string" && existing.content === body,
+        });
+      } catch {
+        setServerConflict(titleConflict);
+      }
+      window.requestAnimationFrame(() => conflictRef.current?.focus());
+      return;
+    }
+    await performCreate("reject");
   }
 
   const canSubmit =
@@ -394,6 +469,26 @@ export function DocumentCreateForm({
         </div>
       )}
 
+      {titleConflict && (
+        <div
+          ref={conflictRef}
+          tabIndex={-1}
+          className="relative z-[var(--z-raised)] shrink-0 border-b border-border bg-surface px-4 py-3 focus:outline-none sm:px-6"
+        >
+          <div className="mx-auto max-w-6xl">
+            <DocumentTitleConflictNotice
+              conflict={titleConflict}
+              onOpenExisting={() => onCreated(titleConflict.existingPath)}
+              onChooseAlternative={() => titleRef.current?.focus()}
+              chooseAlternativeLabel="Choose another title"
+              onKeepBoth={() => performCreate("allow")}
+              keepBothLabel="Create duplicate"
+              keepingBoth={creating}
+            />
+          </div>
+        </div>
+      )}
+
       <div className="relative min-h-0 flex-1 overflow-hidden">
         <main
           className={cn(
@@ -419,6 +514,7 @@ export function DocumentCreateForm({
                 value={title}
                 onChange={(event) => {
                   setTitle(event.target.value);
+                  setServerConflict(null);
                   if (invalidField === "title") setInvalidField(null);
                 }}
                 placeholder="Document title"
@@ -460,6 +556,7 @@ export function DocumentCreateForm({
                     onChange={(markdown, assetIds) => {
                       setBody(markdown);
                       setBodyAssetIds(assetIds);
+                      setServerConflict(null);
                       if (invalidField === "body") setInvalidField(null);
                     }}
                     placeholder="Start with the idea, decision, or context worth keeping…"
@@ -530,6 +627,7 @@ export function DocumentCreateForm({
                 value={collection}
                 onChange={(event) => {
                   setCollection(event.target.value);
+                  setServerConflict(null);
                   if (invalidField === "collection") setInvalidField(null);
                 }}
                 placeholder="engineering/specs"
@@ -574,6 +672,7 @@ export function DocumentCreateForm({
                     type="button"
                     onClick={() => {
                       setCollection(path);
+                      setServerConflict(null);
                       if (invalidField === "collection") setInvalidField(null);
                       collectionRef.current?.focus();
                     }}

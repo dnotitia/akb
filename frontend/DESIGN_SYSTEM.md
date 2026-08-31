@@ -341,6 +341,10 @@ an `sr-only` summary, never the only signal.
   Collection vocabulary, with the target Collection preselected in each modal.
   Collection rows keep the human name and one overflow trigger only—never a
   second line of icon counts or sibling action icons that squeeze the name.
+  Document rows also remain title-first. When two documents in the same
+  Collection have the same title, and only then, both rows add one quiet
+  monospace filename discriminator; generated UUID suffixes collapse to four
+  characters. This is ambiguity recovery, not permanent technical metadata.
   When a Collection mixes resource kinds, or one kind exceeds the 20-row
   preview, Documents / Tables / Files become peer disclosure rows with a quiet
   tabular count. Each open group renders 20 rows initially and reveals 50 more
@@ -442,7 +446,8 @@ commits` control and `Full commit log` route. Below `xl`, the work area stacks
   exceeds the viewport.
 - **Document workspace**: document routes are full-bleed inside `VaultShell`
   (no generic page padding) and use the same `h-16` workspace header as the new
-  document composer. The header identifies the file and vault; its right edge
+  document composer. The header identifies the human document title, Vault, and
+  Collection; the raw filename stays out of this primary identity line. Its right edge
   keeps one primary `Edit` action next to the resource overflow menu. Do not
   repeat the raw canonical `akb://` URI in this title bar; the path row and
   document panel already own location and technical metadata. The
@@ -475,17 +480,33 @@ commits` control and `Full commit log` route. Below `xl`, the work area stacks
   hide the compact summary when horizontal space is constrained, while the panel's
   Info remains the complete metadata view at every breakpoint. The
   document title is the compact workspace-header H1 and is not repeated as a
-  page hero; path, author, commit, age, and History share one dense file-context
-  row immediately above the content surface. Never add another vertical summary
+  page hero; Collection, author, commit, age, and History share one dense
+  file-context row immediately above the content surface. Filename, full path,
+  and canonical URI live behind `Technical details` in the Info inspector, where
+  exact identifiers are useful without taxing ordinary reading. Never add another vertical summary
   band before the file viewer, and omit the compact summary entirely when older
   backends return no value.
-  The document header overflow exposes Move or rename for every current
-  document instead of hiding the capability from readers or read-only Vaults.
-  When unavailable, the action remains visible with the exact permission,
-  historical-version, mirror, or reserved-guide reason. The move dialog is a
-  destination review rather than a generic metadata form: it shows current and
-  normalized target paths, selects an existing Collection (or Vault root), edits
-  the filename/slug, and accepts an optional Git commit message. Submission
+  The document header overflow separates `Rename title` from `Move document`
+  for every current document instead of overloading rename to mean a technical
+  filename change. The title flow patches only the human title; the system-created
+  slug/path remains stable so links and history do not move when display copy
+  changes. File names are not a user-editable field. When either action is
+  unavailable, it remains visible with the exact permission, historical-version,
+  mirror, or reserved-guide reason. The move dialog is a destination review
+  rather than a generic metadata form: it keeps the human title primary and
+  compares current and target Collections. Exact current and expected paths sit
+  behind a technical review disclosure, and an optional Git commit message
+  remains available. Create, rename, and move share one **soft uniqueness**
+  rule: an exact NFC-normalized title (outer whitespace ignored, case and inner
+  whitespace preserved) in the same Collection is a conflict in interactive UI.
+  The notice prioritizes `Open existing`, then changing the title or Collection;
+  an explicit low-emphasis action can still keep both. If title and body are
+  both identical, use stronger duplicate-copy language. Visibly different titles
+  that normalize to the same slug proceed automatically—the backend assigns a
+  collision-safe path and the UI does not expose a filename editor. Interactive
+  writes request server-side rejection first and retry with allow only after the
+  user chooses the exception; legacy API, MCP, agent, and import callers retain
+  lossless allow-by-default behavior. Submission
   preserves entered values on failure; after success the backend-returned path
   is authoritative, the reader replaces the stale route, and a compact status
   notice names the destination Collection. Git history, old-URI aliases,
