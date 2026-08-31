@@ -165,10 +165,10 @@ case "${SECRET_MODE}" in
     if [[ -z "${SECRET_STORE_RELEASE}" ]]; then
       if "${HELM[@]}" status akb-secret-store -n "${NAMESPACE}" >/dev/null 2>&1; then
         # Preserve names for namespaces installed by the original profile.
-        SECRET_STORE_RELEASE="akb-secret-store"
+        SECRET_STORE_RELEASE="akb-secret-store" # pragma: allowlist secret
       else
         NAMESPACE_DIGEST="$(printf '%s' "${NAMESPACE}" | openssl dgst -sha256 | awk '{print substr($NF, 1, 12)}')"
-        SECRET_STORE_RELEASE="akb-sm-${NAMESPACE_DIGEST}"
+        SECRET_STORE_RELEASE="akb-sm-${NAMESPACE_DIGEST}" # pragma: allowlist secret
       fi
     fi
     if [[ ! "${SECRET_STORE_RELEASE}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] ||

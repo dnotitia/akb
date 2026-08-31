@@ -55,9 +55,9 @@ def test_backend_and_postgres_share_platform_compatible_akb_secret_contract():
     pod = backend["spec"]["template"]["spec"]
     assert pod["automountServiceAccountToken"] is False
     volumes = {item["name"]: item for item in pod["volumes"]}
-    assert volumes["secret-config"]["secret"]["secretName"] == "akb-secret"
+    assert volumes["secret-config"]["secret"]["secretName"] == "akb-secret"  # pragma: allowlist secret
     local = volumes["local-session-keys"]["secret"]
-    assert local["secretName"] == "akb-secret"
+    assert local["secretName"] == "akb-secret"  # pragma: allowlist secret
     assert {item["key"]: item["path"] for item in local["items"]} == {
         "local-session-private.pem": "private.pem",
         "local-session-jwks.json": "jwks.json",
@@ -164,7 +164,7 @@ def test_material_generator_matches_contract_without_legacy_jwt_in_secret_yaml()
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     material = module._material()  # noqa: SLF001 - deployment contract unit test
-    assert material["local_session_private_pem"].startswith("-----BEGIN PRIVATE KEY-----")
+    assert material["local_session_private_pem"].startswith("-----BEGIN PRIVATE KEY-----")  # pragma: allowlist secret
     jwks = json.loads(material["local_session_jwks_json"])
     assert len(jwks["keys"]) == 1
     assert jwks["keys"][0]["alg"] == "RS256"
@@ -250,7 +250,7 @@ def test_deploy_scripts_are_context_scoped_idempotent_and_fail_closed():
     assert "SSO_AKB_PUBLIC_URL" in deploy
     assert "SSO_KEYCLOAK_PUBLIC_URL" in deploy
     assert 'rollout status statefulset/keycloak' in deploy
-    assert 'SECRET_STORE_RELEASE="akb-sm-${NAMESPACE_DIGEST}"' in secret_deploy
+    assert 'SECRET_STORE_RELEASE="akb-sm-${NAMESPACE_DIGEST}"' in secret_deploy  # pragma: allowlist secret
     assert 'SECRET_STORE_POD="${STATEFULSET}-0"' in secret_deploy
 
     chart_install = secret_deploy.split("HELM_ARGS=(", maxsplit=1)[1]
@@ -276,16 +276,18 @@ def test_kustomize_and_pinned_helm_profiles_render_when_tools_are_available():
     assert not any(item.get("kind") in {"Namespace", "Secret"} for item in resources)
 
     charts = {
-        "openbao": ("openbao/openbao", "0.29.3"),
-        "hashicorp-vault": ("hashicorp/vault", "0.34.1"),
+        "openbao": ("openbao", "https://openbao.github.io/openbao-helm", "0.29.3"),
+        "hashicorp-vault": ("vault", "https://helm.releases.hashicorp.com", "0.34.1"),
     }
-    for engine, (chart, version) in charts.items():
+    for engine, (chart, repository, version) in charts.items():
         subprocess.run(
             [
                 helm,
                 "template",
                 "akb-secret-store",
                 chart,
+                "--repo",
+                repository,
                 "--version",
                 version,
                 "--namespace",

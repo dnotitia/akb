@@ -238,7 +238,7 @@ spec:
             # Shared contract with akb-platform-managed workspaces. The
             # producer can be manual, bundled Vault/OpenBao, or an external
             # secret store; the application always consumes this name.
-            secretName: akb-secret
+            secretName: akb-secret # pragma: allowlist secret
         - name: local-session-keys
           secret:
             secretName: akb-secret # pragma: allowlist secret
