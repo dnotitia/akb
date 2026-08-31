@@ -1309,6 +1309,47 @@ async def test_unanchored_projection_keeps_precreation_current_as_only_revision(
     assert [entry.legacy_git_oid for entry in lineage] == [current_oid]
 
 
+async def test_unanchored_projection_uses_newest_create_with_same_second_commits():
+    created_at = datetime(2026, 8, 11, 12, 0, 0, 750_000, tzinfo=UTC)
+    committed_at = created_at.replace(microsecond=0)
+    current_oid = _oid("d")
+    create_oid = _oid("c")
+
+    lineage = project_logical_lineage(
+        (
+            {
+                "legacy_git_oid": current_oid,
+                "path_at_revision": "notes/current.md",
+                "committed_at": committed_at,
+                "action": "update",
+            },
+            {
+                "legacy_git_oid": create_oid,
+                "path_at_revision": "notes/current.md",
+                "committed_at": committed_at,
+                "action": "create",
+            },
+            {
+                "legacy_git_oid": _oid("b"),
+                "path_at_revision": "notes/current.md",
+                "committed_at": committed_at,
+                "action": "update",
+            },
+            {
+                "legacy_git_oid": _oid("a"),
+                "path_at_revision": "notes/current.md",
+                "committed_at": committed_at,
+                "action": "create",
+            },
+        ),
+        current_commit=current_oid,
+        current_path="notes/current.md",
+        created_at=created_at,
+    )
+
+    assert [entry.legacy_git_oid for entry in lineage] == [create_oid, current_oid]
+
+
 async def test_anchored_projection_fails_closed_when_anchor_is_absent_or_duplicated():
     created_at = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
     current_oid = _oid("c")

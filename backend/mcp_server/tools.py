@@ -432,7 +432,7 @@ TOOLS = [
         name="akb_grep",
         description=(
             "Search for exact text or regex patterns across document content. "
-            "On the guarded native measurement backend, optionally include admitted "
+            "On a native Document backend, optionally include admitted "
             "searchable text Files with `measurement_include_text_files=true`; binary "
             "Files remain excluded. "
             "Unlike akb_search (semantic/meaning-based), this finds exact string matches — "
@@ -476,13 +476,13 @@ TOOLS = [
                     "type": "boolean",
                     "default": False,
                     "description": (
-                        "Guarded native M1 W3b measurement mode: include admitted searchable "
+                        "Native mode: include admitted searchable "
                         "text Files as well as Documents. File results include resource_type=file, "
                         "their canonical akb:// URI, revision, and content_hash; native results "
                         "also report payload_placement, the body placement their bytes were read "
                         "from. Binary Files are "
-                        "never searchable. Rejected unless the exact native measurement backend "
-                        "and dedicated database guard are active."
+                        "never searchable. Rejected unless postgres_native or the exact guarded "
+                        "native measurement backend is active."
                     ),
                 },
             },

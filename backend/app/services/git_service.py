@@ -1550,6 +1550,29 @@ class GitService:
                 active["path_at_revision"] = fields[-1]
         flush()
 
+        # Git commit timestamps have one-second precision while the document
+        # row's created_at has microseconds. Preserve the standard AKB action
+        # so the migration bridge can stop at the newest create commit instead
+        # of dropping that commit (or admitting an older same-path lifecycle)
+        # on timestamp comparison alone. Unknown historical commit formats
+        # remain supported through the bridge's timestamp fallback.
+        for entry in history:
+            try:
+                commit = repo.commit(entry["legacy_git_oid"])
+                metadata = self._legacy_commit_metadata(commit)
+            except (BadName, BadObject, GitError, KeyError, TypeError, ValueError):
+                continue
+            # Runtime cutover compatibility reuses this already-fixed-ref
+            # primitive to reconstruct the public history envelope.  Keep the
+            # display metadata beside the immutable OID/path/time facts; the
+            # migration digest intentionally continues to project only the
+            # fields it owns.
+            entry["message"] = str(commit.message).strip()
+            entry["author"] = str(commit.author)
+            action = metadata.get("action")
+            if action in {"create", "update", "move", "delete"}:
+                entry["action"] = action
+
         return {
             "fixed_ref": fixed_ref,
             "current_commit": current_commit,
@@ -2334,6 +2357,58 @@ class GitService:
                 lookup_path,
                 commit_hash,
             )
+
+    def manual_fixed_ref_file_diff(
+        self,
+        vault_name: str,
+        fixed_ref: str,
+        file_path: str,
+        commit_hash: str,
+    ) -> dict:
+        """Read one legacy diff without consulting the mutable vault HEAD.
+
+        Existing-database cutover mappings bind both selectors to an exact
+        frozen tip.  The normal legacy ``file_diff`` starts rename tracking at
+        HEAD, so it is not a sufficient authority after Native writes begin.
+        This narrow companion verifies the selected commit is within the
+        frozen graph and resolves its historical path from that graph only.
+        """
+        full_oid = re.compile(r"^[0-9a-f]{40}$")
+        if not full_oid.fullmatch(fixed_ref) or not full_oid.fullmatch(commit_hash):
+            raise FixedRefHistoryError(
+                "fixed-ref diff requires full lowercase 40-hex commit OIDs"
+            )
+        if self._is_mirror(vault_name):
+            raise FixedRefHistoryError("fixed-ref diff is limited to manual vaults")
+        try:
+            with _managed_repo(self._get_repo(vault_name)) as repo:
+                repo.commit(fixed_ref)
+                target = repo.commit(commit_hash).hexsha
+                repo.git.merge_base("--is-ancestor", target, fixed_ref)
+                historical_path = self._stream_path_at_revision(
+                    repo,
+                    fixed_ref,
+                    file_path,
+                    target,
+                )
+                return self._file_diff_with_repo(
+                    repo,
+                    file_path,
+                    historical_path or file_path,
+                    target,
+                )
+        except (
+            BadName,
+            BadObject,
+            FileNotFoundError,
+            GitError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise FixedRefHistoryError(
+                "fixed-ref diff could not resolve the requested commit"
+            ) from exc
 
     def _file_diff_with_repo(
         self,

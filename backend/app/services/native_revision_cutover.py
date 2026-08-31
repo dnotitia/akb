@@ -1,0 +1,645 @@
+"""Fixture-first orchestration for an existing database Native cutover."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import uuid
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+import asyncpg
+
+from app.repositories.native_revision_cutover_repo import (
+    CutoverExclusion,
+    CutoverFile,
+    CutoverRun,
+    CutoverVault,
+    NativeRevisionCutoverRepository,
+)
+from app.repositories.native_revision_migration_repo import (
+    NativeRevisionMigrationRepository,
+)
+from app.services.native_revision_backfill import NativeRevisionBackfill
+from app.services.m1_pg_body_store import M1_PG_TEXT_MAX_BYTES, M1PgBodyStore
+from app.services.native_revision_service import NativeRevisionService
+from app.services.adapters import s3_adapter
+from app.services.git_service import GitService
+from app.services.legacy_revision_bridge import LegacyRevisionBridge
+from app.services.native_revision_authority import (
+    NativeAuthorityIdentity,
+    mint_existing_database_authority,
+)
+from app.services.native_revision_shadow import NativeRevisionShadowComparator
+from app.services.native_revision_shadow_reader import (
+    LegacyFixedRefShadowReader,
+    NativeRevisionShadowReader,
+)
+
+
+class CutoverVerifier(Protocol):
+    async def compare_run(self, run_id: uuid.UUID) -> Mapping[str, Any]: ...
+
+
+class CutoverApplyError(RuntimeError):
+    """A vault-scoped backfill did not reach complete."""
+
+
+class CutoverVerificationError(RuntimeError):
+    """A completed vault run did not produce an acceptable comparison."""
+
+
+class NativeRevisionCutoverVerifier:
+    """Compose the existing product readers for one vault-scoped run."""
+
+    def __init__(self, pool: asyncpg.Pool, *, git: GitService):
+        self.pool = pool
+        self.git = git
+        self.repository = NativeRevisionMigrationRepository(pool)
+        self.bridge = LegacyRevisionBridge(
+            pool,
+            git=git,
+            repository=self.repository,
+        )
+
+    async def compare_run(self, run_id: uuid.UUID) -> Mapping[str, Any]:
+        run = await self.repository.get_run(run_id)
+        if run is None:
+            raise CutoverVerificationError(f"migration run {run_id} does not exist")
+        async with self.pool.acquire() as conn:
+            vault_name = await conn.fetchval(
+                "SELECT name FROM vaults WHERE id = $1",
+                run.namespace_id,
+            )
+        if not isinstance(vault_name, str) or not vault_name:
+            raise CutoverVerificationError(
+                f"vault {run.namespace_id} for migration run {run_id} does not exist"
+            )
+        comparator = NativeRevisionShadowComparator(
+            pool=self.pool,
+            repository=self.repository,
+            bridge=self.bridge,
+            legacy_reader=LegacyFixedRefShadowReader(
+                git=self.git,
+                vault_name=vault_name,
+            ),  # type: ignore[arg-type]  # activity_evidence is candidate-only
+            candidate_reader=NativeRevisionShadowReader(
+                self.pool,
+                namespace_id=run.namespace_id,
+                vault_name=vault_name,
+                selector_bridge=self.bridge,
+            ),
+        )
+        return await comparator.compare_run(run_id)
+
+
+@dataclass(frozen=True, slots=True)
+class CutoverVaultInput:
+    namespace_id: uuid.UUID
+    fixed_ref: str
+
+
+@dataclass(frozen=True, slots=True)
+class CutoverState:
+    cutover_id: uuid.UUID
+    coverage_version: str
+    inventory_digest: str
+    status: str
+    verification_digest: str | None
+    vaults: tuple[CutoverVault, ...]
+    files: tuple[CutoverFile, ...]
+    exclusions: tuple[CutoverExclusion, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CutoverAuthorityState:
+    authority_id: uuid.UUID
+    cutover_id: uuid.UUID
+    inventory_digest: str
+    status: str
+
+
+def _digest(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+class NativeRevisionCutover:
+    """Group existing per-vault backfills and hand off verified authority."""
+
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        *,
+        backfill: NativeRevisionBackfill,
+        verifier: CutoverVerifier,
+        repository: NativeRevisionCutoverRepository | None = None,
+        file_reader: Callable[[str], bytes] | None = None,
+    ):
+        self.pool = pool
+        self.backfill = backfill
+        self.verifier = verifier
+        self.repository = repository or NativeRevisionCutoverRepository(pool)
+        self.file_reader = file_reader or self._read_s3_file
+
+    @staticmethod
+    def _read_s3_file(s3_key: str) -> bytes:
+        return b"".join(s3_adapter.iter_chunks(s3_key))
+
+    async def _file_inventory(
+        self,
+        namespace_ids: list[uuid.UUID],
+    ) -> list[CutoverFile]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT vf.vault_id AS namespace_id, vf.id AS file_id,
+                       CASE WHEN c.path IS NULL THEN vf.name
+                            ELSE c.path || '/' || vf.name END AS logical_path,
+                       COALESCE(NULLIF(vf.mime_type, ''), 'application/octet-stream')
+                           AS mime_type,
+                       vf.content_hash, vf.size_bytes, vf.s3_key,
+                       vf.etag, vf.storage_version, vf.created_by
+                  FROM vault_files vf
+             LEFT JOIN collections c ON c.id = vf.collection_id
+                 WHERE vf.vault_id = ANY($1::uuid[])
+                   AND vf.kind = 'file'
+                   AND vf.upload_state = 'confirmed'
+                   AND vf.hash_verified_at IS NOT NULL
+                   AND vf.content_hash ~ '^[0-9a-f]{64}$'
+                   AND vf.size_bytes >= 0
+                 ORDER BY vf.vault_id, vf.id
+                """,
+                namespace_ids,
+            )
+        return [
+            CutoverFile(
+                cutover_id=uuid.UUID(int=0),
+                namespace_id=row["namespace_id"],
+                file_id=row["file_id"],
+                logical_path=row["logical_path"],
+                mime_type=row["mime_type"],
+                content_hash=row["content_hash"],
+                byte_size=int(row["size_bytes"]),
+                s3_key=row["s3_key"],
+                etag=row["etag"],
+                storage_version=row["storage_version"],
+                created_by=row["created_by"],
+                disposition=(
+                    "native_text"
+                    if row["mime_type"].lower().startswith("text/")
+                    else "preserved_binary"
+                ),
+                status="planned",
+                native_revision_id=None,
+                verification_digest=None,
+                applied_at=None,
+                verified_at=None,
+            )
+            for row in rows
+        ]
+
+    async def _partition_vaults(
+        self,
+        vaults: Sequence[CutoverVaultInput],
+    ) -> tuple[list[CutoverVaultInput], list[CutoverExclusion]]:
+        namespace_ids = [item.namespace_id for item in vaults]
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT v.id, v.status,
+                       EXISTS (
+                           SELECT 1 FROM vault_external_git veg
+                            WHERE veg.vault_id = v.id
+                       ) AS external_git
+                  FROM vaults v
+                 WHERE v.id = ANY($1::uuid[])
+                """,
+                namespace_ids,
+            )
+        by_id = {row["id"]: row for row in rows}
+        eligible: list[CutoverVaultInput] = []
+        exclusions: list[CutoverExclusion] = []
+        for item in vaults:
+            row = by_id.get(item.namespace_id)
+            if row is None:
+                raise ValueError(f"cutover vault does not exist: {item.namespace_id}")
+            if row["external_git"]:
+                exclusions.append(
+                    CutoverExclusion(
+                        cutover_id=uuid.UUID(int=0),
+                        namespace_id=item.namespace_id,
+                        fixed_git_oid=item.fixed_ref,
+                        reason="external_git_requires_collector",
+                        created_at=None,
+                    )
+                )
+                continue
+            if row["status"] != "active":
+                raise ValueError(f"cutover vault is not active: {item.namespace_id}")
+            eligible.append(item)
+        return eligible, exclusions
+
+    async def plan(
+        self,
+        *,
+        vaults: Sequence[CutoverVaultInput],
+        coverage_version: str,
+    ) -> CutoverState:
+        ordered = sorted(vaults, key=lambda item: str(item.namespace_id))
+        if not ordered:
+            raise ValueError("cutover requires at least one vault")
+        if len({item.namespace_id for item in ordered}) != len(ordered):
+            raise ValueError("cutover vaults must be unique")
+
+        eligible, exclusions = await self._partition_vaults(ordered)
+        if not eligible:
+            raise ValueError("cutover requires at least one eligible manual vault")
+
+        prepared: list[CutoverVault] = []
+        for item in eligible:
+            migration_run, _ = await self.backfill.prepare_run(
+                namespace_id=item.namespace_id,
+                fixed_ref=item.fixed_ref,
+                coverage_version=coverage_version,
+            )
+            prepared.append(
+                CutoverVault(
+                    cutover_id=uuid.UUID(int=0),
+                    namespace_id=migration_run.namespace_id,
+                    migration_run_id=migration_run.run_id,
+                    fixed_git_oid=migration_run.fixed_git_oid,
+                    inventory_digest=migration_run.inventory_digest,
+                    status="planned",
+                    verification_digest=None,
+                    applied_at=None,
+                    verified_at=None,
+                )
+            )
+        files = await self._file_inventory([item.namespace_id for item in eligible])
+        inventory_digest = _digest(
+            {
+                "vaults": [
+                    {
+                        "namespace_id": str(item.namespace_id),
+                        "migration_run_id": str(item.migration_run_id),
+                        "fixed_git_oid": item.fixed_git_oid,
+                        "inventory_digest": item.inventory_digest,
+                    }
+                    for item in prepared
+                ],
+                "files": [
+                    {
+                        "namespace_id": str(item.namespace_id),
+                        "file_id": str(item.file_id),
+                        "logical_path": item.logical_path,
+                        "mime_type": item.mime_type,
+                        "content_hash": item.content_hash,
+                        "byte_size": item.byte_size,
+                        "s3_key": item.s3_key,
+                        "etag": item.etag,
+                        "storage_version": item.storage_version,
+                        "created_by": item.created_by,
+                        "disposition": item.disposition,
+                    }
+                    for item in files
+                ],
+                "exclusions": [
+                    {
+                        "namespace_id": str(item.namespace_id),
+                        "fixed_git_oid": item.fixed_git_oid,
+                        "reason": item.reason,
+                    }
+                    for item in exclusions
+                ],
+            }
+        )
+        run = await self.repository.get_or_create_run(
+            coverage_version=coverage_version,
+            inventory_digest=inventory_digest,
+            vaults=prepared,
+            files=files,
+            exclusions=exclusions,
+        )
+        return await self._state(run)
+
+    @staticmethod
+    def _validate_text_file(file: CutoverFile, data: bytes) -> str:
+        if len(data) != file.byte_size:
+            raise CutoverApplyError(f"File {file.file_id} byte size drifted")
+        if hashlib.sha256(data).hexdigest() != file.content_hash:
+            raise CutoverApplyError(f"File {file.file_id} content digest drifted")
+        if len(data) > M1_PG_TEXT_MAX_BYTES or b"\x00" in data:
+            raise CutoverApplyError(f"File {file.file_id} is not eligible searchable text")
+        try:
+            return data.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise CutoverApplyError(
+                f"File {file.file_id} is not valid UTF-8 searchable text"
+            ) from exc
+
+    async def _apply_files(self, cutover_id: uuid.UUID) -> None:
+        native = NativeRevisionService(
+            self.pool,
+            payload_store=M1PgBodyStore(self.pool),
+        )
+        for file in await self.repository.list_files(cutover_id):
+            if file.status in {"applied", "verified"}:
+                continue
+            if file.disposition == "preserved_binary":
+                await self.repository.set_file_status(
+                    cutover_id=cutover_id,
+                    file_id=file.file_id,
+                    status="applied",
+                    native_revision_id=None,
+                )
+                continue
+            data = await asyncio.to_thread(self.file_reader, file.s3_key)
+            self._validate_text_file(file, data)
+            result = await native.create_text(
+                namespace_id=file.namespace_id,
+                surface="file",
+                path=file.logical_path,
+                payload=data,
+                actor=file.created_by or "akb-native-revision-migration",
+                mutation_id=uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"akb:existing-file-cutover:{cutover_id}:{file.file_id}:{file.content_hash}",
+                ),
+                resource_id=file.file_id,
+                message="Existing File searchable-text cutover",
+                expected_digest=file.content_hash,
+                expected_size=file.byte_size,
+            )
+            if result.resource_id != file.file_id:
+                raise CutoverApplyError("Native File publication changed public identity")
+            await self.repository.set_file_status(
+                cutover_id=cutover_id,
+                file_id=file.file_id,
+                status="applied",
+                native_revision_id=result.revision_id,
+            )
+
+    async def _verify_files(self, cutover_id: uuid.UUID) -> list[dict[str, str]]:
+        receipts: list[dict[str, str]] = []
+        for file in await self.repository.list_files(cutover_id):
+            if file.status == "verified":
+                assert file.verification_digest is not None
+                receipts.append(
+                    {"file_id": str(file.file_id), "verification_digest": file.verification_digest}
+                )
+                continue
+            if file.status != "applied":
+                raise CutoverVerificationError(f"File {file.file_id} was not applied")
+            async with self.pool.acquire() as conn:
+                source = await conn.fetchrow(
+                    """
+                    SELECT vf.vault_id, vf.id,
+                           CASE WHEN c.path IS NULL THEN vf.name
+                                ELSE c.path || '/' || vf.name END AS logical_path,
+                           COALESCE(NULLIF(vf.mime_type, ''), 'application/octet-stream')
+                               AS mime_type,
+                           vf.content_hash, vf.size_bytes, vf.s3_key,
+                           vf.etag, vf.storage_version, vf.created_by,
+                           vf.kind, vf.upload_state, vf.hash_verified_at
+                      FROM vault_files vf
+                 LEFT JOIN collections c ON c.id = vf.collection_id
+                     WHERE vf.id = $1 AND vf.vault_id = $2
+                    """,
+                    file.file_id,
+                    file.namespace_id,
+                )
+                native = await conn.fetchrow(
+                    """
+                    SELECT r.namespace_id, r.resource_id, r.surface, r.lifecycle,
+                           r.current_path, r.head_revision_id,
+                           pm.digest, pm.byte_size
+                      FROM native_resources r
+                 LEFT JOIN native_revisions nr
+                        ON nr.resource_id = r.resource_id
+                       AND nr.revision_id = r.head_revision_id
+                 LEFT JOIN native_payload_manifests pm
+                        ON pm.payload_manifest_id = nr.payload_manifest_id
+                     WHERE r.resource_id = $1
+                    """,
+                    file.file_id,
+                )
+            expected_source = (
+                file.namespace_id,
+                file.file_id,
+                file.logical_path,
+                file.mime_type,
+                file.content_hash,
+                file.byte_size,
+                file.s3_key,
+                file.etag,
+                file.storage_version,
+                file.created_by,
+                "file",
+                "confirmed",
+                True,
+            )
+            observed_source = None if source is None else (
+                source["vault_id"], source["id"], source["logical_path"],
+                source["mime_type"], source["content_hash"], int(source["size_bytes"]),
+                source["s3_key"], source["etag"], source["storage_version"],
+                source["created_by"], source["kind"], source["upload_state"],
+                source["hash_verified_at"] is not None,
+            )
+            if observed_source != expected_source:
+                raise CutoverVerificationError(f"File {file.file_id} source facts drifted")
+            data = await asyncio.to_thread(self.file_reader, file.s3_key)
+            if len(data) != file.byte_size or hashlib.sha256(data).hexdigest() != file.content_hash:
+                raise CutoverVerificationError(f"File {file.file_id} S3 bytes drifted")
+            if file.disposition == "native_text":
+                self._validate_text_file(file, data)
+                expected_native = (
+                    file.namespace_id, file.file_id, "file", "live",
+                    file.logical_path, file.native_revision_id,
+                    file.content_hash, file.byte_size,
+                )
+                observed_native = None if native is None else (
+                    native["namespace_id"], native["resource_id"], native["surface"],
+                    native["lifecycle"], native["current_path"], native["head_revision_id"],
+                    native["digest"], int(native["byte_size"]),
+                )
+                if observed_native != expected_native:
+                    raise CutoverVerificationError(
+                        f"File {file.file_id} Native searchable projection drifted"
+                    )
+            elif native is not None:
+                raise CutoverVerificationError(
+                    f"binary File {file.file_id} unexpectedly gained text authority"
+                )
+            receipt = {
+                "file_id": str(file.file_id),
+                "disposition": file.disposition,
+                "content_hash": file.content_hash,
+                "native_revision_id": file.native_revision_id,
+            }
+            verification_digest = _digest(receipt)
+            await self.repository.set_file_status(
+                cutover_id=cutover_id,
+                file_id=file.file_id,
+                status="verified",
+                native_revision_id=file.native_revision_id,
+                verification_digest=verification_digest,
+            )
+            receipts.append(
+                {"file_id": str(file.file_id), "verification_digest": verification_digest}
+            )
+        return receipts
+
+    async def commit(
+        self,
+        cutover_id: uuid.UUID,
+        *,
+        identity: NativeAuthorityIdentity,
+    ) -> CutoverAuthorityState:
+        run = await self._required_run(cutover_id)
+        if run.status != "verified" or run.verification_digest is None:
+            raise CutoverVerificationError(
+                "cutover must be verified before authority can be committed"
+            )
+        async with self.pool.acquire() as conn:
+            if await conn.fetchval("SELECT EXISTS (SELECT 1 FROM vault_external_git)"):
+                raise CutoverVerificationError(
+                    "cutover authority cannot commit while persisted external Git vaults remain"
+                )
+            authority_id = await mint_existing_database_authority(
+                conn,
+                identity=identity,
+                cutover_id=cutover_id,
+            )
+            row = await conn.fetchrow(
+                """
+                SELECT authority_id, cutover_id, inventory_digest, status
+                  FROM native_revision_existing_authority
+                 WHERE authority_id = $1
+                """,
+                authority_id,
+            )
+        if row is None:
+            raise CutoverVerificationError("existing-database authority disappeared")
+        return CutoverAuthorityState(**dict(row))
+
+    async def apply(self, cutover_id: uuid.UUID) -> CutoverState:
+        run = await self._required_run(cutover_id)
+        if run.status in {"applied", "verified"}:
+            return await self._state(run)
+        vaults = await self.repository.list_vaults(cutover_id)
+        for vault in vaults:
+            if vault.status in {"applied", "verified"}:
+                continue
+            result = await self.backfill.backfill_run(vault.migration_run_id)
+            if result.status != "complete" or result.failed_items:
+                raise CutoverApplyError(
+                    f"vault {vault.namespace_id} backfill ended as {result.status}"
+                )
+            await self.repository.set_vault_status(
+                cutover_id=cutover_id,
+                namespace_id=vault.namespace_id,
+                status="applied",
+            )
+        await self._apply_files(cutover_id)
+        run = await self.repository.set_run_status(
+            cutover_id=cutover_id,
+            status="applied",
+        )
+        return await self._state(run)
+
+    async def verify(self, cutover_id: uuid.UUID) -> CutoverState:
+        run = await self._required_run(cutover_id)
+        if run.status == "verified":
+            return await self._state(run)
+        if run.status != "applied":
+            raise CutoverVerificationError("cutover must be applied before verification")
+
+        digests: list[dict[str, str]] = []
+        vaults = await self.repository.list_vaults(cutover_id)
+        for vault in vaults:
+            if vault.status == "verified":
+                assert vault.verification_digest is not None
+                receipt_digest = vault.verification_digest
+            else:
+                receipt = await self.verifier.compare_run(vault.migration_run_id)
+                self._require_passed_receipt(vault, receipt)
+                receipt_digest = _digest(receipt)
+                await self.repository.set_vault_status(
+                    cutover_id=cutover_id,
+                    namespace_id=vault.namespace_id,
+                    status="verified",
+                    verification_digest=receipt_digest,
+                )
+            digests.append(
+                {
+                    "namespace_id": str(vault.namespace_id),
+                    "migration_run_id": str(vault.migration_run_id),
+                    "verification_digest": receipt_digest,
+                }
+            )
+        file_digests = await self._verify_files(cutover_id)
+        run = await self.repository.set_run_status(
+            cutover_id=cutover_id,
+            status="verified",
+            verification_digest=_digest(
+                {
+                    "vaults": digests,
+                    "files": file_digests,
+                    "exclusions": [
+                        {
+                            "namespace_id": str(item.namespace_id),
+                            "fixed_git_oid": item.fixed_git_oid,
+                            "reason": item.reason,
+                        }
+                        for item in await self.repository.list_exclusions(cutover_id)
+                    ],
+                }
+            ),
+        )
+        return await self._state(run)
+
+    @staticmethod
+    def _require_passed_receipt(
+        vault: CutoverVault,
+        receipt: Mapping[str, Any],
+    ) -> None:
+        summary = receipt.get("summary")
+        if not isinstance(summary, Mapping):
+            raise CutoverVerificationError(
+                f"vault {vault.namespace_id} verification summary is missing"
+            )
+        if (
+            receipt.get("status") != "passed"
+            or receipt.get("passed") is not True
+            or summary.get("unexplained_mismatch_count") != 0
+        ):
+            raise CutoverVerificationError(
+                f"vault {vault.namespace_id} verification did not pass"
+            )
+
+    async def _required_run(self, cutover_id: uuid.UUID) -> CutoverRun:
+        run = await self.repository.get_run(cutover_id)
+        if run is None:
+            raise CutoverApplyError(f"cutover {cutover_id} does not exist")
+        return run
+
+    async def _state(self, run: CutoverRun) -> CutoverState:
+        return CutoverState(
+            cutover_id=run.cutover_id,
+            coverage_version=run.coverage_version,
+            inventory_digest=run.inventory_digest,
+            status=run.status,
+            verification_digest=run.verification_digest,
+            vaults=tuple(await self.repository.list_vaults(run.cutover_id)),
+            files=tuple(await self.repository.list_files(run.cutover_id)),
+            exclusions=tuple(await self.repository.list_exclusions(run.cutover_id)),
+        )

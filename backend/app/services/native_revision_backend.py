@@ -12,8 +12,12 @@ import asyncpg
 
 from app.db.postgres import get_pool
 from app.exceptions import NotFoundError
+from app.repositories.native_revision_migration_repo import (
+    NativeRevisionMigrationRepository,
+)
 from app.repositories.native_revision_repo import NativeRevisionRepository
 from app.services.document_service import _parse_markdown
+from app.services.git_service import FixedRefHistoryError, GitService
 from app.services.native_document_service import NativeDocumentService
 from app.services.native_payload_verification import (
     payload_store_for_placement,
@@ -30,9 +34,14 @@ class NativeRevisionBackend:
         *,
         pool: asyncpg.Pool | None = None,
         document_service: NativeDocumentService | None = None,
+        legacy_git: GitService | None = None,
     ):
         self._injected_pool = pool
-        self.document_service = document_service or NativeDocumentService(pool=pool)
+        self._legacy_git = legacy_git or GitService()
+        self.document_service = document_service or NativeDocumentService(
+            pool=pool,
+            legacy_git=self._legacy_git,
+        )
 
     async def _pool(self) -> asyncpg.Pool:
         return self._injected_pool or await get_pool()
@@ -200,6 +209,48 @@ class NativeRevisionBackend:
             revision_id=commit,
         )
         if selected is None:
+            mappings = NativeRevisionMigrationRepository(await self._pool())
+            try:
+                if len(commit) == 40:
+                    mapping = await mappings.exact_mapping(
+                        resource_id=resource["resource_id"],
+                        legacy_git_oid=commit,
+                    )
+                elif 7 <= len(commit) < 40:
+                    matches = await mappings.prefix_mappings(
+                        resource_id=resource["resource_id"],
+                        legacy_git_prefix=commit,
+                    )
+                    if len(matches) > 1:
+                        return {
+                            "file": resource["current_path"],
+                            "commit": commit,
+                            "type": "unknown",
+                            "diff": "",
+                            "error": "commit is ambiguous",
+                        }
+                    mapping = matches[0] if matches else None
+                else:
+                    mapping = None
+            except asyncpg.UndefinedTableError:
+                mapping = None
+            if mapping is not None:
+                try:
+                    return await asyncio.to_thread(
+                        self._legacy_git.manual_fixed_ref_file_diff,
+                        vault,
+                        mapping.fixed_git_oid,
+                        resource["current_path"],
+                        mapping.legacy_git_oid,
+                    )
+                except FixedRefHistoryError:
+                    return {
+                        "file": resource["current_path"],
+                        "commit": commit,
+                        "type": "unknown",
+                        "diff": "",
+                        "error": "frozen legacy diff is unavailable",
+                    }
             return {
                 "file": resource["current_path"],
                 "commit": commit,
@@ -281,7 +332,77 @@ class NativeRevisionBackend:
         *,
         limit: int,
     ) -> dict[str, Any]:
-        return await self.document_service.history(vault, doc_ref, limit=limit)
+        native = await self.document_service.history(vault, doc_ref, limit=limit)
+        resolved = await self._resolve_resource(vault, doc_ref)
+        if resolved is None:
+            return native
+        vault_id, resource = resolved
+        migration = NativeRevisionMigrationRepository(await self._pool())
+        try:
+            mappings = await migration.list_resource_mappings(
+                namespace_id=vault_id,
+                resource_id=resource["resource_id"],
+            )
+        except asyncpg.UndefinedTableError:
+            return native
+        if not mappings:
+            return native
+
+        fixed_refs = {mapping.fixed_git_oid for mapping in mappings}
+        if len(fixed_refs) != 1:
+            # Completed immutable mappings are expected to describe one
+            # frozen lineage.  Do not synthesize history across authorities.
+            return native
+        try:
+            snapshot = await asyncio.to_thread(
+                self._legacy_git.manual_fixed_ref_history,
+                vault,
+                mappings[-1].fixed_git_oid,
+                resource["current_path"],
+                current_commit=mappings[-1].legacy_git_oid,
+            )
+        except FixedRefHistoryError:
+            return native
+        rows = snapshot.get("history")
+        if not isinstance(rows, list):
+            return native
+        by_oid = {
+            row.get("legacy_git_oid"): row
+            for row in rows
+            if isinstance(row, dict) and isinstance(row.get("legacy_git_oid"), str)
+        }
+        if any(mapping.legacy_git_oid not in by_oid for mapping in mappings):
+            return native
+
+        # Native genesis represents the same head as the newest legacy
+        # mapping. Replace that internal token with the public Git history,
+        # while retaining any genuinely-new Native revisions before it.
+        mapped_native_ids = {
+            mapping.native_revision_id
+            for mapping in mappings
+            if mapping.native_revision_id is not None
+        }
+        native_only = [
+            entry
+            for entry in native["history"]
+            if entry.get("hash") not in mapped_native_ids
+        ]
+        legacy = []
+        for mapping in reversed(mappings):
+            row = by_oid[mapping.legacy_git_oid]
+            committed_at = row["committed_at"]
+            legacy.append(
+                {
+                    "hash": mapping.legacy_git_oid[:12],
+                    "message": row.get("message") or row.get("action") or "legacy revision",
+                    "author": row.get("author") or "unknown",
+                    "date": committed_at.isoformat(),
+                }
+            )
+        return {
+            "uri": native["uri"],
+            "history": (native_only + legacy)[:limit],
+        }
 
 
 def native_revision_backend_factory() -> NativeRevisionBackend:

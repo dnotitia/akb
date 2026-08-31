@@ -167,9 +167,13 @@ async def _process_once() -> int:
             and settings.db_name == NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME
         )
     ):
+        if settings.document_revision_backend == "postgres_native":
+            from app.services.native_file_projection import NativeFileProjectionWorker
+
+            native_processed += await NativeFileProjectionWorker(pool).process_once()
         from app.services.native_derived_worker import NativeDerivedWorker
 
-        native_processed = await NativeDerivedWorker(pool).process_once()
+        native_processed += await NativeDerivedWorker(pool).process_once()
 
     # Stage 1: claim. Tiny transaction; commits before any external
     # work begins.

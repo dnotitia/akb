@@ -898,7 +898,7 @@ Optionally pass `replace` to find-and-replace across all matching documents.
 | limit | | Max documents to return (default 20; does not limit writes) |
 | max_replacements | | Replace write budget (default 50, maximum 1000); larger scopes fail before writing |
 | count_only | | Return exact per-resource counts without snippets |
-| measurement_include_text_files | | Guarded native measurement mode: include admitted searchable text Files; binary Files stay excluded |
+| measurement_include_text_files | | Native mode: include admitted searchable text Files; binary Files stay excluded |
 
 ## When to use akb_grep vs akb_search
 | Need | Tool |
