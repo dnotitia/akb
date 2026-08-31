@@ -313,6 +313,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "088_native_revision_existing_cutover.py",  # group existing vault-scoped Native backfills for fixture-led cutover verification
         "089_native_file_projection_outbox.py",  # durable S3 File mutation reconciliation into Native text projection
         "090_native_revision_vault_purge_fence.py",  # allow an authorized exact-vault lifecycle purge after cutover authority commits
+        "091_native_revision_committed_receipt_guard.py",  # freeze a committed cutover's durable authority receipt set
     ):
         if filename in applied:
             continue

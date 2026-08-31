@@ -33,7 +33,7 @@ _MIGRATION_085 = (
     _BACKEND / "app" / "db" / "migrations" / "085_vault_access_contributions.py"
 )
 _MIGRATION_HEAD = (
-    _BACKEND / "app" / "db" / "migrations" / "090_native_revision_vault_purge_fence.py"
+    _BACKEND / "app" / "db" / "migrations" / "091_native_revision_committed_receipt_guard.py"
 )
 _MIGRATIONS_DIR = _BACKEND / "app" / "db" / "migrations"
 

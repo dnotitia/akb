@@ -339,7 +339,9 @@ async def _activate_legacy_write_fence(
     await conn.execute(
         """
         LOCK TABLE vaults, collections, documents, resource_aliases,
-                   vault_files, vault_external_git
+                   vault_files, vault_external_git,
+                   native_revision_cutover_runs, native_revision_cutover_vaults,
+                   native_revision_cutover_files, native_revision_cutover_exclusions
         IN SHARE ROW EXCLUSIVE MODE
         """
     )

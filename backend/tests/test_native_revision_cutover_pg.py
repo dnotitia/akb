@@ -97,6 +97,7 @@ async def _fresh_schema(*, cutover_migrations: bool = True):
                     "088_native_revision_existing_cutover.py",
                     "089_native_file_projection_outbox.py",
                     "090_native_revision_vault_purge_fence.py",
+                    "091_native_revision_committed_receipt_guard.py",
                 ]
             )
         for filename in filenames:
@@ -710,7 +711,7 @@ async def test_text_mime_with_invalid_nul_or_oversized_bytes_is_preserved_binary
             )
 
 
-async def test_authority_mint_is_the_boundary_and_fences_external_git_race(tmp_path):
+async def test_authority_mint_is_the_boundary_and_fences_external_git_and_receipt_races(tmp_path):
     async with _fresh_schema() as pool:
         git = GitService(storage_path=str(tmp_path / "git-fence-race"))
         vault = await _manual_vault(pool, git, label="fence-race")
@@ -728,7 +729,7 @@ async def test_authority_mint_is_the_boundary_and_fences_external_git_race(tmp_p
                 document_id,
             )
         data = b"race fixture\x00"
-        _, s3_key = await _confirmed_file(
+        file_id, s3_key = await _confirmed_file(
             pool,
             namespace_id=vault.namespace_id,
             label="race.bin",
@@ -769,9 +770,9 @@ async def test_authority_mint_is_the_boundary_and_fences_external_git_race(tmp_p
         commit_task = asyncio.create_task(cutover.commit(planned.cutover_id, identity=identity))
         assert await asyncio.to_thread(reader.started.wait, 5)
         try:
-            async with pool.acquire() as racer:
+            async with pool.acquire() as legacy_racer, pool.acquire() as receipt_racer:
                 raced_insert = asyncio.create_task(
-                    racer.execute(
+                    legacy_racer.execute(
                         """
                         INSERT INTO vault_external_git (vault_id, remote_url, remote_branch)
                         VALUES ($1, 'https://git.example.invalid/race.git', 'main')
@@ -779,8 +780,16 @@ async def test_authority_mint_is_the_boundary_and_fences_external_git_race(tmp_p
                         vault.namespace_id,
                     )
                 )
+                raced_receipt_delete = asyncio.create_task(
+                    receipt_racer.execute(
+                        "DELETE FROM native_revision_cutover_files WHERE cutover_id = $1 AND file_id = $2",
+                        planned.cutover_id,
+                        file_id,
+                    )
+                )
                 await asyncio.sleep(0.1)
                 assert not raced_insert.done()
+                assert not raced_receipt_delete.done()
                 reader.release.set()
                 authority = await commit_task
                 with pytest.raises(
@@ -788,6 +797,11 @@ async def test_authority_mint_is_the_boundary_and_fences_external_git_race(tmp_p
                     match="Legacy revision writes are fenced",
                 ):
                     await raced_insert
+                with pytest.raises(
+                    asyncpg.ObjectNotInPrerequisiteStateError,
+                    match="committed Native revision cutover receipt",
+                ):
+                    await raced_receipt_delete
         finally:
             reader.release.set()
 
@@ -912,6 +926,120 @@ async def test_authorized_vault_delete_purges_only_its_post_cutover_legacy_rows(
                 match="Legacy revision writes are fenced",
             ):
                 await conn.execute("DELETE FROM resource_aliases WHERE vault_id = $1", vault.namespace_id)
+            with pytest.raises(
+                asyncpg.ObjectNotInPrerequisiteStateError,
+                match="committed Native revision cutover receipt",
+            ):
+                await conn.execute(
+                    "DELETE FROM native_revision_cutover_files WHERE cutover_id = $1 AND file_id = $2",
+                    planned.cutover_id,
+                    retained_file_id,
+                )
+            with pytest.raises(
+                asyncpg.ObjectNotInPrerequisiteStateError,
+                match="committed Native revision cutover receipt",
+            ):
+                await conn.execute(
+                    """
+                    UPDATE native_revision_cutover_files
+                       SET logical_path = logical_path
+                     WHERE cutover_id = $1 AND file_id = $2
+                    """,
+                    planned.cutover_id,
+                    retained_file_id,
+                )
+            with pytest.raises(
+                asyncpg.ObjectNotInPrerequisiteStateError,
+                match="committed Native revision cutover receipt",
+            ):
+                await conn.execute(
+                    """
+                    INSERT INTO native_revision_cutover_files (
+                        cutover_id, namespace_id, file_id, logical_path, mime_type,
+                        content_hash, byte_size, s3_key, etag, storage_version,
+                        created_by, disposition, status, native_revision_id,
+                        verification_digest, applied_at, verified_at
+                    )
+                    SELECT cutover_id, namespace_id, $3, logical_path, mime_type,
+                           content_hash, byte_size, s3_key, etag, storage_version,
+                           created_by, disposition, status, native_revision_id,
+                           verification_digest, applied_at, verified_at
+                      FROM native_revision_cutover_files
+                     WHERE cutover_id = $1 AND file_id = $2
+                    """,
+                    planned.cutover_id,
+                    retained_file_id,
+                    uuid.uuid4(),
+                )
+            with pytest.raises(
+                asyncpg.ObjectNotInPrerequisiteStateError,
+                match="committed Native revision cutover receipt",
+            ):
+                await conn.execute(
+                    "DELETE FROM native_revision_cutover_vaults WHERE cutover_id = $1 AND namespace_id = $2",
+                    planned.cutover_id,
+                    vault.namespace_id,
+                )
+            with pytest.raises(
+                asyncpg.ObjectNotInPrerequisiteStateError,
+                match="committed Native revision cutover receipt",
+            ):
+                await conn.execute(
+                    """
+                    UPDATE native_revision_cutover_vaults
+                       SET fixed_git_oid = fixed_git_oid
+                     WHERE cutover_id = $1 AND namespace_id = $2
+                    """,
+                    planned.cutover_id,
+                    vault.namespace_id,
+                )
+            with pytest.raises(
+                asyncpg.ObjectNotInPrerequisiteStateError,
+                match="committed Native revision cutover receipt",
+            ):
+                await conn.execute(
+                    """
+                    INSERT INTO native_revision_cutover_vaults (
+                        cutover_id, namespace_id, migration_run_id, fixed_git_oid,
+                        inventory_digest, status, verification_digest, applied_at,
+                        verified_at
+                    )
+                    SELECT cutover_id, $3, $4, fixed_git_oid, inventory_digest,
+                           status, verification_digest, applied_at, verified_at
+                      FROM native_revision_cutover_vaults
+                     WHERE cutover_id = $1 AND namespace_id = $2
+                    """,
+                    planned.cutover_id,
+                    vault.namespace_id,
+                    uuid.uuid4(),
+                    uuid.uuid4(),
+                )
+            with pytest.raises(
+                asyncpg.ObjectNotInPrerequisiteStateError,
+                match="committed Native revision cutover receipt",
+            ):
+                await conn.execute(
+                    """
+                    UPDATE native_revision_cutover_runs
+                       SET coverage_version = coverage_version
+                     WHERE cutover_id = $1
+                    """,
+                    planned.cutover_id,
+                )
+            with pytest.raises(
+                asyncpg.ObjectNotInPrerequisiteStateError,
+                match="committed Native revision cutover receipt",
+            ):
+                await conn.execute(
+                    """
+                    INSERT INTO native_revision_cutover_exclusions (
+                        cutover_id, namespace_id, fixed_git_oid, reason
+                    ) VALUES ($1, $2, $3, 'external_git_requires_collector')
+                    """,
+                    planned.cutover_id,
+                    uuid.uuid4(),
+                    vault.fixed_ref,
+                )
 
         class _RoleSync:
             async def on_vault_delete(self, vault_id: uuid.UUID) -> None:
@@ -1111,6 +1239,7 @@ async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop
             "088_native_revision_existing_cutover.py",
             "089_native_file_projection_outbox.py",
             "090_native_revision_vault_purge_fence.py",
+            "091_native_revision_committed_receipt_guard.py",
         }
         assert cutover_files <= registered
 
@@ -1133,6 +1262,7 @@ async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop
                 "088_native_revision_existing_cutover.py",
                 "089_native_file_projection_outbox.py",
                 "090_native_revision_vault_purge_fence.py",
+                "091_native_revision_committed_receipt_guard.py",
             ]
             assert await conn.fetchval("SELECT state FROM native_revision_legacy_write_fence") == "open"
             assert await conn.fetchval("SELECT to_regclass('public.native_file_projection_outbox') IS NOT NULL") is True
@@ -1146,7 +1276,7 @@ async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop
                     "SELECT count(*) FROM schema_migrations WHERE filename = ANY($1::text[])",
                     list(cutover_files),
                 )
-                == 3
+                == 4
             )
 
 
