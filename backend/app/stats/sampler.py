@@ -352,7 +352,6 @@ async def _vector_bytes(conn) -> int | None:
         return None
 
     total = 0
-    found = False
     for relation in PGVECTOR_RELATIONS:
         size = await conn.fetchval(
             """
@@ -365,13 +364,15 @@ async def _vector_bytes(conn) -> int | None:
             settings.vector_store_schema,
             relation,
         )
-        if size is not None:
-            found = True
-            total += int(size)
-    # The schema is created lazily on first use. Before that no relation
-    # exists, and "the index has not been created" is unknown-shaped, not
-    # zero-shaped.
-    return total if found else None
+        if size is None:
+            # The schema is created lazily on first use, and both relations
+            # arrive in the same batch. Before that nothing exists, and "the
+            # index has not been created" is unknown-shaped, not zero-shaped.
+            # All-or-nothing on purpose: a sum over the relations that do
+            # exist would be the partial total this field must never be.
+            return None
+        total += int(size)
+    return total
 
 
 async def _read_storage(conn) -> dict[str, Any]:

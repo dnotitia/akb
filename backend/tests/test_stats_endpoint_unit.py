@@ -255,6 +255,19 @@ async def test_vector_bytes_absent_when_the_index_is_not_in_this_database(db, mo
     assert "vector_bytes" not in payload["storage"]
 
 
+async def test_vector_bytes_absent_unless_every_index_relation_is_measured(db):
+    """Half an index is not a smaller index.
+
+    `pg_total_relation_size` answers per relation, so one missing relation
+    would otherwise leave a sum over the rest — a partial total that reads
+    exactly like the whole one. Both relations are created in one batch, so
+    this is theoretical today; the field keeps the principle literal.
+    """
+    db.relation_sizes = {("vector_index", "chunks"): 3_000_000_000}  # no `posting`
+    payload = await sampler.compute(now=_NOW)
+    assert "vector_bytes" not in payload["storage"]
+
+
 async def test_file_bytes_absent_when_any_confirmed_file_has_no_size(db):
     db.files = {"file_count": 5, "unsized": 1, "file_bytes": 900}
     payload = await sampler.compute()
