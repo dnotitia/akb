@@ -14,6 +14,7 @@ from typing import Any, Protocol
 import asyncpg
 
 from app.repositories.native_revision_cutover_repo import (
+    CutoverIntegrityError,
     CutoverExclusion,
     CutoverFile,
     CutoverRun,
@@ -78,9 +79,7 @@ class NativeRevisionCutoverVerifier:
                 run.namespace_id,
             )
         if not isinstance(vault_name, str) or not vault_name:
-            raise CutoverVerificationError(
-                f"vault {run.namespace_id} for migration run {run_id} does not exist"
-            )
+            raise CutoverVerificationError(f"vault {run.namespace_id} for migration run {run_id} does not exist")
         comparator = NativeRevisionShadowComparator(
             pool=self.pool,
             repository=self.repository,
@@ -112,6 +111,8 @@ class CutoverState:
     inventory_digest: str
     status: str
     verification_digest: str | None
+    aborted_from_status: str | None
+    aborted_at: Any
     vaults: tuple[CutoverVault, ...]
     files: tuple[CutoverFile, ...]
     exclusions: tuple[CutoverExclusion, ...]
@@ -239,25 +240,27 @@ class NativeRevisionCutover:
                 byte_size=int(row["size_bytes"]),
                 data=data,
             )
-            files.append(CutoverFile(
-                cutover_id=uuid.UUID(int=0),
-                namespace_id=row["namespace_id"],
-                file_id=row["file_id"],
-                logical_path=row["logical_path"],
-                mime_type=row["mime_type"],
-                content_hash=row["content_hash"],
-                byte_size=int(row["size_bytes"]),
-                s3_key=row["s3_key"],
-                etag=row["etag"],
-                storage_version=row["storage_version"],
-                created_by=row["created_by"],
-                disposition=disposition,
-                status="planned",
-                native_revision_id=None,
-                verification_digest=None,
-                applied_at=None,
-                verified_at=None,
-            ))
+            files.append(
+                CutoverFile(
+                    cutover_id=uuid.UUID(int=0),
+                    namespace_id=row["namespace_id"],
+                    file_id=row["file_id"],
+                    logical_path=row["logical_path"],
+                    mime_type=row["mime_type"],
+                    content_hash=row["content_hash"],
+                    byte_size=int(row["size_bytes"]),
+                    s3_key=row["s3_key"],
+                    etag=row["etag"],
+                    storage_version=row["storage_version"],
+                    created_by=row["created_by"],
+                    disposition=disposition,
+                    status="planned",
+                    native_revision_id=None,
+                    verification_digest=None,
+                    applied_at=None,
+                    verified_at=None,
+                )
+            )
         return files
 
     @staticmethod
@@ -294,8 +297,7 @@ class NativeRevisionCutover:
             omitted = sorted(str(item) for item in active_ids - set(by_input))
             added = sorted(str(item) for item in set(by_input) - active_ids)
             raise ValueError(
-                "cutover vaults must equal the complete active vault inventory "
-                f"(omitted={omitted}, added={added})"
+                f"cutover vaults must equal the complete active vault inventory (omitted={omitted}, added={added})"
             )
         eligible: list[CutoverVaultInput] = []
         exclusions: list[CutoverExclusion] = []
@@ -306,9 +308,7 @@ class NativeRevisionCutover:
                 row["name"],
             )
             if current_ref != item.fixed_ref:
-                raise ValueError(
-                    f"cutover fixed ref is not the current Git ref: {item.namespace_id}"
-                )
+                raise ValueError(f"cutover fixed ref is not the current Git ref: {item.namespace_id}")
             if row["external_git"]:
                 exclusions.append(
                     CutoverExclusion(
@@ -368,9 +368,7 @@ class NativeRevisionCutover:
             {
                 "vaults": [cls._vault_inventory_fact(item) for item in vaults],
                 "files": [cls._file_inventory_fact(item) for item in files],
-                "exclusions": [
-                    cls._exclusion_inventory_fact(item) for item in exclusions
-                ],
+                "exclusions": [cls._exclusion_inventory_fact(item) for item in exclusions],
             }
         )
 
@@ -485,9 +483,7 @@ class NativeRevisionCutover:
         for file in await self.repository.list_files(cutover_id):
             if file.status == "verified":
                 assert file.verification_digest is not None
-                receipts.append(
-                    {"file_id": str(file.file_id), "verification_digest": file.verification_digest}
-                )
+                receipts.append({"file_id": str(file.file_id), "verification_digest": file.verification_digest})
                 continue
             if file.status != "applied":
                 raise CutoverVerificationError(f"File {file.file_id} was not applied")
@@ -539,12 +535,24 @@ class NativeRevisionCutover:
                 "confirmed",
                 True,
             )
-            observed_source = None if source is None else (
-                source["vault_id"], source["id"], source["logical_path"],
-                source["mime_type"], source["content_hash"], int(source["size_bytes"]),
-                source["s3_key"], source["etag"], source["storage_version"],
-                source["created_by"], source["kind"], source["upload_state"],
-                source["hash_verified_at"] is not None,
+            observed_source = (
+                None
+                if source is None
+                else (
+                    source["vault_id"],
+                    source["id"],
+                    source["logical_path"],
+                    source["mime_type"],
+                    source["content_hash"],
+                    int(source["size_bytes"]),
+                    source["s3_key"],
+                    source["etag"],
+                    source["storage_version"],
+                    source["created_by"],
+                    source["kind"],
+                    source["upload_state"],
+                    source["hash_verified_at"] is not None,
+                )
             )
             if observed_source != expected_source:
                 raise CutoverVerificationError(f"File {file.file_id} source facts drifted")
@@ -554,23 +562,33 @@ class NativeRevisionCutover:
             if file.disposition == "native_text":
                 self._validate_text_file(file, data)
                 expected_native = (
-                    file.namespace_id, file.file_id, "file", "live",
-                    file.logical_path, file.native_revision_id,
-                    file.content_hash, file.byte_size,
+                    file.namespace_id,
+                    file.file_id,
+                    "file",
+                    "live",
+                    file.logical_path,
+                    file.native_revision_id,
+                    file.content_hash,
+                    file.byte_size,
                 )
-                observed_native = None if native is None else (
-                    native["namespace_id"], native["resource_id"], native["surface"],
-                    native["lifecycle"], native["current_path"], native["head_revision_id"],
-                    native["digest"], int(native["byte_size"]),
+                observed_native = (
+                    None
+                    if native is None
+                    else (
+                        native["namespace_id"],
+                        native["resource_id"],
+                        native["surface"],
+                        native["lifecycle"],
+                        native["current_path"],
+                        native["head_revision_id"],
+                        native["digest"],
+                        int(native["byte_size"]),
+                    )
                 )
                 if observed_native != expected_native:
-                    raise CutoverVerificationError(
-                        f"File {file.file_id} Native searchable projection drifted"
-                    )
+                    raise CutoverVerificationError(f"File {file.file_id} Native searchable projection drifted")
             elif native is not None:
-                raise CutoverVerificationError(
-                    f"binary File {file.file_id} unexpectedly gained text authority"
-                )
+                raise CutoverVerificationError(f"binary File {file.file_id} unexpectedly gained text authority")
             receipt = {
                 "file_id": str(file.file_id),
                 "disposition": file.disposition,
@@ -585,9 +603,7 @@ class NativeRevisionCutover:
                 native_revision_id=file.native_revision_id,
                 verification_digest=verification_digest,
             )
-            receipts.append(
-                {"file_id": str(file.file_id), "verification_digest": verification_digest}
-            )
+            receipts.append({"file_id": str(file.file_id), "verification_digest": verification_digest})
         return receipts
 
     async def _require_native_file_bindings(
@@ -613,9 +629,7 @@ class NativeRevisionCutover:
             )
             if file.disposition == "preserved_binary":
                 if native is not None:
-                    raise CutoverVerificationError(
-                        f"binary File {file.file_id} unexpectedly gained text authority"
-                    )
+                    raise CutoverVerificationError(f"binary File {file.file_id} unexpectedly gained text authority")
                 continue
             expected = (
                 file.namespace_id,
@@ -627,20 +641,22 @@ class NativeRevisionCutover:
                 file.content_hash,
                 file.byte_size,
             )
-            observed = None if native is None else (
-                native["namespace_id"],
-                native["resource_id"],
-                native["surface"],
-                native["lifecycle"],
-                native["current_path"],
-                native["head_revision_id"],
-                native["digest"],
-                int(native["byte_size"]),
+            observed = (
+                None
+                if native is None
+                else (
+                    native["namespace_id"],
+                    native["resource_id"],
+                    native["surface"],
+                    native["lifecycle"],
+                    native["current_path"],
+                    native["head_revision_id"],
+                    native["digest"],
+                    int(native["byte_size"]),
+                )
             )
             if observed != expected:
-                raise CutoverVerificationError(
-                    f"File {file.file_id} Native searchable projection drifted"
-                )
+                raise CutoverVerificationError(f"File {file.file_id} Native searchable projection drifted")
 
     async def _revalidate_authority_inventory(
         self,
@@ -667,25 +683,14 @@ class NativeRevisionCutover:
         for row in active:
             if row["external_git"]:
                 exclusion = exclusion_by_id.get(row["id"])
-                if (
-                    exclusion is None
-                    or exclusion.reason != "external_git_requires_collector"
-                ):
-                    raise CutoverVerificationError(
-                        "active vault classification drifted after planning"
-                    )
+                if exclusion is None or exclusion.reason != "external_git_requires_collector":
+                    raise CutoverVerificationError("active vault classification drifted after planning")
             elif row["id"] not in vault_by_id:
-                raise CutoverVerificationError(
-                    "active vault classification drifted after planning"
-                )
+                raise CutoverVerificationError("active vault classification drifted after planning")
         if any(row["external_git"] for row in active):
-            raise CutoverVerificationError(
-                "cutover authority cannot commit while persisted external Git vaults remain"
-            )
+            raise CutoverVerificationError("cutover authority cannot commit while persisted external Git vaults remain")
         if exclusions:
-            raise CutoverVerificationError(
-                "cutover exclusion inventory drifted after external Git retirement"
-            )
+            raise CutoverVerificationError("cutover exclusion inventory drifted after external Git retirement")
 
         active_by_id = {row["id"]: row for row in active}
         for vault in vaults:
@@ -695,16 +700,10 @@ class NativeRevisionCutover:
                 row["name"],
             )
             if current_ref != vault.fixed_git_oid:
-                raise CutoverVerificationError(
-                    f"vault {vault.namespace_id} Git ref drifted after verification"
-                )
-            migration_run = await self.backfill.repository.get_run(
-                vault.migration_run_id
-            )
+                raise CutoverVerificationError(f"vault {vault.namespace_id} Git ref drifted after verification")
+            migration_run = await self.backfill.repository.get_run(vault.migration_run_id)
             if migration_run is None:
-                raise CutoverVerificationError(
-                    f"vault {vault.namespace_id} migration run disappeared"
-                )
+                raise CutoverVerificationError(f"vault {vault.namespace_id} migration run disappeared")
             try:
                 inventory = await self.backfill.bridge.capture_inventory(
                     namespace_id=vault.namespace_id,
@@ -716,15 +715,11 @@ class NativeRevisionCutover:
                     f"vault {vault.namespace_id} inventory drifted after verification"
                 ) from exc
             if inventory.inventory_digest != vault.inventory_digest:
-                raise CutoverVerificationError(
-                    f"vault {vault.namespace_id} inventory drifted after verification"
-                )
+                raise CutoverVerificationError(f"vault {vault.namespace_id} inventory drifted after verification")
             receipt = await self.verifier.compare_run(vault.migration_run_id)
             self._require_passed_receipt(vault, receipt)
             if _digest(receipt) != vault.verification_digest:
-                raise CutoverVerificationError(
-                    f"vault {vault.namespace_id} verification receipt drifted"
-                )
+                raise CutoverVerificationError(f"vault {vault.namespace_id} verification receipt drifted")
 
         try:
             live_files = await self._file_inventory(
@@ -753,10 +748,10 @@ class NativeRevisionCutover:
         identity: NativeAuthorityIdentity,
     ) -> CutoverAuthorityState:
         run = await self._required_run(cutover_id)
+        if run.status == "aborted":
+            raise CutoverVerificationError("aborted cutover cannot commit authority")
         if run.status != "verified" or run.verification_digest is None:
-            raise CutoverVerificationError(
-                "cutover must be verified before authority can be committed"
-            )
+            raise CutoverVerificationError("cutover must be verified before authority can be committed")
         active = await self._active_vault_inventory()
         async with self._hold_git_write_fences([row["name"] for row in active]):
             async with self.pool.acquire() as conn:
@@ -783,6 +778,8 @@ class NativeRevisionCutover:
 
     async def apply(self, cutover_id: uuid.UUID) -> CutoverState:
         run = await self._required_run(cutover_id)
+        if run.status == "aborted":
+            raise CutoverApplyError("aborted cutover cannot be applied")
         if run.status in {"applied", "verified"}:
             return await self._state(run)
         vaults = await self.repository.list_vaults(cutover_id)
@@ -791,9 +788,7 @@ class NativeRevisionCutover:
                 continue
             result = await self.backfill.backfill_run(vault.migration_run_id)
             if result.status != "complete" or result.failed_items:
-                raise CutoverApplyError(
-                    f"vault {vault.namespace_id} backfill ended as {result.status}"
-                )
+                raise CutoverApplyError(f"vault {vault.namespace_id} backfill ended as {result.status}")
             await self.repository.set_vault_status(
                 cutover_id=cutover_id,
                 namespace_id=vault.namespace_id,
@@ -808,6 +803,8 @@ class NativeRevisionCutover:
 
     async def verify(self, cutover_id: uuid.UUID) -> CutoverState:
         run = await self._required_run(cutover_id)
+        if run.status == "aborted":
+            raise CutoverVerificationError("aborted cutover cannot be verified")
         if run.status == "verified":
             return await self._state(run)
         if run.status != "applied":
@@ -857,6 +854,14 @@ class NativeRevisionCutover:
         )
         return await self._state(run)
 
+    async def abort(self, cutover_id: uuid.UUID) -> CutoverState:
+        """Close a pre-authority cutover while retaining all additive evidence."""
+        try:
+            run = await self.repository.abort_run(cutover_id)
+        except CutoverIntegrityError as exc:
+            raise CutoverVerificationError(str(exc)) from exc
+        return await self._state(run)
+
     @staticmethod
     def _require_passed_receipt(
         vault: CutoverVault,
@@ -864,17 +869,13 @@ class NativeRevisionCutover:
     ) -> None:
         summary = receipt.get("summary")
         if not isinstance(summary, Mapping):
-            raise CutoverVerificationError(
-                f"vault {vault.namespace_id} verification summary is missing"
-            )
+            raise CutoverVerificationError(f"vault {vault.namespace_id} verification summary is missing")
         if (
             receipt.get("status") != "passed"
             or receipt.get("passed") is not True
             or summary.get("unexplained_mismatch_count") != 0
         ):
-            raise CutoverVerificationError(
-                f"vault {vault.namespace_id} verification did not pass"
-            )
+            raise CutoverVerificationError(f"vault {vault.namespace_id} verification did not pass")
 
     async def _required_run(self, cutover_id: uuid.UUID) -> CutoverRun:
         run = await self.repository.get_run(cutover_id)
@@ -889,6 +890,8 @@ class NativeRevisionCutover:
             inventory_digest=run.inventory_digest,
             status=run.status,
             verification_digest=run.verification_digest,
+            aborted_from_status=run.aborted_from_status,
+            aborted_at=run.aborted_at,
             vaults=tuple(await self.repository.list_vaults(run.cutover_id)),
             files=tuple(await self.repository.list_files(run.cutover_id)),
             exclusions=tuple(await self.repository.list_exclusions(run.cutover_id)),

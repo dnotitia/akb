@@ -25,6 +25,8 @@ class CutoverRun:
     created_at: Any
     applied_at: Any
     verified_at: Any
+    aborted_from_status: str | None
+    aborted_at: Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,7 +104,8 @@ class NativeRevisionCutoverRepository:
     ) -> CutoverRun | None:
         sql = """
             SELECT cutover_id, coverage_version, inventory_digest, status,
-                   verification_digest, created_at, applied_at, verified_at
+                   verification_digest, created_at, applied_at, verified_at,
+                   aborted_from_status, aborted_at
               FROM native_revision_cutover_runs
              WHERE cutover_id = $1
         """
@@ -229,10 +232,7 @@ class NativeRevisionCutoverRepository:
                 raise ValueError("cutover File digest or byte size is invalid")
             if file[10] not in {"native_text", "preserved_binary"}:
                 raise ValueError("cutover File disposition is invalid")
-        expected_exclusions = sorted(
-            (item.namespace_id, item.fixed_git_oid, item.reason)
-            for item in exclusions
-        )
+        expected_exclusions = sorted((item.namespace_id, item.fixed_git_oid, item.reason) for item in exclusions)
         if len({item[0] for item in expected_exclusions}) != len(expected_exclusions):
             raise ValueError("cutover exclusions must be unique")
         if {item[0] for item in expected} & {item[0] for item in expected_exclusions}:
@@ -248,7 +248,8 @@ class NativeRevisionCutoverRepository:
                 row = await conn.fetchrow(
                     """
                     SELECT cutover_id, coverage_version, inventory_digest, status,
-                           verification_digest, created_at, applied_at, verified_at
+                           verification_digest, created_at, applied_at, verified_at,
+                           aborted_from_status, aborted_at
                       FROM native_revision_cutover_runs
                      WHERE coverage_version = $1 AND inventory_digest = $2
                      FOR UPDATE
@@ -263,7 +264,8 @@ class NativeRevisionCutoverRepository:
                             (coverage_version, inventory_digest)
                         VALUES ($1, $2)
                         RETURNING cutover_id, coverage_version, inventory_digest, status,
-                                  verification_digest, created_at, applied_at, verified_at
+                                  verification_digest, created_at, applied_at, verified_at,
+                                  aborted_from_status, aborted_at
                         """,
                         coverage_version,
                         inventory_digest,
@@ -290,7 +292,10 @@ class NativeRevisionCutoverRepository:
                                 (cutover_id, namespace_id, fixed_git_oid, reason)
                             VALUES ($1, $2, $3, $4)
                             """,
-                            row["cutover_id"], namespace_id, fixed_git_oid, reason,
+                            row["cutover_id"],
+                            namespace_id,
+                            fixed_git_oid,
+                            reason,
                         )
                     for file in expected_files:
                         await conn.execute(
@@ -336,11 +341,11 @@ class NativeRevisionCutoverRepository:
                 if observed_files != expected_files:
                     raise CutoverIntegrityError("cutover File inventory drifted")
                 persisted_exclusions = await self.list_exclusions(
-                    row["cutover_id"], conn=conn,
+                    row["cutover_id"],
+                    conn=conn,
                 )
                 observed_exclusions = [
-                    (item.namespace_id, item.fixed_git_oid, item.reason)
-                    for item in persisted_exclusions
+                    (item.namespace_id, item.fixed_git_oid, item.reason) for item in persisted_exclusions
                 ]
                 if observed_exclusions != expected_exclusions:
                     raise CutoverIntegrityError("cutover exclusion inventory drifted")
@@ -359,9 +364,7 @@ class NativeRevisionCutoverRepository:
             raise ValueError("invalid cutover File status")
         if native_revision_id is not None and _OID_RE.fullmatch(native_revision_id) is None:
             raise ValueError("native_revision_id must be a lowercase 40-hex id")
-        if status == "verified" and (
-            verification_digest is None or _DIGEST_RE.fullmatch(verification_digest) is None
-        ):
+        if status == "verified" and (verification_digest is None or _DIGEST_RE.fullmatch(verification_digest) is None):
             raise ValueError("verified Files require a lowercase 64-hex digest")
         if status != "verified" and verification_digest is not None:
             raise ValueError("only verified Files carry a verification digest")
@@ -419,9 +422,7 @@ class NativeRevisionCutoverRepository:
     ) -> CutoverVault:
         if status not in _STATUSES:
             raise ValueError("invalid cutover vault status")
-        if status == "verified" and (
-            verification_digest is None or _DIGEST_RE.fullmatch(verification_digest) is None
-        ):
+        if status == "verified" and (verification_digest is None or _DIGEST_RE.fullmatch(verification_digest) is None):
             raise ValueError("verified vaults require a lowercase 64-hex digest")
         if status != "verified" and verification_digest is not None:
             raise ValueError("only verified vaults carry a verification digest")
@@ -475,9 +476,7 @@ class NativeRevisionCutoverRepository:
     ) -> CutoverRun:
         if status not in _STATUSES:
             raise ValueError("invalid cutover status")
-        if status == "verified" and (
-            verification_digest is None or _DIGEST_RE.fullmatch(verification_digest) is None
-        ):
+        if status == "verified" and (verification_digest is None or _DIGEST_RE.fullmatch(verification_digest) is None):
             raise ValueError("verified cutovers require a lowercase 64-hex digest")
         if status != "verified" and verification_digest is not None:
             raise ValueError("only verified cutovers carry a verification digest")
@@ -487,7 +486,8 @@ class NativeRevisionCutoverRepository:
                 row = await conn.fetchrow(
                     """
                     SELECT cutover_id, coverage_version, inventory_digest, status,
-                           verification_digest, created_at, applied_at, verified_at
+                           verification_digest, created_at, applied_at, verified_at,
+                           aborted_from_status, aborted_at
                       FROM native_revision_cutover_runs
                      WHERE cutover_id = $1
                      FOR UPDATE
@@ -496,6 +496,8 @@ class NativeRevisionCutoverRepository:
                 )
                 if row is None:
                     raise CutoverIntegrityError("cutover run disappeared")
+                if row["status"] == "aborted":
+                    raise CutoverIntegrityError("cutover run is aborted")
                 if _STATUSES.index(row["status"]) > _STATUSES.index(status):
                     return _run(row)
                 row = await conn.fetchrow(
@@ -508,12 +510,66 @@ class NativeRevisionCutoverRepository:
                            verified_at = CASE WHEN $2 = 'verified' THEN NOW() ELSE NULL END,
                            verification_digest = $3
                      WHERE cutover_id = $1
-                     RETURNING cutover_id, coverage_version, inventory_digest, status,
-                               verification_digest, created_at, applied_at, verified_at
+                    RETURNING cutover_id, coverage_version, inventory_digest, status,
+                               verification_digest, created_at, applied_at, verified_at,
+                               aborted_from_status, aborted_at
                     """,
                     cutover_id,
                     status,
                     verification_digest,
+                )
+                assert row is not None
+                return _run(row)
+
+    async def abort_run(self, cutover_id: uuid.UUID) -> CutoverRun:
+        """Permanently close a pre-authority cutover without deleting evidence."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT cutover_id, coverage_version, inventory_digest, status,
+                           verification_digest, created_at, applied_at, verified_at,
+                           aborted_from_status, aborted_at
+                      FROM native_revision_cutover_runs
+                     WHERE cutover_id = $1
+                     FOR UPDATE
+                    """,
+                    cutover_id,
+                )
+                if row is None:
+                    raise CutoverIntegrityError("cutover run disappeared")
+                if row["status"] == "aborted":
+                    return _run(row)
+                if await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM native_revision_existing_authority
+                         WHERE cutover_id = $1
+                    )
+                    """,
+                    cutover_id,
+                ):
+                    raise CutoverIntegrityError("committed cutover authority cannot be aborted")
+                fence_state = await conn.fetchval(
+                    """
+                    SELECT state FROM native_revision_legacy_write_fence
+                     WHERE fence_key = TRUE
+                    """
+                )
+                if fence_state != "open":
+                    raise CutoverIntegrityError("cutover cannot abort after the Legacy write fence closes")
+                row = await conn.fetchrow(
+                    """
+                    UPDATE native_revision_cutover_runs
+                       SET aborted_from_status = status,
+                           status = 'aborted',
+                           aborted_at = NOW()
+                     WHERE cutover_id = $1
+                    RETURNING cutover_id, coverage_version, inventory_digest, status,
+                              verification_digest, created_at, applied_at, verified_at,
+                              aborted_from_status, aborted_at
+                    """,
+                    cutover_id,
                 )
                 assert row is not None
                 return _run(row)

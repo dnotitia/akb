@@ -32,6 +32,7 @@ Subcommands:
     initialize-postgres-native  Claim and initialize a never-used PostgreSQL
                                 database for the stable Native backend.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -40,13 +41,14 @@ import json
 import os
 import secrets
 import sys
+import uuid
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import NoReturn
 
 
 REPAIR_RESOURCE_HASHES_USAGE = (
-    "Usage: python -m app.cli repair-resource-hashes "
-    "[--vault NAME] [--documents-only|--files-only] [--limit N]"
+    "Usage: python -m app.cli repair-resource-hashes [--vault NAME] [--documents-only|--files-only] [--limit N]"
 )
 
 PROVISION_RECOVERY_ADMIN_USAGE = (
@@ -57,13 +59,11 @@ PROVISION_RECOVERY_ADMIN_USAGE = (
 )
 
 GENERATE_LOCAL_SESSION_KEYSET_USAGE = (
-    "Usage: python -m app.cli generate-local-session-keyset "
-    "--output-dir DIR [--retain-jwks PATH ...]"
+    "Usage: python -m app.cli generate-local-session-keyset --output-dir DIR [--retain-jwks PATH ...]"
 )
 
 ISSUE_RECOVERY_ADMIN_CREDENTIAL_USAGE = (
-    "Usage: python -m app.cli issue-recovery-admin-credential "
-    "--expected-username USER --expected-email EMAIL"
+    "Usage: python -m app.cli issue-recovery-admin-credential --expected-username USER --expected-email EMAIL"
 )
 
 STANDALONE_SSO_BOOTSTRAP_USAGE = (
@@ -72,6 +72,11 @@ STANDALONE_SSO_BOOTSTRAP_USAGE = (
     "[--upgrade-client-id ID --upgrade-client-secret-file PATH] "
     "--product-admin-username USER --product-admin-email EMAIL "
     "--product-admin-password-file PATH"
+)
+
+MIGRATE_REVISION_BACKEND_USAGE = (
+    "Usage: python -m app.cli migrate-revision-backend "
+    "{plan --coverage-version VERSION|apply|verify|commit|abort --cutover-id UUID}"
 )
 
 
@@ -147,11 +152,7 @@ def _recovery_admin_parser() -> argparse.ArgumentParser:
 
 def _read_password_source(source: str) -> str:
     try:
-        text = (
-            sys.stdin.read()
-            if source == "-"
-            else Path(source).read_text(encoding="utf-8")
-        )
+        text = sys.stdin.read() if source == "-" else Path(source).read_text(encoding="utf-8")
     except OSError:
         raise _ProvisioningInputError("Unable to read the password source") from None
     password = text.rstrip("\r\n")
@@ -200,7 +201,7 @@ def _write_generated_password(target: str, password: str) -> Path:
             output.write("\n")
             output.flush()
             os.fsync(output.fileno())
-    except (OSError, ValueError):
+    except OSError, ValueError:
         if fd is not None:
             try:
                 os.close(fd)
@@ -431,21 +432,15 @@ async def _bootstrap_standalone_sso(args: list[str]) -> int:
     report: dict[str, object] | None = None
     error: tuple[str, str] | None = None
     try:
-        bootstrap_secret = _read_optional_bootstrap_secret_file(
-            parsed.bootstrap_client_secret_file
-        )
+        bootstrap_secret = _read_optional_bootstrap_secret_file(parsed.bootstrap_client_secret_file)
         upgrade_secret = (
             _read_optional_bootstrap_secret_file(parsed.upgrade_client_secret_file)
             if parsed.upgrade_client_secret_file is not None
             else ""
         )
-        product_admin_password = _read_optional_bootstrap_secret_file(
-            parsed.product_admin_password_file
-        )
+        product_admin_password = _read_optional_bootstrap_secret_file(parsed.product_admin_password_file)
         if settings.require_auth_mode() != "sso" or not settings.keycloak_enabled:
-            raise _ProvisioningInputError(
-                "Standalone SSO bootstrap requires auth_mode=sso and Keycloak enabled"
-            )
+            raise _ProvisioningInputError("Standalone SSO bootstrap requires auth_mode=sso and Keycloak enabled")
         required = {
             "keycloak_server_url": settings.keycloak_server_url,
             "keycloak_internal_url or keycloak_server_url": (
@@ -458,19 +453,13 @@ async def _bootstrap_standalone_sso(args: list[str]) -> int:
             "keycloak_admin_client_id": settings.keycloak_admin_client_id,
             "keycloak_admin_client_secret": settings.keycloak_admin_client_secret,
             "keycloak_management_client_id": settings.keycloak_management_client_id,
-            "keycloak_management_client_secret": (
-                settings.keycloak_management_client_secret
-            ),
+            "keycloak_management_client_secret": (settings.keycloak_management_client_secret),
         }
         missing = [name for name, value in required.items() if not value]
         if missing:
-            raise _ProvisioningInputError(
-                "Standalone SSO configuration is incomplete: " + ", ".join(missing)
-            )
+            raise _ProvisioningInputError("Standalone SSO configuration is incomplete: " + ", ".join(missing))
         if settings.keycloak_public_client:
-            raise _ProvisioningInputError(
-                "Bundled standalone SSO requires a confidential API client"
-            )
+            raise _ProvisioningInputError("Bundled standalone SSO requires a confidential API client")
         credentials = [
             settings.keycloak_client_secret,
             settings.keycloak_admin_client_secret,
@@ -481,9 +470,7 @@ async def _bootstrap_standalone_sso(args: list[str]) -> int:
         ]
         configured_credentials = [value for value in credentials if value]
         if len(set(configured_credentials)) != len(configured_credentials):
-            raise _ProvisioningInputError(
-                "Standalone SSO credentials must be independently generated"
-            )
+            raise _ProvisioningInputError("Standalone SSO credentials must be independently generated")
         client_ids = {
             settings.keycloak_client_id,
             settings.keycloak_admin_client_id,
@@ -491,14 +478,10 @@ async def _bootstrap_standalone_sso(args: list[str]) -> int:
             parsed.upgrade_client_id,
         }
         if len(client_ids) != 4:
-            raise _ProvisioningInputError(
-                "Standalone SSO API, admin, management, and upgrade clients must be distinct"
-            )
+            raise _ProvisioningInputError("Standalone SSO API, admin, management, and upgrade clients must be distinct")
 
         spec = StandaloneSSOBootstrapSpec(
-            keycloak_internal_url=(
-                settings.keycloak_internal_url or settings.keycloak_server_url
-            ),
+            keycloak_internal_url=(settings.keycloak_internal_url or settings.keycloak_server_url),
             keycloak_public_url=settings.keycloak_server_url,
             realm=settings.keycloak_realm,
             akb_public_url=settings.public_base_url,
@@ -513,16 +496,12 @@ async def _bootstrap_standalone_sso(args: list[str]) -> int:
             product_admin_username=parsed.product_admin_username,
             product_admin_email=parsed.product_admin_email,
             product_admin_password=product_admin_password,
-            backchannel_logout_uri=(
-                settings.keycloak_backchannel_logout_uri_effective
-            ),
+            backchannel_logout_uri=(settings.keycloak_backchannel_logout_uri_effective),
             upgrade_client_id=parsed.upgrade_client_id,
             upgrade_client_secret=upgrade_secret,
         )
         await _initialize_operator_database()
-        control = KeycloakStandaloneSSOControl(
-            verify_ssl=settings.keycloak_verify_ssl
-        )
+        control = KeycloakStandaloneSSOControl(verify_ssl=settings.keycloak_verify_ssl)
         report = await bootstrap_standalone_sso(
             spec,
             control=control,
@@ -577,7 +556,9 @@ async def _reset_password(username: str) -> int:
 
     try:
         temp, uname = await reset_password(
-            username=username, actor_id=None, method="cli",
+            username=username,
+            actor_id=None,
+            method="cli",
         )
     except NotFoundError:
         print(f"User not found: {username}", file=sys.stderr)
@@ -661,6 +642,104 @@ async def _initialize_postgres_native(args: list[str]) -> int:
     return 0
 
 
+def _native_revision_cutover_parser() -> argparse.ArgumentParser:
+    parser = _SafeArgumentParser(add_help=False)
+    phases = parser.add_subparsers(dest="phase", required=True)
+    plan = phases.add_parser("plan", add_help=False)
+    plan.add_argument("--coverage-version", required=True)
+    for phase in ("apply", "verify", "commit", "abort"):
+        command = phases.add_parser(phase, add_help=False)
+        command.add_argument("--cutover-id", required=True)
+    return parser
+
+
+async def _execute_native_revision_cutover(
+    phase: str,
+    *,
+    coverage_version: str | None,
+    cutover_id: str | None,
+) -> dict[str, object]:
+    """Run one thin operator phase over the product cutover services."""
+    from app.db.postgres import close_pool, get_pool, init_db
+    from app.services.git_service import GitService
+    from app.services.native_revision_authority import NativeAuthorityIdentity
+    from app.services.native_revision_backfill import NativeRevisionBackfill
+    from app.services.native_revision_cutover import (
+        CutoverVaultInput,
+        NativeRevisionCutover,
+        NativeRevisionCutoverVerifier,
+    )
+
+    try:
+        await init_db()
+        pool = await get_pool()
+        git = GitService()
+        cutover = NativeRevisionCutover(
+            pool,
+            backfill=NativeRevisionBackfill(pool, git=git),
+            verifier=NativeRevisionCutoverVerifier(pool, git=git),
+        )
+        result: object
+        if phase == "plan":
+            assert coverage_version is not None
+            async with pool.acquire() as conn:
+                rows = await conn.fetch("SELECT id, name FROM vaults WHERE status = 'active' ORDER BY id")
+            vaults = []
+            for row in rows:
+                fixed_ref = await asyncio.to_thread(git.current_commit, row["name"])
+                if fixed_ref is None:
+                    raise ValueError(f"active vault has no current Legacy Git ref: {row['id']}")
+                vaults.append(
+                    CutoverVaultInput(
+                        namespace_id=row["id"],
+                        fixed_ref=fixed_ref,
+                    )
+                )
+            result = await cutover.plan(
+                vaults=vaults,
+                coverage_version=coverage_version,
+            )
+        else:
+            assert cutover_id is not None
+            parsed_id = uuid.UUID(cutover_id)
+            if phase == "apply":
+                result = await cutover.apply(parsed_id)
+            elif phase == "verify":
+                result = await cutover.verify(parsed_id)
+            elif phase == "commit":
+                result = await cutover.commit(
+                    parsed_id,
+                    identity=NativeAuthorityIdentity.from_settings(),
+                )
+            else:
+                result = await cutover.abort(parsed_id)
+        if not is_dataclass(result):
+            raise RuntimeError("cutover phase returned an invalid operator result")
+        return json.loads(json.dumps(asdict(result), default=str))
+    finally:
+        await close_pool()
+
+
+async def _migrate_revision_backend(args: list[str]) -> int:
+    try:
+        parsed = _native_revision_cutover_parser().parse_args(args)
+    except _CLIUsageError:
+        print(MIGRATE_REVISION_BACKEND_USAGE, file=sys.stderr)
+        return 2
+
+    try:
+        report = await _execute_native_revision_cutover(
+            parsed.phase,
+            coverage_version=getattr(parsed, "coverage_version", None),
+            cutover_id=getattr(parsed, "cutover_id", None),
+        )
+    except (ValueError, RuntimeError) as exc:
+        print(f"revision_backend_cutover_failed: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(report, sort_keys=True))
+    return 0
+
+
 def _okf_validate(args: list[str]) -> int:
     """`okf-validate <bundle-dir>` — check a directory against OKF v0.1."""
     from pathlib import Path
@@ -690,10 +769,7 @@ def _okf_export(args: list[str]) -> int:
 
     from app.services.okf import build_bundle, check_bundle, records_from_git_tree, write_bundle
 
-    usage = (
-        "Usage: python -m app.cli okf-export --from-git <worktree> "
-        "--vault <name> --out <dir>"
-    )
+    usage = "Usage: python -m app.cli okf-export --from-git <worktree> --vault <name> --out <dir>"
     from_git = vault = out = None
     index = 0
     while index < len(args):
@@ -741,7 +817,8 @@ def main(argv: list[str] | None = None) -> int:
             "issue-recovery-admin-credential, "
             "bootstrap-standalone-sso, "
             "reset-password <username>, repair-resource-hashes, "
-            "initialize-postgres-native, okf-validate <dir>, "
+            "initialize-postgres-native, migrate-revision-backend, "
+            "okf-validate <dir>, "
             "okf-export --from-git <worktree> --vault <name> --out <dir>",
             file=sys.stderr,
         )
@@ -764,6 +841,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_repair_resource_hashes(argv[1:]))
     if cmd == "initialize-postgres-native":
         return asyncio.run(_initialize_postgres_native(argv[1:]))
+    if cmd == "migrate-revision-backend":
+        return asyncio.run(_migrate_revision_backend(argv[1:]))
     if cmd == "okf-validate":
         return _okf_validate(argv[1:])
     if cmd == "okf-export":

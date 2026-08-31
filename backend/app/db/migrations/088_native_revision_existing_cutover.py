@@ -36,25 +36,42 @@ async def _run(conn):
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 applied_at TIMESTAMPTZ,
                 verified_at TIMESTAMPTZ,
+                aborted_from_status TEXT,
+                aborted_at TIMESTAMPTZ,
                 CONSTRAINT native_revision_cutover_runs_coverage_check
                     CHECK (btrim(coverage_version) <> ''),
                 CONSTRAINT native_revision_cutover_runs_inventory_digest_check
                     CHECK (inventory_digest ~ '^[0-9a-f]{64}$'),
                 CONSTRAINT native_revision_cutover_runs_status_check
-                    CHECK (status IN ('planned', 'applied', 'verified')),
+                    CHECK (status IN ('planned', 'applied', 'verified', 'aborted')),
+                CONSTRAINT native_revision_cutover_runs_abort_check
+                    CHECK (
+                        (status <> 'aborted'
+                         AND aborted_from_status IS NULL
+                         AND aborted_at IS NULL)
+                        OR
+                        (status = 'aborted'
+                         AND aborted_from_status IN ('planned', 'applied', 'verified')
+                         AND aborted_at IS NOT NULL)
+                    ),
                 CONSTRAINT native_revision_cutover_runs_verification_check
                     CHECK (
-                        (status <> 'verified' AND verification_digest IS NULL AND verified_at IS NULL)
+                        (status <> 'verified'
+                         AND COALESCE(aborted_from_status, '') <> 'verified'
+                         AND verification_digest IS NULL
+                         AND verified_at IS NULL)
                         OR
-                        (status = 'verified'
+                        ((status = 'verified' OR aborted_from_status = 'verified')
                          AND verification_digest ~ '^[0-9a-f]{64}$'
                          AND verified_at IS NOT NULL)
                     ),
                 CONSTRAINT native_revision_cutover_runs_applied_check
                     CHECK (
-                        (status = 'planned' AND applied_at IS NULL)
+                        ((status = 'planned' OR aborted_from_status = 'planned')
+                         AND applied_at IS NULL)
                         OR
-                        (status IN ('applied', 'verified') AND applied_at IS NOT NULL)
+                        (COALESCE(aborted_from_status, status) IN ('applied', 'verified')
+                         AND applied_at IS NOT NULL)
                     ),
                 CONSTRAINT native_revision_cutover_runs_identity_key
                     UNIQUE (coverage_version, inventory_digest)

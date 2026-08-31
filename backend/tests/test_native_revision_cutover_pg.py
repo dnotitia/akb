@@ -28,6 +28,7 @@ from app.services.native_revision_authority import (
     consume_or_validate_existing_database_authority,
 )
 from app.services.native_revision_cutover import (
+    CutoverApplyError,
     CutoverVerificationError,
     CutoverVaultInput,
     NativeRevisionCutover,
@@ -49,7 +50,7 @@ _DSN = os.environ.get(
 async def _reachable() -> bool:
     try:
         conn = await asyncpg.connect(_DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
+    except OSError, asyncpg.PostgresError:
         return False
     await conn.close()
     return True
@@ -222,10 +223,7 @@ class _FixtureVerifier:
         passed = (
             row["status"] == "complete"
             and row["complete_items"] > 0
-            and row["complete_items"]
-            == row["native_resources"]
-            == row["native_heads"]
-            == row["retained_mappings"]
+            and row["complete_items"] == row["native_resources"] == row["native_heads"] == row["retained_mappings"]
         )
         return {
             "status": "passed" if passed else "failed",
@@ -276,9 +274,7 @@ async def test_two_manual_vaults_plan_apply_and_verify_as_one_database_cutover(t
         planned = await cutover.plan(vaults=vaults, coverage_version="fixture-v1")
         assert planned.status == "planned"
         assert len(planned.vaults) == 2
-        assert {item.namespace_id for item in planned.vaults} == {
-            item.namespace_id for item in vaults
-        }
+        assert {item.namespace_id for item in planned.vaults} == {item.namespace_id for item in vaults}
         assert len({item.migration_run_id for item in planned.vaults}) == 2
 
         applied = await cutover.apply(planned.cutover_id)
@@ -391,18 +387,20 @@ async def test_persisted_external_mirror_is_reported_without_poisoning_manual_ba
             coverage_version="fixture-external-mirror-v1",
         )
         assert [item.namespace_id for item in planned.vaults] == [manual.namespace_id]
-        assert [
-            (item.namespace_id, item.fixed_git_oid, item.reason)
-            for item in planned.exclusions
-        ] == [(mirror_id, mirror_oid, "external_git_requires_collector")]
+        assert [(item.namespace_id, item.fixed_git_oid, item.reason) for item in planned.exclusions] == [
+            (mirror_id, mirror_oid, "external_git_requires_collector")
+        ]
         async with pool.acquire() as conn:
-            assert await conn.fetchval(
-                """
+            assert (
+                await conn.fetchval(
+                    """
                 SELECT count(*) FROM native_revision_migration_runs
                  WHERE namespace_id = $1
                 """,
-                mirror_id,
-            ) == 0
+                    mirror_id,
+                )
+                == 0
+            )
 
         assert (await cutover.apply(planned.cutover_id)).status == "applied"
         verified = await cutover.verify(planned.cutover_id)
@@ -417,22 +415,26 @@ async def test_persisted_external_mirror_is_reported_without_poisoning_manual_ba
         ):
             await cutover.commit(planned.cutover_id, identity=identity)
         async with pool.acquire() as conn:
-            assert await conn.fetchval(
-                "SELECT count(*) FROM native_revision_existing_authority"
-            ) == 0
-            assert await conn.fetchval(
-                "SELECT count(*) FROM native_resources WHERE namespace_id = $1",
-                mirror_id,
-            ) == 0
+            assert await conn.fetchval("SELECT count(*) FROM native_revision_existing_authority") == 0
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM native_resources WHERE namespace_id = $1",
+                    mirror_id,
+                )
+                == 0
+            )
             await conn.execute("DELETE FROM vaults WHERE id = $1", mirror_id)
-            assert await conn.fetchval(
-                """
+            assert (
+                await conn.fetchval(
+                    """
                 SELECT count(*) FROM native_revision_cutover_exclusions
                  WHERE cutover_id = $1 AND namespace_id = $2
                 """,
-                planned.cutover_id,
-                mirror_id,
-            ) == 1
+                    planned.cutover_id,
+                    mirror_id,
+                )
+                == 1
+            )
 
         with pytest.raises(
             CutoverVerificationError,
@@ -440,12 +442,11 @@ async def test_persisted_external_mirror_is_reported_without_poisoning_manual_ba
         ):
             await cutover.commit(planned.cutover_id, identity=identity)
         async with pool.acquire() as conn:
-            assert await conn.fetchval(
-                "SELECT state FROM native_revision_legacy_write_fence WHERE fence_key = TRUE"
-            ) == "open"
-            assert await conn.fetchval(
-                "SELECT count(*) FROM native_revision_existing_authority"
-            ) == 0
+            assert (
+                await conn.fetchval("SELECT state FROM native_revision_legacy_write_fence WHERE fence_key = TRUE")
+                == "open"
+            )
+            assert await conn.fetchval("SELECT count(*) FROM native_revision_existing_authority") == 0
 
 
 async def test_commit_rejects_an_omitted_eligible_file_and_leaves_writes_open(tmp_path):
@@ -484,16 +485,18 @@ async def test_commit_rejects_an_omitted_eligible_file_and_leaves_writes_open(tm
             await cutover.commit(planned.cutover_id, identity=_identity("omitted-file"))
 
         async with pool.acquire() as conn:
-            assert await conn.fetchval(
-                "SELECT state FROM native_revision_legacy_write_fence WHERE fence_key = TRUE"
-            ) == "open"
-            assert await conn.fetchval(
-                "SELECT count(*) FROM native_revision_existing_authority"
-            ) == 0
-            assert await conn.execute(
-                "UPDATE documents SET title = title WHERE vault_id = $1",
-                vault.namespace_id,
-            ) == "UPDATE 1"
+            assert (
+                await conn.fetchval("SELECT state FROM native_revision_legacy_write_fence WHERE fence_key = TRUE")
+                == "open"
+            )
+            assert await conn.fetchval("SELECT count(*) FROM native_revision_existing_authority") == 0
+            assert (
+                await conn.execute(
+                    "UPDATE documents SET title = title WHERE vault_id = $1",
+                    vault.namespace_id,
+                )
+                == "UPDATE 1"
+            )
 
 
 async def test_commit_rejects_a_post_plan_vault_and_rolls_back_the_fence(tmp_path):
@@ -523,17 +526,16 @@ async def test_commit_rejects_a_post_plan_vault_and_rolls_back_the_fence(tmp_pat
             )
 
         async with pool.acquire() as conn:
-            fence = await conn.fetchrow(
-                "SELECT state, epoch, cutover_id FROM native_revision_legacy_write_fence"
-            )
+            fence = await conn.fetchrow("SELECT state, epoch, cutover_id FROM native_revision_legacy_write_fence")
             assert tuple(fence.values()) == ("open", 0, None)
-            assert await conn.fetchval(
-                "SELECT count(*) FROM native_revision_existing_authority"
-            ) == 0
-            assert await conn.execute(
-                "UPDATE documents SET title = title WHERE vault_id = $1",
-                original.namespace_id,
-            ) == "UPDATE 1"
+            assert await conn.fetchval("SELECT count(*) FROM native_revision_existing_authority") == 0
+            assert (
+                await conn.execute(
+                    "UPDATE documents SET title = title WHERE vault_id = $1",
+                    original.namespace_id,
+                )
+                == "UPDATE 1"
+            )
 
 
 async def test_commit_revalidates_file_bytes_and_current_git_refs(tmp_path):
@@ -586,12 +588,8 @@ async def test_commit_revalidates_file_bytes_and_current_git_refs(tmp_path):
             await cutover.commit(planned.cutover_id, identity=identity)
 
         async with pool.acquire() as conn:
-            assert await conn.fetchval(
-                "SELECT state FROM native_revision_legacy_write_fence"
-            ) == "open"
-            assert await conn.fetchval(
-                "SELECT count(*) FROM native_revision_existing_authority"
-            ) == 0
+            assert await conn.fetchval("SELECT state FROM native_revision_legacy_write_fence") == "open"
+            assert await conn.fetchval("SELECT count(*) FROM native_revision_existing_authority") == 0
 
 
 async def test_text_mime_with_invalid_nul_or_oversized_bytes_is_preserved_binary(
@@ -636,10 +634,13 @@ async def test_text_mime_with_invalid_nul_or_oversized_bytes_is_preserved_binary
         verified = await cutover.verify(planned.cutover_id)
         assert {item.status for item in verified.files} == {"verified"}
         async with pool.acquire() as conn:
-            assert await conn.fetchval(
-                "SELECT count(*) FROM native_resources WHERE resource_id = ANY($1::uuid[])",
-                list(file_ids),
-            ) == 0
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM native_resources WHERE resource_id = ANY($1::uuid[])",
+                    list(file_ids),
+                )
+                == 0
+            )
 
 
 async def test_authority_mint_is_the_boundary_and_fences_external_git_race(tmp_path):
@@ -685,9 +686,7 @@ async def test_authority_mint_is_the_boundary_and_fences_external_git_race(tmp_p
         identity = _identity("fence-race")
 
         reader.block = True
-        commit_task = asyncio.create_task(
-            cutover.commit(planned.cutover_id, identity=identity)
-        )
+        commit_task = asyncio.create_task(cutover.commit(planned.cutover_id, identity=identity))
         assert await asyncio.to_thread(reader.started.wait, 5)
         try:
             async with pool.acquire() as racer:
@@ -714,9 +713,7 @@ async def test_authority_mint_is_the_boundary_and_fences_external_git_race(tmp_p
 
         assert authority.status == "committed"
         async with pool.acquire() as conn:
-            fence = await conn.fetchrow(
-                "SELECT state, epoch, cutover_id FROM native_revision_legacy_write_fence"
-            )
+            fence = await conn.fetchrow("SELECT state, epoch, cutover_id FROM native_revision_legacy_write_fence")
             assert tuple(fence.values()) == ("committed", 1, planned.cutover_id)
             with pytest.raises(
                 asyncpg.ObjectNotInPrerequisiteStateError,
@@ -726,10 +723,13 @@ async def test_authority_mint_is_the_boundary_and_fences_external_git_race(tmp_p
                     "UPDATE documents SET title = title WHERE vault_id = $1",
                     vault.namespace_id,
                 )
-            assert await conn.execute(
-                "UPDATE vault_files SET description = 'native-era write' WHERE vault_id = $1",
-                vault.namespace_id,
-            ) == "UPDATE 1"
+            assert (
+                await conn.execute(
+                    "UPDATE vault_files SET description = 'native-era write' WHERE vault_id = $1",
+                    vault.namespace_id,
+                )
+                == "UPDATE 1"
+            )
             assert (
                 await consume_or_validate_existing_database_authority(
                     conn,
@@ -764,33 +764,26 @@ async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop
                 "INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING",
                 [(name,) for name in sorted(registered - cutover_files)],
             )
-            applied = {
-                row["filename"]
-                for row in await conn.fetch("SELECT filename FROM schema_migrations")
-            }
+            applied = {row["filename"] for row in await conn.fetch("SELECT filename FROM schema_migrations")}
             await postgres._apply_pending_migrations(conn, applied)
             assert loaded == [
                 "088_native_revision_existing_cutover.py",
                 "089_native_file_projection_outbox.py",
             ]
-            assert await conn.fetchval(
-                "SELECT state FROM native_revision_legacy_write_fence"
-            ) == "open"
-            assert await conn.fetchval(
-                "SELECT to_regclass('public.native_file_projection_outbox') IS NOT NULL"
-            ) is True
+            assert await conn.fetchval("SELECT state FROM native_revision_legacy_write_fence") == "open"
+            assert await conn.fetchval("SELECT to_regclass('public.native_file_projection_outbox') IS NOT NULL") is True
 
             loaded.clear()
-            applied = {
-                row["filename"]
-                for row in await conn.fetch("SELECT filename FROM schema_migrations")
-            }
+            applied = {row["filename"] for row in await conn.fetch("SELECT filename FROM schema_migrations")}
             await postgres._apply_pending_migrations(conn, applied)
             assert loaded == []
-            assert await conn.fetchval(
-                "SELECT count(*) FROM schema_migrations WHERE filename = ANY($1::text[])",
-                list(cutover_files),
-            ) == 2
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM schema_migrations WHERE filename = ANY($1::text[])",
+                    list(cutover_files),
+                )
+                == 2
+            )
 
 
 async def test_unexplained_fixture_mismatch_stops_before_verified_state(tmp_path):
@@ -826,6 +819,54 @@ async def test_unexplained_fixture_mismatch_stops_before_verified_state(tmp_path
             )
         assert run_status == "applied"
         assert vault_status == "applied"
+
+
+async def test_abort_preserves_additive_evidence_and_keeps_legacy_writes_open(tmp_path):
+    async with _fresh_schema() as pool:
+        git = GitService(storage_path=str(tmp_path / "git-abort"))
+        vault = await _manual_vault(pool, git, label="abort")
+        cutover = NativeRevisionCutover(
+            pool,
+            backfill=NativeRevisionBackfill(pool, git=git),
+            verifier=_FixtureVerifier(pool),
+        )
+
+        planned = await cutover.plan(
+            vaults=[vault],
+            coverage_version="fixture-abort-v1",
+        )
+        applied = await cutover.apply(planned.cutover_id)
+        assert applied.status == "applied"
+        async with pool.acquire() as conn:
+            native_before = await conn.fetchval("SELECT count(*) FROM native_resources")
+
+        aborted = await cutover.abort(planned.cutover_id)
+        assert aborted.status == "aborted"
+        assert aborted.aborted_from_status == "applied"
+        assert aborted.aborted_at is not None
+        assert await cutover.abort(planned.cutover_id) == aborted
+
+        with pytest.raises(CutoverVerificationError, match="aborted"):
+            await cutover.commit(
+                planned.cutover_id,
+                identity=NativeAuthorityIdentity(
+                    tenant_id="fixture-tenant",
+                    namespace="fixture-namespace",
+                    database_id=uuid.uuid4(),
+                    current_database="akb",
+                    runtime_image_digest="sha256:" + "a" * 64,
+                ),
+            )
+        with pytest.raises(CutoverApplyError, match="aborted"):
+            await cutover.apply(planned.cutover_id)
+
+        async with pool.acquire() as conn:
+            assert await conn.fetchval("SELECT count(*) FROM native_resources") == native_before
+            assert not await conn.fetchval("SELECT EXISTS (SELECT 1 FROM native_revision_existing_authority)")
+            await conn.execute(
+                "UPDATE documents SET title = 'Legacy remains writable' WHERE vault_id = $1",
+                vault.namespace_id,
+            )
 
 
 async def test_product_shadow_verifier_checks_real_git_and_native_reads(tmp_path):

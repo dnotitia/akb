@@ -95,3 +95,7 @@ and is outside this backend contract.
   database-wide fenced cutover above.
 - No fleet default, tenant cutover, Bare Git retirement, or production-readiness
   claim is implied by the selector.
+
+See
+[`native-revision-existing-database-cutover.md`](../../../operations/native-revision-existing-database-cutover.md)
+for the thin operator CLI, downtime sequence, and snapshot-backed rollback.
