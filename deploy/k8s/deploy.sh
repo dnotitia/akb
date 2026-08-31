@@ -2,13 +2,13 @@
 #
 # AKB Kubernetes deploy — builds + pushes images, applies a kustomize tree.
 #
-# Required env:
-#   REGISTRY      Docker registry to push to (e.g. ghcr.io/myorg or
-#                 my-registry.local:5000). Images are tagged
-#                 ${REGISTRY}/akb-backend:latest and akb-frontend:latest.
+# Image inputs:
+#   Normal build: REGISTRY is required and images are built/pushed there.
+#   Existing images: set SKIP_BUILD=true plus BACKEND_IMAGE and FRONTEND_IMAGE.
 #
 # Optional env:
 #   NAMESPACE     K8s namespace (default: akb).
+#   KUBE_CONTEXT  Explicit kubectl context. Defaults to the current context.
 #   KUSTOMIZE_DIR Directory passed to `kubectl kustomize`. Defaults to
 #                 the script's own directory (= base manifests). Set to
 #                 an overlay (e.g. deploy/k8s/internal) to apply private
@@ -16,16 +16,38 @@
 #                 a single atomic apply — no placeholder window.
 #   PUBLIC_URL    Printed at the end. Cosmetic only — the actual host
 #                 lives in ingress.yaml (or its overlay patch).
+#   SECRET_MODE   manual (default), bundled, or external.
+#   SECRET_ENGINE openbao or hashicorp-vault for bundled/external modes.
+#   SECRET_PROFILE development (default) or production for bundled mode.
+#   STORAGE_CLASS StorageClass for AKB/PostgreSQL and bundled-manager PVCs.
 #
 # See deploy/k8s/README.md for the operator-overlay pattern.
 
 set -euo pipefail
 
-: "${REGISTRY:?Set REGISTRY env (e.g. REGISTRY=ghcr.io/myorg)}"
 NAMESPACE="${NAMESPACE:-akb}"
+KUBE_CONTEXT="${KUBE_CONTEXT:-}"
+SKIP_BUILD="${SKIP_BUILD:-false}"
+SECRET_MODE="${SECRET_MODE:-manual}"
+SECRET_PROFILE="${SECRET_PROFILE:-development}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 KUSTOMIZE_DIR="${KUSTOMIZE_DIR:-${SCRIPT_DIR}}"
 ROOT_DIR="${SCRIPT_DIR}/../.."
+
+KUBECTL=(kubectl)
+if [[ -n "${KUBE_CONTEXT}" ]]; then
+  KUBECTL+=(--context "${KUBE_CONTEXT}")
+fi
+
+if [[ ! "${NAMESPACE}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+  echo "NAMESPACE is not a valid DNS label" >&2
+  exit 2
+fi
+if [[ -n "${STORAGE_CLASS:-}" &&
+      ! "${STORAGE_CLASS}" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]]; then
+  echo "STORAGE_CLASS is not a valid StorageClass name" >&2
+  exit 2
+fi
 
 # Product version is the single source of truth in backend/pyproject.toml.
 # Each build publishes :${VERSION} (immutable, for rollback / pin) and :latest
@@ -34,50 +56,106 @@ ROOT_DIR="${SCRIPT_DIR}/../.."
 VERSION="$(awk -F'"' '/^version = /{print $2; exit}' "${ROOT_DIR}/backend/pyproject.toml")"
 : "${VERSION:?Could not read [project].version from backend/pyproject.toml}"
 
-echo "=== Building Docker images (linux/amd64) — version ${VERSION} ==="
-docker buildx build --platform linux/amd64 \
-  -t "${REGISTRY}/akb-backend:${VERSION}" \
-  -t "${REGISTRY}/akb-backend:latest" \
-  --push \
-  "${ROOT_DIR}/backend/"
+if [[ "${SKIP_BUILD}" == "true" ]]; then
+  : "${BACKEND_IMAGE:?Set BACKEND_IMAGE when SKIP_BUILD=true}"
+  : "${FRONTEND_IMAGE:?Set FRONTEND_IMAGE when SKIP_BUILD=true}"
+  echo "=== Reusing caller-supplied images ==="
+else
+  : "${REGISTRY:?Set REGISTRY env (e.g. REGISTRY=ghcr.io/myorg)}"
+  BACKEND_IMAGE="${REGISTRY}/akb-backend:latest"
+  FRONTEND_IMAGE="${REGISTRY}/akb-frontend:latest"
+  echo "=== Building Docker images (linux/amd64) — version ${VERSION} ==="
+  docker buildx build --platform linux/amd64 \
+    -t "${REGISTRY}/akb-backend:${VERSION}" \
+    -t "${BACKEND_IMAGE}" \
+    --push \
+    "${ROOT_DIR}/backend/"
 
-docker buildx build --platform linux/amd64 \
-  -t "${REGISTRY}/akb-frontend:${VERSION}" \
-  -t "${REGISTRY}/akb-frontend:latest" \
-  --push \
-  "${ROOT_DIR}/frontend/"
+  docker buildx build --platform linux/amd64 \
+    -t "${REGISTRY}/akb-frontend:${VERSION}" \
+    -t "${FRONTEND_IMAGE}" \
+    --push \
+    "${ROOT_DIR}/frontend/"
+fi
 
 echo "=== Creating namespace ==="
-kubectl apply -f "${SCRIPT_DIR}/namespace.yaml"
+"${KUBECTL[@]}" create namespace "${NAMESPACE}" \
+  --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
+
+echo "=== Preparing secret contract (${SECRET_MODE}/${SECRET_ENGINE:-none}) ==="
+NAMESPACE="${NAMESPACE}" \
+KUBE_CONTEXT="${KUBE_CONTEXT}" \
+SECRET_MODE="${SECRET_MODE}" \
+SECRET_ENGINE="${SECRET_ENGINE:-}" \
+SECRET_PROFILE="${SECRET_PROFILE}" \
+BACKEND_IMAGE="${BACKEND_IMAGE}" \
+  bash "${SCRIPT_DIR}/secrets/deploy.sh"
 
 echo "=== Applying manifests (kustomize: ${KUSTOMIZE_DIR}) ==="
 # --load-restrictor=LoadRestrictionsNone lets an overlay reference the
 # base via `../foo.yaml`. No-op for the base (which only references local
 # files), needed when KUSTOMIZE_DIR is an overlay sitting inside the
 # base tree.
-kubectl kustomize --load-restrictor=LoadRestrictionsNone "${KUSTOMIZE_DIR}" | \
-  sed "s|image: akb-backend:latest|image: ${REGISTRY}/akb-backend:latest|g" | \
-  sed "s|image: akb-frontend:latest|image: ${REGISTRY}/akb-frontend:latest|g" | \
-  kubectl apply -f -
+RENDER_DIR="$(mktemp -d "${TMPDIR:-/tmp}/akb-kustomize.XXXXXX")"
+trap 'rm -rf "${RENDER_DIR}"' EXIT
+KUSTOMIZE_SOURCE="$(cd "${KUSTOMIZE_DIR}" && pwd)"
+# Kustomize rejects an absolute path in `resources` even with unrestricted
+# loading. A temporary symlink keeps the generated parent overlay portable
+# while preserving the caller's source tree untouched.
+ln -s "${KUSTOMIZE_SOURCE}" "${RENDER_DIR}/source"
+printf '%s\n' \
+  'apiVersion: kustomize.config.k8s.io/v1beta1' \
+  'kind: Kustomization' \
+  "namespace: ${NAMESPACE}" \
+  'resources:' \
+  '  - source' > "${RENDER_DIR}/kustomization.yaml"
+
+if [[ -n "${STORAGE_CLASS:-}" ]]; then
+  cat >>"${RENDER_DIR}/kustomization.yaml" <<EOF
+patches:
+  - target:
+      kind: PersistentVolumeClaim
+      name: akb-vaultdata
+    patch: |-
+      - op: add
+        path: /spec/storageClassName
+        value: ${STORAGE_CLASS}
+  - target:
+      kind: StatefulSet
+      name: postgres
+    patch: |-
+      - op: add
+        path: /spec/volumeClaimTemplates/0/spec/storageClassName
+        value: ${STORAGE_CLASS}
+EOF
+fi
+
+kubectl kustomize --load-restrictor=LoadRestrictionsNone "${RENDER_DIR}" | \
+  sed "s|image: akb-backend:latest|image: ${BACKEND_IMAGE}|g" | \
+  sed "s|image: akb-frontend:latest|image: ${FRONTEND_IMAGE}|g" | \
+  "${KUBECTL[@]}" apply -f -
 
 echo "=== Rolling restart to pick up :latest image ==="
 # `imagePullPolicy: Always` only pulls on pod creation; if the Deployment
 # spec is unchanged k8s doesn't reschedule, so `:latest` edits silently
 # no-op. Trigger a rollout so the new image is actually deployed.
-kubectl rollout restart "deployment/backend"  -n "${NAMESPACE}"
-kubectl rollout restart "deployment/frontend" -n "${NAMESPACE}"
+"${KUBECTL[@]}" rollout restart "deployment/backend"  -n "${NAMESPACE}"
+"${KUBECTL[@]}" rollout restart "deployment/frontend" -n "${NAMESPACE}"
 
 echo "=== Waiting for pods ==="
-kubectl wait --for=condition=ready pod -l app=akb-postgres -n "${NAMESPACE}" --timeout=180s || echo "PG not ready yet, continuing..."
-kubectl wait --for=condition=ready pod -l app=akb-backend  -n "${NAMESPACE}" --timeout=120s || echo "Backend not ready yet"
-kubectl wait --for=condition=ready pod -l app=akb-frontend -n "${NAMESPACE}" --timeout=120s || echo "Frontend not ready yet"
+"${KUBECTL[@]}" wait --for=condition=ready pod -l app=akb-postgres -n "${NAMESPACE}" --timeout=180s
+# A label-based pod wait captures the old pod during a Recreate/RollingUpdate
+# transition and then waits forever for that deleted object to become Ready.
+# Deployment rollout status follows the controller's current revision instead.
+"${KUBECTL[@]}" rollout status deployment/backend -n "${NAMESPACE}" --timeout=180s
+"${KUBECTL[@]}" rollout status deployment/frontend -n "${NAMESPACE}" --timeout=120s
 
 echo ""
 echo "=== Deployment complete ==="
 [ -n "${PUBLIC_URL:-}" ] && echo "URL: ${PUBLIC_URL}"
 echo "Status:"
-kubectl get pods -n "${NAMESPACE}"
+"${KUBECTL[@]}" get pods -n "${NAMESPACE}"
 echo ""
 echo "Next steps if not done:"
 echo "  kubectl edit configmap akb-app-config -n ${NAMESPACE}  # Adjust app.yaml"
-echo "  kubectl edit secret    akb-secret-config -n ${NAMESPACE}  # Set secret.yaml"
+echo "  kubectl get secret akb-secret -n ${NAMESPACE}  # Stable Secret Contract v1"

@@ -4,6 +4,10 @@ Generic kustomize base for deploying AKB to a Kubernetes cluster. Pair
 with an operator-specific overlay for real hostnames, registries, and
 TLS issuers.
 
+As in `akb-platform`, treat one AKB workspace as one namespace. Pass that
+boundary explicitly with `NAMESPACE`; `deploy.sh` creates only that namespace
+and the selected Secret profile binds its reader identity to it.
+
 ## Layout
 
 ```
@@ -16,10 +20,12 @@ deploy/k8s/
 ├── qdrant.yaml            # optional Qdrant StatefulSet — add to
 │                          # kustomization.yaml only if you flip the
 │                          # backend's vector_store_driver to qdrant
-├── redis.yaml             # event-stream Redis (optional, gated by app.yaml)
+├── redis.yaml             # optional event-stream Redis; add from an overlay
+│                          # only when the OT Redis Operator is installed
 ├── backend.yaml           # Deployment + ConfigMap (vector_store_driver: pgvector)
 ├── frontend.yaml          # Deployment + Service
 ├── ingress.yaml           # placeholder host (akb.example.com)
+├── secrets/               # stable Secret Contract v1 + manual/bundled/external producers
 ├── standalone-sso/        # AKB + owned Keycloak 26.7 + dedicated Keycloak DB;
 │                          # temporary bootstrap service-account retirement
 └── internal/              # gitignored — operator-private overlays
@@ -76,14 +82,24 @@ that reuses a platform-owned/shared Keycloak realm.
 # 1. Provide a registry to push images to.
 export REGISTRY=ghcr.io/myorg          # or my-registry.local:5000
 export PUBLIC_URL=https://akb.example.com    # printed at the end; optional
+# Required only when the cluster has no default StorageClass. The same value
+# is used for AKB/PostgreSQL and a production bundled Secret Manager.
+export STORAGE_CLASS=standard
 
-# 2. Edit ingress.yaml to set your real hostname.
+# 2. Edit ingress.yaml and the app ConfigMap's public_base_url and
+#    local_session_issuer to the same real origin.
 $EDITOR deploy/k8s/ingress.yaml
+$EDITOR deploy/k8s/backend.yaml
 
 # 3. Provide a ClusterIssuer named `letsencrypt-prod` (or change the
 #    annotation in ingress.yaml). cert-manager + your DNS provider.
 
-# 4. Apply.
+# 4. Choose a Secret producer. This example creates a brand-new manual
+#    contract; production should provision `akb-secret` out-of-band instead.
+export SECRET_MODE=manual
+export GENERATE_MANUAL_SECRETS=true
+
+# 5. Apply.
 bash deploy/k8s/deploy.sh
 ```
 
@@ -91,7 +107,7 @@ After the script finishes:
 
 ```bash
 kubectl edit configmap akb-app-config -n akb   # set embed_*, llm_*, s3_*, public_base_url
-kubectl edit secret    akb-secret-config -n akb # set system_hmac_secret, embed_api_key, …
+kubectl get secret akb-secret -n akb           # stable Secret Contract v1
 ```
 
 The placeholder ConfigMap in `backend.yaml` matches `config/app.yaml.example`
@@ -102,18 +118,16 @@ boot for smoke-testing before you wire in real providers.
 
 The `internal/` directory is gitignored and intended for environment-
 specific overrides — real hostnames, internal registries, ClusterIssuers
-with DNS-01 credentials, ConfigMap with private endpoints. The simplest
-pattern is a small wrapper script:
+with DNS-01 credentials, ConfigMap with private endpoints. Make it a
+Kustomize overlay over the public base so hostname and runtime configuration
+are applied in one render, then use a small wrapper script:
 
 ```bash
 # deploy/k8s/internal/deploy-internal.sh
 export REGISTRY=my-registry.internal:5000
 export PUBLIC_URL=https://akb.mycorp.example
 kubectl apply -f "$(dirname "$0")/cluster-issuer.yaml"
-bash "$(dirname "$0")/../deploy.sh"
-kubectl apply -f "$(dirname "$0")/ingress.yaml"        # overrides base
-kubectl apply -f "$(dirname "$0")/backend-config.yaml" # overrides base ConfigMap
-kubectl rollout restart deployment/backend -n akb
+KUSTOMIZE_DIR="$(dirname "$0")" bash "$(dirname "$0")/../deploy.sh"
 ```
 
 Anything you put under `internal/` is automatically excluded by the
@@ -123,33 +137,19 @@ Secrets) goes here too.
 
 ## Secrets
 
-Three Secrets are NOT created by `deploy.sh` — manage them out-of-band so
-re-runs don't clobber real credentials with placeholders:
+The base no longer commits a PostgreSQL `change-me` Secret. It consumes the
+same unified `akb-secret` shape as current `akb-platform` workspaces:
 
-- `akb-secret-config` — `secret.yaml` mounted at `/etc/akb/secret.yaml`
-  in the backend pod. Required keys: `db_password`, `system_hmac_secret`,
-  `embed_api_key` (and optionally `llm_api_key`, `rerank_api_key`,
-  `s3_*_key`, `vector_api_key`, `redis_password`).
-- `akb-local-session-keys` — the persistent RSA-3072 private key and public
-  JWKS for `local-session-rs256-v2`. Generate them explicitly once and back
-  them up with the installation. Replacing both files without retaining the
-  old public JWK intentionally forces every local user to sign in again.
-- `redis-credentials` — single key `password`, referenced by the Redis
-  CR. Skip if you disable the event stream (`redis_url: ""`).
+- PostgreSQL reads `akb-secret/db_password`.
+- Backend and worker mount `akb-secret/secret.yaml`.
+- Local auth projects `local-session-private.pem` and
+  `local-session-jwks.json` from that same Secret.
+- The backend disables automatic ServiceAccount-token mounting and has no
+  Secret Manager or Kubernetes Secret API permission.
 
-```bash
-kubectl create secret generic akb-secret-config -n akb \
-  --from-file=secret.yaml=./secret.yaml
-
-cd backend
-uv run python -m app.cli generate-local-session-keyset \
-  --output-dir ../local-session-keys
-cd ..
-kubectl create secret generic akb-local-session-keys -n akb \
-  --from-file=private.pem=./local-session-keys/private.pem \
-  --from-file=jwks.json=./local-session-keys/jwks.json
-
-PW=$(openssl rand -base64 32)
-kubectl create secret generic redis-credentials -n akb \
-  --from-literal=password="$PW"
-```
+The producer is selected with `SECRET_MODE=manual|bundled|external`.
+Bundled mode supports both `SECRET_ENGINE=openbao` and
+`SECRET_ENGINE=hashicorp-vault`; external mode connects an existing
+Vault-compatible service. See the complete contracts, pinned chart versions,
+TLS/HA profiles, rotation boundary, and migration notes in
+[`secrets/README.md`](secrets/README.md).

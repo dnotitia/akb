@@ -4,9 +4,7 @@ kind: Kustomization
 namespace: akb
 
 resources:
-  - namespace.yaml
   - postgres.yaml
-  - redis.yaml
   - backend.yaml
   - frontend.yaml
   - ingress.yaml
@@ -19,5 +17,11 @@ resources:
 # `vector_store_driver` to `qdrant` (with vector_url set) in the
 # backend ConfigMap.
 
-# Note: akb-init-sql ConfigMap must be created manually before applying:
-#   kubectl create configmap akb-init-sql -n akb --from-file=init.sql=../../backend/app/db/init.sql
+# Redis event fanout is optional and disabled in the base app ConfigMap. Add
+# `redis.yaml` from an operator overlay only when the OT Redis Operator CRD is
+# installed and `redis_url` is configured; core PG outbox events do not need it.
+
+# The namespace is created by deploy.sh (or explicitly by the operator) so a
+# parent overlay can safely choose a namespace without also applying the
+# hard-coded `akb` Namespace object. No cluster-scoped objects live in this
+# base.

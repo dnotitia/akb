@@ -67,7 +67,7 @@ commit their values.
 |---|---|---|
 | `akb-postgres-credentials` | `POSTGRES_DB=akb`, `POSTGRES_USER=akbuser`, `POSTGRES_PASSWORD` | durable |
 | `akb-keycloak-db-credentials` | `POSTGRES_DB=keycloak`, `POSTGRES_USER=keycloak`, `POSTGRES_PASSWORD` | durable |
-| `akb-secret-config` | `secret.yaml` | durable |
+| `akb-secret` | `secret.yaml` plus the Secret Contract v1 compatibility keys | durable |
 | `akb-keycloak-bootstrap` | `client-secret` | one-time |
 | `akb-keycloak-upgrade` | `client-secret` | optional; one-time legacy-profile upgrade only |
 | `akb-product-admin-bootstrap` | `password` | one-time |
@@ -144,6 +144,7 @@ realm signing key.
 Render and validate the public overlay before applying:
 
 ```bash
+kubectl create namespace akb --dry-run=client -o yaml | kubectl apply -f -
 kubectl kustomize --load-restrictor=LoadRestrictionsNone \
   deploy/k8s/standalone-sso > rendered-standalone-sso.yaml
 kubectl apply --dry-run=client --validate=false \

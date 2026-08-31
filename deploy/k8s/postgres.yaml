@@ -1,18 +1,6 @@
 # PostgreSQL with pgvector - simple StatefulSet deployment
 # Using pgvector/pgvector:pg16 which includes the vector extension pre-installed
 
-apiVersion: v1
-kind: Secret
-metadata:
-  name: postgres-credentials
-  namespace: akb
-type: Opaque
-stringData:
-  POSTGRES_DB: akb
-  POSTGRES_USER: akbuser
-  POSTGRES_PASSWORD: akb-secure-password-change-me
-
----
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -51,9 +39,16 @@ spec:
             - "max_connections=200"
           ports:
             - containerPort: 5432
-          envFrom:
-            - secretRef:
-                name: postgres-credentials
+          env:
+            - name: POSTGRES_DB
+              value: akb
+            - name: POSTGRES_USER
+              value: akbuser
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: akb-secret
+                  key: db_password
           volumeMounts:
             - name: pgdata
               mountPath: /var/lib/postgresql/data
