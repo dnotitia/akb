@@ -270,11 +270,15 @@ async def _distilled_doc_count(conn) -> int | None:
     guessed predicate would publish a number nobody can defend, and the
     dashboard would render it as measured.
 
-    Resolving it is a one-function change here once the criterion is chosen.
-    The two candidates on the table are recorded in the handoff notes: filter
-    on the vault's `managed_by` label prefix, or introduce an explicit
-    per-document marker at the distillation write path (the durable option —
-    it survives a vault being re-pointed at a different owner).
+    **This is a stub awaiting a per-document marker.** Counting the documents
+    of vaults whose `managed_by` label starts with `gardener:` was considered
+    and rejected: it counts everything in such a vault, including what a person
+    wrote there by hand, and re-pointing a vault at a different owner would
+    silently reclassify its whole history. The accepted direction is an
+    explicit marker written by the distillation path itself, which is a fact
+    about the document and cannot move under it. That spans this repository and
+    the gardener, so it is deliberately not in this change; when it lands, this
+    function is the only thing here that changes.
     """
     return None
 
