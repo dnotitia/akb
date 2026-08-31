@@ -2147,6 +2147,25 @@ export const deletePublication = (vault: string, slug: string) =>
 export const createPublicationSnapshot = (vault: string, slug: string) =>
   api<Publication>(`/publications/${vault}/${slug}/snapshot`, { method: "POST" });
 
+export interface TablePublicationPreview {
+  kind?: "table_query";
+  columns: string[];
+  items: Record<string, unknown>[];
+  total: number;
+}
+
+/** Execute the generated, read-only table publication query as the current user.
+ *
+ * The table publish dialog never accepts raw SQL. It builds a bounded SELECT
+ * from server-provided identifiers, then uses this endpoint as the required
+ * pre-publication preview and permission check.
+ */
+export const previewTablePublicationQuery = (vault: string, sql: string) =>
+  api<TablePublicationPreview>(`/tables/${encodeURIComponent(vault)}/sql`, {
+    method: "POST",
+    body: JSON.stringify({ sql }),
+  });
+
 export const searchUsers = (query?: string) =>
   api<{ users: any[] }>(`/users/search${query ? `?q=${encodeURIComponent(query)}` : ""}`);
 

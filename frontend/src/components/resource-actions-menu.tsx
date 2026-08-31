@@ -1,5 +1,5 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import { FolderInput, MoreHorizontal, Trash2 } from "lucide-react";
+import { FolderInput, MoreHorizontal, Share2, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -9,6 +9,8 @@ interface ResourceActionsMenuProps {
   onDelete?: () => void;
   moveLabel?: string;
   onMove?: () => void;
+  publishLabel?: string;
+  onPublish?: () => void;
   moveDisabledReason?: string;
   className?: string;
   side?: "top" | "right" | "bottom" | "left";
@@ -27,14 +29,17 @@ export function ResourceActionsMenu({
   onDelete,
   moveLabel,
   onMove,
+  publishLabel,
+  onPublish,
   moveDisabledReason,
   className,
   side = "bottom",
   align = "end",
 }: ResourceActionsMenuProps) {
   const showMoveAction = Boolean(moveLabel && (onMove || moveDisabledReason));
+  const showPublishAction = Boolean(publishLabel && onPublish);
   const showDeleteAction = Boolean(deleteLabel && onDelete);
-  if (!showMoveAction && !showDeleteAction) return null;
+  if (!showMoveAction && !showPublishAction && !showDeleteAction) return null;
 
   return (
     <DropdownMenu.Root>
@@ -83,7 +88,16 @@ export function ResourceActionsMenu({
               </span>
             </DropdownMenu.Item>
           )}
-          {showMoveAction && showDeleteAction && (
+          {showPublishAction && (
+            <DropdownMenu.Item
+              onSelect={onPublish}
+              className="flex cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-hover"
+            >
+              <Share2 className="h-4 w-4 text-link" aria-hidden />
+              {publishLabel}
+            </DropdownMenu.Item>
+          )}
+          {(showMoveAction || showPublishAction) && showDeleteAction && (
             <DropdownMenu.Separator className="my-1 h-px bg-border" />
           )}
           {showDeleteAction && (

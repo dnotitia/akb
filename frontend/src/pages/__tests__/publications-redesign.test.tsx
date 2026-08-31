@@ -177,4 +177,30 @@ describe("Publish page redesign", () => {
       );
     });
   });
+
+  it("returns bounded table publications to their source table", async () => {
+    listPublicationsMock.mockResolvedValue({
+      publications: [
+        {
+          ...PUBLICATION,
+          slug: "release-table",
+          share_url: "https://example.test/p/release-table",
+          resource_type: "table_query",
+          resource_uri: null,
+          title: "Release readiness",
+          query_sql: "SELECT service, ready FROM release_status ORDER BY service LIMIT 100",
+          query_vault_names: ["platform-docs"],
+          query_params: {},
+        },
+      ],
+    });
+    renderPage();
+
+    expect(
+      await screen.findByRole("link", { name: "Release readiness" }),
+    ).toHaveAttribute(
+      "href",
+      "/vault/platform-docs/table/release_status",
+    );
+  });
 });
