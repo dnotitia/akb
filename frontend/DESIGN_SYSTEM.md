@@ -486,17 +486,18 @@ commits` control and `Full commit log` route. Below `xl`, the work area stacks
   exact identifiers are useful without taxing ordinary reading. Never add another vertical summary
   band before the file viewer, and omit the compact summary entirely when older
   backends return no value.
-  The document header overflow separates `Rename title` from `Move document`
-  for every current document instead of overloading rename to mean a technical
-  filename change. The title flow patches only the human title; the system-created
-  slug/path remains stable so links and history do not move when display copy
-  changes. File names are not a user-editable field. When either action is
+  Edit owns the human title and body as one document form: its title field sits
+  immediately above the editor and one Save changes action patches whichever
+  values changed. The system-created slug/path remains stable, so editing the
+  display title does not move links or history. File names are not a user-editable
+  field, and the header overflow contains location/lifecycle actions such as
+  `Move document` and Delete—not a competing `Rename title` flow. When Move is
   unavailable, it remains visible with the exact permission, historical-version,
   mirror, or reserved-guide reason. The move dialog is a destination review
   rather than a generic metadata form: it keeps the human title primary and
   compares current and target Collections. Exact current and expected paths sit
   behind a technical review disclosure, and an optional Git commit message
-  remains available. Create, rename, and move share one **soft uniqueness**
+  remains available. Create, title edits, and move share one **soft uniqueness**
   rule: an exact NFC-normalized title (outer whitespace ignored, case and inner
   whitespace preserved) in the same Collection is a conflict in interactive UI.
   The notice prioritizes `Open existing`, then changing the title or Collection;

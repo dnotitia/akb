@@ -34,6 +34,7 @@ import {
 import {
   authenticatedFetch,
   ApiError,
+  browseVault,
   deleteDocument,
   getDocument,
   getRelations,
@@ -52,6 +53,8 @@ import { DocumentView } from "@/components/document-view";
 import { SummaryFold } from "@/components/summary-fold";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { HistoryList } from "@/components/history-list";
@@ -70,13 +73,36 @@ import { recordRecentDocumentView } from "@/lib/recent-document-views";
 import { ResourceActionsMenu } from "@/components/resource-actions-menu";
 import { ResourceDeleteDialog } from "@/components/resource-delete-dialog";
 import { DocumentMoveDialog } from "@/components/document-move-dialog";
-import { DocumentRenameDialog } from "@/components/document-rename-dialog";
+import { DocumentTitleConflictNotice } from "@/components/document-title-conflict-notice";
+import {
+  documentCollection,
+  documentTitleConflictFromError,
+  documentTitleKey,
+  findDocumentTitleConflict,
+  type DocumentTitleConflict,
+} from "@/lib/document-title-conflict";
 
 // Plate is heavy (~hundreds of KB gzipped); lazy-load so the read-only path
 // (Rendered / Raw) stays cheap.
 const MarkdownEditor = lazy(() => import("@/components/markdown-editor"));
 
 type DocView = "rendered" | "raw" | "edit";
+
+type BrowsedDocumentTitle = {
+  type: "document";
+  name: string;
+  path: string;
+};
+
+function isBrowsedDocumentTitle(item: unknown): item is BrowsedDocumentTitle {
+  if (!item || typeof item !== "object") return false;
+  const candidate = item as Record<string, unknown>;
+  return (
+    candidate.type === "document" &&
+    typeof candidate.name === "string" &&
+    typeof candidate.path === "string"
+  );
+}
 
 interface DocumentPageProps {
   /** Search-launched previews are read-first and keep the search route behind them. */
@@ -102,6 +128,7 @@ export default function DocumentPage({
   const [provenance, setProvenance] = useState<any[]>([]);
   const [historyError, setHistoryError] = useState(false);
   const [pendingView, setPendingView] = useState<DocView | null>(null);
+  const [pendingExistingPath, setPendingExistingPath] = useState<string | null>(null);
   const [docOverride, setDocOverride] = useState<any>(null);
   const [publishing, setPublishing] = useState(false);
   const [publishError, setPublishError] = useState("");
@@ -111,7 +138,6 @@ export default function DocumentPage({
   const [vaultKind, setVaultKind] = useState<"normal" | "mirror" | "error" | null>(null);
   const [vaultReadOnly, setVaultReadOnly] = useState(true);
   const [editOpen, setEditOpen] = useState(false);
-  const [renameOpen, setRenameOpen] = useState(false);
   const [moveOpen, setMoveOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
@@ -121,12 +147,18 @@ export default function DocumentPage({
   const detailsCloseRef = useRef<HTMLButtonElement | null>(null);
   const editButtonRef = useRef<HTMLButtonElement | null>(null);
   const cancelEditButtonRef = useRef<HTMLButtonElement | null>(null);
+  const editTitleRef = useRef<HTMLInputElement | null>(null);
+  const titleConflictRef = useRef<HTMLDivElement | null>(null);
   const restoreEditFocusRef = useRef(false);
   // Plate manages its own state; we remount via `editorKey` when hydrating
   // a fresh server value rather than treating `value` as controlled.
   const [editingContent, setEditingContent] = useState("");
+  const [editingTitle, setEditingTitle] = useState("");
   const [editingAssetIds, setEditingAssetIds] = useState<readonly string[]>([]);
   const [originalContent, setOriginalContent] = useState("");
+  const [originalTitle, setOriginalTitle] = useState("");
+  const [titleTouched, setTitleTouched] = useState(false);
+  const [serverTitleConflict, setServerTitleConflict] = useState<DocumentTitleConflict | null>(null);
   const [editorKey, setEditorKey] = useState(0);
   const [savingBody, setSavingBody] = useState(false);
   const [uploadingImage, setUploadingImage] = useState(false);
@@ -134,12 +166,14 @@ export default function DocumentPage({
   const [bodyError, setBodyError] = useState("");
   const [savedAt, setSavedAt] = useState<number | null>(null);
   const [moveNotice, setMoveNotice] = useState<{ collection: string } | null>(null);
-  const [renameNotice, setRenameNotice] = useState(false);
   // Plate's markdown roundtrip is not byte-identity: adopt the first
   // post-hydration emission as the new `originalContent` baseline so the
   // editor doesn't flash "UNSAVED" the moment it mounts.
   const hydratedKey = useRef<number | null>(null);
-  const isDirty = editingContent !== originalContent;
+  const contentChanged = editingContent !== originalContent;
+  const normalizedEditingTitle = documentTitleKey(editingTitle);
+  const titleChanged = normalizedEditingTitle !== documentTitleKey(originalTitle);
+  const isDirty = contentChanged || titleChanged;
   const hasUnsavedWork = isDirty || uploadingImage;
 
   useEffect(() => {
@@ -147,12 +181,6 @@ export default function DocumentPage({
     const timer = window.setTimeout(() => setMoveNotice(null), 4_500);
     return () => window.clearTimeout(timer);
   }, [moveNotice]);
-
-  useEffect(() => {
-    if (!renameNotice) return;
-    const timer = window.setTimeout(() => setRenameNotice(false), 4_500);
-    return () => window.clearTimeout(timer);
-  }, [renameNotice]);
 
   const docId = id ? decodeURIComponent(id) : "";
   const visibleRelationCount = useMemo(
@@ -276,6 +304,47 @@ export default function DocumentPage({
 
   const doc = docOverride ?? docQuery.data ?? null;
   const currentUserId = currentUser?.user_id;
+  const editTitleCandidatesQuery = useQuery({
+    queryKey: ["document-edit-title-candidates", name],
+    queryFn: () => browseVault(name!),
+    enabled: Boolean(name && view === "edit"),
+    staleTime: 30_000,
+  });
+  const editTitleCandidates = useMemo(
+    () =>
+      (editTitleCandidatesQuery.data?.items || [])
+        .filter(isBrowsedDocumentTitle)
+        .map((item) => ({ name: item.name, path: item.path })),
+    [editTitleCandidatesQuery.data?.items],
+  );
+  const detectedTitleConflict = useMemo(
+    () =>
+      titleChanged && doc?.path
+        ? findDocumentTitleConflict(
+            editTitleCandidates,
+            normalizedEditingTitle,
+            documentCollection(doc.path),
+            doc.path,
+          )
+        : null,
+    [
+      doc?.path,
+      editTitleCandidates,
+      normalizedEditingTitle,
+      titleChanged,
+    ],
+  );
+  const titleConflict =
+    serverTitleConflict ?? (titleTouched ? detectedTitleConflict : null);
+  const titleError =
+    titleTouched && !normalizedEditingTitle ? "Enter a document title." : "";
+  const titleDescriptionIds = [
+    "document-edit-title-help",
+    titleError ? "document-edit-title-error" : "",
+    titleConflict ? "document-edit-title-conflict" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   useEffect(() => {
     const loaded = docQuery.data;
@@ -332,11 +401,16 @@ export default function DocumentPage({
     setRelationsError(false);
     setHistoryError(false);
     setBodyError("");
+    setTitleTouched(false);
+    setServerTitleConflict(null);
     setClaimedAssetIds(null);
     if (!d) return;
     const body = d.content || "";
+    const title = d.title || "";
     setOriginalContent(body);
     setEditingContent(body);
+    setOriginalTitle(title);
+    setEditingTitle(title);
     // Bump the key so the Plate editor remounts with the new value —
     // it's uncontrolled internally and won't pick up `value` prop
     // changes after mount.
@@ -373,14 +447,63 @@ export default function DocumentPage({
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
   }, [hasUnsavedWork]);
 
-  async function handleSaveBody() {
+  function openExistingDocument(existingPath: string) {
+    const nextSearch = new URLSearchParams(searchParams);
+    nextSearch.delete("commit");
+    nextSearch.delete("view");
+    const search = nextSearch.toString();
+    navigate(
+      {
+        pathname: `/vault/${name}/doc/${encodeURIComponent(existingPath)}`,
+        search: search ? `?${search}` : "",
+      },
+      { state: routeLocation.state },
+    );
+  }
+
+  async function showTitleConflict(conflict: DocumentTitleConflict) {
+    let exactContent = false;
+    try {
+      const existing = await getDocument(name!, conflict.existingPath);
+      exactContent =
+        typeof existing?.content === "string" &&
+        existing.content === editingContent;
+    } catch {
+      // The structured conflict still gives enough information to recover.
+    }
+    setServerTitleConflict({ ...conflict, exactContent });
+    window.requestAnimationFrame(() => titleConflictRef.current?.focus());
+  }
+
+  async function handleSaveDocument(
+    titleConflictPolicy: "allow" | "reject" = "reject",
+  ) {
     if (!name || !docId || uploadingImage) return;
+    setTitleTouched(true);
+    if (!normalizedEditingTitle) {
+      window.requestAnimationFrame(() => editTitleRef.current?.focus());
+      return;
+    }
+    const activeConflict = serverTitleConflict ?? detectedTitleConflict;
+    if (titleConflictPolicy === "reject" && activeConflict) {
+      await showTitleConflict(activeConflict);
+      return;
+    }
+
     const contentToSave = editingContent;
     const assetIdsToClaim = editingAssetIds;
+    const payload: Record<string, unknown> = {};
+    if (contentChanged) payload.content = contentToSave;
+    if (titleChanged) {
+      payload.title = normalizedEditingTitle;
+      payload.title_conflict_policy = titleConflictPolicy;
+    }
+    if (Object.keys(payload).length === 0) return;
+
     setSavingBody(true);
     setBodyError("");
     try {
-      const saved = await updateDocument(name, docId, { content: contentToSave });
+      const saved = await updateDocument(name, docId, payload);
       const now = new Date().toISOString();
       // Optimistically advance content + updated_at so the byline reads
       // "last changed just now" without waiting for a refetch. DocumentView
@@ -389,6 +512,7 @@ export default function DocumentPage({
       const nextDoc = {
         ...(doc || {}),
         content: contentToSave,
+        title: titleChanged ? normalizedEditingTitle : doc?.title,
         updated_at: now,
         current_commit: saved.current_commit ?? saved.commit_hash ?? doc?.current_commit,
       };
@@ -401,6 +525,10 @@ export default function DocumentPage({
         }),
       );
       setOriginalContent(contentToSave);
+      setOriginalTitle(titleChanged ? normalizedEditingTitle : originalTitle);
+      setEditingTitle(titleChanged ? normalizedEditingTitle : originalTitle);
+      setTitleTouched(false);
+      setServerTitleConflict(null);
       // Sidebar refresh is best-effort — its failure must not leave the
       // user looking at a "still dirty" editor after a successful save.
       try {
@@ -429,6 +557,11 @@ export default function DocumentPage({
       restoreEditFocusRef.current = true;
       updateRouteParams(p, { replace: true });
     } catch (e: unknown) {
+      const conflict = documentTitleConflictFromError(e);
+      if (conflict) {
+        await showTitleConflict(conflict);
+        return;
+      }
       const status = e instanceof ApiError ? e.status : 0;
       // 5xx responses can carry stack traces or SQL fragments — never
       // surface those verbatim. 4xx are intentional API errors so the
@@ -574,12 +707,6 @@ export default function DocumentPage({
     vaultReadOnly,
     isHistorical,
   });
-  const renameDisabledReason = documentTitleRenameDisabledReason({
-    vaultRole,
-    vaultKind,
-    vaultReadOnly,
-    isHistorical,
-  });
   const canDelete =
     canWrite &&
     !vaultReadOnly &&
@@ -683,7 +810,7 @@ export default function DocumentPage({
                   size="sm"
                   aria-label="Save"
                   loading={savingBody}
-                  onClick={handleSaveBody}
+                  onClick={() => void handleSaveDocument("reject")}
                   disabled={uploadingImage || !isDirty}
                 >
                   {savingBody ? "Saving…" : "Save changes"}
@@ -699,9 +826,6 @@ export default function DocumentPage({
                 )}
                 <ResourceActionsMenu
                   resourceName={doc.title || fileName}
-                  renameLabel="Rename title"
-                  onRename={renameDisabledReason ? undefined : () => setRenameOpen(true)}
-                  renameDisabledReason={renameDisabledReason || undefined}
                   moveLabel="Move document"
                   onMove={moveDisabledReason ? undefined : () => setMoveOpen(true)}
                   moveDisabledReason={moveDisabledReason || undefined}
@@ -839,12 +963,69 @@ export default function DocumentPage({
                   <div
                     className="p-4 sm:p-6"
                   >
+                    <div className="mb-5 space-y-2 border-b border-border pb-5">
+                      <Label htmlFor="document-edit-title">Document title</Label>
+                      <Input
+                        ref={editTitleRef}
+                        id="document-edit-title"
+                        value={editingTitle}
+                        onChange={(event) => {
+                          setEditingTitle(event.currentTarget.value);
+                          setServerTitleConflict(null);
+                          setBodyError("");
+                        }}
+                        onBlur={() => setTitleTouched(true)}
+                        disabled={savingBody}
+                        aria-invalid={Boolean(titleError || titleConflict) || undefined}
+                        aria-describedby={titleDescriptionIds}
+                        className="font-display text-base font-semibold"
+                      />
+                      <p
+                        id="document-edit-title-help"
+                        className="text-xs leading-relaxed text-foreground-muted"
+                      >
+                        This is the visible title. Editing it keeps the document path,
+                        links, and version history unchanged.
+                      </p>
+                      {titleError && (
+                        <p
+                          id="document-edit-title-error"
+                          role="alert"
+                          className="text-xs font-medium text-destructive"
+                        >
+                          {titleError}
+                        </p>
+                      )}
+                      {titleConflict && (
+                        <div
+                          id="document-edit-title-conflict"
+                          ref={titleConflictRef}
+                          tabIndex={-1}
+                          className="pt-1 focus:outline-none"
+                        >
+                          <DocumentTitleConflictNotice
+                            conflict={titleConflict}
+                            onOpenExisting={() =>
+                              setPendingExistingPath(titleConflict.existingPath)
+                            }
+                            onChooseAlternative={() => editTitleRef.current?.focus()}
+                            chooseAlternativeLabel="Choose another title"
+                            onKeepBoth={() => void handleSaveDocument("allow")}
+                            keepBothLabel="Save duplicate title"
+                            keepingBoth={savingBody}
+                          />
+                        </div>
+                      )}
+                    </div>
                     <Suspense fallback={<MarkdownEditorFallback />}>
                       <MarkdownEditor
                         key={editorKey}
                         value={originalContent}
                         onChange={(markdown, assetIds) => {
                           setEditingAssetIds(assetIds);
+                          setServerTitleConflict((current) =>
+                            current ? { ...current, exactContent: false } : null,
+                          );
                           if (hydratedKey.current !== editorKey) {
                             hydratedKey.current = editorKey;
                             setOriginalContent(markdown);
@@ -1117,33 +1298,6 @@ export default function DocumentPage({
         </div>
       </section>
 
-      <DocumentRenameDialog
-        open={renameOpen}
-        onOpenChange={setRenameOpen}
-        vault={name!}
-        docId={docId}
-        path={doc.path}
-        title={doc.title || fileName}
-        onOpenDocument={(existingPath) => {
-          const nextSearch = new URLSearchParams(searchParams);
-          nextSearch.delete("commit");
-          nextSearch.delete("view");
-          const search = nextSearch.toString();
-          navigate(
-            {
-              pathname: `/vault/${name}/doc/${encodeURIComponent(existingPath)}`,
-              search: search ? `?${search}` : "",
-            },
-            { state: routeLocation.state },
-          );
-        }}
-        onRenamed={(nextTitle) => {
-          setDocOverride({ ...doc, title: nextTitle });
-          setRenameNotice(true);
-          refetchTree();
-        }}
-      />
-
       <FrontmatterEditDialog
         open={editOpen}
         onOpenChange={setEditOpen}
@@ -1162,19 +1316,7 @@ export default function DocumentPage({
         vault={name!}
         path={doc.path}
         title={doc.title || fileName}
-        onOpenDocument={(existingPath) => {
-          const nextSearch = new URLSearchParams(searchParams);
-          nextSearch.delete("commit");
-          nextSearch.delete("view");
-          const search = nextSearch.toString();
-          navigate(
-            {
-              pathname: `/vault/${name}/doc/${encodeURIComponent(existingPath)}`,
-              search: search ? `?${search}` : "",
-            },
-            { state: routeLocation.state },
-          );
-        }}
+        onOpenDocument={openExistingDocument}
         onMoved={(result) => {
           const changedAt = new Date().toISOString();
           const nextDoc = {
@@ -1237,13 +1379,33 @@ export default function DocumentPage({
       />
 
       <ConfirmDialog
+        open={pendingExistingPath !== null}
+        onOpenChange={(open) => !open && setPendingExistingPath(null)}
+        title="Discard changes and open the existing document?"
+        description="Your unsaved title or body changes will be lost."
+        confirmLabel="Discard and open"
+        cancelLabel="Keep editing"
+        variant="destructive"
+        returnFocusRef={editTitleRef}
+        onConfirm={() => {
+          const existingPath = pendingExistingPath;
+          setEditingContent(originalContent);
+          setEditingTitle(originalTitle);
+          setEditingAssetIds([]);
+          setTitleTouched(false);
+          setServerTitleConflict(null);
+          if (existingPath) openExistingDocument(existingPath);
+        }}
+      />
+
+      <ConfirmDialog
         open={pendingView !== null}
         onOpenChange={(o) => !o && setPendingView(null)}
         title="Discard unsaved changes?"
         description={
           uploadingImage
-            ? "The image upload will be cancelled and your edits to the document body will be lost."
-            : "Your edits to the document body will be lost."
+            ? "The image upload will be cancelled and your unsaved document changes will be lost."
+            : "Your unsaved title or body changes will be lost."
         }
         confirmLabel="Discard changes"
         variant="destructive"
@@ -1251,9 +1413,12 @@ export default function DocumentPage({
         onConfirm={() => {
           const next = pendingView;
           setEditingContent(originalContent);
+          setEditingTitle(originalTitle);
           setEditingAssetIds([]);
           setEditorKey((k) => k + 1);
           setBodyError("");
+          setTitleTouched(false);
+          setServerTitleConflict(null);
           setPendingView(null);
           if (next) {
             restoreEditFocusRef.current = true;
@@ -1278,21 +1443,6 @@ export default function DocumentPage({
         </div>
       )}
 
-      {renameNotice && (
-        <div
-          role="status"
-          aria-live="polite"
-          className="fixed bottom-4 right-4 z-[var(--z-toast)] flex max-w-sm items-start gap-3 rounded-[var(--radius-lg)] border border-success/30 bg-surface px-4 py-3 text-sm text-foreground shadow-lg"
-        >
-          <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-success" aria-hidden />
-          <div className="min-w-0">
-            <p className="font-semibold">Document renamed</p>
-            <p className="mt-0.5 text-xs text-foreground-muted">
-              Its stable file identity, links, and version history were preserved.
-            </p>
-          </div>
-        </div>
-      )}
     </>
   );
 }
@@ -1305,14 +1455,14 @@ interface DocumentMovePermissionState {
   isHistorical: boolean;
 }
 
-function documentTitleRenameDisabledReason({
+function documentWriteDisabledReason({
   vaultRole,
   vaultKind,
   vaultReadOnly,
   isHistorical,
 }: Omit<DocumentMovePermissionState, "path">) {
   if (isHistorical) {
-    return "Return to the latest version before renaming this document.";
+    return "Return to the latest version before changing this document.";
   }
   if (vaultKind === "error") {
     return "Permissions could not be verified. Refresh the page and try again.";
@@ -1339,7 +1489,7 @@ function documentMoveDisabledReason({
   if (path === VAULT_SKILL_PATH) {
     return "The Vault guide has a reserved location and cannot be moved.";
   }
-  const reason = documentTitleRenameDisabledReason({
+  const reason = documentWriteDisabledReason({
     vaultRole,
     vaultKind,
     vaultReadOnly,
