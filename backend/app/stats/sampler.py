@@ -46,18 +46,32 @@ logger = logging.getLogger("akb.stats_sampler")
 # them reject the whole snapshot rather than read the fields they know.
 SCHEMA_VERSION = 1
 
-# The pgvector relations counted by `storage.vector_bytes`, named explicitly
-# rather than discovered by scanning the schema: an operator who puts something
-# else in that schema should not silently change what this number means.
-# `pg_total_relation_size` covers each one's heap, its TOAST table and TOAST
-# index, and every index on it.
-#
-# These live INSIDE the main database when the driver shares the main pool, so
-# `vector_bytes` is a SUBSET of `db_bytes` — the two must never be added
-# together. When the driver is anything else, or points at its own DSN, the
-# bytes are not in this database and the field is reported as absent rather
-# than as a number that would break that containment.
-PGVECTOR_RELATIONS: tuple[str, ...] = ("chunks", "posting")
+
+
+def pgvector_relations() -> tuple[str, ...]:
+    """The pgvector relations counted by `storage.vector_bytes`.
+
+    Named explicitly rather than discovered by scanning the schema: an operator
+    who puts something else in that schema should not silently change what
+    this number means. `pg_total_relation_size` covers each one's heap, its
+    TOAST table and TOAST index, and every index on it.
+
+    Which relations exist is decided by `vector_store_sparse_shape`
+    (`app/services/vector_store/pgvector.py`, `_do_ensure`): the `posting`
+    shape creates `chunks` plus the `posting` side table, the `arrays` shape
+    keeps the sparse terms inside `chunks` and creates nothing else. Asking
+    for a relation the shape never creates would make the field permanently
+    absent for that tenant.
+
+    These live INSIDE the main database when the driver shares the main pool,
+    so `vector_bytes` is a SUBSET of `db_bytes` — the two must never be added
+    together. When the driver is anything else, or points at its own DSN, the
+    bytes are not in this database and the field is reported as absent rather
+    than as a number that would break that containment.
+    """
+    if settings.vector_store_sparse_shape == "posting":
+        return ("chunks", "posting")
+    return ("chunks",)
 
 _snapshot: dict[str, Any] | None = None
 _last_error: str | None = None
@@ -352,7 +366,7 @@ async def _vector_bytes(conn) -> int | None:
         return None
 
     total = 0
-    for relation in PGVECTOR_RELATIONS:
+    for relation in pgvector_relations():
         size = await conn.fetchval(
             """
             SELECT pg_total_relation_size(c.oid)
@@ -365,11 +379,12 @@ async def _vector_bytes(conn) -> int | None:
             relation,
         )
         if size is None:
-            # The schema is created lazily on first use, and both relations
-            # arrive in the same batch. Before that nothing exists, and "the
-            # index has not been created" is unknown-shaped, not zero-shaped.
-            # All-or-nothing on purpose: a sum over the relations that do
-            # exist would be the partial total this field must never be.
+            # The schema is created lazily on first use, and everything the
+            # shape needs arrives in the same batch. Before that nothing
+            # exists, and "the index has not been created" is unknown-shaped,
+            # not zero-shaped. All-or-nothing on purpose: a sum over the
+            # relations that do exist would be the partial total this field
+            # must never be.
             return None
         total += int(size)
     return total

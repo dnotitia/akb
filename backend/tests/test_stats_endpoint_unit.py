@@ -292,6 +292,15 @@ async def test_vector_bytes_absent_unless_every_index_relation_is_measured(db):
     assert "vector_bytes" not in payload["storage"]
 
 
+async def test_vector_bytes_counts_only_the_relations_the_sparse_shape_creates(db, monkeypatch):
+    """The `arrays` shape keeps sparse terms inside `chunks`; there is no
+    `posting` table to be missing, so its absence must not blank the field."""
+    monkeypatch.setattr(settings, "vector_store_sparse_shape", "arrays")
+    db.relation_sizes = {("vector_index", "chunks"): 3_000_000_000}
+    payload = await sampler.compute(now=_NOW)
+    assert payload["storage"]["vector_bytes"] == 3_000_000_000
+
+
 async def test_file_bytes_absent_when_any_confirmed_file_has_no_size(db):
     db.files = {"file_count": 5, "unsized": 1, "file_bytes": 900}
     payload = await sampler.compute()
