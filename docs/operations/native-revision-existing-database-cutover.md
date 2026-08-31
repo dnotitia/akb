@@ -30,11 +30,14 @@ python -m app.cli migrate-revision-backend commit --cutover-id CUTOVER_UUID
 ```
 
 Each command prints a JSON receipt. Preserve it with the recovery point. `plan`
-captures every active Vault and its current Git ref; omitted Vaults, changed
-refs, File drift, or an external-Git sidecar make later authority commit fail
-closed. `commit` revalidates the complete inventory while holding Git write
-locks and closes the database-enforced Legacy revision-write fence atomically
-with Native authority.
+captures every retained (non-deleted) Vault and its current Git ref; omitted
+Vaults, changed refs, File drift, or an external-Git sidecar make later
+authority commit fail closed. Archived Vaults are included because they can be
+reactivated later. `commit` revalidates the complete retained inventory while
+holding Git write locks and closes the database-enforced Legacy revision-write
+fence atomically with Native authority. The committed fixed ref also remains
+the frozen source for pre-cutover vault activity, including deleted and
+delete/recreate lifecycles.
 
 Before `commit`, an operator may permanently close the attempt without deleting
 its evidence or additive Native rows:

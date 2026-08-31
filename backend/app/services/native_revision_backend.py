@@ -12,6 +12,7 @@ import asyncpg
 
 from app.db.postgres import get_pool
 from app.exceptions import NotFoundError
+from app.repositories.native_revision_cutover_repo import NativeRevisionCutoverRepository
 from app.repositories.native_revision_migration_repo import (
     NativeRevisionMigrationRepository,
 )
@@ -156,23 +157,32 @@ class NativeRevisionBackend:
         *,
         vault: str,
         vault_id: uuid.UUID,
+        max_count: int,
         since: datetime | None,
         path: str | None,
     ) -> tuple[list[dict[str, Any]], set[str]]:
-        """Re-open completed C9 events through their immutable path bindings.
+        """Re-open Legacy activity through the committed vault fixed ref.
 
-        The native genesis row is deliberately an authority event, not a
-        replacement for every Legacy commit.  Public activity therefore keeps
-        that row out of the feed and reconstructs each retained event from
-        its completed mapping's fixed ref and path.
+        A completed existing-database cutover already persists one exact Git
+        tip per vault. Reading that full graph keeps Legacy events for wholly
+        deleted Resources and pre-recreate lifecycles, which cannot be
+        reconstructed from only the surviving native Resource anchors. Before
+        authority exists, retain the C9 per-resource bridge for the guarded
+        migration path.
         """
-        migration = NativeRevisionMigrationRepository(await self._pool())
+        pool = await self._pool()
+        migration = NativeRevisionMigrationRepository(pool)
         try:
             anchors = await migration.list_completed_lineage_anchors(
                 namespace_id=vault_id,
             )
         except asyncpg.UndefinedTableError:
             return [], set()
+
+        try:
+            fixed_ref = await NativeRevisionCutoverRepository(pool).committed_vault_fixed_git_oid(vault_id)
+        except asyncpg.UndefinedTableError:
+            fixed_ref = None
 
         bridged_by_hash: dict[str, dict[str, Any]] = {}
         mapped_native_ids: set[str] = set()
@@ -184,6 +194,8 @@ class NativeRevisionBackend:
             for mapping in mappings:
                 if mapping.native_revision_id is not None:
                     mapped_native_ids.add(mapping.native_revision_id)
+                if fixed_ref is not None:
+                    continue
                 try:
                     snapshot = await asyncio.to_thread(
                         self._legacy_git.manual_fixed_ref_history,
@@ -217,6 +229,19 @@ class NativeRevisionBackend:
                     if signature not in known_files:
                         existing["files"].append(changed)
                         known_files.add(signature)
+        if fixed_ref is not None:
+            try:
+                events = await asyncio.to_thread(
+                    self._legacy_git.manual_fixed_ref_vault_log,
+                    vault,
+                    fixed_ref,
+                    max_count=max_count,
+                    since=None if since is None else since.isoformat(),
+                    path=path,
+                )
+            except FixedRefHistoryError:
+                return [], mapped_native_ids
+            return events, mapped_native_ids
         return list(bridged_by_hash.values()), mapped_native_ids
 
     async def _legacy_mappings_for_selector(
@@ -296,6 +321,7 @@ class NativeRevisionBackend:
         legacy, mapped_native_ids = await self._bridged_legacy_activity(
             vault=vault,
             vault_id=vault_id,
+            max_count=max_count,
             since=parsed_since,
             path=path,
         )

@@ -2261,18 +2261,60 @@ class GitService:
         with _managed_repo(self._get_repo(vault_name)) as repo:
             return self._vault_log_with_repo(repo, max_count, since, path)
 
+    def manual_fixed_ref_vault_log(
+        self,
+        vault_name: str,
+        fixed_ref: str,
+        *,
+        max_count: int,
+        since: str | None,
+        path: str | None,
+    ) -> list[dict]:
+        """Read a vault activity feed from one exact manual-vault ancestor.
+
+        Cutover activity is bound to a durable Legacy tip, not the mutable
+        repository HEAD or the set of documents that happen to survive in the
+        current catalog. This retains deleted and prior-recreate lifecycles.
+        """
+        if re.fullmatch(r"[0-9a-f]{40}", fixed_ref) is None:
+            raise FixedRefHistoryError("fixed-ref vault activity requires a full lowercase 40-hex OID")
+        if self._is_mirror(vault_name):
+            raise FixedRefHistoryError("fixed-ref vault activity is limited to manual vaults")
+        try:
+            with _managed_repo(self._get_repo(vault_name)) as repo:
+                repo.commit(fixed_ref)
+                return self._vault_log_with_repo(
+                    repo,
+                    max_count,
+                    since,
+                    path,
+                    fixed_ref=fixed_ref,
+                )
+        except (BadName, BadObject, FileNotFoundError, GitError, TypeError, ValueError) as exc:
+            raise FixedRefHistoryError("fixed-ref vault activity could not be read") from exc
+
     def _vault_log_with_repo(
         self,
         repo: Repo,
         max_count: int,
         since: str | None,
         path: str | None,
+        *,
+        fixed_ref: str | None = None,
     ) -> list[dict]:
         try:
             # gitpython's iter_commits stub forbids **kwargs splatting
             # (each named param is typed individually). Two branches by
             # which optional flags are present — explicit, mypy-clean.
-            if since and path:
+            if fixed_ref is not None and since and path:
+                commits = list(repo.iter_commits(fixed_ref, max_count=max_count, since=since, paths=path))
+            elif fixed_ref is not None and since:
+                commits = list(repo.iter_commits(fixed_ref, max_count=max_count, since=since))
+            elif fixed_ref is not None and path:
+                commits = list(repo.iter_commits(fixed_ref, max_count=max_count, paths=path))
+            elif fixed_ref is not None:
+                commits = list(repo.iter_commits(fixed_ref, max_count=max_count))
+            elif since and path:
                 commits = list(repo.iter_commits(max_count=max_count, since=since, paths=path))
             elif since:
                 commits = list(repo.iter_commits(max_count=max_count, since=since))

@@ -178,6 +178,29 @@ class NativeRevisionCutoverRepository:
                 rows = await acquired.fetch(sql, cutover_id)
         return [_exclusion(row) for row in rows]
 
+    async def committed_vault_fixed_git_oid(
+        self,
+        namespace_id: uuid.UUID,
+        *,
+        conn: asyncpg.Connection | None = None,
+    ) -> str | None:
+        """Return the authoritative frozen Legacy tip for one committed vault."""
+
+        sql = """
+            SELECT cv.fixed_git_oid
+              FROM native_revision_existing_authority a
+              JOIN native_revision_cutover_vaults cv
+                ON cv.cutover_id = a.cutover_id
+             WHERE a.marker_id = TRUE
+               AND cv.namespace_id = $1
+        """
+        if conn is not None:
+            row = await conn.fetchrow(sql, namespace_id)
+        else:
+            async with self.pool.acquire() as acquired:
+                row = await acquired.fetchrow(sql, namespace_id)
+        return None if row is None else row["fixed_git_oid"]
+
     async def get_or_create_run(
         self,
         *,

@@ -159,7 +159,7 @@ class NativeRevisionCutover:
     def _read_s3_file(s3_key: str) -> bytes:
         return b"".join(s3_adapter.iter_chunks(s3_key))
 
-    async def _active_vault_inventory(
+    async def _retained_vault_inventory(
         self,
         *,
         conn: asyncpg.Connection | None = None,
@@ -171,7 +171,7 @@ class NativeRevisionCutover:
                         WHERE veg.vault_id = v.id
                    ) AS external_git
               FROM vaults v
-             WHERE v.status = 'active'
+             WHERE v.status <> 'deleted'
              ORDER BY v.id
         """
         if conn is not None:
@@ -290,14 +290,14 @@ class NativeRevisionCutover:
         self,
         vaults: Sequence[CutoverVaultInput],
     ) -> tuple[list[CutoverVaultInput], list[CutoverExclusion]]:
-        rows = await self._active_vault_inventory()
+        rows = await self._retained_vault_inventory()
         by_input = {item.namespace_id: item for item in vaults}
-        active_ids = {row["id"] for row in rows}
-        if set(by_input) != active_ids:
-            omitted = sorted(str(item) for item in active_ids - set(by_input))
-            added = sorted(str(item) for item in set(by_input) - active_ids)
+        retained_ids = {row["id"] for row in rows}
+        if set(by_input) != retained_ids:
+            omitted = sorted(str(item) for item in retained_ids - set(by_input))
+            added = sorted(str(item) for item in set(by_input) - retained_ids)
             raise ValueError(
-                f"cutover vaults must equal the complete active vault inventory (omitted={omitted}, added={added})"
+                f"cutover vaults must equal the complete retained vault inventory (omitted={omitted}, added={added})"
             )
         eligible: list[CutoverVaultInput] = []
         exclusions: list[CutoverExclusion] = []
@@ -670,31 +670,31 @@ class NativeRevisionCutover:
         vaults = await self.repository.list_vaults(cutover_id, conn=conn)
         files = await self.repository.list_files(cutover_id, conn=conn)
         exclusions = await self.repository.list_exclusions(cutover_id, conn=conn)
-        active = await self._active_vault_inventory(conn=conn)
+        retained = await self._retained_vault_inventory(conn=conn)
 
         planned_ids = {item.namespace_id for item in vaults}
         planned_ids.update(item.namespace_id for item in exclusions)
-        active_ids = {row["id"] for row in active}
-        if planned_ids != active_ids:
-            raise CutoverVerificationError("active vault inventory drifted after planning")
+        retained_ids = {row["id"] for row in retained}
+        if planned_ids != retained_ids:
+            raise CutoverVerificationError("retained vault inventory drifted after planning")
 
         vault_by_id = {item.namespace_id: item for item in vaults}
         exclusion_by_id = {item.namespace_id: item for item in exclusions}
-        for row in active:
+        for row in retained:
             if row["external_git"]:
                 exclusion = exclusion_by_id.get(row["id"])
                 if exclusion is None or exclusion.reason != "external_git_requires_collector":
-                    raise CutoverVerificationError("active vault classification drifted after planning")
+                    raise CutoverVerificationError("retained vault classification drifted after planning")
             elif row["id"] not in vault_by_id:
-                raise CutoverVerificationError("active vault classification drifted after planning")
-        if any(row["external_git"] for row in active):
+                raise CutoverVerificationError("retained vault classification drifted after planning")
+        if any(row["external_git"] for row in retained):
             raise CutoverVerificationError("cutover authority cannot commit while persisted external Git vaults remain")
         if exclusions:
             raise CutoverVerificationError("cutover exclusion inventory drifted after external Git retirement")
 
-        active_by_id = {row["id"]: row for row in active}
+        retained_by_id = {row["id"]: row for row in retained}
         for vault in vaults:
-            row = active_by_id[vault.namespace_id]
+            row = retained_by_id[vault.namespace_id]
             current_ref = await asyncio.to_thread(
                 self.backfill.git.current_commit,
                 row["name"],
@@ -752,8 +752,8 @@ class NativeRevisionCutover:
             raise CutoverVerificationError("aborted cutover cannot commit authority")
         if run.status != "verified" or run.verification_digest is None:
             raise CutoverVerificationError("cutover must be verified before authority can be committed")
-        active = await self._active_vault_inventory()
-        async with self._hold_git_write_fences([row["name"] for row in active]):
+        retained = await self._retained_vault_inventory()
+        async with self._hold_git_write_fences([row["name"] for row in retained]):
             async with self.pool.acquire() as conn:
                 authority_id = await mint_existing_database_authority(
                     conn,

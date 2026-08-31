@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import uuid
+from dataclasses import dataclass
 
 from app import cli
+from app.db import postgres
+import app.services.git_service as git_service
+import app.services.native_revision_backfill as backfill_module
+import app.services.native_revision_cutover as cutover_module
 
 
 def test_native_revision_cutover_cli_routes_plan(monkeypatch, capsys) -> None:
@@ -26,6 +33,76 @@ def test_native_revision_cutover_cli_routes_plan(monkeypatch, capsys) -> None:
     assert code == 0
     assert calls == [("plan", {"coverage_version": "fixture-v1", "cutover_id": None})]
     assert json.loads(capsys.readouterr().out)["status"] == "planned"
+
+
+def test_native_revision_cutover_cli_plan_includes_archived_vaults(monkeypatch) -> None:
+    active_id = uuid.uuid4()
+    archived_id = uuid.uuid4()
+    refs = {"active": "a" * 40, "archived": "b" * 40}
+    planned: list[tuple[object, str]] = []
+
+    class _Connection:
+        async def fetch(self, sql: str):
+            assert "status <> 'deleted'" in sql
+            return [
+                {"id": active_id, "name": "active"},
+                {"id": archived_id, "name": "archived"},
+            ]
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Connection()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    class _Git:
+        def current_commit(self, name: str) -> str:
+            return refs[name]
+
+    @dataclass
+    class _Receipt:
+        status: str
+
+    class _Cutover:
+        def __init__(self, pool, *, backfill, verifier) -> None:
+            assert isinstance(pool, _Pool)
+            assert backfill is not None
+            assert verifier is not None
+
+        async def plan(self, *, vaults, coverage_version: str):
+            planned.extend((item.namespace_id, item.fixed_ref) for item in vaults)
+            assert coverage_version == "fixture-v1"
+            return _Receipt(status="planned")
+
+    async def _noop() -> None:
+        return None
+
+    async def _pool() -> _Pool:
+        return _Pool()
+
+    monkeypatch.setattr(postgres, "init_db", _noop)
+    monkeypatch.setattr(postgres, "get_pool", _pool)
+    monkeypatch.setattr(postgres, "close_pool", _noop)
+    monkeypatch.setattr(git_service, "GitService", _Git)
+    monkeypatch.setattr(backfill_module, "NativeRevisionBackfill", lambda pool, *, git: object())
+    monkeypatch.setattr(cutover_module, "NativeRevisionCutoverVerifier", lambda pool, *, git: object())
+    monkeypatch.setattr(cutover_module, "NativeRevisionCutover", _Cutover)
+
+    report = asyncio.run(
+        cli._execute_native_revision_cutover(
+            "plan",
+            coverage_version="fixture-v1",
+            cutover_id=None,
+        )
+    )
+
+    assert report == {"status": "planned"}
+    assert planned == [(active_id, refs["active"]), (archived_id, refs["archived"])]
 
 
 def test_native_revision_cutover_cli_routes_abort(monkeypatch) -> None:

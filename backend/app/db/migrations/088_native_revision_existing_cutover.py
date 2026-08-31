@@ -384,12 +384,12 @@ async def _run(conn):
 
             DROP TRIGGER IF EXISTS guard_native_legacy_write ON documents;
             CREATE TRIGGER guard_native_legacy_write
-                BEFORE INSERT OR UPDATE ON documents
+                BEFORE INSERT OR UPDATE OR DELETE ON documents
                 FOR EACH ROW EXECUTE FUNCTION reject_fenced_legacy_revision_write();
 
             DROP TRIGGER IF EXISTS guard_native_legacy_write ON resource_aliases;
             CREATE TRIGGER guard_native_legacy_write
-                BEFORE INSERT OR UPDATE ON resource_aliases
+                BEFORE INSERT OR UPDATE OR DELETE ON resource_aliases
                 FOR EACH ROW EXECUTE FUNCTION reject_fenced_legacy_revision_write();
 
             DROP TRIGGER IF EXISTS guard_native_legacy_write ON vault_external_git;

@@ -683,12 +683,12 @@ async def _execute_native_revision_cutover(
         if phase == "plan":
             assert coverage_version is not None
             async with pool.acquire() as conn:
-                rows = await conn.fetch("SELECT id, name FROM vaults WHERE status = 'active' ORDER BY id")
+                rows = await conn.fetch("SELECT id, name FROM vaults WHERE status <> 'deleted' ORDER BY id")
             vaults = []
             for row in rows:
                 fixed_ref = await asyncio.to_thread(git.current_commit, row["name"])
                 if fixed_ref is None:
-                    raise ValueError(f"active vault has no current Legacy Git ref: {row['id']}")
+                    raise ValueError(f"retained vault has no current Legacy Git ref: {row['id']}")
                 vaults.append(
                     CutoverVaultInput(
                         namespace_id=row["id"],

@@ -34,6 +34,7 @@ from app.services.native_revision_cutover import (
     NativeRevisionCutover,
     NativeRevisionCutoverVerifier,
 )
+from app.services.native_revision_backend import NativeRevisionBackend
 
 
 pytestmark = pytest.mark.asyncio
@@ -246,23 +247,28 @@ class _MismatchVerifier:
         }
 
 
-async def test_two_manual_vaults_plan_apply_and_verify_as_one_database_cutover(tmp_path):
+async def test_active_and_archived_manual_vaults_cut_over_as_one_database(tmp_path):
     async with _fresh_schema() as pool:
         git = GitService(storage_path=str(tmp_path / "git"))
         vaults = [
             await _manual_vault(pool, git, label="one"),
             await _manual_vault(pool, git, label="two"),
         ]
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE vaults SET status = 'archived' WHERE id = $1",
+                vaults[1].namespace_id,
+            )
         backfill = NativeRevisionBackfill(pool, git=git)
         verifier = _FixtureVerifier(pool)
         cutover = NativeRevisionCutover(pool, backfill=backfill, verifier=verifier)
 
-        with pytest.raises(ValueError, match="complete active vault inventory"):
+        with pytest.raises(ValueError, match="complete retained vault inventory"):
             await cutover.plan(
                 vaults=vaults[:1],
                 coverage_version="fixture-omitted-vault-v1",
             )
-        with pytest.raises(ValueError, match="complete active vault inventory"):
+        with pytest.raises(ValueError, match="complete retained vault inventory"):
             await cutover.plan(
                 vaults=[
                     *vaults,
@@ -316,6 +322,12 @@ async def test_two_manual_vaults_plan_apply_and_verify_as_one_database_cutover(t
         assert await cutover.commit(planned.cutover_id, identity=identity) == authority
 
         async with pool.acquire() as conn:
+            assert await conn.fetchval("SELECT status FROM vaults WHERE id = $1", vaults[1].namespace_id) == "archived"
+            await conn.execute(
+                "UPDATE vaults SET status = 'active' WHERE id = $1",
+                vaults[1].namespace_id,
+            )
+            assert await conn.fetchval("SELECT status FROM vaults WHERE id = $1", vaults[1].namespace_id) == "active"
             assert (
                 await consume_or_validate_existing_database_authority(
                     conn,
@@ -341,7 +353,7 @@ async def test_two_manual_vaults_plan_apply_and_verify_as_one_database_cutover(t
                 await conn.execute("DELETE FROM native_revision_existing_authority")
 
 
-async def test_persisted_external_mirror_is_reported_without_poisoning_manual_backfill(
+async def test_archived_external_mirror_blocks_authority_without_poisoning_manual_backfill(
     tmp_path,
 ):
     async with _fresh_schema() as pool:
@@ -360,7 +372,7 @@ async def test_persisted_external_mirror_is_reported_without_poisoning_manual_ba
             mirror_id = await conn.fetchval(
                 """
                 INSERT INTO vaults (name, git_path, status)
-                VALUES ($1, $2, 'active') RETURNING id
+                VALUES ($1, $2, 'archived') RETURNING id
                 """,
                 mirror_name,
                 str(git._bare_path(mirror_name)),
@@ -438,7 +450,7 @@ async def test_persisted_external_mirror_is_reported_without_poisoning_manual_ba
 
         with pytest.raises(
             CutoverVerificationError,
-            match="active vault inventory drifted",
+            match="retained vault inventory drifted",
         ):
             await cutover.commit(planned.cutover_id, identity=identity)
         async with pool.acquire() as conn:
@@ -518,7 +530,7 @@ async def test_commit_rejects_a_post_plan_vault_and_rolls_back_the_fence(tmp_pat
 
         with pytest.raises(
             CutoverVerificationError,
-            match="active vault inventory drifted",
+            match="retained vault inventory drifted",
         ):
             await cutover.commit(
                 planned.cutover_id,
@@ -647,6 +659,19 @@ async def test_authority_mint_is_the_boundary_and_fences_external_git_race(tmp_p
     async with _fresh_schema() as pool:
         git = GitService(storage_path=str(tmp_path / "git-fence-race"))
         vault = await _manual_vault(pool, git, label="fence-race")
+        async with pool.acquire() as conn:
+            document_id = await conn.fetchval(
+                "SELECT id FROM documents WHERE vault_id = $1",
+                vault.namespace_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO resource_aliases (vault_id, resource_type, old_ref, resource_id)
+                VALUES ($1, 'document', 'legacy-document.md', $2)
+                """,
+                vault.namespace_id,
+                document_id,
+            )
         data = b"race fixture\x00"
         _, s3_key = await _confirmed_file(
             pool,
@@ -723,6 +748,22 @@ async def test_authority_mint_is_the_boundary_and_fences_external_git_race(tmp_p
                     "UPDATE documents SET title = title WHERE vault_id = $1",
                     vault.namespace_id,
                 )
+            with pytest.raises(
+                asyncpg.ObjectNotInPrerequisiteStateError,
+                match="Legacy revision writes are fenced",
+            ):
+                await conn.execute(
+                    "DELETE FROM documents WHERE vault_id = $1",
+                    vault.namespace_id,
+                )
+            with pytest.raises(
+                asyncpg.ObjectNotInPrerequisiteStateError,
+                match="Legacy revision writes are fenced",
+            ):
+                await conn.execute(
+                    "DELETE FROM resource_aliases WHERE vault_id = $1",
+                    vault.namespace_id,
+                )
             assert (
                 await conn.execute(
                     "UPDATE vault_files SET description = 'native-era write' WHERE vault_id = $1",
@@ -736,6 +777,124 @@ async def test_authority_mint_is_the_boundary_and_fences_external_git_race(tmp_p
                     identity=identity,
                 )
                 == "cutover_validated"
+            )
+
+
+async def test_committed_cutover_preserves_vault_activity_for_deleted_and_recreated_documents(tmp_path):
+    async with _fresh_schema() as pool:
+        git = GitService(storage_path=str(tmp_path / "git-frozen-vault-activity"))
+        vault_name = f"cutover-frozen-activity-{uuid.uuid4().hex}"
+        git.init_vault(vault_name)
+
+        deleted_create = git.commit_file(
+            vault_name,
+            "deleted.md",
+            "deleted resource\n",
+            "[create] deleted.md\n\nagent: fixture\naction: create\nsummary: create deleted resource",
+        )
+        await asyncio.sleep(1.05)
+        deleted_remove = git.delete_file(
+            vault_name,
+            "deleted.md",
+            "[delete] deleted.md\n\nagent: fixture\naction: delete\nsummary: delete deleted resource",
+        )
+        await asyncio.sleep(1.05)
+        prior_create = git.commit_file(
+            vault_name,
+            "recreated.md",
+            "prior resource\n",
+            "[create] recreated.md\n\nagent: fixture\naction: create\nsummary: create prior resource",
+        )
+        await asyncio.sleep(1.05)
+        prior_remove = git.delete_file(
+            vault_name,
+            "recreated.md",
+            "[delete] recreated.md\n\nagent: fixture\naction: delete\nsummary: delete prior resource",
+        )
+        await asyncio.sleep(1.05)
+        recreated_create = git.commit_file(
+            vault_name,
+            "recreated.md",
+            "replacement resource\n",
+            "[create] recreated.md\n\nagent: fixture\naction: create\nsummary: create replacement resource",
+        )
+        recreated_at = Repo(str(git._bare_path(vault_name))).commit(recreated_create).committed_datetime
+
+        async with pool.acquire() as conn:
+            namespace_id = await conn.fetchval(
+                """
+                INSERT INTO vaults (name, git_path, status)
+                VALUES ($1, $2, 'active')
+                RETURNING id
+                """,
+                vault_name,
+                str(git._bare_path(vault_name)),
+            )
+            await conn.execute(
+                """
+                INSERT INTO documents
+                    (id, vault_id, path, title, created_at, updated_at, current_commit, source)
+                VALUES ($1, $2, 'recreated.md', 'replacement', $3, $3, $4, 'manual')
+                """,
+                uuid.uuid4(),
+                namespace_id,
+                recreated_at,
+                recreated_create,
+            )
+
+        expected = await asyncio.to_thread(git.vault_log, vault_name, max_count=20)
+        assert [entry["hash"] for entry in expected] == [
+            recreated_create[:12],
+            prior_remove[:12],
+            prior_create[:12],
+            deleted_remove[:12],
+            deleted_create[:12],
+        ]
+        expected_by_path = {
+            path: await asyncio.to_thread(git.vault_log, vault_name, max_count=20, path=path)
+            for path in ("deleted.md", "recreated.md")
+        }
+
+        vault = CutoverVaultInput(namespace_id=namespace_id, fixed_ref=recreated_create)
+        cutover = NativeRevisionCutover(
+            pool,
+            backfill=NativeRevisionBackfill(pool, git=git),
+            verifier=_FixtureVerifier(pool),
+        )
+        planned = await cutover.plan(
+            vaults=[vault],
+            coverage_version="fixture-frozen-vault-activity-v1",
+        )
+        await cutover.apply(planned.cutover_id)
+        await cutover.verify(planned.cutover_id)
+        await cutover.commit(planned.cutover_id, identity=_identity("frozen-vault-activity"))
+
+        post_cutover = git.commit_file(
+            vault_name,
+            "recreated.md",
+            "legacy head moved after cutover\n",
+            "[update] recreated.md\n\nagent: fixture\naction: update\nsummary: must not enter frozen activity",
+        )
+        moved_head = await asyncio.to_thread(git.vault_log, vault_name, max_count=20)
+        assert moved_head[0]["hash"] == post_cutover[:12]
+
+        backend = NativeRevisionBackend(pool=pool, legacy_git=git)
+        activity = await backend.vault_activity(
+            vault_name,
+            max_count=20,
+            since=None,
+            path=None,
+        )
+        assert activity == expected
+        for path in ("deleted.md", "recreated.md"):
+            assert (
+                await backend.vault_activity(
+                    vault_name,
+                    max_count=20,
+                    since=None,
+                    path=path,
+                )
+                == expected_by_path[path]
             )
 
 
