@@ -7,11 +7,13 @@
     "akb-mcp": "./bin/akb-mcp.mjs"
   },
   "scripts": {
-    "test": "node test/contract.test.mjs && node test/reconnect.test.mjs && node test/protocol.test.mjs"
+    "inspect": "node scripts/mcp-inspector-smoke.mjs",
+    "test": "node test/contract.test.mjs && node test/reconnect.test.mjs && node test/protocol.test.mjs && node --test test/mcp-inspector-smoke.test.mjs"
   },
   "type": "module",
   "devDependencies": {
-    "@modelcontextprotocol/client": "2.0.0"
+    "@modelcontextprotocol/client": "2.0.0",
+    "@modelcontextprotocol/inspector": "2.4.0"
   },
   "files": ["bin/", "lib/", "CHANGELOG.md"],
   "keywords": ["mcp", "akb", "knowledge-base", "claude-code", "cursor", "copilot", "ai-agent"],

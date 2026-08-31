@@ -455,11 +455,9 @@ class E2ERuntime:
         }
         if isinstance(fixture_namespace, str):
             fixture["namespace"] = fixture_namespace
-            fixture["generation"] = fixture_namespace
         evidence: dict[str, object] = {
             "source_revision": self._source_revision(),
             "backend_artifact_version": self._backend_version(),
-            "profile": self.profile.name,
             "protocol_revision": PROTOCOL_REVISION,
             "transport": ["http", "stdio"] if self.profile.needs_stdio else ["http"],
             "selected_capabilities": list(self.selected_capabilities),
@@ -496,50 +494,6 @@ class E2ERuntime:
                 },
             },
             "fixture": fixture,
-            "consumer_smoke": {
-                "protocol_era": "modern",
-                "protocol_version": "2026-07-28",
-                "http": {
-                    "service": "app",
-                    "method": "POST",
-                    "path": "/mcp/",
-                },
-                "required_tools": ["akb_list_vaults", "akb_put", "akb_delete"],
-                "shared_tools": ["akb_list_vaults", "akb_put", "akb_delete"],
-                "representative": {
-                    "tool": "akb_list_vaults",
-                    "read_only": True,
-                    "arguments": {},
-                    "observable": {
-                        "content_type": "json",
-                        "result_type": "object",
-                        "required_keys": ["vaults", "total", "returned"],
-                        "items_key": "vaults",
-                        "count_rule": "total>=returned==items.length",
-                        "is_error": False,
-                    },
-                },
-                "proxy_local": {
-                    "tools": [
-                        "akb_put_file",
-                        "akb_put_image",
-                        "akb_discard_image",
-                        "akb_get_file",
-                        "akb_update_file",
-                        "akb_delete_file",
-                    ],
-                    "input_properties": {
-                        # Top-level properties accepted by the stdio proxy but
-                        # absent from direct HTTP. `_vault_skill_ack` is the
-                        # existing capability-v2 retry extension; `file` is
-                        # the existing local-filesystem extension.
-                        "akb_list_vaults": [],
-                        "akb_put": ["file", "_vault_skill_ack"],
-                        "akb_delete": ["_vault_skill_ack"],
-                        "akb_update": ["file", "_vault_skill_ack"],
-                    },
-                },
-            },
             "failure_stages": ["provisioning", "product_assertion"],
         }
         if self.profile.needs_stdio:
@@ -578,12 +532,6 @@ class E2ERuntime:
             "scenario": self.config.scenario,
             "app_ready": self.app_ready,
         }
-
-    def fixture_generation(self) -> str | None:
-        """Return the current reset generation without exposing private values."""
-
-        generation = self._fixture_catalog.get("namespace")
-        return generation if isinstance(generation, str) and generation else None
 
     def fixture_discovery(self) -> dict[str, object]:
         """Return sanitized product coordinates and bounded fixture controls."""
@@ -1236,6 +1184,7 @@ class E2ERuntime:
         *,
         log_path: Path,
         check: bool = True,
+        stdin_data: bytes | None = None,
     ) -> int:
         log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with log_path.open("ab", buffering=0) as handle:
@@ -1244,13 +1193,17 @@ class E2ERuntime:
                 *command,
                 cwd=str(self.config.runtime_root),
                 env=self._child_environment(),
-                stdin=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.PIPE if stdin_data is not None else asyncio.subprocess.DEVNULL,
                 stdout=handle,
                 stderr=handle,
                 start_new_session=True,
             )
             self._active_command = process
             try:
+                if stdin_data is not None and process.stdin is not None:
+                    process.stdin.write(stdin_data)
+                    await process.stdin.drain()
+                    process.stdin.close()
                 returncode = await process.wait()
             finally:
                 self._active_command = None
@@ -3200,6 +3153,31 @@ class E2ERuntime:
                     "returncode": 0,
                 }
             )
+
+            try:
+                await self._run_logged_command(
+                    [
+                        "npm",
+                        "--prefix",
+                        str(self.config.proxy_package_dir),
+                        "run",
+                        "--silent",
+                        "inspect",
+                        "--",
+                        "--intent",
+                        "smoke",
+                        "--target",
+                        "both",
+                        "--descriptor",
+                        "-",
+                    ],
+                    log_path=self.config.logs_dir / "mcp-inspector.log",
+                    stdin_data=json.dumps(
+                        self.descriptor(), separators=(",", ":"), ensure_ascii=False
+                    ).encode(),
+                )
+            except ProvisioningFailure as exc:
+                raise ProductAssertionFailure("MCP Inspector consumer smoke failed") from exc
 
         child_env = self._child_environment()
         with log_path.open("ab", buffering=0) as handle:

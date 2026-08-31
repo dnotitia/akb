@@ -127,72 +127,46 @@ product-assertion failures are emitted as separate gate events.
 ### MCP Inspector consumer smoke
 
 The repository-owned MCP Inspector command is a development tool, not a
-second runtime. Install its private, exact-pinned package once in a clean
-checkout:
+second runtime. It lives with the stdio client and is installed by the
+client's existing npm workflow:
 
 ```bash
-(cd tools/mcp-inspector && npm ci)
+(cd packages/akb-mcp-client && npm ci)
 ```
 
-The same entrypoint provides a machine-readable smoke and an interactive Web
-diagnostic. It consumes the schema-v2 descriptor printed by the runtime and
-never needs a global Inspector install:
+The same package entrypoint provides a machine-readable smoke and an
+interactive Web diagnostic. It consumes the ready descriptor printed by the
+repository runtime and never needs a global Inspector install:
 
 ```bash
-npm run --prefix tools/mcp-inspector inspect -- \
+npm --prefix packages/akb-mcp-client run --silent inspect -- \
   --intent smoke --target both --descriptor /path/to/descriptor.json
 
-npm run --prefix tools/mcp-inspector inspect -- \
-  --intent interactive --target http --descriptor /path/to/descriptor.json
+npm --prefix packages/akb-mcp-client run --silent inspect -- \
+  --intent interactive --config /path/to/mcp-config.json
 ```
 
-For an interactive session, use `serve --profile transport-proxy` when the
-stdio target is needed. The Web client is explicitly bound to `127.0.0.1` and
-keeps Inspector's normal launch/session authentication. The command reads the
-credential environment names declared by discovery, mints a run-scoped PAT
-when one is not already present, and sends Inspector configuration through a
-private, ephemeral FIFO. The FIFO carries in-memory JSON and is unlinked after
-each child exits; it is not a regular config file. The command does not put
-credentials in argv, a checked-in/generated config, or Inspector's persistent
-OAuth/secret stores.
+The smoke uses Node.js `>=22.19.0` and the exact-pinned
+`@modelcontextprotocol/inspector@2.4.0` public executable. For each selected
+transport it runs `initialize`, `tools/list --strict --format json`, and
+`akb_list_vaults({})` through the actual Inspector child process. It reports
+HTTP and stdio independently, retains Inspector diagnostics and warnings,
+and exits non-zero when either transport or the representative schema/result
+check fails.
 
-The runtime discovery contract lists the exact top-level stdio-only input
-properties under `proxy_local.input_properties`: `file` for the local-file
-document path on `akb_put`/`akb_update`, and `_vault_skill_ack` for the existing
-capability-v2 retry argument on write tools such as `akb_put`, `akb_delete`, and
-`akb_update`. The read-only `akb_list_vaults` entry is explicitly empty. The
-comparison removes only those declared per-tool properties
-(and matching required entries) from the stdio schema; all other schema drift
-remains a portability failure.
+The smoke obtains endpoints, fixture reset, credential environment names, and
+the clean installed `akb-mcp` executable from the ready descriptor and its
+fixture discovery. A fixture PAT is placed only in a private 0700 run
+directory's 0600 temporary Inspector config, which is deleted in `finally`
+cleanup. The PAT is not placed in argv, logs, command output, reports, or
+uploaded artifacts. The focused package regression exercises the same public
+entrypoint with a synthetic marker and verifies config removal and redaction.
 
-Smoke pins the modern protocol era and runs, in order, `initialize`,
-`tools/list --strict --format json`, and the discovery-declared read-only
-`tools/call`. It validates server identity, required tools, strict schema
-findings, `isError`, the runtime-declared observable result, and—when both
-transports are selected—shared tool schemas and the public representative
-result. Proxy-local file tools are recorded as local extensions and are not
-required from direct HTTP. This is a modern consumer-portability proof, not a
-complete MCP specification-conformance certification.
-
-The command emits one JSON evidence object. It includes the exact source
-revision, Inspector/Node versions, protocol era, runtime profile,
-fixture/reset generation, per-transport config digest, operation order and
-outcomes. Transport outcomes remain independent when `--target both` is used.
-Its stable failure classes and process exit codes are:
-
-| Exit | Failure class |
-| ---: | --- |
-| 0 | success |
-| 1 | `unexpected_failure` |
-| 2 | `usage_configuration_error` |
-| 3 | `authentication_required` |
-| 4 | `server_unreachable` |
-| 5 | `tool_result_error` |
-| 6 | `schema_portability_error` |
-
-Missing readiness, discovery, reset, credential names, exact representative
-coordinates, or the clean installed `akb-mcp` executable is a configuration
-failure; the command never silently skips it.
+For an interactive session, pass a user-owned Inspector config file. The
+entrypoint binds the Web server to `127.0.0.1` and keeps Inspector's normal
+session authentication; it does not create a user PAT file or alter the
+user's credential boundary. The existing `transport-proxy` runtime profile
+can be used when the interactive config includes stdio.
 
 For a direct local gate, use the uv-managed Python environment to generate
 per-run values and export them without placing a credential value in the
@@ -200,6 +174,7 @@ command line or repository files:
 
 ```bash
 uv sync --locked --extra dev --project backend
+(cd packages/akb-mcp-client && npm ci)
 RUNTIME_ROOT="$(mktemp -d /tmp/akb-e2e-runtime.XXXXXX)"
 export AKB_E2E_USERNAME="$(uv run --locked --project backend python -c \
   'import secrets; print(f"akb-e2e-{secrets.token_hex(8)}")')"

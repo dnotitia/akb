@@ -24,8 +24,6 @@ class FixtureRuntime(Protocol):
 
     def fixture_log_observation(self) -> dict[str, object]: ...
 
-    def fixture_generation(self) -> str | None: ...
-
     async def reset_scenario(self) -> None: ...
 
     def fixture_control(
@@ -96,11 +94,7 @@ def create_app(runtime: FixtureRuntime) -> FastAPI:
                 detail="reset scenario does not match the running runtime",
             )
         await runtime.reset_scenario()
-        response = {"status": "ready", "scenario": runtime.scenario}
-        generation = runtime.fixture_generation()
-        if generation:
-            response["generation"] = generation
-        return response
+        return {"status": "ready", "scenario": runtime.scenario}
 
     @app.post("/control")
     async def control(request: ControlRequest) -> dict[str, object]:

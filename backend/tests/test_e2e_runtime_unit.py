@@ -168,29 +168,6 @@ def test_fixture_discovery_declares_auth_and_observability_without_secrets(
     serialized = json.dumps(discovery)
     assert "external-user-value" not in serialized
     assert "external-password-value" not in serialized
-    assert discovery["runtime"]["profile"] == "tool-only"
-    assert discovery["runtime"]["fixture"]["generation"] == "fixture-randomized"
-    consumer_smoke = discovery["runtime"]["consumer_smoke"]
-    assert consumer_smoke["protocol_era"] == "modern"
-    assert consumer_smoke["protocol_version"] == "2026-07-28"
-    assert consumer_smoke["http"] == {
-        "service": "app",
-        "method": "POST",
-        "path": "/mcp/",
-    }
-    assert consumer_smoke["representative"] == {
-        "tool": "akb_list_vaults",
-        "read_only": True,
-        "arguments": {},
-        "observable": {
-            "content_type": "json",
-            "result_type": "object",
-            "required_keys": ["vaults", "total", "returned"],
-            "items_key": "vaults",
-            "count_rule": "total>=returned==items.length",
-            "is_error": False,
-        },
-    }
 
 
 def test_installation_discovery_publishes_success_lifecycle_command_bodies(tmp_path):
@@ -547,7 +524,6 @@ class FakeFixtureRuntime:
     def __init__(self, scenario="empty"):
         self.reset_count = 0
         self.scenario = scenario
-        self.generation = "fixture-generation"
 
     def fixture_health(self):
         return {"status": "ready", "scenario": self.scenario, "app_ready": True}
@@ -594,9 +570,6 @@ class FakeFixtureRuntime:
     async def reset_scenario(self):
         self.reset_count += 1
 
-    def fixture_generation(self):
-        return self.generation
-
 
 @pytest.mark.asyncio
 async def test_fixture_control_exposes_reset_discovery_and_sanitized_logs():
@@ -635,7 +608,6 @@ async def test_fixture_control_exposes_reset_discovery_and_sanitized_logs():
         assert log_observation.json()["redaction_scan"]["private_value_hits"] == 0
         reset = await client.post("/reset", json={"scenario": "empty"})
         assert reset.status_code == 200
-        assert reset.json()["generation"] == "fixture-generation"
         assert runtime.reset_count == 1
         control = await client.post(
             "/control",
@@ -1082,14 +1054,6 @@ def test_transport_profile_exposes_real_proxy_boundary_without_secret(tmp_path):
     assert "akb_runtime_secret" not in serialized
     assert "AKB_E2E_PAT" in serialized
     assert descriptor["evidence"]["transport"] == ["http", "stdio"]
-    assert descriptor["evidence"]["consumer_smoke"]["http"]["path"] == "/mcp/"
-    assert "akb_get_file" in descriptor["evidence"]["consumer_smoke"]["proxy_local"]["tools"]
-    assert descriptor["evidence"]["consumer_smoke"]["proxy_local"]["input_properties"] == {
-        "akb_list_vaults": [],
-        "akb_put": ["file", "_vault_skill_ack"],
-        "akb_delete": ["_vault_skill_ack"],
-        "akb_update": ["file", "_vault_skill_ack"],
-    }
 
 
 @pytest.mark.asyncio
