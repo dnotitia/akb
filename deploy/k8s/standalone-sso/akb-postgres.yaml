@@ -28,9 +28,16 @@ spec:
           ports:
             - name: postgres
               containerPort: 5432
-          envFrom:
-            - secretRef:
-                name: akb-postgres-credentials
+          env:
+            - name: POSTGRES_DB
+              value: akb
+            - name: POSTGRES_USER
+              value: akbuser
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: akb-secret
+                  key: db_password
           volumeMounts:
             - name: pgdata
               mountPath: /var/lib/postgresql/data

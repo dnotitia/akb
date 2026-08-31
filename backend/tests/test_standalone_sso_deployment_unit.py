@@ -70,6 +70,19 @@ def test_keycloak_bootstrap_secret_is_required_for_first_boot_and_not_a_human_ad
     assert "KC_BOOTSTRAP_ADMIN_PASSWORD" not in env
 
 
+def test_akb_database_uses_the_shared_platform_secret_contract():
+    postgres = _one("akb-postgres.yaml", kind="StatefulSet", resource_name="postgres")
+    container = postgres["spec"]["template"]["spec"]["containers"][0]
+    assert "envFrom" not in container
+    env = {item["name"]: item for item in container["env"]}
+    assert env["POSTGRES_DB"]["value"] == "akb"
+    assert env["POSTGRES_USER"]["value"] == "akbuser"
+    assert env["POSTGRES_PASSWORD"]["valueFrom"]["secretKeyRef"] == {
+        "name": "akb-secret",
+        "key": "db_password",
+    }
+
+
 def test_backend_patch_removes_local_key_authority_and_mounts_one_time_inputs_only_in_init():
     deployment = _one(
         "backend-deployment-patch.yaml",

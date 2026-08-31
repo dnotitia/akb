@@ -49,15 +49,18 @@ intentionally unable to mutate clients.
 
 ## Required operator inputs
 
-Patch these public values in an operator overlay before applying:
+When using `deploy/k8s/deploy.sh` with `AUTH_PROFILE=sso`, provide these public
+values as environment variables. The deployer validates them and replaces the
+public placeholders in one render, before anything is applied:
 
-- `akb.example.com` in the AKB Ingress and `akb-app-config`
-- `auth.akb.example.com` in the Keycloak Ingress, `KC_HOSTNAME`, and
-  `akb-app-config`
-- `product-admin-username` and `product-admin-email` in
-  `akb-sso-bootstrap-config`
+- `SSO_AKB_PUBLIC_URL` (for example `https://akb.example.com`)
+- `SSO_KEYCLOAK_PUBLIC_URL` (for example `https://auth.akb.example.com`)
+- `SSO_PRODUCT_ADMIN_USERNAME` and `SSO_PRODUCT_ADMIN_EMAIL`
 - the immutable `akb-backend` and `akb-frontend` image references
 - TLS issuer/secret names and storage classes as needed
+
+An operator-specific Kustomize overlay may still patch those fields directly,
+but it must be passed with `KUSTOMIZE_DIR` and use the same coherent origins.
 
 The following Secrets are deliberately absent from Kustomize output. Create
 them with a secret manager, Sealed Secrets, or `kubectl create secret`; never
@@ -65,9 +68,8 @@ commit their values.
 
 | Secret | Required keys | Lifecycle |
 |---|---|---|
-| `akb-postgres-credentials` | `POSTGRES_DB=akb`, `POSTGRES_USER=akbuser`, `POSTGRES_PASSWORD` | durable |
 | `akb-keycloak-db-credentials` | `POSTGRES_DB=keycloak`, `POSTGRES_USER=keycloak`, `POSTGRES_PASSWORD` | durable |
-| `akb-secret` | `secret.yaml` plus the Secret Contract v1 compatibility keys | durable |
+| `akb-secret` | `db_password`, `secret.yaml`, SSO runtime and Secret Contract v1 compatibility keys | durable |
 | `akb-keycloak-bootstrap` | `client-secret` | one-time |
 | `akb-keycloak-upgrade` | `client-secret` | optional; one-time legacy-profile upgrade only |
 | `akb-product-admin-bootstrap` | `password` | one-time |
@@ -77,7 +79,7 @@ independent browser-session encryption key, and three independently generated
 confidential-client secrets:
 
 ```yaml
-db_password: <same value as akb-postgres-credentials>
+db_password: <AKB PostgreSQL password; also projected as akb-secret/db_password>
 system_hmac_secret: <independent random value>
 sso_session_epoch: <installation-owned UUID>
 sso_browser_session_encryption_key: <independent 32-byte base64url value>
@@ -92,6 +94,31 @@ temporary, must be at least 12 characters, must differ from its username and
 email, and Keycloak forces `UPDATE_PASSWORD` on first login. The realm enforces
 the same lean policy for the replacement password. The bootstrap client secret
 is not the product-admin password.
+
+The unified Secret Manager deployment creates these projections for manual,
+bundled OpenBao, bundled HashiCorp Vault, and external Vault-compatible modes.
+For a fresh isolated installation:
+
+```bash
+AUTH_PROFILE=sso \
+NAMESPACE=akb-sso-example \
+SSO_AKB_PUBLIC_URL=https://akb.example.com \
+SSO_KEYCLOAK_PUBLIC_URL=https://auth.akb.example.com \
+SSO_PRODUCT_ADMIN_USERNAME=admin \
+SSO_PRODUCT_ADMIN_EMAIL=admin@example.com \
+SECRET_MODE=bundled \
+SECRET_ENGINE=openbao \
+SECRET_PROFILE=development \
+REGISTRY=registry.example.com \
+bash deploy/k8s/deploy.sh
+```
+
+`AUTH_PROFILE=sso` automatically selects this Kustomize tree. The Secret
+profile first makes the complete contract ready, then the deployer applies AKB,
+the dedicated Keycloak database, Keycloak, and both ingresses. It waits for
+both databases and Keycloak before accepting the backend rollout. Reusing a KV
+path created for `AUTH_PROFILE=local` is rejected; authentication cutover is a
+separate migration, not an implicit secret rewrite.
 
 `sso_session_epoch` is not a credential. Generate it once with
 `python -c 'import uuid; print(uuid.uuid4())'` and keep it stable across normal

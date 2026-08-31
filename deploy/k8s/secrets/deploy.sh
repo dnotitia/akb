@@ -10,6 +10,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SECRET_MODE="${SECRET_MODE:-manual}"
 SECRET_ENGINE="${SECRET_ENGINE:-}"
 SECRET_PROFILE="${SECRET_PROFILE:-development}"
+AUTH_PROFILE="${AUTH_PROFILE:-local}"
+SECRET_STORE_RELEASE="${SECRET_STORE_RELEASE:-}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-}"
 INSTALL_VSO="${INSTALL_VSO:-false}"
 KV_MOUNT="${KV_MOUNT:-kv}"
@@ -28,6 +30,10 @@ if [[ ! "${NAMESPACE}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
   echo "NAMESPACE is not a valid DNS label" >&2
   exit 2
 fi
+if [[ "${AUTH_PROFILE}" != "local" && "${AUTH_PROFILE}" != "sso" ]]; then
+  echo "AUTH_PROFILE must be local or sso" >&2
+  exit 2
+fi
 if [[ ! "${KV_MOUNT}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] ||
    [[ ! "${KUBERNETES_AUTH_MOUNT}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] ||
    [[ ! "${VAULT_ROLE}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
@@ -41,14 +47,32 @@ if [[ ! "${KV_PATH}" =~ ^[A-Za-z0-9][A-Za-z0-9_./-]*$ ]] ||
 fi
 
 secret_contract_ready() {
-  "${KUBECTL[@]}" get secret akb-secret -n "${NAMESPACE}" -o json 2>/dev/null | \
-    jq -e '
+  local runtime_ready
+  runtime_ready="$("${KUBECTL[@]}" get secret akb-secret -n "${NAMESPACE}" -o json 2>/dev/null | \
+    jq -r --arg profile "${AUTH_PROFILE}" '
       .data.db_password and
       .data.system_hmac_secret and
       .data["secret.yaml"] and
       .data["local-session-private.pem"] and
-      .data["local-session-jwks.json"]
-    ' >/dev/null
+      .data["local-session-jwks.json"] and
+      ((.data.auth_runtime_mode | @base64d) == $profile) and
+      (
+        $profile == "local" or
+        (
+          .data.keycloak_client_secret and
+          .data.keycloak_admin_client_secret and
+          .data.keycloak_management_client_secret and
+          .data.sso_browser_session_encryption_key and
+          .data.sso_session_epoch
+        )
+      )
+    ' 2>/dev/null || true)"
+  [[ "${runtime_ready}" == "true" ]] || return 1
+  if [[ "${AUTH_PROFILE}" == "sso" ]]; then
+    "${KUBECTL[@]}" get secret \
+      akb-keycloak-db-credentials akb-keycloak-bootstrap \
+      akb-product-admin-bootstrap -n "${NAMESPACE}" >/dev/null 2>&1
+  fi
 }
 
 wait_for_contract() {
@@ -87,6 +111,10 @@ render_vso() {
   local skip_tls="$2"
   local ca_ref="${3:-}"
   local rendered
+  local adapter="${SCRIPT_DIR}/vso-vault-compatible.yaml"
+  if [[ "${AUTH_PROFILE}" == "sso" ]]; then
+    adapter="${SCRIPT_DIR}/vso-vault-compatible-sso.yaml"
+  fi
   local address_pattern='^https?://([A-Za-z0-9._-]+|\[[0-9A-Fa-f:]+\])(:[0-9]+)?(/[A-Za-z0-9._/-]*)?$'
   rendered="$(mktemp "${TMPDIR:-/tmp}/akb-vso.XXXXXX.yaml")"
   if [[ ! "${address}" =~ ${address_pattern} ]]; then
@@ -109,7 +137,7 @@ render_vso() {
     -e "s|__VAULT_ROLE__|${VAULT_ROLE}|g" \
     -e "s|__KV_MOUNT__|${KV_MOUNT}|g" \
     -e "s|__KV_PATH__|${KV_PATH}|g" \
-    "${SCRIPT_DIR}/vso-vault-compatible.yaml" >"${rendered}"
+    "${adapter}" >"${rendered}"
   "${KUBECTL[@]}" apply -n "${NAMESPACE}" -f "${rendered}"
   rm -f "${rendered}"
 }
@@ -122,7 +150,8 @@ case "${SECRET_MODE}" in
         docker run --rm --platform linux/amd64 \
           -v "${SCRIPT_DIR}/bootstrap_material.py:/opt/akb/bootstrap_material.py:ro" \
           "${BACKEND_IMAGE}" python /opt/akb/bootstrap_material.py \
-          --format kubernetes --namespace "${NAMESPACE}" | \
+          --format kubernetes --auth-profile "${AUTH_PROFILE}" \
+          --namespace "${NAMESPACE}" | \
           "${KUBECTL[@]}" apply -f -
       else
         echo "Required Secret akb-secret is missing or incomplete in ${NAMESPACE}." >&2
@@ -133,14 +162,28 @@ case "${SECRET_MODE}" in
     ;;
   bundled)
     ensure_vso
+    if [[ -z "${SECRET_STORE_RELEASE}" ]]; then
+      if "${HELM[@]}" status akb-secret-store -n "${NAMESPACE}" >/dev/null 2>&1; then
+        # Preserve names for namespaces installed by the original profile.
+        SECRET_STORE_RELEASE="akb-secret-store"
+      else
+        NAMESPACE_DIGEST="$(printf '%s' "${NAMESPACE}" | openssl dgst -sha256 | awk '{print substr($NF, 1, 12)}')"
+        SECRET_STORE_RELEASE="akb-sm-${NAMESPACE_DIGEST}"
+      fi
+    fi
+    if [[ ! "${SECRET_STORE_RELEASE}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] ||
+       (( ${#SECRET_STORE_RELEASE} > 40 )); then
+      echo "SECRET_STORE_RELEASE must be a DNS label of at most 40 characters" >&2
+      exit 2
+    fi
     case "${SECRET_ENGINE}" in
       openbao)
         CHART="openbao/openbao"
         CHART_VERSION="0.29.3"
         CHART_REPO_NAME="openbao"
         CHART_REPO_URL="https://openbao.github.io/openbao-helm"
-        SERVICE="akb-secret-store-openbao"
-        STATEFULSET="akb-secret-store-openbao"
+        SERVICE="${SECRET_STORE_RELEASE}-openbao"
+        STATEFULSET="${SECRET_STORE_RELEASE}-openbao"
         ;;
       hashicorp-vault)
         if [[ "${HASHICORP_LICENSE_ACKNOWLEDGED:-false}" != "true" ]]; then
@@ -151,8 +194,8 @@ case "${SECRET_MODE}" in
         CHART_VERSION="0.34.1"
         CHART_REPO_NAME="hashicorp"
         CHART_REPO_URL="https://helm.releases.hashicorp.com"
-        SERVICE="akb-secret-store-vault"
-        STATEFULSET="akb-secret-store-vault"
+        SERVICE="${SECRET_STORE_RELEASE}-vault"
+        STATEFULSET="${SECRET_STORE_RELEASE}-vault"
         ;;
       *)
         echo "SECRET_ENGINE must be openbao or hashicorp-vault for bundled mode" >&2
@@ -166,7 +209,7 @@ case "${SECRET_MODE}" in
       exit 2
     fi
     HELM_ARGS=(
-      upgrade --install akb-secret-store "${CHART}"
+      upgrade --install "${SECRET_STORE_RELEASE}" "${CHART}"
       --version "${CHART_VERSION}"
       --namespace "${NAMESPACE}"
       --values "${VALUES}"
@@ -194,8 +237,8 @@ case "${SECRET_MODE}" in
     # Generating a new token on every idempotent deploy breaks OnDelete chart
     # pods: their current environment still contains the previous token.
     ROOT_TOKEN=""
-    if "${HELM[@]}" status akb-secret-store -n "${NAMESPACE}" >/dev/null 2>&1; then
-      ROOT_TOKEN="$("${HELM[@]}" get values akb-secret-store -n "${NAMESPACE}" -o json | \
+    if "${HELM[@]}" status "${SECRET_STORE_RELEASE}" -n "${NAMESPACE}" >/dev/null 2>&1; then
+      ROOT_TOKEN="$("${HELM[@]}" get values "${SECRET_STORE_RELEASE}" -n "${NAMESPACE}" -o json | \
         jq -r '.server.dev.devRootToken // empty')"
     fi
     if [[ -z "${ROOT_TOKEN}" ]]; then
@@ -214,7 +257,9 @@ case "${SECRET_MODE}" in
       -n "${NAMESPACE}" --timeout=5m
     NAMESPACE="${NAMESPACE}" KUBE_CONTEXT="${KUBE_CONTEXT}" \
       SECRET_ENGINE="${SECRET_ENGINE}" ROOT_TOKEN="${ROOT_TOKEN}" \
+      SECRET_STORE_POD="${STATEFULSET}-0" \
       BACKEND_IMAGE="${BACKEND_IMAGE}" KV_MOUNT="${KV_MOUNT}" KV_PATH="${KV_PATH}" \
+      AUTH_PROFILE="${AUTH_PROFILE}" \
       KUBERNETES_AUTH_MOUNT="${KUBERNETES_AUTH_MOUNT}" VAULT_ROLE="${VAULT_ROLE}" \
       bash "${SCRIPT_DIR}/bootstrap-bundled.sh"
     render_vso "http://${SERVICE}.${NAMESPACE}.svc:8200" false ""

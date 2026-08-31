@@ -15,6 +15,7 @@ KV_MOUNT="${KV_MOUNT:-kv}"
 KV_PATH="${KV_PATH:-akb/runtime}"
 AUTH_MOUNT="${KUBERNETES_AUTH_MOUNT:-kubernetes}"
 VAULT_ROLE="${VAULT_ROLE:-akb-runtime-reader}"
+AUTH_PROFILE="${AUTH_PROFILE:-local}"
 
 KUBECTL=(kubectl)
 if [[ -n "${KUBE_CONTEXT}" ]]; then
@@ -23,14 +24,14 @@ fi
 
 case "${SECRET_ENGINE}" in
   openbao)
-    POD="akb-secret-store-openbao-0"
+    POD="${SECRET_STORE_POD:-akb-secret-store-openbao-0}"
     CLI="bao"
     TOKEN_ENV="BAO_TOKEN"
     ADDR_ENV="BAO_ADDR"
     LOCAL_ADDR="http://127.0.0.1:8200"
     ;;
   hashicorp-vault)
-    POD="akb-secret-store-vault-0"
+    POD="${SECRET_STORE_POD:-akb-secret-store-vault-0}"
     CLI="vault"
     TOKEN_ENV="VAULT_TOKEN"
     ADDR_ENV="VAULT_ADDR"
@@ -75,12 +76,20 @@ cli write "auth/${AUTH_MOUNT}/role/${VAULT_ROLE}" \
   ttl=10m >/dev/null
 
 if cli kv get -mount="${KV_MOUNT}" "${KV_PATH}" >/dev/null 2>&1; then
+  EXISTING_AUTH_PROFILE="$(cli kv get -format=json -mount="${KV_MOUNT}" "${KV_PATH}" | \
+    jq -r '.data.data.auth_runtime_mode // "local"')"
+  if [[ "${EXISTING_AUTH_PROFILE}" != "${AUTH_PROFILE}" ]]; then
+    echo "Existing secret material uses auth profile ${EXISTING_AUTH_PROFILE}; refusing ${AUTH_PROFILE} projection" >&2
+    echo "Use a new KV_PATH or follow the explicit authentication cutover runbook." >&2
+    exit 2
+  fi
   echo "Preserving existing AKB runtime material"
 else
-  echo "Generating AKB Secret Contract v1 material"
+  echo "Generating AKB Secret Contract v1 material (${AUTH_PROFILE})"
   docker run --rm --platform linux/amd64 \
     -v "${SCRIPT_DIR}/bootstrap_material.py:/opt/akb/bootstrap_material.py:ro" \
-    "${BACKEND_IMAGE}" python /opt/akb/bootstrap_material.py --format vault | \
+    "${BACKEND_IMAGE}" python /opt/akb/bootstrap_material.py \
+      --format vault --auth-profile "${AUTH_PROFILE}" | \
     "${KUBECTL[@]}" exec -i -n "${NAMESPACE}" "${POD}" -- \
       env "${TOKEN_ENV}=${ROOT_TOKEN}" "${ADDR_ENV}=${LOCAL_ADDR}" sh -ec '
         material="$(mktemp)"

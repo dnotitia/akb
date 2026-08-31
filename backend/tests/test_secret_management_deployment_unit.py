@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import uuid
 
 import pytest
 import yaml
@@ -97,6 +98,41 @@ def test_vso_adapter_projects_only_contract_keys_and_has_bounded_rollout():
     assert "rolloutRestartTargets" not in redis["spec"]
 
 
+def test_sso_vso_adapter_projects_runtime_database_and_one_time_boundaries():
+    path = _SECRETS / "vso-vault-compatible-sso.yaml"
+    runtime = _one(path, kind="VaultStaticSecret", name="akb-runtime")
+    runtime_keys = set(runtime["spec"]["destination"]["transformation"]["templates"])
+    assert {
+        "keycloak_client_secret",
+        "keycloak_admin_client_secret",
+        "keycloak_management_client_secret",
+        "sso_browser_session_encryption_key",
+        "sso_session_epoch",
+    }.issubset(runtime_keys)
+    assert runtime["spec"]["rolloutRestartTargets"] == [
+        {"kind": "Deployment", "name": "backend"}
+    ]
+
+    keycloak_db = _one(path, kind="VaultStaticSecret", name="akb-keycloak-database")
+    db_templates = keycloak_db["spec"]["destination"]["transformation"]["templates"]
+    assert set(db_templates) == {"POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"}
+    assert db_templates["POSTGRES_DB"]["text"] == "keycloak"
+    assert db_templates["POSTGRES_USER"]["text"] == "keycloak"
+    assert "rolloutRestartTargets" not in keycloak_db["spec"]
+
+    for name, destination, key in (
+        ("akb-keycloak-bootstrap", "akb-keycloak-bootstrap", "client-secret"),
+        ("akb-product-admin-bootstrap", "akb-product-admin-bootstrap", "password"),
+    ):
+        item = _one(path, kind="VaultStaticSecret", name=name)
+        assert item["spec"]["destination"]["name"] == destination
+        assert set(item["spec"]["destination"]["transformation"]["templates"]) == {key}
+        assert item["spec"]["destination"]["annotations"] == {
+            "akb.dnotitia.com/lifecycle": "one-time-first-install"
+        }
+        assert "rolloutRestartTargets" not in item["spec"]
+
+
 @pytest.mark.parametrize("engine", ["openbao", "hashicorp-vault"])
 def test_bundled_profiles_separate_ephemeral_development_from_ha_production(engine: str):
     development = yaml.safe_load(
@@ -138,6 +174,60 @@ def test_material_generator_matches_contract_without_legacy_jwt_in_secret_yaml()
     assert "jwt_secret" not in secret_config
 
 
+def test_sso_material_is_independent_and_projects_complete_standalone_contract():
+    spec = importlib.util.spec_from_file_location(
+        "akb_bootstrap_material_sso",
+        _SECRETS / "bootstrap_material.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    material = module._material("sso")  # noqa: SLF001 - deployment contract unit test
+
+    independent = [
+        material["keycloak_client_secret"],
+        material["keycloak_admin_client_secret"],
+        material["keycloak_management_client_secret"],
+        material["keycloak_db_password"],
+        material["keycloak_bootstrap_client_secret"],
+        material["product_admin_bootstrap_password"],
+    ]
+    assert len(set(independent)) == len(independent)
+    assert len(material["sso_browser_session_encryption_key"]) == 43
+    assert "=" not in material["sso_browser_session_encryption_key"]
+    assert str(uuid.UUID(material["sso_session_epoch"])) == material["sso_session_epoch"]
+    assert material["auth_runtime_mode"] == "sso"
+    assert material["auth_runtime_contract"] == "sso-keycloak-broker-v3"
+
+    secret_config = yaml.safe_load(material["secret_yaml"])
+    for key in (
+        "keycloak_client_secret",
+        "keycloak_admin_client_secret",
+        "keycloak_management_client_secret",
+        "sso_browser_session_encryption_key",
+        "sso_session_epoch",
+    ):
+        assert secret_config[key] == material[key]
+    assert "keycloak_db_password" not in secret_config
+    assert "keycloak_bootstrap_client_secret" not in secret_config
+    assert "product_admin_bootstrap_password" not in secret_config
+
+    resources = module._kubernetes_list(material, "akb-sso-test")["items"]  # noqa: SLF001
+    by_name = {item["metadata"]["name"]: item for item in resources}
+    assert set(by_name) == {
+        "akb-secret",
+        "redis-credentials",
+        "akb-keycloak-db-credentials",
+        "akb-keycloak-bootstrap",
+        "akb-product-admin-bootstrap",
+    }
+    assert by_name["akb-keycloak-db-credentials"]["stringData"] == {
+        "POSTGRES_DB": "keycloak",
+        "POSTGRES_USER": "keycloak",
+        "POSTGRES_PASSWORD": material["keycloak_db_password"],
+    }
+
+
 def test_deploy_scripts_are_context_scoped_idempotent_and_fail_closed():
     deploy = (_K8S / "deploy.sh").read_text(encoding="utf-8")
     secret_deploy = (_SECRETS / "deploy.sh").read_text(encoding="utf-8")
@@ -151,9 +241,17 @@ def test_deploy_scripts_are_context_scoped_idempotent_and_fail_closed():
     assert "deployment rollout status follows" in deploy.lower()
     assert 'rollout status deployment/backend' in deploy
     assert "Backend not ready yet" not in deploy
-    assert 'get values akb-secret-store -n "${NAMESPACE}"' in secret_deploy
+    assert 'get values "${SECRET_STORE_RELEASE}" -n "${NAMESPACE}"' in secret_deploy
     assert ".server.dev.devRootToken // empty" in secret_deploy
     assert "--wait --timeout 5m" in secret_deploy
+    assert 'AUTH_PROFILE="${AUTH_PROFILE:-local}"' in deploy
+    assert 'AUTH_PROFILE="${AUTH_PROFILE:-local}"' in secret_deploy
+    assert "vso-vault-compatible-sso.yaml" in secret_deploy
+    assert "SSO_AKB_PUBLIC_URL" in deploy
+    assert "SSO_KEYCLOAK_PUBLIC_URL" in deploy
+    assert 'rollout status statefulset/keycloak' in deploy
+    assert 'SECRET_STORE_RELEASE="akb-sm-${NAMESPACE_DIGEST}"' in secret_deploy
+    assert 'SECRET_STORE_POD="${STATEFULSET}-0"' in secret_deploy
 
     chart_install = secret_deploy.split("HELM_ARGS=(", maxsplit=1)[1]
     production_block, development_block = chart_install.split('ROOT_TOKEN=""', maxsplit=1)

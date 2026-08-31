@@ -153,3 +153,10 @@ Bundled mode supports both `SECRET_ENGINE=openbao` and
 Vault-compatible service. See the complete contracts, pinned chart versions,
 TLS/HA profiles, rotation boundary, and migration notes in
 [`secrets/README.md`](secrets/README.md).
+
+Human authentication is selected independently with
+`AUTH_PROFILE=local|sso`. `AUTH_PROFILE=sso` defaults `KUSTOMIZE_DIR` to the
+standalone SSO tree and requires coherent `SSO_AKB_PUBLIC_URL` and
+`SSO_KEYCLOAK_PUBLIC_URL` origins plus the product-admin identity. This keeps
+all four combinations supported: local or SSO with manual, bundled OpenBao,
+bundled HashiCorp Vault, or an external Vault-compatible Secret producer.

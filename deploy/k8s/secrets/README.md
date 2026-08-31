@@ -16,6 +16,9 @@ This layout follows the current `akb-platform` workspace contract: PostgreSQL
 reads `akb-secret/db_password`, while the backend mounts
 `akb-secret/secret.yaml`. Standalone local auth additionally projects
 `local-session-private.pem` and `local-session-jwks.json` from the same Secret.
+With `AUTH_PROFILE=sso`, the same producer also projects the durable browser
+session and three-client Keycloak contract, the dedicated Keycloak database
+credential, and two narrowly scoped first-install Secrets.
 
 It also follows the platform's tenancy boundary: one workspace is one
 Kubernetes namespace. A bundled engine lives inside that workspace namespace;
@@ -41,6 +44,20 @@ Required keys in `akb-secret`:
 | `local-session-private.pem` | local-session signer | mounted as mode `0400` |
 | `local-session-jwks.json` | local-session verifier | retain prior public keys during planned rotation |
 
+The SSO profile adds these durable `akb-secret` keys (and the same values in
+`secret.yaml`):
+
+- `keycloak_client_secret` for `akb-web`
+- `keycloak_admin_client_secret` for `akb-admin`
+- `keycloak_management_client_secret` for `akb-sso-manager`
+- `sso_browser_session_encryption_key` (32 random bytes, unpadded base64url)
+- `sso_session_epoch` (installation UUID, not a credential)
+
+It creates separate projections for `akb-keycloak-db-credentials`,
+`akb-keycloak-bootstrap/client-secret`, and
+`akb-product-admin-bootstrap/password`. The latter two are one-time inputs and
+are never mounted into the serving containers.
+
 The generated contract also carries the non-runtime projections
 `jwt_secret`, `auth_runtime_contract`, `auth_runtime_generation`, and
 `auth_runtime_mode`. These align standalone Secret ownership with the newer
@@ -65,6 +82,7 @@ contract and pipe it directly to the Kubernetes API:
 
 ```bash
 NAMESPACE=akb-dev \
+AUTH_PROFILE=local \
 SECRET_MODE=manual \
 GENERATE_MANUAL_SECRETS=true \
 REGISTRY=registry.example.com \
@@ -79,6 +97,28 @@ They are not an in-place migration tool: if a PostgreSQL PVC already exists,
 seed the external KV record with that database's current password and the
 existing signing/HMAC material before switching producers. Never let the
 development bootstrap invent a new password for an initialized database.
+
+For a new SSO bundle, set `AUTH_PROFILE=sso` and the required public origins.
+The top-level deployer then selects `deploy/k8s/standalone-sso` automatically:
+
+```bash
+NAMESPACE=akb-sso-dev \
+AUTH_PROFILE=sso \
+SSO_AKB_PUBLIC_URL=https://akb-sso.example.com \
+SSO_KEYCLOAK_PUBLIC_URL=https://auth-akb-sso.example.com \
+SSO_PRODUCT_ADMIN_USERNAME=admin \
+SSO_PRODUCT_ADMIN_EMAIL=admin@example.com \
+SECRET_MODE=bundled \
+SECRET_ENGINE=openbao \
+SECRET_PROFILE=development \
+REGISTRY=registry.example.com \
+bash deploy/k8s/deploy.sh
+```
+
+The generated product-admin password remains in the selected Secret Manager
+until the installer hands it to the administrator. After the first successful
+`bundled-keycloak-v3` report, follow the standalone SSO retirement procedure;
+do not erase it before handoff or before the receipt exists.
 
 ### Bundled OpenBao
 
@@ -120,8 +160,8 @@ Pinned distribution:
 ### External OpenBao or Vault
 
 External mode installs no Secret Manager server. It creates only a
-namespace-local ServiceAccount, `VaultConnection`, `VaultAuth`, and two
-`VaultStaticSecret` resources.
+namespace-local ServiceAccount, `VaultConnection`, `VaultAuth`, and the
+`VaultStaticSecret` projections required by the selected auth profile.
 
 ```bash
 NAMESPACE=akb-external \
@@ -139,8 +179,9 @@ bash deploy/k8s/deploy.sh
 
 The external server must already have Kubernetes auth, a least-privilege role,
 and a KV v2 record with the source fields used by
-`vso-vault-compatible.yaml`. HTTP is rejected unless the explicitly unsafe
-development override is set.
+`vso-vault-compatible.yaml` (local) or
+`vso-vault-compatible-sso.yaml` (SSO). HTTP is rejected unless the explicitly
+unsafe development override is set.
 
 ## Vault Secrets Operator
 
@@ -178,6 +219,10 @@ It is only for local and isolated namespace tests.
 The token is retained in the namespace-local Helm release metadata so an
 idempotent rerun can authenticate to the still-running OnDelete pod. This is
 another reason the profile is forbidden for production.
+New bundled installs use a short namespace-derived Helm release name so the
+charts' cluster-scoped auth-delegator bindings do not collide across AKB
+namespaces. A namespace that already has the historical `akb-secret-store`
+release keeps that name on upgrade.
 
 `production` renders a fail-closed baseline:
 
@@ -211,6 +256,14 @@ credential.
 compatibility key and inside `secret.yaml`. Rotate both source fields in one KV
 version. The same atomic-version rule applies to any value duplicated between
 the platform compatibility projection and the application configuration blob.
+
+SSO database and one-time bootstrap projections deliberately have no automatic
+rollout target. A blind Keycloak database password overwrite does not update
+the PostgreSQL role, and an automatic bootstrap restart could race the
+receipt-backed retirement ceremony. Rotate those values only with their
+specific runbooks. An `sso_session_epoch` rotation also requires incrementing
+`auth_runtime_generation`; changing only the UUID is rejected by the runtime
+boundary rather than silently invalidating an unrecorded set of sessions.
 
 ## Test isolation
 
