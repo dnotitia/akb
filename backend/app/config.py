@@ -930,6 +930,18 @@ class Settings(BaseModel):
     # user plus exact binding. `invite_only` accepts only an exact prebound
     # (issuer, subject) identity. `disabled` rejects external login entirely.
     keycloak_enrollment_mode: Literal["open", "invite_only", "disabled"] = "open"
+    # Offer the installation's OWN realm as a login option, for a deployment
+    # that has no external identity provider to broker to. Off by default: an
+    # installation that registers no provider keeps today's behaviour rather than
+    # silently gaining a login.
+    #
+    # The cost is real and is the operator's to accept: this realm also holds the
+    # product administrator account, so enabling it puts the operator plane and
+    # the audience plane in one realm. It is bounded rather than open -- an
+    # administrator who signs in this way still arrives as a pending admission
+    # and still needs approval, exactly like anyone else, so arrival is not entry.
+    sso_local_realm_login_enabled: bool = False
+    sso_local_realm_display_name: str = "This workspace"
     # `invite_only` records the arrival it refuses so an administrator can
     # approve that exact identity. Both bounds are on the RECORD, never on the
     # refusal: eviction changes what an administrator can still see, and never

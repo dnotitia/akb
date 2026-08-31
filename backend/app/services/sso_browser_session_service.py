@@ -35,6 +35,7 @@ from app.services.sso_session_epoch import (
     lock_active_sso_session_epoch,
 )
 from app.sso.providers.keycloak_oidc import ProviderDefinitionError, validate_alias
+from app.sso import local_realm
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +176,18 @@ def _scope(claims: Mapping[str, object]) -> str:
 
 
 def _provider_alias(claims: Mapping[str, object]) -> str:
+    # A direct sign-in against this installation's own realm is brokered nowhere,
+    # so Keycloak mints no `identity_provider`. Absence is the local realm's
+    # signature, recorded under its reserved alias -- which no Keycloak identity
+    # provider may take, so the two can never be confused.
+    #
+    # This does not weaken the brokered case. The route already asserted the
+    # biconditional before a session exists, and every comparison below is an
+    # equality: a brokered session's custody names its provider, so a later token
+    # that lost the claim reads as `local` and fails, and a local session's
+    # custody names `local`, so a token that gained one fails too.
+    if claims.get("identity_provider") is None:
+        return local_realm.ALIAS
     value = _required_claim(claims, "identity_provider", maximum=63)
     try:
         return validate_alias(value)
