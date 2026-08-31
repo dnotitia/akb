@@ -529,6 +529,53 @@ def test_stale_sync_cannot_rearm_a_completed_retired_mirror(git_http, tmp_path):
     assert not (bare / "akb-external-mirror-retiring").exists()
 
 
+def test_stale_reclone_cannot_replace_a_completed_retired_mirror(
+    git_http, tmp_path, monkeypatch,
+):
+    """A health decision made before retirement has no destructive authority.
+
+    Pause at the re-clone publication seam, complete offline retirement, then
+    resume the stale poller. Its staged clone must be discarded: the retained
+    repository, frozen HEAD/history, and marker-free manual-vault shape survive.
+    """
+    from app.exceptions import MirrorMarkerError
+
+    git = _mirror_git(git_http, tmp_path)
+    service = ExternalGitService(git=git)
+    url, head1 = git_http.add_repo("retired-reclone", {"doc.md": "one\n"})
+    vault_name = f"retired-reclone-{uuid.uuid4().hex[:8]}"
+    assert service.ensure_local_bare(vault_name, None, head1, url, "main", None) == (
+        "cloned",
+        head1,
+    )
+    head2 = git_http.publish_change("retired-reclone", "doc.md", "two\n")
+    assert head2 != head1
+
+    real_reclone = git.reclone_active_mirror
+
+    def _retire_then_resume(*args, **kwargs):
+        git.quarantine_external_mirror_marker(vault_name, expected_ref=head1)
+        git.finalize_external_mirror_retirement(vault_name, expected_ref=head1)
+        return real_reclone(*args, **kwargs)
+
+    monkeypatch.setattr(git, "reclone_active_mirror", _retire_then_resume)
+    monkeypatch.setattr(
+        git,
+        "inspect_mirror_structure",
+        lambda *args, **kwargs: ["disallowed-config"],
+    )
+
+    with pytest.raises(MirrorMarkerError, match="external-git mirror is no longer active"):
+        service.ensure_local_bare(vault_name, head1, head2, url, "main", None)
+
+    bare = _mirror_bare(tmp_path, vault_name)
+    assert git.current_commit(vault_name) == head1
+    assert git.read_file(vault_name, "doc.md") == "one\n"
+    assert [item.hexsha for item in Repo(str(bare)).iter_commits()] == [head1]
+    assert not (bare / "akb-external-mirror").exists()
+    assert not (bare / "akb-external-mirror-retiring").exists()
+
+
 def test_is_healthy_repo(git_http, tmp_path):
     """Structural soundness probe: absent → False, healthy clone → True,
     objects dropped → False."""
@@ -1131,13 +1178,13 @@ def test_ensure_local_bare_breaks_reclone_loop_on_systemic_findings(git_http, tm
     # EVERY structure inspection — including on our own fresh sterile re-clone —
     # reports a finding.
     clones: list[str] = []
-    real_clone = git.clone_mirror
+    real_clone = git.reclone_active_mirror
 
     def _counting_clone(name, *a, **k):
         clones.append(name)
         return real_clone(name, *a, **k)
 
-    monkeypatch.setattr(git, "clone_mirror", _counting_clone)
+    monkeypatch.setattr(git, "reclone_active_mirror", _counting_clone)
     monkeypatch.setattr(
         git, "inspect_mirror_structure", lambda *a, **k: ["disallowed config entry"]
     )

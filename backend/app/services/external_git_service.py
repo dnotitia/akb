@@ -188,8 +188,13 @@ class ExternalGitService:
                 "Untrusted bare repo for mirror %s (%s); re-cloning from %s",
                 vault_name, reason, host,
             )
-            self.git.cleanup_vault_dirs(vault_name)
-            sha = self.git.clone_mirror(vault_name, remote_url, branch, auth_token)
+            sha = self.git.reclone_active_mirror(
+                vault_name,
+                remote_url,
+                branch,
+                auth_token,
+                allow_unmarked_never_synced=last_synced_sha is None,
+            )
             # Loop-breaker: a FRESH, sterilely re-cloned bare must be
             # structurally clean. If it STILL trips the structure inspector, the
             # findings are systemic — a git-version / inspector incompatibility

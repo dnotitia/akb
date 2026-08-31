@@ -1089,6 +1089,70 @@ class GitService:
         logger.info("Mirror cloned: vault=%s branch=%s", vault_name, branch)
         return sha
 
+    def reclone_active_mirror(
+        self,
+        vault_name: str,
+        remote_url: str,
+        branch: str,
+        auth_token: str | None = None,
+        timeout: int | None = None,
+        *,
+        allow_unmarked_never_synced: bool = False,
+    ) -> str:
+        """Sterilely replace an untrusted *active* external mirror.
+
+        Network clone work is staged away from the published bare repository.
+        At the short publication boundary, the vault lock is acquired and both
+        retirement markers are re-read before the old repository is touched.
+        A poller whose health decision predates a completed retirement therefore
+        discards its staged clone instead of deleting or re-marking the retained
+        manual repository.
+        """
+        self._require_safe_vault_name(vault_name)
+        tmp = self.storage_path / f".extgit-clone-{vault_name}-{uuid.uuid4().hex}"
+        backup = self.storage_path / f".extgit-replaced-{vault_name}-{uuid.uuid4().hex}"
+        try:
+            sha = self._ext_runner.clone_bare(
+                remote_url, branch, auth_token, tmp, timeout=timeout
+            )
+            (tmp / _MIRROR_MARKER).write_text(
+                "akb external-git mirror\n", encoding="utf-8"
+            )
+            self._contained(tmp)
+            self._contained(backup)
+            with self._vault_write_lock(vault_name):
+                bare = self._retirement_bare(vault_name)
+                if allow_unmarked_never_synced:
+                    # A pre-first-sync stale directory predates publication and
+                    # legitimately has no marker. A retirement tombstone still
+                    # always wins. Abnormal marker shapes fail in _marker_state.
+                    if _marker_state(bare / _RETIRING_MIRROR_MARKER) == "valid":
+                        raise MirrorMarkerError(
+                            "external-git mirror retirement is incomplete"
+                        )
+                    _marker_state(bare / _MIRROR_MARKER)
+                else:
+                    self._require_active_external_mirror_publication(bare)
+
+                # Keep the retained repository recoverable if publication
+                # itself faults. Both renames are same-filesystem and occur
+                # while every Git mutation/retirement publication is excluded.
+                os.rename(bare, backup)
+                try:
+                    os.rename(tmp, bare)
+                except BaseException:
+                    os.rename(backup, bare)
+                    raise
+                self._rmtree_quiet(backup)
+        except BaseException:
+            self._rmtree_quiet(tmp)
+            # Never delete ``backup`` here. If publication failed and even the
+            # rollback rename faulted, it is the only retained copy of the
+            # operator's repository and must remain available for recovery.
+            raise
+        logger.info("Mirror re-cloned: vault=%s branch=%s", vault_name, branch)
+        return sha
+
     def fetch_remote(
         self,
         vault_name: str,
