@@ -54,6 +54,24 @@ period with in-flight requests and an undrained audit queue. The listener
 subclasses `Server` with `capture_signals` as a no-op and is stopped explicitly
 from the API's own lifespan instead. Pinned by test.
 
+## 2026-08-31 — Uvicorn logging configuration
+
+`uvicorn.Config` is not a per-server object where logging is concerned. Its
+constructor runs `configure_logging()`, which with the default `log_config`
+re-runs `logging.config.dictConfig` over the process-wide `uvicorn`,
+`uvicorn.error` and `uvicorn.access` loggers, and `access_log=False` /
+`log_level=` strip and re-level those same loggers. The first cut passed both
+to keep this port's one-line-per-poll traffic out of the log, and in doing so
+took the API server's access log with it, dropped `uvicorn.error` to WARNING,
+and replaced the handler the secret-redaction filter had been installed on
+(`app/logging_redaction.py` covers the handlers that exist when the lifespan
+starts, and the listener starts after that). Caught in review by running
+`listener.start()` against the API server's logging state. The listener now
+passes `log_config=None` and nothing else about logging, and accepts one
+access line per poll on the API's log. Pinned by a test that snapshots the
+three loggers' handlers, their filters, levels and propagation across
+`start()`.
+
 ## 2026-08-31 — Deriving `distilled_doc_count` from the vault label
 
 Counting documents in vaults whose `vault_write_policy.managed_by` begins with

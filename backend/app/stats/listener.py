@@ -164,10 +164,16 @@ def start() -> bool:
         # The app has no lifespan of its own, and running one would emit a
         # second set of startup/shutdown events inside the main app's lifespan.
         lifespan="off",
-        # One line per poll, every couple of minutes, forever, saying 200 —
-        # that is the whole traffic profile of this port.
-        access_log=False,
-        log_level="warning",
+        # Logging is left exactly as the API server configured it. `Config` is
+        # not a per-server object where logging is concerned: its constructor
+        # runs `configure_logging()`, which with the default `log_config`
+        # re-runs `dictConfig` over the process-wide `uvicorn*` loggers —
+        # replacing the handler the secret-redaction filter was installed on —
+        # and `access_log=False` / `log_level=` strip and re-level the very
+        # loggers the API server shares with this one. The price of this line
+        # is one access-log entry per poll on the API's log; the price of
+        # anything else here is the API's own logs.
+        log_config=None,
     )
     try:
         sock = config.bind_socket()

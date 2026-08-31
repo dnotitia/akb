@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import signal
 import socket
 from contextlib import asynccontextmanager
@@ -24,6 +25,8 @@ import jsonschema
 import pytest
 
 from app.config import settings
+from app.logging_redaction import _FILTER as REDACTION_FILTER
+from app.logging_redaction import install_secret_redaction
 from app.stats import listener, sampler
 
 # `asyncio_mode = "auto"` (pyproject) runs the coroutine tests; the sync ones
@@ -435,6 +438,76 @@ async def test_the_stats_server_leaves_process_signal_handlers_alone():
 
 async def test_stop_is_safe_when_the_listener_was_never_started():
     await asyncio.wait_for(listener.stop(), timeout=2.0)
+
+
+_UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
+
+
+@pytest.fixture
+def uvicorn_logging_restored():
+    """Put the three process-wide uvicorn loggers back the way pytest had them."""
+    saved = {}
+    for name in _UVICORN_LOGGERS:
+        log = logging.getLogger(name)
+        saved[name] = (list(log.handlers), log.level, log.propagate, list(log.filters))
+    yield
+    for name, (handlers, level, propagate, filters) in saved.items():
+        log = logging.getLogger(name)
+        log.handlers = handlers
+        log.setLevel(level)
+        log.propagate = propagate
+        log.filters = filters
+
+
+def _uvicorn_logging_state():
+    return {
+        name: (
+            tuple(logging.getLogger(name).handlers),
+            tuple(tuple(handler.filters) for handler in logging.getLogger(name).handlers),
+            logging.getLogger(name).level,
+            logging.getLogger(name).propagate,
+        )
+        for name in _UVICORN_LOGGERS
+    }
+
+
+async def test_starting_the_listener_leaves_the_process_wide_uvicorn_logging_alone(
+    monkeypatch, uvicorn_logging_restored
+):
+    """`uvicorn.Config` configures logging for the whole process, not a server.
+
+    The API server's `uvicorn`, `uvicorn.error` and `uvicorn.access` loggers
+    are the same objects this listener's server would log through. A second
+    `Config` built with the default `log_config` re-runs `dictConfig` over
+    them — replacing the handler the secret-redaction filter is installed on —
+    and `access_log=False` / `log_level=` would strip and re-level them. The
+    first cut of this listener did exactly that: setting `stats.port` silenced
+    the API's access log and let `uvicorn.error` records bypass redaction.
+
+    Reproduces the state the API server is in when the lifespan starts this
+    listener (uvicorn's own logging config, then the redaction install) and
+    asserts that `start()` changes none of it: same handler objects, same
+    filters on them, same levels, same propagation.
+    """
+    # What `uvicorn app.main:app` (the Dockerfile) does for the API server,
+    # then what the lifespan does on top of it.
+    listener.uvicorn.Config(app=listener.stats_app, log_level="info")
+    install_secret_redaction()
+    before = _uvicorn_logging_state()
+    # Sanity: there is something to clobber, and the redaction is on it.
+    assert logging.getLogger("uvicorn.access").handlers
+    assert logging.getLogger("uvicorn.error").level == logging.INFO
+    assert all(REDACTION_FILTER in handler.filters for handler in logging.getLogger("uvicorn").handlers)
+
+    monkeypatch.delenv(listener.PORT_ENV_VAR, raising=False)
+    monkeypatch.setattr(settings.stats, "host", "127.0.0.1")
+    monkeypatch.setattr(settings.stats, "port", _free_port())
+
+    assert listener.start() is True
+    try:
+        assert _uvicorn_logging_state() == before
+    finally:
+        await listener.stop(timeout=5.0)
 
 
 # ── /health: queue-head age ──────────────────────────────────────────────
