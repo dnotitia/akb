@@ -19,6 +19,7 @@ import pytest
 from git import Repo
 
 from app.db import postgres
+from app.repositories.native_revision_migration_repo import MigrationIntegrityError
 import app.services.native_revision_cutover as cutover_module
 from app.services.git_service import FixedRefHistoryError, GitService
 from app.services.native_revision_backfill import NativeRevisionBackfill
@@ -98,6 +99,7 @@ async def _fresh_schema(*, cutover_migrations: bool = True):
                     "089_native_file_projection_outbox.py",
                     "090_native_revision_vault_purge_fence.py",
                     "091_native_revision_committed_receipt_guard.py",
+                    "092_native_revision_plan_supersession.py",
                 ]
             )
         for filename in filenames:
@@ -461,6 +463,178 @@ async def test_archived_external_mirror_blocks_authority_without_poisoning_manua
                 == "open"
             )
             assert await conn.fetchval("SELECT count(*) FROM native_revision_existing_authority") == 0
+
+
+async def test_aborting_classification_plan_releases_pending_item_reservations(tmp_path):
+    """A retired external mirror may be replanned only after explicit abort."""
+    async with _fresh_schema() as pool:
+        git = GitService(storage_path=str(tmp_path / "git-reclassification"))
+        manual = await _manual_vault(pool, git, label="reclassification-manual")
+
+        mirror_name = f"cutover-reclassification-mirror-{uuid.uuid4().hex}"
+        git.init_vault(mirror_name)
+        mirror_oid = git.commit_file(
+            mirror_name,
+            "mirrored.md",
+            "persisted external mirror body\n",
+            "[create] mirrored.md\n\nagent: fixture\naction: create\nsummary: mirror",
+        )
+        async with pool.acquire() as conn:
+            mirror_id = await conn.fetchval(
+                """
+                INSERT INTO vaults (name, git_path, status)
+                VALUES ($1, $2, 'active') RETURNING id
+                """,
+                mirror_name,
+                str(git._bare_path(mirror_name)),
+            )
+            await conn.execute(
+                """
+                INSERT INTO vault_external_git (vault_id, remote_url, remote_branch)
+                VALUES ($1, 'https://git.example.invalid/fixture.git', 'main')
+                """,
+                mirror_id,
+            )
+
+        backfill = NativeRevisionBackfill(pool, git=git)
+        cutover = NativeRevisionCutover(
+            pool,
+            backfill=backfill,
+            verifier=_FixtureVerifier(pool),
+        )
+        classification = await cutover.plan(
+            vaults=[
+                manual,
+                CutoverVaultInput(namespace_id=mirror_id, fixed_ref=mirror_oid),
+            ],
+            coverage_version="fixture-reclassification-classification-v1",
+        )
+        assert [item.namespace_id for item in classification.vaults] == [manual.namespace_id]
+        assert [item.namespace_id for item in classification.exclusions] == [mirror_id]
+        classification_run_id = classification.vaults[0].migration_run_id
+        with pytest.raises(
+            asyncpg.UniqueViolationError,
+            match="native_revision_migration_items_active_resource_head_key",
+        ):
+            await cutover.plan(
+                vaults=[
+                    manual,
+                    CutoverVaultInput(namespace_id=mirror_id, fixed_ref=mirror_oid),
+                ],
+                coverage_version="fixture-reclassification-must-abort-v2",
+            )
+
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM vaults WHERE id = $1", mirror_id)
+
+        aborted = await cutover.abort(classification.cutover_id)
+        assert aborted.status == "aborted"
+        assert aborted.aborted_from_status == "planned"
+        async with pool.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT status FROM native_revision_migration_runs WHERE run_id = $1",
+                    classification_run_id,
+                )
+                == "superseded"
+            )
+            assert (
+                await conn.fetchval(
+                    """
+                    SELECT reservation_active
+                      FROM native_revision_migration_items
+                     WHERE run_id = $1
+                    """,
+                    classification_run_id,
+                )
+                is False
+            )
+            assert (
+                await conn.fetchval(
+                    """
+                    SELECT count(*)
+                      FROM native_revision_cutover_exclusions
+                     WHERE cutover_id = $1 AND namespace_id = $2
+                    """,
+                    classification.cutover_id,
+                    mirror_id,
+                )
+                == 1
+            )
+
+        fresh = await cutover.plan(
+            vaults=[manual],
+            coverage_version="fixture-reclassification-authority-v2",
+        )
+        assert fresh.cutover_id != classification.cutover_id
+        assert fresh.vaults[0].migration_run_id != classification_run_id
+        assert (await cutover.apply(fresh.cutover_id)).status == "applied"
+        with pytest.raises(CutoverApplyError, match="aborted"):
+            await cutover.apply(classification.cutover_id)
+        with pytest.raises(MigrationIntegrityError, match="superseded"):
+            await backfill.backfill_run(classification_run_id)
+
+
+async def test_plan_supersession_migration_releases_legacy_aborted_reservations(tmp_path):
+    """Upgrade releases an attempt that was aborted before plan supersession existed."""
+    async with _fresh_schema(cutover_migrations=False) as pool:
+        async with pool.acquire() as conn:
+            for filename in (
+                "088_native_revision_existing_cutover.py",
+                "089_native_file_projection_outbox.py",
+                "090_native_revision_vault_purge_fence.py",
+                "091_native_revision_committed_receipt_guard.py",
+            ):
+                await _load(filename).migrate(conn=conn)
+
+        git = GitService(storage_path=str(tmp_path / "git-legacy-aborted-plan"))
+        manual = await _manual_vault(pool, git, label="legacy-aborted-plan")
+        cutover = NativeRevisionCutover(
+            pool,
+            backfill=NativeRevisionBackfill(pool, git=git),
+            verifier=_FixtureVerifier(pool),
+        )
+        prior = await cutover.plan(
+            vaults=[manual],
+            coverage_version="fixture-legacy-aborted-plan-v1",
+        )
+        prior_run_id = prior.vaults[0].migration_run_id
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE native_revision_cutover_runs
+                   SET status = 'aborted',
+                       aborted_from_status = 'planned',
+                       aborted_at = NOW()
+                 WHERE cutover_id = $1
+                """,
+                prior.cutover_id,
+            )
+            await _load("092_native_revision_plan_supersession.py").migrate(conn=conn)
+            assert (
+                await conn.fetchval(
+                    "SELECT status FROM native_revision_migration_runs WHERE run_id = $1",
+                    prior_run_id,
+                )
+                == "superseded"
+            )
+            assert (
+                await conn.fetchval(
+                    """
+                    SELECT reservation_active
+                      FROM native_revision_migration_items
+                     WHERE run_id = $1
+                    """,
+                    prior_run_id,
+                )
+                is False
+            )
+
+        fresh = await cutover.plan(
+            vaults=[manual],
+            coverage_version="fixture-legacy-aborted-plan-v2",
+        )
+        assert fresh.vaults[0].migration_run_id != prior_run_id
 
 
 async def test_deleted_vault_external_git_sidecar_blocks_authority_outside_retained_inventory(tmp_path):
@@ -1240,6 +1414,7 @@ async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop
             "089_native_file_projection_outbox.py",
             "090_native_revision_vault_purge_fence.py",
             "091_native_revision_committed_receipt_guard.py",
+            "092_native_revision_plan_supersession.py",
         }
         assert cutover_files <= registered
 
@@ -1263,6 +1438,7 @@ async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop
                 "089_native_file_projection_outbox.py",
                 "090_native_revision_vault_purge_fence.py",
                 "091_native_revision_committed_receipt_guard.py",
+                "092_native_revision_plan_supersession.py",
             ]
             assert await conn.fetchval("SELECT state FROM native_revision_legacy_write_fence") == "open"
             assert await conn.fetchval("SELECT to_regclass('public.native_file_projection_outbox') IS NOT NULL") is True
@@ -1276,7 +1452,7 @@ async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop
                     "SELECT count(*) FROM schema_migrations WHERE filename = ANY($1::text[])",
                     list(cutover_files),
                 )
-                == 4
+                == 5
             )
 
 

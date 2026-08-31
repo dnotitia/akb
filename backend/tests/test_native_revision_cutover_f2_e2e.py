@@ -688,8 +688,12 @@ async def test_real_legacy_seed_stops_then_backfills_same_database_and_git(
             ) == 1
 
         # Membership and classifications are bound facts, so retiring the
-        # excluded mirror requires a fresh complete database plan. Reusing the
-        # classification receipt would be a reclassified-state authority bug.
+        # excluded mirror requires permanently closing this never-applied
+        # classification receipt before creating a fresh complete database
+        # plan. Reusing it would be a reclassified-state authority bug.
+        aborted = await cutover.abort(classification.cutover_id)
+        assert aborted.status == "aborted"
+        assert aborted.aborted_from_status == "planned"
         planned = await cutover.plan(
             vaults=[
                 CutoverVaultInput(
