@@ -49,6 +49,12 @@ dev = [
     "pytest==9.0.3",
     "pytest-asyncio==1.3.0",
     "hypothesis==6.155.7",
+    # Validates the `/stats` responses against the JSON Schema this repo
+    # publishes for them (`app/stats/schema_v1.json`). Declared explicitly even
+    # though it already resolves transitively: the schema check is the only
+    # thing standing between a shape change here and a silently broken
+    # consumer, and it must not depend on another package's dependency list.
+    "jsonschema==4.26.0",
     "ruff==0.15.16",
     "mypy==2.1.0",
     "bandit[toml]==1.9.4",
