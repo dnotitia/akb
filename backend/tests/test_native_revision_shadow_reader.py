@@ -1955,6 +1955,46 @@ async def test_comparator_receipt_is_redacted_and_classified():
     assert run.inventory_digest not in encoded
 
 
+async def test_activity_projection_rejects_candidate_values_it_would_mask():
+    document = _document()
+    native_id = _oid("9")
+    legacy = {
+        "events": [
+            {
+                "hash": document.current_commit,
+                "subject": document.activity.subject,
+                "author": {
+                    "id": document.activity.actor,
+                    "display": "Legacy Writer (Git)",
+                },
+                "action": document.activity.action,
+                "summary": document.activity.summary,
+                "projection_revision": document.current_commit,
+            }
+        ]
+    }
+    candidate = {
+        "events": [
+            {
+                "hash": native_id,
+                "subject": "forged subject",
+                "author": {"id": "forged actor", "display": "forged actor"},
+                "action": "delete",
+                "summary": "forged summary",
+                "projection_revision": native_id,
+            }
+        ]
+    }
+
+    with pytest.raises(ShadowComparisonError, match="candidate activity"):
+        NativeRevisionShadowComparator._project_candidate_activity(
+            legacy,
+            candidate,
+            document,
+            native_id,
+        )
+
+
 async def test_owner_run_count_tamper_cannot_survive_correlated_recompute():
     document = _document()
     run, item, inventory, native_id = _run_and_item(document)
