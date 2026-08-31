@@ -192,6 +192,9 @@ def build_vault_skill_seed_request(vault: str) -> DocumentPutRequest:
         content=VAULT_SKILL_SEED_TEMPLATE.replace("{vault}", vault),
         type="skill",
         tags=["akb:skill"],
+        # Seeding retains the historical lossless write behavior. Interactive
+        # duplicate guidance is an explicit frontend policy.
+        title_conflict_policy="allow",
     )
 
 

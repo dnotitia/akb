@@ -20,8 +20,10 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from app.exceptions import DocumentTitleConflictError
 from app.util import errors as errors_mod
 from app.util.errors import (
+    DOCUMENT_TITLE_CONFLICT,
     GIT_HISTORY_ENTRY_CAPPED,
     GIT_HISTORY_FAILED,
     GIT_HISTORY_OUTPUT_CAPPED,
@@ -95,6 +97,27 @@ def test_git_history_failures_keep_explicit_mcp_codes():
 
     for error, code in cases:
         assert exception_envelope(error) == {"error": str(error), "code": code}
+
+
+def test_document_title_conflict_keeps_structured_mcp_details():
+    error = DocumentTitleConflictError(
+        title="API Guide",
+        collection="engineering",
+        existing_path="engineering/api-guide.md",
+        existing_title="API Guide",
+    )
+
+    assert exception_envelope(error) == {
+        "error": 'A document titled "API Guide" already exists in engineering',
+        "code": DOCUMENT_TITLE_CONFLICT,
+        "hint": "Open the existing document, choose another title or Collection, or explicitly keep both.",
+        "details": {
+            "title": "API Guide",
+            "collection": "engineering",
+            "existing_path": "engineering/api-guide.md",
+            "existing_title": "API Guide",
+        },
+    }
 
 
 # ── Catalogue enforcement ─────────────────────────────────────

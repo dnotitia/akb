@@ -71,6 +71,9 @@ class ConflictError(AKBError):
         )
 
 
+DOCUMENT_TITLE_CONFLICT = "document_title_conflict"
+
+
 class DocumentTitleConflictError(ConflictError):
     """An interactive write found the same title in one Collection.
 
@@ -90,7 +93,7 @@ class DocumentTitleConflictError(ConflictError):
         location = collection or "Vault root"
         super().__init__(
             f'A document titled "{title.strip()}" already exists in {location}',
-            code="document_title_conflict",
+            code=DOCUMENT_TITLE_CONFLICT,
             hint="Open the existing document, choose another title or Collection, or explicitly keep both.",
             details={
                 "title": title.strip(),
