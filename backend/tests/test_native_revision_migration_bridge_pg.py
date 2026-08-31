@@ -14,7 +14,6 @@ import asyncpg
 import pytest
 from git import Repo
 
-from app.exceptions import NotFoundError
 from app.repositories.native_revision_migration_repo import (
     MigrationInventoryDriftError,
     NativeRevisionMigrationRepository,
@@ -286,7 +285,7 @@ async def _make_compact_failpoint_fixtures(pool, tmp_path: Path) -> tuple[
     return git, fixtures
 
 
-async def test_inventory_is_fixed_ref_bounded_and_manual_only(tmp_path):
+async def test_inventory_is_fixed_ref_bounded_and_includes_archived_manual_vaults(tmp_path):
     async with _fresh_schema(tmp_path) as pool:
         fixture = await _make_fixture(pool, tmp_path)
         bridge = LegacyRevisionBridge(
@@ -371,12 +370,15 @@ async def test_inventory_is_fixed_ref_bounded_and_manual_only(tmp_path):
                 "UPDATE vaults SET status = 'archived' WHERE id = $1",
                 fixture["namespace_id"],
             )
-        with pytest.raises(NotFoundError):
-            await bridge.capture_inventory(
-                namespace_id=fixture["namespace_id"],
-                fixed_ref=fixture["unrelated_tip"],
-                coverage_version="c9-v5",
-            )
+        archived_inventory = await bridge.capture_inventory(
+            namespace_id=fixture["namespace_id"],
+            fixed_ref=fixture["unrelated_tip"],
+            coverage_version="c9-v5",
+        )
+        assert {item.resource_id for item in archived_inventory.documents} == {
+            fixture["document_one"],
+            fixture["document_two"],
+        }
 
         async with pool.acquire() as conn:
             await conn.execute(

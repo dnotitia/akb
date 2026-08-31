@@ -10,6 +10,7 @@ from app.db import postgres
 import app.services.git_service as git_service
 import app.services.native_revision_backfill as backfill_module
 import app.services.native_revision_cutover as cutover_module
+import app.services.external_git_retirement as retirement_module
 
 
 def test_native_revision_cutover_cli_routes_plan(monkeypatch, capsys) -> None:
@@ -122,3 +123,102 @@ def test_native_revision_cutover_cli_routes_abort(monkeypatch) -> None:
 def test_native_revision_cutover_cli_rejects_incomplete_arguments(capsys) -> None:
     assert cli.main(["migrate-revision-backend", "apply"]) == 2
     assert "migrate-revision-backend" in capsys.readouterr().err
+
+
+def test_external_git_retirement_cli_routes_only_with_the_exact_downtime_confirmation(monkeypatch, capsys) -> None:
+    calls: list[dict[str, str]] = []
+    vault_id = "00000000-0000-0000-0000-000000000093"
+
+    async def fake_retire(**kwargs):
+        calls.append(kwargs)
+        return {"status": "retired", "vault_id": vault_id}
+
+    monkeypatch.setattr(cli, "_execute_external_git_retirement", fake_retire, raising=False)
+    args = [
+        "migrate-revision-backend",
+        "retire-external-git",
+        "--vault-id",
+        vault_id,
+        "--manifest-file",
+        "/safe/operator/manifest.json",
+        "--idempotency-key",
+        "00000000-0000-0000-0000-000000000094",
+        "--requested-by",
+        "collector-adoption-operator",
+        "--confirm-planned-downtime",
+        f"RETIRE-EXTERNAL-GIT:{vault_id}",
+    ]
+
+    assert cli.main(args) == 0
+    assert calls == [
+        {
+            "vault_id": vault_id,
+            "manifest_file": "/safe/operator/manifest.json",
+            "idempotency_key": "00000000-0000-0000-0000-000000000094",
+            "requested_by": "collector-adoption-operator",
+            "planned_downtime_confirmation": f"RETIRE-EXTERNAL-GIT:{vault_id}",
+        }
+    ]
+    assert json.loads(capsys.readouterr().out)["status"] == "retired"
+
+    calls.clear()
+    bad_args = [
+        *args[:-1],
+        "RETIRE-EXTERNAL-GIT:wrong-vault",
+    ]
+    assert cli.main(bad_args) == 1
+    assert calls == []
+    assert "planned-downtime confirmation" in capsys.readouterr().err
+
+
+def test_external_git_retirement_cli_binds_the_operator_vault_id_to_the_service(monkeypatch) -> None:
+    vault_id = uuid.UUID("00000000-0000-0000-0000-000000000093")
+    manifest = object()
+    calls: list[dict[str, object]] = []
+
+    @dataclass
+    class _Receipt:
+        status: str
+
+    class _Retirement:
+        def __init__(self, pool) -> None:
+            assert pool == "pool"
+
+        async def retire(self, **kwargs):
+            calls.append(kwargs)
+            return _Receipt(status="retired")
+
+    async def _init_db() -> None:
+        return None
+
+    async def _get_pool():
+        return "pool"
+
+    async def _close_pool() -> None:
+        return None
+
+    monkeypatch.setattr(postgres, "init_db", _init_db)
+    monkeypatch.setattr(postgres, "get_pool", _get_pool)
+    monkeypatch.setattr(postgres, "close_pool", _close_pool)
+    monkeypatch.setattr(retirement_module, "load_adoption_manifest", lambda _path: manifest)
+    monkeypatch.setattr(retirement_module, "ExternalGitRetirement", _Retirement)
+
+    report = asyncio.run(
+        cli._execute_external_git_retirement(
+            vault_id=str(vault_id),
+            manifest_file="/safe/operator/manifest.json",
+            idempotency_key="00000000-0000-0000-0000-000000000094",
+            requested_by="collector-adoption-operator",
+            planned_downtime_confirmation=f"RETIRE-EXTERNAL-GIT:{vault_id}",
+        )
+    )
+
+    assert report == {"status": "retired"}
+    assert calls == [
+        {
+            "manifest": manifest,
+            "expected_vault_id": vault_id,
+            "idempotency_key": uuid.UUID("00000000-0000-0000-0000-000000000094"),
+            "requested_by": "collector-adoption-operator",
+        }
+    ]

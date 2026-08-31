@@ -290,6 +290,140 @@ class NativeRevisionMigrationRepository:
             async with acquired.transaction():
                 return await _get_or_create(acquired)
 
+    @staticmethod
+    async def _adopt_aborted_completed_reservation(
+        conn: asyncpg.Connection,
+        *,
+        run: MigrationRun,
+        legacy_document_id: uuid.UUID,
+        captured_path: str,
+        legacy_head_oid: str,
+        body_digest: str,
+        byte_size: int,
+    ) -> bool:
+        """Move one completed reservation from an aborted cutover to ``run``.
+
+        The old completed run and its immutable Legacy mappings remain audit and
+        selector authority.  Only its partial-index reservation is released,
+        then the replacement run records the exact already-published native
+        head as complete.  This is intentionally narrower than a generic
+        duplicate-resource escape hatch: the source must be fully complete and
+        linked only to an aborted, pre-authority applied/verified cutover.
+        """
+        source = await conn.fetchrow(
+            """
+            SELECT item.run_id, item.namespace_id, item.legacy_document_id,
+                   item.native_resource_id, item.captured_path,
+                   item.legacy_head_oid, item.native_head_revision_id,
+                   item.body_digest, item.byte_size, item.status,
+                   source_run.status AS run_status
+              FROM native_revision_migration_items item
+              JOIN native_revision_migration_runs source_run
+                ON source_run.run_id = item.run_id
+               AND source_run.namespace_id = item.namespace_id
+             WHERE item.native_resource_id = $1
+               AND item.legacy_head_oid = $2
+               AND item.reservation_active
+             FOR UPDATE OF item, source_run
+            """,
+            legacy_document_id,
+            legacy_head_oid,
+        )
+        if source is None:
+            return False
+        expected_source = (
+            run.namespace_id,
+            legacy_document_id,
+            legacy_document_id,
+            captured_path,
+            legacy_head_oid,
+            body_digest,
+            byte_size,
+        )
+        observed_source = (
+            source["namespace_id"],
+            source["legacy_document_id"],
+            source["native_resource_id"],
+            source["captured_path"],
+            source["legacy_head_oid"],
+            source["body_digest"],
+            source["byte_size"],
+        )
+        native_head_revision_id = source["native_head_revision_id"]
+        if (
+            source["run_status"] != "complete"
+            or source["status"] != "complete"
+            or observed_source != expected_source
+            or not isinstance(native_head_revision_id, str)
+            or _OID_RE.fullmatch(native_head_revision_id) is None
+        ):
+            return False
+        if not await conn.fetchval(
+            """
+            SELECT NOT EXISTS (
+                SELECT 1
+                  FROM native_revision_migration_items
+                 WHERE run_id = $1 AND status <> 'complete'
+            )
+            """,
+            source["run_id"],
+        ):
+            return False
+        cutover_context = await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS cutover_count,
+                   bool_and(
+                       cutover.status = 'aborted'
+                       AND cutover.aborted_from_status IN ('applied', 'verified')
+                   ) AS all_aborted_completed
+              FROM native_revision_cutover_vaults cutover_vault
+              JOIN native_revision_cutover_runs cutover
+                ON cutover.cutover_id = cutover_vault.cutover_id
+             WHERE cutover_vault.migration_run_id = $1
+            """,
+            source["run_id"],
+        )
+        if (
+            cutover_context is None
+            or cutover_context["cutover_count"] != 1
+            or cutover_context["all_aborted_completed"] is not True
+        ):
+            return False
+
+        released = await conn.execute(
+            """
+            UPDATE native_revision_migration_items
+               SET reservation_active = FALSE,
+                   updated_at = NOW()
+             WHERE run_id = $1
+               AND legacy_document_id = $2
+               AND reservation_active
+            """,
+            source["run_id"],
+            source["legacy_document_id"],
+        )
+        if released != "UPDATE 1":
+            raise MigrationIntegrityError("completed migration reservation changed during transfer")
+        await conn.execute(
+            """
+            INSERT INTO native_revision_migration_items
+                (run_id, namespace_id, legacy_document_id, native_resource_id,
+                 captured_path, legacy_head_oid, native_head_revision_id,
+                 body_digest, byte_size, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'complete')
+            """,
+            run.run_id,
+            run.namespace_id,
+            legacy_document_id,
+            legacy_document_id,
+            captured_path,
+            legacy_head_oid,
+            native_head_revision_id,
+            body_digest,
+            byte_size,
+        )
+        return True
+
     async def ensure_pending_items(
         self,
         run: MigrationRun,
@@ -340,16 +474,38 @@ class NativeRevisionMigrationRepository:
                     document_id,
                 )
                 if row is None:
-                    await acquired.execute(
-                        """
-                        INSERT INTO native_revision_migration_items
-                            (run_id, namespace_id, legacy_document_id,
-                             native_resource_id, captured_path, legacy_head_oid,
-                             body_digest, byte_size, status)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
-                        """,
-                        *expected,
-                    )
+                    try:
+                        # Isolate the uniqueness failure in a savepoint so a
+                        # completed reservation may be transferred without
+                        # aborting the caller's larger frozen-inventory txn.
+                        async with acquired.transaction():
+                            await acquired.execute(
+                                """
+                                INSERT INTO native_revision_migration_items
+                                    (run_id, namespace_id, legacy_document_id,
+                                     native_resource_id, captured_path, legacy_head_oid,
+                                     body_digest, byte_size, status)
+                                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+                                """,
+                                *expected,
+                            )
+                    except asyncpg.UniqueViolationError as exc:
+                        if (
+                            exc.constraint_name
+                            != "native_revision_migration_items_active_resource_head_key"
+                        ):
+                            raise
+                        adopted = await self._adopt_aborted_completed_reservation(
+                            acquired,
+                            run=run,
+                            legacy_document_id=document_id,
+                            captured_path=observed["captured_path"],
+                            legacy_head_oid=observed["legacy_head_oid"],
+                            body_digest=observed["body_digest"],
+                            byte_size=observed["byte_size"],
+                        )
+                        if not adopted:
+                            raise
                 else:
                     observed_identity = (
                         row["run_id"],
@@ -416,6 +572,75 @@ class NativeRevisionMigrationRepository:
             async with self.pool.acquire() as acquired:
                 rows = await acquired.fetch(sql, run_id)
         return [_item(row) for row in rows]
+
+    async def is_completed_reservation_transfer(
+        self,
+        *,
+        owner_run_id: uuid.UUID,
+        replacement_run_id: uuid.UUID,
+        legacy_document_id: uuid.UUID,
+        native_head_revision_id: str,
+    ) -> bool:
+        """Prove that a completed item only transferred its active reservation.
+
+        Immutable Legacy mappings stay owned by ``owner_run_id``.  The
+        replacement may reference the already-published Native head only when
+        the source cutover was explicitly aborted after apply/verify and every
+        frozen item fact is byte-for-byte identical.
+        """
+        _require_oid(native_head_revision_id, "native_head_revision_id")
+        async with self.pool.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                          FROM native_revision_migration_items source
+                          JOIN native_revision_migration_items replacement
+                            ON replacement.run_id = $2
+                           AND replacement.legacy_document_id = source.legacy_document_id
+                          JOIN native_revision_migration_runs source_run
+                            ON source_run.run_id = source.run_id
+                           AND source_run.namespace_id = source.namespace_id
+                          JOIN native_revision_migration_runs replacement_run
+                            ON replacement_run.run_id = replacement.run_id
+                           AND replacement_run.namespace_id = replacement.namespace_id
+                         WHERE source.run_id = $1
+                           AND source.legacy_document_id = $3
+                           AND source.status = 'complete'
+                           AND replacement.status = 'complete'
+                           AND NOT source.reservation_active
+                           AND replacement.reservation_active
+                           AND source_run.status = 'complete'
+                           AND replacement_run.status = 'complete'
+                           AND source.namespace_id = replacement.namespace_id
+                           AND source.legacy_document_id = replacement.legacy_document_id
+                           AND source.native_resource_id = replacement.native_resource_id
+                           AND source.captured_path = replacement.captured_path
+                           AND source.legacy_head_oid = replacement.legacy_head_oid
+                           AND source.native_head_revision_id = replacement.native_head_revision_id
+                           AND source.native_head_revision_id = $4
+                           AND source.body_digest = replacement.body_digest
+                           AND source.byte_size = replacement.byte_size
+                           AND (
+                               SELECT COUNT(*) = 1
+                                      AND bool_and(
+                                          cutover.status = 'aborted'
+                                          AND cutover.aborted_from_status IN ('applied', 'verified')
+                                      )
+                                 FROM native_revision_cutover_vaults cutover_vault
+                                 JOIN native_revision_cutover_runs cutover
+                                   ON cutover.cutover_id = cutover_vault.cutover_id
+                                WHERE cutover_vault.migration_run_id = source.run_id
+                           )
+                    )
+                    """,
+                    owner_run_id,
+                    replacement_run_id,
+                    legacy_document_id,
+                    native_head_revision_id,
+                )
+            )
 
     async def get_item(
         self,

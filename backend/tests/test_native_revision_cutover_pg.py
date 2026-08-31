@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib.util
+import json
 import os
 import re
 import threading
@@ -19,7 +20,18 @@ import pytest
 from git import Repo
 
 from app.db import postgres
+from app.exceptions import ForbiddenError
+from app.models.document import DocumentUpdateRequest
 from app.repositories.native_revision_migration_repo import MigrationIntegrityError
+from app.services import access_service
+from app.services.document_service import DocumentService
+from app.services.external_git_service import ExternalGitService
+from app.services.external_git_retirement import (
+    ExternalGitRetirement,
+    ExternalGitRetirementConflict,
+    ExternalGitRetirementError,
+    parse_adoption_manifest,
+)
 import app.services.native_revision_cutover as cutover_module
 from app.services.git_service import FixedRefHistoryError, GitService
 from app.services.native_revision_backfill import NativeRevisionBackfill
@@ -36,6 +48,7 @@ from app.services.native_revision_cutover import (
     NativeRevisionCutoverVerifier,
 )
 from app.services.native_revision_backend import NativeRevisionBackend
+from app.services.uri_service import doc_uri, split_uri
 
 
 pytestmark = pytest.mark.asyncio
@@ -87,7 +100,10 @@ async def _fresh_schema(*, cutover_migrations: bool = True):
         await conn.execute(_INIT_SQL)
         filenames = [
             "010_external_git_mirror.py",
+            "015_events_outbox.py",
+            "044_vault_write_policy.py",
             "048_native_revision_core.py",
+            "049_external_git_quarantine.py",
             "053_native_revision_m1_pg_body.py",
             "060_native_revision_migration_bridge.py",
             "061_native_revision_authority.py",
@@ -100,6 +116,8 @@ async def _fresh_schema(*, cutover_migrations: bool = True):
                     "090_native_revision_vault_purge_fence.py",
                     "091_native_revision_committed_receipt_guard.py",
                     "092_native_revision_plan_supersession.py",
+                    "093_external_git_retirement.py",
+                    "094_native_revision_completed_reservation_transfer.py",
                 ]
             )
         for filename in filenames:
@@ -575,6 +593,436 @@ async def test_aborting_classification_plan_releases_pending_item_reservations(t
             await backfill.backfill_run(classification_run_id)
 
 
+async def test_external_git_retirement_reclassifies_a_collector_adoption_and_requires_a_fresh_plan(tmp_path):
+    """The one-way retirement keeps the vault/data/Git while removing only its sidecar."""
+    async with _fresh_schema() as pool:
+        previous_pool = postgres._pool
+        postgres._pool = pool
+        try:
+            git = GitService(storage_path=str(tmp_path / "git-external-retirement"))
+            vault_name = f"collector-adoption-{uuid.uuid4().hex}"
+            root_body = "# Overview\n\nMirrored source.\n"
+            nested_body = "Contract body."
+            root_markdown = (
+                "---\n"
+                "title: Overview\n"
+                "type: note\n"
+                "status: active\n"
+                "tags:\n- collector\n"
+                "domain: operations\n"
+                "summary: Adopted source\n"
+                "external_path: overview.md\n"
+                "topic: adoption\n"
+                "---\n"
+                f"{root_body}"
+            )
+            git.init_vault(vault_name)
+            root_ref = git.commit_file(vault_name, "overview.md", root_markdown, "seed overview")
+            fixed_ref = git.commit_file(vault_name, "specs/contract.txt", nested_body, "seed contract")
+            assert root_ref != fixed_ref
+            assert git.mark_as_mirror(vault_name) is True
+            bare_repo = Repo(str(git._bare_path(vault_name)))
+            try:
+                root_blob = bare_repo.git.rev_parse(f"{fixed_ref}:overview.md").strip()
+                nested_blob = bare_repo.git.rev_parse(f"{fixed_ref}:specs/contract.txt").strip()
+            finally:
+                bare_repo.close()
+
+            owner_id = uuid.uuid4()
+            collaborator_id = uuid.uuid4()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO users (id, username, email, password_hash) VALUES ($1, $2, $3, 'x')",
+                    owner_id,
+                    "collector-owner",
+                    "collector-owner@example.test",
+                )
+                await conn.execute(
+                    "INSERT INTO users (id, username, email, password_hash) VALUES ($1, $2, $3, 'x')",
+                    collaborator_id,
+                    "collector-collaborator",
+                    "collector-collaborator@example.test",
+                )
+                vault_id = await conn.fetchval(
+                    """
+                    INSERT INTO vaults (name, git_path, owner_id, status)
+                    VALUES ($1, $2, $3, 'active')
+                    RETURNING id
+                    """,
+                    vault_name,
+                    str(git._bare_path(vault_name)),
+                    owner_id,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO collections (vault_id, path, name, doc_count)
+                    VALUES ($1, 'specs', 'specs', 1)
+                    """,
+                    vault_id,
+                )
+                await conn.execute(
+                    "INSERT INTO vault_access (vault_id, user_id, role, granted_by) VALUES ($1, $2, 'writer', $3)",
+                    vault_id,
+                    collaborator_id,
+                    owner_id,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO documents (
+                        id, vault_id, path, title, doc_type, status, summary, domain,
+                        created_by, current_commit, content_hash, hash_algorithm,
+                        content_hash_commit, tags, metadata, source, external_path, external_blob
+                    ) VALUES
+                        ($1, $3, 'overview.md', 'Overview', 'note', 'active', 'Adopted source', 'operations',
+                         'external_git:git.example.invalid', $4, $5, 'sha256', $4, ARRAY['collector'], $6::jsonb,
+                         'external_git', 'overview.md', $7),
+                        ($2, $3, 'specs/contract.txt', 'contract', NULL, 'active', '', '',
+                         'external_git:git.example.invalid', $8, $9, 'sha256', $8, ARRAY[]::text[], $10::jsonb,
+                         'external_git', 'specs/contract.txt', $11)
+                    """,
+                    uuid.uuid4(),
+                    uuid.uuid4(),
+                    vault_id,
+                    root_ref,
+                    hashlib.sha256(root_body.encode()).hexdigest(),
+                    json.dumps({"external_path": "overview.md", "topic": "adoption"}),
+                    root_blob,
+                    fixed_ref,
+                    hashlib.sha256(nested_body.encode()).hexdigest(),
+                    json.dumps({"external_path": "specs/contract.txt"}),
+                    nested_blob,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO vault_external_git (
+                        vault_id, remote_url, remote_branch, auth_token, poll_interval_secs,
+                        last_synced_sha, sync_state, poll_next_at
+                    ) VALUES ($1, 'https://git.example.invalid/acme/knowledge.git', 'main',
+                              'test-token-must-never-escape', 300, $2, 'active', NOW())
+                    """,
+                    vault_id,
+                    fixed_ref,
+                )
+            await _confirmed_file(
+                pool,
+                namespace_id=vault_id,
+                label="retained.txt",
+                data=b"retained file\n",
+                mime_type="text/plain",
+            )
+
+            manual = await _manual_vault(pool, git, label="retirement-existing-plan")
+            cutover = NativeRevisionCutover(
+                pool,
+                backfill=NativeRevisionBackfill(pool, git=git),
+                verifier=_FixtureVerifier(pool),
+                file_reader=lambda _s3_key: b"retained file\n",
+            )
+            existing_plan = await cutover.plan(
+                vaults=[manual, CutoverVaultInput(namespace_id=vault_id, fixed_ref=fixed_ref)],
+                coverage_version="fixture-external-retirement-preexisting-v1",
+            )
+            assert [item.namespace_id for item in existing_plan.vaults] == [manual.namespace_id]
+            assert [item.namespace_id for item in existing_plan.exclusions] == [vault_id]
+
+            with pytest.raises(ForbiddenError, match="read-only external git mirror"):
+                await access_service.check_vault_access(str(owner_id), vault_name, required_role="writer")
+
+            manifest = parse_adoption_manifest(
+                {
+                    "schema": "akb-collector.git-adoption-manifest",
+                    "version": 1,
+                    "purpose": "legacy-external-git-retirement",
+                    "binding": {
+                        "name": "git-fixture",
+                        "source_scope": "fixture/repository",
+                        "target_vault": vault_name,
+                        "target_collection": "collector-control",
+                    },
+                    "source": {
+                        "remote_url": "https://git.example.invalid/acme/knowledge.git",
+                        "branch": "main",
+                        "snapshot_commit": fixed_ref,
+                        "path_prefix": None,
+                    },
+                    "documents": [
+                        {
+                            "origin_key": "git://fixture/repository/specs/contract.txt",
+                            "path": "specs/contract.txt",
+                            "resource_uri": doc_uri(vault_name, "specs/contract.txt"),
+                            "source_version": nested_blob,
+                            "blob_sha": nested_blob,
+                            "akb_content_sha256": hashlib.sha256(nested_body.encode()).hexdigest(),
+                            "akb_current_version": fixed_ref,
+                            "managed_metadata": {
+                                "managed": False,
+                                "title": "contract",
+                                "type": "reference",
+                                "tags": [],
+                                "domain": "",
+                                "summary": "",
+                            },
+                        },
+                        {
+                            "origin_key": "git://fixture/repository/overview.md",
+                            "path": "overview.md",
+                            "resource_uri": doc_uri(vault_name, "overview.md"),
+                            "source_version": root_blob,
+                            "blob_sha": root_blob,
+                            "akb_content_sha256": hashlib.sha256(root_body.encode()).hexdigest(),
+                            "akb_current_version": root_ref,
+                            "managed_metadata": {
+                                "managed": True,
+                                "title": "Overview",
+                                "type": "note",
+                                "tags": ["collector"],
+                                "domain": "operations",
+                                "summary": "Adopted source",
+                            },
+                        },
+                    ],
+                }
+            )
+            retirement = ExternalGitRetirement(pool, git=git)
+            # The retirement receipt is not even quarantined when an otherwise
+            # well-formed manifest has stale, missing, or extra live facts.
+            # Duplicate entries are rejected by the strict parser unit contract.
+            stale_manifest = manifest.fact()
+            stale_manifest["documents"][0]["akb_content_sha256"] = "d" * 64
+            missing_manifest = manifest.fact()
+            missing_manifest["source"]["path_prefix"] = "specs"
+            missing_manifest["documents"] = [
+                document
+                for document in missing_manifest["documents"]
+                if document["path"].startswith("specs/")
+            ]
+            extra_manifest = manifest.fact()
+            extra_manifest["documents"].append(
+                {
+                    "origin_key": "git://fixture/repository/untracked.md",
+                    "path": "untracked.md",
+                    "resource_uri": doc_uri(vault_name, "untracked.md"),
+                    "source_version": "e" * 40,
+                    "blob_sha": "e" * 40,
+                    "akb_content_sha256": "f" * 64,
+                    "akb_current_version": fixed_ref,
+                    "managed_metadata": {
+                        "managed": True,
+                        "title": "Untracked",
+                        "type": "note",
+                        "tags": [],
+                        "domain": "",
+                        "summary": "",
+                    },
+                }
+            )
+            with pytest.raises(ExternalGitRetirementError, match="vault binding is stale"):
+                await retirement.retire(
+                    manifest=manifest,
+                    expected_vault_id=uuid.uuid4(),
+                    idempotency_key=uuid.UUID("00000000-0000-0000-0000-000000000089"),
+                    requested_by="collector-adoption-operator",
+                )
+            for invalid_manifest, invalid_key in (
+                (stale_manifest, uuid.UUID("00000000-0000-0000-0000-000000000090")),
+                (missing_manifest, uuid.UUID("00000000-0000-0000-0000-000000000091")),
+                (extra_manifest, uuid.UUID("00000000-0000-0000-0000-000000000092")),
+            ):
+                with pytest.raises(ExternalGitRetirementError, match="does not match live documents"):
+                    await retirement.retire(
+                        manifest=parse_adoption_manifest(invalid_manifest),
+                        expected_vault_id=vault_id,
+                        idempotency_key=invalid_key,
+                        requested_by="collector-adoption-operator",
+                    )
+            async with pool.acquire() as conn:
+                assert await conn.fetchval(
+                    "SELECT sync_state FROM vault_external_git WHERE vault_id = $1", vault_id
+                ) == "active"
+                assert await conn.fetchval("SELECT count(*) FROM external_git_retirements") == 0
+            idempotency_key = uuid.UUID("00000000-0000-0000-0000-000000000093")
+            quarantined = await retirement._load_or_quarantine(
+                manifest,
+                expected_vault_id=vault_id,
+                idempotency_key=idempotency_key,
+                requested_by="collector-adoption-operator",
+            )
+            assert quarantined.status == "quarantined"
+
+            class _LatePollerGit:
+                def cat_blob(self, _vault_name: str, _blob_sha: str) -> bytes:
+                    return root_markdown.encode()
+
+                def last_commit_for_path(self, _vault_name: str, _path: str, _tip_sha: str) -> str:
+                    return root_ref
+
+            late_poller = ExternalGitService(git=_LatePollerGit())
+            # Real PostgreSQL regression: once the retirement transaction has
+            # quarantined the sidecar, an in-flight poller can no longer upsert
+            # or delete external rows before final reclassification.
+            assert (
+                await late_poller._reindex_file(
+                    vault_id=vault_id,
+                    vault_name=vault_name,
+                    path="overview.md",
+                    blob_sha=root_blob,
+                    remote_url="https://git.example.invalid/acme/knowledge.git",
+                    tip_sha=fixed_ref,
+                )
+            ) == "superseded"
+            assert (
+                await late_poller._delete_external_path(
+                    vault_id=vault_id,
+                    vault_name=vault_name,
+                    path="overview.md",
+                    expected_blob=root_blob,
+                )
+            ) == "superseded"
+            async with pool.acquire() as conn:
+                assert await conn.fetchval(
+                    "SELECT sync_state FROM vault_external_git WHERE vault_id = $1", vault_id
+                ) == "quarantined"
+                assert await conn.fetchval(
+                    "SELECT source FROM documents WHERE vault_id = $1 AND path = 'overview.md'", vault_id
+                ) == "external_git"
+
+            receipt = await retirement.retire(
+                manifest=manifest,
+                expected_vault_id=vault_id,
+                idempotency_key=idempotency_key,
+                requested_by="collector-adoption-operator",
+            )
+            assert receipt.status == "retired"
+            assert receipt.manifest_digest == manifest.digest
+            assert receipt.document_count == 2
+            assert git.current_commit(vault_name) == fixed_ref
+            assert not (git._bare_path(vault_name) / "akb-external-mirror").exists()
+            assert not (git._bare_path(vault_name) / "akb-external-mirror-retiring").exists()
+
+            async with pool.acquire() as conn:
+                assert await conn.fetchval("SELECT count(*) FROM vault_external_git WHERE vault_id = $1", vault_id) == 0
+                retained = await conn.fetch(
+                    """
+                    SELECT path, source, external_path, external_blob, title, doc_type,
+                           status, tags, domain, summary, metadata
+                      FROM documents
+                     WHERE vault_id = $1
+                     ORDER BY path
+                    """,
+                    vault_id,
+                )
+                assert [(row["path"], row["source"], row["external_path"], row["external_blob"]) for row in retained] == [
+                    ("overview.md", "manual", None, None),
+                    ("specs/contract.txt", "manual", None, None),
+                ]
+                assert json.loads(retained[0]["metadata"]) == {
+                    "external_path": "overview.md",
+                    "topic": "adoption",
+                }
+                assert await conn.fetchval("SELECT count(*) FROM collections WHERE vault_id = $1", vault_id) == 1
+                assert await conn.fetchval("SELECT count(*) FROM vault_files WHERE vault_id = $1", vault_id) == 1
+                assert await conn.fetchval("SELECT count(*) FROM vault_access WHERE vault_id = $1", vault_id) == 1
+                receipt_row = await conn.fetchrow(
+                    """
+                    SELECT manifest_digest, document_count, remote_url, remote_branch,
+                           last_synced_sha, idempotency_key, requested_by, status
+                      FROM external_git_retirements
+                     WHERE vault_id = $1
+                    """,
+                    vault_id,
+                )
+                assert dict(receipt_row) == {
+                    "manifest_digest": manifest.digest,
+                    "document_count": 2,
+                    "remote_url": manifest.remote_url,
+                    "remote_branch": manifest.remote_branch,
+                    "last_synced_sha": fixed_ref,
+                    "idempotency_key": idempotency_key,
+                    "requested_by": "collector-adoption-operator",
+                    "status": "retired",
+                }
+                with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match="retirement receipt"):
+                    await conn.execute(
+                        "UPDATE external_git_retirements SET remote_url = 'https://example.invalid/changed.git' WHERE vault_id = $1",
+                        vault_id,
+                    )
+
+            # A stale poller that resumes after the committed receipt also
+            # cannot turn the retained manual document back into a mirror row.
+            assert (
+                await late_poller._reindex_file(
+                    vault_id=vault_id,
+                    vault_name=vault_name,
+                    path="overview.md",
+                    blob_sha=root_blob,
+                    remote_url="https://git.example.invalid/acme/knowledge.git",
+                    tip_sha=fixed_ref,
+                )
+            ) == "superseded"
+
+            # This is the same normal writer gate and document path a Collector
+            # adoption uses after AKB has removed its read-only sidecar.
+            access_service.reset_authorized_vault()
+            grant = await access_service.check_vault_access(str(owner_id), vault_name, required_role="writer")
+            assert grant["vault_id"] == vault_id
+            adopted_uri = doc_uri(vault_name, "overview.md")
+            adopted_vault, adopted_path = split_uri(adopted_uri, expected_type="doc")
+            updated = await DocumentService(git=git).update(
+                adopted_vault,
+                adopted_path,
+                DocumentUpdateRequest(content="# Overview\n\nCollector-owned update.\n"),
+                agent_id="collector-adoption",
+            )
+            assert updated.uri == adopted_uri
+            # A subsequent Collector adoption pass touches each retained
+            # document through the ordinary writer so the fresh Native plan
+            # has a native public-activity commit at its fixed ref.
+            await DocumentService(git=git).update(
+                vault_name,
+                "specs/contract.txt",
+                DocumentUpdateRequest(content="Collector-owned update."),
+                agent_id="collector-adoption",
+            )
+
+            # The previous plan remains a durable exclusion receipt; it cannot
+            # retroactively acquire the retired vault. A fresh plan after an
+            # explicit abort is the only path that includes it.
+            preserved = await cutover.repository.list_exclusions(existing_plan.cutover_id)
+            assert [item.namespace_id for item in preserved] == [vault_id]
+            assert (await cutover.abort(existing_plan.cutover_id)).status == "aborted"
+            retired_ref = git.current_commit(vault_name)
+            assert retired_ref is not None
+            fresh = await cutover.plan(
+                vaults=[
+                    manual,
+                    CutoverVaultInput(namespace_id=vault_id, fixed_ref=retired_ref),
+                ],
+                coverage_version="fixture-external-retirement-fresh-v2",
+            )
+            assert {item.namespace_id for item in fresh.vaults} == {manual.namespace_id, vault_id}
+            assert fresh.exclusions == ()
+
+            # An exact replay does not reintroduce the sidecar and remains
+            # successful after the ordinary Collector update advanced Git.
+            assert (
+                await retirement.retire(
+                    manifest=manifest,
+                    expected_vault_id=vault_id,
+                    idempotency_key=idempotency_key,
+                    requested_by="collector-adoption-operator",
+                )
+            ) == receipt
+            with pytest.raises(ExternalGitRetirementConflict, match="replay conflicts"):
+                await retirement.retire(
+                    manifest=manifest,
+                    expected_vault_id=vault_id,
+                    idempotency_key=idempotency_key,
+                    requested_by="different-operator",
+                )
+        finally:
+            postgres._pool = previous_pool
+
+
 async def test_plan_supersession_migration_releases_legacy_aborted_reservations(tmp_path):
     """Upgrade releases an attempt that was aborted before plan supersession existed."""
     async with _fresh_schema(cutover_migrations=False) as pool:
@@ -635,6 +1083,66 @@ async def test_plan_supersession_migration_releases_legacy_aborted_reservations(
             coverage_version="fixture-legacy-aborted-plan-v2",
         )
         assert fresh.vaults[0].migration_run_id != prior_run_id
+
+
+async def test_completed_reservation_transfer_migration_upgrades_aborted_applied_cutover(tmp_path):
+    """Migration 094 releases only an eligible completed reservation on demand."""
+    async with _fresh_schema(cutover_migrations=False) as pool:
+        async with pool.acquire() as conn:
+            for filename in (
+                "088_native_revision_existing_cutover.py",
+                "089_native_file_projection_outbox.py",
+                "090_native_revision_vault_purge_fence.py",
+                "091_native_revision_committed_receipt_guard.py",
+                "092_native_revision_plan_supersession.py",
+                "093_external_git_retirement.py",
+            ):
+                await _load(filename).migrate(conn=conn)
+
+        git = GitService(storage_path=str(tmp_path / "git-legacy-aborted-complete"))
+        vault = await _manual_vault(pool, git, label="legacy-aborted-complete")
+        cutover = NativeRevisionCutover(
+            pool,
+            backfill=NativeRevisionBackfill(pool, git=git),
+            verifier=_FixtureVerifier(pool),
+        )
+        prior = await cutover.plan(
+            vaults=[vault],
+            coverage_version="fixture-legacy-aborted-complete-v1",
+        )
+        prior_run_id = prior.vaults[0].migration_run_id
+        assert (await cutover.apply(prior.cutover_id)).status == "applied"
+        assert (await cutover.abort(prior.cutover_id)).aborted_from_status == "applied"
+
+        # Before 094, its deliberate transfer attempt is still blocked by the
+        # older check constraint, and the failed fresh plan rolls back intact.
+        with pytest.raises(
+            asyncpg.CheckViolationError,
+            match="native_revision_migration_items_reservation_state_check",
+        ):
+            await cutover.plan(
+                vaults=[vault],
+                coverage_version="fixture-legacy-aborted-complete-v2",
+            )
+
+        async with pool.acquire() as conn:
+            await _load("094_native_revision_completed_reservation_transfer.py").migrate(conn=conn)
+
+        fresh = await cutover.plan(
+            vaults=[vault],
+            coverage_version="fixture-legacy-aborted-complete-v2",
+        )
+        assert fresh.vaults[0].migration_run_id != prior_run_id
+        assert (await cutover.apply(fresh.cutover_id)).status == "applied"
+
+        async with pool.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT reservation_active FROM native_revision_migration_items WHERE run_id = $1",
+                    prior_run_id,
+                )
+                is False
+            )
 
 
 async def test_deleted_vault_external_git_sidecar_blocks_authority_outside_retained_inventory(tmp_path):
@@ -1415,6 +1923,8 @@ async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop
             "090_native_revision_vault_purge_fence.py",
             "091_native_revision_committed_receipt_guard.py",
             "092_native_revision_plan_supersession.py",
+            "093_external_git_retirement.py",
+            "094_native_revision_completed_reservation_transfer.py",
         }
         assert cutover_files <= registered
 
@@ -1439,6 +1949,8 @@ async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop
                 "090_native_revision_vault_purge_fence.py",
                 "091_native_revision_committed_receipt_guard.py",
                 "092_native_revision_plan_supersession.py",
+                "093_external_git_retirement.py",
+                "094_native_revision_completed_reservation_transfer.py",
             ]
             assert await conn.fetchval("SELECT state FROM native_revision_legacy_write_fence") == "open"
             assert await conn.fetchval("SELECT to_regclass('public.native_file_projection_outbox') IS NOT NULL") is True
@@ -1452,7 +1964,7 @@ async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop
                     "SELECT count(*) FROM schema_migrations WHERE filename = ANY($1::text[])",
                     list(cutover_files),
                 )
-                == 5
+                == 7
             )
 
 
@@ -1537,6 +2049,141 @@ async def test_abort_preserves_additive_evidence_and_keeps_legacy_writes_open(tm
                 "UPDATE documents SET title = 'Legacy remains writable' WHERE vault_id = $1",
                 vault.namespace_id,
             )
+
+
+@pytest.mark.parametrize(
+    ("verify_before_abort", "expected_abort_status"),
+    [(False, "applied"), (True, "verified")],
+    ids=["applied", "verified"],
+)
+async def test_aborted_completed_cutover_transfers_reservations_without_duplicate_history(
+    tmp_path,
+    verify_before_abort,
+    expected_abort_status,
+):
+    """A later coverage plan adopts completed work from an aborted cutover.
+
+    The original native Resource/revisions and immutable Legacy mappings stay
+    owned by the completed run.  Only the active `(resource, legacy head)`
+    reservation moves to the replacement run, so the fresh cutover can apply
+    without a duplicate history or a second link to the old run.
+    """
+    async with _fresh_schema() as pool:
+        git = GitService(storage_path=str(tmp_path / "git-aborted-completed-transfer"))
+        vault = await _manual_vault(
+            pool,
+            git,
+            label=f"aborted-completed-transfer-{expected_abort_status}",
+        )
+        cutover = NativeRevisionCutover(
+            pool,
+            backfill=NativeRevisionBackfill(pool, git=git),
+            verifier=NativeRevisionCutoverVerifier(pool, git=git),
+        )
+
+        prior = await cutover.plan(
+            vaults=[vault],
+            coverage_version=f"fixture-aborted-completed-{expected_abort_status}-v1",
+        )
+        prior_run_id = prior.vaults[0].migration_run_id
+        assert (await cutover.apply(prior.cutover_id)).status == "applied"
+        if verify_before_abort:
+            assert (await cutover.verify(prior.cutover_id)).status == "verified"
+
+        async with pool.acquire() as conn:
+            native_resource_count = await conn.fetchval("SELECT count(*) FROM native_resources")
+            native_revision_count = await conn.fetchval("SELECT count(*) FROM native_revisions")
+            mappings_before = [
+                (row["resource_id"], row["legacy_git_oid"], row["run_id"])
+                for row in await conn.fetch(
+                    """
+                    SELECT resource_id, legacy_git_oid, run_id
+                      FROM legacy_revision_mappings
+                     ORDER BY resource_id, legacy_git_oid
+                    """
+                )
+            ]
+            assert mappings_before
+
+        aborted = await cutover.abort(prior.cutover_id)
+        assert aborted.status == "aborted"
+        assert aborted.aborted_from_status == expected_abort_status
+
+        fresh = await cutover.plan(
+            vaults=[vault],
+            coverage_version=f"fixture-aborted-completed-{expected_abort_status}-v2",
+        )
+        fresh_run_id = fresh.vaults[0].migration_run_id
+        assert fresh.cutover_id != prior.cutover_id
+        assert fresh_run_id != prior_run_id
+        assert (await cutover.apply(fresh.cutover_id)).status == "applied"
+        assert (await cutover.verify(fresh.cutover_id)).status == "verified"
+
+        # The transfer is single-owner, not a uniqueness bypass: while the
+        # replacement cutover remains applicable, another coverage attempt for
+        # the same `(Resource, Legacy head)` still collides at PostgreSQL.
+        with pytest.raises(
+            asyncpg.UniqueViolationError,
+            match="native_revision_migration_items_active_resource_head_key",
+        ):
+            await cutover.plan(
+                vaults=[vault],
+                coverage_version=f"fixture-aborted-completed-{expected_abort_status}-v3",
+            )
+
+        async with pool.acquire() as conn:
+            assert await conn.fetchval("SELECT count(*) FROM native_resources") == native_resource_count
+            assert await conn.fetchval("SELECT count(*) FROM native_revisions") == native_revision_count
+            mappings_after = [
+                (row["resource_id"], row["legacy_git_oid"], row["run_id"])
+                for row in await conn.fetch(
+                    """
+                    SELECT resource_id, legacy_git_oid, run_id
+                      FROM legacy_revision_mappings
+                     ORDER BY resource_id, legacy_git_oid
+                    """
+                )
+            ]
+            assert mappings_after == mappings_before
+            assert {row[2] for row in mappings_after} == {prior_run_id}
+
+            prior_item = await conn.fetchrow(
+                """
+                SELECT status, reservation_active, native_head_revision_id
+                  FROM native_revision_migration_items
+                 WHERE run_id = $1
+                """,
+                prior_run_id,
+            )
+            fresh_item = await conn.fetchrow(
+                """
+                SELECT status, reservation_active, native_head_revision_id
+                  FROM native_revision_migration_items
+                 WHERE run_id = $1
+                """,
+                fresh_run_id,
+            )
+            assert prior_item is not None and fresh_item is not None
+            assert prior_item["status"] == fresh_item["status"] == "complete"
+            assert prior_item["reservation_active"] is False
+            assert fresh_item["reservation_active"] is True
+            assert prior_item["native_head_revision_id"] == fresh_item["native_head_revision_id"]
+
+            links = {
+                (row["cutover_id"], row["migration_run_id"])
+                for row in await conn.fetch(
+                    """
+                    SELECT cutover_id, migration_run_id
+                      FROM native_revision_cutover_vaults
+                     WHERE namespace_id = $1
+                    """,
+                    vault.namespace_id,
+                )
+            }
+            assert links == {
+                (prior.cutover_id, prior_run_id),
+                (fresh.cutover_id, fresh_run_id),
+            }
 
 
 async def test_product_shadow_verifier_checks_real_git_and_native_reads(tmp_path):
