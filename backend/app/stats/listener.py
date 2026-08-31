@@ -136,6 +136,22 @@ def is_running() -> bool:
     return _task is not None and not _task.done()
 
 
+def _report_serve_exit(task: asyncio.Task) -> None:
+    """Make a serving task that died visible somewhere.
+
+    The socket is bound before the task exists, so the realistic failures are
+    behind it; but a task that raises after that — uvicorn's startup, a
+    protocol-level error — would simply finish. `is_running()` would turn
+    False, `stop()` reads a finished task as nothing to drain, and no line
+    anywhere would say the port stopped answering.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("stats listener stopped serving", exc_info=exc)
+
+
 def start() -> bool:
     """Bind the stats socket. Returns False when the feature is not configured.
 
@@ -198,6 +214,7 @@ def start() -> bool:
         # listener that exists and answers nothing.
         sock.close()
         raise
+    task.add_done_callback(_report_serve_exit)
     # Published only once there is something to stop.
     _server, _socket, _task = server, sock, task
     logger.info("stats listener bound on %s:%d", settings.stats.host, port)

@@ -748,6 +748,41 @@ async def test_a_port_that_cannot_be_bound_stops_the_boot(monkeypatch):
     await asyncio.wait_for(listener.stop(), timeout=2.0)
 
 
+async def test_a_serving_task_that_dies_after_the_bind_is_logged(monkeypatch, caplog):
+    """`start()` returned True, so nothing upstream will look again.
+
+    A task that raises after the bind — uvicorn's startup, a protocol error —
+    would otherwise just finish: `is_running()` turns False, `stop()` reads a
+    finished task as nothing to drain, and no line anywhere says the port
+    stopped answering.
+    """
+
+    async def _dies(self, sockets=None):
+        raise RuntimeError("serve exploded")
+
+    monkeypatch.setattr(listener._NoSignalServer, "serve", _dies)
+    monkeypatch.delenv(listener.PORT_ENV_VAR, raising=False)
+    monkeypatch.setattr(settings.stats, "host", "127.0.0.1")
+    monkeypatch.setattr(settings.stats, "port", _free_port())
+
+    with caplog.at_level(logging.ERROR, logger="akb.stats_listener"):
+        assert listener.start() is True
+        sock = listener._socket
+        for _ in range(50):
+            if not listener.is_running():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("the serving task did not finish")
+        await asyncio.sleep(0)  # the done callback runs on the next loop turn
+
+    died = [r for r in caplog.records if "stopped serving" in r.getMessage()]
+    assert died and died[0].exc_info and "serve exploded" in repr(died[0].exc_info[1])
+    # The failure is not swallowed at stop() time either: the socket is released.
+    await listener.stop(timeout=1.0)
+    assert sock is not None and sock.fileno() == -1
+
+
 @pytest.mark.parametrize("drain_timeout", [5.0, 0.0], ids=["graceful", "cancelled"])
 async def test_stopping_closes_the_listening_socket(monkeypatch, drain_timeout):
     """`stop()` leaves no listening socket open, on either drain path.
