@@ -97,7 +97,7 @@ Operational logs go to stderr and the private runtime log directory. Its
 shape is schema v2:
 
 ```json
-{"schema_version":2,"status":"ready","scenario":"empty","services":{"app":{"origin":"http://127.0.0.1:8000","health":{"method":"GET","url":"http://127.0.0.1:8000/readyz"},"discovery":{"method":"GET","url":"http://127.0.0.1:8000/openapi.json"}},"fixture":{"origin":"http://127.0.0.1:8889","health":{"method":"GET","url":"http://127.0.0.1:8889/health"},"reset":{"method":"POST","url":"http://127.0.0.1:8889/reset","content_type":"application/json","body":{"scenario":"empty"}},"discovery":{"method":"GET","url":"http://127.0.0.1:8889/openapi.json"}}},"credentials":{"username_env":"AKB_E2E_USERNAME","password_env":"AKB_E2E_PASSWORD","login_path":"/api/v1/auth/login"}}
+{"schema_version":2,"status":"ready","scenario":"empty","services":{"app":{"origin":"http://127.0.0.1:8000","health":{"method":"GET","url":"http://127.0.0.1:8000/readyz"},"discovery":{"method":"GET","url":"http://127.0.0.1:8000/openapi.json"}},"fixture":{"origin":"http://127.0.0.1:8889","health":{"method":"GET","url":"http://127.0.0.1:8889/health"},"reset":{"method":"POST","url":"http://127.0.0.1:8889/reset","content_type":"application/json","body":{"scenario":"empty"}},"discovery":{"method":"GET","url":"http://127.0.0.1:8889/discover"}}},"credentials":{"username_env":"AKB_E2E_USERNAME","password_env":"AKB_E2E_PASSWORD","login_path":"/api/v1/auth/login"}}
 ```
 
 Credential values are read only from the named environment variables and are
@@ -124,12 +124,57 @@ tests after the clean install and observes `tools/list` plus a read-only
 `tools/call` through the real child process. Provisioning failures and live
 product-assertion failures are emitted as separate gate events.
 
+### MCP Inspector consumer smoke
+
+The repository-owned MCP Inspector command is a development tool, not a
+second runtime. It lives with the stdio client and is installed by the
+client's existing npm workflow:
+
+```bash
+(cd packages/akb-mcp-client && npm ci)
+```
+
+The same package entrypoint provides a machine-readable smoke and an
+interactive Web diagnostic. It consumes the ready descriptor printed by the
+repository runtime and never needs a global Inspector install:
+
+```bash
+npm --prefix packages/akb-mcp-client run --silent inspect -- \
+  --intent smoke --target both --descriptor /path/to/descriptor.json
+
+npm --prefix packages/akb-mcp-client run --silent inspect -- \
+  --intent interactive --config /path/to/mcp-config.json
+```
+
+The smoke uses Node.js `>=22.19.0` and the exact-pinned
+`@modelcontextprotocol/inspector@2.4.0` public executable. For each selected
+transport it runs `initialize`, `tools/list --strict --format json`, and
+`akb_list_vaults({})` through the actual Inspector child process. It reports
+HTTP and stdio independently, retains Inspector diagnostics and warnings,
+and exits non-zero when either transport or the representative schema/result
+check fails.
+
+The smoke obtains endpoints, fixture reset, credential environment names, and
+the clean installed `akb-mcp` executable from the ready descriptor and its
+fixture discovery. A fixture PAT is placed only in a private 0700 run
+directory's 0600 temporary Inspector config, which is deleted in `finally`
+cleanup. The PAT is not placed in argv, logs, command output, reports, or
+uploaded artifacts. The focused package regression exercises the same public
+entrypoint with a synthetic marker and verifies config removal and redaction.
+
+For an interactive session, pass a user-owned Inspector config file. The
+entrypoint binds the Web server to `127.0.0.1` and keeps Inspector's normal
+session authentication; it does not create a user PAT file or alter the
+user's credential boundary. The existing `transport-proxy` runtime profile
+can be used when the interactive config includes stdio.
+
 For a direct local gate, use the uv-managed Python environment to generate
 per-run values and export them without placing a credential value in the
 command line or repository files:
 
 ```bash
 uv sync --locked --extra dev --project backend
+(cd packages/akb-mcp-client && npm ci)
 RUNTIME_ROOT="$(mktemp -d /tmp/akb-e2e-runtime.XXXXXX)"
 export AKB_E2E_USERNAME="$(uv run --locked --project backend python -c \
   'import secrets; print(f"akb-e2e-{secrets.token_hex(8)}")')"

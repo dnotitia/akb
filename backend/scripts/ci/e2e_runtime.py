@@ -1184,6 +1184,7 @@ class E2ERuntime:
         *,
         log_path: Path,
         check: bool = True,
+        stdin_data: bytes | None = None,
     ) -> int:
         log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with log_path.open("ab", buffering=0) as handle:
@@ -1192,13 +1193,17 @@ class E2ERuntime:
                 *command,
                 cwd=str(self.config.runtime_root),
                 env=self._child_environment(),
-                stdin=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.PIPE if stdin_data is not None else asyncio.subprocess.DEVNULL,
                 stdout=handle,
                 stderr=handle,
                 start_new_session=True,
             )
             self._active_command = process
             try:
+                if stdin_data is not None and process.stdin is not None:
+                    process.stdin.write(stdin_data)
+                    await process.stdin.drain()
+                    process.stdin.close()
                 returncode = await process.wait()
             finally:
                 self._active_command = None
@@ -3148,6 +3153,31 @@ class E2ERuntime:
                     "returncode": 0,
                 }
             )
+
+            try:
+                await self._run_logged_command(
+                    [
+                        "npm",
+                        "--prefix",
+                        str(self.config.proxy_package_dir),
+                        "run",
+                        "--silent",
+                        "inspect",
+                        "--",
+                        "--intent",
+                        "smoke",
+                        "--target",
+                        "both",
+                        "--descriptor",
+                        "-",
+                    ],
+                    log_path=self.config.logs_dir / "mcp-inspector.log",
+                    stdin_data=json.dumps(
+                        self.descriptor(), separators=(",", ":"), ensure_ascii=False
+                    ).encode(),
+                )
+            except ProvisioningFailure as exc:
+                raise ProductAssertionFailure("MCP Inspector consumer smoke failed") from exc
 
         child_env = self._child_environment()
         with log_path.open("ab", buffering=0) as handle:

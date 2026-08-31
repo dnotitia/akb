@@ -221,6 +221,13 @@ step "generated type drift (@akb/client)"
 step "packed SDK consumer proof (@akb/client)"
 (cd packages/akb-client && pnpm run proof:packed)
 
+# ─── stdio proxy + MCP Inspector developer contract ──────────────
+# The package owns its exact Inspector devDependency, command, and focused
+# redaction/cleanup regression. The live HTTP+stdio smoke is invoked by the
+# existing isolated E2E runtime gate.
+step "stdio proxy + MCP Inspector contract"
+(cd packages/akb-mcp-client && npm test)
+
 # ─── frontend: vitest (unit + RTL + MSW) ──────────────────────────
 # Closes the biggest gate gap: previously a broken test could merge
 # because check.sh only ran lint/type. Stage 3 (Playwright) lives

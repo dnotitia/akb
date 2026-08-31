@@ -29,6 +29,16 @@ jobs:
 
       - uses: astral-sh/setup-uv@v6
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.19.0"
+          cache: npm
+          cache-dependency-path: packages/akb-mcp-client/package-lock.json
+
+      - name: Install stdio proxy and Inspector deps
+        working-directory: packages/akb-mcp-client
+        run: npm ci
+
       - name: Install backend from the locked contract
         env:
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/akb-e2e-python
@@ -54,6 +64,7 @@ jobs:
           export AKB_E2E_PASSWORD="$(uv run --locked --project backend python -c 'import secrets; print(secrets.token_urlsafe(24))')"
           uv run --locked --project backend python \
             backend/scripts/ci/e2e_runtime.py gate \
+            --profile transport-proxy \
             --scenario empty \
             --checkout "$GITHUB_WORKSPACE" \
             --runtime-root "${{ runner.temp }}/akb-e2e-runtime"
