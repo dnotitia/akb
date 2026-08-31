@@ -12,6 +12,7 @@ The properties under test are the ones a consumer cannot check for itself:
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import signal
@@ -168,6 +169,22 @@ def test_golden_fixtures_validate(fixture):
     jsonschema.validate(fixture, SCHEMA)
 
 
+def _assert_every_numeric_field_is_nullable_and_optional(schema):
+    for section in ("storage", "corpus", "activity"):
+        block = schema["properties"][section]
+        required = set(block.get("required", ()))
+        for name, spec in block["properties"].items():
+            types = spec["type"]
+            # JSON Schema allows both `"integer"` and `["integer", "null"]`;
+            # the string form is exactly what a hand-added measurement would
+            # look like, so it must be examined, not skipped.
+            types = [types] if isinstance(types, str) else list(types)
+            if "integer" not in types and "number" not in types:
+                continue  # timestamps, not measurements
+            assert "null" in types, f"{section}.{name} must accept null"
+            assert name not in required, f"{section}.{name} must not be required"
+
+
 def test_schema_marks_every_numeric_field_nullable_and_optional():
     """The encoding contract, asserted against the published artifact.
 
@@ -175,15 +192,22 @@ def test_schema_marks_every_numeric_field_nullable_and_optional():
     every number can be missing. A required numeric field would let a
     generator emit a non-pointer integer and silently turn absence into 0.
     """
-    for section in ("storage", "corpus", "activity"):
-        block = SCHEMA["properties"][section]
-        required = set(block.get("required", ()))
-        for name, spec in block["properties"].items():
-            types = spec["type"]
-            if isinstance(types, str) or "integer" not in types:
-                continue  # timestamps, not measurements
-            assert "null" in types, f"{section}.{name} must accept null"
-            assert name not in required, f"{section}.{name} must not be required"
+    _assert_every_numeric_field_is_nullable_and_optional(SCHEMA)
+
+
+def test_the_numeric_field_check_catches_a_string_typed_measurement():
+    """The check must fail for the field it is most likely to be handed.
+
+    `"type": "integer"` (string form) is the shape a new measurement would be
+    written in; a check that only examined the list form would wave it
+    through as a timestamp.
+    """
+    schema = copy.deepcopy(SCHEMA)
+    corpus = schema["properties"]["corpus"]
+    corpus["properties"]["table_count"] = {"type": "integer"}
+    corpus["required"] = [*corpus.get("required", ()), "table_count"]
+    with pytest.raises(AssertionError, match="corpus.table_count"):
+        _assert_every_numeric_field_is_nullable_and_optional(schema)
 
 
 async def test_computed_payload_has_exactly_the_golden_shape(db):
