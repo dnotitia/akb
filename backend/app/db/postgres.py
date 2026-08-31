@@ -309,6 +309,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "084_bm25_corpus_revision.py",  # mutation revision replaces mismatched chunk-count/eligible-doc BM25 refresh gate
         "085_vault_access_contributions.py",  # why a pair holds the role it holds: independent grant bases behind the effective vault_access row, backfilled as 'direct' so nothing moves
         "086_dynamic_table_rows_changed.py",  # statement-level transition-table wake-up events for dynamic table DML
+        "087_tenant_activity_daily.py",  # closed-once daily activity windows served by /stats; NULL counts mean "not computable", never 0
     ):
         if filename in applied:
             continue

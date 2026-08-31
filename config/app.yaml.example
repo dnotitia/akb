@@ -428,3 +428,28 @@ redis_stream_maxlen: 100000
 #   session_map_max: 10000        # bound on the (session, vault) tracking map; eviction just re-injects once
 #   vault_cache_max: 4096         # LRU bound on the per-vault cache; the TTL governs freshness, not size
 #   fetch_timeout_secs: 3.0       # ceiling on one cache-miss lookup; on timeout the call ships without a payload
+
+# ── Tenant stats listener (`/stats`) ──────────────────────────
+# A cached inventory snapshot — storage bytes, corpus counts, and the previous
+# complete UTC day's call volume — served as plain JSON on a SEPARATE port.
+#
+# The port is separate because the caller (a control plane's monitor) must be
+# able to read inventory without being able to reach tenant data, and the only
+# enforcement layer for that is a NetworkPolicy, which selects on port. For the
+# same reason the surface carries no authentication of its own: reachability is
+# the authorization, so DO NOT bind this port on a deployment whose network
+# policy does not restrict who may connect to it.
+#
+# Off by default — leave `port` unset and no socket is bound and no sampler
+# runs. `AKB_STATS_PORT` overrides `port` (the deployment-layer exception, same
+# class as AKB_PG_POOL_MIN_SIZE/MAX_SIZE).
+#
+# Requests are served from the last sample and never recompute, so polling is
+# free; poll at half the sampler interval or faster, otherwise a phase drift
+# skips whole snapshots. Not a metrics endpoint: no Prometheus dependency, no
+# exposition format.
+# stats:
+#   port: 9100                    # unset = the listener is not composed at all
+#   host: "0.0.0.0"               # the NetworkPolicy, not the bind address, is what makes this safe
+#   sampler_interval_secs: 300    # the only thing that decides what this surface costs
+#   activity_grace_minutes: 5     # settling time after a UTC day closes, before its volume is folded (permanently)

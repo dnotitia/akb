@@ -47,6 +47,7 @@ from app.services.sso_callback_urls import is_backchannel_logout_uri
 from app.services.role_sync import RoleSync, get_role_sync, set_role_sync
 from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
 from app.services.vector_store import get_vector_store
+from app.stats import listener as stats_listener, sampler as stats_sampler
 
 logger = logging.getLogger("akb.lifecycle")
 
@@ -291,6 +292,20 @@ def _start_api_local(started: list[str]) -> None:
     else:
         logger.info("tool_usage collection disabled (tool_usage.enabled=false)")
 
+    # `/stats` lives on its own socket in this same process, so it is composed
+    # with the serving process and never with the worker one. The sampler is
+    # started only alongside a bound listener — nothing else reads its cache,
+    # and sampling into a snapshot nobody can fetch is pure database load.
+    if stats_listener.start():
+        stats_sampler.start()
+        started.append("stats_listener")
+        started.append("stats_sampler")
+    else:
+        logger.info(
+            "stats listener disabled (neither stats.port nor %s is set)",
+            stats_listener.PORT_ENV_VAR,
+        )
+
 
 def start_api_runtime() -> None:
     """Start only process-local serving support, never durable queue workers."""
@@ -444,6 +459,8 @@ async def stop_workers(*, include_api_local: bool = True) -> None:
         components.extend([
             ("audit_uploader", audit_log.stop_uploader),
             ("tool_usage", lambda: tool_usage.stop()),
+            ("stats_listener", stats_listener.stop),
+            ("stats_sampler", stats_sampler.stop),
         ])
     tasks = [
         asyncio.create_task(_stop_component(name, stop), name=f"stop:{name}")
@@ -489,6 +506,14 @@ async def stop_api_runtime() -> None:
         asyncio.create_task(
             _stop_component("tool_usage", lambda: tool_usage.stop()),
             name="stop:tool_usage",
+        ),
+        asyncio.create_task(
+            _stop_component("stats_listener", stats_listener.stop),
+            name="stop:stats_listener",
+        ),
+        asyncio.create_task(
+            _stop_component("stats_sampler", stats_sampler.stop),
+            name="stop:stats_sampler",
         ),
     ]
     try:

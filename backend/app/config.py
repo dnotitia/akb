@@ -311,6 +311,46 @@ class ToolUsageSettings(BaseModel):
     shutdown_deadline_secs: float = Field(default=8.0, ge=0.5, le=60.0)
 
 
+class StatsSettings(BaseModel):
+    """Tenant `/stats` snapshot — a **separate listener**, not part of the API.
+
+    The control plane needs coarse per-tenant inventory (storage, corpus,
+    yesterday's call volume) without being able to reach any tenant data. That
+    separation is enforced at L3/L4 by a NetworkPolicy, which selects on port —
+    so this surface cannot share the API port, and it carries no authentication
+    of its own: reachability *is* the authorization, and the port stays closed
+    unless an operator opens it.
+
+    Off by default. Leave ``port`` unset and no socket is ever bound, no
+    sampler runs, and nothing about the process changes.
+
+    Deliberately NOT a metrics endpoint: no ``prometheus_client``, no
+    exposition format, no registry. Plain JSON, computed on a timer and served
+    from cache, so a scrape storm on this port cannot turn into DB load.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # None = the listener is not composed at all (default). The
+    # AKB_STATS_PORT environment variable overrides this; see
+    # `app/stats/listener.py` for why that exception exists.
+    port: int | None = Field(default=None, ge=1, le=65535)
+    # Bind address for the stats socket. The default binds all interfaces
+    # because the only intended caller is another pod, and the pod's own
+    # NetworkPolicy — not a bind address — is what makes that safe.
+    host: str = "0.0.0.0"
+    # Sampler cadence. Requests are served from the last completed sample and
+    # never trigger a recomputation, so this is the only thing that decides how
+    # much DB work the surface costs. A consumer should poll at half this or
+    # faster; polling at the same period drops a snapshot whenever the two
+    # phases drift apart, and reading the cache costs nothing.
+    sampler_interval_secs: int = Field(default=300, ge=30, le=3600)
+    # How long after a UTC day closes before its activity window is finalized.
+    # Writes that were in flight across midnight still need to land in
+    # `tool_calls`; folding the day the instant it closes would undercount them.
+    activity_grace_minutes: int = Field(default=5, ge=0, le=720)
+
+
 class VaultSkillSettings(BaseModel):
     """Auto-injection of the vault-skill into MCP tool responses."""
 
@@ -1120,6 +1160,10 @@ class Settings(BaseModel):
     # Vault-skill auto-injection into MCP tool responses. See
     # VaultSkillSettings above; the state lives in `services/vault_skill_service`.
     vault_skill: VaultSkillSettings = Field(default_factory=VaultSkillSettings)
+
+    # Tenant `/stats` snapshot listener. Off unless `stats.port` (or
+    # AKB_STATS_PORT) is set. See StatsSettings above.
+    stats: StatsSettings = Field(default_factory=StatsSettings)
 
     @model_validator(mode="after")
     def validate_service_admin_client(self) -> "Settings":
