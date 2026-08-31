@@ -453,6 +453,18 @@ class GitService:
             raise MirrorMarkerError("external-git mirror retirement is incomplete")
         return _marker_state(bare / _MIRROR_MARKER) == "valid"
 
+    def _require_normal_write_allowed(self, vault_name: str) -> None:
+        """Fail closed only for an in-progress mirror retirement.
+
+        The usual mirror read-only policy remains owned by the service layer;
+        this guard deliberately does not reinterpret a normal mirror marker.
+        It closes the committed-receipt-to-tombstone-cleanup window for every
+        ordinary Git mutation, under the same vault lock used by retirement.
+        """
+        bare = self._bare_path(vault_name)
+        if _marker_state(bare / _RETIRING_MIRROR_MARKER) == "valid":
+            raise MirrorMarkerError("external-git mirror retirement is incomplete")
+
     def _use_mirror_reader(self, vault_name: str) -> bool:
         """Decide how a READ on ``vault_name`` must be served, fail-CLOSED.
 
@@ -2073,6 +2085,7 @@ class GitService:
         attach the worktree to — happens once at vault creation).
         """
         with self._vault_write_lock(vault_name):
+            self._require_normal_write_allowed(vault_name)
             wt = self._ensure_worktree(vault_name)
             if wt is None:
                 return self._commit_via_clone(vault_name, file_path, content, message, author_name, author_email)
@@ -2107,6 +2120,7 @@ class GitService:
     ) -> str:
         """Delete a file and commit. Returns the commit hash."""
         with self._vault_write_lock(vault_name):
+            self._require_normal_write_allowed(vault_name)
             wt = self._ensure_worktree(vault_name)
             if wt is None:
                 raise FileNotFoundError(f"File not found in vault: {file_path}")
@@ -2146,6 +2160,7 @@ class GitService:
         if old_path == new_path:
             raise ValueError("move_file: old_path and new_path are identical")
         with self._vault_write_lock(vault_name):
+            self._require_normal_write_allowed(vault_name)
             wt = self._ensure_worktree(vault_name)
             if wt is None:
                 raise FileNotFoundError(f"File not found in vault: {old_path}")
@@ -2217,6 +2232,7 @@ class GitService:
         Returns the new commit's hex SHA, or `None` when no commit was made.
         """
         with self._vault_write_lock(vault_name):
+            self._require_normal_write_allowed(vault_name)
             wt = self._ensure_worktree(vault_name)
             if wt is None:
                 # Empty bare repo or missing vault — nothing to delete.

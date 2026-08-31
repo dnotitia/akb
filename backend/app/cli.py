@@ -685,7 +685,6 @@ async def _execute_external_git_retirement(
     from app.db.postgres import close_pool, get_pool, init_db
     from app.services.external_git_retirement import (
         ExternalGitRetirement,
-        ExternalGitRetirementError,
         load_adoption_manifest,
     )
 
@@ -699,12 +698,11 @@ async def _execute_external_git_retirement(
         except (TypeError, ValueError):
             raise ValueError("external Git retirement idempotency key is invalid") from None
         manifest = load_adoption_manifest(Path(manifest_file))
-        if manifest.vault_id != parsed_vault_id:
-            raise ExternalGitRetirementError("external Git retirement vault id does not match the manifest")
         await init_db()
         pool = await get_pool()
         result = await ExternalGitRetirement(pool).retire(
             manifest=manifest,
+            expected_vault_id=parsed_vault_id,
             idempotency_key=parsed_idempotency_key,
             requested_by=requested_by,
         )

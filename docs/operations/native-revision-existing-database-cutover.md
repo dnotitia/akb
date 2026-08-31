@@ -12,11 +12,19 @@ It does not perform an online dual write or a reverse migration.
    can be restored into a disposable environment.
 3. For each persisted external-Git source, have Git Collector write a **read-only
    v1 adoption manifest while the source is still an AKB `external_git` mirror**.
-   The manifest is credential-free and body-free: it binds the exact Vault,
-   canonical remote/branch, last-synced fixed SHA, and every active mirrored
-   Document's public URI, path, content hash, and normalized managed metadata.
+   AKB accepts only Collector's exact
+   `akb-collector.git-adoption-manifest` v1 shape: the fixed purpose,
+   `binding.{name,source_scope,target_vault,target_collection}`, and
+   `source.{remote_url,branch,snapshot_commit,path_prefix}`. `path_prefix` is
+   required: it is `null` for an unfiltered source or the Collector's canonical
+   filtered prefix. Each document proves `origin_key`, path, resource URI,
+   source version/blob SHA, AKB content SHA-256/current version, and the
+   `managed_metadata` fields. The manifest is credential-free and body-free.
    Store it as an operator artifact; do not put a token or document body in it.
-   AKB verifies the whole live inventory before it accepts the handoff.
+   AKB resolves `target_vault` to the exact `--vault-id`, preserves the binding
+   fields as Collector proof context, and verifies **every** live active
+   external-Git Document—not only documents under `path_prefix`—before it
+   accepts the handoff.
 4. Record the future Native deployment identity fields in `app.yaml`:
    `document_revision_tenant_id`, `document_revision_namespace`,
    `document_revision_database_id`, and the immutable image digest.
@@ -36,7 +44,10 @@ python -m app.cli migrate-revision-backend retire-external-git \
   --confirm-planned-downtime RETIRE-EXTERNAL-GIT:VAULT_UUID
 ```
 
-This command quarantines the old poller before changing the marker, retains the
+This command quarantines the old poller before changing the marker, and its
+in-transaction sidecar fence prevents an already-running poller from mutating
+Documents after quarantine. The retirement tombstone also blocks ordinary Git
+writes until the durable receipt and marker cleanup complete. It retains the
 Vault, Documents, collections, Files, Git repository, and ACLs, then removes
 only the external-Git sidecar. Its receipt contains only the manifest digest,
 count, remote/branch/fixed ref, idempotency key, and audit identity. An exact

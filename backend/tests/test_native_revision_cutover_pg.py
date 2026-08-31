@@ -25,6 +25,7 @@ from app.models.document import DocumentUpdateRequest
 from app.repositories.native_revision_migration_repo import MigrationIntegrityError
 from app.services import access_service
 from app.services.document_service import DocumentService
+from app.services.external_git_service import ExternalGitService
 from app.services.external_git_retirement import (
     ExternalGitRetirement,
     ExternalGitRetirementConflict,
@@ -600,7 +601,7 @@ async def test_external_git_retirement_reclassifies_a_collector_adoption_and_req
             git = GitService(storage_path=str(tmp_path / "git-external-retirement"))
             vault_name = f"collector-adoption-{uuid.uuid4().hex}"
             root_body = "# Overview\n\nMirrored source.\n"
-            nested_body = "# Contract\n\nMirrored contract.\n"
+            nested_body = "Contract body."
             root_markdown = (
                 "---\n"
                 "title: Overview\n"
@@ -614,23 +615,17 @@ async def test_external_git_retirement_reclassifies_a_collector_adoption_and_req
                 "---\n"
                 f"{root_body}"
             )
-            nested_markdown = (
-                "---\n"
-                "title: Contract\n"
-                "type: spec\n"
-                "status: active\n"
-                "tags: []\n"
-                "domain: ''\n"
-                "summary: ''\n"
-                "external_path: specs/contract.md\n"
-                "---\n"
-                f"{nested_body}"
-            )
             git.init_vault(vault_name)
             root_ref = git.commit_file(vault_name, "overview.md", root_markdown, "seed overview")
-            fixed_ref = git.commit_file(vault_name, "specs/contract.md", nested_markdown, "seed contract")
+            fixed_ref = git.commit_file(vault_name, "specs/contract.txt", nested_body, "seed contract")
             assert root_ref != fixed_ref
             assert git.mark_as_mirror(vault_name) is True
+            bare_repo = Repo(str(git._bare_path(vault_name)))
+            try:
+                root_blob = bare_repo.git.rev_parse(f"{fixed_ref}:overview.md").strip()
+                nested_blob = bare_repo.git.rev_parse(f"{fixed_ref}:specs/contract.txt").strip()
+            finally:
+                bare_repo.close()
 
             owner_id = uuid.uuid4()
             collaborator_id = uuid.uuid4()
@@ -680,9 +675,9 @@ async def test_external_git_retirement_reclassifies_a_collector_adoption_and_req
                         ($1, $3, 'overview.md', 'Overview', 'note', 'active', 'Adopted source', 'operations',
                          'external_git:git.example.invalid', $4, $5, 'sha256', $4, ARRAY['collector'], $6::jsonb,
                          'external_git', 'overview.md', $7),
-                        ($2, $3, 'specs/contract.md', 'Contract', 'spec', 'active', '', '',
+                        ($2, $3, 'specs/contract.txt', 'contract', NULL, 'active', '', '',
                          'external_git:git.example.invalid', $8, $9, 'sha256', $8, ARRAY[]::text[], $10::jsonb,
-                         'external_git', 'specs/contract.md', $11)
+                         'external_git', 'specs/contract.txt', $11)
                     """,
                     uuid.uuid4(),
                     uuid.uuid4(),
@@ -690,11 +685,11 @@ async def test_external_git_retirement_reclassifies_a_collector_adoption_and_req
                     root_ref,
                     hashlib.sha256(root_body.encode()).hexdigest(),
                     json.dumps({"external_path": "overview.md", "topic": "adoption"}),
-                    "b" * 40,
+                    root_blob,
                     fixed_ref,
                     hashlib.sha256(nested_body.encode()).hexdigest(),
-                    json.dumps({"external_path": "specs/contract.md"}),
-                    "c" * 40,
+                    json.dumps({"external_path": "specs/contract.txt"}),
+                    nested_blob,
                 )
                 await conn.execute(
                     """
@@ -734,39 +729,54 @@ async def test_external_git_retirement_reclassifies_a_collector_adoption_and_req
 
             manifest = parse_adoption_manifest(
                 {
-                    "schema_version": 1,
-                    "vault_id": str(vault_id),
-                    "vault_name": vault_name,
-                    "remote_url": "https://git.example.invalid/acme/knowledge.git",
-                    "remote_branch": "main",
-                    "last_synced_sha": fixed_ref,
+                    "schema": "akb-collector.git-adoption-manifest",
+                    "version": 1,
+                    "purpose": "legacy-external-git-retirement",
+                    "binding": {
+                        "name": "git-fixture",
+                        "source_scope": "fixture/repository",
+                        "target_vault": vault_name,
+                        "target_collection": "collector-control",
+                    },
+                    "source": {
+                        "remote_url": "https://git.example.invalid/acme/knowledge.git",
+                        "branch": "main",
+                        "snapshot_commit": fixed_ref,
+                        "path_prefix": None,
+                    },
                     "documents": [
                         {
-                            "uri": doc_uri(vault_name, "specs/contract.md"),
-                            "path": "specs/contract.md",
-                            "content_hash": hashlib.sha256(nested_body.encode()).hexdigest(),
+                            "origin_key": "git://fixture/repository/specs/contract.txt",
+                            "path": "specs/contract.txt",
+                            "resource_uri": doc_uri(vault_name, "specs/contract.txt"),
+                            "source_version": nested_blob,
+                            "blob_sha": nested_blob,
+                            "akb_content_sha256": hashlib.sha256(nested_body.encode()).hexdigest(),
+                            "akb_current_version": fixed_ref,
                             "managed_metadata": {
-                                "title": "Contract",
-                                "type": "spec",
-                                "status": "active",
+                                "managed": False,
+                                "title": "contract",
+                                "type": "reference",
                                 "tags": [],
                                 "domain": "",
                                 "summary": "",
-                                "metadata": {"external_path": "specs/contract.md"},
                             },
                         },
                         {
-                            "uri": doc_uri(vault_name, "overview.md"),
+                            "origin_key": "git://fixture/repository/overview.md",
                             "path": "overview.md",
-                            "content_hash": hashlib.sha256(root_body.encode()).hexdigest(),
+                            "resource_uri": doc_uri(vault_name, "overview.md"),
+                            "source_version": root_blob,
+                            "blob_sha": root_blob,
+                            "akb_content_sha256": hashlib.sha256(root_body.encode()).hexdigest(),
+                            "akb_current_version": root_ref,
                             "managed_metadata": {
+                                "managed": True,
                                 "title": "Overview",
                                 "type": "note",
-                                "status": "active",
                                 "tags": ["collector"],
                                 "domain": "operations",
                                 "summary": "Adopted source",
-                                "metadata": {"external_path": "overview.md", "topic": "adoption"},
                             },
                         },
                     ],
@@ -777,26 +787,41 @@ async def test_external_git_retirement_reclassifies_a_collector_adoption_and_req
             # well-formed manifest has stale, missing, or extra live facts.
             # Duplicate entries are rejected by the strict parser unit contract.
             stale_manifest = manifest.fact()
-            stale_manifest["documents"][0]["content_hash"] = "d" * 64
+            stale_manifest["documents"][0]["akb_content_sha256"] = "d" * 64
             missing_manifest = manifest.fact()
-            missing_manifest["documents"] = missing_manifest["documents"][:-1]
+            missing_manifest["source"]["path_prefix"] = "specs"
+            missing_manifest["documents"] = [
+                document
+                for document in missing_manifest["documents"]
+                if document["path"].startswith("specs/")
+            ]
             extra_manifest = manifest.fact()
             extra_manifest["documents"].append(
                 {
-                    "uri": doc_uri(vault_name, "untracked.md"),
+                    "origin_key": "git://fixture/repository/untracked.md",
                     "path": "untracked.md",
-                    "content_hash": "e" * 64,
+                    "resource_uri": doc_uri(vault_name, "untracked.md"),
+                    "source_version": "e" * 40,
+                    "blob_sha": "e" * 40,
+                    "akb_content_sha256": "f" * 64,
+                    "akb_current_version": fixed_ref,
                     "managed_metadata": {
+                        "managed": True,
                         "title": "Untracked",
                         "type": "note",
-                        "status": "active",
                         "tags": [],
                         "domain": "",
                         "summary": "",
-                        "metadata": {"external_path": "untracked.md"},
                     },
                 }
             )
+            with pytest.raises(ExternalGitRetirementError, match="vault binding is stale"):
+                await retirement.retire(
+                    manifest=manifest,
+                    expected_vault_id=uuid.uuid4(),
+                    idempotency_key=uuid.UUID("00000000-0000-0000-0000-000000000089"),
+                    requested_by="collector-adoption-operator",
+                )
             for invalid_manifest, invalid_key in (
                 (stale_manifest, uuid.UUID("00000000-0000-0000-0000-000000000090")),
                 (missing_manifest, uuid.UUID("00000000-0000-0000-0000-000000000091")),
@@ -805,6 +830,7 @@ async def test_external_git_retirement_reclassifies_a_collector_adoption_and_req
                 with pytest.raises(ExternalGitRetirementError, match="does not match live documents"):
                     await retirement.retire(
                         manifest=parse_adoption_manifest(invalid_manifest),
+                        expected_vault_id=vault_id,
                         idempotency_key=invalid_key,
                         requested_by="collector-adoption-operator",
                     )
@@ -814,8 +840,54 @@ async def test_external_git_retirement_reclassifies_a_collector_adoption_and_req
                 ) == "active"
                 assert await conn.fetchval("SELECT count(*) FROM external_git_retirements") == 0
             idempotency_key = uuid.UUID("00000000-0000-0000-0000-000000000093")
+            quarantined = await retirement._load_or_quarantine(
+                manifest,
+                expected_vault_id=vault_id,
+                idempotency_key=idempotency_key,
+                requested_by="collector-adoption-operator",
+            )
+            assert quarantined.status == "quarantined"
+
+            class _LatePollerGit:
+                def cat_blob(self, _vault_name: str, _blob_sha: str) -> bytes:
+                    return root_markdown.encode()
+
+                def last_commit_for_path(self, _vault_name: str, _path: str, _tip_sha: str) -> str:
+                    return root_ref
+
+            late_poller = ExternalGitService(git=_LatePollerGit())
+            # Real PostgreSQL regression: once the retirement transaction has
+            # quarantined the sidecar, an in-flight poller can no longer upsert
+            # or delete external rows before final reclassification.
+            assert (
+                await late_poller._reindex_file(
+                    vault_id=vault_id,
+                    vault_name=vault_name,
+                    path="overview.md",
+                    blob_sha=root_blob,
+                    remote_url="https://git.example.invalid/acme/knowledge.git",
+                    tip_sha=fixed_ref,
+                )
+            ) == "superseded"
+            assert (
+                await late_poller._delete_external_path(
+                    vault_id=vault_id,
+                    vault_name=vault_name,
+                    path="overview.md",
+                    expected_blob=root_blob,
+                )
+            ) == "superseded"
+            async with pool.acquire() as conn:
+                assert await conn.fetchval(
+                    "SELECT sync_state FROM vault_external_git WHERE vault_id = $1", vault_id
+                ) == "quarantined"
+                assert await conn.fetchval(
+                    "SELECT source FROM documents WHERE vault_id = $1 AND path = 'overview.md'", vault_id
+                ) == "external_git"
+
             receipt = await retirement.retire(
                 manifest=manifest,
+                expected_vault_id=vault_id,
                 idempotency_key=idempotency_key,
                 requested_by="collector-adoption-operator",
             )
@@ -840,7 +912,7 @@ async def test_external_git_retirement_reclassifies_a_collector_adoption_and_req
                 )
                 assert [(row["path"], row["source"], row["external_path"], row["external_blob"]) for row in retained] == [
                     ("overview.md", "manual", None, None),
-                    ("specs/contract.md", "manual", None, None),
+                    ("specs/contract.txt", "manual", None, None),
                 ]
                 assert json.loads(retained[0]["metadata"]) == {
                     "external_path": "overview.md",
@@ -874,6 +946,19 @@ async def test_external_git_retirement_reclassifies_a_collector_adoption_and_req
                         vault_id,
                     )
 
+            # A stale poller that resumes after the committed receipt also
+            # cannot turn the retained manual document back into a mirror row.
+            assert (
+                await late_poller._reindex_file(
+                    vault_id=vault_id,
+                    vault_name=vault_name,
+                    path="overview.md",
+                    blob_sha=root_blob,
+                    remote_url="https://git.example.invalid/acme/knowledge.git",
+                    tip_sha=fixed_ref,
+                )
+            ) == "superseded"
+
             # This is the same normal writer gate and document path a Collector
             # adoption uses after AKB has removed its read-only sidecar.
             access_service.reset_authorized_vault()
@@ -893,8 +978,8 @@ async def test_external_git_retirement_reclassifies_a_collector_adoption_and_req
             # has a native public-activity commit at its fixed ref.
             await DocumentService(git=git).update(
                 vault_name,
-                "specs/contract.md",
-                DocumentUpdateRequest(content="# Contract\n\nCollector-owned update.\n"),
+                "specs/contract.txt",
+                DocumentUpdateRequest(content="Collector-owned update."),
                 agent_id="collector-adoption",
             )
 
@@ -921,6 +1006,7 @@ async def test_external_git_retirement_reclassifies_a_collector_adoption_and_req
             assert (
                 await retirement.retire(
                     manifest=manifest,
+                    expected_vault_id=vault_id,
                     idempotency_key=idempotency_key,
                     requested_by="collector-adoption-operator",
                 )
@@ -928,6 +1014,7 @@ async def test_external_git_retirement_reclassifies_a_collector_adoption_and_req
             with pytest.raises(ExternalGitRetirementConflict, match="replay conflicts"):
                 await retirement.retire(
                     manifest=manifest,
+                    expected_vault_id=vault_id,
                     idempotency_key=idempotency_key,
                     requested_by="different-operator",
                 )

@@ -12,11 +12,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import math
 import re
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 import asyncpg
@@ -29,24 +28,36 @@ from app.services.uri_service import doc_uri
 from app.util.text import to_nfc
 
 
-_MANIFEST_SCHEMA_VERSION = 1
+_COLLECTOR_MANIFEST_SCHEMA = "akb-collector.git-adoption-manifest"
+_COLLECTOR_MANIFEST_VERSION = 1
+_COLLECTOR_MANIFEST_PURPOSE = "legacy-external-git-retirement"
 _OID_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _MANIFEST_KEYS = frozenset(
     {
-        "schema_version",
-        "vault_id",
-        "vault_name",
-        "remote_url",
-        "remote_branch",
-        "last_synced_sha",
+        "schema",
+        "version",
+        "purpose",
+        "binding",
+        "source",
         "documents",
     }
 )
-_DOCUMENT_KEYS = frozenset({"uri", "path", "content_hash", "managed_metadata"})
-_MANAGED_METADATA_KEYS = frozenset(
-    {"title", "type", "status", "tags", "domain", "summary", "metadata"}
+_BINDING_KEYS = frozenset({"name", "source_scope", "target_vault", "target_collection"})
+_SOURCE_KEYS = frozenset({"remote_url", "branch", "snapshot_commit", "path_prefix"})
+_DOCUMENT_KEYS = frozenset(
+    {
+        "origin_key",
+        "path",
+        "resource_uri",
+        "source_version",
+        "blob_sha",
+        "akb_content_sha256",
+        "akb_current_version",
+        "managed_metadata",
+    }
 )
+_MANAGED_METADATA_KEYS = frozenset({"managed", "title", "type", "tags", "summary", "domain"})
 _MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 
 
@@ -67,16 +78,24 @@ class ExternalGitRetirementConflict(ExternalGitRetirementError):
 class AdoptionDocument:
     """One active external-Git document's credential-free adoption facts."""
 
-    uri: str
+    origin_key: str
     path: str
-    content_hash: str
+    resource_uri: str
+    source_version: str
+    blob_sha: str
+    akb_content_sha256: str
+    akb_current_version: str
     managed_metadata: dict[str, Any]
 
     def fact(self) -> dict[str, Any]:
         return {
-            "uri": self.uri,
+            "origin_key": self.origin_key,
             "path": self.path,
-            "content_hash": self.content_hash,
+            "resource_uri": self.resource_uri,
+            "source_version": self.source_version,
+            "blob_sha": self.blob_sha,
+            "akb_content_sha256": self.akb_content_sha256,
+            "akb_current_version": self.akb_current_version,
             "managed_metadata": self.managed_metadata,
         }
 
@@ -85,11 +104,14 @@ class AdoptionDocument:
 class AdoptionManifest:
     """Canonical, body-free manifest accepted by the retirement command."""
 
-    vault_id: uuid.UUID
-    vault_name: str
+    binding_name: str
+    source_scope: str
+    target_vault: str
+    target_collection: str
     remote_url: str
     remote_branch: str
-    last_synced_sha: str
+    snapshot_commit: str
+    path_prefix: str | None
     documents: tuple[AdoptionDocument, ...]
     digest: str
 
@@ -97,14 +119,33 @@ class AdoptionManifest:
     def document_count(self) -> int:
         return len(self.documents)
 
+    @property
+    def vault_name(self) -> str:
+        """The existing receipt column names the Collector target Vault."""
+        return self.target_vault
+
+    @property
+    def last_synced_sha(self) -> str:
+        """The source snapshot is the mirror's only accepted fixed ref."""
+        return self.snapshot_commit
+
     def fact(self) -> dict[str, Any]:
         return {
-            "schema_version": _MANIFEST_SCHEMA_VERSION,
-            "vault_id": str(self.vault_id),
-            "vault_name": self.vault_name,
-            "remote_url": self.remote_url,
-            "remote_branch": self.remote_branch,
-            "last_synced_sha": self.last_synced_sha,
+            "schema": _COLLECTOR_MANIFEST_SCHEMA,
+            "version": _COLLECTOR_MANIFEST_VERSION,
+            "purpose": _COLLECTOR_MANIFEST_PURPOSE,
+            "binding": {
+                "name": self.binding_name,
+                "source_scope": self.source_scope,
+                "target_vault": self.target_vault,
+                "target_collection": self.target_collection,
+            },
+            "source": {
+                "remote_url": self.remote_url,
+                "branch": self.remote_branch,
+                "snapshot_commit": self.snapshot_commit,
+                "path_prefix": self.path_prefix,
+            },
             "documents": [document.fact() for document in self.documents],
         }
 
@@ -118,35 +159,32 @@ def _require_exact_keys(value: Mapping[str, Any], expected: frozenset[str]) -> N
         raise _manifest_shape_error()
 
 
-def _text(value: object, *, allow_none: bool = False) -> str | None:
-    if value is None and allow_none:
-        return None
+def _canonical_text(value: object, *, allow_empty: bool = False) -> str:
     if not isinstance(value, str):
         raise _manifest_shape_error()
-    return to_nfc(value)
+    if value != value.strip() or (not allow_empty and not value):
+        raise _manifest_shape_error()
+    return value
 
 
-def _json_value(value: object) -> Any:
-    """Return NFC-normalized JSON data without accepting Python-only values."""
-    if value is None or isinstance(value, (str, bool, int)):
-        return to_nfc(value) if isinstance(value, str) else value
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise _manifest_shape_error()
-        return value
-    if isinstance(value, list):
-        return [_json_value(item) for item in value]
-    if isinstance(value, Mapping):
-        normalized: dict[str, Any] = {}
-        for raw_key, raw_value in value.items():
-            if not isinstance(raw_key, str):
-                raise _manifest_shape_error()
-            key = to_nfc(raw_key)
-            if key in normalized:
-                raise _manifest_shape_error()
-            normalized[key] = _json_value(raw_value)
-        return normalized
-    raise _manifest_shape_error()
+def _canonical_path(value: object) -> str:
+    path = _canonical_text(value)
+    pure = PurePosixPath(path)
+    if (
+        pure.is_absolute()
+        or path.endswith("/")
+        or any(component in {"", ".", ".."} for component in path.split("/"))
+    ):
+        raise ExternalGitRetirementError("external Git adoption manifest document path is invalid")
+    return path
+
+
+def _collector_path_prefix(value: object) -> str:
+    """Keep Collector's canonical selection fact without giving it AKB meaning."""
+    prefix = _canonical_text(value)
+    if prefix != prefix.strip("/"):
+        raise _manifest_shape_error()
+    return prefix
 
 
 def _managed_metadata(value: object) -> dict[str, Any]:
@@ -154,32 +192,26 @@ def _managed_metadata(value: object) -> dict[str, Any]:
         raise _manifest_shape_error()
     _require_exact_keys(value, _MANAGED_METADATA_KEYS)
 
-    title = _text(value["title"])
-    doc_type = _text(value["type"], allow_none=True)
-    status = _text(value["status"])
-    domain = _text(value["domain"], allow_none=True)
-    summary = _text(value["summary"], allow_none=True)
+    managed = value["managed"]
+    title = _canonical_text(value["title"], allow_empty=True)
+    doc_type = _canonical_text(value["type"])
+    domain = _canonical_text(value["domain"], allow_empty=True)
+    summary = _canonical_text(value["summary"], allow_empty=True)
     tags = value["tags"]
-    metadata = value["metadata"]
-    if status != "active" or not isinstance(tags, list) or not isinstance(metadata, Mapping):
+    if type(managed) is not bool or not isinstance(tags, list):
         raise _manifest_shape_error()
     normalized_tags: list[str] = []
     for tag in tags:
-        normalized_tag = _text(tag)
-        assert normalized_tag is not None
-        normalized_tags.append(normalized_tag)
-    normalized_metadata = _json_value(metadata)
-    if not isinstance(normalized_metadata, dict):
-        raise _manifest_shape_error()
-    assert title is not None and status is not None
+        normalized_tags.append(_canonical_text(tag))
+    if not managed and (doc_type != "reference" or normalized_tags or summary or domain):
+        raise ExternalGitRetirementError("external Git adoption manifest unmanaged metadata is invalid")
     return {
+        "managed": managed,
         "title": title,
         "type": doc_type,
-        "status": status,
         "tags": normalized_tags,
         "domain": domain,
         "summary": summary,
-        "metadata": normalized_metadata,
     }
 
 
@@ -195,7 +227,7 @@ def _canonical_digest(value: Mapping[str, Any]) -> str:
 
 
 def parse_adoption_manifest(value: object) -> AdoptionManifest:
-    """Parse one strict credential-free Collector adoption manifest.
+    """Parse the exact strict credential-free Collector v1 manifest.
 
     Unknown keys are refused rather than ignored.  That makes a future
     credential/body field a hard compatibility break instead of something that
@@ -204,25 +236,30 @@ def parse_adoption_manifest(value: object) -> AdoptionManifest:
     if not isinstance(value, Mapping):
         raise _manifest_shape_error()
     _require_exact_keys(value, _MANIFEST_KEYS)
-    if isinstance(value["schema_version"], bool) or value["schema_version"] != _MANIFEST_SCHEMA_VERSION:
-        raise _manifest_shape_error()
-    try:
-        vault_id = uuid.UUID(_text(value["vault_id"]) or "")
-    except (TypeError, ValueError, AttributeError):
-        raise _manifest_shape_error() from None
-    vault_name = _text(value["vault_name"])
-    remote_url = _text(value["remote_url"])
-    remote_branch = _text(value["remote_branch"])
-    last_synced_sha = _text(value["last_synced_sha"])
-    documents = value["documents"]
     if (
-        not vault_name
-        or not remote_url
-        or not remote_branch
-        or not last_synced_sha
-        or not isinstance(documents, list)
-        or _OID_RE.fullmatch(last_synced_sha) is None
+        value["schema"] != _COLLECTOR_MANIFEST_SCHEMA
+        or isinstance(value["version"], bool)
+        or value["version"] != _COLLECTOR_MANIFEST_VERSION
+        or value["purpose"] != _COLLECTOR_MANIFEST_PURPOSE
+        or not isinstance(value["binding"], Mapping)
+        or not isinstance(value["source"], Mapping)
     ):
+        raise _manifest_shape_error()
+    binding = value["binding"]
+    source = value["source"]
+    _require_exact_keys(binding, _BINDING_KEYS)
+    _require_exact_keys(source, _SOURCE_KEYS)
+    binding_name = _canonical_text(binding["name"])
+    source_scope = _canonical_text(binding["source_scope"])
+    target_vault = _canonical_text(binding["target_vault"])
+    target_collection = _canonical_text(binding["target_collection"])
+    remote_url = _canonical_text(source["remote_url"])
+    remote_branch = _canonical_text(source["branch"])
+    snapshot_commit = _canonical_text(source["snapshot_commit"])
+    raw_path_prefix = source["path_prefix"]
+    path_prefix = None if raw_path_prefix is None else _collector_path_prefix(raw_path_prefix)
+    documents = value["documents"]
+    if not isinstance(documents, list) or _OID_RE.fullmatch(snapshot_commit) is None:
         raise _manifest_shape_error()
     try:
         remote = validate(
@@ -239,51 +276,70 @@ def parse_adoption_manifest(value: object) -> AdoptionManifest:
 
     parsed_documents: list[AdoptionDocument] = []
     paths: set[str] = set()
-    uris: set[str] = set()
+    resource_uris: set[str] = set()
+    origin_keys: set[str] = set()
     for document in documents:
         if not isinstance(document, Mapping):
             raise _manifest_shape_error()
         _require_exact_keys(document, _DOCUMENT_KEYS)
-        uri = _text(document["uri"])
-        path = _text(document["path"])
-        content_hash = _text(document["content_hash"])
+        origin_key = _canonical_text(document["origin_key"])
+        path = _canonical_path(document["path"])
+        resource_uri = _canonical_text(document["resource_uri"])
+        source_version = _canonical_text(document["source_version"])
+        blob_sha = _canonical_text(document["blob_sha"])
+        akb_content_sha256 = _canonical_text(document["akb_content_sha256"])
+        akb_current_version = _canonical_text(document["akb_current_version"])
         if (
-            not uri
-            or not path
-            or not content_hash
-            or _DIGEST_RE.fullmatch(content_hash) is None
-            or uri != doc_uri(vault_name, path)
+            _OID_RE.fullmatch(source_version) is None
+            or _OID_RE.fullmatch(blob_sha) is None
+            or _DIGEST_RE.fullmatch(akb_content_sha256) is None
+            or _OID_RE.fullmatch(akb_current_version) is None
         ):
+            raise _manifest_shape_error()
+        if source_version != blob_sha or origin_key != f"git://{source_scope}/{path}":
+            raise ExternalGitRetirementError("external Git adoption manifest source identity is invalid")
+        if resource_uri != doc_uri(target_vault, path):
             raise ExternalGitRetirementError("external Git adoption manifest document URI is invalid")
-        if path in paths or uri in uris:
+        if path in paths or resource_uri in resource_uris or origin_key in origin_keys:
             raise ExternalGitRetirementError("external Git adoption manifest contains duplicate documents")
         paths.add(path)
-        uris.add(uri)
+        resource_uris.add(resource_uri)
+        origin_keys.add(origin_key)
         parsed_documents.append(
             AdoptionDocument(
-                uri=uri,
+                origin_key=origin_key,
                 path=path,
-                content_hash=content_hash,
+                resource_uri=resource_uri,
+                source_version=source_version,
+                blob_sha=blob_sha,
+                akb_content_sha256=akb_content_sha256,
+                akb_current_version=akb_current_version,
                 managed_metadata=_managed_metadata(document["managed_metadata"]),
             )
         )
 
-    ordered = tuple(sorted(parsed_documents, key=lambda document: document.path))
+    ordered = tuple(sorted(parsed_documents, key=lambda document: (document.path, document.origin_key)))
     preliminary = AdoptionManifest(
-        vault_id=vault_id,
-        vault_name=vault_name,
+        binding_name=binding_name,
+        source_scope=source_scope,
+        target_vault=target_vault,
+        target_collection=target_collection,
         remote_url=remote.canonical_url,
         remote_branch=remote.branch,
-        last_synced_sha=last_synced_sha,
+        snapshot_commit=snapshot_commit,
+        path_prefix=path_prefix,
         documents=ordered,
         digest="",
     )
     return AdoptionManifest(
-        vault_id=preliminary.vault_id,
-        vault_name=preliminary.vault_name,
+        binding_name=preliminary.binding_name,
+        source_scope=preliminary.source_scope,
+        target_vault=preliminary.target_vault,
+        target_collection=preliminary.target_collection,
         remote_url=preliminary.remote_url,
         remote_branch=preliminary.remote_branch,
-        last_synced_sha=preliminary.last_synced_sha,
+        snapshot_commit=preliminary.snapshot_commit,
+        path_prefix=preliminary.path_prefix,
         documents=preliminary.documents,
         digest=_canonical_digest(preliminary.fact()),
     )
@@ -373,19 +429,27 @@ def _requested_by(value: object) -> str:
     return normalized
 
 
-def _strict_db_metadata(value: object) -> dict[str, Any]:
-    """Decode the JSONB driver value without silently replacing corruption."""
-    decoded = value
-    if isinstance(decoded, str):
-        try:
-            decoded = json.loads(decoded)
-        except json.JSONDecodeError:
-            raise ExternalGitRetirementError("external Git managed metadata is invalid") from None
-    if not isinstance(decoded, Mapping):
-        raise ExternalGitRetirementError("external Git managed metadata is invalid")
-    normalized = _json_value(decoded)
-    if not isinstance(normalized, dict):
-        raise ExternalGitRetirementError("external Git managed metadata is invalid")
+def _normalized_live_metadata_text(value: object, *, default: str) -> str:
+    """Use the same blank/default rules as Collector's public AKB proof."""
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ExternalGitRetirementError("external Git retirement document facts are invalid")
+    return value.strip() or default
+
+
+def _normalized_live_metadata_tags(value: object) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise ExternalGitRetirementError("external Git retirement document facts are invalid")
+    normalized: list[str] = []
+    for tag in value:
+        if not isinstance(tag, str):
+            raise ExternalGitRetirementError("external Git retirement document facts are invalid")
+        trimmed = tag.strip()
+        if trimmed:
+            normalized.append(trimmed)
     return normalized
 
 
@@ -413,11 +477,12 @@ class ExternalGitRetirement:
         receipt: ExternalGitRetirementReceipt,
         manifest: AdoptionManifest,
         *,
+        expected_vault_id: uuid.UUID,
         idempotency_key: uuid.UUID,
         requested_by: str,
     ) -> bool:
         return (
-            receipt.vault_id == manifest.vault_id
+            receipt.vault_id == expected_vault_id
             and receipt.vault_name == manifest.vault_name
             and receipt.manifest_digest == manifest.digest
             and receipt.document_count == manifest.document_count
@@ -434,24 +499,31 @@ class ExternalGitRetirement:
         receipt: ExternalGitRetirementReceipt,
         manifest: AdoptionManifest,
         *,
+        expected_vault_id: uuid.UUID,
         idempotency_key: uuid.UUID,
         requested_by: str,
     ) -> None:
         if not cls._same_binding(
             receipt,
             manifest,
+            expected_vault_id=expected_vault_id,
             idempotency_key=idempotency_key,
             requested_by=requested_by,
         ):
             raise ExternalGitRetirementConflict("external Git retirement replay conflicts with its durable receipt")
 
     @staticmethod
-    async def _locked_vault(conn: asyncpg.Connection, manifest: AdoptionManifest) -> asyncpg.Record:
+    async def _locked_vault(
+        conn: asyncpg.Connection,
+        manifest: AdoptionManifest,
+        *,
+        expected_vault_id: uuid.UUID,
+    ) -> asyncpg.Record:
         row = await conn.fetchrow(
-            "SELECT id, name, status FROM vaults WHERE id = $1 FOR UPDATE",
-            manifest.vault_id,
+            "SELECT id, name, status FROM vaults WHERE name = $1 FOR UPDATE",
+            manifest.target_vault,
         )
-        if row is None or row["name"] != manifest.vault_name:
+        if row is None or row["id"] != expected_vault_id:
             raise ExternalGitRetirementError("external Git retirement vault binding is stale")
         if row["status"] == "deleted":
             raise ExternalGitRetirementError("external Git retirement cannot reclassify a deleted vault")
@@ -508,79 +580,89 @@ class ExternalGitRetirement:
             raise ExternalGitRetirementError("external Git retirement sidecar binding is stale")
 
     @staticmethod
-    def _live_document(vault_name: str, row: Mapping[str, Any]) -> AdoptionDocument:
-        path = row["path"]
-        content_hash = row["content_hash"]
-        tags = row["tags"]
+    def _require_live_document_matches(
+        manifest: AdoptionManifest,
+        document: AdoptionDocument,
+        row: Mapping[str, Any],
+    ) -> None:
+        """Prove every Collector fact against the active AKB mirror row."""
         if (
             row["source"] != "external_git"
-            or row["external_path"] != path
-            or not isinstance(row["external_blob"], str)
-            or _OID_RE.fullmatch(row["external_blob"]) is None
-            or not isinstance(path, str)
-            or not isinstance(content_hash, str)
-            or _DIGEST_RE.fullmatch(content_hash) is None
+            or row["status"] != "active"
+            or row["external_path"] != document.path
+            or row["external_blob"] != document.blob_sha
+            or row["content_hash"] != document.akb_content_sha256
             or row["hash_algorithm"] != "sha256"
-            or not isinstance(tags, (list, tuple))
+            or row["current_commit"] != document.akb_current_version
+            or document.source_version != document.blob_sha
+            or document.origin_key != f"git://{manifest.source_scope}/{document.path}"
+            or document.resource_uri != doc_uri(manifest.target_vault, document.path)
         ):
-            raise ExternalGitRetirementError("external Git retirement document facts are invalid")
+            raise ExternalGitRetirementError("external Git retirement manifest does not match live documents")
+        if not document.managed_metadata["managed"]:
+            return
+        expected_metadata = {
+            "title": document.managed_metadata["title"],
+            "type": document.managed_metadata["type"],
+            "tags": document.managed_metadata["tags"],
+            "summary": document.managed_metadata["summary"],
+            "domain": document.managed_metadata["domain"],
+        }
         try:
-            managed_metadata = _managed_metadata(
-                {
-                    "title": row["title"],
-                    "type": row["doc_type"],
-                    "status": row["status"],
-                    "tags": list(tags),
-                    "domain": row["domain"],
-                    "summary": row["summary"],
-                    "metadata": _strict_db_metadata(row["metadata"]),
-                }
-            )
+            live_metadata = {
+                "title": _normalized_live_metadata_text(row["title"], default=""),
+                "type": _normalized_live_metadata_text(row["doc_type"], default="reference"),
+                "tags": _normalized_live_metadata_tags(row["tags"]),
+                "summary": _normalized_live_metadata_text(row["summary"], default=""),
+                "domain": _normalized_live_metadata_text(row["domain"], default=""),
+            }
         except ExternalGitRetirementError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - never expose persisted document values
-            raise ExternalGitRetirementError("external Git retirement document facts are invalid") from exc
-        normalized_path = to_nfc(path)
-        normalized_hash = to_nfc(content_hash)
-        return AdoptionDocument(
-            uri=doc_uri(vault_name, normalized_path),
-            path=normalized_path,
-            content_hash=normalized_hash,
-            managed_metadata=managed_metadata,
-        )
+            raise ExternalGitRetirementError(
+                "external Git retirement manifest does not match live documents"
+            ) from None
+        if live_metadata != expected_metadata:
+            raise ExternalGitRetirementError("external Git retirement manifest does not match live documents")
 
     async def _validate_live_documents(
         self,
         conn: asyncpg.Connection,
         manifest: AdoptionManifest,
+        *,
+        vault_id: uuid.UUID,
     ) -> None:
         rows = await conn.fetch(
             """
             SELECT id, path, title, doc_type, status, tags, domain, summary,
-                   metadata, source, external_path, external_blob, content_hash,
-                   hash_algorithm
+                   source, external_path, external_blob, content_hash,
+                   hash_algorithm, current_commit
               FROM documents
              WHERE vault_id = $1 AND source = 'external_git'
              ORDER BY path
              FOR UPDATE
             """,
-            manifest.vault_id,
+            vault_id,
         )
-        live = tuple(
-            sorted(
-                (self._live_document(manifest.vault_name, row) for row in rows),
-                key=lambda document: document.path,
-            )
-        )
-        if len(live) != manifest.document_count or [item.fact() for item in live] != [
-            item.fact() for item in manifest.documents
-        ]:
+        if len(rows) != manifest.document_count:
+            raise ExternalGitRetirementError("external Git retirement manifest does not match live documents")
+        expected_by_path = {document.path: document for document in manifest.documents}
+        seen_paths: set[str] = set()
+        for row in rows:
+            path = row["path"]
+            if not isinstance(path, str) or path in seen_paths:
+                raise ExternalGitRetirementError("external Git retirement manifest does not match live documents")
+            document = expected_by_path.get(path)
+            if document is None:
+                raise ExternalGitRetirementError("external Git retirement manifest does not match live documents")
+            seen_paths.add(path)
+            self._require_live_document_matches(manifest, document, row)
+        if len(seen_paths) != manifest.document_count:
             raise ExternalGitRetirementError("external Git retirement manifest does not match live documents")
 
     async def _load_or_quarantine(
         self,
         manifest: AdoptionManifest,
         *,
+        expected_vault_id: uuid.UUID,
         idempotency_key: uuid.UUID,
         requested_by: str,
     ) -> ExternalGitRetirementReceipt:
@@ -588,30 +670,40 @@ class ExternalGitRetirement:
             async with conn.transaction():
                 record = await conn.fetchrow(
                     "SELECT * FROM external_git_retirements WHERE vault_id = $1 FOR UPDATE",
-                    manifest.vault_id,
+                    expected_vault_id,
                 )
                 if record is not None:
                     receipt = _receipt(record)
                     self._require_same_binding(
                         receipt,
                         manifest,
+                        expected_vault_id=expected_vault_id,
                         idempotency_key=idempotency_key,
                         requested_by=requested_by,
                     )
                     if receipt.status == "retired":
                         return receipt
-                    await self._locked_vault(conn, manifest)
+                    vault = await self._locked_vault(
+                        conn,
+                        manifest,
+                        expected_vault_id=expected_vault_id,
+                    )
                     await self._require_open_authority(conn)
-                    sidecar = await self._locked_sidecar(conn, manifest.vault_id)
+                    sidecar = await self._locked_sidecar(conn, vault["id"])
                     if (
                         sidecar["sync_state"] != "quarantined"
                         or sidecar["sync_state_reason"] != _RETIREMENT_PENDING_REASON
                     ):
                         raise ExternalGitRetirementError("external Git retirement quarantine intent is stale")
                     self._validate_sidecar(sidecar, manifest)
-                    await self._validate_live_documents(conn, manifest)
+                    await self._validate_live_documents(conn, manifest, vault_id=vault["id"])
                     return receipt
 
+                vault = await self._locked_vault(
+                    conn,
+                    manifest,
+                    expected_vault_id=expected_vault_id,
+                )
                 key_record = await conn.fetchrow(
                     "SELECT * FROM external_git_retirements WHERE idempotency_key = $1 FOR UPDATE",
                     idempotency_key,
@@ -620,13 +712,12 @@ class ExternalGitRetirement:
                     raise ExternalGitRetirementConflict(
                         "external Git retirement idempotency key is already bound to another receipt"
                     )
-                await self._locked_vault(conn, manifest)
                 await self._require_open_authority(conn)
-                sidecar = await self._locked_sidecar(conn, manifest.vault_id)
+                sidecar = await self._locked_sidecar(conn, vault["id"])
                 if sidecar["sync_state"] not in {"active", "pending_preflight"}:
                     raise ExternalGitRetirementError("external Git retirement sidecar is not claimable for retirement")
                 self._validate_sidecar(sidecar, manifest)
-                await self._validate_live_documents(conn, manifest)
+                await self._validate_live_documents(conn, manifest, vault_id=vault["id"])
 
                 try:
                     record = await conn.fetchrow(
@@ -638,7 +729,7 @@ class ExternalGitRetirement:
                         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                         RETURNING *
                         """,
-                        manifest.vault_id,
+                        vault["id"],
                         manifest.vault_name,
                         manifest.digest,
                         manifest.document_count,
@@ -664,7 +755,7 @@ class ExternalGitRetirement:
                      WHERE vault_id = $1
                        AND sync_state IN ('active', 'pending_preflight')
                     """,
-                    manifest.vault_id,
+                    vault["id"],
                     _RETIREMENT_PENDING_REASON,
                     _RETIREMENT_PENDING_ERROR,
                 )
@@ -676,6 +767,7 @@ class ExternalGitRetirement:
         self,
         manifest: AdoptionManifest,
         *,
+        expected_vault_id: uuid.UUID,
         idempotency_key: uuid.UUID,
         requested_by: str,
     ) -> ExternalGitRetirementReceipt:
@@ -683,7 +775,7 @@ class ExternalGitRetirement:
             async with conn.transaction():
                 record = await conn.fetchrow(
                     "SELECT * FROM external_git_retirements WHERE vault_id = $1 FOR UPDATE",
-                    manifest.vault_id,
+                    expected_vault_id,
                 )
                 if record is None:
                     raise ExternalGitRetirementError("external Git retirement intent disappeared")
@@ -691,21 +783,26 @@ class ExternalGitRetirement:
                 self._require_same_binding(
                     receipt,
                     manifest,
+                    expected_vault_id=expected_vault_id,
                     idempotency_key=idempotency_key,
                     requested_by=requested_by,
                 )
                 if receipt.status == "retired":
                     return receipt
-                await self._locked_vault(conn, manifest)
+                vault = await self._locked_vault(
+                    conn,
+                    manifest,
+                    expected_vault_id=expected_vault_id,
+                )
                 await self._require_open_authority(conn)
-                sidecar = await self._locked_sidecar(conn, manifest.vault_id)
+                sidecar = await self._locked_sidecar(conn, vault["id"])
                 if (
                     sidecar["sync_state"] != "quarantined"
                     or sidecar["sync_state_reason"] != _RETIREMENT_PENDING_REASON
                 ):
                     raise ExternalGitRetirementError("external Git retirement quarantine intent is stale")
                 self._validate_sidecar(sidecar, manifest)
-                await self._validate_live_documents(conn, manifest)
+                await self._validate_live_documents(conn, manifest, vault_id=vault["id"])
 
                 reclassified = await conn.execute(
                     """
@@ -719,13 +816,13 @@ class ExternalGitRetirement:
                            llm_next_attempt_at = NULL
                      WHERE vault_id = $1 AND source = 'external_git'
                     """,
-                    manifest.vault_id,
+                    vault["id"],
                 )
                 if _command_count(reclassified) != manifest.document_count:
                     raise ExternalGitRetirementError("external Git retirement document reclassification drifted")
                 deleted = await conn.execute(
                     "DELETE FROM vault_external_git WHERE vault_id = $1",
-                    manifest.vault_id,
+                    vault["id"],
                 )
                 if not _command_updated_one(deleted):
                     raise ExternalGitRetirementError("external Git retirement sidecar delete was superseded")
@@ -736,7 +833,7 @@ class ExternalGitRetirement:
                      WHERE vault_id = $1 AND status = 'quarantined'
                     RETURNING *
                     """,
-                    manifest.vault_id,
+                    vault["id"],
                 )
                 if row is None:
                     raise ExternalGitRetirementError("external Git retirement receipt transition was superseded")
@@ -746,6 +843,7 @@ class ExternalGitRetirement:
         self,
         manifest: AdoptionManifest,
         *,
+        expected_vault_id: uuid.UUID,
         idempotency_key: uuid.UUID,
         requested_by: str,
     ) -> None:
@@ -754,7 +852,7 @@ class ExternalGitRetirement:
             async with conn.transaction():
                 record = await conn.fetchrow(
                     "SELECT * FROM external_git_retirements WHERE vault_id = $1 FOR UPDATE",
-                    manifest.vault_id,
+                    expected_vault_id,
                 )
                 if record is None:
                     raise ExternalGitRetirementError("external Git retirement receipt disappeared")
@@ -762,6 +860,7 @@ class ExternalGitRetirement:
                 self._require_same_binding(
                     receipt,
                     manifest,
+                    expected_vault_id=expected_vault_id,
                     idempotency_key=idempotency_key,
                     requested_by=requested_by,
                 )
@@ -769,7 +868,7 @@ class ExternalGitRetirement:
                     raise ExternalGitRetirementError("external Git retirement is not complete")
                 vault = await conn.fetchrow(
                     "SELECT id, name FROM vaults WHERE id = $1 FOR UPDATE",
-                    manifest.vault_id,
+                    expected_vault_id,
                 )
                 if vault is None:
                     return
@@ -777,12 +876,12 @@ class ExternalGitRetirement:
                     raise ExternalGitRetirementError("external Git retirement vault binding is stale")
                 if await conn.fetchval(
                     "SELECT 1 FROM vault_external_git WHERE vault_id = $1",
-                    manifest.vault_id,
+                    expected_vault_id,
                 ):
                     raise ExternalGitRetirementError("external Git retirement sidecar unexpectedly remains")
                 if await conn.fetchval(
                     "SELECT 1 FROM documents WHERE vault_id = $1 AND source = 'external_git'",
-                    manifest.vault_id,
+                    expected_vault_id,
                 ):
                     raise ExternalGitRetirementError("external Git retirement document reclassification is incomplete")
                 vault_name = vault["name"]
@@ -800,23 +899,34 @@ class ExternalGitRetirement:
         self,
         *,
         manifest: AdoptionManifest,
+        expected_vault_id: uuid.UUID,
         idempotency_key: uuid.UUID,
         requested_by: str,
     ) -> ExternalGitRetirementReceipt:
         """Retire one pre-adopted external-Git sidecar with exact replay only."""
         if not isinstance(manifest, AdoptionManifest):
             raise ExternalGitRetirementError("external Git retirement manifest is invalid")
+        if not isinstance(expected_vault_id, uuid.UUID):
+            raise ExternalGitRetirementError("external Git retirement vault id is invalid")
         if not isinstance(idempotency_key, uuid.UUID):
             raise ExternalGitRetirementError("external Git retirement idempotency key is invalid")
+        try:
+            canonical_manifest = parse_adoption_manifest(manifest.fact())
+        except ExternalGitRetirementError:
+            raise ExternalGitRetirementError("external Git retirement manifest is invalid") from None
+        if canonical_manifest != manifest:
+            raise ExternalGitRetirementError("external Git retirement manifest is invalid")
         requested_by = _requested_by(requested_by)
         receipt = await self._load_or_quarantine(
             manifest,
+            expected_vault_id=expected_vault_id,
             idempotency_key=idempotency_key,
             requested_by=requested_by,
         )
         if receipt.status == "retired":
             await self._finish_completed_marker(
                 manifest,
+                expected_vault_id=expected_vault_id,
                 idempotency_key=idempotency_key,
                 requested_by=requested_by,
             )
@@ -831,11 +941,13 @@ class ExternalGitRetirement:
             raise ExternalGitRetirementError("external Git retirement marker quarantine failed") from exc
         receipt = await self._finalize(
             manifest,
+            expected_vault_id=expected_vault_id,
             idempotency_key=idempotency_key,
             requested_by=requested_by,
         )
         await self._finish_completed_marker(
             manifest,
+            expected_vault_id=expected_vault_id,
             idempotency_key=idempotency_key,
             requested_by=requested_by,
         )

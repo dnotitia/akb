@@ -88,6 +88,28 @@ class ExternalGitCompatError(AKBError):
         super().__init__(message, status_code=502, code="external_git_compat")
 
 
+async def _active_sidecar_for_document_mutation(conn, vault_id: uuid.UUID) -> bool:
+    """Take an in-transaction active-sidecar snapshot before a mirror write.
+
+    ``lock_vault_for_child_write`` must be held first.  Retirement takes that
+    parent row ``FOR UPDATE`` before it quarantines the sidecar, so a document
+    mutation ordered before quarantine can finish and is revalidated by
+    retirement; one ordered after cannot pass this gate or change a now-manual
+    document back into an external-Git row.
+    """
+    return bool(
+        await conn.fetchval(
+            """
+            SELECT 1
+              FROM vault_external_git
+             WHERE vault_id = $1 AND sync_state = 'active'
+             FOR KEY SHARE
+            """,
+            vault_id,
+        )
+    )
+
+
 class ExternalGitService:
     """Encapsulates clone/fetch/reconcile for read-only mirror vaults."""
 
@@ -314,6 +336,8 @@ class ExternalGitService:
                             vault_id=vault_id, vault_name=vault_name, path=path,
                             expected_blob=existing["external_blob"],
                         )
+                        if outcome == "superseded":
+                            return {"status": "superseded", "sha": materialized_sha}
                         if outcome == "conflict":
                             # A concurrent reconcile moved this path's blob after
                             # our snapshot; the tombstone CAS did not match. Treat
@@ -341,11 +365,13 @@ class ExternalGitService:
                         )
                     skipped += 1
                     continue
-                await self._reindex_file(
+                reindex_outcome = await self._reindex_file(
                     vault_id=vault_id, vault_name=vault_name,
                     path=path, blob_sha=blob_sha, remote_url=cfg["remote_url"],
                     tip_sha=materialized_sha,
                 )
+                if reindex_outcome == "superseded":
+                    return {"status": "superseded", "sha": materialized_sha}
                 if existing:
                     updated += 1
                 else:
@@ -363,6 +389,8 @@ class ExternalGitService:
                     vault_id=vault_id, vault_name=vault_name, path=path,
                     expected_blob=local[path]["external_blob"],
                 )
+                if outcome == "superseded":
+                    return {"status": "superseded", "sha": materialized_sha}
                 if outcome == "conflict":
                     # A concurrent reconcile re-indexed this path to a newer blob
                     # after our snapshot, so it is NOT actually gone from truth.
@@ -432,7 +460,7 @@ class ExternalGitService:
         blob_sha: str,
         remote_url: str,
         tip_sha: str,
-    ) -> None:
+    ) -> str | None:
         raw = await asyncio.to_thread(self.git.cat_blob, vault_name, blob_sha)
         try:
             content = raw.decode("utf-8")
@@ -512,6 +540,8 @@ class ExternalGitService:
                         "Vault was deleted during external Git synchronization",
                         status_code=409,
                     )
+                if not await _active_sidecar_for_document_mutation(conn, vault_id):
+                    return "superseded"
                 previous_asset_state = await doc_repo.find_asset_sync_state_for_update(
                     vault_id, path, conn=conn,
                 )
@@ -592,6 +622,7 @@ class ExternalGitService:
                         "hash_algorithm": HASH_ALGORITHM,
                     },
                 )
+        return None
 
     async def _delete_external_path(
         self,
@@ -615,6 +646,9 @@ class ExternalGitService:
           cursor over content this reconcile never reconciled. Otherwise the next
           poll's ``unchanged`` fast-path (cursor == upstream SHA) would perpetuate
           the stale prior content forever.
+        * ``"superseded"`` — the sidecar is no longer active inside this
+          transaction, so retirement/reconfiguration won before any document,
+          chunk, collection, or event mutation began.
 
         The row is re-read and LOCKED (``FOR UPDATE``) INSIDE the transaction,
         never before it. Two reconciles that overlap (a claim lease that expired
@@ -635,6 +669,8 @@ class ExternalGitService:
             async with conn.transaction():
                 if not await lock_vault_for_child_write(conn, vault_id):
                     return "already_absent"
+                if not await _active_sidecar_for_document_mutation(conn, vault_id):
+                    return "superseded"
                 row = await conn.fetchrow(
                     """
                     SELECT id, collection_id, created_by, external_blob

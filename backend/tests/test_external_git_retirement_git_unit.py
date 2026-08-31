@@ -22,6 +22,18 @@ def test_external_mirror_marker_retires_through_a_fail_closed_tombstone(tmp_path
     assert (bare / "akb-external-mirror-retiring").is_file()
     with pytest.raises(MirrorMarkerError, match="retirement is incomplete"):
         git.current_commit(vault)
+    for mutation in (
+        lambda: git.commit_file(vault, "new.md", "# New\n", "post-quarantine write"),
+        lambda: git.delete_file(vault, "overview.md", "post-quarantine delete"),
+        lambda: git.move_file(vault, "overview.md", "renamed.md", "post-quarantine move"),
+        lambda: git.delete_paths_bulk(
+            vault_name=vault,
+            file_paths=["overview.md"],
+            message="post-quarantine bulk delete",
+        ),
+    ):
+        with pytest.raises(MirrorMarkerError, match="retirement is incomplete"):
+            mutation()
 
     # Both phases are recovery-safe when a process restarts after either side
     # of the non-transactional filesystem transition.
@@ -32,6 +44,7 @@ def test_external_mirror_marker_retires_through_a_fail_closed_tombstone(tmp_path
     assert not (bare / "akb-external-mirror").exists()
     assert not (bare / "akb-external-mirror-retiring").exists()
     assert git.current_commit(vault) == fixed_ref
+    assert git.commit_file(vault, "new.md", "# New\n", "post-retirement write") != fixed_ref
 
 
 def test_external_mirror_marker_refuses_a_ref_drift_before_removal(tmp_path) -> None:
