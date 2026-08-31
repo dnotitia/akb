@@ -7,6 +7,36 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Added a tenant stats snapshot on its own port
+
+A new `/stats` surface reports coarse inventory — database and file bytes,
+vault/collection/document/chunk counts, and the previous complete UTC day's
+call volume — as plain JSON. It listens on a **separate port**, configured by
+`stats.port` in `app.yaml` or the `AKB_STATS_PORT` environment variable, and is
+not composed at all when neither is set. The separation exists so a control
+plane can read inventory over a NetworkPolicy that cannot reach the API port;
+the surface carries no authentication of its own, so do not bind it where no
+such policy restricts who may connect.
+
+Responses are served from a snapshot recomputed every
+`stats.sampler_interval_secs` (default 300) and never from the request path, so
+polling costs nothing; callers get 503 until the first sample and keep being
+served the last good snapshot while sampling fails. Unmeasurable numbers are
+omitted rather than defaulted to 0, and the previous day's call volume is
+finalized once into `tenant_activity_daily` (migration 087) so a restart cannot
+publish a different number for a window a consumer already recorded. The wire
+contract is `backend/app/stats/schema_v1.json` with golden fixtures beside it.
+This is deliberately not a metrics endpoint — there is no Prometheus
+dependency.
+
+### Reported the age of the indexing queue head on /health
+
+`/health` now carries `oldest_pending_enqueued_at`: the enqueue time of the
+oldest chunk still waiting to be indexed, also available per vault under
+`vector_store.backfill.upsert`. The existing backlog counters said how much
+work was outstanding but not whether it was moving, so a stuck queue and a busy
+one looked alike. The field is omitted entirely when nothing is pending.
+
 ### Fixed upstream provider selection with an existing Keycloak session
 
 Ordinary browser login now requires a fresh Keycloak authentication ceremony

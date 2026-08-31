@@ -213,3 +213,34 @@ only.
   `external_git`, `metadata_backfill`, `events`. Backfill stats come
   from `vector_indexer.pending_stats()` (single source of truth for
   the unified embed+sparse+upsert stage). Not probed by kubelet.
+  Also carries top-level `oldest_pending_enqueued_at` — when the
+  indexing queue is non-empty, the enqueue time of its oldest pending
+  chunk. Omitted entirely when the queue is empty (never 0 or epoch).
+
+## Tenant stats (`/stats`, separate port)
+
+`app/stats/` serves a cached inventory snapshot — storage bytes,
+corpus counts, and the previous complete UTC day's call volume — on
+its **own listener**, configured by `stats.port` in `app.yaml` or
+`AKB_STATS_PORT`. Unset = no socket bound, no sampler, nothing
+changes. It is not part of the API app and does not appear in the
+OpenAPI document.
+
+- Separate port because a control plane must read inventory without
+  reaching tenant data, and the enforcing NetworkPolicy selects on
+  port. The surface has **no authentication**: reachability is the
+  authorization, so do not bind it where the network policy does not.
+- **Requests never compute.** A sampler writes the snapshot every
+  `stats.sampler_interval_secs` (default 300); `/stats` returns the
+  cache, or 503 before the first sample. A failed sample keeps serving
+  the last good one.
+- **Absent is not zero.** Unmeasurable numeric fields are omitted, not
+  defaulted. `app/stats/schema_v1.json` (the contract consumers
+  vendor) marks every one nullable and optional;
+  `golden_v1*.json` are the fixtures both sides test against.
+- Yesterday's activity window is folded **once** into
+  `tenant_activity_daily` and served from there forever, so a restart
+  cannot publish a different number for a window a consumer already
+  stored (migration 087).
+- No Prometheus dependency — plain JSON, deliberately not a metrics
+  endpoint.
