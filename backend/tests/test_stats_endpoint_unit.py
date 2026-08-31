@@ -484,7 +484,15 @@ async def test_the_stats_server_leaves_process_signal_handlers_alone():
     API server's shutdown signal — the pod would be SIGKILLed at the end of its
     grace period with the API never told to drain.
     """
-    server = listener._NoSignalServer(listener.uvicorn.Config(app=listener.stats_app))
+    # The override is only worth anything while `Server` still calls a hook by
+    # this name; a rename would turn it into dead code and `serve()` would
+    # install handlers again with this test none the wiser. The `==` pin on
+    # uvicorn is what protects production; this makes a bump fail here first.
+    assert "capture_signals" in vars(listener.uvicorn.Server)
+
+    # `log_config=None`: a default `Config` reconfigures the process-wide
+    # uvicorn loggers, which is exactly what the listener no longer does.
+    server = listener._NoSignalServer(listener.uvicorn.Config(app=listener.stats_app, log_config=None))
     before = signal.getsignal(signal.SIGTERM)
     with server.capture_signals():
         assert signal.getsignal(signal.SIGTERM) is before
