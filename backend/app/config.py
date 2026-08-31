@@ -935,11 +935,14 @@ class Settings(BaseModel):
     # installation that registers no provider keeps today's behaviour rather than
     # silently gaining a login.
     #
-    # The cost is real and is the operator's to accept: this realm also holds the
-    # product administrator account, so enabling it puts the operator plane and
-    # the audience plane in one realm. It is bounded rather than open -- an
-    # administrator who signs in this way still arrives as a pending admission
-    # and still needs approval, exactly like anyone else, so arrival is not entry.
+    # This does not put two planes into one realm. A realm-local native identity
+    # is already what this realm is for: the product administrator is one, and
+    # this realm is the only human issuer the installation accepts. What the
+    # setting decides is whether ordinary people also hold an account here rather
+    # than at an upstream -- an installation-owner's choice, which is why it is a
+    # setting and not a default. Bounded either way: whoever signs in this way
+    # arrives as a pending admission and still needs approval, exactly like
+    # anyone else, so arrival is not entry.
     sso_local_realm_login_enabled: bool = False
     sso_local_realm_display_name: str = "This workspace"
     # `invite_only` records the arrival it refuses so an administrator can
