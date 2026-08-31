@@ -877,7 +877,7 @@ def test_purge_cutoff_is_a_whole_day_boundary():
     joining raw rows against the aggregate."""
     from datetime import datetime, timezone
 
-    cutoff = tool_usage._purge_cutoff(
+    cutoff = tool_usage.purge_cutoff(
         datetime(2026, 7, 28, 13, 47, 31, 12345, tzinfo=timezone.utc)
     )
     assert (cutoff.hour, cutoff.minute, cutoff.second, cutoff.microsecond) == (0, 0, 0, 0)

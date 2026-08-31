@@ -537,13 +537,17 @@ def _requeue_front(batch: list[_Row]) -> int:
     return len(batch)
 
 
-def _purge_cutoff(now: datetime | None = None) -> datetime:
+def purge_cutoff(now: datetime | None = None) -> datetime:
     """Midnight UTC, ``raw_retention_days`` back — a whole-day boundary.
 
     Truncating to the day keeps a retention pass from splitting a day across
     runs, so "this day is gone" is never half-true for a reader joining raw
     rows against the aggregate. The ``now`` argument exists so the boundary can
     be asserted deterministically in tests.
+
+    Public because it is also the line behind which raw rows can no longer be
+    counted: the stats sampler (``app/stats/sampler.py``) refuses to fold a
+    day's call volume from rows this purge may already have reached.
     """
     now = now or datetime.now(timezone.utc)
     day = (now - timedelta(days=settings.tool_usage.raw_retention_days)).date()
@@ -576,7 +580,7 @@ async def purge_once() -> int:
     pool = await get_pool()
     async with pool.acquire() as conn:
         n = await conn.fetchval(
-            _PURGE_SQL, _purge_cutoff(), settings.tool_usage.maintenance_batch
+            _PURGE_SQL, purge_cutoff(), settings.tool_usage.maintenance_batch
         )
     n = int(n or 0)
     if n:

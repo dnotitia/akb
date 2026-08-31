@@ -37,6 +37,8 @@ GOLDEN = json.loads((_PKG / "golden_v1.json").read_text())
 GOLDEN_UNMEASURED = json.loads((_PKG / "golden_v1_unmeasured.json").read_text())
 
 _UTC = timezone.utc
+# A mid-day clock: the most recent closed-and-settled UTC day is 2026-08-20.
+_NOW = datetime(2026, 8, 21, 9, 0, tzinfo=_UTC)
 
 
 # ── a fake database that behaves like the real one for these statements ──
@@ -184,17 +186,14 @@ def test_schema_marks_every_numeric_field_nullable_and_optional():
             assert name not in required, f"{section}.{name} must not be required"
 
 
-async def test_computed_payload_has_exactly_the_golden_shape(db, monkeypatch):
+async def test_computed_payload_has_exactly_the_golden_shape(db):
     """A fully measurable environment produces the documented payload.
 
     Compared key-by-key against the fixture rather than field-by-field in the
     test, so the fixture stays the thing that has to be updated when the shape
     changes — which is also what the consumer vendors.
     """
-    monkeypatch.setattr(
-        sampler, "target_activity_day", lambda now, grace: date(2026, 8, 20)
-    )
-    payload = await sampler.compute()
+    payload = await sampler.compute(now=_NOW)
 
     jsonschema.validate(payload, SCHEMA)
     assert _shape(payload) == _shape(GOLDEN)
@@ -211,12 +210,11 @@ def _shape(obj):
 # ── absent is not zero ───────────────────────────────────────────────────
 
 
-async def test_unmeasurable_fields_are_absent_rather_than_zero(db, monkeypatch):
+async def test_unmeasurable_fields_are_absent_rather_than_zero(db):
     """Every field this test makes unmeasurable must vanish, not become 0."""
     db.relation_sizes = {}  # vector index not materialised yet
     db.files = {"file_count": 128, "unsized": 3, "file_bytes": 41637294}
-    closed_day = date(2026, 8, 20)
-    monkeypatch.setattr(sampler, "target_activity_day", lambda now, grace: closed_day)
+    closed_day = date(2026, 8, 20)  # what `_NOW` targets
     db.activity_rows[closed_day] = {
         "day": closed_day,
         "window_start": datetime(2026, 8, 20, tzinfo=_UTC),
@@ -226,7 +224,7 @@ async def test_unmeasurable_fields_are_absent_rather_than_zero(db, monkeypatch):
         "active_actors": None,
     }
 
-    payload = await sampler.compute()
+    payload = await sampler.compute(now=_NOW)
 
     jsonschema.validate(payload, SCHEMA)
     assert "vector_bytes" not in payload["storage"]
@@ -290,18 +288,14 @@ def test_target_day_defers_a_day_that_is_still_settling(now, expected):
     assert sampler.target_activity_day(now, timedelta(minutes=5)) == expected
 
 
-async def test_activity_window_is_finalized_once_and_survives_a_restart(db, monkeypatch):
+async def test_activity_window_is_finalized_once_and_survives_a_restart(db):
     """The value a consumer first sees must be the value it always sees.
 
     The second pass here is a restarted process: the module cache is cleared
     and `tool_calls` now answers differently (a purge, a late flush, tracking
     toggled). The served window must not move.
     """
-    monkeypatch.setattr(
-        sampler, "target_activity_day", lambda now, grace: date(2026, 8, 20)
-    )
-
-    first = await sampler.compute()
+    first = await sampler.compute(now=_NOW)
     assert first["activity"]["calls_read"] == 4192
     assert first["activity"]["window_start"] == "2026-08-20T00:00:00Z"
     assert first["activity"]["window_end"] == "2026-08-21T00:00:00Z"
@@ -309,7 +303,7 @@ async def test_activity_window_is_finalized_once_and_survives_a_restart(db, monk
     db.tool_calls = {"calls_read": 1, "calls_write": 1, "active_actors": 1}
     sampler.reset()  # process restart
 
-    second = await sampler.compute()
+    second = await sampler.compute(now=_NOW)
     assert second["activity"] == first["activity"]
     assert len(db.activity_rows) == 1
 
@@ -321,15 +315,39 @@ async def test_activity_counts_are_unknown_when_usage_tracking_is_off(db, monkey
     tenant yesterday" as an uncorrectable fact.
     """
     monkeypatch.setattr(settings.tool_usage, "enabled", False)
-    monkeypatch.setattr(
-        sampler, "target_activity_day", lambda now, grace: date(2026, 8, 20)
-    )
 
-    payload = await sampler.compute()
+    payload = await sampler.compute(now=_NOW)
 
     assert payload["activity"]["window_start"] == "2026-08-20T00:00:00Z"
     for absent in ("calls_read", "calls_write", "active_actors"):
         assert absent not in payload["activity"]
+
+
+async def test_activity_counts_are_unknown_when_the_purge_may_have_reached_the_window(db, monkeypatch):
+    """A window behind the retention boundary is unknown, not whatever is left.
+
+    `tool_usage` purges rolled-up rows older than `raw_retention_days` (whole
+    UTC days) on its own cadence. With the minimum retention of 1, a sample
+    inside the grace window targets the day before yesterday — a window the
+    purge may already have emptied — and a count over the remainder would be
+    frozen as that day's volume forever.
+    """
+    monkeypatch.setattr(settings.tool_usage, "raw_retention_days", 1)
+
+    inside_grace = datetime(2026, 8, 21, 0, 1, tzinfo=_UTC)  # targets 2026-08-19
+    payload = await sampler.compute(now=inside_grace)
+
+    assert payload["activity"]["window_start"] == "2026-08-19T00:00:00Z"
+    for absent in ("calls_read", "calls_write", "active_actors"):
+        assert absent not in payload["activity"]
+
+    # Same retention, a settled clock: yesterday is still in front of the
+    # boundary and is measured. The rule is about the purge, not the setting.
+    sampler.reset()
+    db.activity_rows.clear()
+    measured = await sampler.compute(now=_NOW)
+    assert measured["activity"]["window_start"] == "2026-08-20T00:00:00Z"
+    assert measured["activity"]["calls_read"] == 4192
 
 
 async def test_activity_section_is_absent_before_any_day_is_folded(db, monkeypatch):

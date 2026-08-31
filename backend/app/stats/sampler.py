@@ -35,6 +35,7 @@ from typing import Any
 
 from app.config import settings
 from app.db.postgres import get_pool
+from app.services import tool_usage
 from app.services._backfill import BackfillRunner
 
 logger = logging.getLogger("akb.stats_sampler")
@@ -201,7 +202,18 @@ async def _fold_activity_day(conn, now: datetime) -> None:
     if already:
         return
 
-    calls_read, calls_write, active_actors = await _activity_counts(conn, window_start, window_end)
+    if window_start < tool_usage.purge_cutoff(now):
+        # The retention purge deletes rolled-up rows behind this boundary on
+        # its own cadence, so any part of a window behind it may already be
+        # gone. A count over what is left is a floor that reads as a total,
+        # and the fold is permanent — store unknown, exactly as the
+        # tracking-off path does. Reachable whenever the target day is more
+        # than `tool_usage.raw_retention_days` behind today: with the minimum
+        # retention of 1 that is any sample inside the grace window, whose
+        # target is two days back.
+        calls_read = calls_write = active_actors = None
+    else:
+        calls_read, calls_write, active_actors = await _activity_counts(conn, window_start, window_end)
     await conn.execute(
         """
         INSERT INTO tenant_activity_daily
@@ -403,9 +415,14 @@ async def _read_storage(conn) -> dict[str, Any]:
 # ── sampling ─────────────────────────────────────────────────────────────
 
 
-async def compute() -> dict[str, Any]:
-    """Build one payload. Raises on failure; the caller decides what to keep."""
-    now = datetime.now(timezone.utc)
+async def compute(now: datetime | None = None) -> dict[str, Any]:
+    """Build one payload. Raises on failure; the caller decides what to keep.
+
+    `now` is injectable so that the activity fold's day selection and its
+    retention check run against one fixed clock in tests; production passes
+    nothing.
+    """
+    now = now or datetime.now(timezone.utc)
     pool = await get_pool()
     async with pool.acquire() as conn:
         storage = await _read_storage(conn)
