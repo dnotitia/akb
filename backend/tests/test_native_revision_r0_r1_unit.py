@@ -93,6 +93,22 @@ def test_native_selector_constructs_the_native_facade_without_git(monkeypatch, t
     assert revision_backend.selected_document_revision_backend() == "postgres_native"
 
 
+def test_native_backend_with_injected_document_service_does_not_construct_legacy_git(monkeypatch):
+    from app.services import native_revision_backend
+    from app.services.native_document_service import NativeDocumentService
+
+    document_service = NativeDocumentService()
+
+    def fail_if_constructed(*_args, **_kwargs):
+        raise AssertionError("current Native backend construction must not construct GitService")
+
+    monkeypatch.setattr(native_revision_backend, "GitService", fail_if_constructed)
+
+    backend = native_revision_backend.NativeRevisionBackend(document_service=document_service)
+
+    assert backend.document_service is document_service
+
+
 def test_legacy_native_measurement_alias_remains_guarded(tmp_path):
     with pytest.raises(ValueError, match="native_revision_m1_measurement_only"):
         Settings(

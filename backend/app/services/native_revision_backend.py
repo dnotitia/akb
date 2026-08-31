@@ -41,11 +41,23 @@ class NativeRevisionBackend:
         legacy_git: GitService | None = None,
     ):
         self._injected_pool = pool
-        self._legacy_git = legacy_git or GitService()
+        # Keep the retained Legacy reader out of current Native-only paths.
+        # It is needed only when a completed migration mapping resolves to a
+        # Legacy bridge; NativeDocumentService follows the same lazy boundary.
+        self._legacy_git = legacy_git
+        self._created_document_service = document_service is None
         self.document_service = document_service or NativeDocumentService(
             pool=pool,
-            legacy_git=self._legacy_git,
+            legacy_git=legacy_git,
         )
+
+    def _legacy_git_reader(self) -> GitService:
+        """Construct the retained Legacy reader only for a bridge operation."""
+        if self._legacy_git is None:
+            self._legacy_git = GitService()
+            if self._created_document_service:
+                self.document_service._legacy_git = self._legacy_git
+        return self._legacy_git
 
     async def _pool(self) -> asyncpg.Pool:
         return self._injected_pool or await get_pool()
@@ -198,7 +210,7 @@ class NativeRevisionBackend:
                     continue
                 try:
                     snapshot = await asyncio.to_thread(
-                        self._legacy_git.manual_fixed_ref_history,
+                        self._legacy_git_reader().manual_fixed_ref_history,
                         vault,
                         mapping.fixed_git_oid,
                         mapping.path_at_revision,
@@ -231,7 +243,7 @@ class NativeRevisionBackend:
                         known_files.add(signature)
         if fixed_ref is not None:
             events = await asyncio.to_thread(
-                self._legacy_git.manual_fixed_ref_vault_log,
+                self._legacy_git_reader().manual_fixed_ref_vault_log,
                 vault,
                 fixed_ref,
                 max_count=max_count,
@@ -267,7 +279,7 @@ class NativeRevisionBackend:
     async def _frozen_legacy_diff(self, vault: str, mapping, commit: str) -> dict[str, Any]:
         try:
             return await asyncio.to_thread(
-                self._legacy_git.manual_fixed_ref_file_diff,
+                self._legacy_git_reader().manual_fixed_ref_file_diff,
                 vault,
                 mapping.fixed_git_oid,
                 mapping.path_at_revision,
@@ -552,7 +564,7 @@ class NativeRevisionBackend:
                 return None
             mapping = matches[0]
             raw = await asyncio.to_thread(
-                self._legacy_git.read_file,
+                self._legacy_git_reader().read_file,
                 vault,
                 mapping.path_at_revision,
                 mapping.legacy_git_oid,
@@ -593,7 +605,7 @@ class NativeRevisionBackend:
         frozen_head = mappings[-1]
         try:
             snapshot = await asyncio.to_thread(
-                self._legacy_git.manual_fixed_ref_history,
+                self._legacy_git_reader().manual_fixed_ref_history,
                 vault,
                 frozen_head.fixed_git_oid,
                 frozen_head.path_at_revision,
