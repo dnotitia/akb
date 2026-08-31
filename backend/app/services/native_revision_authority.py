@@ -6,7 +6,7 @@ import hashlib
 import inspect
 import json
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -47,6 +47,7 @@ _AUTHORITY_CONTENT_TABLES = (
 )
 
 Failpoint = Callable[[str], Any]
+ExistingCutoverRevalidator = Callable[[asyncpg.Connection], Awaitable[None]]
 
 
 class NativeAuthorityError(RuntimeError):
@@ -296,6 +297,26 @@ async def _verified_cutover_binding(
             "native_authority_cutover_incomplete",
             "Existing-database Native authority requires every vault to be verified",
         )
+    files_incomplete = await conn.fetchval(
+        """
+        SELECT EXISTS (
+            SELECT 1
+              FROM native_revision_cutover_files
+             WHERE cutover_id = $1
+               AND (
+                    status <> 'verified'
+                    OR verification_digest IS NULL
+                    OR verification_digest !~ '^[0-9a-f]{64}$'
+               )
+        )
+        """,
+        cutover_id,
+    )
+    if files_incomplete:
+        raise NativeAuthorityError(
+            "native_authority_cutover_incomplete",
+            "Existing-database Native authority requires every File to be verified",
+        )
     binding = [
         {
             "namespace_id": str(row["namespace_id"]),
@@ -309,14 +330,78 @@ async def _verified_cutover_binding(
     return run, _canonical_digest(binding)
 
 
+async def _activate_legacy_write_fence(
+    conn: asyncpg.Connection,
+    *,
+    cutover_id: uuid.UUID,
+) -> int:
+    # SHARE ROW EXCLUSIVE conflicts with ordinary INSERT/UPDATE/DELETE's
+    # ROW EXCLUSIVE lock while leaving the final read-only validation free to
+    # inspect every source table. Once this transaction commits, the row-level
+    # triggers reject any waiter that was admitted by a stopped Legacy image.
+    await conn.execute(
+        """
+        LOCK TABLE vaults, collections, documents, resource_aliases,
+                   vault_files, vault_external_git
+        IN SHARE ROW EXCLUSIVE MODE
+        """
+    )
+    fence = await conn.fetchrow(
+        "SELECT * FROM native_revision_legacy_write_fence WHERE fence_key = TRUE FOR UPDATE"
+    )
+    if fence is None or fence["state"] != "open":
+        raise NativeAuthorityError(
+            "native_authority_legacy_fence_conflict",
+            "Existing-database authority requires the open Legacy write fence",
+        )
+    row = await conn.fetchrow(
+        """
+        UPDATE native_revision_legacy_write_fence
+           SET epoch = epoch + 1,
+               state = 'fenced',
+               cutover_id = $1,
+               fenced_at = NOW()
+         WHERE fence_key = TRUE AND state = 'open'
+        RETURNING epoch
+        """,
+        cutover_id,
+    )
+    if row is None:
+        raise NativeAuthorityError(
+            "native_authority_legacy_fence_conflict",
+            "Existing-database authority lost the Legacy write fence",
+        )
+    return int(row["epoch"])
+
+
+async def _require_committed_legacy_fence(
+    conn: asyncpg.Connection,
+    authority: asyncpg.Record,
+) -> None:
+    fence = await conn.fetchrow(
+        "SELECT state, epoch, cutover_id FROM native_revision_legacy_write_fence WHERE fence_key = TRUE"
+    )
+    if (
+        fence is None
+        or fence["state"] != "committed"
+        or int(fence["epoch"]) != int(authority["legacy_write_epoch"])
+        or fence["cutover_id"] != authority["cutover_id"]
+    ):
+        raise NativeAuthorityError(
+            "native_authority_legacy_fence_mismatch",
+            "Existing-database Native authority is not bound to its committed Legacy fence",
+        )
+
+
 async def mint_existing_database_authority(
     conn: asyncpg.Connection,
     *,
     identity: NativeAuthorityIdentity,
     cutover_id: uuid.UUID,
     authority_id: uuid.UUID | None = None,
+    revalidate: ExistingCutoverRevalidator | None = None,
 ) -> uuid.UUID:
-    """Bind one verified existing-database cutover before Native startup."""
+    """Fence Legacy writes, revalidate, and mint immutable Native authority."""
     async with conn.transaction():
         await conn.execute("SELECT pg_advisory_xact_lock($1)", AUTHORITY_LOCK_KEY)
         bootstrap_counts = await conn.fetchrow(
@@ -333,19 +418,20 @@ async def mint_existing_database_authority(
                 "Existing-database cutover cannot coexist with new-database authority",
             )
 
-        run, vault_binding_digest = await _verified_cutover_binding(conn, cutover_id)
         existing = await conn.fetchrow(
             "SELECT * FROM native_revision_existing_authority WHERE marker_id = TRUE FOR UPDATE"
         )
-        expected = {
-            "cutover_id": cutover_id,
-            "record_kind": EXISTING_AUTHORITY_RECORD_KIND,
-            "backend": AUTHORITY_BACKEND,
-            "inventory_digest": run["inventory_digest"],
-            "verification_digest": run["verification_digest"],
-            "vault_binding_digest": vault_binding_digest,
-        }
         if existing is not None:
+            run, vault_binding_digest = await _verified_cutover_binding(conn, cutover_id)
+            expected = {
+                "cutover_id": cutover_id,
+                "record_kind": EXISTING_AUTHORITY_RECORD_KIND,
+                "backend": AUTHORITY_BACKEND,
+                "inventory_digest": run["inventory_digest"],
+                "verification_digest": run["verification_digest"],
+                "vault_binding_digest": vault_binding_digest,
+                "status": "committed",
+            }
             if not _initialization_matches(existing, identity) or any(
                 existing[key] != value for key, value in expected.items()
             ):
@@ -353,7 +439,16 @@ async def mint_existing_database_authority(
                     "native_authority_existing_mismatch",
                     "Existing-database Native authority does not match the verified cutover",
                 )
+            await _require_committed_legacy_fence(conn, existing)
             return existing["authority_id"]
+
+        legacy_write_epoch = await _activate_legacy_write_fence(
+            conn,
+            cutover_id=cutover_id,
+        )
+        run, vault_binding_digest = await _verified_cutover_binding(conn, cutover_id)
+        if revalidate is not None:
+            await revalidate(conn)
 
         authority_id = authority_id or uuid.uuid4()
         await conn.execute(
@@ -361,8 +456,12 @@ async def mint_existing_database_authority(
             INSERT INTO native_revision_existing_authority (
                 marker_id, authority_id, cutover_id, tenant_id, namespace,
                 database_id, current_database, runtime_image_digest,
-                inventory_digest, verification_digest, vault_binding_digest
-            ) VALUES (TRUE, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                inventory_digest, verification_digest, vault_binding_digest,
+                legacy_write_epoch, status, committed_at
+            ) VALUES (
+                TRUE, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                $11, 'committed', NOW()
+            )
             """,
             authority_id,
             cutover_id,
@@ -370,7 +469,25 @@ async def mint_existing_database_authority(
             run["inventory_digest"],
             run["verification_digest"],
             vault_binding_digest,
+            legacy_write_epoch,
         )
+        committed = await conn.execute(
+            """
+            UPDATE native_revision_legacy_write_fence
+               SET state = 'committed', committed_at = NOW()
+             WHERE fence_key = TRUE
+               AND state = 'fenced'
+               AND epoch = $1
+               AND cutover_id = $2
+            """,
+            legacy_write_epoch,
+            cutover_id,
+        )
+        if committed != "UPDATE 1":
+            raise NativeAuthorityError(
+                "native_authority_legacy_fence_conflict",
+                "Existing-database authority could not commit the Legacy write fence",
+            )
         return authority_id
 
 
@@ -380,7 +497,7 @@ async def consume_or_validate_existing_database_authority(
     identity: NativeAuthorityIdentity,
     failpoint: Failpoint | None = None,
 ) -> str:
-    """Commit the verified existing-DB handoff, or validate it on restart."""
+    """Validate the immutable existing-DB authority minted at cutover."""
     async with conn.transaction():
         await conn.execute("SELECT pg_advisory_xact_lock($1)", AUTHORITY_LOCK_KEY)
         await _trip(failpoint, "after_lock")
@@ -405,24 +522,14 @@ async def consume_or_validate_existing_database_authority(
                 "native_authority_existing_mismatch",
                 "Existing-database Native authority binding drifted",
             )
-        if row["status"] == "committed":
-            await _trip(failpoint, "validated_marker")
-            return "cutover_validated"
-        if row["status"] != "pending" or not _initialization_matches(row, identity):
+        if row["status"] != "committed":
             raise NativeAuthorityError(
-                "native_authority_existing_pending_mismatch",
-                "Pending existing-database authority does not match the first Native image",
+                "native_authority_existing_mismatch",
+                "Existing-database authority was not committed at mint",
             )
-        await _trip(failpoint, "before_marker")
-        await conn.execute(
-            """
-            UPDATE native_revision_existing_authority
-               SET status = 'committed', committed_at = NOW()
-             WHERE marker_id = TRUE AND status = 'pending'
-            """
-        )
-        await _trip(failpoint, "after_marker")
-        return "cutover_committed"
+        await _require_committed_legacy_fence(conn, row)
+        await _trip(failpoint, "validated_marker")
+        return "cutover_validated"
 
 
 def git_authority_is_blank(root: str | Path) -> bool:

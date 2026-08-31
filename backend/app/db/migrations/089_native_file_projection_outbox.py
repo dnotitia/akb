@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-logger = logging.getLogger("akb.migration.088")
+logger = logging.getLogger("akb.migration.089")
 
 
 async def migrate(conn=None):
@@ -79,4 +79,4 @@ async def _run(conn):
                 WHERE completed_at IS NULL;
             """
         )
-    logger.info("Migration 088: Native File projection outbox ready")
+    logger.info("Migration 089: Native File projection outbox ready")

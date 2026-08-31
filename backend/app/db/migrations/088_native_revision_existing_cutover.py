@@ -1,15 +1,15 @@
-"""Coordinate existing-database Native backfill across manual vaults.
+"""Coordinate and fence an existing-database Native authority cutover.
 
 It groups the existing vault-scoped migration runs into one database-local
-plan, records apply/verification progress, and provides one immutable
-existing-database authority handoff after verification.
+plan, records apply/verification progress, and provides one DB-enforced
+Legacy write epoch plus immutable authority handoff after verification.
 """
 
 from __future__ import annotations
 
 import logging
 
-logger = logging.getLogger("akb.migration.087")
+logger = logging.getLogger("akb.migration.088")
 
 
 async def migrate(conn=None):
@@ -200,6 +200,46 @@ async def _run(conn):
             CREATE INDEX IF NOT EXISTS idx_native_revision_cutover_files_status
                 ON native_revision_cutover_files(cutover_id, status, namespace_id, file_id);
 
+            CREATE TABLE IF NOT EXISTS native_revision_legacy_write_fence (
+                fence_key BOOLEAN PRIMARY KEY DEFAULT TRUE,
+                epoch BIGINT NOT NULL DEFAULT 0,
+                state TEXT NOT NULL DEFAULT 'open',
+                cutover_id UUID UNIQUE
+                    REFERENCES native_revision_cutover_runs(cutover_id) ON DELETE RESTRICT,
+                fenced_at TIMESTAMPTZ,
+                committed_at TIMESTAMPTZ,
+                CONSTRAINT native_revision_legacy_write_fence_singleton_check
+                    CHECK (fence_key),
+                CONSTRAINT native_revision_legacy_write_fence_epoch_check
+                    CHECK (epoch >= 0),
+                CONSTRAINT native_revision_legacy_write_fence_state_check
+                    CHECK (state IN ('open', 'fenced', 'committed')),
+                CONSTRAINT native_revision_legacy_write_fence_shape_check
+                    CHECK (
+                        (state = 'open'
+                         AND epoch = 0
+                         AND cutover_id IS NULL
+                         AND fenced_at IS NULL
+                         AND committed_at IS NULL)
+                        OR
+                        (state = 'fenced'
+                         AND epoch > 0
+                         AND cutover_id IS NOT NULL
+                         AND fenced_at IS NOT NULL
+                         AND committed_at IS NULL)
+                        OR
+                        (state = 'committed'
+                         AND epoch > 0
+                         AND cutover_id IS NOT NULL
+                         AND fenced_at IS NOT NULL
+                         AND committed_at IS NOT NULL)
+                    )
+            );
+
+            INSERT INTO native_revision_legacy_write_fence (fence_key)
+            VALUES (TRUE)
+            ON CONFLICT (fence_key) DO NOTHING;
+
             CREATE TABLE IF NOT EXISTS native_revision_existing_authority (
                 marker_id BOOLEAN PRIMARY KEY DEFAULT TRUE,
                 authority_id UUID NOT NULL UNIQUE DEFAULT uuid_generate_v4(),
@@ -215,9 +255,10 @@ async def _run(conn):
                 inventory_digest TEXT NOT NULL,
                 verification_digest TEXT NOT NULL,
                 vault_binding_digest TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
+                legacy_write_epoch BIGINT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'committed',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                committed_at TIMESTAMPTZ,
+                committed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 CONSTRAINT native_revision_existing_authority_singleton_check
                     CHECK (marker_id),
                 CONSTRAINT native_revision_existing_authority_kind_check
@@ -238,13 +279,12 @@ async def _run(conn):
                     CHECK (verification_digest ~ '^[0-9a-f]{64}$'),
                 CONSTRAINT native_revision_existing_authority_vault_binding_check
                     CHECK (vault_binding_digest ~ '^[0-9a-f]{64}$'),
+                CONSTRAINT native_revision_existing_authority_epoch_check
+                    CHECK (legacy_write_epoch > 0),
                 CONSTRAINT native_revision_existing_authority_status_check
-                    CHECK (status IN ('pending', 'committed')),
+                    CHECK (status = 'committed'),
                 CONSTRAINT native_revision_existing_authority_committed_shape_check
-                    CHECK (
-                        (status = 'pending' AND committed_at IS NULL)
-                        OR (status = 'committed' AND committed_at IS NOT NULL)
-                    )
+                    CHECK (committed_at IS NOT NULL)
             );
 
             CREATE OR REPLACE FUNCTION guard_native_revision_existing_authority_mutation()
@@ -253,12 +293,7 @@ async def _run(conn):
                 IF TG_OP = 'DELETE' THEN
                     RAISE EXCEPTION 'existing database revision authority cannot be deleted';
                 END IF;
-                IF OLD.status <> 'pending' OR NEW.status <> 'committed'
-                   OR (to_jsonb(OLD) - 'status' - 'committed_at')
-                      IS DISTINCT FROM (to_jsonb(NEW) - 'status' - 'committed_at') THEN
-                    RAISE EXCEPTION 'invalid existing database revision authority mutation';
-                END IF;
-                RETURN NEW;
+                RAISE EXCEPTION 'existing database revision authority is immutable';
             END;
             $guard$;
 
@@ -268,6 +303,82 @@ async def _run(conn):
                 BEFORE UPDATE OR DELETE ON native_revision_existing_authority
                 FOR EACH ROW EXECUTE FUNCTION
                     guard_native_revision_existing_authority_mutation();
+
+            CREATE OR REPLACE FUNCTION guard_native_revision_legacy_fence_mutation()
+            RETURNS TRIGGER LANGUAGE plpgsql AS $guard$
+            BEGIN
+                IF TG_OP = 'DELETE' THEN
+                    RAISE EXCEPTION 'Native Legacy write fence cannot be deleted';
+                END IF;
+                IF OLD.state = 'open'
+                   AND NEW.state = 'fenced'
+                   AND NEW.epoch = OLD.epoch + 1
+                   AND NEW.cutover_id IS NOT NULL
+                   AND NEW.fenced_at IS NOT NULL
+                   AND NEW.committed_at IS NULL THEN
+                    RETURN NEW;
+                END IF;
+                IF OLD.state = 'fenced'
+                   AND NEW.state = 'committed'
+                   AND NEW.epoch = OLD.epoch
+                   AND NEW.cutover_id = OLD.cutover_id
+                   AND NEW.fenced_at = OLD.fenced_at
+                   AND NEW.committed_at IS NOT NULL THEN
+                    RETURN NEW;
+                END IF;
+                RAISE EXCEPTION 'invalid Native Legacy write fence transition';
+            END;
+            $guard$;
+
+            DROP TRIGGER IF EXISTS guard_native_revision_legacy_fence
+                ON native_revision_legacy_write_fence;
+            CREATE TRIGGER guard_native_revision_legacy_fence
+                BEFORE UPDATE OR DELETE ON native_revision_legacy_write_fence
+                FOR EACH ROW EXECUTE FUNCTION
+                    guard_native_revision_legacy_fence_mutation();
+
+            CREATE OR REPLACE FUNCTION reject_fenced_legacy_revision_write()
+            RETURNS TRIGGER LANGUAGE plpgsql AS $guard$
+            DECLARE
+                fence_epoch BIGINT;
+            BEGIN
+                SELECT epoch INTO fence_epoch
+                  FROM native_revision_legacy_write_fence
+                 WHERE fence_key = TRUE AND state <> 'open';
+                IF FOUND THEN
+                    RAISE EXCEPTION 'Legacy revision writes are fenced at epoch %', fence_epoch
+                        USING ERRCODE = '55000';
+                END IF;
+                IF TG_OP = 'DELETE' THEN
+                    RETURN OLD;
+                END IF;
+                RETURN NEW;
+            END;
+            $guard$;
+
+            -- These triggers fence the Legacy revision representation after
+            -- authority minting.  Ordinary Native-era vault, collection, and
+            -- File catalog writes remain valid; the mint transaction locks and
+            -- revalidates those complete inventories before crossing the
+            -- boundary.
+            DROP TRIGGER IF EXISTS guard_native_legacy_write ON vaults;
+            DROP TRIGGER IF EXISTS guard_native_legacy_write ON collections;
+            DROP TRIGGER IF EXISTS guard_native_legacy_write ON vault_files;
+
+            DROP TRIGGER IF EXISTS guard_native_legacy_write ON documents;
+            CREATE TRIGGER guard_native_legacy_write
+                BEFORE INSERT OR UPDATE ON documents
+                FOR EACH ROW EXECUTE FUNCTION reject_fenced_legacy_revision_write();
+
+            DROP TRIGGER IF EXISTS guard_native_legacy_write ON resource_aliases;
+            CREATE TRIGGER guard_native_legacy_write
+                BEFORE INSERT OR UPDATE ON resource_aliases
+                FOR EACH ROW EXECUTE FUNCTION reject_fenced_legacy_revision_write();
+
+            DROP TRIGGER IF EXISTS guard_native_legacy_write ON vault_external_git;
+            CREATE TRIGGER guard_native_legacy_write
+                BEFORE INSERT OR UPDATE OR DELETE ON vault_external_git
+                FOR EACH ROW EXECUTE FUNCTION reject_fenced_legacy_revision_write();
             """
         )
-    logger.info("Migration 087: existing-database Native cutover coordination ready")
+    logger.info("Migration 088: fenced existing-database Native cutover ready")

@@ -2,7 +2,7 @@
 status: accepted
 stage: applied
 created: 2026-08-12
-updated: 2026-08-12
+updated: 2026-08-31
 ---
 
 # PostgreSQL Native Document Revision Backend
@@ -54,6 +54,31 @@ transaction leaves either reusable pending authority or the completed marker,
 never an authority gap. Later image versions validate the durable tenant and
 database binding; the original image digest remains audit evidence.
 
+An existing database uses an explicit stop-the-world cutover. Before planning,
+the operator stops every Legacy API and worker and takes coordinated database
+and Git-storage snapshots. The plan is not a caller-selected subset: the
+service derives every active vault and eligible confirmed File from the
+database, requires a current Git ref for every active vault, and records
+external-Git vaults as explicit exclusions. Retiring or reclassifying an
+excluded vault requires a fresh plan. Authority cannot be minted while any
+persisted external-Git vault remains.
+
+After backfill and verification, authority minting takes the authority advisory
+lock and write-conflicting locks over the Legacy catalog tables, advances the
+singleton Legacy write-fence epoch, and revalidates the complete vault/File
+membership, document inventories, File catalog facts and bytes, Native
+projections, verification receipts, current Git refs, and external-Git absence.
+The immutable authority row and committed fence epoch are written in that same
+transaction. A failed check or interrupted pre-mint transaction rolls back to
+the open fence and remains abortable.
+
+The immutable authority insert—not backend startup and not a later Native
+write—is the forward-only boundary. After it commits, database triggers reject
+Legacy writes. Rollback across that boundary is permitted only by restoring the
+coordinated pre-cutover database and Git snapshots while the service remains
+stopped; deleting or editing the authority/fence records in place is not a
+rollback procedure.
+
 An old-but-empty database is ineligible because its AKB sentinel schema exists
 without the pre-schema claim. Bare Git startup also rejects a database carrying
 any stable Native claim, pending record, or marker. A copied database presented
@@ -66,7 +91,7 @@ and is outside this backend contract.
 - Bare Git remains the default.
 - Selection is immutable for the backend process; there is no request- or
   Vault-level split and no dual canonical write.
-- Existing-tenant activation requires a later, separately approved fenced
-  migration record. This implementation mints only `new_database` authority.
+- Existing-tenant activation requires the explicit stopped, snapshot-backed,
+  database-wide fenced cutover above.
 - No fleet default, tenant cutover, Bare Git retirement, or production-readiness
   claim is implied by the selector.

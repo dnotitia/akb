@@ -687,7 +687,20 @@ async def test_real_legacy_seed_stops_then_backfills_same_database_and_git(
                 mirror_id,
             ) == 1
 
-        planned = classification
+        # Membership and classifications are bound facts, so retiring the
+        # excluded mirror requires a fresh complete database plan. Reusing the
+        # classification receipt would be a reclassified-state authority bug.
+        planned = await cutover.plan(
+            vaults=[
+                CutoverVaultInput(
+                    namespace_id=row["id"],
+                    fixed_ref=str(fixed[row["name"]]),
+                )
+                for row in vault_rows
+            ],
+            coverage_version=f"native-cutover-f3-authority-{suffix}",
+        )
+        assert planned.exclusions == ()
         assert len(planned.files) == 2
         assert {item.disposition for item in planned.files} == {
             "native_text",
@@ -768,7 +781,7 @@ async def test_real_legacy_seed_stops_then_backfills_same_database_and_git(
             planned.cutover_id,
             identity=native_identity,
         )
-        assert authority.status == "pending"
+        assert authority.status == "committed"
         assert await cutover.commit(
             planned.cutover_id,
             identity=native_identity,
@@ -1208,8 +1221,8 @@ async def test_real_legacy_seed_stops_then_backfills_same_database_and_git(
                 item["uri"] for item in response.json()["results"]
             }
 
-            # F4: open the Document write path exactly once after the read-only
-            # handoff checks. This revision must advance only Native authority;
+            # F4: authority minting above already crossed the forward-only
+            # boundary. This later write proves post-boundary Native mutation;
             # the fixed Legacy Git refs remain a retained-history bridge.
             native_write_body = "# Moving\n\nversion three from Native"
             response = await search_client.patch(
@@ -1379,7 +1392,8 @@ async def test_real_legacy_seed_stops_then_backfills_same_database_and_git(
             "fixed_ref_count": len(fixed),
             "authority_status": authority_status,
             "native_public_read_smoke": "passed",
-            "native_write_opened": True,
+            "authority_mint_was_forward_boundary": True,
+            "post_authority_native_write": True,
             "native_document_head_advanced": True,
             "native_write_survived_restart": True,
             "pending_file_projection_resumed_after_restart": True,
