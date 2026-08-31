@@ -1,3 +1,4 @@
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
@@ -10,11 +11,15 @@ import {
   Hash,
   Info,
   KeyRound,
+  MoreHorizontal,
   PanelRightClose,
   PanelRightOpen,
+  Pencil,
+  Plus,
   Rows3,
   Table2,
   ToggleLeft,
+  Trash2,
   Type,
   X,
 } from "lucide-react";
@@ -28,6 +33,7 @@ import {
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TooltipText } from "@/components/ui/tooltip-text";
@@ -35,35 +41,37 @@ import { ResourceActionsMenu } from "@/components/resource-actions-menu";
 import { ResourceDeleteDialog } from "@/components/resource-delete-dialog";
 import { PublicationSuccessBanner } from "@/components/publication-success-banner";
 import { TablePublishDialog } from "@/components/table-publish-dialog";
+import { TableRowDialog } from "@/components/table-row-dialog";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import {
-  authenticatedFetch,
   deleteVaultTable,
+  deleteVaultTableRow,
   getVaultInfo,
+  insertVaultTableRow,
+  listVaultTableRows,
+  listVaultTables,
+  updateVaultTableRow,
   type Publication,
+  type VaultTableColumnInput,
+  type VaultTableInfo,
 } from "@/lib/api";
 import { ROLE_RANK, type Role } from "@/lib/roles";
 import { cn } from "@/lib/utils";
 
-interface Column {
-  name: string;
-  type?: string;
-  required?: boolean;
-  primary_key?: boolean;
-}
+type Column = VaultTableColumnInput;
 
-interface TableInfo {
-  name: string;
-  description?: string;
-  row_count: number;
-  columns: Column[];
-}
+const SYSTEM_COLUMN_TYPES: Record<string, string> = {
+  id: "uuid",
+  created_by: "text",
+  created_at: "timestamp",
+  updated_at: "timestamp",
+};
 
 export default function TablePage() {
   const { name: vault, table } = useParams<{ name: string; table: string }>();
   const navigate = useNavigate();
   const { refetchTree } = useVaultRefresh();
-  const [info, setInfo] = useState<TableInfo | null>(null);
+  const [info, setInfo] = useState<VaultTableInfo | null>(null);
   const [rows, setRows] = useState<Record<string, unknown>[]>([]);
   const [cols, setCols] = useState<string[]>([]);
   const [total, setTotal] = useState(0);
@@ -73,11 +81,17 @@ export default function TablePage() {
   const [schemaOpen, setSchemaOpen] = useState(false);
   const [canPublish, setCanPublish] = useState(false);
   const [canDelete, setCanDelete] = useState(false);
+  const [canManageRows, setCanManageRows] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [published, setPublished] = useState<Publication | null>(null);
+  const [rowDialogMode, setRowDialogMode] = useState<"create" | "edit" | null>(null);
+  const [selectedRow, setSelectedRow] = useState<Record<string, unknown> | null>(null);
+  const [rowToDelete, setRowToDelete] = useState<Record<string, unknown> | null>(null);
+  const [rowNotice, setRowNotice] = useState("");
   const schemaToggleRef = useRef<HTMLButtonElement | null>(null);
   const schemaCloseRef = useRef<HTMLButtonElement | null>(null);
+  const dataRequestRef = useRef(0);
   const limit = 50;
 
   useEffect(() => {
@@ -85,6 +99,7 @@ export default function TablePage() {
     let cancelled = false;
     setCanPublish(false);
     setCanDelete(false);
+    setCanManageRows(false);
     getVaultInfo(vault)
       .then((data) => {
         const roleRank = ROLE_RANK[data?.role as Role] ?? 0;
@@ -92,12 +107,14 @@ export default function TablePage() {
         if (!cancelled) {
           setCanPublish(roleRank >= ROLE_RANK.writer && writable);
           setCanDelete(roleRank >= ROLE_RANK.admin && writable);
+          setCanManageRows(roleRank >= ROLE_RANK.writer && writable);
         }
       })
       .catch(() => {
         if (!cancelled) {
           setCanPublish(false);
           setCanDelete(false);
+          setCanManageRows(false);
         }
       });
     return () => {
@@ -105,63 +122,61 @@ export default function TablePage() {
     };
   }, [vault]);
 
+  const refreshTableData = useCallback(
+    async (showLoading = false) => {
+      if (!vault || !table) return;
+      const requestId = ++dataRequestRef.current;
+      if (showLoading) {
+        setInfo(null);
+        setRows([]);
+        setCols([]);
+        setTotal(0);
+        setError("");
+        setLoading(true);
+        setInfoLoading(true);
+      }
+      try {
+        const [catalog, data] = await Promise.all([
+          listVaultTables(vault),
+          listVaultTableRows(vault, table, { limit }),
+        ]);
+        if (requestId !== dataRequestRef.current) return;
+        const found = catalog.items.find((item) => item.name === table) || null;
+        setInfo(found);
+        setRows(data.items || []);
+        setCols(data.columns || []);
+        setTotal(data.total ?? data.items?.length ?? 0);
+        setError("");
+      } catch (caught: unknown) {
+        if (requestId !== dataRequestRef.current) return;
+        setError(caught instanceof Error ? caught.message : "The table could not be loaded.");
+      } finally {
+        if (requestId === dataRequestRef.current) {
+          setLoading(false);
+          setInfoLoading(false);
+        }
+      }
+    },
+    [limit, table, vault],
+  );
+
   const closeSchema = useCallback(() => {
     setSchemaOpen(false);
     window.requestAnimationFrame(() => schemaToggleRef.current?.focus());
   }, []);
 
   useEffect(() => {
-    if (!vault || !table) return;
-    let cancelled = false;
-    setInfo(null);
-    setRows([]);
-    setCols([]);
-    setTotal(0);
-    setError("");
-    setLoading(true);
-    setInfoLoading(true);
-
-    authenticatedFetch(`/api/v1/tables/${encodeURIComponent(vault)}`)
-      .then((response) => (response.ok ? response.json().catch(() => null) : null))
-      .then((data) => {
-        if (cancelled || !data) return;
-        const found = (data.items || []).find((item: TableInfo) => item.name === table);
-        if (found) setInfo(found);
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (!cancelled) setInfoLoading(false);
-      });
-
-    // Table identifiers are restricted to ^[a-z][a-z0-9_]*$. Keep the bare
-    // name so the backend SQL rewriter maps it to the vault-scoped relation.
-    authenticatedFetch(`/api/v1/tables/${encodeURIComponent(vault)}/sql`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sql: `SELECT * FROM ${table} LIMIT ${limit}` }),
-    })
-      .then((response) => response.json())
-      .then((data) => {
-        if (cancelled) return;
-        if (data.error || data.detail) {
-          setError(data.error || data.detail);
-          return;
-        }
-        setRows(data.items || []);
-        setCols(data.columns || []);
-        setTotal(data.total ?? data.items?.length ?? 0);
-      })
-      .catch((queryError) => {
-        if (!cancelled) setError(String(queryError));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-
+    void refreshTableData(true);
     return () => {
-      cancelled = true;
+      dataRequestRef.current += 1;
     };
-  }, [vault, table]);
+  }, [refreshTableData]);
+
+  useEffect(() => {
+    if (!rowNotice) return;
+    const timeout = window.setTimeout(() => setRowNotice(""), 4000);
+    return () => window.clearTimeout(timeout);
+  }, [rowNotice]);
 
   useEffect(() => {
     if (!schemaOpen) return;
@@ -179,12 +194,19 @@ export default function TablePage() {
   }, [closeSchema, schemaOpen]);
 
   const columnByName = useMemo(
-    () => new Map((info?.columns || []).map((column) => [column.name, column])),
+    () =>
+      new Map<string, Column>([
+        ...Object.entries(SYSTEM_COLUMN_TYPES).map(
+          ([name, type]) => [name, { name, type }] as const,
+        ),
+        ...(info?.columns || []).map((column) => [column.name, column] as const),
+      ]),
     [info?.columns],
   );
 
   const rowCount = info?.row_count ?? total;
-  const columnCount = info?.columns?.length || cols.length;
+  const schemaColumnCount = info?.columns?.length || Math.max(0, cols.length - 4);
+  const visibleColumnCount = cols.length || schemaColumnCount;
   const primaryKeyCount = info?.columns?.filter((column) => column.primary_key).length || 0;
   const requiredCount =
     info?.columns?.filter((column) => column.required || column.primary_key).length || 0;
@@ -206,7 +228,11 @@ export default function TablePage() {
             <span className="font-medium text-foreground">{vault}</span>
           </>
         }
-        meta={<Badge variant="outline">Read only</Badge>}
+        meta={
+          <Badge variant={canManageRows ? "success" : "outline"}>
+            {canManageRows ? "Editable" : "Read only"}
+          </Badge>
+        }
         actions={
           <>
             <div className="mr-1 hidden items-center gap-3 text-xs text-foreground-muted xl:flex">
@@ -216,9 +242,25 @@ export default function TablePage() {
               </span>
               <span className="inline-flex items-center gap-1.5 whitespace-nowrap tabular-nums">
                 <Columns3 className="h-3.5 w-3.5" aria-hidden />
-                {columnCount} columns
+                {visibleColumnCount} columns
               </span>
             </div>
+            {canManageRows && (
+              <Button
+                type="button"
+                variant="accent"
+                size="sm"
+                onClick={() => {
+                  setSelectedRow(null);
+                  setRowDialogMode("create");
+                }}
+                disabled={!info?.columns?.length}
+                title={!info?.columns?.length ? "Schema metadata is required to add rows" : undefined}
+              >
+                <Plus className="h-4 w-4" aria-hidden />
+                <span className="hidden sm:inline">Add row</span>
+              </Button>
+            )}
             <Button
               ref={schemaToggleRef}
               type="button"
@@ -261,31 +303,45 @@ export default function TablePage() {
         <ResourceCanvas>
           <ResourceContextBar
             trailing={
-              <span className="inline-flex items-center gap-1.5 whitespace-nowrap tabular-nums">
-                <Rows3 className="h-3.5 w-3.5" aria-hidden />
-                {sampled ? `${rows.length} of ${rowCount}` : `${rows.length} rows`}
-              </span>
+              rowNotice ? (
+                <span role="status" className="font-medium text-success">
+                  {rowNotice}
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1.5 whitespace-nowrap tabular-nums">
+                  <Rows3 className="h-3.5 w-3.5" aria-hidden />
+                  {sampled ? `${rows.length} of ${rowCount}` : `${rows.length} rows`}
+                </span>
+              )
             }
           >
             <div className="flex min-w-0 items-center gap-2 text-xs text-foreground-muted">
               <Info className="h-3.5 w-3.5 shrink-0 text-link" aria-hidden />
               <TooltipText
-                tip={info?.description || "A read-only sample of this Vault table."}
+                tip={
+                  info?.description ||
+                  (canManageRows
+                    ? "Add, edit, or remove records in this Vault table."
+                    : "A read-only view of this Vault table.")
+                }
                 className="truncate"
               >
-                {info?.description || "A read-only sample of this Vault table."}
+                {info?.description ||
+                  (canManageRows
+                    ? "Add, edit, or remove records in this Vault table."
+                    : "A read-only view of this Vault table.")}
               </TooltipText>
             </div>
           </ResourceContextBar>
 
           <ResourceViewerFrame
             icon={Database}
-            label="Data preview"
+            label="Records"
             meta={
               <>
                 <span className="tabular-nums">{cols.length} columns</span>
                 <span className="hidden sm:inline">
-                  {sampled ? `First ${limit} rows` : "Complete result"}
+                  {sampled ? `Latest ${limit} rows` : "Complete result"}
                 </span>
               </>
             }
@@ -302,8 +358,25 @@ export default function TablePage() {
                 <Table2 className="h-9 w-9 text-foreground-muted" aria-hidden />
                 <h2 className="mt-4 text-sm font-semibold text-foreground">No rows yet</h2>
                 <p className="mt-1 max-w-sm text-sm text-foreground-muted">
-                  The schema is ready, but this table does not contain any records.
+                  {canManageRows
+                    ? "The schema is ready. Add the first record to start using this table."
+                    : "The schema is ready, but this table does not contain any records."}
                 </p>
+                {canManageRows && info?.columns?.length ? (
+                  <Button
+                    type="button"
+                    variant="accent"
+                    size="sm"
+                    className="mt-5"
+                    onClick={() => {
+                      setSelectedRow(null);
+                      setRowDialogMode("create");
+                    }}
+                  >
+                    <Plus className="h-4 w-4" aria-hidden />
+                    Add first row
+                  </Button>
+                ) : null}
               </div>
             ) : (
               <div
@@ -337,22 +410,36 @@ export default function TablePage() {
                           )}
                         </th>
                       ))}
+                      {canManageRows && (
+                        <th
+                          scope="col"
+                          className="sticky right-0 top-0 z-[var(--z-sticky)] w-12 border-b border-l border-border bg-surface-2 px-2 py-2.5 text-center text-xs font-medium text-foreground-muted"
+                        >
+                          <span className="sr-only">Row actions</span>
+                        </th>
+                      )}
                     </tr>
                   </thead>
                   <tbody>
                     {rows.map((row, rowIndex) => (
-                      <tr key={rowIndex} className="group transition-colors hover:bg-surface-hover">
+                      <tr
+                        key={typeof row.id === "string" ? row.id : rowIndex}
+                        className="group transition-colors hover:bg-surface-hover"
+                      >
                         <td className="sticky left-0 z-[var(--z-raised)] border-b border-r border-border bg-surface px-3 py-2 text-xs text-foreground-muted tabular-nums group-hover:bg-surface-hover">
                           {rowIndex + 1}
                         </td>
                         {cols.map((columnName) => {
                           const value = row[columnName];
+                          const numeric =
+                            typeof value === "number" ||
+                            isNumericColumnType(columnByName.get(columnName)?.type);
                           return (
                             <TooltipText key={columnName} asChild tip={formatCellFull(value)}>
                               <td
                                 className={cn(
                                   "max-w-md truncate whitespace-nowrap border-b border-r border-border px-3 py-2 text-foreground last:border-r-0",
-                                  typeof value === "number" && "text-right tabular-nums",
+                                  numeric && "text-right tabular-nums",
                                   value !== null && typeof value === "object" && "font-mono text-xs",
                                   value === null && "italic text-foreground-muted",
                                 )}
@@ -362,6 +449,18 @@ export default function TablePage() {
                             </TooltipText>
                           );
                         })}
+                        {canManageRows && (
+                          <td className="sticky right-0 z-[var(--z-raised)] border-b border-l border-border bg-surface px-1 py-1 text-center group-hover:bg-surface-hover">
+                            <RowActionsMenu
+                              rowNumber={rowIndex + 1}
+                              onEdit={() => {
+                                setSelectedRow(row);
+                                setRowDialogMode("edit");
+                              }}
+                              onDelete={() => setRowToDelete(row)}
+                            />
+                          </td>
+                        )}
                       </tr>
                     ))}
                   </tbody>
@@ -418,7 +517,7 @@ export default function TablePage() {
                     </span>
                   </div>
                   <dl className="grid grid-cols-3 overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface-2/60">
-                    <SchemaStat value={columnCount} label="Columns" icon={Columns3} />
+                    <SchemaStat value={schemaColumnCount} label="Columns" icon={Columns3} />
                     <SchemaStat value={primaryKeyCount} label="Primary keys" icon={KeyRound} />
                     <SchemaStat value={requiredCount} label="Required" icon={Asterisk} />
                   </dl>
@@ -433,7 +532,7 @@ export default function TablePage() {
                       <p className="mt-0.5 text-xs text-foreground-muted">Stored order and constraints</p>
                     </div>
                     <span className="text-xs text-foreground-muted tabular-nums">
-                      {columnCount} total
+                      {schemaColumnCount} total
                     </span>
                   </div>
 
@@ -498,8 +597,110 @@ export default function TablePage() {
         columns={info?.columns || []}
         onPublished={setPublished}
       />
+      <TableRowDialog
+        open={rowDialogMode !== null}
+        onOpenChange={(open) => {
+          if (open) return;
+          setRowDialogMode(null);
+          setSelectedRow(null);
+        }}
+        mode={rowDialogMode || "create"}
+        table={table || "Table"}
+        columns={info?.columns || []}
+        row={selectedRow}
+        onSave={async (values) => {
+          if (!vault || !table) return;
+          if (rowDialogMode === "edit") {
+            const rowId = selectedRow?.id;
+            if (typeof rowId !== "string") throw new Error("This row does not have a valid id.");
+            await updateVaultTableRow(vault, table, rowId, values);
+            setRowNotice("Row updated");
+          } else {
+            await insertVaultTableRow(vault, table, values);
+            setRowNotice("Row added");
+          }
+          await refreshTableData();
+          refetchTree();
+        }}
+      />
+      <ConfirmDialog
+        open={rowToDelete !== null}
+        onOpenChange={(open) => !open && setRowToDelete(null)}
+        title="Delete row?"
+        description={`This permanently removes ${rowLabel(rowToDelete)} from ${table}. This action cannot be undone.`}
+        confirmLabel="Delete row"
+        variant="destructive"
+        onConfirm={async () => {
+          if (!vault || !table || typeof rowToDelete?.id !== "string") {
+            throw new Error("This row does not have a valid id.");
+          }
+          await deleteVaultTableRow(vault, table, rowToDelete.id);
+          await refreshTableData();
+          refetchTree();
+          setRowNotice("Row deleted");
+          setRowToDelete(null);
+        }}
+      />
     </ResourceWorkspace>
   );
+}
+
+function RowActionsMenu({
+  rowNumber,
+  onEdit,
+  onDelete,
+}: {
+  rowNumber: number;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  const itemClass =
+    "flex cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-3 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-hover";
+  return (
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="h-8 w-8 text-foreground-muted"
+          aria-label={`Actions for row ${rowNumber}`}
+        >
+          <MoreHorizontal className="h-4 w-4" aria-hidden />
+        </Button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content
+          align="end"
+          sideOffset={6}
+          className="z-[var(--z-popover)] min-w-40 overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
+        >
+          <DropdownMenu.Item onSelect={onEdit} className={itemClass}>
+            <Pencil className="h-4 w-4 text-foreground-muted" aria-hidden />
+            Edit row
+          </DropdownMenu.Item>
+          <DropdownMenu.Separator className="my-1 h-px bg-border" />
+          <DropdownMenu.Item
+            onSelect={onDelete}
+            className={`${itemClass} text-destructive data-[highlighted]:bg-destructive-soft`}
+          >
+            <Trash2 className="h-4 w-4" aria-hidden />
+            Delete row
+          </DropdownMenu.Item>
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  );
+}
+
+function rowLabel(row: Record<string, unknown> | null): string {
+  if (!row) return "this row";
+  const identity = ["title", "name", "label", "id"]
+    .map((key) => row[key])
+    .find((value) => typeof value === "string" && value.trim());
+  if (typeof identity !== "string") return "this row";
+  const compact = identity.length > 48 ? `${identity.slice(0, 48)}…` : identity;
+  return `“${compact}”`;
 }
 
 function SchemaStat({
@@ -583,6 +784,10 @@ function columnTypeIcon(type: string) {
   if (/json|array|map|struct/.test(normalized)) return Braces;
   if (/uuid/.test(normalized)) return Fingerprint;
   return Type;
+}
+
+function isNumericColumnType(type: string | undefined): boolean {
+  return /^(int|float|numeric|number)$/.test((type || "").toLowerCase());
 }
 
 function TablePageLoading() {

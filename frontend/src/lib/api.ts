@@ -1455,6 +1455,9 @@ export interface VaultTableColumnInput {
   type: string;
   required?: boolean;
   unique?: boolean;
+  default?: unknown;
+  enum?: unknown[];
+  primary_key?: boolean;
 }
 
 export interface VaultTableCreateInput {
@@ -1482,6 +1485,27 @@ export interface VaultTableDeleteResult {
   deleted: true;
 }
 
+export interface VaultTableInfo {
+  kind?: "table";
+  uri?: string;
+  vault?: string;
+  collection?: string | null;
+  name: string;
+  description?: string;
+  columns: VaultTableColumnInput[];
+  row_count: number;
+  created_at?: string;
+}
+
+export interface VaultTableQueryResult {
+  kind: "table_query";
+  vault?: string;
+  table?: string;
+  columns: string[];
+  items: Record<string, unknown>[];
+  total: number;
+}
+
 export const createVaultTable = (
   vault: string,
   input: VaultTableCreateInput,
@@ -1494,6 +1518,71 @@ export const createVaultTable = (
       collection: input.collection?.trim() || undefined,
     }),
   });
+
+export const listVaultTables = (vault: string) =>
+  api<{ items: VaultTableInfo[] }>(`/tables/${encodeURIComponent(vault)}`);
+
+export const listVaultTableRows = (
+  vault: string,
+  table: string,
+  { limit = 50, offset = 0 }: { limit?: number; offset?: number } = {},
+) => {
+  const query = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+    order: "created_at.desc",
+  });
+  return api<VaultTableQueryResult>(
+    `/tables/${encodeURIComponent(vault)}/${encodeURIComponent(table)}/rows?${query}`,
+    { headers: { Prefer: "count=exact" } },
+  );
+};
+
+export const insertVaultTableRow = (
+  vault: string,
+  table: string,
+  row: Record<string, unknown>,
+) =>
+  api<VaultTableQueryResult>(
+    `/tables/${encodeURIComponent(vault)}/${encodeURIComponent(table)}/rows?select=*`,
+    {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify(row),
+    },
+  );
+
+export const updateVaultTableRow = (
+  vault: string,
+  table: string,
+  rowId: string,
+  changes: Record<string, unknown>,
+) => {
+  const query = new URLSearchParams({ id: `eq.${rowId}`, select: "*" });
+  return api<VaultTableQueryResult>(
+    `/tables/${encodeURIComponent(vault)}/${encodeURIComponent(table)}/rows?${query}`,
+    {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify(changes),
+    },
+  );
+};
+
+export const deleteVaultTableRow = (
+  vault: string,
+  table: string,
+  rowId: string,
+) => {
+  const query = new URLSearchParams({ id: `eq.${rowId}`, select: "id" });
+  return api<VaultTableQueryResult>(
+    `/tables/${encodeURIComponent(vault)}/${encodeURIComponent(table)}/rows?${query}`,
+    {
+      method: "DELETE",
+      headers: { Prefer: "return=representation" },
+    },
+  );
+};
 
 export const deleteVaultTable = (vault: string, tableName: string) =>
   api<VaultTableDeleteResult>(
