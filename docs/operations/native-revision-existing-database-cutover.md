@@ -10,16 +10,45 @@ It does not perform an online dual write or a reverse migration.
    the cutover command are installed without changing authority.
 2. Take a coherent PostgreSQL and Git-storage recovery point and verify that it
    can be restored into a disposable environment.
-3. Move persisted external-Git sources to Git Collector. The cutover refuses to
-   commit while an `external_git` sidecar remains.
+3. For each persisted external-Git source, have Git Collector write a **read-only
+   v1 adoption manifest while the source is still an AKB `external_git` mirror**.
+   The manifest is credential-free and body-free: it binds the exact Vault,
+   canonical remote/branch, last-synced fixed SHA, and every active mirrored
+   Document's public URI, path, content hash, and normalized managed metadata.
+   Store it as an operator artifact; do not put a token or document body in it.
+   AKB verifies the whole live inventory before it accepts the handoff.
 4. Record the future Native deployment identity fields in `app.yaml`:
    `document_revision_tenant_id`, `document_revision_namespace`,
    `document_revision_database_id`, and the immutable image digest.
 
 ## Downtime sequence
 
-Stop the API and every AKB/collector worker that can write the database, Git
-storage, or File catalogue. Then run, from the same image and configuration:
+Stop the API and every AKB external-Git/collector worker that can write the
+database, Git storage, or File catalogue. For each manifest created above, run
+the one-way sidecar retirement from the same image and configuration:
+
+```console
+python -m app.cli migrate-revision-backend retire-external-git \
+  --vault-id VAULT_UUID \
+  --manifest-file /secure/operator/collector-adoption.json \
+  --idempotency-key RETIREMENT_UUID \
+  --requested-by OPERATOR_ID \
+  --confirm-planned-downtime RETIRE-EXTERNAL-GIT:VAULT_UUID
+```
+
+This command quarantines the old poller before changing the marker, retains the
+Vault, Documents, collections, Files, Git repository, and ACLs, then removes
+only the external-Git sidecar. Its receipt contains only the manifest digest,
+count, remote/branch/fixed ref, idempotency key, and audit identity. An exact
+replay is safe; changing any of those facts is a conflict. A refusal leaves the
+mirror fail-closed for investigation.
+
+After retirement, let Git Collector perform its ordinary authorized full
+adoption/sync against the retained manual Vault, refreshing every retained
+Document, then stop writers again. Do not reuse a pre-retirement cutover plan:
+it keeps the former mirror as an immutable exclusion. Abort that uncommitted
+plan and make a fresh plan only after the Collector adoption/sync has
+completed. Then run:
 
 ```console
 python -m app.cli migrate-revision-backend plan \

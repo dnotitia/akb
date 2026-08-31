@@ -94,6 +94,15 @@ def _managed_repo(repo: Repo) -> Iterator[Repo]:
 # default-deny inspector.
 _MIRROR_MARKER = "akb-external-mirror"
 
+# An operator retirement moves the normal mirror marker through this
+# fail-closed tombstone before the sidecar is deleted.  A process crash cannot
+# then turn an external mirror into an ordinary GitPython-readable vault in the
+# gap between the filesystem and PostgreSQL phases: every read refuses while
+# this marker exists.  It is deliberately a sibling of ``_MIRROR_MARKER`` so
+# the transition stays under the same per-vault lock and storage containment
+# checks.
+_RETIRING_MIRROR_MARKER = "akb-external-mirror-retiring"
+
 # Slack over ``external_git_blob_max_bytes`` for the runner's STREAMING output
 # cap. The per-blob size pre-check already refuses an
 # over-cap blob, so a passed blob's streamed read is at most ``cap`` bytes; this
@@ -439,7 +448,10 @@ class GitService:
         promisor/rewrite config cannot re-open lazy-fetch on a plain public
         READ; returning ``False`` on an ambiguous entry would re-open exactly
         that (fail-open), hence the raise."""
-        return _marker_state(self._bare_path(vault_name) / _MIRROR_MARKER) == "valid"
+        bare = self._bare_path(vault_name)
+        if _marker_state(bare / _RETIRING_MIRROR_MARKER) == "valid":
+            raise MirrorMarkerError("external-git mirror retirement is incomplete")
+        return _marker_state(bare / _MIRROR_MARKER) == "valid"
 
     def _use_mirror_reader(self, vault_name: str) -> bool:
         """Decide how a READ on ``vault_name`` must be served, fail-CLOSED.
@@ -516,6 +528,13 @@ class GitService:
             # resolve-under-root catches a parent-dir symlink that would redirect
             # the marker write out of storage on a restored/tampered layout.
             self._contained(bare)
+            if _marker_state(bare / _RETIRING_MIRROR_MARKER) == "valid":
+                # A retirement tombstone means the operator has intentionally
+                # quiesced this mirror but has not yet committed its durable
+                # sidecar handoff. Re-stamping the normal marker would conceal
+                # that interrupted state; fail closed until the same operator
+                # command resumes it.
+                raise MirrorMarkerError("external-git mirror retirement is incomplete")
             marker = bare / _MIRROR_MARKER
             if _marker_state(marker) == "valid":
                 return False  # already a valid marker — idempotent no-op
@@ -543,6 +562,131 @@ class GitService:
                 os.close(fd)
             logger.info("Backfilled external-git mirror marker for vault %s", vault_name)
             return True
+
+    def _retirement_bare(self, vault_name: str) -> Path:
+        """Return a real, contained bare repo for an offline retirement step."""
+        bare = self._bare_path(vault_name)
+        try:
+            bare_st = os.lstat(bare)
+        except FileNotFoundError as exc:
+            raise MirrorMarkerError("external-git mirror bare repository is missing") from exc
+        except OSError as exc:
+            raise MirrorMarkerError("external-git mirror bare repository is unreadable") from exc
+        if stat.S_ISLNK(bare_st.st_mode) or not stat.S_ISDIR(bare_st.st_mode):
+            raise MirrorMarkerError("external-git mirror bare repository is not a real directory")
+        self._contained(bare)
+        return bare
+
+    def _verify_retirement_ref(self, bare: Path, expected_ref: str) -> None:
+        """Check the locally materialized mirror tip without any network I/O."""
+        if re.fullmatch(r"[0-9a-f]{40}", expected_ref) is None:
+            raise MirrorMarkerError("external-git mirror retirement fixed ref is invalid")
+        try:
+            observed = self._ext_runner.rev_parse(bare, "HEAD")
+        except Exception as exc:  # noqa: BLE001 - surface only a safe operator error
+            raise MirrorMarkerError("external-git mirror retirement fixed ref could not be read") from exc
+        if observed != expected_ref:
+            raise MirrorMarkerError("external-git mirror retirement fixed ref did not match")
+
+    @staticmethod
+    def _write_retirement_marker(marker: Path) -> None:
+        """Create the tombstone no-clobber before unlinking the old marker."""
+        try:
+            fd = os.open(
+                marker,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                0o644,
+            )
+        except FileExistsError:
+            # The caller re-classifies the entry below; never overwrite a
+            # concurrent/foreign marker.
+            return
+        try:
+            os.write(fd, b"akb external-git mirror retirement in progress\n")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _fsync_retirement_directory(bare: Path) -> None:
+        """Durably publish a marker create or unlink in the bare directory."""
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(bare, flags)
+        except OSError as exc:
+            raise MirrorMarkerError("external-git mirror retirement directory cannot be synced") from exc
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            raise MirrorMarkerError("external-git mirror retirement directory cannot be synced") from exc
+        finally:
+            os.close(fd)
+
+    def quarantine_external_mirror_marker(self, vault_name: str, *, expected_ref: str) -> None:
+        """Replace a mirror marker with a fail-closed retirement tombstone.
+
+        This is the filesystem half of the external-Git retirement protocol.
+        It is intentionally recoverable: a crash after the tombstone is created
+        but before the old marker is unlinked leaves *both* regular files, which
+        is still fail-closed and is completed on the next exact replay.  A crash
+        after unlink leaves only the tombstone, also fail-closed.  The caller
+        must persist the sidecar quarantine intent before invoking this method.
+        """
+        with self._vault_write_lock(vault_name):
+            bare = self._retirement_bare(vault_name)
+            marker = bare / _MIRROR_MARKER
+            tombstone = bare / _RETIRING_MIRROR_MARKER
+            marker_state = _marker_state(marker)
+            tombstone_state = _marker_state(tombstone)
+            if marker_state == "absent" and tombstone_state == "absent":
+                raise MirrorMarkerError("external-git mirror retirement marker is missing")
+            self._verify_retirement_ref(bare, expected_ref)
+            if tombstone_state == "absent":
+                if marker_state != "valid":
+                    raise MirrorMarkerError("external-git mirror retirement marker is invalid")
+                self._write_retirement_marker(tombstone)
+                tombstone_state = _marker_state(tombstone)
+                if tombstone_state != "valid":
+                    raise MirrorMarkerError("external-git mirror retirement tombstone was not created")
+                self._fsync_retirement_directory(bare)
+            if marker_state == "valid":
+                try:
+                    os.unlink(marker)
+                except OSError as exc:
+                    raise MirrorMarkerError("external-git mirror marker could not be removed") from exc
+                self._fsync_retirement_directory(bare)
+            if _marker_state(marker) != "absent" or _marker_state(tombstone) != "valid":
+                raise MirrorMarkerError("external-git mirror retirement marker readback failed")
+
+    def finalize_external_mirror_retirement(self, vault_name: str, *, expected_ref: str) -> None:
+        """Remove a completed retirement tombstone after the DB receipt commits.
+
+        An interrupted final cleanup leaves the tombstone in place and therefore
+        rejects every read.  Exact replay performs this small, idempotent final
+        step; no caller is allowed to turn a still-quarantined mirror writable.
+        """
+        with self._vault_write_lock(vault_name):
+            bare = self._retirement_bare(vault_name)
+            marker = bare / _MIRROR_MARKER
+            tombstone = bare / _RETIRING_MIRROR_MARKER
+            marker_state = _marker_state(marker)
+            tombstone_state = _marker_state(tombstone)
+            if marker_state != "absent":
+                raise MirrorMarkerError("external-git mirror retirement marker is still present")
+            if tombstone_state == "valid":
+                # The fixed ref is load-bearing only while the tombstone still
+                # blocks the handoff. Once both markers are absent the vault is
+                # a normal writable vault and an exact receipt replay must not
+                # reject an ordinary post-retirement commit.
+                self._verify_retirement_ref(bare, expected_ref)
+                try:
+                    os.unlink(tombstone)
+                except OSError as exc:
+                    raise MirrorMarkerError("external-git mirror retirement tombstone could not be removed") from exc
+                self._fsync_retirement_directory(bare)
+            if _marker_state(marker) != "absent" or _marker_state(tombstone) != "absent":
+                raise MirrorMarkerError("external-git mirror retirement final readback failed")
 
     @staticmethod
     def _git_author_env(author_name: str, author_email: str) -> dict[str, str]:

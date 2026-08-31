@@ -76,7 +76,9 @@ STANDALONE_SSO_BOOTSTRAP_USAGE = (
 
 MIGRATE_REVISION_BACKEND_USAGE = (
     "Usage: python -m app.cli migrate-revision-backend "
-    "{plan --coverage-version VERSION|apply|verify|commit|abort --cutover-id UUID}"
+    "{plan --coverage-version VERSION|apply|verify|commit|abort --cutover-id UUID|"
+    "retire-external-git --vault-id UUID --manifest-file PATH --idempotency-key UUID "
+    "--requested-by ID --confirm-planned-downtime RETIRE-EXTERNAL-GIT:UUID}"
 )
 
 
@@ -650,7 +652,67 @@ def _native_revision_cutover_parser() -> argparse.ArgumentParser:
     for phase in ("apply", "verify", "commit", "abort"):
         command = phases.add_parser(phase, add_help=False)
         command.add_argument("--cutover-id", required=True)
+    retire = phases.add_parser("retire-external-git", add_help=False)
+    retire.add_argument("--vault-id", required=True)
+    retire.add_argument("--manifest-file", required=True)
+    retire.add_argument("--idempotency-key", required=True)
+    retire.add_argument("--requested-by", required=True)
+    retire.add_argument("--confirm-planned-downtime", required=True)
     return parser
+
+
+def _require_external_git_retirement_confirmation(vault_id: str, confirmation: str) -> uuid.UUID:
+    """Require the operator's exact, vault-bound planned-downtime acknowledgement."""
+    try:
+        parsed_vault_id = uuid.UUID(vault_id)
+    except (TypeError, ValueError):
+        raise ValueError("external Git retirement vault id is invalid") from None
+    expected = f"RETIRE-EXTERNAL-GIT:{parsed_vault_id}"
+    if confirmation != expected:
+        raise ValueError("external Git retirement requires the exact planned-downtime confirmation")
+    return parsed_vault_id
+
+
+async def _execute_external_git_retirement(
+    *,
+    vault_id: str,
+    manifest_file: str,
+    idempotency_key: str,
+    requested_by: str,
+    planned_downtime_confirmation: str,
+) -> dict[str, object]:
+    """Run the offline, one-vault external-Git retirement command."""
+    from app.db.postgres import close_pool, get_pool, init_db
+    from app.services.external_git_retirement import (
+        ExternalGitRetirement,
+        ExternalGitRetirementError,
+        load_adoption_manifest,
+    )
+
+    try:
+        parsed_vault_id = _require_external_git_retirement_confirmation(
+            vault_id,
+            planned_downtime_confirmation,
+        )
+        try:
+            parsed_idempotency_key = uuid.UUID(idempotency_key)
+        except (TypeError, ValueError):
+            raise ValueError("external Git retirement idempotency key is invalid") from None
+        manifest = load_adoption_manifest(Path(manifest_file))
+        if manifest.vault_id != parsed_vault_id:
+            raise ExternalGitRetirementError("external Git retirement vault id does not match the manifest")
+        await init_db()
+        pool = await get_pool()
+        result = await ExternalGitRetirement(pool).retire(
+            manifest=manifest,
+            idempotency_key=parsed_idempotency_key,
+            requested_by=requested_by,
+        )
+        if not is_dataclass(result):
+            raise RuntimeError("external Git retirement returned an invalid operator receipt")
+        return json.loads(json.dumps(asdict(result), default=str))
+    finally:
+        await close_pool()
 
 
 async def _execute_native_revision_cutover(
@@ -728,13 +790,31 @@ async def _migrate_revision_backend(args: list[str]) -> int:
         return 2
 
     try:
-        report = await _execute_native_revision_cutover(
-            parsed.phase,
-            coverage_version=getattr(parsed, "coverage_version", None),
-            cutover_id=getattr(parsed, "cutover_id", None),
-        )
+        if parsed.phase == "retire-external-git":
+            _require_external_git_retirement_confirmation(
+                parsed.vault_id,
+                parsed.confirm_planned_downtime,
+            )
+            report = await _execute_external_git_retirement(
+                vault_id=parsed.vault_id,
+                manifest_file=parsed.manifest_file,
+                idempotency_key=parsed.idempotency_key,
+                requested_by=parsed.requested_by,
+                planned_downtime_confirmation=parsed.confirm_planned_downtime,
+            )
+        else:
+            report = await _execute_native_revision_cutover(
+                parsed.phase,
+                coverage_version=getattr(parsed, "coverage_version", None),
+                cutover_id=getattr(parsed, "cutover_id", None),
+            )
     except (ValueError, RuntimeError) as exc:
-        print(f"revision_backend_cutover_failed: {exc}", file=sys.stderr)
+        prefix = (
+            "revision_backend_retirement_failed"
+            if parsed.phase == "retire-external-git"
+            else "revision_backend_cutover_failed"
+        )
+        print(f"{prefix}: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(report, sort_keys=True))
     return 0

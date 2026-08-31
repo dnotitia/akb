@@ -315,6 +315,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "090_native_revision_vault_purge_fence.py",  # allow an authorized exact-vault lifecycle purge after cutover authority commits
         "091_native_revision_committed_receipt_guard.py",  # freeze a committed cutover's durable authority receipt set
         "092_native_revision_plan_supersession.py",  # release never-applied aborted-plan reservations for a fresh coverage version
+        "093_external_git_retirement.py",  # durable offline retirement receipt for a Collector-adopted external Git mirror
     ):
         if filename in applied:
             continue

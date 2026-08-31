@@ -33,7 +33,7 @@ _MIGRATION_085 = (
     _BACKEND / "app" / "db" / "migrations" / "085_vault_access_contributions.py"
 )
 _MIGRATION_HEAD = (
-    _BACKEND / "app" / "db" / "migrations" / "092_native_revision_plan_supersession.py"
+    _BACKEND / "app" / "db" / "migrations" / "093_external_git_retirement.py"
 )
 _MIGRATIONS_DIR = _BACKEND / "app" / "db" / "migrations"
 
