@@ -422,13 +422,88 @@ def test_ensure_local_bare_reclones_untrusted_stale_dir(git_http, tmp_path):
     (stale / "garbage").write_text("not a git repo")
     assert git.vault_exists(name)  # path present → old code would SKIP clone
 
-    action, sha = svc.ensure_local_bare(name, None, head, url, "main", None)
+    action, sha = svc.ensure_local_bare(
+        name,
+        None,
+        head,
+        url,
+        "main",
+        None,
+        allow_unmarked_never_synced=True,
+    )
 
     assert action == "cloned"
     assert sha == head
     # Stale garbage gone, replaced by a valid clone at the upstream head.
     assert not (git._bare_path(name) / "garbage").exists()
     assert "doc.md" in git.ls_tree(name, sha)
+
+
+def test_never_synced_reclone_holds_exact_active_sidecar_authority(
+    git_service, monkeypatch,
+):
+    """The exceptional unmarked cleanup runs while retirement is DB-blocked."""
+    import asyncio
+
+    state = {"transaction_open": False, "ensure_calls": 0}
+
+    class _Transaction:
+        async def __aenter__(self):
+            state["transaction_open"] = True
+
+        async def __aexit__(self, *_args):
+            state["transaction_open"] = False
+
+    class _Connection:
+        def transaction(self):
+            return _Transaction()
+
+        async def fetchval(self, query, *args):
+            assert "FOR SHARE" in query
+            assert args[0] == vault_id
+            return 1
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Connection()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    vault_id = uuid.uuid4()
+    vault_name = f"never-synced-{uuid.uuid4().hex[:8]}"
+    git_service._bare_path(vault_name).mkdir()
+    service = ExternalGitService(git=git_service)
+
+    def _ensure(*args, **kwargs):
+        assert state["transaction_open"] is True
+        assert kwargs == {"allow_unmarked_never_synced": True}
+        state["ensure_calls"] += 1
+        return ("cloned", "a" * 40)
+
+    monkeypatch.setattr(service, "ensure_local_bare", _ensure)
+    cfg = {
+        "last_synced_sha": None,
+        "remote_url": "https://example.invalid/repo.git",
+        "remote_branch": "main",
+        "auth_token": None,
+    }
+    result = asyncio.run(
+        service._ensure_local_bare_for_reconcile(
+            _Pool(),
+            vault_id=vault_id,
+            vault_name=vault_name,
+            cfg=cfg,
+            new_sha="a" * 40,
+        )
+    )
+
+    assert result == ("cloned", "a" * 40)
+    assert state == {"transaction_open": False, "ensure_calls": 1}
 
 
 def test_ensure_local_bare_unchanged_when_synced_and_sha_matches(git_http, tmp_path):
@@ -572,6 +647,35 @@ def test_stale_reclone_cannot_replace_a_completed_retired_mirror(
     assert git.current_commit(vault_name) == head1
     assert git.read_file(vault_name, "doc.md") == "one\n"
     assert [item.hexsha for item in Repo(str(bare)).iter_commits()] == [head1]
+    assert not (bare / "akb-external-mirror").exists()
+    assert not (bare / "akb-external-mirror-retiring").exists()
+
+
+def test_stale_first_sync_snapshot_cannot_replace_a_completed_retired_mirror(
+    git_http, tmp_path, monkeypatch,
+):
+    """A stale ``last_synced_sha=None`` snapshot is not publication authority."""
+    from app.exceptions import MirrorMarkerError
+
+    git = _mirror_git(git_http, tmp_path)
+    service = ExternalGitService(git=git)
+    url, head = git_http.add_repo("retired-first-sync", {"doc.md": "one\n"})
+    vault_name = f"retired-first-sync-{uuid.uuid4().hex[:8]}"
+    service.ensure_local_bare(vault_name, None, head, url, "main", None)
+    git.quarantine_external_mirror_marker(vault_name, expected_ref=head)
+    git.finalize_external_mirror_retirement(vault_name, expected_ref=head)
+    monkeypatch.setattr(
+        git,
+        "inspect_mirror_structure",
+        lambda *args, **kwargs: ["disallowed-config"],
+    )
+
+    with pytest.raises(MirrorMarkerError, match="external-git mirror is no longer active"):
+        service.ensure_local_bare(vault_name, None, head, url, "main", None)
+
+    bare = _mirror_bare(tmp_path, vault_name)
+    assert git.current_commit(vault_name) == head
+    assert git.read_file(vault_name, "doc.md") == "one\n"
     assert not (bare / "akb-external-mirror").exists()
     assert not (bare / "akb-external-mirror-retiring").exists()
 

@@ -126,6 +126,8 @@ class ExternalGitService:
         remote_url: str,
         branch: str,
         auth_token: str | None,
+        *,
+        allow_unmarked_never_synced: bool = False,
     ) -> tuple[str, str]:
         """Make the local bare repo present and trustworthy before reconcile
         reads blobs from it. Returns `(action, materialized_sha)` where action
@@ -193,7 +195,7 @@ class ExternalGitService:
                 remote_url,
                 branch,
                 auth_token,
-                allow_unmarked_never_synced=last_synced_sha is None,
+                allow_unmarked_never_synced=allow_unmarked_never_synced,
             )
             # Loop-breaker: a FRESH, sterilely re-cloned bare must be
             # structurally clean. If it STILL trips the structure inspector, the
@@ -225,6 +227,64 @@ class ExternalGitService:
             return ("unchanged", local_sha)
         sha = self.git.fetch_remote(vault_name, remote_url, branch, auth_token)
         return ("fetched", sha)
+
+    async def _ensure_local_bare_for_reconcile(
+        self,
+        pool,
+        *,
+        vault_id: uuid.UUID,
+        vault_name: str,
+        cfg: dict,
+        new_sha: str,
+    ) -> tuple[str, str]:
+        """Run the one exceptional unmarked re-clone under live DB authority.
+
+        An unmarked existing directory is eligible for self-healing only before
+        the mirror's first successful sync. Hold ``FOR SHARE`` on the exact
+        active sidecar while the staged re-clone publishes, so retirement
+        (which needs ``FOR UPDATE`` on that row) either waits for publication or
+        completes first and makes this stale worker refuse. Normal marked paths
+        keep the existing filesystem-only fast path.
+        """
+        values = (
+            vault_name,
+            cfg["last_synced_sha"],
+            new_sha,
+            cfg["remote_url"],
+            cfg["remote_branch"],
+            cfg["auth_token"],
+        )
+        if cfg["last_synced_sha"] is not None or not self.git.vault_exists(vault_name):
+            return await asyncio.to_thread(self.ensure_local_bare, *values)
+
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                active = await conn.fetchval(
+                    """
+                    SELECT 1
+                      FROM vault_external_git
+                     WHERE vault_id = $1
+                       AND sync_state = 'active'
+                       AND last_synced_sha IS NULL
+                       AND remote_url = $2
+                       AND remote_branch = $3
+                       AND auth_token IS NOT DISTINCT FROM $4
+                     FOR SHARE
+                    """,
+                    vault_id,
+                    cfg["remote_url"],
+                    cfg["remote_branch"],
+                    cfg["auth_token"],
+                )
+                if not active:
+                    raise MirrorMarkerError(
+                        "external-git first-sync publication is no longer active"
+                    )
+                return await asyncio.to_thread(
+                    self.ensure_local_bare,
+                    *values,
+                    allow_unmarked_never_synced=True,
+                )
 
     # ── Reconcile (called by poller) ─────────────────────────
 
@@ -264,14 +324,12 @@ class ExternalGitService:
         # authoritative materialized SHA (local ref), which we use from here on
         # so a force-push between ls-remote and fetch can't desync the tree
         # from the cursor. 'unchanged' short-circuits the rest.
-        action, materialized_sha = await asyncio.to_thread(
-            self.ensure_local_bare,
-            vault_name,
-            cfg["last_synced_sha"],
-            new_sha,
-            cfg["remote_url"],
-            cfg["remote_branch"],
-            cfg["auth_token"],
+        action, materialized_sha = await self._ensure_local_bare_for_reconcile(
+            pool,
+            vault_id=vault_id,
+            vault_name=vault_name,
+            cfg=cfg,
+            new_sha=new_sha,
         )
         if action == "unchanged":
             marked = await ext_repo.mark_success(
