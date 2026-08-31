@@ -33,8 +33,15 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { ResourceActionsMenu } from "@/components/resource-actions-menu";
 import { ResourceDeleteDialog } from "@/components/resource-delete-dialog";
+import { PublicationSuccessBanner } from "@/components/publication-success-banner";
+import { TablePublishDialog } from "@/components/table-publish-dialog";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
-import { authenticatedFetch, deleteVaultTable, getVaultInfo } from "@/lib/api";
+import {
+  authenticatedFetch,
+  deleteVaultTable,
+  getVaultInfo,
+  type Publication,
+} from "@/lib/api";
 import { ROLE_RANK, type Role } from "@/lib/roles";
 import { cn } from "@/lib/utils";
 
@@ -64,8 +71,11 @@ export default function TablePage() {
   const [loading, setLoading] = useState(true);
   const [infoLoading, setInfoLoading] = useState(true);
   const [schemaOpen, setSchemaOpen] = useState(false);
+  const [canPublish, setCanPublish] = useState(false);
   const [canDelete, setCanDelete] = useState(false);
+  const [publishOpen, setPublishOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [published, setPublished] = useState<Publication | null>(null);
   const schemaToggleRef = useRef<HTMLButtonElement | null>(null);
   const schemaCloseRef = useRef<HTMLButtonElement | null>(null);
   const limit = 50;
@@ -73,20 +83,22 @@ export default function TablePage() {
   useEffect(() => {
     if (!vault) return;
     let cancelled = false;
+    setCanPublish(false);
     setCanDelete(false);
     getVaultInfo(vault)
       .then((data) => {
         const roleRank = ROLE_RANK[data?.role as Role] ?? 0;
+        const writable = !data?.is_archived && !data?.is_external_git;
         if (!cancelled) {
-          setCanDelete(
-            roleRank >= ROLE_RANK.admin &&
-              !data?.is_archived &&
-              !data?.is_external_git,
-          );
+          setCanPublish(roleRank >= ROLE_RANK.writer && writable);
+          setCanDelete(roleRank >= ROLE_RANK.admin && writable);
         }
       })
       .catch(() => {
-        if (!cancelled) setCanDelete(false);
+        if (!cancelled) {
+          setCanPublish(false);
+          setCanDelete(false);
+        }
       });
     return () => {
       cancelled = true;
@@ -223,16 +235,27 @@ export default function TablePage() {
               )}
               <span className="hidden sm:inline">Schema</span>
             </Button>
-            {canDelete && (
+            {(canPublish || canDelete) && (
               <ResourceActionsMenu
                 resourceName={table || "Table"}
-                deleteLabel="Delete table"
-                onDelete={() => setDeleteOpen(true)}
+                publishLabel={canPublish && info?.columns?.length ? "Publish table" : undefined}
+                onPublish={canPublish && info?.columns?.length ? () => setPublishOpen(true) : undefined}
+                deleteLabel={canDelete ? "Delete table" : undefined}
+                onDelete={canDelete ? () => setDeleteOpen(true) : undefined}
               />
             )}
           </>
         }
       />
+
+      {published && (
+        <PublicationSuccessBanner
+          vault={vault!}
+          publication={published}
+          resourceLabel="Table"
+          onDismiss={() => setPublished(null)}
+        />
+      )}
 
       <div className="relative min-h-0 flex-1 overflow-hidden">
         <ResourceCanvas>
@@ -466,6 +489,14 @@ export default function TablePage() {
           refetchTree();
           navigate(`/vault/${vault}`);
         }}
+      />
+      <TablePublishDialog
+        open={publishOpen}
+        onOpenChange={setPublishOpen}
+        vault={vault!}
+        table={table!}
+        columns={info?.columns || []}
+        onPublished={setPublished}
       />
     </ResourceWorkspace>
   );
