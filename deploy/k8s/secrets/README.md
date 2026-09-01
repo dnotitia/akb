@@ -86,6 +86,15 @@ an existing endpoint and does not add another workload. The two
 `*-secret-manager` profiles require `SECRET_MODE=bundled`, which they select by
 default.
 
+These are routing profiles, not four copied deployment trees. `standalone` and
+`standalone-secret-manager` apply the existing `deploy/k8s` base;
+`standalone-sso` and `standalone-sso-secret-manager` apply the existing
+`deploy/k8s/standalone-sso` Kustomize overlay. A `*-secret-manager` profile
+first prepares the bundled Secret Manager and VSO Secret contract, then applies
+the corresponding existing AKB tree. `deploy/all-in-one` remains the separate
+single-container demo image and does not bundle this production Secret Manager
+lifecycle.
+
 ### Manual Secret ownership
 
 The default is backward-compatible operator ownership. Existing installations
@@ -323,12 +332,16 @@ SECRET_ROOT_TOKEN_PGP_KEY=/secure/bootstrap-admin.asc \
 bash deploy/k8s/deploy.sh
 ```
 
-`-pgp-keys` encrypts each generated Unseal Share to the corresponding public
-key in input order. It does not encrypt the root token; that requires the
-separate `-root-token-pgp-key` option. The installer prints only encrypted
-values, then enters `AwaitingKeyHolderUnseal`. Each threshold holder decrypts
-their own share on their secure workstation and submits it through the native
-hidden `operator unseal` prompt. The installer never receives private keys.
+`SECRET_PGP_KEYS`, `SECRET_ROOT_TOKEN_PGP_KEY`, a valid share count, and a valid
+threshold are mandatory installation inputs. The top-level deployer validates
+them before building images, creating a namespace, or installing a Helm chart.
+`-pgp-keys` then encrypts each generated Unseal Share to the corresponding
+public key in input order. It does not encrypt the root token; that requires the
+separate `-root-token-pgp-key` option. Only after native initialization has
+produced those encrypted values does the installer enter
+`AwaitingKeyHolderUnseal`. Each threshold holder decrypts their own share on
+their secure workstation and submits it through the native hidden
+`operator unseal` prompt. The installer never receives private keys.
 
 Each holder can decode their assigned output on their own workstation; the
 result is the plaintext share accepted by the hidden prompt:

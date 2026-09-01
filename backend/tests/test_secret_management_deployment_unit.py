@@ -264,6 +264,13 @@ def test_deploy_scripts_are_context_scoped_idempotent_and_fail_closed():
     assert "standalone-sso-secret-manager" in deploy
     assert 'SECRET_SEAL_MODE="${SECRET_SEAL_MODE:-plaintext}"' in deploy
     assert 'SECRET_TOPOLOGY="${SECRET_TOPOLOGY:-production-ha}"' in deploy
+    assert (
+        "PGP mode requires SECRET_PGP_KEYS and SECRET_ROOT_TOKEN_PGP_KEY "
+        "before deployment"
+    ) in deploy
+    assert deploy.index("PGP mode requires SECRET_PGP_KEYS") < deploy.index(
+        'if [[ "${SKIP_BUILD}" == "true" ]]'
+    )
     assert "initialize-production-bundled.sh" in secret_deploy
     assert "rerun in external mode" not in secret_deploy
     assert 'server.ha.replicas=${SECRET_STORE_REPLICAS}' in secret_deploy
@@ -296,6 +303,29 @@ def test_deploy_scripts_are_context_scoped_idempotent_and_fail_closed():
     production_block, development_block = chart_install.split('ROOT_TOKEN=""', maxsplit=1)
     assert "--wait --timeout 5m" not in production_block
     assert "--wait --timeout 5m" in development_block
+
+
+def test_pgp_profile_rejects_missing_custody_inputs_before_deployment_action():
+    result = subprocess.run(
+        ["bash", str(_K8S / "deploy.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "AKB_PROFILE": "standalone-secret-manager",
+            "SECRET_PROFILE": "production",  # pragma: allowlist secret
+            "SECRET_SEAL_MODE": "pgp",  # pragma: allowlist secret
+        },
+    )
+    assert result.returncode == 2
+    assert (
+        "PGP mode requires SECRET_PGP_KEYS and SECRET_ROOT_TOKEN_PGP_KEY "
+        "before deployment"
+    ) in result.stderr
+    assert "Building Docker images" not in result.stdout
+    assert "Creating namespace" not in result.stdout
 
 
 def test_cert_manager_adapter_covers_service_and_all_ha_member_dns_names():
