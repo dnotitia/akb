@@ -73,6 +73,8 @@ def test_backend_and_postgres_share_platform_compatible_akb_secret_contract():
 
 def test_vso_adapter_projects_only_contract_keys_and_has_bounded_rollout():
     path = _SECRETS / "vso-vault-compatible.yaml"
+    operator = _one(path, kind="ServiceAccount", name="akb-secret-admin")
+    assert operator["automountServiceAccountToken"] is False
     runtime = _one(path, kind="VaultStaticSecret", name="akb-runtime")
     assert runtime["spec"]["type"] == "kv-v2"
     assert runtime["spec"]["hmacSecretData"] is True
@@ -148,11 +150,14 @@ def test_bundled_profiles_separate_ephemeral_development_from_ha_production(engi
     assert production["server"]["ha"]["enabled"] is True
     assert production["server"]["ha"]["replicas"] == 3
     assert production["server"]["ha"]["raft"]["enabled"] is True
+    assert production["server"]["podManagementPolicy"] == "Parallel"
     assert production["server"]["persistentVolumeClaimRetentionPolicy"] == {
         "whenDeleted": "Retain",
         "whenScaled": "Retain",
     }
     assert "tls_disable = 0" in production["server"]["ha"]["raft"]["config"]
+    assert "retry_join" in production["server"]["ha"]["raft"]["config"]
+    assert 'leader_api_addr = "RAFT_ADDR"' in production["server"]["ha"]["raft"]["config"]
 
 
 def test_material_generator_matches_contract_without_legacy_jwt_in_secret_yaml():
@@ -231,6 +236,10 @@ def test_sso_material_is_independent_and_projects_complete_standalone_contract()
 def test_deploy_scripts_are_context_scoped_idempotent_and_fail_closed():
     deploy = (_K8S / "deploy.sh").read_text(encoding="utf-8")
     secret_deploy = (_SECRETS / "deploy.sh").read_text(encoding="utf-8")
+    production_init = (_SECRETS / "initialize-production-bundled.sh").read_text(
+        encoding="utf-8"
+    )
+    bootstrap = (_SECRETS / "bootstrap-bundled.sh").read_text(encoding="utf-8")
 
     assert 'KUBECTL+=(--context "${KUBE_CONTEXT}")' in deploy
     assert 'HELM+=(--kube-context "${KUBE_CONTEXT}")' in secret_deploy
@@ -252,11 +261,63 @@ def test_deploy_scripts_are_context_scoped_idempotent_and_fail_closed():
     assert 'rollout status statefulset/keycloak' in deploy
     assert 'SECRET_STORE_RELEASE="akb-sm-${NAMESPACE_DIGEST}"' in secret_deploy  # pragma: allowlist secret
     assert 'SECRET_STORE_POD="${STATEFULSET}-0"' in secret_deploy
+    assert "standalone-sso-secret-manager" in deploy
+    assert 'SECRET_SEAL_MODE="${SECRET_SEAL_MODE:-plaintext}"' in deploy
+    assert 'SECRET_TOPOLOGY="${SECRET_TOPOLOGY:-production-ha}"' in deploy
+    assert "initialize-production-bundled.sh" in secret_deploy
+    assert "rerun in external mode" not in secret_deploy
+    assert 'server.ha.replicas=${SECRET_STORE_REPLICAS}' in secret_deploy
+    assert "operator init -format=json" in production_init
+    assert '-pgp-keys="${remote_pgp_keys}"' in production_init
+    assert '-root-token-pgp-key="${remote_root_key}"' in production_init
+    assert '-recovery-pgp-keys="${remote_recovery_keys}"' in production_init
+    assert "AwaitingKeyHolderUnseal" in production_init
+    assert 'write -format=json sys/unseal key=-' in production_init
+    assert "(.data.sealed == false) or (.sealed == false)" in production_init
+    assert 'operator unseal -format=json "${key}"' not in production_init
+    assert "Recovery Kit" not in production_init
+    assert "Recovery Code" not in production_init
+    assert "BEGIN PGP PUBLIC KEY BLOCK" in production_init
+    assert 'tee "${PGP_REMOTE_DIR}/${remote_name}"' in production_init
+    assert "akb-secret-admin" in production_init
+    assert "operator-service-account" in production_init
+    assert "SECRET_STORE_CERT_ISSUER_NAME" in secret_deploy
+    assert "certificate.yaml" in secret_deploy
+    assert "SECRET_STORE_SEAL_CONFIG_SECRET" in secret_deploy
+    assert "server.extraVolumes[0].type=secret" in secret_deploy
+    assert "server.extraArgs=-config=" in secret_deploy
+    assert 'path "auth/token/renew-self"' in bootstrap
+    assert 'role/${OPERATOR_ROLE}' in bootstrap
+    assert "token_no_default_policy=true" in bootstrap
+    assert '"${TOKEN_ENV}=${ROOT_TOKEN}"' not in bootstrap
+    assert "IFS= read -r bootstrap_token" in bootstrap
 
     chart_install = secret_deploy.split("HELM_ARGS=(", maxsplit=1)[1]
     production_block, development_block = chart_install.split('ROOT_TOKEN=""', maxsplit=1)
     assert "--wait --timeout 5m" not in production_block
     assert "--wait --timeout 5m" in development_block
+
+
+def test_cert_manager_adapter_covers_service_and_all_ha_member_dns_names():
+    template = (_SECRETS / "certificate.yaml").read_text(encoding="utf-8")
+    rendered = (
+        template.replace("__CERT_ISSUER_KIND__", "Issuer")
+        .replace("__CERT_ISSUER_NAME__", "test-ca")
+        .replace("__SERVICE__", "akb-sm-openbao")
+        .replace("__STATEFULSET__", "akb-sm-openbao")
+        .replace("__NAMESPACE__", "akb-rehearsal")
+        .replace("__CLUSTER_DOMAIN__", "cluster.local")
+    )
+    certificate = yaml.safe_load(rendered)
+    assert certificate["spec"]["secretName"] == "akb-secret-store-tls"  # pragma: allowlist secret
+    assert certificate["spec"]["issuerRef"] == {"kind": "Issuer", "name": "test-ca"}
+    dns_names = set(certificate["spec"]["dnsNames"])
+    assert "akb-sm-openbao.akb-rehearsal.svc" in dns_names
+    for index in range(3):
+        assert (
+            f"akb-sm-openbao-{index}.akb-sm-openbao-internal."
+            "akb-rehearsal.svc.cluster.local"
+        ) in dns_names
 
 
 def test_kustomize_and_pinned_helm_profiles_render_when_tools_are_available():
@@ -302,3 +363,60 @@ def test_kustomize_and_pinned_helm_profiles_render_when_tools_are_available():
             text=True,
             timeout=60,
         )
+
+        production = subprocess.run(
+            [
+                helm,
+                "template",
+                "akb-secret-store",
+                chart,
+                "--repo",
+                repository,
+                "--version",
+                version,
+                "--namespace",
+                "akb-secret-test",
+                "--values",
+                str(_SECRETS / "values" / f"{engine}-production.yaml"),
+                "--set-string",
+                "server.extraEnvironmentVars.RAFT_ADDR=https://akb-secret-store-0.internal:8200",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        ).stdout
+        assert "retry_join" in production
+        assert 'leader_api_addr = "RAFT_ADDR"' in production
+        assert "https://akb-secret-store-0.internal:8200" in production
+        assert "kind: PodDisruptionBudget" in production
+
+        home = "/openbao" if engine == "openbao" else "/vault"
+        auto_seal = subprocess.run(
+            [
+                helm,
+                "template",
+                "akb-secret-store",
+                chart,
+                "--repo",
+                repository,
+                "--version",
+                version,
+                "--namespace",
+                "akb-secret-test",
+                "--values",
+                str(_SECRETS / "values" / f"{engine}-production.yaml"),
+                "--set",
+                "server.extraVolumes[0].type=secret",
+                "--set",
+                "server.extraVolumes[0].name=akb-secret-store-seal",
+                "--set-string",
+                f"server.extraArgs=-config={home}/userconfig/akb-secret-store-seal/seal.hcl",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        ).stdout
+        assert "secretName: akb-secret-store-seal" in auto_seal
+        assert f"-config={home}/userconfig/akb-secret-store-seal/seal.hcl" in auto_seal

@@ -16,11 +16,19 @@
 #                 a single atomic apply — no placeholder window.
 #   PUBLIC_URL    Printed at the end. Cosmetic only — the actual host
 #                 lives in ingress.yaml (or its overlay patch).
-#   SECRET_MODE   manual (default), bundled, or external.
-#   SECRET_ENGINE openbao or hashicorp-vault for bundled/external modes.
+#   AKB_PROFILE    standalone (default), standalone-sso,
+#                  standalone-secret-manager, or
+#                  standalone-sso-secret-manager. This is the public profile;
+#                  AUTH_PROFILE and SECRET_MODE remain compatibility inputs.
+#   SECRET_MODE    manual (default), bundled, or external. Bundled is selected
+#                  by the *-secret-manager profiles; external is an adapter
+#                  override for standalone / standalone-sso.
+#   SECRET_ENGINE  openbao or hashicorp-vault for bundled/external modes.
 #   SECRET_PROFILE development (default) or production for bundled mode.
-#   AUTH_PROFILE   local (default) or sso. The sso profile defaults to the
-#                  standalone-sso Kustomize tree and requires the SSO_* inputs.
+#   SECRET_SEAL_MODE plaintext (default), pgp, or auto for production bundles.
+#   SECRET_TOPOLOGY onprem-small (one Raft member) or production-ha (three).
+#   SECRET_STORE_CERT_ISSUER_NAME Optional existing cert-manager CA issuer;
+#                  otherwise provision akb-secret-store-tls out-of-band.
 #   STORAGE_CLASS StorageClass for AKB/PostgreSQL and bundled-manager PVCs.
 #
 # See deploy/k8s/README.md for the operator-overlay pattern.
@@ -30,9 +38,72 @@ set -euo pipefail
 NAMESPACE="${NAMESPACE:-akb}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-}"
 SKIP_BUILD="${SKIP_BUILD:-false}"
-SECRET_MODE="${SECRET_MODE:-manual}"
 SECRET_PROFILE="${SECRET_PROFILE:-development}"
-AUTH_PROFILE="${AUTH_PROFILE:-local}"
+AKB_PROFILE="${AKB_PROFILE:-}"
+
+# Keep the original AUTH_PROFILE/SECRET_MODE inputs as a compatibility layer,
+# but expose only four coherent top-level installation profiles going forward.
+# External Secret Managers are an ownership adapter, not another workload
+# profile, so standalone and standalone-sso may override manual with external.
+if [[ -z "${AKB_PROFILE}" ]]; then
+  AUTH_PROFILE="${AUTH_PROFILE:-local}"
+  SECRET_MODE="${SECRET_MODE:-manual}"
+  if [[ "${AUTH_PROFILE}" == "sso" && "${SECRET_MODE}" == "bundled" ]]; then
+    AKB_PROFILE="standalone-sso-secret-manager"
+  elif [[ "${AUTH_PROFILE}" == "sso" ]]; then
+    AKB_PROFILE="standalone-sso"
+  elif [[ "${SECRET_MODE}" == "bundled" ]]; then
+    AKB_PROFILE="standalone-secret-manager"
+  else
+    AKB_PROFILE="standalone"
+  fi
+else
+  case "${AKB_PROFILE}" in
+    standalone)
+      PROFILE_AUTH="local"
+      PROFILE_SECRET="manual" # pragma: allowlist secret
+      ;;
+    standalone-sso)
+      PROFILE_AUTH="sso"
+      PROFILE_SECRET="manual" # pragma: allowlist secret
+      ;;
+    standalone-secret-manager)
+      PROFILE_AUTH="local"
+      PROFILE_SECRET="bundled" # pragma: allowlist secret
+      ;;
+    standalone-sso-secret-manager)
+      PROFILE_AUTH="sso"
+      PROFILE_SECRET="bundled" # pragma: allowlist secret
+      ;;
+    *)
+      echo "AKB_PROFILE must be standalone, standalone-sso, standalone-secret-manager, or standalone-sso-secret-manager" >&2
+      exit 2
+      ;;
+  esac
+  AUTH_PROFILE="${AUTH_PROFILE:-${PROFILE_AUTH}}"
+  SECRET_MODE="${SECRET_MODE:-${PROFILE_SECRET}}"
+  if [[ "${AUTH_PROFILE}" != "${PROFILE_AUTH}" ]]; then
+    echo "AUTH_PROFILE=${AUTH_PROFILE} conflicts with AKB_PROFILE=${AKB_PROFILE}" >&2
+    exit 2
+  fi
+  case "${AKB_PROFILE}" in
+    standalone|standalone-sso)
+      if [[ "${SECRET_MODE}" != "manual" && "${SECRET_MODE}" != "external" ]]; then
+        echo "${AKB_PROFILE} supports SECRET_MODE=manual or external; use a *-secret-manager profile for bundled" >&2
+        exit 2
+      fi
+      ;;
+    *-secret-manager)
+      if [[ "${SECRET_MODE}" != "bundled" ]]; then
+        echo "${AKB_PROFILE} requires SECRET_MODE=bundled" >&2
+        exit 2
+      fi
+      ;;
+  esac
+fi
+
+SECRET_SEAL_MODE="${SECRET_SEAL_MODE:-plaintext}"
+SECRET_TOPOLOGY="${SECRET_TOPOLOGY:-production-ha}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [[ "${AUTH_PROFILE}" == "sso" ]]; then
   KUSTOMIZE_DIR="${KUSTOMIZE_DIR:-${SCRIPT_DIR}/standalone-sso}"
@@ -52,6 +123,17 @@ if [[ ! "${NAMESPACE}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
 fi
 if [[ "${AUTH_PROFILE}" != "local" && "${AUTH_PROFILE}" != "sso" ]]; then
   echo "AUTH_PROFILE must be local or sso" >&2
+  exit 2
+fi
+if [[ "${SECRET_SEAL_MODE}" != "plaintext" &&
+      "${SECRET_SEAL_MODE}" != "pgp" &&
+      "${SECRET_SEAL_MODE}" != "auto" ]]; then
+  echo "SECRET_SEAL_MODE must be plaintext, pgp, or auto" >&2
+  exit 2
+fi
+if [[ "${SECRET_TOPOLOGY}" != "onprem-small" &&
+      "${SECRET_TOPOLOGY}" != "production-ha" ]]; then
+  echo "SECRET_TOPOLOGY must be onprem-small or production-ha" >&2
   exit 2
 fi
 if [[ -n "${STORAGE_CLASS:-}" &&
@@ -119,12 +201,15 @@ echo "=== Creating namespace ==="
 "${KUBECTL[@]}" create namespace "${NAMESPACE}" \
   --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
 
-echo "=== Preparing secret contract (${SECRET_MODE}/${SECRET_ENGINE:-none}) ==="
+echo "=== Preparing secret contract (${AKB_PROFILE}; ${SECRET_MODE}/${SECRET_ENGINE:-none}) ==="
 NAMESPACE="${NAMESPACE}" \
 KUBE_CONTEXT="${KUBE_CONTEXT}" \
+AKB_PROFILE="${AKB_PROFILE}" \
 SECRET_MODE="${SECRET_MODE}" \
 SECRET_ENGINE="${SECRET_ENGINE:-}" \
 SECRET_PROFILE="${SECRET_PROFILE}" \
+SECRET_SEAL_MODE="${SECRET_SEAL_MODE}" \
+SECRET_TOPOLOGY="${SECRET_TOPOLOGY}" \
 AUTH_PROFILE="${AUTH_PROFILE}" \
 BACKEND_IMAGE="${BACKEND_IMAGE}" \
   bash "${SCRIPT_DIR}/secrets/deploy.sh"

@@ -68,9 +68,25 @@ platform-managed workspace shape without reintroducing `jwt_secret` into
 Redis Operator resource. It is generated from the same source record but is
 not mounted by AKB.
 
-## Modes
+## Installation profiles
 
-### Manual
+`AKB_PROFILE` is the public installation choice. The lower-level
+`AUTH_PROFILE` and `SECRET_MODE` variables remain only for compatibility and
+external-store adapters.
+
+| `AKB_PROFILE` | Human auth | Bundled Secret Manager |
+|---|---|---|
+| `standalone` | local | no |
+| `standalone-sso` | owned Keycloak | no |
+| `standalone-secret-manager` | local | yes |
+| `standalone-sso-secret-manager` | owned Keycloak | yes |
+
+`standalone` and `standalone-sso` may set `SECRET_MODE=external`; that connects
+an existing endpoint and does not add another workload. The two
+`*-secret-manager` profiles require `SECRET_MODE=bundled`, which they select by
+default.
+
+### Manual Secret ownership
 
 The default is backward-compatible operator ownership. Existing installations
 must migrate their old `akb-secret-config`, `akb-local-session-keys`, and
@@ -82,8 +98,7 @@ contract and pipe it directly to the Kubernetes API:
 
 ```bash
 NAMESPACE=akb-dev \
-AUTH_PROFILE=local \
-SECRET_MODE=manual \
+AKB_PROFILE=standalone \
 GENERATE_MANUAL_SECRETS=true \
 REGISTRY=registry.example.com \
 bash deploy/k8s/deploy.sh
@@ -98,17 +113,17 @@ seed the external KV record with that database's current password and the
 existing signing/HMAC material before switching producers. Never let the
 development bootstrap invent a new password for an initialized database.
 
-For a new SSO bundle, set `AUTH_PROFILE=sso` and the required public origins.
-The top-level deployer then selects `deploy/k8s/standalone-sso` automatically:
+For a new SSO + Secret Manager bundle, choose the combined profile and provide
+the public origins. The deployer selects `deploy/k8s/standalone-sso`
+automatically:
 
 ```bash
 NAMESPACE=akb-sso-dev \
-AUTH_PROFILE=sso \
+AKB_PROFILE=standalone-sso-secret-manager \
 SSO_AKB_PUBLIC_URL=https://akb-sso.example.com \
 SSO_KEYCLOAK_PUBLIC_URL=https://auth-akb-sso.example.com \
 SSO_PRODUCT_ADMIN_USERNAME=admin \
 SSO_PRODUCT_ADMIN_EMAIL=admin@example.com \
-SECRET_MODE=bundled \
 SECRET_ENGINE=openbao \
 SECRET_PROFILE=development \
 REGISTRY=registry.example.com \
@@ -124,7 +139,7 @@ do not erase it before handoff or before the receipt exists.
 
 ```bash
 NAMESPACE=akb-openbao \
-SECRET_MODE=bundled \
+AKB_PROFILE=standalone-secret-manager \
 SECRET_ENGINE=openbao \
 SECRET_PROFILE=development \
 REGISTRY=registry.example.com \
@@ -144,7 +159,7 @@ BSL terms before enabling it.
 
 ```bash
 NAMESPACE=akb-vault \
-SECRET_MODE=bundled \
+AKB_PROFILE=standalone-secret-manager \
 SECRET_ENGINE=hashicorp-vault \
 SECRET_PROFILE=development \
 HASHICORP_LICENSE_ACKNOWLEDGED=true \
@@ -165,6 +180,7 @@ namespace-local ServiceAccount, `VaultConnection`, `VaultAuth`, and the
 
 ```bash
 NAMESPACE=akb-external \
+AKB_PROFILE=standalone \
 SECRET_MODE=external \
 SECRET_ENGINE=hashicorp-vault \
 SECRET_STORE_ADDRESS=https://vault.example.com \
@@ -224,24 +240,224 @@ charts' cluster-scoped auth-delegator bindings do not collide across AKB
 namespaces. A namespace that already has the historical `akb-secret-store`
 release keeps that name on upgrade.
 
-`production` renders a fail-closed baseline:
+`production` renders a fail-closed persistent baseline:
 
-- three replicas
+- `SECRET_TOPOLOGY=onprem-small` for one persistent Raft member, or
+  `SECRET_TOPOLOGY=production-ha` for three
 - integrated Raft
 - TLS from `akb-secret-store-tls`
 - retained data and audit PVCs
-- explicit initialization/unseal ceremony
+- parallel Pod creation and automatic Raft `retry_join`
+- a complete init, unseal, bootstrap, VSO projection, and AKB startup lifecycle
 
-Create `akb-secret-store-tls` with `tls.crt`, `tls.key`, and `ca.crt` before
-installing. Certificates must include the engine's service and pod DNS names.
-The profile installs the HA servers, then intentionally exits before applying
-AKB because recovery keys and the initial root credential must be handed off
-outside the cluster. Configure KMS auto-unseal through a private
-`SECRET_STORE_EXTRA_VALUES` file or initialize/unseal manually, seed KV and
-Kubernetes auth, then consume the initialized service through `external` mode.
+TLS has two supported ownership paths:
+
+- create `akb-secret-store-tls` with `tls.crt`, `tls.key`, and `ca.crt`
+  out-of-band; or
+- point the installer at an existing cert-manager CA `Issuer` or
+  `ClusterIssuer`. It creates and renews only the namespace-local Certificate:
+
+```bash
+SECRET_STORE_CERT_ISSUER_NAME=workspace-ca \
+SECRET_STORE_CERT_ISSUER_KIND=ClusterIssuer \
+... \
+bash deploy/k8s/deploy.sh
+```
+
+The rendered Certificate covers the engine Service and all three possible Pod
+DNS names under the chart's `*-internal` headless Service. The issuer must
+populate `ca.crt`; a public ACME certificate is not suitable for these private
+cluster DNS names. The bundled profile remains bundled on reruns and is never
+reclassified as external.
+
+### Production seal patterns
+
+AKB uses only native Vault/OpenBao initialization formats:
+
+```text
+ordinary installation -> plaintext operator init -> administrator stores shares
+multi-admin security   -> operator init -pgp-keys -> key holders decrypt/submit
+unattended restart     -> KMS/HSM/Transit seal -> native Auto Unseal
+```
+
+No AKB-specific Recovery Kit, unlock code, or key-encryption format is created.
+
+#### Plaintext Shamir (default)
+
+Run from a trusted interactive terminal that is not recorded:
+
+```bash
+AKB_PROFILE=standalone-sso-secret-manager \
+SECRET_ENGINE=openbao \
+SECRET_PROFILE=production \
+SECRET_SEAL_MODE=plaintext \
+SECRET_TOPOLOGY=production-ha \
+... \
+bash deploy/k8s/deploy.sh
+```
+
+The installer prints the official `operator init` values once and waits for
+the operator to type `STORED`. It then uses the same in-memory shares to unseal
+all Raft members, configures KV and Kubernetes auth, seeds Secret Contract v1,
+creates the short-lived operator-admin login boundary described below, revokes
+the initial root token, verifies revocation, and lets VSO project the contract
+before databases or applications start. It creates no durable local key file.
+
+#### PGP Shamir
+
+Provide one PGP public-key path per share plus a public key for the bootstrap
+administrator's initial root token. Binary, base64-encoded, and common
+ASCII-armoured (`.asc`) public exports are accepted; ASCII armour is normalized
+to the engine's required base64 packet form before upload:
+
+```bash
+AKB_PROFILE=standalone-sso-secret-manager \
+SECRET_ENGINE=openbao \
+SECRET_PROFILE=production \
+SECRET_SEAL_MODE=pgp \
+SECRET_KEY_SHARES=5 \
+SECRET_KEY_THRESHOLD=3 \
+SECRET_PGP_KEYS=/secure/a.asc,/secure/b.asc,/secure/c.asc,/secure/d.asc,/secure/e.asc \
+SECRET_ROOT_TOKEN_PGP_KEY=/secure/bootstrap-admin.asc \
+... \
+bash deploy/k8s/deploy.sh
+```
+
+`-pgp-keys` encrypts each generated Unseal Share to the corresponding public
+key in input order. It does not encrypt the root token; that requires the
+separate `-root-token-pgp-key` option. The installer prints only encrypted
+values, then enters `AwaitingKeyHolderUnseal`. Each threshold holder decrypts
+their own share on their secure workstation and submits it through the native
+hidden `operator unseal` prompt. The installer never receives private keys.
+
+Each holder can decode their assigned output on their own workstation; the
+result is the plaintext share accepted by the hidden prompt:
+
+```bash
+printf '%s' '<that holder encrypted share>' | \
+  openssl base64 -d -A | gpg --decrypt
+```
+
+The bootstrap administrator performs the same operation for the separately
+encrypted initial root token, enters it only when the installer asks, and does
+not retain it as day-2 authority after revocation succeeds.
+
+Because the installer cannot decrypt those shares, this mode intentionally
+requires key-holder participation during initial installation and every
+Shamir restart. Repeating one administrator's public key technically works but
+does not provide multi-party control; use plaintext mode for a single-holder
+installation instead.
+
+#### Auto Seal
+
+Create a namespace-local Secret whose `seal.hcl` key contains one native,
+supported KMS/HSM/Transit `seal` stanza. The installer mounts it as a second
+server config file; the repository and Helm release contain no seal
+credentials. Use workload identity when possible, or use a private extra
+values file only for environment-variable references to an existing
+Kubernetes Secret:
+
+```bash
+kubectl create secret generic akb-secret-store-seal \
+  -n akb-production \
+  --from-file=seal.hcl=/secure/seal.hcl
+
+AKB_PROFILE=standalone-sso-secret-manager \
+SECRET_ENGINE=openbao \
+SECRET_PROFILE=production \
+SECRET_SEAL_MODE=auto \
+SECRET_STORE_SEAL_CONFIG_SECRET=akb-secret-store-seal \
+SECRET_STORE_EXTRA_VALUES=/secure/openbao-workload-identity.yaml \
+... \
+bash deploy/k8s/deploy.sh
+```
+
+`server.extraVolumes[0]` is reserved for this mounted seal-config Secret. Do
+not redefine that slot in `SECRET_STORE_EXTRA_VALUES`. The `seal.hcl` file is
+the engine's native HCL, not an AKB format. For example, Transit configuration
+contains the parent address, key name, mount path, and a token supplied by an
+indirect mechanism; AWS/Azure/GCP configurations should rely on pod/workload
+identity rather than static access keys.
+
+The provider must be healthy before initialization. Vault/OpenBao stores its
+root key wrapped by that provider and automatically unwraps it on restart.
+This is not Shamir shares stored in KMS. Initialization still returns Recovery
+Shares; provide `SECRET_RECOVERY_PGP_KEYS` to use native
+`-recovery-pgp-keys`, and optionally `SECRET_ROOT_TOKEN_PGP_KEY` for the
+initial root token.
+
+Recovery Shares authorize privileged operations but cannot replace a missing
+Auto Seal provider. Permanently deleting the provider key can make the cluster
+and snapshots unrecoverable, so deletion protection and a tested provider
+recovery policy are mandatory.
+
+### Idempotency and recovery
+
+Successful production bootstrap records only a non-sensitive ConfigMap receipt
+(`akb-secret-manager-bootstrap`): cluster ID, engine, seal type, contract
+version, operator-role identity, and the fact that the initial root token was
+revoked. Reruns never call `operator init` again.
+
+If a Shamir cluster is already initialized but sealed, the installer shows the
+native `operator unseal` command and waits for the operator or key holders. If
+an Auto Seal cluster stays sealed, the installer fails closed and directs the
+operator to repair the provider. An initialized cluster without a bootstrap
+receipt requires an explicitly supplied interactive root credential to resume;
+the installer does not invent replacement keys.
 
 Never store KMS credentials, recovery keys, root tokens, or actual AKB Secret
 values in this repository or Helm values.
+
+### Day-2 operator access
+
+The initial root token is one-time bootstrap authority, not a permanent admin
+login. Before revoking it, the installer creates:
+
+- policy `akb-operator-admin`;
+- Kubernetes-auth role `akb-operator-admin` (30-minute token, 4-hour maximum);
+- non-automounted ServiceAccount `akb-secret-admin`.
+
+An operator must already have Kubernetes RBAC permission to request a token for
+that exact ServiceAccount. That permission is therefore equivalent to
+short-lived Secret Manager administration and must be limited to the platform
+operator group. No reusable ServiceAccount JWT or Vault/OpenBao token is
+stored in a Secret.
+
+The following pattern keeps the audience JWT off command arguments and obtains
+a bounded admin token. Substitute the engine command/environment names for
+HashiCorp Vault:
+
+```bash
+NAMESPACE=akb-production
+POD=<release>-openbao-0
+TLS_NAME="${POD}.<release>-openbao-internal.${NAMESPACE}.svc"
+
+OPERATOR_TOKEN="$(
+  kubectl create token akb-secret-admin -n "${NAMESPACE}" \
+    --audience=vault --duration=10m | \
+  kubectl exec -i -n "${NAMESPACE}" "${POD}" -- \
+    env BAO_ADDR=https://127.0.0.1:8200 \
+        BAO_CACERT=/openbao/tls/ca.crt \
+        BAO_TLS_SERVER_NAME="${TLS_NAME}" \
+        bao write -format=json auth/kubernetes/login \
+          role=akb-operator-admin jwt=- | jq -r .auth.client_token
+)"
+
+kubectl exec -n "${NAMESPACE}" "${POD}" -- \
+  env BAO_ADDR=https://127.0.0.1:8200 \
+      BAO_CACERT=/openbao/tls/ca.crt \
+      BAO_TLS_SERVER_NAME="${TLS_NAME}" \
+      BAO_TOKEN="${OPERATOR_TOKEN}" \
+      bao operator raft list-peers
+unset OPERATOR_TOKEN
+```
+
+The broad admin policy is intentionally paired with a short TTL and explicit
+Kubernetes TokenRequest. Use it for policy/auth maintenance, Raft snapshots,
+and diagnostics; AKB itself continues to use only the read-only VSO role. If
+Kubernetes auth is unavailable, the stored Shamir shares (or Auto Seal
+Recovery Shares) remain the break-glass path for the native generate-root
+ceremony.
 
 ## Rotation boundary
 
@@ -272,7 +488,7 @@ Always use a new namespace and explicit context for rehearsals:
 ```bash
 KUBE_CONTEXT=kubernetes-admin@kubernetes \
 NAMESPACE=akb-secret-openbao-<date> \
-SECRET_MODE=bundled \
+AKB_PROFILE=standalone-secret-manager \
 SECRET_ENGINE=openbao \
 SECRET_PROFILE=development \
 ... \

@@ -94,9 +94,10 @@ $EDITOR deploy/k8s/backend.yaml
 # 3. Provide a ClusterIssuer named `letsencrypt-prod` (or change the
 #    annotation in ingress.yaml). cert-manager + your DNS provider.
 
-# 4. Choose a Secret producer. This example creates a brand-new manual
-#    contract; production should provision `akb-secret` out-of-band instead.
-export SECRET_MODE=manual
+# 4. Choose one coherent installation profile. This example creates a
+#    brand-new local-auth/manual-Secret contract; production should provision
+#    `akb-secret` out-of-band instead.
+export AKB_PROFILE=standalone
 export GENERATE_MANUAL_SECRETS=true
 
 # 5. Apply.
@@ -147,16 +148,18 @@ same unified `akb-secret` shape as current `akb-platform` workspaces:
 - The backend disables automatic ServiceAccount-token mounting and has no
   Secret Manager or Kubernetes Secret API permission.
 
-The producer is selected with `SECRET_MODE=manual|bundled|external`.
-Bundled mode supports both `SECRET_ENGINE=openbao` and
-`SECRET_ENGINE=hashicorp-vault`; external mode connects an existing
-Vault-compatible service. See the complete contracts, pinned chart versions,
-TLS/HA profiles, rotation boundary, and migration notes in
+Choose one public `AKB_PROFILE`: `standalone`, `standalone-sso`,
+`standalone-secret-manager`, or `standalone-sso-secret-manager`. The two
+`*-secret-manager` profiles bundle OpenBao or HashiCorp Vault; the other two
+can either use an operator-owned Kubernetes Secret or adapt an existing
+Vault-compatible endpoint with `SECRET_MODE=external`. See the complete
+contracts, pinned chart versions, TLS/Raft profiles, native Shamir/PGP/Auto
+Seal operations, rotation boundary, and migration notes in
 [`secrets/README.md`](secrets/README.md).
 
-Human authentication is selected independently with
-`AUTH_PROFILE=local|sso`. `AUTH_PROFILE=sso` defaults `KUSTOMIZE_DIR` to the
-standalone SSO tree and requires coherent `SSO_AKB_PUBLIC_URL` and
-`SSO_KEYCLOAK_PUBLIC_URL` origins plus the product-admin identity. This keeps
-all four combinations supported: local or SSO with manual, bundled OpenBao,
-bundled HashiCorp Vault, or an external Vault-compatible Secret producer.
+The SSO profiles select the standalone SSO Kustomize tree and require coherent
+`SSO_AKB_PUBLIC_URL` and `SSO_KEYCLOAK_PUBLIC_URL` origins plus the
+product-admin identity. Lower-level `AUTH_PROFILE` and `SECRET_MODE` remain
+compatibility/adapter inputs, but new installations should use
+`AKB_PROFILE` so an auth/Secret Manager combination cannot be assembled
+accidentally.

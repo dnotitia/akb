@@ -10,6 +10,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SECRET_MODE="${SECRET_MODE:-manual}"
 SECRET_ENGINE="${SECRET_ENGINE:-}"
 SECRET_PROFILE="${SECRET_PROFILE:-development}"
+SECRET_SEAL_MODE="${SECRET_SEAL_MODE:-plaintext}"
+SECRET_TOPOLOGY="${SECRET_TOPOLOGY:-production-ha}"
 AUTH_PROFILE="${AUTH_PROFILE:-local}"
 SECRET_STORE_RELEASE="${SECRET_STORE_RELEASE:-}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-}"
@@ -18,6 +20,10 @@ KV_MOUNT="${KV_MOUNT:-kv}"
 KV_PATH="${KV_PATH:-akb/runtime}"
 KUBERNETES_AUTH_MOUNT="${KUBERNETES_AUTH_MOUNT:-kubernetes}"
 VAULT_ROLE="${VAULT_ROLE:-akb-runtime-reader}"
+SECRET_STORE_CERT_ISSUER_NAME="${SECRET_STORE_CERT_ISSUER_NAME:-}"
+SECRET_STORE_CERT_ISSUER_KIND="${SECRET_STORE_CERT_ISSUER_KIND:-ClusterIssuer}"
+SECRET_STORE_CLUSTER_DOMAIN="${SECRET_STORE_CLUSTER_DOMAIN:-cluster.local}"
+SECRET_STORE_SEAL_CONFIG_SECRET="${SECRET_STORE_SEAL_CONFIG_SECRET:-}"
 
 KUBECTL=(kubectl)
 HELM=(helm)
@@ -32,6 +38,17 @@ if [[ ! "${NAMESPACE}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
 fi
 if [[ "${AUTH_PROFILE}" != "local" && "${AUTH_PROFILE}" != "sso" ]]; then
   echo "AUTH_PROFILE must be local or sso" >&2
+  exit 2
+fi
+if [[ "${SECRET_SEAL_MODE}" != "plaintext" &&
+      "${SECRET_SEAL_MODE}" != "pgp" &&
+      "${SECRET_SEAL_MODE}" != "auto" ]]; then
+  echo "SECRET_SEAL_MODE must be plaintext, pgp, or auto" >&2
+  exit 2
+fi
+if [[ "${SECRET_TOPOLOGY}" != "onprem-small" &&
+      "${SECRET_TOPOLOGY}" != "production-ha" ]]; then
+  echo "SECRET_TOPOLOGY must be onprem-small or production-ha" >&2
   exit 2
 fi
 if [[ ! "${KV_MOUNT}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] ||
@@ -106,6 +123,49 @@ ensure_vso() {
     --wait --timeout 5m
 }
 
+ensure_production_tls() {
+  if "${KUBECTL[@]}" get secret akb-secret-store-tls -n "${NAMESPACE}" >/dev/null 2>&1; then
+    return
+  fi
+  if [[ -z "${SECRET_STORE_CERT_ISSUER_NAME}" ]]; then
+    echo "Production bundle requires akb-secret-store-tls with tls.crt, tls.key, and ca.crt." >&2
+    echo "Create it out-of-band or set SECRET_STORE_CERT_ISSUER_NAME for an existing cert-manager CA issuer." >&2
+    exit 2
+  fi
+  if [[ "${SECRET_STORE_CERT_ISSUER_KIND}" != "Issuer" &&
+        "${SECRET_STORE_CERT_ISSUER_KIND}" != "ClusterIssuer" ]] ||
+     [[ ! "${SECRET_STORE_CERT_ISSUER_NAME}" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] ||
+     [[ ! "${SECRET_STORE_CLUSTER_DOMAIN}" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]]; then
+    echo "Secret Manager cert-manager issuer inputs are invalid" >&2
+    exit 2
+  fi
+  if ! "${KUBECTL[@]}" get crd certificates.cert-manager.io >/dev/null 2>&1; then
+    echo "SECRET_STORE_CERT_ISSUER_NAME requires an existing cert-manager installation" >&2
+    exit 2
+  fi
+  if [[ "${SECRET_STORE_CERT_ISSUER_KIND}" == "Issuer" ]]; then
+    if ! "${KUBECTL[@]}" get issuer "${SECRET_STORE_CERT_ISSUER_NAME}" \
+      -n "${NAMESPACE}" >/dev/null 2>&1; then
+      echo "Issuer/${SECRET_STORE_CERT_ISSUER_NAME} does not exist in ${NAMESPACE}" >&2
+      exit 2
+    fi
+  elif ! "${KUBECTL[@]}" get clusterissuer "${SECRET_STORE_CERT_ISSUER_NAME}" >/dev/null 2>&1; then
+    echo "ClusterIssuer/${SECRET_STORE_CERT_ISSUER_NAME} does not exist" >&2
+    exit 2
+  fi
+  echo "Requesting Secret Manager TLS certificate from ${SECRET_STORE_CERT_ISSUER_KIND}/${SECRET_STORE_CERT_ISSUER_NAME}"
+  sed \
+    -e "s|__CERT_ISSUER_KIND__|${SECRET_STORE_CERT_ISSUER_KIND}|g" \
+    -e "s|__CERT_ISSUER_NAME__|${SECRET_STORE_CERT_ISSUER_NAME}|g" \
+    -e "s|__SERVICE__|${SERVICE}|g" \
+    -e "s|__STATEFULSET__|${STATEFULSET}|g" \
+    -e "s|__NAMESPACE__|${NAMESPACE}|g" \
+    -e "s|__CLUSTER_DOMAIN__|${SECRET_STORE_CLUSTER_DOMAIN}|g" \
+    "${SCRIPT_DIR}/certificate.yaml" | "${KUBECTL[@]}" apply -n "${NAMESPACE}" -f -
+  "${KUBECTL[@]}" wait certificate/akb-secret-store-tls -n "${NAMESPACE}" \
+    --for=condition=Ready --timeout=5m
+}
+
 render_vso() {
   local address="$1"
   local skip_tls="$2"
@@ -140,6 +200,17 @@ render_vso() {
     "${adapter}" >"${rendered}"
   "${KUBECTL[@]}" apply -n "${NAMESPACE}" -f "${rendered}"
   rm -f "${rendered}"
+}
+
+chart_fullname() {
+  local chart_name="$1"
+  # Both official charts use Helm's standard `contains chartName releaseName`
+  # fullname helper to avoid names such as `vault-vault`.
+  if [[ "${SECRET_STORE_RELEASE}" == *"${chart_name}"* ]]; then
+    printf '%s' "${SECRET_STORE_RELEASE}"
+  else
+    printf '%s-%s' "${SECRET_STORE_RELEASE}" "${chart_name}"
+  fi
 }
 
 case "${SECRET_MODE}" in
@@ -182,8 +253,8 @@ case "${SECRET_MODE}" in
         CHART_VERSION="0.29.3"
         CHART_REPO_NAME="openbao"
         CHART_REPO_URL="https://openbao.github.io/openbao-helm"
-        SERVICE="${SECRET_STORE_RELEASE}-openbao"
-        STATEFULSET="${SECRET_STORE_RELEASE}-openbao"
+        SERVICE="$(chart_fullname openbao)"
+        STATEFULSET="${SERVICE}"
         ;;
       hashicorp-vault)
         if [[ "${HASHICORP_LICENSE_ACKNOWLEDGED:-false}" != "true" ]]; then
@@ -194,8 +265,8 @@ case "${SECRET_MODE}" in
         CHART_VERSION="0.34.1"
         CHART_REPO_NAME="hashicorp"
         CHART_REPO_URL="https://helm.releases.hashicorp.com"
-        SERVICE="${SECRET_STORE_RELEASE}-vault"
-        STATEFULSET="${SECRET_STORE_RELEASE}-vault"
+        SERVICE="$(chart_fullname vault)"
+        STATEFULSET="${SERVICE}"
         ;;
       *)
         echo "SECRET_ENGINE must be openbao or hashicorp-vault for bundled mode" >&2
@@ -221,17 +292,66 @@ case "${SECRET_MODE}" in
       )
     fi
     if [[ -n "${SECRET_STORE_EXTRA_VALUES:-}" ]]; then
+      if [[ ! -f "${SECRET_STORE_EXTRA_VALUES}" ]]; then
+        echo "SECRET_STORE_EXTRA_VALUES does not exist: ${SECRET_STORE_EXTRA_VALUES}" >&2
+        exit 2
+      fi
       HELM_ARGS+=(--values "${SECRET_STORE_EXTRA_VALUES}")
     fi
     if [[ "${SECRET_PROFILE}" == "production" ]]; then
-      if ! "${KUBECTL[@]}" get secret akb-secret-store-tls -n "${NAMESPACE}" >/dev/null 2>&1; then
-        echo "Production bundle requires akb-secret-store-tls with tls.crt, tls.key, and ca.crt." >&2
-        exit 2
+      ensure_production_tls
+      for tls_key in tls.crt tls.key ca.crt; do
+        if [[ -z "$("${KUBECTL[@]}" get secret akb-secret-store-tls -n "${NAMESPACE}" \
+          -o "jsonpath={.data.${tls_key//./\\.}}" 2>/dev/null || true)" ]]; then
+          echo "akb-secret-store-tls is missing ${tls_key}" >&2
+          exit 2
+        fi
+      done
+      if [[ "${SECRET_SEAL_MODE}" == "auto" ]]; then
+        if [[ ! "${SECRET_STORE_SEAL_CONFIG_SECRET}" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]]; then
+          echo "SECRET_SEAL_MODE=auto requires a valid SECRET_STORE_SEAL_CONFIG_SECRET" >&2
+          exit 2
+        fi
+        if [[ -z "$("${KUBECTL[@]}" get secret "${SECRET_STORE_SEAL_CONFIG_SECRET}" \
+          -n "${NAMESPACE}" -o 'jsonpath={.data.seal\.hcl}' 2>/dev/null || true)" ]]; then
+          echo "${SECRET_STORE_SEAL_CONFIG_SECRET} must exist in ${NAMESPACE} with key seal.hcl" >&2
+          exit 2
+        fi
+        if [[ "${SECRET_ENGINE}" == "openbao" ]]; then
+          SECRET_STORE_HOME="/openbao"
+        else
+          SECRET_STORE_HOME="/vault"
+        fi
+        HELM_ARGS+=(
+          --set-string "server.extraVolumes[0].type=secret"
+          --set-string "server.extraVolumes[0].name=${SECRET_STORE_SEAL_CONFIG_SECRET}"
+          --set-string "server.extraArgs=-config=${SECRET_STORE_HOME}/userconfig/${SECRET_STORE_SEAL_CONFIG_SECRET}/seal.hcl"
+        )
       fi
+      if [[ "${SECRET_TOPOLOGY}" == "onprem-small" ]]; then
+        SECRET_STORE_REPLICAS=1
+        HELM_ARGS+=(--set "server.ha.disruptionBudget.enabled=false")
+      else
+        SECRET_STORE_REPLICAS=3
+      fi
+      RAFT_LEADER_ADDR="https://${STATEFULSET}-0.${STATEFULSET}-internal.${NAMESPACE}.svc:8200"
+      HELM_ARGS+=(
+        --set "server.ha.replicas=${SECRET_STORE_REPLICAS}"
+        --set-string "server.extraEnvironmentVars.RAFT_ADDR=${RAFT_LEADER_ADDR}"
+      )
       "${HELM[@]}" "${HELM_ARGS[@]}"
-      echo "Production ${SECRET_ENGINE} is installed but intentionally uninitialized/sealed." >&2
-      echo "Complete the documented init/unseal ceremony, configure KV/Auth, then rerun in external mode." >&2
-      exit 3
+      NAMESPACE="${NAMESPACE}" KUBE_CONTEXT="${KUBE_CONTEXT}" \
+        SECRET_ENGINE="${SECRET_ENGINE}" SECRET_SEAL_MODE="${SECRET_SEAL_MODE}" \
+        SECRET_STORE_POD="${STATEFULSET}-0" \
+        SECRET_STORE_STATEFULSET="${STATEFULSET}" SECRET_STORE_SERVICE="${SERVICE}" \
+        BACKEND_IMAGE="${BACKEND_IMAGE}" KV_MOUNT="${KV_MOUNT}" KV_PATH="${KV_PATH}" \
+        AUTH_PROFILE="${AUTH_PROFILE}" KUBERNETES_AUTH_MOUNT="${KUBERNETES_AUTH_MOUNT}" \
+        VAULT_ROLE="${VAULT_ROLE}" \
+        bash "${SCRIPT_DIR}/initialize-production-bundled.sh"
+      render_vso "https://${SERVICE}.${NAMESPACE}.svc:8200" false "akb-secret-store-tls"
+      wait_for_contract
+      secret_contract_ready
+      exit 0
     fi
     # Reuse the development token recorded in this namespace's Helm release.
     # Generating a new token on every idempotent deploy breaks OnDelete chart

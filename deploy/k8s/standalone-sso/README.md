@@ -54,9 +54,10 @@ intentionally unable to mutate clients.
 
 ## Required operator inputs
 
-When using `deploy/k8s/deploy.sh` with `AUTH_PROFILE=sso`, provide these public
-values as environment variables. The deployer validates them and replaces the
-public placeholders in one render, before anything is applied:
+When using `deploy/k8s/deploy.sh` with `AKB_PROFILE=standalone-sso` or
+`AKB_PROFILE=standalone-sso-secret-manager`, provide these public values as
+environment variables. The deployer validates them and replaces the public
+placeholders in one render, before anything is applied:
 
 - `SSO_AKB_PUBLIC_URL` (for example `https://akb.example.com`)
 - `SSO_KEYCLOAK_PUBLIC_URL` (for example `https://auth.akb.example.com`)
@@ -105,25 +106,24 @@ bundled OpenBao, bundled HashiCorp Vault, and external Vault-compatible modes.
 For a fresh isolated installation:
 
 ```bash
-AUTH_PROFILE=sso \
+AKB_PROFILE=standalone-sso-secret-manager \
 NAMESPACE=akb-sso-example \
 SSO_AKB_PUBLIC_URL=https://akb.example.com \
 SSO_KEYCLOAK_PUBLIC_URL=https://auth.akb.example.com \
 SSO_PRODUCT_ADMIN_USERNAME=admin \
 SSO_PRODUCT_ADMIN_EMAIL=admin@example.com \
-SECRET_MODE=bundled \
 SECRET_ENGINE=openbao \
 SECRET_PROFILE=development \
 REGISTRY=registry.example.com \
 bash deploy/k8s/deploy.sh
 ```
 
-`AUTH_PROFILE=sso` automatically selects this Kustomize tree. The Secret
-profile first makes the complete contract ready, then the deployer applies AKB,
-the dedicated Keycloak database, Keycloak, and both ingresses. It waits for
-both databases and Keycloak before accepting the backend rollout. Reusing a KV
-path created for `AUTH_PROFILE=local` is rejected; authentication cutover is a
-separate migration, not an implicit secret rewrite.
+The SSO profiles automatically select this Kustomize tree. The Secret profile
+first makes the complete contract ready, then the deployer applies AKB, the
+dedicated Keycloak database, Keycloak, and both ingresses. It waits for both
+databases and Keycloak before accepting the backend rollout. Reusing a KV path
+created for local auth is rejected; authentication cutover is a separate
+migration, not an implicit secret rewrite.
 
 `sso_session_epoch` is not a credential. Generate it once with
 `python -c 'import uuid; print(uuid.uuid4())'` and keep it stable across normal
