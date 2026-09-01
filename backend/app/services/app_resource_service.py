@@ -17,7 +17,7 @@ import uuid
 import asyncpg
 
 from app.exceptions import ConflictError, ValidationError
-from app.repositories import table_data_repo
+from app.repositories import table_data_repo, table_registry_repo
 from app.util.text import to_nfc_any
 
 _TABLE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -41,15 +41,6 @@ def canonical_json(value: Any) -> bytes:
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
-
-
-def _json_list(value: Any) -> list[Any]:
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return []
-    return list(value) if isinstance(value, list) else []
 
 
 def _row_value(row: Any, key: str, default: Any = None) -> Any:
@@ -180,7 +171,7 @@ def canonical_table_descriptor(row: Any) -> dict[str, Any]:
     are omitted because AKB derives vault-qualified physical names; their
     columns and ordering remain part of the schema contract.
     """
-    raw_columns = _json_list(_row_value(row, "columns"))
+    raw_columns = table_registry_repo.parse_json_list(_row_value(row, "columns"))
     columns = [_canonical_column(item) for item in raw_columns]
     columns.sort(key=lambda item: item["name"])
     inline_unique = []
@@ -193,13 +184,21 @@ def canonical_table_descriptor(row: Any) -> dict[str, Any]:
             inline_unique.append({"columns": [name]})
         if raw_column.get("index") is True and isinstance(name, str):
             inline_indexes.append({"columns": [{"name": name, "order": "asc"}]})
-    unique_keys = [_canonical_unique_key(item) for item in _json_list(_row_value(row, "unique_keys"))]
+    unique_keys = [
+        _canonical_unique_key(item)
+        for item in table_registry_repo.parse_json_list(
+            _row_value(row, "unique_keys")
+        )
+    ]
     unique_identities = {tuple(item["columns"]) for item in unique_keys}
     unique_keys.extend(
         item for item in inline_unique if tuple(item["columns"]) not in unique_identities
     )
     unique_keys.sort(key=canonical_json)
-    indexes = [_canonical_index(item) for item in _json_list(_row_value(row, "indexes"))]
+    indexes = [
+        _canonical_index(item)
+        for item in table_registry_repo.parse_json_list(_row_value(row, "indexes"))
+    ]
     index_identities = {
         tuple((column["name"], column["order"]) for column in item["columns"])
         for item in indexes

@@ -105,34 +105,26 @@ def _reject_unlisted_fields(value: dict[str, Any], allowed: set[str], *, label: 
         raise ValidationError(f"{label} contains an unsupported field")
 
 
-def _table_name(value: Any) -> str:
+def _identifier(value: Any, *, label: str) -> str:
     if (
         not isinstance(value, str)
         or len(value.encode("utf-8")) > _MAX_IDENTIFIER_LENGTH
         or not _TABLE_NAME.fullmatch(value)
     ):
-        raise ValidationError("Manifest table must be a safe table name")
+        raise ValidationError(f"Manifest {label} is invalid")
     return value
+
+
+def _table_name(value: Any) -> str:
+    return _identifier(value, label="table name")
 
 
 def _column_name(value: Any) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value.encode("utf-8")) > _MAX_IDENTIFIER_LENGTH
-        or not _TABLE_NAME.fullmatch(value)
-    ):
-        raise ValidationError("Manifest column must be a safe column name")
-    return value
+    return _identifier(value, label="column name")
 
 
 def _named_identifier(value: Any, *, label: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value.encode("utf-8")) > _MAX_IDENTIFIER_LENGTH
-        or not _TABLE_NAME.fullmatch(value)
-    ):
-        raise ValidationError(f"Manifest {label} name is invalid")
-    return value
+    return _identifier(value, label=f"{label} name")
 
 
 def _normalize_column(value: Any, *, nullable_only: bool = False) -> dict[str, Any]:
@@ -641,12 +633,6 @@ def manifest_checksum(manifest: Any, *, version: str | None = None) -> str:
     """Return the canonical v2 checksum for a manifest without its outer checksum."""
     _normalized, computed = _normalize_manifest(manifest, product_version=version)
     return computed
-
-
-def schema_projection_fingerprint(schema: Any) -> str:
-    if not isinstance(schema, dict) or not isinstance(schema.get("tables"), list):
-        raise ValidationError("Manifest schema must contain a tables array")
-    return app_resource_service.canonical_table_fingerprint(schema["tables"])
 
 
 def select_transition_plan(

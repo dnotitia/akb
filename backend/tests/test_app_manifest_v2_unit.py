@@ -158,14 +158,6 @@ def test_source_plan_selection_is_exact_and_fail_closed() -> None:
         )
 
 
-def test_table_fingerprint_is_the_projection_fingerprint() -> None:
-    manifest = _manifest()
-    tables = manifest["schema"]["tables"]
-    assert rollout.schema_projection_fingerprint(manifest["schema"]) == resources.canonical_table_fingerprint(
-        reversed(tables)
-    )
-
-
 def test_table_fingerprint_normalizes_logical_aliases_and_physical_constraint_names() -> None:
     first = {
         "name": "orders",

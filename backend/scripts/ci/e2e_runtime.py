@@ -1928,6 +1928,9 @@ class E2ERuntime:
             "indexes": [],
         }
         baseline_fingerprint = _fixture_schema_fingerprint([baseline_table])
+        transition_plans: Sequence[
+            tuple[object, Sequence[dict[str, object]]]
+        ] | None = None
         if valid:
             transition_steps: list[dict[str, object]] = [
                 {
@@ -1983,20 +1986,6 @@ class E2ERuntime:
                     },
                     transition_steps,
                 ),
-            ]
-        else:
-            transition_plans = [
-                (
-                    "fresh",
-                    [
-                        {
-                            "id": "invalid_contract",
-                            "phase": "contract",
-                            "operation": "drop_table",
-                            "payload": {"table": "rollout_data"},
-                        }
-                    ],
-                )
             ]
         manifest, checksum = _fixture_v2_manifest(
             app_key=app_key,

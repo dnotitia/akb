@@ -101,7 +101,6 @@ async def test_v2_release_replays_byte_equivalent_and_conflicts_without_partial_
     monkeypatch,
 ):
     async with _fresh_database() as conn:
-        await _load_migration(MIGRATIONS[-1]).migrate(conn=conn)
         class _Pool:
             def acquire(self):
                 return self
