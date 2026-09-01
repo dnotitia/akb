@@ -1,11 +1,19 @@
-# AKB all-in-one image
+# AKB single-container demo (`all-in-one` compatibility path)
 
-Single-container build of AKB (Postgres + pgvector + Redis + MinIO +
-backend + frontend behind nginx). Use cases:
+The historical directory name is retained for image and documentation links,
+but this is a single-container demo bundle rather than the production
+"everything included" deployment. It contains Postgres + pgvector + Redis +
+MinIO + backend + frontend behind nginx. Use cases:
 
 - [Glama](https://glama.ai/) MCP introspection / listing
 - Quick demos (one `docker run` brings up the full stack)
 - Self-hosted single-box deployments
+
+It deliberately does not run OpenBao/Vault or Keycloak inside the application
+container. Doing so would place the Secret Manager, its storage, and the
+secret-consuming application under the same root process and filesystem trust
+boundary. Use `deploy/helm/akb` for an all-in-one installation whose components
+remain isolated as Kubernetes workloads.
 
 ## Quick start (pre-built image)
 

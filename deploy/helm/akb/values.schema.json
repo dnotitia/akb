@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["profile", "global", "images", "secretContract", "sso", "secretManager"],
+  "properties": {
+    "profile": {
+      "type": "string",
+      "enum": [
+        "standalone",
+        "standalone-sso",
+        "standalone-secret-manager",
+        "standalone-sso-secret-manager"
+      ]
+    },
+    "global": {
+      "type": "object",
+      "required": ["publicUrl"],
+      "properties": {
+        "publicUrl": {"type": "string", "pattern": "^https?://[^/]+/?$"}
+      }
+    },
+    "images": {
+      "type": "object",
+      "required": ["backend", "frontend"],
+      "properties": {
+        "backend": {"$ref": "#/$defs/image"},
+        "frontend": {"$ref": "#/$defs/image"}
+      }
+    },
+    "secretContract": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"}
+      }
+    },
+    "sso": {
+      "type": "object",
+      "required": ["enabled", "keycloakPublicUrl", "productAdmin"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "keycloakPublicUrl": {"type": "string", "pattern": "^https?://[^/]+/?$"},
+        "productAdmin": {
+          "type": "object",
+          "required": ["username", "email"],
+          "properties": {
+            "username": {"type": "string", "minLength": 1},
+            "email": {"type": "string", "minLength": 3}
+          }
+        }
+      }
+    },
+    "secretManager": {
+      "type": "object",
+      "required": ["mode", "engine", "profile", "sealMode", "topology"],
+      "properties": {
+        "mode": {"type": "string", "enum": ["manual", "bundled", "external"]},
+        "engine": {"type": "string", "enum": ["", "openbao", "hashicorp-vault"]},
+        "profile": {"type": "string", "enum": ["production"]},
+        "sealMode": {"type": "string", "enum": ["plaintext", "pgp", "auto"]},
+        "topology": {"type": "string", "enum": ["onprem-small", "production-ha"]}
+      }
+    }
+  },
+  "$defs": {
+    "image": {
+      "type": "object",
+      "required": ["repository", "tag", "pullPolicy"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string", "minLength": 1},
+        "pullPolicy": {"type": "string", "enum": ["Always", "IfNotPresent", "Never"]}
+      }
+    }
+  }
+}

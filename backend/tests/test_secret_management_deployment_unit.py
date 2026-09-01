@@ -239,6 +239,9 @@ def test_deploy_scripts_are_context_scoped_idempotent_and_fail_closed():
     production_init = (_SECRETS / "initialize-production-bundled.sh").read_text(
         encoding="utf-8"
     )
+    seal_validator = (_SECRETS / "validate-seal-inputs.sh").read_text(
+        encoding="utf-8"
+    )
     bootstrap = (_SECRETS / "bootstrap-bundled.sh").read_text(encoding="utf-8")
 
     assert 'KUBECTL+=(--context "${KUBE_CONTEXT}")' in deploy
@@ -264,11 +267,12 @@ def test_deploy_scripts_are_context_scoped_idempotent_and_fail_closed():
     assert "standalone-sso-secret-manager" in deploy
     assert 'SECRET_SEAL_MODE="${SECRET_SEAL_MODE:-plaintext}"' in deploy
     assert 'SECRET_TOPOLOGY="${SECRET_TOPOLOGY:-production-ha}"' in deploy
+    assert "validate-seal-inputs.sh" in deploy
     assert (
         "PGP mode requires SECRET_PGP_KEYS and SECRET_ROOT_TOKEN_PGP_KEY "
         "before deployment"
-    ) in deploy
-    assert deploy.index("PGP mode requires SECRET_PGP_KEYS") < deploy.index(
+    ) in seal_validator
+    assert deploy.index("validate-seal-inputs.sh") < deploy.index(
         'if [[ "${SKIP_BUILD}" == "true" ]]'
     )
     assert "initialize-production-bundled.sh" in secret_deploy

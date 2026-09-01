@@ -1,4 +1,11 @@
-# Kubernetes deploy
+# Kubernetes deploy (Kustomize compatibility path)
+
+New standalone installations should prefer the umbrella Helm chart under
+[`deploy/helm/akb`](../helm/akb/README.md). It exposes the same four profiles as
+explicit values files and keeps declarative resource ownership in Helm. This
+Kustomize path remains supported for existing operator overlays and migration;
+`deploy.sh` is a compatibility orchestrator, not the source of truth for the
+new Helm templates.
 
 Generic kustomize base for deploying AKB to a Kubernetes cluster. Pair
 with an operator-specific overlay for real hostnames, registries, and
