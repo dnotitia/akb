@@ -17,6 +17,11 @@ vi.mock("@/lib/api", () => ({
   previewTablePublicationQuery: vi.fn(),
   deleteVaultFile: vi.fn(),
   deleteVaultTable: vi.fn(),
+  deleteVaultTableRow: vi.fn(),
+  insertVaultTableRow: vi.fn(),
+  listVaultTableRows: vi.fn(),
+  listVaultTables: vi.fn(),
+  updateVaultTableRow: vi.fn(),
 }));
 
 import {
@@ -28,6 +33,8 @@ import {
   deleteVaultTable,
   getVaultInfo,
   listPublications,
+  listVaultTableRows,
+  listVaultTables,
   previewTablePublicationQuery,
 } from "@/lib/api";
 
@@ -40,6 +47,8 @@ const snapshotMock = createPublicationSnapshot as unknown as ReturnType<typeof v
 const deletePublicationMock = deletePublication as unknown as ReturnType<typeof vi.fn>;
 const listPublicationsMock = listPublications as unknown as ReturnType<typeof vi.fn>;
 const previewPublicationMock = previewTablePublicationQuery as unknown as ReturnType<typeof vi.fn>;
+const listTablesMock = listVaultTables as unknown as ReturnType<typeof vi.fn>;
+const listRowsMock = listVaultTableRows as unknown as ReturnType<typeof vi.fn>;
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -82,6 +91,21 @@ beforeEach(() => {
   snapshotMock.mockResolvedValue({});
   deletePublicationMock.mockResolvedValue({ deleted: 1 });
   previewPublicationMock.mockResolvedValue({ columns: [], items: [], total: 0 });
+  listTablesMock.mockReset();
+  listRowsMock.mockReset();
+  listTablesMock.mockResolvedValue({
+    items: [{
+      name: "audit_log",
+      row_count: 1,
+      columns: [{ name: "event", type: "text" }],
+    }],
+  });
+  listRowsMock.mockResolvedValue({
+    kind: "table_query",
+    items: [{ id: "6ab163e8-6ea4-4d20-8765-bf912716384c", event: "First" }],
+    columns: ["id", "event"],
+    total: 1,
+  });
 });
 
 afterEach(() => cleanup());
@@ -149,24 +173,6 @@ describe("resource viewer deletion", () => {
 
   it("requires an admin and an exact name before deleting a table", async () => {
     vaultInfoMock.mockResolvedValue({ role: "admin" });
-    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
-      if (init?.method === "POST" && url.endsWith("/sql")) {
-        return Promise.resolve(jsonResponse({
-          items: [{ id: 1, title: "First" }],
-          columns: ["id", "title"],
-          total: 1,
-        }));
-      }
-      return Promise.resolve(jsonResponse({
-        items: [
-          {
-            name: "audit_log",
-            row_count: 1,
-            columns: [{ name: "id", type: "int", primary_key: true }],
-          },
-        ],
-      }));
-    });
     const user = userEvent.setup();
     const { refetchTree } = renderRoute("/vault/v/table/audit_log");
 
@@ -184,18 +190,6 @@ describe("resource viewer deletion", () => {
 
   it("lets a writer publish a table without exposing admin-only deletion", async () => {
     vaultInfoMock.mockResolvedValue({ role: "writer" });
-    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
-      if (init?.method === "POST" && url.endsWith("/sql")) {
-        return Promise.resolve(jsonResponse({ items: [], columns: [], total: 0 }));
-      }
-      return Promise.resolve(jsonResponse({
-        items: [{
-          name: "audit_log",
-          row_count: 0,
-          columns: [{ name: "event", type: "text" }],
-        }],
-      }));
-    });
     const user = userEvent.setup();
     renderRoute("/vault/v/table/audit_log");
 
@@ -207,18 +201,6 @@ describe("resource viewer deletion", () => {
 
   it("does not expose table publication or deletion to a reader", async () => {
     vaultInfoMock.mockResolvedValue({ role: "reader" });
-    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
-      if (init?.method === "POST" && url.endsWith("/sql")) {
-        return Promise.resolve(jsonResponse({ items: [], columns: [], total: 0 }));
-      }
-      return Promise.resolve(jsonResponse({
-        items: [{
-          name: "audit_log",
-          row_count: 0,
-          columns: [{ name: "event", type: "text" }],
-        }],
-      }));
-    });
     renderRoute("/vault/v/table/audit_log");
 
     await screen.findByRole("heading", { name: "audit_log" });
