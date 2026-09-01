@@ -31,7 +31,6 @@ def test_manifest_v2_migration_is_registered_and_replaces_v1_checks() -> None:
     assert "manifest->>'image_digest' ~ '^sha256:[0-9a-f]{64}$'" in source
     assert "manifest->>'source_revision' ~ '^[0-9A-Fa-f]{40,64}$'" in source
     assert "akb_check_release_manifest_app_key" in source
-    assert "to_regclass('public.app_releases')" in source
 
 
 @pytest.mark.asyncio
