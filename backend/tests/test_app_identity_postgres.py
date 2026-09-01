@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import importlib.util
 import json
 import os
@@ -16,6 +15,7 @@ import pytest
 
 from app.config import settings
 from app.exceptions import AuthenticationError, ConflictError, ForbiddenError
+from app.services import app_rollout_service as rollout
 
 pytestmark = pytest.mark.asyncio
 
@@ -24,6 +24,7 @@ _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
 _MIGRATIONS = [
     _BACKEND / "app" / "db" / "migrations" / "047_app_registry.py",
     _BACKEND / "app" / "db" / "migrations" / "051_app_credentials.py",
+    _BACKEND / "app" / "db" / "migrations" / "095_app_release_manifest_v2.py",
 ]
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
@@ -124,8 +125,23 @@ async def _vault(pool, label: str) -> uuid.UUID:
 
 
 async def _release(pool, app_id: uuid.UUID) -> uuid.UUID:
-    manifest = json.dumps({"steps": [{"id": "prepare"}]}, separators=(",", ":"))
-    checksum = hashlib.sha256(manifest.encode()).hexdigest()
+    version = f"1.0.{uuid.uuid4().int % 100000}"
+    async with pool.acquire() as conn:
+        app_key = await conn.fetchval(
+            "SELECT app_key FROM app_definitions WHERE id=$1", app_id
+        )
+    body = {
+        "manifest_version": 2,
+        "app_key": app_key,
+        "source_revision": "a" * 40,
+        "image_digest": "sha256:" + "b" * 64,
+        "schema_version": 3,
+        "schema": {"tables": []},
+        "transition_plans": [{"source": "fresh", "steps": []}],
+    }
+    checksum = rollout.manifest_checksum(body, version=version)
+    normalized = rollout.validate_manifest(body, checksum, version=version)
+    manifest = json.dumps(rollout.manifest_storage_projection(normalized), separators=(",", ":"))
     async with pool.acquire() as conn:
         return await conn.fetchval(
             """
@@ -135,7 +151,7 @@ async def _release(pool, app_id: uuid.UUID) -> uuid.UUID:
             RETURNING id
             """,
             app_id,
-            f"1.0.{uuid.uuid4().int % 100000}",
+            version,
             manifest,
             checksum,
         )

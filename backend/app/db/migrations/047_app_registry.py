@@ -129,8 +129,13 @@ async def _run(conn):
                         ADD CONSTRAINT app_releases_manifest_shape
                         CHECK (
                             jsonb_typeof(manifest) = 'object'
-                            AND manifest ? 'steps'
-                            AND jsonb_typeof(manifest->'steps') = 'array'
+                            AND manifest->>'manifest_version' = '2'
+                            AND jsonb_typeof(manifest->'app_key') = 'string'
+                            AND jsonb_typeof(manifest->'source_revision') = 'string'
+                            AND jsonb_typeof(manifest->'image_digest') = 'string'
+                            AND jsonb_typeof(manifest->'schema_version') = 'number'
+                            AND jsonb_typeof(manifest->'schema') = 'object'
+                            AND jsonb_typeof(manifest->'transition_plans') = 'array'
                         );
                 END IF;
                 IF NOT EXISTS (

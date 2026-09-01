@@ -7,6 +7,25 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Added the strict App Release Manifest v2 contract
+
+App release registration now requires a v2-only manifest with immutable app
+identity, full source revision, immutable OCI `sha256:` image digest, product
+schema version, complete desired table projection, and source-specific
+transition plans. Canonical NFC/sorted-key/compact-JSON checksums cover the
+release version, provenance, desired schema, and every plan. v1 payloads,
+unknown fields, raw SQL, expressions, custom code, and destructive operations
+are rejected without a compatibility fallback.
+
+Fresh plans create complete table descriptors, including required columns,
+unique keys, and indexes. Existing-installation rollout and resume select only
+an exact source release/schema fingerprint plan and fail closed before schema
+mutation when one is missing or ambiguous. Legacy adoption derives its
+expected fingerprint from the v2 desired projection; operators no longer send
+a second expected checksum. Migration 095 enforces the v2 registry shape, so
+deployments with historical v1 release rows must resolve that registry state
+before upgrade.
+
 ### Added a tenant stats snapshot on its own port
 
 A new `/stats` surface reports coarse inventory — database and file bytes,

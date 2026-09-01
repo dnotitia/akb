@@ -17,7 +17,7 @@ from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, ValidationError
 from app.repositories import table_data_repo, table_registry_repo
-from app.services import app_rollout_service
+from app.services import app_rollout_service, table_service
 from app.services._backfill import BackfillRunner
 from app.services.app_inventory_service import expected_schema_fingerprint
 from app.services.app_resource_service import (
@@ -150,10 +150,12 @@ async def _preflight_target(conn: Any, target: dict[str, Any]) -> tuple[bool, st
         """,
         target["installation_id"], target["app_id"],
     )
-    if row is None or row["lifecycle"] != "upgrading" or row["desired_release_id"] != target["release_id"]:
+    if row is None or row["lifecycle"] not in {"installing", "upgrading"} or row["desired_release_id"] != target["release_id"]:
         return False, "installation_stale"
     if row["grant_status"] != "active" or row["active_generation"] != row["grant_generation"]:
         return False, "grant_stale"
+    if row["current_release_id"] is None and row["lifecycle"] == "installing":
+        return True, None
     if row["observed_generation"] is None or row["observed_release_id"] != row["current_release_id"] or row["observed_grant_generation"] != row["grant_generation"]:
         return False, "observed_stale"
     return True, None
@@ -182,6 +184,14 @@ async def _create_table_owned(conn: Any, target: dict[str, Any], payload: dict[s
         raise ConflictError("Rollout vault is unavailable")
     columns = list(payload["columns"])
     pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
+    _, unique_keys, indexes = table_service._canonical_create_spec(
+        vault_name=vault["name"],
+        name=table_name,
+        columns=columns,
+        unique_keys=list(payload.get("unique_keys") or []),
+        indexes=list(payload.get("indexes") or []),
+        normalize_columns=False,
+    )
     table_id = uuid.uuid4()
     await table_data_repo.create_dynamic_table(
         conn,
@@ -191,6 +201,20 @@ async def _create_table_owned(conn: Any, target: dict[str, Any], payload: dict[s
         vault_id=target["vault_id"],
         resource_uri=table_uri(vault["name"], table_name),
     )
+    for unique_key in unique_keys:
+        await table_data_repo.create_unique_constraint(
+            conn,
+            pg_name,
+            unique_key["name"],
+            unique_key["columns"],
+        )
+    for index in indexes:
+        await table_data_repo.create_index(
+            conn,
+            pg_name,
+            index["name"],
+            [(column["name"], column["order"]) for column in index["columns"]],
+        )
     await table_registry_repo.insert(
         conn,
         table_id=table_id,
@@ -200,6 +224,8 @@ async def _create_table_owned(conn: Any, target: dict[str, Any], payload: dict[s
         columns=columns,
         created_by="app-rollout-worker",
         now=datetime.now(timezone.utc),
+        unique_keys=unique_keys,
+        indexes=indexes,
     )
     await get_role_sync().grant_table_in_conn(conn, target["vault_id"], pg_name)
     await conn.execute(
@@ -213,7 +239,7 @@ async def _run_backfill(conn: Any, target: dict[str, Any], step: dict[str, Any],
     column = _safe_identifier(payload["column"])
     primary_key = _safe_identifier(payload["primary_key"])
     if primary_key != "id":
-        raise ValidationError("v1 backfill cursor must use the stable id primary key")
+        raise ValidationError("backfill cursor must use the stable id primary key")
     vault_name = await conn.fetchval("SELECT name FROM vaults WHERE id=$1", target["vault_id"])
     if not vault_name:
         raise ConflictError("Rollout vault is unavailable")
@@ -295,6 +321,28 @@ async def _execute_step(conn: Any, target: dict[str, Any], step: dict[str, Any],
                 app_id=target["app_id"],
             ),
         )
+    elif operation == "add_unique_key":
+        await alter_table(
+            target["vault_id"],
+            table_name,
+            actor_id="app-rollout-worker",
+            add_unique_keys=[
+                {
+                    key: value
+                    for key, value in {
+                        "name": payload.get("name"),
+                        "columns": payload["columns"],
+                    }.items()
+                    if value is not None
+                }
+            ],
+            _conn=conn,
+            _defer_index=True,
+            _ownership_context=TableOwnershipContext(
+                installation_id=target["installation_id"],
+                app_id=target["app_id"],
+            ),
+        )
     elif operation == "add_index":
         await alter_table(
             target["vault_id"],
@@ -302,8 +350,8 @@ async def _execute_step(conn: Any, target: dict[str, Any], step: dict[str, Any],
             actor_id="app-rollout-worker",
             add_indexes=[
                 {
-                    "name": payload["name"],
-                    "columns": [{"name": c, "order": "asc"} for c in payload["columns"]],
+                    "name": payload.get("name"),
+                    "columns": payload["columns"],
                 }
             ],
             _conn=conn,
@@ -371,20 +419,51 @@ async def _process_target(target: dict[str, Any]) -> None:
                 await _mark_job_blocked(conn, target, reason or "preflight_failed")
                 return
             job = await conn.fetchrow("SELECT release_id, manifest_checksum FROM app_rollout_jobs WHERE id=$1", target["job_id"])
-            release = await conn.fetchrow("SELECT manifest FROM app_releases WHERE app_id=$1 AND id=$2", target["app_id"], target["release_id"])
+            release = await conn.fetchrow(
+                "SELECT version, manifest FROM app_releases WHERE app_id=$1 AND id=$2",
+                target["app_id"],
+                target["release_id"],
+            )
             if job is None or release is None:
                 await _mark_job_blocked(conn, target, "release_missing")
                 return
             try:
-                manifest = app_rollout_service.validate_manifest(release["manifest"], job["manifest_checksum"])
+                manifest = app_rollout_service.validate_manifest(
+                    release["manifest"],
+                    job["manifest_checksum"],
+                    version=release["version"],
+                )
             except Exception:
                 await _mark_job_blocked(conn, target, "manifest_invalid")
+                return
+            source = await conn.fetchrow(
+                """
+                SELECT current_release.version AS current_version,
+                       observed.schema_fingerprint
+                  FROM vault_app_installations AS installation
+                  LEFT JOIN app_releases AS current_release
+                    ON current_release.id = installation.current_release_id
+                  LEFT JOIN app_installation_observed_states AS observed
+                    ON observed.installation_id = installation.id
+                 WHERE installation.id = $1 AND installation.app_id = $2
+                """,
+                target["installation_id"],
+                target["app_id"],
+            )
+            try:
+                plan = app_rollout_service.select_transition_plan(
+                    manifest,
+                    current_release_version=source["current_version"] if source else None,
+                    current_schema_fingerprint=source["schema_fingerprint"] if source else None,
+                )
+            except ValidationError:
+                await _mark_job_blocked(conn, target, "source_plan_unavailable")
                 return
             steps = await conn.fetch("SELECT id, step_id, step_order, operation, state, checkpoint, reason_code FROM app_rollout_steps WHERE target_id=$1 ORDER BY step_order", target["id"])
             for step in steps:
                 if step["state"] in {"applied", "replayed"}:
                     continue
-                manifest_step = next((item for item in manifest["steps"] if item["id"] == step["step_id"]), None)
+                manifest_step = next((item for item in plan["steps"] if item["id"] == step["step_id"]), None)
                 if manifest_step is None:
                     await _mark_job_blocked(conn, target, "step_missing")
                     return
@@ -414,7 +493,10 @@ async def _process_target(target: dict[str, Any]) -> None:
             except Exception:
                 await _mark_job_blocked(conn, target, "schema_unavailable")
                 return
-            if expected is not None and actual.lower() != expected.lower():
+            if expected is None:
+                await _mark_job_blocked(conn, target, "schema_projection_missing")
+                return
+            if actual.lower() != expected.lower():
                 await _mark_job_blocked(conn, target, "schema_mismatch")
                 return
             await conn.execute("UPDATE app_rollout_targets SET state='applied', lease_owner=NULL, lease_expires_at=NULL, completed_at=NOW() WHERE id=$1", target["id"])
@@ -422,6 +504,26 @@ async def _process_target(target: dict[str, Any]) -> None:
             observed = await conn.fetchrow("SELECT observed_generation, observed_at, observed_grant_generation FROM app_installation_observed_states WHERE installation_id=$1", target["installation_id"])
             if observed:
                 await conn.execute("UPDATE app_installation_observed_states SET observed_generation=GREATEST(observed_generation,$2), observed_at=GREATEST(observed_at,NOW()), observed_release_id=$3, observed_release_version=(SELECT version FROM app_releases WHERE id=$3), schema_fingerprint=$5, observed_grant_generation=$4, checkpoint='{}'::jsonb, recent_error=NULL WHERE installation_id=$1", target["installation_id"], observed["observed_generation"] + 1, target["release_id"], observed["observed_grant_generation"], actual if expected is not None else None)
+            else:
+                await conn.execute(
+                    """
+                    INSERT INTO app_installation_observed_states(
+                        installation_id, app_id, vault_id, observed_generation,
+                        observed_at, observed_release_id, observed_release_version,
+                        schema_fingerprint, observed_grant_generation, checkpoint
+                    )
+                    SELECT $1, $2, $3, 0, NOW(), $4, release.version,
+                           $5, installation.grant_generation, '{}'::jsonb
+                      FROM vault_app_installations AS installation
+                      JOIN app_releases AS release ON release.id = $4
+                     WHERE installation.id = $1 AND installation.app_id = $2
+                    """,
+                    target["installation_id"],
+                    target["app_id"],
+                    target["vault_id"],
+                    target["release_id"],
+                    actual,
+                )
             remaining = await conn.fetchval("SELECT COUNT(*) FROM app_rollout_targets WHERE job_id=$1 AND state NOT IN ('applied','replayed')", target["job_id"])
             await conn.execute("UPDATE app_rollout_jobs SET status=$2, completed_at=CASE WHEN $2='applied' THEN NOW() ELSE completed_at END WHERE id=$1", target["job_id"], "applied" if not remaining else "running")
             await conn.execute(

@@ -23,6 +23,37 @@ installation, inventory, and rollout routes use the shared models in
 IDs. The checked-in control-plane fixture is compared with `app.openapi()` so
 route status, request, success, and error references cannot drift silently.
 
+## App Release Manifest v2
+
+Release registration accepts one strict, immutable v2 manifest. It contains
+`manifest_version: 2`, the immutable `app_key`, full `source_revision`, an
+immutable OCI `image_digest`, `schema_version`, and a complete `schema`
+projection. The projection contains every table's canonical `name`, `columns`,
+`unique_keys`, and `indexes`, plus its derived `fingerprint`. The manifest also
+contains `transition_plans`: exactly one `fresh` plan and zero or more plans
+whose source is the exact `{release_version, schema_fingerprint}` pair.
+
+Steps use only bounded structured operations. A fresh `create_table` step must
+carry the complete final table descriptor, including required column flags,
+unique keys, and indexes. Raw SQL, expressions, custom code, and destructive
+operations are rejected. The worker selects a source plan before mutating a
+target; missing, ambiguous, or mismatched source identity blocks or rejects the
+request with a bounded reason.
+
+The canonical checksum uses the normalized v2 projection encoded as
+NFC-normalized, sorted-key, compact UTF-8 JSON. Each step checksum covers its
+normalized structured step, and the release checksum covers the product
+version together with app identity, provenance, desired schema, and every
+transition plan. A release's app identity must match the registered app. The
+v2 migration removes the v1 release shape; it does not
+translate historical v1 rows or provide an alias/fallback path, so operators
+must resolve any legacy registry state before applying the release.
+
+Legacy adoption no longer accepts an operator-supplied expected fingerprint.
+It derives the expected value from the v2 desired-schema projection and only
+adopts an exact canonical baseline. The same projection/fingerprint helper is
+used by inventory drift, rollout postflight, and adoption preflight.
+
 ## SDK facade
 
 `control-plane.gen.ts` is the generated operation/type boundary. The facade in

@@ -16,6 +16,8 @@ import {
   createControlPlaneAppClient,
   exchangeAppCredential,
   type ControlPlaneOperations,
+  type DesiredSchemaProjection,
+  type ReleaseManifest,
   type RolloutRequest,
 } from "@akb/client/control-plane";
 
@@ -51,6 +53,10 @@ type _ControlPlaneOperation = Assert<
 >;
 type _ControlPlaneRollout = Assert<
   Equal<RolloutRequest["manifest_checksum"], string>
+>;
+type _ManifestVersion = Assert<Equal<ReleaseManifest["manifest_version"], 2>>;
+type _ManifestSchema = Assert<
+  Equal<ReleaseManifest["schema"], DesiredSchemaProjection>
 >;
 
 const main = createClient({

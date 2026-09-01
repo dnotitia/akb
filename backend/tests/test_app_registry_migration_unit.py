@@ -89,10 +89,16 @@ async def _release(
     conn: asyncpg.Connection,
     app_id: uuid.UUID,
     version: str,
-    *,
-    steps: list[dict[str, object]] | None = None,
 ) -> uuid.UUID:
-    manifest = {"steps": steps or [{"id": "prepare"}, {"id": "apply"}]}
+    manifest = {
+        "manifest_version": 2,
+        "app_key": "registry-test",
+        "source_revision": "a" * 40,
+        "image_digest": "sha256:" + "b" * 64,
+        "schema_version": 3,
+        "schema": {"tables": [], "fingerprint": hashlib.sha256(b"[]").hexdigest()},
+        "transition_plans": [{"source": "fresh", "steps": []}],
+    }
     encoded = json.dumps(manifest, separators=(",", ":"))
     checksum = hashlib.sha256(encoded.encode()).hexdigest()
     return await conn.fetchval(
@@ -345,12 +351,7 @@ async def test_release_rows_are_immutable_including_manifest_order_and_checksum(
         await _apply(conn)
         app_a = await _app(conn, f"release-a-{uuid.uuid4().hex}")
         app_b = await _app(conn, f"release-b-{uuid.uuid4().hex}")
-        release_id = await _release(
-            conn,
-            app_a,
-            "1.2.3",
-            steps=[{"id": "first"}, {"id": "second"}],
-        )
+        release_id = await _release(conn, app_a, "1.2.3")
         before = await conn.fetchrow(
             "SELECT app_id, version, manifest, manifest_checksum, registered_at FROM app_releases WHERE id = $1",
             release_id,
