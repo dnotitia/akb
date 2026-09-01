@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: akb
       POSTGRES_DB: akb
     ports:
-      - "15432:5432"
+      - "${AKB_E2E_POSTGRES_PORT:-15432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -22,7 +22,7 @@ services:
       MINIO_ROOT_USER: akb-ci
       MINIO_ROOT_PASSWORD: akb-ci-secret
     ports:
-      - "9000:9000"
+      - "${AKB_E2E_MINIO_PORT:-9000}:9000"
     volumes:
       - minio_data:/data
     healthcheck:

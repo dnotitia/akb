@@ -303,9 +303,34 @@ def test_suite_sql_uses_compose_psql_by_default_and_preserves_override(tmp_path,
     monkeypatch.delenv("AKB_PG_EXEC", raising=False)
     child_env = runtime._child_environment()
     assert child_env["AKB_PG_EXEC"].endswith("exec -T postgres")
+    assert child_env["AKB_E2E_POSTGRES_PORT"] == "15432"
+    assert child_env["AKB_E2E_MINIO_PORT"] == "9000"
 
     monkeypatch.setenv("AKB_PG_EXEC", "custom-pg-command")
     assert runtime._child_environment()["AKB_PG_EXEC"] == "custom-pg-command"
+
+
+def test_runtime_uses_selected_dependency_ports_consistently(tmp_path):
+    runtime = E2ERuntime(
+        dataclasses.replace(
+            make_config(tmp_path),
+            postgres_port=25432,
+            minio_port=29000,
+        )
+    )
+    prepare_private_runtime_root(runtime.config.runtime_root)
+
+    runtime._write_config()
+
+    child_env = runtime._child_environment()
+    app_config = yaml.safe_load(
+        (runtime.config.config_dir / "app.yaml").read_text(encoding="utf-8")
+    )
+    assert child_env["AKB_E2E_POSTGRES_PORT"] == "25432"
+    assert child_env["AKB_E2E_MINIO_PORT"] == "29000"
+    assert app_config["db_port"] == 25432
+    assert app_config["s3_endpoint_url"] == "http://127.0.0.1:29000"
+    assert app_config["s3_public_url"] == "http://127.0.0.1:29000"
 
 
 def test_runtime_root_is_private_and_separate(tmp_path):
@@ -986,8 +1011,12 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
     assert compose["services"]["minio"]["image"] == (
         "minio/minio:RELEASE.2025-09-07T16-13-09Z"
     )
-    assert compose["services"]["postgres"]["ports"] == ["15432:5432"]
-    assert compose["services"]["minio"]["ports"] == ["9000:9000"]
+    assert compose["services"]["postgres"]["ports"] == [
+        "${AKB_E2E_POSTGRES_PORT:-15432}:5432"
+    ]
+    assert compose["services"]["minio"]["ports"] == [
+        "${AKB_E2E_MINIO_PORT:-9000}:9000"
+    ]
 
     workflow = WORKFLOW.read_text()
     assert "backend/scripts/ci/e2e_runtime.py gate" in workflow

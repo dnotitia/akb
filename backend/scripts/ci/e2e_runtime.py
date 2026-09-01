@@ -64,6 +64,8 @@ DEFAULT_PASSWORD_ENV = "AKB_E2E_PASSWORD"
 DEFAULT_APP_PORT = 8000
 DEFAULT_EMBED_PORT = 8888
 DEFAULT_FIXTURE_PORT = 8889
+DEFAULT_POSTGRES_PORT = 15432
+DEFAULT_MINIO_PORT = 9000
 DEFAULT_COMPOSE_PROJECT = "akb-e2e"
 DEFAULT_TIMEOUT_SECONDS = 180.0
 DEFAULT_PROFILE = "tool-only"
@@ -195,6 +197,8 @@ class RuntimeConfig:
     embed_port: int = DEFAULT_EMBED_PORT
     fixture_host: str = "127.0.0.1"
     fixture_port: int = DEFAULT_FIXTURE_PORT
+    postgres_port: int = DEFAULT_POSTGRES_PORT
+    minio_port: int = DEFAULT_MINIO_PORT
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     credentials: CredentialNames = dataclasses.field(default_factory=CredentialNames)
     scenario: Scenario = SCENARIO
@@ -216,6 +220,10 @@ class RuntimeConfig:
     @property
     def fixture_origin(self) -> str:
         return f"http://{self.fixture_host}:{self.fixture_port}"
+
+    @property
+    def minio_origin(self) -> str:
+        return f"http://127.0.0.1:{self.minio_port}"
 
     @property
     def state_dir(self) -> Path:
@@ -793,7 +801,11 @@ class E2ERuntime:
                 ):
                     return False
                 connection = await asyncpg.connect(
-                    host="127.0.0.1", port=15432, user="akb", password="akb", database="akb"
+                    host="127.0.0.1",
+                    port=self.config.postgres_port,
+                    user="akb",
+                    password="akb",
+                    database="akb",
                 )
                 try:
                     current = await connection.fetchval(
@@ -838,7 +850,11 @@ class E2ERuntime:
             if not isinstance(vault_id, str):
                 return False
             connection = await asyncpg.connect(
-                host="127.0.0.1", port=15432, user="akb", password="akb", database="akb"
+                host="127.0.0.1",
+                port=self.config.postgres_port,
+                user="akb",
+                password="akb",
+                database="akb",
             )
             try:
                 vault_name = await connection.fetchval("SELECT name FROM vaults WHERE id=$1", uuid.UUID(vault_id))
@@ -872,7 +888,11 @@ class E2ERuntime:
                 ):
                     return False
                 connection = await asyncpg.connect(
-                    host="127.0.0.1", port=15432, user="akb", password="akb", database="akb"
+                    host="127.0.0.1",
+                    port=self.config.postgres_port,
+                    user="akb",
+                    password="akb",
+                    database="akb",
                 )
                 try:
                     await connection.execute(
@@ -900,7 +920,11 @@ class E2ERuntime:
             if not isinstance(vault_id, str):
                 return False
             connection = await asyncpg.connect(
-                host="127.0.0.1", port=15432, user="akb", password="akb", database="akb"
+                host="127.0.0.1",
+                port=self.config.postgres_port,
+                user="akb",
+                password="akb",
+                database="akb",
             )
             try:
                 vault_name = await connection.fetchval(
@@ -1095,7 +1119,7 @@ class E2ERuntime:
             "local_session_private_key_path": str(local_key_dir / "private.pem"),
             "local_session_jwks_path": str(local_key_dir / "jwks.json"),
             "db_host": "127.0.0.1",
-            "db_port": 15432,
+            "db_port": self.config.postgres_port,
             "db_name": "akb",
             "db_user": "akb",
             "public_base_url": self.config.app_origin,
@@ -1107,8 +1131,8 @@ class E2ERuntime:
             "llm_base_url": "",
             "llm_model": "",
             "rerank_enabled": False,
-            "s3_endpoint_url": "http://127.0.0.1:9000",
-            "s3_public_url": "http://127.0.0.1:9000",
+            "s3_endpoint_url": self.config.minio_origin,
+            "s3_public_url": self.config.minio_origin,
             "s3_bucket": "akb-files",
         }
         if self.oidc_fixture is not None:
@@ -1147,6 +1171,8 @@ class E2ERuntime:
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONFAULTHANDLER"] = "1"
         env["AKB_URL"] = self.config.app_origin
+        env["AKB_E2E_POSTGRES_PORT"] = str(self.config.postgres_port)
+        env["AKB_E2E_MINIO_PORT"] = str(self.config.minio_port)
         if not env.get("AKB_PG_EXEC"):
             env["AKB_PG_EXEC"] = shlex.join(
                 [
@@ -1317,10 +1343,10 @@ class E2ERuntime:
 
     async def _start_dependencies(self) -> None:
         await self._compose("up", "--detach", "--wait")
-        await self._wait_tcp("PostgreSQL", "127.0.0.1", 15432)
+        await self._wait_tcp("PostgreSQL", "127.0.0.1", self.config.postgres_port)
         await self._wait_http(
             "MinIO",
-            "http://127.0.0.1:9000/minio/health/live",
+            f"{self.config.minio_origin}/minio/health/live",
             lambda status, _body: status == 200,
         )
         await asyncio.to_thread(self._ensure_minio_bucket)
@@ -1332,7 +1358,7 @@ class E2ERuntime:
 
             client = boto3.client(
                 "s3",
-                endpoint_url="http://127.0.0.1:9000",
+                endpoint_url=self.config.minio_origin,
                 aws_access_key_id="akb-ci",
                 aws_secret_access_key="akb-ci-secret",
             )
@@ -2922,7 +2948,7 @@ class E2ERuntime:
             system_admin_id = uuid.uuid4()
             connection = await asyncpg.connect(
                 host="127.0.0.1",
-                port=15432,
+                port=self.config.postgres_port,
                 user="akb",
                 password="akb",
                 database="akb",
