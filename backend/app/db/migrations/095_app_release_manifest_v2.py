@@ -19,6 +19,12 @@ async def migrate(conn=None):
 
 
 async def _run(conn):
+    if await conn.fetchval("SELECT to_regclass('public.app_releases')") is None:
+        logger.info(
+            "Migration 095 skipped: app_releases is not present in this partial schema"
+        )
+        return
+
     async with conn.transaction():
         await conn.execute(
             """
