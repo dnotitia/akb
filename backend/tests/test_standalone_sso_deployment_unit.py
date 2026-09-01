@@ -11,6 +11,7 @@ import yaml
 
 
 _ROOT = Path(__file__).resolve().parents[2]
+_K8S = _ROOT / "deploy" / "k8s"
 _OVERLAY = _ROOT / "deploy" / "k8s" / "standalone-sso"
 
 
@@ -35,15 +36,22 @@ def test_overlay_owns_dedicated_keycloak_and_database_without_committed_secrets(
         kind="Kustomization",
         resource_name=None,
     )
+    assert kustomization["resources"] == ["../base"]
+    assert kustomization["components"] == ["component"]
+
+    component = _one(
+        "component/kustomization.yaml",
+        kind="Component",
+        resource_name=None,
+    )
     assert {
-        "akb-postgres.yaml",
         "keycloak-postgres.yaml",
         "keycloak.yaml",
         "keycloak-ingress.yaml",
-    }.issubset(set(kustomization["resources"]))
+    }.issubset({Path(item).name for item in component["resources"]})
 
-    for path in _OVERLAY.glob("*.yaml"):
-        for document in _documents(path.name):
+    for path in _OVERLAY.rglob("*.yaml"):
+        for document in _documents(str(path.relative_to(_OVERLAY))):
             assert document.get("kind") != "Secret"
             assert "stringData" not in document
 
@@ -71,7 +79,14 @@ def test_keycloak_bootstrap_secret_is_required_for_first_boot_and_not_a_human_ad
 
 
 def test_akb_database_uses_the_shared_platform_secret_contract():
-    postgres = _one("akb-postgres.yaml", kind="StatefulSet", resource_name="postgres")
+    resources = [
+        item
+        for item in yaml.safe_load_all(
+            (_K8S / "postgres.yaml").read_text(encoding="utf-8")
+        )
+        if isinstance(item, dict)
+    ]
+    postgres = next(item for item in resources if item.get("kind") == "StatefulSet")
     container = postgres["spec"]["template"]["spec"]["containers"][0]
     assert "envFrom" not in container
     env = {item["name"]: item for item in container["env"]}
@@ -122,8 +137,8 @@ def test_backend_patch_removes_local_key_authority_and_mounts_one_time_inputs_on
 
 def test_legacy_profile_upgrade_job_is_explicit_opt_in_and_uses_temporary_service_admin():
     kustomization = _one(
-        "kustomization.yaml",
-        kind="Kustomization",
+        "component/kustomization.yaml",
+        kind="Component",
         resource_name=None,
     )
     assert "legacy-profile-upgrade-job.yaml" not in kustomization["resources"]

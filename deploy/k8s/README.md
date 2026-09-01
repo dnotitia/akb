@@ -19,8 +19,14 @@ and the selected Secret profile binds its reader identity to it.
 
 ```
 deploy/k8s/
-├── deploy.sh              # build → push → kubectl apply (kustomize base)
-├── kustomization.yaml     # base resources (pgvector default; qdrant.yaml not listed)
+├── deploy.sh              # common compatibility execution engine
+├── kustomization.yaml     # legacy standalone entry point → base/
+├── base/                  # canonical AKB + PostgreSQL resource composition
+├── profiles/              # public, directly executable deployment combinations
+│   ├── standalone/
+│   ├── standalone-sso/
+│   ├── standalone-secret-manager/
+│   └── standalone-sso-secret-manager/
 ├── namespace.yaml
 ├── postgres.yaml          # pgvector/pgvector:pg16 StatefulSet — hosts both
 │                          # the main DB and the vector_index schema
@@ -33,8 +39,8 @@ deploy/k8s/
 ├── frontend.yaml          # Deployment + Service
 ├── ingress.yaml           # placeholder host (akb.example.com)
 ├── secrets/               # stable Secret Contract v1 + manual/bundled/external producers
-├── standalone-sso/        # AKB + owned Keycloak 26.7 + dedicated Keycloak DB;
-│                          # temporary bootstrap service-account retirement
+├── standalone-sso/        # reusable SSO component + compatibility overlay;
+│                          # patches base rather than copying AKB/PostgreSQL
 └── internal/              # gitignored — operator-private overlays
     ├── deploy-internal.sh
     ├── cluster-issuer.yaml
@@ -101,14 +107,13 @@ $EDITOR deploy/k8s/backend.yaml
 # 3. Provide a ClusterIssuer named `letsencrypt-prod` (or change the
 #    annotation in ingress.yaml). cert-manager + your DNS provider.
 
-# 4. Choose one coherent installation profile. This example creates a
+# 4. Choose one coherent installation path. This example creates a
 #    brand-new local-auth/manual-Secret contract; production should provision
 #    `akb-secret` out-of-band instead.
-export AKB_PROFILE=standalone
 export GENERATE_MANUAL_SECRETS=true
 
 # 5. Apply.
-bash deploy/k8s/deploy.sh
+bash deploy/k8s/profiles/standalone/deploy.sh
 ```
 
 After the script finishes:
@@ -155,8 +160,10 @@ same unified `akb-secret` shape as current `akb-platform` workspaces:
 - The backend disables automatic ServiceAccount-token mounting and has no
   Secret Manager or Kubernetes Secret API permission.
 
-Choose one public `AKB_PROFILE`: `standalone`, `standalone-sso`,
-`standalone-secret-manager`, or `standalone-sso-secret-manager`. The two
+Choose one public path under [`profiles/`](profiles/README.md): `standalone`,
+`standalone-sso`, `standalone-secret-manager`, or
+`standalone-sso-secret-manager`. Each directory has its own executable
+`deploy.sh`, `profile.env`, and application-layer `kustomization.yaml`. The two
 `*-secret-manager` profiles bundle OpenBao or HashiCorp Vault; the other two
 can either use an operator-owned Kubernetes Secret or adapt an existing
 Vault-compatible endpoint with `SECRET_MODE=external`. See the complete
@@ -164,9 +171,10 @@ contracts, pinned chart versions, TLS/Raft profiles, native Shamir/PGP/Auto
 Seal operations, rotation boundary, and migration notes in
 [`secrets/README.md`](secrets/README.md).
 
-The SSO profiles select the standalone SSO Kustomize tree and require coherent
+The SSO profiles compose the standalone SSO component over the canonical base
+and require coherent
 `SSO_AKB_PUBLIC_URL` and `SSO_KEYCLOAK_PUBLIC_URL` origins plus the
 product-admin identity. Lower-level `AUTH_PROFILE` and `SECRET_MODE` remain
-compatibility/adapter inputs, but new installations should use
-`AKB_PROFILE` so an auth/Secret Manager combination cannot be assembled
-accidentally.
+compatibility/adapter inputs, but new installations should execute the
+matching profile path so supported combinations are discoverable without
+reading the common script.

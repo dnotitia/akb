@@ -246,7 +246,6 @@ def test_single_container_demo_is_not_presented_as_secret_manager_boundary():
     "manifest",
     [
         _ROOT / "deploy" / "k8s" / "postgres.yaml",
-        _ROOT / "deploy" / "k8s" / "standalone-sso" / "akb-postgres.yaml",
         _ROOT / "deploy" / "k8s" / "standalone-sso" / "keycloak-postgres.yaml",
     ],
 )

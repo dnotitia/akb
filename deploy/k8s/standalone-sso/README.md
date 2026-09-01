@@ -1,7 +1,9 @@
 # Standalone SSO Kubernetes bundle
 
-This overlay adds a Keycloak 26.7 broker and a dedicated Keycloak PostgreSQL
-database to the standalone AKB stack. It owns exactly one AKB realm and is not
+This compatibility overlay composes the canonical AKB base with a reusable SSO
+component that adds a Keycloak 26.7 broker and a dedicated Keycloak PostgreSQL
+database. AKB and its PostgreSQL manifest are not copied. It owns exactly one
+AKB realm and is not
 the deployment shape for a managed tenant that reuses a platform-owned
 Keycloak.
 
@@ -54,10 +56,10 @@ intentionally unable to mutate clients.
 
 ## Required operator inputs
 
-When using `deploy/k8s/deploy.sh` with `AKB_PROFILE=standalone-sso` or
-`AKB_PROFILE=standalone-sso-secret-manager`, provide these public values as
-environment variables. The deployer validates them and replaces the public
-placeholders in one render, before anything is applied:
+When using `deploy/k8s/profiles/standalone-sso/deploy.sh` or
+`deploy/k8s/profiles/standalone-sso-secret-manager/deploy.sh`, provide these
+public values as environment variables. The common deployer validates them and
+replaces the public placeholders in one render, before anything is applied:
 
 - `SSO_AKB_PUBLIC_URL` (for example `https://akb.example.com`)
 - `SSO_KEYCLOAK_PUBLIC_URL` (for example `https://auth.akb.example.com`)
@@ -106,7 +108,6 @@ bundled OpenBao, bundled HashiCorp Vault, and external Vault-compatible modes.
 For a fresh isolated installation:
 
 ```bash
-AKB_PROFILE=standalone-sso-secret-manager \
 NAMESPACE=akb-sso-example \
 SSO_AKB_PUBLIC_URL=https://akb.example.com \
 SSO_KEYCLOAK_PUBLIC_URL=https://auth.akb.example.com \
@@ -115,7 +116,7 @@ SSO_PRODUCT_ADMIN_EMAIL=admin@example.com \
 SECRET_ENGINE=openbao \
 SECRET_PROFILE=development \
 REGISTRY=registry.example.com \
-bash deploy/k8s/deploy.sh
+bash deploy/k8s/profiles/standalone-sso-secret-manager/deploy.sh
 ```
 
 The SSO profiles automatically select this Kustomize tree. The Secret profile

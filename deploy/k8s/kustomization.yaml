@@ -4,24 +4,7 @@ kind: Kustomization
 namespace: akb
 
 resources:
-  - postgres.yaml
-  - backend.yaml
-  - frontend.yaml
-  - ingress.yaml
+  - base
 
-# Vector store: default driver is pgvector running inside the main
-# Postgres pod (`postgres.yaml` already uses the pgvector/pgvector
-# image, so the extension is available; backend creates its own
-# `vector_index` schema). To run Qdrant as a separate StatefulSet
-# instead, add `qdrant.yaml` to this list and flip
-# `vector_store_driver` to `qdrant` (with vector_url set) in the
-# backend ConfigMap.
-
-# Redis event fanout is optional and disabled in the base app ConfigMap. Add
-# `redis.yaml` from an operator overlay only when the OT Redis Operator CRD is
-# installed and `redis_url` is configured; core PG outbox events do not need it.
-
-# The namespace is created by deploy.sh (or explicitly by the operator) so a
-# parent overlay can safely choose a namespace without also applying the
-# hard-coded `akb` Namespace object. No cluster-scoped objects live in this
-# base.
+# Compatibility entry point. New installations select an explicit directory
+# under profiles/, all of which compose the same canonical base.

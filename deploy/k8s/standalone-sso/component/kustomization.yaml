@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# SSO is an additive component over the canonical standalone AKB base. Keep
+# the compatibility overlay one directory up, and let every public profile
+# compose this component instead of copying the base PostgreSQL/AKB resources.
+resources:
+  - ../bootstrap-config.yaml
+  - ../keycloak-postgres.yaml
+  - ../keycloak.yaml
+  - ../keycloak-ingress.yaml
+
+patches:
+  - path: ../backend-config-patch.yaml
+  - path: ../backend-deployment-patch.yaml

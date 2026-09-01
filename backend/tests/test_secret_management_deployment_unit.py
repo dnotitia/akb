@@ -34,11 +34,18 @@ def _one(path: Path, *, kind: str, name: str) -> dict:
 
 
 def test_base_has_no_committed_secret_or_fixed_namespace_resource():
-    kustomization = yaml.safe_load((_K8S / "kustomization.yaml").read_text(encoding="utf-8"))
-    assert "namespace.yaml" not in kustomization["resources"]
+    compatibility = yaml.safe_load(
+        (_K8S / "kustomization.yaml").read_text(encoding="utf-8")
+    )
+    assert compatibility["resources"] == ["base"]
+    base_dir = _K8S / "base"
+    kustomization = yaml.safe_load(
+        (base_dir / "kustomization.yaml").read_text(encoding="utf-8")
+    )
+    assert "../namespace.yaml" not in kustomization["resources"]
 
     for resource in kustomization["resources"]:
-        path = _K8S / resource
+        path = base_dir / resource
         for document in _documents(path):
             assert document.get("kind") != "Secret"
             assert "stringData" not in document
@@ -256,7 +263,7 @@ def test_deploy_scripts_are_context_scoped_idempotent_and_fail_closed():
     assert 'get values "${SECRET_STORE_RELEASE}" -n "${NAMESPACE}"' in secret_deploy
     assert ".server.dev.devRootToken // empty" in secret_deploy
     assert "--wait --timeout 5m" in secret_deploy
-    assert 'AUTH_PROFILE="${AUTH_PROFILE:-local}"' in deploy
+    assert 'AUTH_PROFILE="${AUTH_PROFILE:-${PROFILE_AUTH}}"' in deploy
     assert 'AUTH_PROFILE="${AUTH_PROFILE:-local}"' in secret_deploy
     assert "vso-vault-compatible-sso.yaml" in secret_deploy
     assert "SSO_AKB_PUBLIC_URL" in deploy
@@ -265,6 +272,9 @@ def test_deploy_scripts_are_context_scoped_idempotent_and_fail_closed():
     assert 'SECRET_STORE_RELEASE="akb-sm-${NAMESPACE_DIGEST}"' in secret_deploy  # pragma: allowlist secret
     assert 'SECRET_STORE_POD="${STATEFULSET}-0"' in secret_deploy
     assert "standalone-sso-secret-manager" in deploy
+    assert 'PROFILE_FILE="${PROFILE_DIR}/profile.env"' in deploy
+    assert 'source "${PROFILE_FILE}"' in deploy
+    assert 'KUSTOMIZE_DIR="${KUSTOMIZE_DIR:-${PROFILE_DIR}}"' in deploy
     assert 'SECRET_SEAL_MODE="${SECRET_SEAL_MODE:-plaintext}"' in deploy
     assert 'SECRET_TOPOLOGY="${SECRET_TOPOLOGY:-production-ha}"' in deploy
     assert "validate-seal-inputs.sh" in deploy
@@ -330,6 +340,103 @@ def test_pgp_profile_rejects_missing_custody_inputs_before_deployment_action():
     ) in result.stderr
     assert "Building Docker images" not in result.stdout
     assert "Creating namespace" not in result.stdout
+
+
+def test_kubernetes_profiles_are_symmetric_discoverable_entry_points():
+    profiles = _K8S / "profiles"
+    expected = {
+        "standalone": ("local", "manual"),
+        "standalone-sso": ("sso", "manual"),
+        "standalone-secret-manager": ("local", "bundled"),
+        "standalone-sso-secret-manager": ("sso", "bundled"),
+    }
+    discovered = {path.parent.name for path in profiles.glob("*/profile.env")}
+    assert discovered == set(expected)
+
+    for name, (auth, secret_mode) in expected.items():
+        profile_dir = profiles / name
+        metadata = dict(
+            line.split("#", maxsplit=1)[0].strip().split("=", maxsplit=1)
+            for line in (profile_dir / "profile.env").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line
+        )
+        assert metadata == {
+            "PROFILE_AUTH": auth,
+            "PROFILE_SECRET": secret_mode,
+        }
+        assert (profile_dir / "kustomization.yaml").is_file()
+        wrapper = profile_dir / "deploy.sh"
+        assert wrapper.stat().st_mode & 0o111
+        assert f"AKB_PROFILE={name}" in wrapper.read_text(encoding="utf-8")
+
+
+def test_all_kubernetes_profile_application_layers_render(tmp_path: Path):
+    kubectl = shutil.which("kubectl")
+    if kubectl is None:
+        pytest.skip("kubectl is required for profile rendering")
+
+    profiles = _K8S / "profiles"
+    for name in (
+        "standalone",
+        "standalone-sso",
+        "standalone-secret-manager",
+        "standalone-sso-secret-manager",
+    ):
+        rendered = subprocess.run(
+            [
+                kubectl,
+                "kustomize",
+                "--load-restrictor=LoadRestrictionsNone",
+                str(profiles / name),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        ).stdout
+        resources = [
+            item for item in yaml.safe_load_all(rendered) if isinstance(item, dict)
+        ]
+        statefulsets = {
+            item["metadata"]["name"]
+            for item in resources
+            if item.get("kind") == "StatefulSet"
+        }
+        assert "postgres" in statefulsets
+        assert ("keycloak" in statefulsets) is ("-sso" in name)
+        assert not any(item.get("kind") == "Secret" for item in resources)
+
+        # deploy.sh wraps the selected profile in a generated namespace overlay
+        # through a symlink. Prove that the same composition remains renderable
+        # through that exact shape, not only from its source path.
+        generated = tmp_path / name
+        generated.mkdir()
+        (generated / "source").symlink_to(
+            profiles / name,
+            target_is_directory=True,
+        )
+        (generated / "kustomization.yaml").write_text(
+            "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+            "kind: Kustomization\n"
+            "namespace: akb-generated-test\n"
+            "resources:\n"
+            "  - source\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [
+                kubectl,
+                "kustomize",
+                "--load-restrictor=LoadRestrictionsNone",
+                str(generated),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
 
 
 def test_cert_manager_adapter_covers_service_and_all_ha_member_dns_names():

@@ -9,17 +9,16 @@
 # Optional env:
 #   NAMESPACE     K8s namespace (default: akb).
 #   KUBE_CONTEXT  Explicit kubectl context. Defaults to the current context.
-#   KUSTOMIZE_DIR Directory passed to `kubectl kustomize`. Defaults to
-#                 the script's own directory (= base manifests). Set to
+#   KUSTOMIZE_DIR Directory passed to `kubectl kustomize`. Defaults to the
+#                 selected profiles/<name> application layer. Set to
 #                 an overlay (e.g. deploy/k8s/internal) to apply private
 #                 hostnames, ClusterIssuers, and ConfigMap overrides in
 #                 a single atomic apply — no placeholder window.
 #   PUBLIC_URL    Printed at the end. Cosmetic only — the actual host
 #                 lives in ingress.yaml (or its overlay patch).
-#   AKB_PROFILE    standalone (default), standalone-sso,
-#                  standalone-secret-manager, or
-#                  standalone-sso-secret-manager. This is the public profile;
-#                  AUTH_PROFILE and SECRET_MODE remain compatibility inputs.
+#   AKB_PROFILE   Compatibility selector. New installs execute the matching
+#                 deploy/k8s/profiles/<name>/deploy.sh path directly;
+#                 AUTH_PROFILE and SECRET_MODE remain compatibility inputs.
 #   SECRET_MODE    manual (default), bundled, or external. Bundled is selected
 #                  by the *-secret-manager profiles; external is an adapter
 #                  override for standalone / standalone-sso.
@@ -31,75 +30,73 @@
 #                  otherwise provision akb-secret-store-tls out-of-band.
 #   STORAGE_CLASS StorageClass for AKB/PostgreSQL and bundled-manager PVCs.
 #
-# See deploy/k8s/README.md for the operator-overlay pattern.
+# See deploy/k8s/profiles/README.md for supported combinations and
+# deploy/k8s/README.md for the operator-overlay pattern.
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="${SCRIPT_DIR}/../.."
+PROFILES_DIR="${SCRIPT_DIR}/profiles"
 NAMESPACE="${NAMESPACE:-akb}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-}"
 SKIP_BUILD="${SKIP_BUILD:-false}"
 SECRET_PROFILE="${SECRET_PROFILE:-development}"
 AKB_PROFILE="${AKB_PROFILE:-}"
 
-# Keep the original AUTH_PROFILE/SECRET_MODE inputs as a compatibility layer,
-# but expose only four coherent top-level installation profiles going forward.
-# External Secret Managers are an ownership adapter, not another workload
-# profile, so standalone and standalone-sso may override manual with external.
+# Keep the original AUTH_PROFILE/SECRET_MODE inputs as a compatibility layer.
+# The supported combinations themselves live under profiles/<name>/profile.env
+# so `find deploy/k8s/profiles -name profile.env` is the source of truth and
+# adding a profile does not require another hidden branch in this script.
 if [[ -z "${AKB_PROFILE}" ]]; then
-  AUTH_PROFILE="${AUTH_PROFILE:-local}"
-  SECRET_MODE="${SECRET_MODE:-manual}"
-  if [[ "${AUTH_PROFILE}" == "sso" && "${SECRET_MODE}" == "bundled" ]]; then
+  legacy_auth_profile="${AUTH_PROFILE:-local}"
+  legacy_secret_mode="${SECRET_MODE:-manual}"
+  if [[ "${legacy_auth_profile}" == "sso" && "${legacy_secret_mode}" == "bundled" ]]; then
     AKB_PROFILE="standalone-sso-secret-manager"
-  elif [[ "${AUTH_PROFILE}" == "sso" ]]; then
+  elif [[ "${legacy_auth_profile}" == "sso" ]]; then
     AKB_PROFILE="standalone-sso"
-  elif [[ "${SECRET_MODE}" == "bundled" ]]; then
+  elif [[ "${legacy_secret_mode}" == "bundled" ]]; then
     AKB_PROFILE="standalone-secret-manager"
   else
     AKB_PROFILE="standalone"
   fi
-else
-  case "${AKB_PROFILE}" in
-    standalone)
-      PROFILE_AUTH="local"
-      PROFILE_SECRET="manual" # pragma: allowlist secret
-      ;;
-    standalone-sso)
-      PROFILE_AUTH="sso"
-      PROFILE_SECRET="manual" # pragma: allowlist secret
-      ;;
-    standalone-secret-manager)
-      PROFILE_AUTH="local"
-      PROFILE_SECRET="bundled" # pragma: allowlist secret
-      ;;
-    standalone-sso-secret-manager)
-      PROFILE_AUTH="sso"
-      PROFILE_SECRET="bundled" # pragma: allowlist secret
-      ;;
-    *)
-      echo "AKB_PROFILE must be standalone, standalone-sso, standalone-secret-manager, or standalone-sso-secret-manager" >&2
-      exit 2
-      ;;
-  esac
-  AUTH_PROFILE="${AUTH_PROFILE:-${PROFILE_AUTH}}"
-  SECRET_MODE="${SECRET_MODE:-${PROFILE_SECRET}}"
-  if [[ "${AUTH_PROFILE}" != "${PROFILE_AUTH}" ]]; then
-    echo "AUTH_PROFILE=${AUTH_PROFILE} conflicts with AKB_PROFILE=${AKB_PROFILE}" >&2
+fi
+
+PROFILE_DIR="${PROFILES_DIR}/${AKB_PROFILE}"
+PROFILE_FILE="${PROFILE_DIR}/profile.env"
+if [[ ! -f "${PROFILE_FILE}" ]]; then
+  echo "Unknown AKB_PROFILE=${AKB_PROFILE}. Available profile paths:" >&2
+  for candidate in "${PROFILES_DIR}"/*/profile.env; do
+    [[ -f "${candidate}" ]] && echo "  $(basename "$(dirname "${candidate}")")" >&2
+  done
+  exit 2
+fi
+
+PROFILE_AUTH=""
+PROFILE_SECRET="" # pragma: allowlist secret
+# profile.env is repository-owned static metadata, never operator input.
+# shellcheck disable=SC1090
+source "${PROFILE_FILE}"
+if [[ "${PROFILE_AUTH}" != "local" && "${PROFILE_AUTH}" != "sso" ]] ||
+   [[ "${PROFILE_SECRET}" != "manual" && "${PROFILE_SECRET}" != "bundled" ]]; then
+  echo "Invalid repository profile metadata: ${PROFILE_FILE}" >&2
+  exit 2
+fi
+
+AUTH_PROFILE="${AUTH_PROFILE:-${PROFILE_AUTH}}"
+SECRET_MODE="${SECRET_MODE:-${PROFILE_SECRET}}"
+if [[ "${AUTH_PROFILE}" != "${PROFILE_AUTH}" ]]; then
+  echo "AUTH_PROFILE=${AUTH_PROFILE} conflicts with AKB_PROFILE=${AKB_PROFILE}" >&2
+  exit 2
+fi
+if [[ "${PROFILE_SECRET}" == "manual" ]]; then
+  if [[ "${SECRET_MODE}" != "manual" && "${SECRET_MODE}" != "external" ]]; then
+    echo "${AKB_PROFILE} supports SECRET_MODE=manual or external; use a *-secret-manager profile for bundled" >&2
     exit 2
   fi
-  case "${AKB_PROFILE}" in
-    standalone|standalone-sso)
-      if [[ "${SECRET_MODE}" != "manual" && "${SECRET_MODE}" != "external" ]]; then
-        echo "${AKB_PROFILE} supports SECRET_MODE=manual or external; use a *-secret-manager profile for bundled" >&2
-        exit 2
-      fi
-      ;;
-    *-secret-manager)
-      if [[ "${SECRET_MODE}" != "bundled" ]]; then
-        echo "${AKB_PROFILE} requires SECRET_MODE=bundled" >&2
-        exit 2
-      fi
-      ;;
-  esac
+elif [[ "${SECRET_MODE}" != "bundled" ]]; then
+  echo "${AKB_PROFILE} requires SECRET_MODE=bundled" >&2
+  exit 2
 fi
 
 SECRET_SEAL_MODE="${SECRET_SEAL_MODE:-plaintext}"
@@ -110,13 +107,7 @@ SECRET_PGP_KEYS="${SECRET_PGP_KEYS:-}"
 SECRET_ROOT_TOKEN_PGP_KEY="${SECRET_ROOT_TOKEN_PGP_KEY:-}"
 SECRET_RECOVERY_PGP_KEYS="${SECRET_RECOVERY_PGP_KEYS:-}"
 SECRET_STORE_SEAL_CONFIG_SECRET="${SECRET_STORE_SEAL_CONFIG_SECRET:-}"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-if [[ "${AUTH_PROFILE}" == "sso" ]]; then
-  KUSTOMIZE_DIR="${KUSTOMIZE_DIR:-${SCRIPT_DIR}/standalone-sso}"
-else
-  KUSTOMIZE_DIR="${KUSTOMIZE_DIR:-${SCRIPT_DIR}}"
-fi
-ROOT_DIR="${SCRIPT_DIR}/../.."
+KUSTOMIZE_DIR="${KUSTOMIZE_DIR:-${PROFILE_DIR}}"
 
 KUBECTL=(kubectl)
 if [[ -n "${KUBE_CONTEXT}" ]]; then

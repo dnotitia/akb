@@ -4,7 +4,4 @@ kind: Kustomization
 namespace: akb
 
 resources:
-  - ../base
-
-components:
-  - component
+  - ../../base
