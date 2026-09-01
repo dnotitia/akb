@@ -1832,8 +1832,9 @@ class GitService:
     def _manual_fixed_ref_activity(self, repo: Repo, commit, file_path: str) -> dict:
         """Freeze the legacy public activity projection for one file commit."""
         metadata = self._legacy_commit_metadata(commit)
-        action = metadata["action"]
-        if action not in {"create", "update", "move", "delete"}:
+        declared_action = metadata["action"]
+        supported_actions = {"create", "update", "move", "delete"}
+        if declared_action and declared_action not in supported_actions:
             raise FixedRefHistoryError(
                 "fixed-ref current commit has no supported public activity action"
             )
@@ -1881,11 +1882,17 @@ class GitService:
                             "path_to": file_path,
                         }
                     )
-        if len(changes) != 1 or changes[0]["change"] != action:
+        if len(changes) != 1:
             raise FixedRefHistoryError(
                 "fixed-ref current commit activity does not match the file action"
             )
         selected_change = changes[0]
+        inferred_action = selected_change["change"]
+        action = declared_action or inferred_action
+        if action != inferred_action:
+            raise FixedRefHistoryError(
+                "fixed-ref current commit activity does not match the file action"
+            )
         return {
             "legacy_git_oid": commit.hexsha,
             "committed_at": datetime.fromtimestamp(
