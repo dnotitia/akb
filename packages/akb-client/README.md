@@ -44,6 +44,48 @@ const result = await akb.request("/tables/reef");
 const { data } = result.throwOnError();
 ```
 
+## Git dependencies and operational failures
+
+The package builds its `dist/` entrypoints from the `prepare` lifecycle, so a
+consumer can install the package directly from an immutable Git revision:
+
+```json
+{
+  "dependencies": {
+    "@akb/client": "git+https://github.com/dnotitia/akb.git#<full-40-character-sha>&path:/packages/akb-client"
+  }
+}
+```
+
+With pnpm 11.10.0, approve only the resolved Git artifact in the consumer's
+`pnpm-workspace.yaml`:
+
+```yaml
+allowBuilds:
+  "@akb/client@https://codeload.github.com/dnotitia/akb/tar.gz/<full-40-character-sha>#path:/packages/akb-client": true
+```
+
+All HTTP transport, cancellation, response-read, and JSON-parse failures are
+returned as `{ data: null, error: AkbError }`. SDK-local errors use these
+stable codes: `transport_error`, `request_aborted`, `response_read_error`, and
+`invalid_json`. `error.status` and `error.response` preserve an HTTP response
+when one exists; transport failures use `null` rather than a fabricated status.
+The SDK does not copy a credential, request URL/body, or signal reason into
+these errors. Injected fetch rejections are covered by this result boundary;
+invalid input/configuration and token-supplier or user-callback failures keep
+their native exception boundary.
+
+Pass a request-scoped signal to control-plane operations through their final
+options object (list options also accept `signal`), or to storage operations
+through their options:
+
+```ts
+const signal = new AbortController().signal;
+await admin.apps.get("app-id", { signal });
+await app.inventory.list({ limit: 10, signal });
+await exchangeAppCredential({ baseUrl, credential, signal });
+```
+
 Vault-scoped table administration is available through the immutable `.tables`
 facade. Request bodies use the generated public types, and migrations require
 an explicit idempotency key:

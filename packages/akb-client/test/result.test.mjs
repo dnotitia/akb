@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
 
-import { AkbError, createClient, createTypedFetch, unwrapAkbResponse } from "../src/index.js";
+import { AkbError, akbFetch, createClient, createTypedFetch, unwrapAkbResponse } from "../src/index.js";
 import { createClient as createLiteClient } from "../src/lite.js";
 
 // Computed at runtime so the fake key never appears as a string literal, which
@@ -38,9 +38,117 @@ test("unwrapAkbResponse maps HTTP errors to AkbError", () => {
   assert.ok(result.error instanceof AkbError);
   assert.equal(result.error.message, "permission denied for table incidents");
   assert.equal(result.error.code, "permission_denied");
+  assert.equal(result.error.status, 403);
   assert.deepEqual(result.error.details, { pg_sqlstate: "42501" });
   assert.equal(result.error.hint, "Check vault membership.");
   assert.throws(() => result.throwOnError(), AkbError);
+});
+
+test("akbFetch returns sanitized results for transport, cancel, read, and JSON failures", async () => {
+  const transport = await akbFetch("https://akb.test/private?token=secret", undefined, async () => {
+    throw new Error("network details must stay private");
+  });
+  assert.equal(transport.data, null);
+  assert.equal(transport.error?.code, "transport_error");
+  assert.equal(transport.error?.status, null);
+  assert.equal(transport.response, null);
+  assert.throws(() => transport.throwOnError(), AkbError);
+  assert.doesNotMatch(transport.error?.message ?? "", /network details|secret/);
+
+  const preAbortedController = new AbortController();
+  preAbortedController.abort(new Error("signal reason must stay private"));
+  let preAbortedFetchCalls = 0;
+  const preAborted = await akbFetch(
+    "https://akb.test",
+    { signal: preAbortedController.signal },
+    async () => {
+      preAbortedFetchCalls += 1;
+      return new Response(null, { status: 200 });
+    },
+  );
+  assert.equal(preAbortedFetchCalls, 0);
+  assert.equal(preAborted.error?.code, "request_aborted");
+  assert.equal(preAborted.error?.status, null);
+
+  const inFlightController = new AbortController();
+  const inFlight = await akbFetch(
+    "https://akb.test",
+    { signal: inFlightController.signal },
+    async () => {
+      throw new DOMException("abort reason must stay private", "AbortError");
+    },
+  );
+  assert.equal(inFlight.error?.code, "request_aborted");
+  assert.doesNotMatch(inFlight.error?.message ?? "", /abort reason|private/);
+
+  const responseRead = await akbFetch("https://akb.test", undefined, async () => ({
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    headers: new Headers({ "content-type": "application/json" }),
+    text: async () => {
+      throw new Error("response read details must stay private");
+    },
+  }));
+  assert.equal(responseRead.error?.code, "response_read_error");
+  assert.equal(responseRead.error?.status, 200);
+  assert.doesNotMatch(responseRead.error?.message ?? "", /response read details|private/);
+
+  const responseAbortController = new AbortController();
+  const responseAbort = await akbFetch(
+    "https://akb.test",
+    { signal: responseAbortController.signal },
+    async () => ({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      headers: new Headers({ "content-type": "application/json" }),
+      text: async () => {
+        throw new DOMException("response abort reason must stay private", "AbortError");
+      },
+    }),
+  );
+  assert.equal(responseAbort.error?.code, "request_aborted");
+  assert.equal(responseAbort.error?.status, 200);
+  assert.doesNotMatch(responseAbort.error?.message ?? "", /response abort reason|private/);
+
+  const malformedJson = await akbFetch(
+    "https://akb.test",
+    undefined,
+    async () => new Response("{not-json", {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  assert.equal(malformedJson.error?.code, "invalid_json");
+  assert.equal(malformedJson.error?.status, 200);
+
+  const text = await akbFetch(
+    "https://akb.test",
+    undefined,
+    async () => new Response('{"text":"not json"}', {
+      status: 200,
+      headers: { "content-type": "text/plain" },
+    }),
+  );
+  assert.equal(text.data, '{"text":"not json"}');
+  assert.equal(text.error, null);
+
+  const empty = await akbFetch("https://akb.test", undefined, async () => new Response(null, { status: 204 }));
+  assert.equal(empty.data, null);
+  assert.equal(empty.error, null);
+});
+
+test("client token supplier errors keep their native rejection boundary", async () => {
+  const client = createClient({
+    baseUrl: "https://akb.test/api/v1",
+    token: () => {
+      throw new Error("token supplier failure");
+    },
+    fetch: async () => new Response(null, { status: 204 }),
+  });
+
+  await assert.rejects(() => client.request("/health"), /token supplier failure/);
 });
 
 test("createClient sends bearer auth and JSON body through the boundary", async () => {
@@ -654,6 +762,76 @@ test("storage facade performs presigned upload, download, list, and delete flows
   assert.equal(new URL(listCalls.at(-1).url).searchParams.get("limit"), "200");
   assert.equal(listResult.throwOnError().data.total, 1);
   assert.equal(deleteResult.throwOnError().data.deleted, true);
+});
+
+test("storage direct transport and response-read failures return result errors with caller signals", async () => {
+  const fileId = "55555555-5555-4555-8555-555555555555";
+  const signal = new AbortController().signal;
+  const calls = [];
+  const uploadClient = createClient("https://akb.test/api/v1", {
+    fetch: async (input, init = {}) => {
+      const url = String(input);
+      calls.push({ url, signal: init.signal });
+      if (url === "https://storage.example/upload") {
+        throw new Error("direct upload details must stay private");
+      }
+      return responseJson({
+        kind: "file",
+        uri: `akb://eng/file/${fileId}`,
+        upload_url: "https://storage.example/upload",
+      });
+    },
+  });
+
+  const upload = await uploadClient.vault("eng").storage.upload("hello.txt", "hello", { signal });
+  assert.equal(upload.data, null);
+  assert.equal(upload.error?.code, "transport_error");
+  assert.equal(upload.error?.status, null);
+  assert.doesNotMatch(upload.error?.message ?? "", /direct upload details|private/);
+  assert.equal(calls[0].signal, signal);
+  assert.equal(calls[1].signal, signal);
+
+  let directDownloadMode = "transport";
+  const downloadClient = createClient("https://akb.test/api/v1", {
+    fetch: async (input, init = {}) => {
+      const url = String(input);
+      calls.push({ url, signal: init.signal });
+      if (url === "https://storage.example/download") {
+        if (directDownloadMode === "transport") {
+          throw new Error("direct download details must stay private");
+        }
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          headers: new Headers(),
+          arrayBuffer: async () => {
+            throw new Error("direct read details must stay private");
+          },
+        };
+      }
+      return responseJson({
+        kind: "file",
+        uri: `akb://eng/file/${fileId}`,
+        download_url: "https://storage.example/download",
+      });
+    },
+  });
+
+  const downloadTransport = await downloadClient.vault("eng").storage.download(fileId, { bytes: true, signal });
+  assert.equal(downloadTransport.data, null);
+  assert.equal(downloadTransport.error?.code, "transport_error");
+  assert.equal(downloadTransport.error?.status, null);
+  assert.doesNotMatch(downloadTransport.error?.message ?? "", /direct download details|private/);
+
+  directDownloadMode = "read";
+  const download = await downloadClient.vault("eng").storage.download(fileId, { bytes: true, signal });
+  assert.equal(download.data, null);
+  assert.equal(download.error?.code, "response_read_error");
+  assert.equal(download.error?.status, 200);
+  assert.doesNotMatch(download.error?.message ?? "", /direct read details|private/);
+  const directDownloadCalls = calls.filter((call) => call.url === "https://storage.example/download");
+  assert.ok(directDownloadCalls.every((call) => call.signal === signal));
 });
 
 test("storage facade resolves paths with a file collection segment through list lookup", async () => {

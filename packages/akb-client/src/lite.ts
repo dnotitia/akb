@@ -1,4 +1,5 @@
 export {
+  AKB_ERROR_CODES,
   AkbError,
   akbFetch,
   createClient,
@@ -11,6 +12,7 @@ export type {
   AkbClientConfig,
   AkbClientOptions,
   AkbErrorPayload,
+  AkbLocalErrorCode,
   AkbJsonValue,
   AkbNamespaceStub,
   AkbResult,

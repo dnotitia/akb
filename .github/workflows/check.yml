@@ -54,11 +54,34 @@ jobs:
         run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Install @akb/client deps
         working-directory: packages/akb-client
-        # Its own pnpm store: typescript + vitest. No postinstall build
-        # scripts, so a plain frozen install is enough for `pnpm run build`
-        # (tsc emit) and `pnpm exec vitest run` in scripts/check.sh.
+        # Its own pnpm store: typescript + vitest. The package's prepare
+        # lifecycle may emit dist/, while the contributor gate runs the
+        # explicit build again before its checks.
         run: pnpm install --frozen-lockfile
 
       # ── Single entry point so CI and local pre-commit stay in sync ──
       - name: Run scripts/check.sh
         run: bash scripts/check.sh
+
+  git-consumer:
+    name: Exact @akb/client Git consumer
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.10.0
+      - name: Prove exact Git dependency consumer
+        env:
+          AKB_GIT_REPOSITORY: https://github.com/${{ github.repository }}.git
+          AKB_GIT_SHA: ${{ github.event.pull_request.head.sha }}
+          AKB_GIT_SUBDIRECTORY: packages/akb-client
+        run: node packages/akb-client/scripts/prove-git-consumer.mjs

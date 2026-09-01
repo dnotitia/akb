@@ -1,7 +1,14 @@
-import { AkbError } from "./errors.js";
+import {
+  AKB_ERROR_CODES,
+  AkbError,
+  createLocalError,
+  isAbortError,
+} from "./errors.js";
 import { createQueryBuilder } from "./client/query-builder.js";
 
 export { AkbError } from "./errors.js";
+export { AKB_ERROR_CODES } from "./errors.js";
+export type { AkbLocalErrorCode } from "./errors.js";
 export { createTypedFetch } from "./core/fetch.js";
 
 export type {
@@ -364,6 +371,7 @@ export interface AkbDocumentUpdateInput {
 
 export interface AkbStorageVaultOptions {
   vault?: string | null;
+  signal?: AbortSignal | null;
 }
 
 export interface AkbStoragePresignUploadOptions extends AkbStorageVaultOptions {
@@ -704,12 +712,32 @@ export async function akbFetch<T = unknown>(
   init: RequestInit | undefined = undefined,
   fetchImpl: typeof fetch = globalThis.fetch,
 ): Promise<AkbResult<T>> {
-  if (typeof fetchImpl !== "function") {
-    throw new TypeError("A fetch implementation is required.");
+  requireFetchImplementation(fetchImpl);
+  const signal = init?.signal;
+  if (signal?.aborted) {
+    return localErrorResult<T>(AKB_ERROR_CODES.aborted);
   }
-  const response = await fetchImpl(input, init);
-  const body = await readBody(response);
-  return unwrapAkbResponse<T>(response, body);
+
+  let response: Response;
+  try {
+    response = await fetchImpl(input, init);
+  } catch (error) {
+    return localErrorResult<T>(
+      isAbortError(error, signal) ? AKB_ERROR_CODES.aborted : AKB_ERROR_CODES.transport,
+    );
+  }
+
+  try {
+    const body = await readBody(response, signal);
+    return unwrapAkbResponse<T>(response, body);
+  } catch (error) {
+    const code = error instanceof ResponseBodyError
+      ? error.code
+      : isAbortError(error, signal)
+        ? AKB_ERROR_CODES.aborted
+        : AKB_ERROR_CODES.responseRead;
+    return localErrorResult<T>(code, response);
+  }
 }
 
 /**
@@ -745,18 +773,87 @@ function makeResult<T>(
   };
 }
 
-async function readBody(response: Response): Promise<unknown> {
-  const text = await response.text();
-  if (!text) return null;
-  const contentType = response.headers.get("content-type") ?? "";
-  if (contentType.includes("application/json")) {
-    return JSON.parse(text);
+type LocalErrorCode = typeof AKB_ERROR_CODES[keyof typeof AKB_ERROR_CODES];
+
+function requireFetchImplementation(fetchImpl: typeof fetch): void {
+  if (typeof fetchImpl !== "function") {
+    throw new TypeError("A fetch implementation is required.");
   }
+}
+
+function localErrorResult<T>(
+  code: LocalErrorCode,
+  response: Pick<Response, "ok" | "status" | "statusText"> | null = null,
+): AkbResult<T> {
+  const errorResponse = response
+    ? { ok: response.ok, status: response.status, statusText: response.statusText }
+    : null;
+  return makeResult<T>(null, createLocalError(code, errorResponse), response);
+}
+
+async function fetchResponse(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  fetchImpl: typeof fetch,
+): Promise<AkbResult<Response>> {
+  requireFetchImplementation(fetchImpl);
+  if (init.signal?.aborted) return localErrorResult<Response>(AKB_ERROR_CODES.aborted);
   try {
-    return JSON.parse(text);
-  } catch {
-    return text;
+    const response = await fetchImpl(input, init);
+    return makeResult(response, null, response);
+  } catch (error) {
+    return localErrorResult<Response>(
+      isAbortError(error, init.signal) ? AKB_ERROR_CODES.aborted : AKB_ERROR_CODES.transport,
+    );
   }
+}
+
+async function readBody(
+  response: Response,
+  signal: AbortSignal | null | undefined,
+): Promise<unknown> {
+  let text: string;
+  try {
+    text = await response.text();
+  } catch (error) {
+    throw new ResponseBodyError(
+      isAbortError(error, signal) ? AKB_ERROR_CODES.aborted : AKB_ERROR_CODES.responseRead,
+    );
+  }
+  if (signal?.aborted) throw new ResponseBodyError(AKB_ERROR_CODES.aborted);
+  if (!text) return null;
+  let contentType = "";
+  try {
+    contentType = response.headers.get("content-type") ?? "";
+  } catch {
+    throw new ResponseBodyError(AKB_ERROR_CODES.responseRead);
+  }
+  const mediaType = contentType.split(";", 1)[0].trim().toLowerCase();
+  if (isJsonMediaType(mediaType)) {
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new ResponseBodyError(AKB_ERROR_CODES.invalidJson);
+    }
+  }
+  if (!mediaType) {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
+  }
+  return text;
+}
+
+class ResponseBodyError extends Error {
+  constructor(readonly code: "request_aborted" | "response_read_error" | "invalid_json") {
+    super(code);
+  }
+}
+
+function isJsonMediaType(mediaType: string): boolean {
+  return mediaType.endsWith("/json") || mediaType.endsWith("+json");
 }
 
 function asResponse(
@@ -1221,7 +1318,7 @@ function makeStorageFacade(
     appendOptional(params, "content_hash", options.contentHash);
     return request<import("./core/schema.gen.js").AkbFileEnvelope>(
       `/files/${encodePathSegment(vault)}/upload?${params}`,
-      { method: "POST" },
+      { method: "POST", signal: options.signal },
     );
   };
 
@@ -1238,7 +1335,7 @@ function makeStorageFacade(
     const query = params.size > 0 ? `?${params}` : "";
     return request<import("./core/schema.gen.js").AkbFileEnvelope>(
       `/files/${encodePathSegment(vault)}/${encodePathSegment(fileId)}/confirm${query}`,
-      { method: "POST" },
+      { method: "POST", signal: options.signal },
     );
   };
 
@@ -1255,10 +1352,17 @@ function makeStorageFacade(
     options: AkbStorageDownloadUrlOptions | AkbStorageDownloadBytesOptions = {},
   ): Promise<AkbResult<import("./core/schema.gen.js").AkbFileEnvelope | AkbStorageDownload>> {
     const vault = resolveStorageVault(options.vault ?? defaultVault);
-    const resolved = await resolveStorageFileRef(request, vault, fileRef, options.lookupLimit);
+    const resolved = await resolveStorageFileRef(
+      request,
+      vault,
+      fileRef,
+      options.lookupLimit,
+      options.signal,
+    );
     if (resolved.error) return resolved.error;
     const file = await request<import("./core/schema.gen.js").AkbFileEnvelope>(
       `/files/${encodePathSegment(vault)}/${encodePathSegment(resolved.fileId)}/download`,
+      { signal: options.signal },
     );
     if (file.error || !options.bytes) return file;
     if (!file.data) {
@@ -1274,7 +1378,30 @@ function makeStorageFacade(
         "missing_download_url",
       );
     }
-    const response = await fetchImpl(downloadUrl, options.fetchInit);
+    const directFetch = await fetchResponse(
+      downloadUrl,
+      {
+        ...options.fetchInit,
+        ...(options.fetchInit?.signal === undefined
+          ? { signal: options.signal }
+          : {}),
+      },
+      fetchImpl,
+    );
+    if (directFetch.error) {
+      return makeResult<import("./core/schema.gen.js").AkbFileEnvelope | AkbStorageDownload>(
+        null,
+        directFetch.error,
+        directFetch.response,
+      );
+    }
+    const response = directFetch.data;
+    if (!response) {
+      return errorResult<import("./core/schema.gen.js").AkbFileEnvelope | AkbStorageDownload>(
+        "Storage download did not return a response.",
+        "storage_response_missing",
+      );
+    }
     if (!response.ok) {
       return makeResult<import("./core/schema.gen.js").AkbFileEnvelope | AkbStorageDownload>(
         null,
@@ -1285,7 +1412,23 @@ function makeStorageFacade(
         response,
       );
     }
-    const bytes = await response.arrayBuffer();
+    let bytes: ArrayBuffer;
+    try {
+      bytes = await response.arrayBuffer();
+      if (options.fetchInit?.signal?.aborted || options.signal?.aborted) {
+        return localErrorResult<import("./core/schema.gen.js").AkbFileEnvelope | AkbStorageDownload>(
+          AKB_ERROR_CODES.aborted,
+          response,
+        );
+      }
+    } catch (error) {
+      return localErrorResult<import("./core/schema.gen.js").AkbFileEnvelope | AkbStorageDownload>(
+        isAbortError(error, options.fetchInit?.signal ?? options.signal)
+          ? AKB_ERROR_CODES.aborted
+          : AKB_ERROR_CODES.responseRead,
+        response,
+      );
+    }
     return makeResult({ kind: "file_download", file: file.data, bytes }, null, response);
   }
 
@@ -1301,11 +1444,23 @@ function makeStorageFacade(
       if (!uploadUrl) {
         return errorResult("Upload URL was not returned for the file.", "missing_upload_url");
       }
-      const response = await fetchImpl(uploadUrl, {
+      const directFetch = await fetchResponse(uploadUrl, {
         method: "PUT",
         body: file,
         headers: storageUploadHeaders(mimeType, options.headers),
-      });
+        signal: options.signal,
+      }, fetchImpl);
+      if (directFetch.error) {
+        return makeResult<import("./core/schema.gen.js").AkbFileEnvelope>(
+          null,
+          directFetch.error,
+          directFetch.response,
+        );
+      }
+      const response = directFetch.data;
+      if (!response) {
+        return errorResult("Storage upload did not return a response.", "storage_response_missing");
+      }
       if (!response.ok) {
         return makeResult(
           null,
@@ -1323,6 +1478,7 @@ function makeStorageFacade(
         vault: options.vault,
         contentHash: options.contentHash,
         hashAlgorithm: options.hashAlgorithm,
+        signal: options.signal,
       });
     },
     confirm,
@@ -1335,15 +1491,22 @@ function makeStorageFacade(
       const query = params.size > 0 ? `?${params}` : "";
       return request<import("./core/schema.gen.js").AkbFileEnvelope>(
         `/files/${encodePathSegment(vault)}${query}`,
+        { signal: options.signal },
       );
     },
     async delete(fileRef: string, options: AkbStorageRefOptions = {}) {
       const vault = resolveStorageVault(options.vault ?? defaultVault);
-      const resolved = await resolveStorageFileRef(request, vault, fileRef, options.lookupLimit);
+      const resolved = await resolveStorageFileRef(
+        request,
+        vault,
+        fileRef,
+        options.lookupLimit,
+        options.signal,
+      );
       if (resolved.error) return resolved.error;
       return request<import("./core/schema.gen.js").AkbFileEnvelope>(
         `/files/${encodePathSegment(vault)}/${encodePathSegment(resolved.fileId)}`,
-        { method: "DELETE" },
+        { method: "DELETE", signal: options.signal },
       );
     },
   } as AkbStorageFacade;
@@ -1559,6 +1722,7 @@ async function resolveStorageFileRef(
   vault: string,
   fileRef: string,
   lookupLimit: number | undefined,
+  signal: AbortSignal | null | undefined,
 ): Promise<{ fileId: string; error: null } | { fileId: null; error: AkbResult<import("./core/schema.gen.js").AkbFileEnvelope> }> {
   const direct = storageFileIdFromRef(fileRef);
   if (direct) return { fileId: direct, error: null };
@@ -1569,6 +1733,7 @@ async function resolveStorageFileRef(
   appendOptional(params, "limit", lookupLimit ?? 200);
   const listed = await request<import("./core/schema.gen.js").AkbFileEnvelope>(
     `/files/${encodePathSegment(vault)}?${params}`,
+    { signal },
   );
   if (listed.error) return { fileId: null, error: listed };
 
