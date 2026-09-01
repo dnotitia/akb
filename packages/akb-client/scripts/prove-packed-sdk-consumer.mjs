@@ -92,6 +92,7 @@ try {
 
   console.log(JSON.stringify({
     result: "passed",
+    distribution_channel: "npm-release-artifact",
     repository_source_absent: true,
     package_manager: "pnpm pack",
     operations: installedContract.operations.length,

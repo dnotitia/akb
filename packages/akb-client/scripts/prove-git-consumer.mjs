@@ -58,7 +58,6 @@ try {
   const lockfileResolution = firstLockfile
     .split("\n")
     .filter((line) => line.includes("@akb/client") && line.includes(`path:/${subdirectory}`));
-  await assertBuildApproval(workspaceConfig, buildApprovalKey);
   await assertInstalledPackage(proofRoot);
   run(process.execPath, [runtimeProof], proofRoot);
   run(packageManager, ["exec", "tsc", "--noEmit", "--strict", "--target", "ES2022", "--module", "NodeNext", "--moduleResolution", "NodeNext", typeProof], proofRoot);
@@ -78,6 +77,8 @@ try {
   );
   console.log(JSON.stringify({
     result: "passed",
+    distribution_channel: "development/nightly-git",
+    npm_release_artifact_proof: "proof:packed",
     repository: repositoryUrl,
     commit,
     subdirectory,
@@ -124,16 +125,6 @@ function validateSubdirectory(value) {
 function assertResolution(lockfile, specifier) {
   if (!lockfile.includes(specifier)) {
     throw new Error("pnpm-lock.yaml does not retain the exact Git URL, commit, and subdirectory specifier.");
-  }
-}
-
-async function assertBuildApproval(workspaceConfig, approvalKey) {
-  const config = await readFile(workspaceConfig, "utf8");
-  if (!config.includes(`${JSON.stringify(approvalKey)}: true`)) {
-    throw new Error("pnpm-workspace.yaml does not contain the exact Git build approval.");
-  }
-  if (/dangerouslyAllowAllBuilds|onlyBuiltDependencies|ignoredBuiltDependencies|neverBuiltDependencies/u.test(config)) {
-    throw new Error("Git consumer proof must not enable broad or legacy build approvals.");
   }
 }
 

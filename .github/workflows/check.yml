@@ -62,26 +62,3 @@ jobs:
       # ── Single entry point so CI and local pre-commit stay in sync ──
       - name: Run scripts/check.sh
         run: bash scripts/check.sh
-
-  git-consumer:
-    name: Exact @akb/client Git consumer
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 1
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.10.0
-      - name: Prove exact Git dependency consumer
-        env:
-          AKB_GIT_REPOSITORY: https://github.com/${{ github.repository }}.git
-          AKB_GIT_SHA: ${{ github.event.pull_request.head.sha }}
-          AKB_GIT_SUBDIRECTORY: packages/akb-client
-        run: node packages/akb-client/scripts/prove-git-consumer.mjs

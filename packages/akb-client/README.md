@@ -44,10 +44,12 @@ const result = await akb.request("/tables/reef");
 const { data } = result.throwOnError();
 ```
 
-## Git dependencies and operational failures
+## Distribution channels and operational failures
 
-The package builds its `dist/` entrypoints from the `prepare` lifecycle, so a
-consumer can install the package directly from an immutable Git revision:
+The final distribution channel for `@akb/client` is npm. This package does not
+publish anything as part of its build or CI lifecycle. Development and nightly
+consumers can instead install an immutable Git revision; the package builds its
+`dist/` entrypoints from the `prepare` lifecycle:
 
 ```json
 {
@@ -64,6 +66,10 @@ With pnpm 11.10.0, approve only the resolved Git artifact in the consumer's
 allowBuilds:
   "@akb/client@https://codeload.github.com/dnotitia/akb/tar.gz/<full-40-character-sha>#path:/packages/akb-client": true
 ```
+
+The exact Git consumer proof covers only that development/nightly channel.
+`pnpm run proof:packed` remains the authoritative consumer proof for a future
+npm release artifact; Git proof does not replace npm release validation.
 
 All HTTP transport, cancellation, response-read, and JSON-parse failures are
 returned as `{ data: null, error: AkbError }`. SDK-local errors use these
