@@ -39,7 +39,7 @@
     "proof:packed": "pnpm run build && node scripts/prove-packed-sdk-consumer.mjs",
     "test": "pnpm run build && vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "prepublishOnly": "pnpm run clean && pnpm run build"
+    "prepare": "pnpm run clean && pnpm run build"
   },
   "devDependencies": {
     "typescript": "~5.9.3",
