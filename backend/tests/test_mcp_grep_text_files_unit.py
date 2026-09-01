@@ -30,7 +30,7 @@ def test_akb_grep_schema_exposes_guarded_text_file_measurement_argument():
     assert "does not limit replacement writes" in grep.input_schema["properties"]["limit"]["description"]
     assert argument["type"] == "boolean"
     assert argument["default"] is False
-    assert "guarded native" in argument["description"].lower()
+    assert "native mode" in argument["description"].lower()
 
 
 @pytest.mark.asyncio
@@ -165,13 +165,48 @@ async def test_text_file_measurement_argument_fails_closed_when_native_arm_is_of
     monkeypatch.setattr(settings, "native_revision_m1_measurement_only", False)
     monkeypatch.setattr(settings, "db_name", "akb")
 
-    with pytest.raises(ValidationError, match="guarded native measurement backend"):
+    with pytest.raises(ValidationError, match="requires a native Document backend"):
         await SearchService().grep(
             "needle",
             vault="legacy-vault",
             user_id=str(uuid.uuid4()),
             measurement_include_text_files=True,
         )
+
+
+@pytest.mark.asyncio
+async def test_text_file_argument_is_accepted_by_stable_postgres_native(monkeypatch):
+    from app.services.m1_native_grep_service import M1NativeGrepService
+    from app.services.search_service import SearchService
+
+    monkeypatch.setattr(settings, "document_revision_backend", "postgres_native")
+    monkeypatch.setattr(settings, "native_revision_m1_measurement_only", False)
+    monkeypatch.setattr(settings, "db_name", "akb")
+    calls = []
+
+    async def grep_public(self, pattern, **kwargs):
+        calls.append((self, pattern, kwargs))
+        return {"pattern": pattern, "results": []}
+
+    monkeypatch.setattr(M1NativeGrepService, "grep_public", grep_public)
+    monkeypatch.setattr(
+        "app.services.search_service.get_pool",
+        lambda: _async_value(object()),
+    )
+
+    result = await SearchService().grep(
+        "needle",
+        vault="stable",
+        user_id=str(uuid.uuid4()),
+        measurement_include_text_files=True,
+    )
+
+    assert result == {"pattern": "needle", "results": []}
+    assert calls[0][2]["include_text_files"] is True
+
+
+async def _async_value(value):
+    return value
 
 
 def test_text_file_measurement_body_rejects_binary_bytes():

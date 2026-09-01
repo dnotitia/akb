@@ -850,6 +850,9 @@ async def test_reconcile_mark_success_branches(monkeypatch, action, mark_ok,
             return {}
 
     class _Git:
+        def vault_exists(self, name):
+            return False
+
         def ls_remote_head(self, url, branch, token):
             return "hint_sha"
 

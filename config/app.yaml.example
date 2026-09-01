@@ -243,6 +243,21 @@ app_credential_overlap_seconds: 300
 #                                         # Exact subject bindings need no email claim.
 #                                         # Set false ONLY for a trusted realm with
 #                                         # controlled emails.
+# sso_local_realm_login_enabled: false    # offer THIS installation's own realm as a
+#                                         # login option, for a deployment with no
+#                                         # external identity provider to broker to.
+#                                         # Off by default: an installation that
+#                                         # registers no provider keeps the behaviour
+#                                         # it has rather than gaining a login. The
+#                                         # kind appears as provider_type
+#                                         # `local-realm` under the reserved alias
+#                                         # `local`, carries no broker hint, and
+#                                         # requires the identity_provider claim to be
+#                                         # ABSENT where a brokered provider requires
+#                                         # it present and matching. Registering this
+#                                         # realm as its own upstream provider stays
+#                                         # refused; that would be an authorize loop.
+# sso_local_realm_display_name: "This workspace"  # label shown for that choice
 # keycloak_link_by_email is a deprecated migration marker; omit it. Setting it
 # to true fails canonical startup. Exact pre-binding is the only account-link path.
 # Ordinary AKB browser login uses authorization code + PKCE/nonce and a fixed

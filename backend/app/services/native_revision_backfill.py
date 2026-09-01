@@ -15,6 +15,7 @@ import asyncpg
 
 from app.exceptions import NotFoundError
 from app.repositories.native_revision_migration_repo import (
+    MigrationIntegrityError,
     MigrationRun,
     NativeRevisionMigrationRepository,
 )
@@ -139,6 +140,8 @@ class NativeRevisionBackfill:
                 failed_items=0,
                 skipped_items=0,
             )
+        if run.status == "superseded":
+            raise MigrationIntegrityError("superseded migration run cannot be backfilled")
         scope = await self.bridge.inventory_scope_for_run(run)
         inventory = scope.inventory
 

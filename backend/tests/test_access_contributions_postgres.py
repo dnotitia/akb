@@ -32,6 +32,9 @@ _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
 _MIGRATION_085 = (
     _BACKEND / "app" / "db" / "migrations" / "085_vault_access_contributions.py"
 )
+_MIGRATION_HEAD = (
+    _BACKEND / "app" / "db" / "migrations" / "094_native_revision_completed_reservation_transfer.py"
+)
 _MIGRATIONS_DIR = _BACKEND / "app" / "db" / "migrations"
 
 
@@ -54,8 +57,8 @@ def _registered_migrations() -> list[Path]:
         seen.add(name)
         ordered.append(_MIGRATIONS_DIR / name)
     assert ordered, "no migrations found in the registry"
-    assert ordered[-1].name == _MIGRATION_085.name, (
-        "085 must be the last registered migration for this test to be measuring "
+    assert ordered[-1].name == _MIGRATION_HEAD.name, (
+        "the expected migration must be last for this test to be measuring "
         f"the current head; registry ends at {ordered[-1].name}"
     )
     return ordered

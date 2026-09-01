@@ -46,6 +46,7 @@ from app.sso.keycloak_admin import (
     get_keycloak_provider_control,
 )
 from app.sso.providers.keycloak_oidc import ProviderDefinitionError, validate_alias
+from app.sso import local_realm
 from app.util.text import NFCModel
 
 router = APIRouter()
@@ -189,6 +190,21 @@ async def auth_config(response: Response):
             for provider in catalog
             if provider.state == "enabled"
         ]
+        # The installation's own realm, when its owner asked for it. It is not a
+        # Keycloak identity provider, so it is not in the catalog read above; it
+        # is appended here, at the one place that catalog becomes a browser's
+        # list of choices. Its alias is reserved, so it cannot collide with one.
+        if settings.sso_local_realm_login_enabled:
+            providers.append(
+                {
+                    "provider_type": local_realm.PROVIDER_TYPE,
+                    "alias": local_realm.ALIAS,
+                    "display_name": settings.sso_local_realm_display_name,
+                    "login_url": (
+                        f"/api/v1/auth/sso/{local_realm.ALIAS}/login" if browser_session_ready else None
+                    ),
+                }
+            )
     return {
         "schema_version": 2,
         "auth_mode": mode,
@@ -347,6 +363,16 @@ async def _require_enabled_provider(alias: str) -> str:
             status.HTTP_404_NOT_FOUND,
             "SSO provider is not enabled",
         ) from None
+    # The local realm is answered before the catalog is consulted: it is not in
+    # there, and a broker outage must not take away the one login that does not
+    # depend on a broker.
+    if local_realm.is_local_alias(alias):
+        if not settings.sso_local_realm_login_enabled:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                "SSO provider is not enabled",
+            )
+        return alias
     control = get_keycloak_provider_control()
     if control.control_mode != "direct":
         raise HTTPException(
@@ -373,6 +399,15 @@ def _require_signed_provider(
     expected_alias: str,
 ) -> None:
     value = claims.get("identity_provider")
+    # Present and matching for a brokered provider; ABSENT for the local realm,
+    # which brokers nowhere and so is never vouched for by anyone. The claim does
+    # not become optional -- an optional claim is a hole, and a token minted
+    # through one provider could then be presented for another. Each kind asserts
+    # the shape the other cannot produce.
+    if local_realm.is_local_alias(expected_alias):
+        if value is not None:
+            raise AuthenticationError("SSO sign-in failed")
+        return
     if not isinstance(value, str):
         raise AuthenticationError("SSO sign-in failed")
     try:

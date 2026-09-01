@@ -8,6 +8,7 @@ from urllib.parse import quote, urlsplit
 
 from app.sso.models import ProviderConfigureSpec, ProviderReadback, ProviderState
 from app.util.text import to_nfc
+from app.sso import local_realm
 
 
 PROVIDER_TYPE = "keycloak-oidc"
@@ -92,6 +93,8 @@ def validate_spec(spec: ProviderConfigureSpec, *, broker_issuer: str) -> Provide
     if spec.provider_type != PROVIDER_TYPE:
         raise ProviderDefinitionError("provider_type_mismatch")
     alias = validate_alias(spec.alias)
+    if local_realm.is_local_alias(alias):
+        raise ProviderDefinitionError("provider_alias_reserved")
     display_name = _clean_text(
         spec.display_name,
         maximum=80,

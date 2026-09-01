@@ -94,6 +94,15 @@ def _managed_repo(repo: Repo) -> Iterator[Repo]:
 # default-deny inspector.
 _MIRROR_MARKER = "akb-external-mirror"
 
+# An operator retirement moves the normal mirror marker through this
+# fail-closed tombstone before the sidecar is deleted.  A process crash cannot
+# then turn an external mirror into an ordinary GitPython-readable vault in the
+# gap between the filesystem and PostgreSQL phases: every read refuses while
+# this marker exists.  It is deliberately a sibling of ``_MIRROR_MARKER`` so
+# the transition stays under the same per-vault lock and storage containment
+# checks.
+_RETIRING_MIRROR_MARKER = "akb-external-mirror-retiring"
+
 # Slack over ``external_git_blob_max_bytes`` for the runner's STREAMING output
 # cap. The per-blob size pre-check already refuses an
 # over-cap blob, so a passed blob's streamed read is at most ``cap`` bytes; this
@@ -439,7 +448,37 @@ class GitService:
         promisor/rewrite config cannot re-open lazy-fetch on a plain public
         READ; returning ``False`` on an ambiguous entry would re-open exactly
         that (fail-open), hence the raise."""
-        return _marker_state(self._bare_path(vault_name) / _MIRROR_MARKER) == "valid"
+        bare = self._bare_path(vault_name)
+        if _marker_state(bare / _RETIRING_MIRROR_MARKER) == "valid":
+            raise MirrorMarkerError("external-git mirror retirement is incomplete")
+        return _marker_state(bare / _MIRROR_MARKER) == "valid"
+
+    def _require_normal_write_allowed(self, vault_name: str) -> None:
+        """Fail closed only for an in-progress mirror retirement.
+
+        The usual mirror read-only policy remains owned by the service layer;
+        this guard deliberately does not reinterpret a normal mirror marker.
+        It closes the committed-receipt-to-tombstone-cleanup window for every
+        ordinary Git mutation, under the same vault lock used by retirement.
+        """
+        bare = self._bare_path(vault_name)
+        if _marker_state(bare / _RETIRING_MIRROR_MARKER) == "valid":
+            raise MirrorMarkerError("external-git mirror retirement is incomplete")
+
+    @staticmethod
+    def _require_active_external_mirror_publication(bare: Path) -> None:
+        """Prove a staged external fetch may still publish into ``bare``.
+
+        A fetch receives objects and a namespaced temporary ref outside the
+        vault lock. Its branch-ref promotion is the persistent publication
+        boundary, so re-read both markers while the lock is held: a retirement
+        tombstone blocks the handoff window and an absent normal marker means a
+        completed retirement returned this bare to manual ownership.
+        """
+        if _marker_state(bare / _RETIRING_MIRROR_MARKER) == "valid":
+            raise MirrorMarkerError("external-git mirror retirement is incomplete")
+        if _marker_state(bare / _MIRROR_MARKER) != "valid":
+            raise MirrorMarkerError("external-git mirror is no longer active")
 
     def _use_mirror_reader(self, vault_name: str) -> bool:
         """Decide how a READ on ``vault_name`` must be served, fail-CLOSED.
@@ -516,6 +555,13 @@ class GitService:
             # resolve-under-root catches a parent-dir symlink that would redirect
             # the marker write out of storage on a restored/tampered layout.
             self._contained(bare)
+            if _marker_state(bare / _RETIRING_MIRROR_MARKER) == "valid":
+                # A retirement tombstone means the operator has intentionally
+                # quiesced this mirror but has not yet committed its durable
+                # sidecar handoff. Re-stamping the normal marker would conceal
+                # that interrupted state; fail closed until the same operator
+                # command resumes it.
+                raise MirrorMarkerError("external-git mirror retirement is incomplete")
             marker = bare / _MIRROR_MARKER
             if _marker_state(marker) == "valid":
                 return False  # already a valid marker — idempotent no-op
@@ -543,6 +589,131 @@ class GitService:
                 os.close(fd)
             logger.info("Backfilled external-git mirror marker for vault %s", vault_name)
             return True
+
+    def _retirement_bare(self, vault_name: str) -> Path:
+        """Return a real, contained bare repo for an offline retirement step."""
+        bare = self._bare_path(vault_name)
+        try:
+            bare_st = os.lstat(bare)
+        except FileNotFoundError as exc:
+            raise MirrorMarkerError("external-git mirror bare repository is missing") from exc
+        except OSError as exc:
+            raise MirrorMarkerError("external-git mirror bare repository is unreadable") from exc
+        if stat.S_ISLNK(bare_st.st_mode) or not stat.S_ISDIR(bare_st.st_mode):
+            raise MirrorMarkerError("external-git mirror bare repository is not a real directory")
+        self._contained(bare)
+        return bare
+
+    def _verify_retirement_ref(self, bare: Path, expected_ref: str) -> None:
+        """Check the locally materialized mirror tip without any network I/O."""
+        if re.fullmatch(r"[0-9a-f]{40}", expected_ref) is None:
+            raise MirrorMarkerError("external-git mirror retirement fixed ref is invalid")
+        try:
+            observed = self._ext_runner.rev_parse(bare, "HEAD")
+        except Exception as exc:  # noqa: BLE001 - surface only a safe operator error
+            raise MirrorMarkerError("external-git mirror retirement fixed ref could not be read") from exc
+        if observed != expected_ref:
+            raise MirrorMarkerError("external-git mirror retirement fixed ref did not match")
+
+    @staticmethod
+    def _write_retirement_marker(marker: Path) -> None:
+        """Create the tombstone no-clobber before unlinking the old marker."""
+        try:
+            fd = os.open(
+                marker,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                0o644,
+            )
+        except FileExistsError:
+            # The caller re-classifies the entry below; never overwrite a
+            # concurrent/foreign marker.
+            return
+        try:
+            os.write(fd, b"akb external-git mirror retirement in progress\n")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _fsync_retirement_directory(bare: Path) -> None:
+        """Durably publish a marker create or unlink in the bare directory."""
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(bare, flags)
+        except OSError as exc:
+            raise MirrorMarkerError("external-git mirror retirement directory cannot be synced") from exc
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            raise MirrorMarkerError("external-git mirror retirement directory cannot be synced") from exc
+        finally:
+            os.close(fd)
+
+    def quarantine_external_mirror_marker(self, vault_name: str, *, expected_ref: str) -> None:
+        """Replace a mirror marker with a fail-closed retirement tombstone.
+
+        This is the filesystem half of the external-Git retirement protocol.
+        It is intentionally recoverable: a crash after the tombstone is created
+        but before the old marker is unlinked leaves *both* regular files, which
+        is still fail-closed and is completed on the next exact replay.  A crash
+        after unlink leaves only the tombstone, also fail-closed.  The caller
+        must persist the sidecar quarantine intent before invoking this method.
+        """
+        with self._vault_write_lock(vault_name):
+            bare = self._retirement_bare(vault_name)
+            marker = bare / _MIRROR_MARKER
+            tombstone = bare / _RETIRING_MIRROR_MARKER
+            marker_state = _marker_state(marker)
+            tombstone_state = _marker_state(tombstone)
+            if marker_state == "absent" and tombstone_state == "absent":
+                raise MirrorMarkerError("external-git mirror retirement marker is missing")
+            self._verify_retirement_ref(bare, expected_ref)
+            if tombstone_state == "absent":
+                if marker_state != "valid":
+                    raise MirrorMarkerError("external-git mirror retirement marker is invalid")
+                self._write_retirement_marker(tombstone)
+                tombstone_state = _marker_state(tombstone)
+                if tombstone_state != "valid":
+                    raise MirrorMarkerError("external-git mirror retirement tombstone was not created")
+                self._fsync_retirement_directory(bare)
+            if marker_state == "valid":
+                try:
+                    os.unlink(marker)
+                except OSError as exc:
+                    raise MirrorMarkerError("external-git mirror marker could not be removed") from exc
+                self._fsync_retirement_directory(bare)
+            if _marker_state(marker) != "absent" or _marker_state(tombstone) != "valid":
+                raise MirrorMarkerError("external-git mirror retirement marker readback failed")
+
+    def finalize_external_mirror_retirement(self, vault_name: str, *, expected_ref: str) -> None:
+        """Remove a completed retirement tombstone after the DB receipt commits.
+
+        An interrupted final cleanup leaves the tombstone in place and therefore
+        rejects every read.  Exact replay performs this small, idempotent final
+        step; no caller is allowed to turn a still-quarantined mirror writable.
+        """
+        with self._vault_write_lock(vault_name):
+            bare = self._retirement_bare(vault_name)
+            marker = bare / _MIRROR_MARKER
+            tombstone = bare / _RETIRING_MIRROR_MARKER
+            marker_state = _marker_state(marker)
+            tombstone_state = _marker_state(tombstone)
+            if marker_state != "absent":
+                raise MirrorMarkerError("external-git mirror retirement marker is still present")
+            if tombstone_state == "valid":
+                # The fixed ref is load-bearing only while the tombstone still
+                # blocks the handoff. Once both markers are absent the vault is
+                # a normal writable vault and an exact receipt replay must not
+                # reject an ordinary post-retirement commit.
+                self._verify_retirement_ref(bare, expected_ref)
+                try:
+                    os.unlink(tombstone)
+                except OSError as exc:
+                    raise MirrorMarkerError("external-git mirror retirement tombstone could not be removed") from exc
+                self._fsync_retirement_directory(bare)
+            if _marker_state(marker) != "absent" or _marker_state(tombstone) != "absent":
+                raise MirrorMarkerError("external-git mirror retirement final readback failed")
 
     @staticmethod
     def _git_author_env(author_name: str, author_email: str) -> dict[str, str]:
@@ -878,6 +1049,11 @@ class GitService:
         if bare_path.exists():
             raise FileExistsError(f"Vault already exists: {vault_name}")
         with self._vault_write_lock(vault_name):
+            # The initial existence check is only a fast failure. Re-check at
+            # the publication lock boundary so a staged clone never lands over
+            # a vault retained or created while this caller waited for the lock.
+            if bare_path.exists():
+                raise FileExistsError(f"Vault already exists: {vault_name}")
             # Age-qualified sweep INSIDE the lock: only reap leftover
             # temp clone dirs older than the clone timeout, so a concurrent
             # same-vault clone's ACTIVE temp is never deleted. Same-vault clones
@@ -900,6 +1076,8 @@ class GitService:
                 # outside storage. ``bare_path`` doesn't exist yet — ``_contained``
                 # resolves its existing parents lexically, which is what we want.
                 self._contained(bare_path)
+                if bare_path.exists():
+                    raise FileExistsError(f"Vault already exists: {vault_name}")
                 # Atomic within storage_path (same filesystem). bare_path was
                 # asserted absent above / removed by a sterile re-clone caller.
                 os.rename(tmp, bare_path)
@@ -909,6 +1087,70 @@ class GitService:
                 self._rmtree_quiet(tmp)
                 raise
         logger.info("Mirror cloned: vault=%s branch=%s", vault_name, branch)
+        return sha
+
+    def reclone_active_mirror(
+        self,
+        vault_name: str,
+        remote_url: str,
+        branch: str,
+        auth_token: str | None = None,
+        timeout: int | None = None,
+        *,
+        allow_unmarked_never_synced: bool = False,
+    ) -> str:
+        """Sterilely replace an untrusted *active* external mirror.
+
+        Network clone work is staged away from the published bare repository.
+        At the short publication boundary, the vault lock is acquired and both
+        retirement markers are re-read before the old repository is touched.
+        A poller whose health decision predates a completed retirement therefore
+        discards its staged clone instead of deleting or re-marking the retained
+        manual repository.
+        """
+        self._require_safe_vault_name(vault_name)
+        tmp = self.storage_path / f".extgit-clone-{vault_name}-{uuid.uuid4().hex}"
+        backup = self.storage_path / f".extgit-replaced-{vault_name}-{uuid.uuid4().hex}"
+        try:
+            sha = self._ext_runner.clone_bare(
+                remote_url, branch, auth_token, tmp, timeout=timeout
+            )
+            (tmp / _MIRROR_MARKER).write_text(
+                "akb external-git mirror\n", encoding="utf-8"
+            )
+            self._contained(tmp)
+            self._contained(backup)
+            with self._vault_write_lock(vault_name):
+                bare = self._retirement_bare(vault_name)
+                if allow_unmarked_never_synced:
+                    # A pre-first-sync stale directory predates publication and
+                    # legitimately has no marker. A retirement tombstone still
+                    # always wins. Abnormal marker shapes fail in _marker_state.
+                    if _marker_state(bare / _RETIRING_MIRROR_MARKER) == "valid":
+                        raise MirrorMarkerError(
+                            "external-git mirror retirement is incomplete"
+                        )
+                    _marker_state(bare / _MIRROR_MARKER)
+                else:
+                    self._require_active_external_mirror_publication(bare)
+
+                # Keep the retained repository recoverable if publication
+                # itself faults. Both renames are same-filesystem and occur
+                # while every Git mutation/retirement publication is excluded.
+                os.rename(bare, backup)
+                try:
+                    os.rename(tmp, bare)
+                except BaseException:
+                    os.rename(backup, bare)
+                    raise
+                self._rmtree_quiet(backup)
+        except BaseException:
+            self._rmtree_quiet(tmp)
+            # Never delete ``backup`` here. If publication failed and even the
+            # rollback rename faulted, it is the only retained copy of the
+            # operator's repository and must remain available for recovery.
+            raise
+        logger.info("Mirror re-cloned: vault=%s branch=%s", vault_name, branch)
         return sha
 
     def fetch_remote(
@@ -949,6 +1191,12 @@ class GitService:
 
         # Brief critical section: promote tmp ref → branch ref, read the sha.
         with self._vault_write_lock(vault_name):
+            # Network I/O above deliberately runs without this lock. Re-resolve
+            # the live bare and its mirror/retirement authority immediately
+            # before promotion, so a stale poller cannot overwrite the HEAD of
+            # a retained manual vault after retirement finishes.
+            bare_path = self._retirement_bare(vault_name)
+            self._require_active_external_mirror_publication(bare_path)
             self._ext_runner.update_ref(bare_path, f"refs/heads/{vbranch}", tmp_ref)
             self._ext_runner.delete_ref_quiet(bare_path, tmp_ref)
             return self._ext_runner.rev_parse(bare_path, f"refs/heads/{vbranch}")
@@ -1550,6 +1798,29 @@ class GitService:
                 active["path_at_revision"] = fields[-1]
         flush()
 
+        # Git commit timestamps have one-second precision while the document
+        # row's created_at has microseconds. Preserve the standard AKB action
+        # so the migration bridge can stop at the newest create commit instead
+        # of dropping that commit (or admitting an older same-path lifecycle)
+        # on timestamp comparison alone. Unknown historical commit formats
+        # remain supported through the bridge's timestamp fallback.
+        for entry in history:
+            try:
+                commit = repo.commit(entry["legacy_git_oid"])
+                metadata = self._legacy_commit_metadata(commit)
+            except (BadName, BadObject, GitError, KeyError, TypeError, ValueError):
+                continue
+            # Runtime cutover compatibility reuses this already-fixed-ref
+            # primitive to reconstruct the public history envelope.  Keep the
+            # display metadata beside the immutable OID/path/time facts; the
+            # migration digest intentionally continues to project only the
+            # fields it owns.
+            entry["message"] = str(commit.message).strip()
+            entry["author"] = str(commit.author)
+            action = metadata.get("action")
+            if action in {"create", "update", "move", "delete"}:
+                entry["action"] = action
+
         return {
             "fixed_ref": fixed_ref,
             "current_commit": current_commit,
@@ -1906,6 +2177,7 @@ class GitService:
         attach the worktree to — happens once at vault creation).
         """
         with self._vault_write_lock(vault_name):
+            self._require_normal_write_allowed(vault_name)
             wt = self._ensure_worktree(vault_name)
             if wt is None:
                 return self._commit_via_clone(vault_name, file_path, content, message, author_name, author_email)
@@ -1940,6 +2212,7 @@ class GitService:
     ) -> str:
         """Delete a file and commit. Returns the commit hash."""
         with self._vault_write_lock(vault_name):
+            self._require_normal_write_allowed(vault_name)
             wt = self._ensure_worktree(vault_name)
             if wt is None:
                 raise FileNotFoundError(f"File not found in vault: {file_path}")
@@ -1979,6 +2252,7 @@ class GitService:
         if old_path == new_path:
             raise ValueError("move_file: old_path and new_path are identical")
         with self._vault_write_lock(vault_name):
+            self._require_normal_write_allowed(vault_name)
             wt = self._ensure_worktree(vault_name)
             if wt is None:
                 raise FileNotFoundError(f"File not found in vault: {old_path}")
@@ -2050,6 +2324,7 @@ class GitService:
         Returns the new commit's hex SHA, or `None` when no commit was made.
         """
         with self._vault_write_lock(vault_name):
+            self._require_normal_write_allowed(vault_name)
             wt = self._ensure_worktree(vault_name)
             if wt is None:
                 # Empty bare repo or missing vault — nothing to delete.
@@ -2238,18 +2513,60 @@ class GitService:
         with _managed_repo(self._get_repo(vault_name)) as repo:
             return self._vault_log_with_repo(repo, max_count, since, path)
 
+    def manual_fixed_ref_vault_log(
+        self,
+        vault_name: str,
+        fixed_ref: str,
+        *,
+        max_count: int,
+        since: str | None,
+        path: str | None,
+    ) -> list[dict]:
+        """Read a vault activity feed from one exact manual-vault ancestor.
+
+        Cutover activity is bound to a durable Legacy tip, not the mutable
+        repository HEAD or the set of documents that happen to survive in the
+        current catalog. This retains deleted and prior-recreate lifecycles.
+        """
+        if re.fullmatch(r"[0-9a-f]{40}", fixed_ref) is None:
+            raise FixedRefHistoryError("fixed-ref vault activity requires a full lowercase 40-hex OID")
+        if self._is_mirror(vault_name):
+            raise FixedRefHistoryError("fixed-ref vault activity is limited to manual vaults")
+        try:
+            with _managed_repo(self._get_repo(vault_name)) as repo:
+                repo.commit(fixed_ref)
+                return self._vault_log_with_repo(
+                    repo,
+                    max_count,
+                    since,
+                    path,
+                    fixed_ref=fixed_ref,
+                )
+        except (BadName, BadObject, FileNotFoundError, GitError, TypeError, ValueError) as exc:
+            raise FixedRefHistoryError("fixed-ref vault activity could not be read") from exc
+
     def _vault_log_with_repo(
         self,
         repo: Repo,
         max_count: int,
         since: str | None,
         path: str | None,
+        *,
+        fixed_ref: str | None = None,
     ) -> list[dict]:
         try:
             # gitpython's iter_commits stub forbids **kwargs splatting
             # (each named param is typed individually). Two branches by
             # which optional flags are present — explicit, mypy-clean.
-            if since and path:
+            if fixed_ref is not None and since and path:
+                commits = list(repo.iter_commits(fixed_ref, max_count=max_count, since=since, paths=path))
+            elif fixed_ref is not None and since:
+                commits = list(repo.iter_commits(fixed_ref, max_count=max_count, since=since))
+            elif fixed_ref is not None and path:
+                commits = list(repo.iter_commits(fixed_ref, max_count=max_count, paths=path))
+            elif fixed_ref is not None:
+                commits = list(repo.iter_commits(fixed_ref, max_count=max_count))
+            elif since and path:
                 commits = list(repo.iter_commits(max_count=max_count, since=since, paths=path))
             elif since:
                 commits = list(repo.iter_commits(max_count=max_count, since=since))
@@ -2334,6 +2651,58 @@ class GitService:
                 lookup_path,
                 commit_hash,
             )
+
+    def manual_fixed_ref_file_diff(
+        self,
+        vault_name: str,
+        fixed_ref: str,
+        file_path: str,
+        commit_hash: str,
+    ) -> dict:
+        """Read one legacy diff without consulting the mutable vault HEAD.
+
+        Existing-database cutover mappings bind both selectors to an exact
+        frozen tip.  The normal legacy ``file_diff`` starts rename tracking at
+        HEAD, so it is not a sufficient authority after Native writes begin.
+        This narrow companion verifies the selected commit is within the
+        frozen graph and resolves its historical path from that graph only.
+        """
+        full_oid = re.compile(r"^[0-9a-f]{40}$")
+        if not full_oid.fullmatch(fixed_ref) or not full_oid.fullmatch(commit_hash):
+            raise FixedRefHistoryError(
+                "fixed-ref diff requires full lowercase 40-hex commit OIDs"
+            )
+        if self._is_mirror(vault_name):
+            raise FixedRefHistoryError("fixed-ref diff is limited to manual vaults")
+        try:
+            with _managed_repo(self._get_repo(vault_name)) as repo:
+                repo.commit(fixed_ref)
+                target = repo.commit(commit_hash).hexsha
+                repo.git.merge_base("--is-ancestor", target, fixed_ref)
+                historical_path = self._stream_path_at_revision(
+                    repo,
+                    fixed_ref,
+                    file_path,
+                    target,
+                )
+                return self._file_diff_with_repo(
+                    repo,
+                    file_path,
+                    historical_path or file_path,
+                    target,
+                )
+        except (
+            BadName,
+            BadObject,
+            FileNotFoundError,
+            GitError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise FixedRefHistoryError(
+                "fixed-ref diff could not resolve the requested commit"
+            ) from exc
 
     def _file_diff_with_repo(
         self,

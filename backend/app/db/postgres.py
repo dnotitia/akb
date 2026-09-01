@@ -310,6 +310,13 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "085_vault_access_contributions.py",  # why a pair holds the role it holds: independent grant bases behind the effective vault_access row, backfilled as 'direct' so nothing moves
         "086_dynamic_table_rows_changed.py",  # statement-level transition-table wake-up events for dynamic table DML
         "087_tenant_activity_daily.py",  # closed-once daily activity windows served by /stats; NULL counts mean "not computable", never 0
+        "088_native_revision_existing_cutover.py",  # group existing vault-scoped Native backfills for fixture-led cutover verification
+        "089_native_file_projection_outbox.py",  # durable S3 File mutation reconciliation into Native text projection
+        "090_native_revision_vault_purge_fence.py",  # allow an authorized exact-vault lifecycle purge after cutover authority commits
+        "091_native_revision_committed_receipt_guard.py",  # freeze a committed cutover's durable authority receipt set
+        "092_native_revision_plan_supersession.py",  # release never-applied aborted-plan reservations for a fresh coverage version
+        "093_external_git_retirement.py",  # durable offline retirement receipt for a Collector-adopted external Git mirror
+        "094_native_revision_completed_reservation_transfer.py",  # let a fresh coverage run adopt completed work from an aborted pre-authority cutover
     ):
         if filename in applied:
             continue

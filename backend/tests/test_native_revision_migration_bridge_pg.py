@@ -14,7 +14,6 @@ import asyncpg
 import pytest
 from git import Repo
 
-from app.exceptions import NotFoundError
 from app.repositories.native_revision_migration_repo import (
     MigrationInventoryDriftError,
     NativeRevisionMigrationRepository,
@@ -30,11 +29,13 @@ from app.services.legacy_revision_bridge import (
     SelectorUnknownError,
 )
 from app.services.m1_pg_body_store import M1PgBodyStore
+from app.services.native_document_service import NativeDocumentService
 from app.services.native_revision_backfill import (
     BackfillFailpointError,
     FAILPOINT_BOUNDARIES,
     NativeRevisionBackfill,
 )
+from app.services.native_revision_backend import NativeRevisionBackend
 
 
 pytestmark = pytest.mark.asyncio
@@ -284,7 +285,7 @@ async def _make_compact_failpoint_fixtures(pool, tmp_path: Path) -> tuple[
     return git, fixtures
 
 
-async def test_inventory_is_fixed_ref_bounded_and_manual_only(tmp_path):
+async def test_inventory_is_fixed_ref_bounded_and_includes_archived_manual_vaults(tmp_path):
     async with _fresh_schema(tmp_path) as pool:
         fixture = await _make_fixture(pool, tmp_path)
         bridge = LegacyRevisionBridge(
@@ -369,12 +370,15 @@ async def test_inventory_is_fixed_ref_bounded_and_manual_only(tmp_path):
                 "UPDATE vaults SET status = 'archived' WHERE id = $1",
                 fixture["namespace_id"],
             )
-        with pytest.raises(NotFoundError):
-            await bridge.capture_inventory(
-                namespace_id=fixture["namespace_id"],
-                fixed_ref=fixture["unrelated_tip"],
-                coverage_version="c9-v5",
-            )
+        archived_inventory = await bridge.capture_inventory(
+            namespace_id=fixture["namespace_id"],
+            fixed_ref=fixture["unrelated_tip"],
+            coverage_version="c9-v5",
+        )
+        assert {item.resource_id for item in archived_inventory.documents} == {
+            fixture["document_one"],
+            fixture["document_two"],
+        }
 
         async with pool.acquire() as conn:
             await conn.execute(
@@ -1484,6 +1488,107 @@ async def test_alias_mutation_after_prepare_fails_closed_before_publication(tmp_
                 """,
                 document.resource_id,
             ) == 0
+
+
+async def test_completed_backfill_bridges_multi_commit_frozen_activity_semantics(tmp_path):
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _make_fixture(pool, tmp_path)
+        backfill = NativeRevisionBackfill(pool, git=fixture["git"])
+        run, _ = await backfill.prepare_run(
+            namespace_id=fixture["namespace_id"],
+            fixed_ref=fixture["unrelated_tip"],
+            coverage_version="c9-public-activity-continuity",
+        )
+        assert (await backfill.backfill_run(run.run_id)).status == "complete"
+
+        backend = NativeRevisionBackend(pool=pool, legacy_git=fixture["git"])
+        activity = await backend.vault_activity(
+            fixture["vault_name"],
+            max_count=20,
+            since=None,
+            path=None,
+        )
+        frozen_hashes = [
+            fixture["current_oid"][:12],
+            fixture["move_oid"][:12],
+        ]
+        expected_by_hash = {
+            entry["hash"]: entry
+            for entry in await asyncio.to_thread(
+                fixture["git"].vault_log,
+                fixture["vault_name"],
+                max_count=20,
+            )
+            if entry["hash"] in frozen_hashes
+        }
+        bridged = [entry for entry in activity if entry["hash"] in frozen_hashes]
+
+        assert [entry["hash"] for entry in bridged] == frozen_hashes
+        assert bridged == [expected_by_hash[commit] for commit in frozen_hashes]
+        assert fixture["later_file_tip"][:12] not in {entry["hash"] for entry in activity}
+
+
+async def test_native_move_keeps_completed_legacy_paths_for_historical_reads(tmp_path):
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _make_fixture(pool, tmp_path)
+        backfill = NativeRevisionBackfill(pool, git=fixture["git"])
+        run, _ = await backfill.prepare_run(
+            namespace_id=fixture["namespace_id"],
+            fixed_ref=fixture["unrelated_tip"],
+            coverage_version="c9-native-move-historical-reads",
+        )
+        assert (await backfill.backfill_run(run.run_id)).status == "complete"
+
+        documents = NativeDocumentService(pool=pool, legacy_git=fixture["git"])
+        backend = NativeRevisionBackend(
+            pool=pool,
+            document_service=documents,
+            legacy_git=fixture["git"],
+        )
+        moved = await documents.move(
+            fixture["vault_name"],
+            "renamed.md",
+            collection="native-cutover",
+            slug="moved-document",
+            agent_id="native-writer",
+        )
+        assert moved.path == "native-cutover/moved-document.md"
+
+        for alias in ("same.md", "renamed.md", moved.path):
+            current = await documents.get(fixture["vault_name"], alias)
+            assert current.path == moved.path
+            assert current.current_commit == moved.commit_hash
+
+        version = await backend.document_version(
+            fixture["vault_name"],
+            "same.md",
+            fixture["initial_oid"],
+        )
+        assert version is not None
+        assert version[1] == "new v1\n"
+
+        history = await backend.document_history(
+            fixture["vault_name"],
+            "same.md",
+            limit=20,
+        )
+        assert [entry["hash"] for entry in history["history"]] == [
+            moved.commit_hash,
+            fixture["current_oid"][:12],
+            fixture["move_oid"][:12],
+            fixture["initial_oid"][:12],
+        ]
+
+        diff = await backend.document_diff(
+            fixture["vault_name"],
+            moved.path,
+            fixture["initial_oid"],
+        )
+        assert diff is not None
+        assert diff["file"] == "same.md"
+        assert diff["type"] == "modified"
+        assert "-old resource" in diff["diff"]
+        assert "+new v1" in diff["diff"]
 
 
 async def test_manual_fixed_ref_history_missing_repo_is_stable_error(tmp_path):

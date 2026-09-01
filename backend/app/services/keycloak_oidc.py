@@ -40,6 +40,7 @@ from app.services.auth_verifier_profiles import (
     VerifiedPrincipal,
 )
 from app.sso.providers.keycloak_oidc import ProviderDefinitionError, validate_alias
+from app.sso import local_realm
 
 logger = logging.getLogger("akb.keycloak")
 
@@ -244,13 +245,18 @@ class KeycloakOIDC:
             "nonce": nonce,
             "code_challenge": self._make_code_challenge(verifier),
             "code_challenge_method": "S256",
-            "kc_idp_hint": provider_alias,
             # The browser can carry a native Keycloak session from the
             # separate product-admin surface.  Force Keycloak to run the
             # selected broker ceremony again without forwarding prompt=login
             # and unnecessarily defeating the upstream provider's own SSO.
             "max_age": "0",
         }
+        # The local realm IS this broker, so there is nothing to hint at: adding
+        # the hint would send Keycloak to an identity provider that does not
+        # exist, and a self-referential one would be an authorize loop. Every
+        # other provider is brokered and must carry it.
+        if not local_realm.is_local_alias(provider_alias):
+            params["kc_idp_hint"] = provider_alias
         await _store_issue(
             state,
             "browser-state-v1",
@@ -701,8 +707,15 @@ class KeycloakOIDC:
             "sid": 255,
             "nonce": 512,
             "at_hash": 512,
-            "identity_provider": 63,
         }
+        # `identity_provider` is required of a BROKERED token and must be absent
+        # from a local-realm one, which nothing brokered. Same biconditional the
+        # route applies to the access token: the claim never becomes optional,
+        # each kind asserts the shape the other cannot produce.
+        if not local_realm.is_local_alias(expected_provider_alias):
+            required_string_limits["identity_provider"] = 63
+        elif claims.get("identity_provider") is not None:
+            raise AuthenticationError("Invalid browser identity token")
         if any(
             not isinstance(claims.get(name), str) or not claims[name].strip() or len(claims[name]) > limit
             for name, limit in required_string_limits.items()
@@ -713,7 +726,11 @@ class KeycloakOIDC:
         if claims["azp"] != settings.keycloak_client_id:
             raise AuthenticationError("Invalid browser identity token")
         try:
-            actual_provider_alias = validate_alias(claims["identity_provider"])
+            actual_provider_alias = (
+                local_realm.ALIAS
+                if local_realm.is_local_alias(expected_provider_alias)
+                else validate_alias(claims["identity_provider"])
+            )
             selected_provider_alias = validate_alias(expected_provider_alias)
         except (ProviderDefinitionError, TypeError):
             raise AuthenticationError("Invalid browser identity token") from None

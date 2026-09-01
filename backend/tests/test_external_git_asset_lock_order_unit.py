@@ -34,10 +34,14 @@ class _Connection:
         return _AsyncContext()
 
     async def fetchval(self, sql, *args):
-        assert "FROM vaults" in sql and "FOR KEY SHARE" in sql
         assert args == (self.vault_id,)
-        self.order.append("vault")
-        return self.vault_id
+        if "FROM vaults" in sql:
+            assert "FOR KEY SHARE" in sql
+            self.order.append("vault")
+            return self.vault_id
+        assert "FROM vault_external_git" in sql and "sync_state = 'active'" in sql
+        self.order.append("sidecar")
+        return 1
 
 
 class _Pool:
@@ -102,4 +106,4 @@ async def test_external_git_write_locks_vault_before_document(monkeypatch):
         tip_sha="a" * 40,
     )
 
-    assert order[:2] == ["vault", "document"]
+    assert order[:3] == ["vault", "sidecar", "document"]

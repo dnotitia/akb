@@ -1799,6 +1799,14 @@ async def remove_vault_write_grant(actor_id: str, vault_name: str, token_id: str
 # ── Destructive: vault delete ───────────────────────────────
 
 
+async def _mark_native_revision_vault_purge(conn, vault_id: uuid.UUID) -> None:
+    """Permit the current authorized transaction to purge this exact vault."""
+    await conn.execute(
+        "SELECT set_config('akb.native_revision_vault_purge_id', $1, TRUE)",
+        str(vault_id),
+    )
+
+
 async def delete_vault(user_id: str, vault_name: str) -> dict:
     """Permanently delete a vault and all its data. Owner or admin only.
 
@@ -1837,6 +1845,7 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
                 return err(f"Vault not found: {vault_name}", code=NOT_FOUND)
             vault_id = vault["id"]
             is_native_ledger_vault = str(vault["git_path"]).startswith("native-ledger://")
+            await _mark_native_revision_vault_purge(conn, vault_id)
 
             # Capture every object key while the vault lock makes the set
             # complete with respect to concurrent image uploads. Remote S3 I/O

@@ -196,8 +196,10 @@ TOOLS = [
                 "uri": {"type": "string", "description": "Document URI"},
                 "content": {"type": "string", "description": "New document body (replaces existing)"},
                 "title": {"type": "string", "description": "New title"},
+                "type": {"type": "string", "description": "New document type"},
                 "status": {"type": "string", "enum": ["draft", "active", "archived"]},
                 "tags": {"type": "array", "items": {"type": "string"}},
+                "domain": {"type": "string", "description": "New document domain"},
                 "summary": {"type": "string"},
                 "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Update the same-vault dependency list (akb:// URIs). Use an ordinary Markdown link in content for a cross-vault reference."},
                 "related_to": {"type": "array", "items": {"type": "string"}, "description": "Update the same-vault related list (akb:// URIs). Use an ordinary Markdown link in content for a cross-vault reference."},
@@ -432,7 +434,7 @@ TOOLS = [
         name="akb_grep",
         description=(
             "Search for exact text or regex patterns across document content. "
-            "On the guarded native measurement backend, optionally include admitted "
+            "On a native Document backend, optionally include admitted "
             "searchable text Files with `measurement_include_text_files=true`; binary "
             "Files remain excluded. "
             "Unlike akb_search (semantic/meaning-based), this finds exact string matches — "
@@ -476,13 +478,13 @@ TOOLS = [
                     "type": "boolean",
                     "default": False,
                     "description": (
-                        "Guarded native M1 W3b measurement mode: include admitted searchable "
+                        "Native mode: include admitted searchable "
                         "text Files as well as Documents. File results include resource_type=file, "
                         "their canonical akb:// URI, revision, and content_hash; native results "
                         "also report payload_placement, the body placement their bytes were read "
                         "from. Binary Files are "
-                        "never searchable. Rejected unless the exact native measurement backend "
-                        "and dedicated database guard are active."
+                        "never searchable. Rejected unless postgres_native or the exact guarded "
+                        "native measurement backend is active."
                     ),
                 },
             },

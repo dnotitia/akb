@@ -23,7 +23,11 @@ from app.exceptions import ValidationError
 from app.models.document import SearchResponse, SearchResult
 from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.services import sparse_encoder
-from app.services.index_service import CHUNK_HEADER_KEYS, generate_embeddings
+from app.services.index_service import (
+    CHUNK_HEADER_KEYS,
+    SOURCE_NATIVE_FILE,
+    generate_embeddings,
+)
 from app.services.grep_replace import (
     DEFAULT_MAX_REPLACEMENTS,
     apply_grep_replacement,
@@ -210,6 +214,13 @@ def _verified_native_metadata(row) -> dict:
     canonical = verify_native_head_body(row)
     metadata, _ = _parse_markdown(canonical.decode("utf-8", errors="strict"))
     return metadata
+
+
+def _verify_native_body(row) -> None:
+    """Verify one native body without interpreting File bytes as Markdown."""
+    from app.services.native_payload_verification import verify_native_head_body
+
+    verify_native_head_body(row)
 
 
 class SearchService:
@@ -600,13 +611,19 @@ class SearchService:
                 degradation_reason=degraded_reason,
             )
 
-        # Dedup at the source level — one hit per (source_type, source_id).
+        # Dedup at the public source level — one hit per public resource.
         # Previously dedup was by document_id only; generalizing keeps
-        # tables and files first-class in the dedup pool.
+        # tables and files first-class in the dedup pool. A text File has both
+        # its ordinary S3 metadata chunk (``file``) and its native body chunks
+        # (``native_file``); those are two projections of the same public File,
+        # not two search results.
         seen: set[tuple[str, str]] = set()
         unique_hits = []
         for hit in hits:
-            key = (hit.source_type, hit.source_id)
+            public_source_type = (
+                "file" if hit.source_type == SOURCE_NATIVE_FILE else hit.source_type
+            )
+            key = (public_source_type, hit.source_id)
             if key in seen:
                 continue
             seen.add(key)
@@ -875,6 +892,102 @@ class SearchService:
                         "collection": collection,
                         "revision": r["head_revision_id"],
                     }
+            if by_type[SOURCE_NATIVE_FILE]:
+                native_file_hits = {
+                    uuid.UUID(h.chunk_id): h
+                    for h in hits
+                    if h.source_type == SOURCE_NATIVE_FILE
+                }
+                native_file_body_bytes = await conn.fetchval(
+                    """
+                    SELECT COALESCE(SUM(p.byte_size), 0)::bigint
+                      FROM chunks c
+                      JOIN native_derived_chunks dc ON dc.chunk_id = c.id
+                      JOIN native_resources r
+                        ON r.resource_id = dc.resource_id
+                       AND r.head_revision_id = dc.revision_id
+                       AND r.surface = 'file'
+                       AND r.lifecycle = 'live'
+                      JOIN native_revisions nr
+                        ON nr.resource_id = r.resource_id
+                       AND nr.revision_id = r.head_revision_id
+                      JOIN native_payload_manifests pm
+                        ON pm.payload_manifest_id = nr.payload_manifest_id
+                      JOIN m1_reference_payloads p
+                        ON p.payload_id = pm.private_locator
+                     WHERE c.id = ANY($1::uuid[])
+                       AND c.source_type = 'native_file'
+                    """,
+                    list(native_file_hits),
+                )
+                if native_file_body_bytes > NATIVE_SEARCH_MAX_BODY_BYTES:
+                    raise ValidationError(
+                        "native search hydration exceeds the bounded body corpus"
+                    )
+                rows = await conn.fetch(
+                    f"""
+                    SELECT c.id AS chunk_id, r.resource_id, r.current_path,
+                           r.head_revision_id, v.name AS vault_name,
+                           f.name, f.description, f.mime_type,
+                           col.path AS collection,
+                           p.payload_id, p.namespace_id, p.content_profile,
+                           p.digest, p.byte_size, p.encoding,
+                           p.selected_placement, p.verification_profile,
+                           p.canonical_bytes
+                      FROM chunks c
+                      JOIN native_derived_chunks dc ON dc.chunk_id = c.id
+                      JOIN native_derived_heads dh
+                        ON dh.resource_id = dc.resource_id
+                       AND dh.revision_id = dc.revision_id
+                      JOIN native_resources r
+                        ON r.resource_id = dc.resource_id
+                       AND r.head_revision_id = dc.revision_id
+                       AND r.surface = 'file'
+                       AND r.lifecycle = 'live'
+                      JOIN vaults v ON v.id = r.namespace_id
+                      JOIN vault_files f
+                        ON f.id = r.resource_id
+                       AND f.vault_id = r.namespace_id
+                      LEFT JOIN collections col ON col.id = f.collection_id
+                      JOIN native_revisions nr
+                        ON nr.resource_id = r.resource_id
+                       AND nr.revision_id = r.head_revision_id
+                      JOIN native_payload_manifests pm
+                        ON pm.payload_manifest_id = nr.payload_manifest_id
+                      JOIN m1_reference_payloads p
+                        ON p.payload_id = pm.private_locator
+                     WHERE c.id = ANY($1::uuid[])
+                       AND c.source_type = 'native_file'
+                       AND {confirmed_file_predicate("f")}
+                    """,
+                    list(native_file_hits),
+                )
+                for r in rows:
+                    # File catalog/S3 remains public authority. The native body
+                    # is a searchable projection and must still verify against
+                    # its immutable Head before a derived hit is exposed.
+                    await asyncio.to_thread(_verify_native_body, r)
+                    catalog_path = (
+                        f"{r['collection']}/{r['name']}"
+                        if r["collection"]
+                        else r["name"]
+                    )
+                    if r["current_path"] != catalog_path:
+                        logger.warning(
+                            "hydrate: stale native File path skipped for %s",
+                            r["resource_id"],
+                        )
+                        continue
+                    meta[(SOURCE_NATIVE_FILE, str(r["resource_id"]))] = {
+                        "vault": r["vault_name"],
+                        "path": catalog_path,
+                        "title": r["name"],
+                        "doc_type": "file",
+                        "summary": r["description"] or r["mime_type"],
+                        "tags": [],
+                        "collection": r["collection"],
+                        "revision": r["head_revision_id"],
+                    }
             if by_type["table"]:
                 rows = await conn.fetch(
                     """
@@ -982,13 +1095,19 @@ class SearchService:
                 uri = doc_uri(m["vault"], m["path"])
             elif h.source_type == "table":
                 uri = table_uri(m["vault"], m["title"], collection=m.get("collection"))
-            elif h.source_type == "file":
+            elif h.source_type in {"file", SOURCE_NATIVE_FILE}:
                 uri = file_uri(m["vault"], h.source_id, collection=m.get("collection"))
             else:
                 continue
             results.append(
                 SearchResult(
-                    source_type=("document" if h.source_type == NATIVE_DOCUMENT_SOURCE else h.source_type),
+                    source_type=(
+                        "document"
+                        if h.source_type == NATIVE_DOCUMENT_SOURCE
+                        else "file"
+                        if h.source_type == SOURCE_NATIVE_FILE
+                        else h.source_type
+                    ),
                     uri=uri,
                     vault=m["vault"], path=m["path"], title=m["title"],
                     collection=m.get("collection"),
@@ -1179,12 +1298,13 @@ class SearchService:
 
         document_source = _configured_document_source_type()
         if measurement_include_text_files and (
-            settings.document_revision_backend != "native_ledger_m1"
+            settings.document_revision_backend
+            not in {"postgres_native", "native_ledger_m1"}
             or document_source != NATIVE_DOCUMENT_SOURCE
         ):
             raise ValidationError(
-                "measurement_include_text_files requires the guarded native measurement "
-                "backend (native_ledger_m1)"
+                "measurement_include_text_files requires a native Document backend "
+                "(postgres_native or guarded native_ledger_m1)"
             )
         if document_source == NATIVE_DOCUMENT_SOURCE:
             from app.services.m1_native_grep_service import M1NativeGrepService

@@ -469,7 +469,7 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
     `vector_store.backfill` and `embed_backfill` is gone — they were
     reporting the same `chunks.vector_indexed_at IS NULL` count.
     """
-    from app.services import queue_rescuer, sparse_encoder, vault_backfill
+    from app.services import native_file_projection, queue_rescuer, sparse_encoder, vault_backfill
 
     store = get_vector_store()
     vs_info: dict = {"reachable": await store.health()}
@@ -505,6 +505,7 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
         "asset_gc": await _safe(asset_gc_worker.pending_stats),
         "metadata_backfill": await _safe(metadata_worker.pending_stats),
         "events": await _safe(events_publisher.pending_stats),
+        "native_file_projection": await _safe(native_file_projection.pending_stats),
         "vector_store": vs_info,
     }
 
