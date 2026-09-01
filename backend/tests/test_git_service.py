@@ -19,7 +19,7 @@ import pytest
 from git import Repo
 
 from app.services.external_git_service import ExternalGitService
-from app.services.git_service import GitService
+from app.services.git_service import FixedRefHistoryError, GitService
 from tests.extgit_http import build_runner
 
 
@@ -111,6 +111,131 @@ def test_commit_file_creates_initial_commit(git_service: GitService) -> None:
     assert len(sha) == 40
     assert git_service.read_file(name, "first.md") == "first\n"
     assert _vault_commit_count(git_service, name) == 1
+
+
+def test_manual_fixed_ref_history_infers_plain_git_create_activity(
+    git_service: GitService,
+) -> None:
+    """An imported Git commit need not carry AKB's private activity footer."""
+    name = f"plain_import_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    current_oid = git_service.commit_file(
+        vault_name=name,
+        file_path="notes/imported.md",
+        content="# Imported\n\nPlain Git history.\n",
+        message="Import documentation",
+        author_name="Fixture Collector",
+        author_email="collector@example.dev",
+    )
+    fixed_ref = git_service.commit_file(
+        vault_name=name,
+        file_path="notes/unrelated.md",
+        content="# Unrelated\n",
+        message="Add unrelated document",
+    )
+    current = Repo(str(git_service._bare_path(name))).commit(current_oid)
+
+    snapshot = git_service.manual_fixed_ref_history(
+        name,
+        fixed_ref,
+        "notes/imported.md",
+        current_commit=current_oid,
+        since_epoch=current.committed_date + 1,
+    )
+
+    assert snapshot["body"] == b"# Imported\n\nPlain Git history.\n"
+    assert snapshot["history"][0]["action"] == "create"
+    assert snapshot["activity"] == {
+        "legacy_git_oid": current_oid,
+        "committed_at": current.committed_datetime,
+        "actor": "Fixture Collector",
+        "subject": "Import documentation",
+        "summary": "",
+        "action": "create",
+        "path_from": None,
+        "path_to": "notes/imported.md",
+        "changed_paths": [
+            {
+                "change": "create",
+                "path_from": None,
+                "path_to": "notes/imported.md",
+            }
+        ],
+    }
+
+
+def test_manual_fixed_ref_history_infers_plain_git_update_activity(
+    git_service: GitService,
+) -> None:
+    name = f"plain_update_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    git_service.commit_file(
+        vault_name=name,
+        file_path="notes/imported.md",
+        content="# Imported\n",
+        message="Import documentation",
+    )
+    current_oid = git_service.commit_file(
+        vault_name=name,
+        file_path="notes/imported.md",
+        content="# Imported\n\nRevised.\n",
+        message="Revise documentation",
+        author_name="Fixture Collector",
+        author_email="collector@example.dev",
+    )
+    current = Repo(str(git_service._bare_path(name))).commit(current_oid)
+
+    snapshot = git_service.manual_fixed_ref_history(
+        name,
+        current_oid,
+        "notes/imported.md",
+        current_commit=current_oid,
+        since_epoch=current.committed_date + 1,
+    )
+
+    assert [entry["action"] for entry in snapshot["history"]] == [
+        "update",
+        "create",
+    ]
+    assert snapshot["activity"]["action"] == "update"
+    assert snapshot["activity"]["actor"] == "Fixture Collector"
+    assert snapshot["activity"]["subject"] == "Revise documentation"
+    assert snapshot["activity"]["changed_paths"] == [
+        {
+            "change": "update",
+            "path_from": None,
+            "path_to": "notes/imported.md",
+        }
+    ]
+
+
+def test_manual_fixed_ref_history_rejects_declared_activity_that_conflicts_with_git(
+    git_service: GitService,
+) -> None:
+    name = f"invalid_activity_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    current_oid = git_service.commit_file(
+        vault_name=name,
+        file_path="notes/imported.md",
+        content="# Imported\n",
+        message=(
+            "Import documentation\n\n"
+            "agent: fixture-collector\n"
+            "action: update\n"
+            "summary: claims an update for a newly added file"
+        ),
+    )
+
+    with pytest.raises(
+        FixedRefHistoryError,
+        match="activity does not match the file action",
+    ):
+        git_service.manual_fixed_ref_history(
+            name,
+            current_oid,
+            "notes/imported.md",
+            current_commit=current_oid,
+        )
 
 
 def test_read_file_closes_repo_while_caller_still_references_it(

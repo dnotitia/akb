@@ -57,8 +57,8 @@ The topology is deliberately small:
 
 | Component | Process owner | Endpoint / image | Responsibility |
 | --- | --- | --- | --- |
-| PostgreSQL + pgvector | dependency Compose | `pgvector/pgvector:pg16`, `127.0.0.1:15432` | AKB database and vector index |
-| MinIO | dependency Compose | pinned `minio/minio:RELEASE.2025-09-07T16-13-09Z`, `127.0.0.1:9000` | S3-compatible file storage |
+| PostgreSQL + pgvector | dependency Compose | `pgvector/pgvector:pg16`, `127.0.0.1:15432` by default | AKB database and vector index |
+| MinIO | dependency Compose | pinned `minio/minio:RELEASE.2025-09-07T16-13-09Z`, `127.0.0.1:9000` by default | S3-compatible file storage |
 | embedding stub | Ubuntu host process | `127.0.0.1:8888` | deterministic `/v1/embeddings` responses |
 | backend | Ubuntu host process | `127.0.0.1:8000` | AKB application under test |
 | fixture control | supervisor-owned in-process app | `127.0.0.1:8889` | health, discovery, and empty reset |
@@ -69,6 +69,12 @@ Only PostgreSQL and MinIO are managed by
 is the normal development stack and is the default path for contributors;
 the dependency Compose file is an internal implementation detail of this
 runtime and should not be started directly.
+
+Callers that share a host with another development stack may select free
+`RuntimeConfig.postgres_port` and `RuntimeConfig.minio_port` values. The
+supervisor passes those exact values to Compose, generated AKB configuration,
+readiness probes, and fixture database/S3 clients; the defaults above remain
+unchanged for the canonical local and CI paths.
 
 The supervisor has two modes:
 
