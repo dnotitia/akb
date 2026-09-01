@@ -94,6 +94,15 @@ class MigrationReadRepository(Protocol):
 
     async def list_items(self, run_id: uuid.UUID) -> list[MigrationItem]: ...
 
+    async def is_completed_reservation_transfer(
+        self,
+        *,
+        owner_run_id: uuid.UUID,
+        replacement_run_id: uuid.UUID,
+        legacy_document_id: uuid.UUID,
+        native_head_revision_id: str,
+    ) -> bool: ...
+
     async def exact_mapping(
         self,
         *,
@@ -639,6 +648,7 @@ class NativeRevisionShadowComparator:
 
         activity = document.activity
         cls._validate_legacy_activity(legacy_event, activity)
+        cls._validate_candidate_activity(candidate_event, activity, native_revision_id)
         projected = copy.deepcopy(candidate)
         event = copy.deepcopy(candidate_event)
         event["hash"] = native_revision_id
@@ -680,6 +690,49 @@ class NativeRevisionShadowComparator:
             raise ShadowComparisonError("activity author shape is unsupported")
         projected["events"] = [event]
         return projected
+
+    @staticmethod
+    def _validate_candidate_activity(
+        event: dict[str, Any],
+        activity: LegacyActivitySemantics,
+        native_revision_id: str,
+    ) -> None:
+        """Bind the unprojected Native event before applying a public bridge.
+
+        C9's native genesis is an authority event, while a reconciled Native
+        head already carries the frozen Legacy semantics.  Both are valid
+        inputs to the explicit bridge below; any other actor/action/summary
+        combination must be surfaced rather than overwritten with Legacy
+        values during comparison.
+        """
+        if event.get("hash") != native_revision_id or event.get("projection_revision") != native_revision_id:
+            raise ShadowComparisonError("candidate activity selector is not bound to the native revision")
+        author = event.get("author")
+        if not isinstance(author, dict):
+            raise ShadowComparisonError("candidate activity author shape differs")
+        observed = (
+            event.get("action"),
+            event.get("subject"),
+            event.get("summary"),
+            author.get("id"),
+            author.get("display"),
+        )
+        migration = (
+            "create",
+            None,
+            None,
+            "akb-native-revision-migration",
+            "akb-native-revision-migration",
+        )
+        legacy = (
+            "replace" if activity.action == "update" else activity.action,
+            activity.subject,
+            activity.summary,
+            activity.actor,
+            activity.actor,
+        )
+        if observed not in {migration, legacy}:
+            raise ShadowComparisonError("candidate activity differs from its native envelope")
 
     @staticmethod
     def _validate_legacy_activity(event: dict[str, Any], activity: LegacyActivitySemantics) -> None:
@@ -1308,7 +1361,16 @@ class NativeRevisionShadowComparator:
                 if current_item is None or self._value(current_item, "native_head_revision_id") != native_id:
                     raise ShadowComparisonError("current-run mapping has no matching completed migration item")
             elif current_item is not None:
-                raise ShadowComparisonError("current-run item attempts to re-home an immutable mapping")
+                if (
+                    self._value(current_item, "native_head_revision_id") != native_id
+                    or not await self.repository.is_completed_reservation_transfer(
+                        owner_run_id=owner_run_uuid,
+                        replacement_run_id=comparison_run_id,
+                        legacy_document_id=document.resource_id,
+                        native_head_revision_id=native_id,
+                    )
+                ):
+                    raise ShadowComparisonError("current-run item attempts to re-home an immutable mapping")
             ordered_private = [private_mappings[entry.legacy_git_oid] for entry in document.lineage]
             native_parent_bindings: list[dict[str, Any]] = []
             prior_native: dict[str, Any] | None = None

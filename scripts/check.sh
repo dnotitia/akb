@@ -100,38 +100,73 @@ fi
 
 echo "  mypy + bandit parse Python ${REQUIRED_PYTHON}"
 
-# 2. Node deps must be installed in BOTH pnpm projects.
+# 2. Node deps must be installed in every node project this gate runs in.
 #
-# frontend/ and packages/akb-client/ are separate pnpm projects with separate
-# lockfiles and separate node_modules, and this gate runs steps in each.
-# Installing only one died six steps later, inside the other, as:
+# There are three, they do not share a package manager, and each has its own
+# lockfile and its own node_modules: frontend/ and packages/akb-client/ are
+# pnpm, packages/akb-mcp-client/ is npm. Installing only some of them dies
+# several steps later, inside one of the others, as something that names
+# neither the package nor the missing install:
 #
 #     undefined
 #      ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL  Command "vitest" not found
+#     Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@modelcontextprotocol/client'
 #
-# — which names neither the package nor the missing install, and has already
-# been misread once. Worse, the two steps before it can PASS out of a global
-# tsc on PATH, so the run appears to get further than it did and to have
-# typechecked against a compiler nobody pinned. CI installs both explicitly
+# — which has already been misread once. Worse, the steps before it can PASS
+# out of a global tsc on PATH, so the run appears to get further than it did
+# and to have typechecked against a compiler nobody pinned.
+#
+# The list is DERIVED from the committed lockfiles, not restated. It used to be
+# restated — two entries and a hardcoded "2" — and it went stale the moment a
+# third project arrived: the preflight announced "2 of the 2 pnpm projects this
+# gate runs in" while the gate ran in three, so the one it did not know about
+# failed as ERR_MODULE_NOT_FOUND minutes later, which is precisely the failure
+# this preflight exists to prevent. A hand-maintained list reports the wrong
+# number confidently, and a preflight that is confidently wrong is worse than
+# none.
+#
+# A committed lockfile is this repository's own statement that the directory is
+# an installed node project. If one is ever added that this gate does not step
+# into, this will ask for an install it does not strictly need — a cheap wrong,
+# and the opposite of the one it replaces. CI installs each explicitly
 # (.github/workflows/check.yml); nothing else said so, so a fresh clone could
 # not run this script. Say it here and in CONTRIBUTING.md.
+node_install_command() {   # $1 = project directory
+  if [ -f "$1/pnpm-lock.yaml" ]; then
+    printf '(cd %s && pnpm install --frozen-lockfile)' "$1"
+  else
+    printf '(cd %s && npm ci)' "$1"
+  fi
+}
+
+node_projects=()
+while IFS= read -r lockfile; do
+  node_projects+=("$(dirname "${lockfile}")")
+done < <(git ls-files | grep -E '(^|/)(pnpm-lock\.yaml|package-lock\.json)$' | sort)
+
+if [ "${#node_projects[@]}" -eq 0 ]; then
+  echo "  ✗ found no committed node lockfiles — this preflight is measuring the wrong tree" >&2
+  exit 1
+fi
+
 missing_installs=()
-for pnpm_project in frontend packages/akb-client; do
-  [ -d "${pnpm_project}/node_modules" ] || missing_installs+=("${pnpm_project}")
+for node_project in "${node_projects[@]}"; do
+  [ -d "${node_project}/node_modules" ] || missing_installs+=("${node_project}")
 done
 if [ "${#missing_installs[@]}" -ne 0 ]; then
   echo >&2
-  echo "  ✗ node_modules missing in ${#missing_installs[@]} of the 2 pnpm projects this gate runs in:" >&2
-  for pnpm_project in "${missing_installs[@]}"; do
-    echo "      ${pnpm_project}" >&2
+  echo "  ✗ node_modules missing in ${#missing_installs[@]} of the ${#node_projects[@]} node projects this gate runs in:" >&2
+  for node_project in "${missing_installs[@]}"; do
+    echo "      ${node_project}" >&2
   done
   echo >&2
-  echo "    Both are required — they are separate projects with separate lockfiles:" >&2
-  for pnpm_project in "${missing_installs[@]}"; do
-    echo "      (cd ${pnpm_project} && pnpm install --frozen-lockfile)" >&2
+  echo "    All of them are required — separate projects, separate lockfiles," >&2
+  echo "    and not all the same package manager:" >&2
+  for node_project in "${missing_installs[@]}"; do
+    echo "      $(node_install_command "${node_project}")" >&2
   done
   echo >&2
-  echo "    Refusing to run: without them eslint/tsc/vitest either fail without" >&2
+  echo "    Refusing to run: without them eslint/tsc/vitest/node either fail without" >&2
   echo "    naming their package or silently resolve to a global toolchain." >&2
   exit 1
 fi

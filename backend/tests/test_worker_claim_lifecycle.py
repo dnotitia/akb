@@ -128,10 +128,21 @@ def test_rescuer_covers_every_attempt_at_claim_queue():
         "events",
         "documents",
         "native_invalidation_intents",
+        "native_file_projection_outbox",
     ):
         assert f"UPDATE {table}" in sql
-    assert sql.count(">= $1") == 6
+    assert sql.count(">= $1") == 7
     assert "delivery_outcome = 'abandoned'" in sql
+    assert "outcome = 'abandoned'" in sql
+
+    projection_rescue = next(
+        statement for statement in queue_rescuer._RESCUE_STATEMENTS
+        if "UPDATE native_file_projection_outbox" in statement
+    )
+    assert "completed_at = NOW(), outcome = 'abandoned'" in projection_rescue
+    assert "claimed_at = NULL, next_attempt_at = NULL" in projection_rescue
+    assert "retry_count >= $1" in projection_rescue
+    assert "next_attempt_at <= NOW()" in projection_rescue
 
 
 def test_migration_is_registered_and_adds_claim_lifecycle_columns():

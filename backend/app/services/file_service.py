@@ -41,6 +41,10 @@ from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services import skill_policy
 from app.services.uri_service import file_uri
 from app.services.m1_file_measurement import MeasurementFileService, measurement_enabled
+from app.services.native_file_projection import (
+    enqueue_native_file_projection,
+    enqueue_native_file_projection_delete,
+)
 
 # Re-export so existing callers (publication_service, public routes)
 # don't break. New code should import directly from s3_adapter.
@@ -698,6 +702,18 @@ class FileService:
                                 **_delegated_actor_event_fields(delegated_actor),
                             },
                         )
+                        await enqueue_native_file_projection(
+                            conn,
+                            file_id=fid,
+                            namespace_id=vault_id,
+                            collection=locked["collection"],
+                            name=locked["name"],
+                            mime_type=mime_type,
+                            content_hash=server_content_hash,
+                            byte_size=size_bytes,
+                            s3_key=final_key,
+                            actor=actor_id,
+                        )
                         result_row = {
                             **locked,
                             "s3_key": final_key,
@@ -885,6 +901,18 @@ class FileService:
                         "storage_version": storage_version,
                         **_delegated_actor_event_fields(delegated_actor),
                     },
+                )
+                await enqueue_native_file_projection(
+                    conn,
+                    file_id=fid,
+                    namespace_id=vault_id,
+                    collection=row["collection"],
+                    name=row["name"],
+                    mime_type=row["mime_type"],
+                    content_hash=server_content_hash,
+                    byte_size=size_bytes,
+                    s3_key=row["s3_key"],
+                    actor=actor_id,
                 )
 
         # Index file metadata for hybrid search.
@@ -1107,6 +1135,14 @@ class FileService:
                         "s3_key": row["s3_key"],
                         "size_bytes": row["size_bytes"],
                     },
+                )
+                await enqueue_native_file_projection_delete(
+                    conn,
+                    file_id=fid,
+                    namespace_id=vault_id,
+                    collection=row["collection"],
+                    name=row["name"],
+                    actor=actor_id,
                 )
 
         logger.info("Deleted file %s (s3://%s/%s)", file_id, self._bucket, row["s3_key"])

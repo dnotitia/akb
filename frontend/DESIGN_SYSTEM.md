@@ -558,7 +558,20 @@ commits` control and `Full commit log` route. Below `xl`, the work area stacks
   content arrives.
 - **Table workspace**: table routes use the same resource shell, but the data
   grid—not schema prose—is the primary canvas. The 64px header owns table
-  identity, read-only state, row/column totals, and a labelled Schema control.
+  identity, permission state, row/column totals, and a labelled Schema control.
+  Reader access remains explicitly read-only. Writer and higher roles receive
+  one orange `Add row` action plus an always-keyboard-reachable trailing action
+  cell for Edit/Delete; archived and external-git Vaults stay read-only even
+  when the member role would otherwise permit writes. Row mutations use the
+  structured REST endpoints—not a browser-composed SQL statement—and key every
+  Edit/Delete by the system UUID so an unfiltered mutation is impossible.
+  Add/Edit opens a schema-derived dialog with visible labels, type hints,
+  inline validation, nullable state, and server-managed identity/audit fields
+  omitted. Delete uses `ConfirmDialog`, keeps failures inline, and successful
+  mutations refresh both the grid and explorer counts with polite status text.
+  DDL remains a separately governed concern rather than sharing the frequent
+  row-action surface: direct Alter/Drop is admin-only, while the idempotent
+  migration contract retains its existing writer policy.
   The context row carries the table description and honest sample range. A
   single framed data surface fills the remaining height and owns both horizontal
   and vertical scrolling; its header and row-index column remain sticky, while

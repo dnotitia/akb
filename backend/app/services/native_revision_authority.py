@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,7 @@ from app.config import Settings, settings
 
 AUTHORITY_BACKEND = "postgres_native"
 AUTHORITY_RECORD_KIND = "new_database"
+EXISTING_AUTHORITY_RECORD_KIND = "existing_database_cutover"
 AUTHORITY_MARKER_KEY = True
 # A single, product-owned PostgreSQL advisory-lock namespace.  Bootstrap uses
 # the session form across init_db(); startup uses the transaction form.
@@ -44,6 +47,7 @@ _AUTHORITY_CONTENT_TABLES = (
 )
 
 Failpoint = Callable[[str], Any]
+ExistingCutoverRevalidator = Callable[[asyncpg.Connection], Awaitable[None]]
 
 
 class NativeAuthorityError(RuntimeError):
@@ -106,6 +110,17 @@ def _binding_matches(row: asyncpg.Record | dict[str, Any], identity: NativeAutho
 
 def _initialization_matches(row: asyncpg.Record | dict[str, Any], identity: NativeAuthorityIdentity) -> bool:
     return _binding_matches(row, identity) and row["runtime_image_digest"] == identity.runtime_image_digest
+
+
+def _canonical_digest(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 async def _trip(failpoint: Failpoint | None, name: str) -> None:
@@ -235,6 +250,285 @@ async def _content_inventory(conn: asyncpg.Connection) -> dict[str, int]:
     for table in _AUTHORITY_CONTENT_TABLES:
         inventory[table] = int(await conn.fetchval(f'SELECT COUNT(*) FROM "{table}"'))
     return inventory
+
+
+async def _verified_cutover_binding(
+    conn: asyncpg.Connection,
+    cutover_id: uuid.UUID,
+) -> tuple[asyncpg.Record, str]:
+    run = await conn.fetchrow(
+        """
+        SELECT cutover_id, inventory_digest, verification_digest, status
+          FROM native_revision_cutover_runs
+         WHERE cutover_id = $1
+        """,
+        cutover_id,
+    )
+    if (
+        run is None
+        or run["status"] != "verified"
+        or not isinstance(run["verification_digest"], str)
+    ):
+        raise NativeAuthorityError(
+            "native_authority_cutover_not_verified",
+            "Existing-database Native authority requires one verified cutover",
+        )
+    # The cutover receipt survives a source-vault lifecycle delete, while its
+    # live migration run correctly cascades with that retired vault.
+    vaults = await conn.fetch(
+        """
+        SELECT v.namespace_id, v.migration_run_id, v.fixed_git_oid,
+               v.inventory_digest, v.verification_digest, v.status
+          FROM native_revision_cutover_vaults v
+         WHERE v.cutover_id = $1
+         ORDER BY v.namespace_id
+        """,
+        cutover_id,
+    )
+    if not vaults or any(
+        row["status"] != "verified"
+        or not isinstance(row["verification_digest"], str)
+        for row in vaults
+    ):
+        raise NativeAuthorityError(
+            "native_authority_cutover_incomplete",
+            "Existing-database Native authority requires every vault to be verified",
+        )
+    files_incomplete = await conn.fetchval(
+        """
+        SELECT EXISTS (
+            SELECT 1
+              FROM native_revision_cutover_files
+             WHERE cutover_id = $1
+               AND (
+                    status <> 'verified'
+                    OR verification_digest IS NULL
+                    OR verification_digest !~ '^[0-9a-f]{64}$'
+               )
+        )
+        """,
+        cutover_id,
+    )
+    if files_incomplete:
+        raise NativeAuthorityError(
+            "native_authority_cutover_incomplete",
+            "Existing-database Native authority requires every File to be verified",
+        )
+    binding = [
+        {
+            "namespace_id": str(row["namespace_id"]),
+            "migration_run_id": str(row["migration_run_id"]),
+            "fixed_git_oid": row["fixed_git_oid"],
+            "inventory_digest": row["inventory_digest"],
+            "verification_digest": row["verification_digest"],
+        }
+        for row in vaults
+    ]
+    return run, _canonical_digest(binding)
+
+
+async def _activate_legacy_write_fence(
+    conn: asyncpg.Connection,
+    *,
+    cutover_id: uuid.UUID,
+) -> int:
+    # SHARE ROW EXCLUSIVE conflicts with ordinary INSERT/UPDATE/DELETE's
+    # ROW EXCLUSIVE lock while leaving the final read-only validation free to
+    # inspect every source table. Once this transaction commits, the row-level
+    # triggers reject any waiter that was admitted by a stopped Legacy image.
+    await conn.execute(
+        """
+        LOCK TABLE vaults, collections, documents, resource_aliases,
+                   vault_files, vault_external_git,
+                   native_revision_cutover_runs, native_revision_cutover_vaults,
+                   native_revision_cutover_files, native_revision_cutover_exclusions
+        IN SHARE ROW EXCLUSIVE MODE
+        """
+    )
+    fence = await conn.fetchrow(
+        "SELECT * FROM native_revision_legacy_write_fence WHERE fence_key = TRUE FOR UPDATE"
+    )
+    if fence is None or fence["state"] != "open":
+        raise NativeAuthorityError(
+            "native_authority_legacy_fence_conflict",
+            "Existing-database authority requires the open Legacy write fence",
+        )
+    row = await conn.fetchrow(
+        """
+        UPDATE native_revision_legacy_write_fence
+           SET epoch = epoch + 1,
+               state = 'fenced',
+               cutover_id = $1,
+               fenced_at = NOW()
+         WHERE fence_key = TRUE AND state = 'open'
+        RETURNING epoch
+        """,
+        cutover_id,
+    )
+    if row is None:
+        raise NativeAuthorityError(
+            "native_authority_legacy_fence_conflict",
+            "Existing-database authority lost the Legacy write fence",
+        )
+    return int(row["epoch"])
+
+
+async def _require_committed_legacy_fence(
+    conn: asyncpg.Connection,
+    authority: asyncpg.Record,
+) -> None:
+    fence = await conn.fetchrow(
+        "SELECT state, epoch, cutover_id FROM native_revision_legacy_write_fence WHERE fence_key = TRUE"
+    )
+    if (
+        fence is None
+        or fence["state"] != "committed"
+        or int(fence["epoch"]) != int(authority["legacy_write_epoch"])
+        or fence["cutover_id"] != authority["cutover_id"]
+    ):
+        raise NativeAuthorityError(
+            "native_authority_legacy_fence_mismatch",
+            "Existing-database Native authority is not bound to its committed Legacy fence",
+        )
+
+
+async def mint_existing_database_authority(
+    conn: asyncpg.Connection,
+    *,
+    identity: NativeAuthorityIdentity,
+    cutover_id: uuid.UUID,
+    authority_id: uuid.UUID | None = None,
+    revalidate: ExistingCutoverRevalidator | None = None,
+) -> uuid.UUID:
+    """Fence Legacy writes, revalidate, and mint immutable Native authority."""
+    async with conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock($1)", AUTHORITY_LOCK_KEY)
+        bootstrap_counts = await conn.fetchrow(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM document_revision_bootstrap_claims) AS claims,
+                (SELECT COUNT(*) FROM document_revision_authority_pending) AS pending,
+                (SELECT COUNT(*) FROM document_revision_authority_marker) AS markers
+            """
+        )
+        if any(int(bootstrap_counts[name]) for name in bootstrap_counts.keys()):
+            raise NativeAuthorityError(
+                "native_authority_mode_conflict",
+                "Existing-database cutover cannot coexist with new-database authority",
+            )
+
+        existing = await conn.fetchrow(
+            "SELECT * FROM native_revision_existing_authority WHERE marker_id = TRUE FOR UPDATE"
+        )
+        if existing is not None:
+            run, vault_binding_digest = await _verified_cutover_binding(conn, cutover_id)
+            expected = {
+                "cutover_id": cutover_id,
+                "record_kind": EXISTING_AUTHORITY_RECORD_KIND,
+                "backend": AUTHORITY_BACKEND,
+                "inventory_digest": run["inventory_digest"],
+                "verification_digest": run["verification_digest"],
+                "vault_binding_digest": vault_binding_digest,
+                "status": "committed",
+            }
+            if not _initialization_matches(existing, identity) or any(
+                existing[key] != value for key, value in expected.items()
+            ):
+                raise NativeAuthorityError(
+                    "native_authority_existing_mismatch",
+                    "Existing-database Native authority does not match the verified cutover",
+                )
+            await _require_committed_legacy_fence(conn, existing)
+            return existing["authority_id"]
+
+        legacy_write_epoch = await _activate_legacy_write_fence(
+            conn,
+            cutover_id=cutover_id,
+        )
+        run, vault_binding_digest = await _verified_cutover_binding(conn, cutover_id)
+        if revalidate is not None:
+            await revalidate(conn)
+
+        authority_id = authority_id or uuid.uuid4()
+        await conn.execute(
+            """
+            INSERT INTO native_revision_existing_authority (
+                marker_id, authority_id, cutover_id, tenant_id, namespace,
+                database_id, current_database, runtime_image_digest,
+                inventory_digest, verification_digest, vault_binding_digest,
+                legacy_write_epoch, status, committed_at
+            ) VALUES (
+                TRUE, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                $11, 'committed', NOW()
+            )
+            """,
+            authority_id,
+            cutover_id,
+            *identity.params(),
+            run["inventory_digest"],
+            run["verification_digest"],
+            vault_binding_digest,
+            legacy_write_epoch,
+        )
+        committed = await conn.execute(
+            """
+            UPDATE native_revision_legacy_write_fence
+               SET state = 'committed', committed_at = NOW()
+             WHERE fence_key = TRUE
+               AND state = 'fenced'
+               AND epoch = $1
+               AND cutover_id = $2
+            """,
+            legacy_write_epoch,
+            cutover_id,
+        )
+        if committed != "UPDATE 1":
+            raise NativeAuthorityError(
+                "native_authority_legacy_fence_conflict",
+                "Existing-database authority could not commit the Legacy write fence",
+            )
+        return authority_id
+
+
+async def consume_or_validate_existing_database_authority(
+    conn: asyncpg.Connection,
+    *,
+    identity: NativeAuthorityIdentity,
+    failpoint: Failpoint | None = None,
+) -> str:
+    """Validate the immutable existing-DB authority minted at cutover."""
+    async with conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock($1)", AUTHORITY_LOCK_KEY)
+        await _trip(failpoint, "after_lock")
+        row = await conn.fetchrow(
+            "SELECT * FROM native_revision_existing_authority WHERE marker_id = TRUE FOR UPDATE"
+        )
+        if row is None:
+            raise NativeAuthorityError(
+                "native_authority_missing",
+                "postgres_native requires an existing-database cutover authority record",
+            )
+        run, vault_binding_digest = await _verified_cutover_binding(conn, row["cutover_id"])
+        if (
+            not _binding_matches(row, identity)
+            or row["record_kind"] != EXISTING_AUTHORITY_RECORD_KIND
+            or row["backend"] != AUTHORITY_BACKEND
+            or row["inventory_digest"] != run["inventory_digest"]
+            or row["verification_digest"] != run["verification_digest"]
+            or row["vault_binding_digest"] != vault_binding_digest
+        ):
+            raise NativeAuthorityError(
+                "native_authority_existing_mismatch",
+                "Existing-database Native authority binding drifted",
+            )
+        if row["status"] != "committed":
+            raise NativeAuthorityError(
+                "native_authority_existing_mismatch",
+                "Existing-database authority was not committed at mint",
+            )
+        await _require_committed_legacy_fence(conn, row)
+        await _trip(failpoint, "validated_marker")
+        return "cutover_validated"
 
 
 def git_authority_is_blank(root: str | Path) -> bool:
@@ -415,7 +709,8 @@ async def _reject_native_authority_for_non_product_mode(conn: asyncpg.Connection
             SELECT
                 (SELECT COUNT(*) FROM document_revision_bootstrap_claims) AS claims,
                 (SELECT COUNT(*) FROM document_revision_authority_pending) AS pending,
-                (SELECT COUNT(*) FROM document_revision_authority_marker) AS markers
+                (SELECT COUNT(*) FROM document_revision_authority_marker) AS markers,
+                (SELECT COUNT(*) FROM native_revision_existing_authority) AS existing_cutovers
             """
         )
         if any(int(counts[name]) for name in counts.keys()):
@@ -436,6 +731,14 @@ async def startup_revision_authority_preflight(
     pool = await get_pool()
     async with pool.acquire() as conn:
         if configured.document_revision_backend == "postgres_native":
+            if await conn.fetchval(
+                "SELECT COUNT(*) FROM native_revision_existing_authority"
+            ):
+                return await consume_or_validate_existing_database_authority(
+                    conn,
+                    identity=NativeAuthorityIdentity.from_settings(configured),
+                    failpoint=failpoint,
+                )
             return await consume_or_validate_native_authority(
                 conn,
                 identity=NativeAuthorityIdentity.from_settings(configured),
@@ -458,14 +761,20 @@ async def pre_migration_revision_authority_guard(configured: Settings = settings
             if claim_table
             else 0
         )
+        existing_table = await _relation_exists(conn, "native_revision_existing_authority")
+        existing_count = (
+            int(await conn.fetchval("SELECT COUNT(*) FROM native_revision_existing_authority"))
+            if existing_table
+            else 0
+        )
         if configured.document_revision_backend == "postgres_native":
-            if claim_count != 1:
+            if (claim_count, existing_count) not in {(1, 0), (0, 1)}:
                 raise NativeAuthorityError(
                     "native_authority_missing",
-                    "postgres_native startup requires a pre-schema bootstrap claim; "
-                    "run initialize-postgres-native before the first backend pod",
+                    "postgres_native startup requires exactly one new-database claim "
+                    "or verified existing-database cutover authority",
                 )
-        elif claim_count:
+        elif claim_count or existing_count:
             raise NativeAuthorityError(
                 "native_authority_mode_conflict",
                 "Bare Git and measurement modes reject a database claimed by postgres_native",

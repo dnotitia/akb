@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 
 from app.services.table_row_write import (
     compile_ast_mutation,
@@ -52,6 +53,19 @@ def test_compile_insert_bulk_uses_union_columns_defaults_and_server_actor() -> N
         "VALUES ($1, $2, $3), ($4, DEFAULT, $5) RETURNING id, title, severity"
     )
     assert compiled.params == ["a", "high", "alice", "b", "alice"]
+
+
+def test_compile_insert_preserves_numeric_json_literal_precision() -> None:
+    compiled = compile_insert_rows(
+        vault_name="eng",
+        table_name="incidents",
+        columns=[{"name": "score", "type": "numeric"}],
+        actor_id="alice",
+        body={"score": 0.87},
+    )
+
+    assert not isinstance(compiled, dict)
+    assert compiled.params == [Decimal("0.87"), "alice"]
 
 
 def test_compile_insert_allows_client_id_and_created_at() -> None:

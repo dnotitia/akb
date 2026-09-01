@@ -175,10 +175,16 @@ def project_logical_lineage(
     if oldest_anchor_oid is not None and _OID_RE.fullmatch(oldest_anchor_oid) is None:
         raise LogicalLineageProjectionError("oldest anchor must be a full Git OID")
     created_at_utc = created_at.astimezone(UTC)
+    entries = tuple(history)
+    use_create_boundary = oldest_anchor_oid is None and any(
+        isinstance(entry, Mapping) and entry.get("action") == "create"
+        for entry in entries
+    )
     newest: list[LegacyLineageEntry] = []
     seen: set[str] = set()
     anchor_found = False
-    for entry in history:
+    create_found = False
+    for entry in entries:
         if not isinstance(entry, Mapping):
             raise LogicalLineageProjectionError("history entry must be a mapping")
         oid = entry.get("legacy_git_oid")
@@ -189,6 +195,8 @@ def project_logical_lineage(
                 raise LogicalLineageProjectionError(
                     "history contains a duplicate oldest anchor"
                 )
+            continue
+        if create_found:
             continue
         committed_at = entry.get("committed_at")
         if (
@@ -211,6 +219,7 @@ def project_logical_lineage(
         seen.add(oid)
         if (
             oldest_anchor_oid is None
+            and not use_create_boundary
             and oid != current_commit
             and committed_at.astimezone(UTC) < created_at_utc
         ):
@@ -224,6 +233,8 @@ def project_logical_lineage(
         )
         if oid == oldest_anchor_oid:
             anchor_found = True
+        if use_create_boundary and entry.get("action") == "create":
+            create_found = True
     if oldest_anchor_oid is not None and not anchor_found:
         raise LogicalLineageProjectionError(
             "completed oldest anchor is absent from fixed-ref history"

@@ -36,6 +36,11 @@ data:
     keycloak_require_verified_email: true
     api_oauth_audience: https://akb.example.com/api
     keycloak_verify_ssl: true
+    # With no external identity provider to broker to, uncomment these to let
+    # people sign in with an account in this installation's own realm. See
+    # "Sign in without an upstream provider" in README.md.
+    # sso_local_realm_login_enabled: true
+    # sso_local_realm_display_name: "This workspace"
 
     vector_store_driver: pgvector
     vector_store_dsn: ""

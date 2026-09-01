@@ -33,10 +33,15 @@ encrypts the Keycloak refresh/ID token set and never persists an access token.
 The bootstrap maps the `identity_provider` user-session note into both ordinary
 token profiles so AKB can bind each callback and refresh to the exact enabled
 broker alias rather than trusting `kc_idp_hint`.
-It becomes ready only after the browser-session encryption key is supplied and
-an upstream provider is enabled. `/admin` uses the dedicated confidential
-client and requires a fresh native Keycloak password ceremony; a brokered
-upstream identity is not accepted as the recovery administrator.
+That custody becomes ready once its own configuration is complete — the
+browser-session encryption key is the last piece an operator supplies — and
+readiness is a property of that profile alone, never of the provider list.
+Readiness is not a way in, though: a person still needs somewhere to sign in,
+which is either an enabled upstream provider or this installation's own realm
+(see [Sign in without an upstream provider](#sign-in-without-an-upstream-provider)).
+`/admin` uses the dedicated confidential client and requires a fresh native
+Keycloak password ceremony; a brokered upstream identity is not accepted as the
+recovery administrator.
 
 The browser-facing AKB origin and Keycloak-to-AKB back-channel are separate
 deployment concerns. `keycloak_backchannel_logout_uri` is registered on the
@@ -182,6 +187,40 @@ Apply only after all durable and first-install one-time Secrets exist. Wait for 
 pod's `bootstrap-standalone-sso` init container and main container to complete,
 then inspect the init log. Its JSON report contains only IDs, key metadata, and
 the exact role names; it never contains credential values.
+
+## Sign in without an upstream provider
+
+A bundled-Keycloak install has a realm of its own, and an installation that has
+no external identity provider to broker to can use it as the place people
+authenticate:
+
+```yaml
+sso_local_realm_login_enabled: true
+sso_local_realm_display_name: "This workspace"
+```
+
+`/api/v1/auth/config` then offers one provider of type `local-realm` under the
+reserved alias `local`, whose `login_url` is `/api/v1/auth/sso/local/login`; that
+route redirects to this realm's own authorize endpoint with no broker hint
+attached. Off by default, so an installation that
+registers no provider keeps the behaviour it has rather than silently gaining a
+login.
+
+The two kinds are not interchangeable and neither accepts the other's shape. A
+brokered sign-in carries the `identity_provider` claim and it must be present
+and equal to the selected alias; a direct realm sign-in cannot carry it, because
+nothing brokered it, and it must be absent. The claim never becomes optional:
+that would let a token minted through one provider be presented for another.
+
+Registering this realm as its own upstream provider is a different thing and
+stays refused (`provider_issuer_is_broker`) -- it would be an authorize loop,
+not a login.
+
+This realm already holds a realm-local native identity: the product
+administrator is one. So enabling this does not introduce a plane that was
+absent; it decides that ordinary people also hold an account here rather than at
+an upstream. Whoever arrives this way is a pending admission and still needs an
+administrator's approval, exactly like anyone arriving through a broker.
 
 ## Upgrade an existing receipt
 

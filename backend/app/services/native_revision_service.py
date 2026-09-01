@@ -818,6 +818,231 @@ class NativeRevisionService:
             occurred_at=occurred_at,
         )
 
+    async def restore_text(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        surface: str,
+        path: str,
+        payload: str | bytes,
+        actor: str,
+        mutation_id: uuid.UUID,
+        expected_revision_id: str,
+        expected_resource_id: uuid.UUID,
+        message: str | None = None,
+        subject: str | None = None,
+        summary: str | None = None,
+        expected_digest: str | None = None,
+        expected_size: int | None = None,
+    ) -> NativeMutationResult:
+        """Restore a deleted Resource without discarding its immutable history.
+
+        Restoration is intentionally a ``replace`` Revision: the Resource has
+        a parent and receives a new verified payload, while its stable identity
+        remains unchanged.  The current path must still be the tombstoned path;
+        callers may issue an ordinary move after restoration when needed.
+        """
+        self._validate_common(surface=surface, path=path, actor=actor, mutation_id=mutation_id)
+        self._validate_expected_revision(expected_revision_id)
+        if not isinstance(expected_resource_id, uuid.UUID):
+            raise ValidationError("Native Resource ID must be a UUID")
+        await self._hit("payload.before_prepare")
+        prepared = await self.payload_store.prepare_text(
+            namespace_id=namespace_id,
+            payload=payload,
+            expected_digest=expected_digest,
+            expected_size=expected_size,
+        )
+        await self._hit("payload.after_verified")
+        fingerprint = self._fingerprint(
+            action="replace",
+            namespace_id=namespace_id,
+            surface=surface,
+            path=path,
+            payload=prepared,
+            expected_revision_id=expected_revision_id,
+            actor=actor,
+            message=message,
+            subject=subject,
+            summary=summary,
+            expected_resource_id=expected_resource_id,
+        )
+        await self._hit("payload.after_prepare_before_tx")
+        result = await self._publish_restore(
+            namespace_id=namespace_id,
+            surface=surface,
+            path=path,
+            actor=actor,
+            mutation_id=mutation_id,
+            expected_revision_id=expected_revision_id,
+            expected_resource_id=expected_resource_id,
+            message=message,
+            subject=subject,
+            summary=summary,
+            prepared=prepared,
+            fingerprint=fingerprint,
+        )
+        await self._hit("authority.after_commit_before_response")
+        return result
+
+    async def _publish_restore(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        surface: str,
+        path: str,
+        actor: str,
+        mutation_id: uuid.UUID,
+        expected_revision_id: str,
+        expected_resource_id: uuid.UUID,
+        message: str | None,
+        subject: str | None,
+        summary: str | None,
+        prepared: PreparedReferencePayload,
+        fingerprint: str,
+    ) -> NativeMutationResult:
+        revision_id = await self._allocate_revision_id()
+        manifest_id = uuid.uuid4()
+        activity_id = uuid.uuid4()
+        intent_id = uuid.uuid4()
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.transaction():
+                    await self.repository.lock_mutation(conn, namespace_id, mutation_id)
+                    prior = await self.repository.find_mutation(conn, namespace_id, mutation_id)
+                    if prior is not None:
+                        if prior["request_fingerprint"] != fingerprint:
+                            raise ConflictError(
+                                "Native idempotency key was reused with different input"
+                            )
+                        return self._from_row(prior, replay=True)
+
+                    resource = await self.repository.lock_resource(conn, expected_resource_id)
+                    if resource is None:
+                        raise NotFoundError("Native Resource", str(expected_resource_id))
+                    if (
+                        resource["namespace_id"] != namespace_id
+                        or resource["surface"] != surface
+                    ):
+                        raise NotFoundError("Native Resource", str(expected_resource_id))
+                    if resource["lifecycle"] != "deleted":
+                        raise ConflictError("Native Resource is not deleted")
+                    if resource["current_path"] != path:
+                        raise ConflictError(
+                            "Native restore path must match the tombstoned Resource path"
+                        )
+                    parent_revision_id = resource["head_revision_id"]
+                    if parent_revision_id != expected_revision_id:
+                        raise ConflictError(
+                            "Native Revision conflict: expected "
+                            f"{expected_revision_id}, current Head is {parent_revision_id}"
+                        )
+
+                    await self.repository.lock_paths(conn, namespace_id, surface, path)
+                    live_owner = await self.repository.find_live_path(
+                        conn, namespace_id, surface, path,
+                    )
+                    if live_owner is not None:
+                        raise ConflictError(f"Native Resource already exists at path: {path}")
+                    reused_alias = await self.repository.find_live_alias(
+                        conn,
+                        namespace_id=namespace_id,
+                        surface=surface,
+                        old_path=path,
+                    )
+
+                    occurred_at = datetime.now(UTC)
+                    await self.repository.insert_manifest(
+                        conn,
+                        payload_manifest_id=manifest_id,
+                        namespace_id=namespace_id,
+                        resource_id=expected_resource_id,
+                        payload=prepared,
+                        occurred_at=occurred_at,
+                    )
+                    await self._hit("authority.after_manifest")
+                    await self.repository.insert_revision(
+                        conn,
+                        revision_id=revision_id,
+                        namespace_id=namespace_id,
+                        resource_id=expected_resource_id,
+                        parent_revision_id=parent_revision_id,
+                        action="replace",
+                        path=path,
+                        path_from=None,
+                        path_to=None,
+                        payload_manifest_id=manifest_id,
+                        mutation_id=mutation_id,
+                        request_fingerprint=fingerprint,
+                        message=message,
+                        subject=subject,
+                        summary=summary,
+                        actor=actor,
+                        occurred_at=occurred_at,
+                        activity_event_id=activity_id,
+                        invalidation_intent_id=intent_id,
+                    )
+                    await self._hit("authority.after_revision")
+                    await self.repository.set_head(
+                        conn,
+                        resource_id=expected_resource_id,
+                        revision_id=revision_id,
+                        path=path,
+                        lifecycle="live",
+                        occurred_at=occurred_at,
+                    )
+                    await self._hit("authority.after_head")
+                    await self._hit("authority.after_path")
+                    if reused_alias is not None:
+                        await self.repository.retire_live_alias(
+                            conn,
+                            namespace_id=namespace_id,
+                            surface=surface,
+                            old_path=path,
+                            retired_revision_id=revision_id,
+                            occurred_at=occurred_at,
+                        )
+                    await self._hit("authority.after_alias")
+                    await self.repository.insert_activity(
+                        conn,
+                        activity_event_id=activity_id,
+                        namespace_id=namespace_id,
+                        resource_id=expected_resource_id,
+                        revision_id=revision_id,
+                        action="replace",
+                        actor=actor,
+                        subject=subject,
+                        summary=summary,
+                        path_from=None,
+                        path_to=None,
+                        occurred_at=occurred_at,
+                    )
+                    await self._hit("authority.after_activity")
+                    await self.repository.insert_invalidation_intent(
+                        conn,
+                        intent_id=intent_id,
+                        namespace_id=namespace_id,
+                        resource_id=expected_resource_id,
+                        revision_id=revision_id,
+                        reason="replace",
+                        occurred_at=occurred_at,
+                    )
+                    await self._hit("authority.after_invalidation")
+                    await self._hit("authority.before_commit")
+        except asyncpg.UniqueViolationError as exc:
+            if exc.constraint_name == "uq_native_resources_live_path":
+                raise ConflictError(f"Native Resource already exists at path: {path}") from exc
+            raise
+        return NativeMutationResult(
+            resource_id=expected_resource_id,
+            revision_id=revision_id,
+            parent_revision_id=parent_revision_id,
+            action="replace",
+            path=path,
+            payload_manifest_id=manifest_id,
+            occurred_at=occurred_at,
+        )
+
     async def move_text(
         self,
         *,

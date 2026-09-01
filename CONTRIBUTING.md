@@ -127,13 +127,16 @@ uv tool install --python 3.14 --force 'ruff==0.15.16'
 uv tool install --python 3.14 --force 'detect-secrets==1.5.0'
 ```
 
-**2. Node deps in both pnpm projects.** `frontend/` and `packages/akb-client/`
-are separate projects with separate lockfiles and separate `node_modules`,
-and the gate runs steps in each. Installing only one is the common mistake:
+**2. Node deps in all three node projects.** `frontend/`,
+`packages/akb-client/` and `packages/akb-mcp-client/` are separate projects
+with separate lockfiles and separate `node_modules`, and the gate runs steps in
+each. They are not all the same package manager. Installing only some of them
+is the common mistake:
 
 ```bash
 (cd frontend && pnpm install --frozen-lockfile)
 (cd packages/akb-client && pnpm install --frozen-lockfile)
+(cd packages/akb-mcp-client && npm ci)
 ```
 
 Then:

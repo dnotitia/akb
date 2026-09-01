@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
 import asyncpg
@@ -819,4 +820,16 @@ def _last_value(query_params: Sequence[tuple[str, str]], key: str) -> str | None
 def _normalize_value(value: Any, type_name: str) -> Any:
     if _is_json_type(type_name) and not isinstance(value, str):
         return json.dumps(value)
+    # JSON decoders represent decimal literals as binary floats. Passing that
+    # float directly to PostgreSQL NUMERIC preserves the binary approximation
+    # (for example 0.87 becomes a long 0.86999… value). Convert through the
+    # shortest decimal string so structured row writes keep the value the user
+    # actually entered. Booleans are intentionally excluded: PG should reject
+    # them as a type mismatch rather than silently treating True as 1.
+    if (
+        type_name in {"numeric", "number"}
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
+    ):
+        return Decimal(str(value))
     return value
