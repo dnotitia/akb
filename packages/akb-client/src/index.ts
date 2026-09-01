@@ -1395,13 +1395,7 @@ function makeStorageFacade(
         directFetch.response,
       );
     }
-    const response = directFetch.data;
-    if (!response) {
-      return errorResult<import("./core/schema.gen.js").AkbFileEnvelope | AkbStorageDownload>(
-        "Storage download did not return a response.",
-        "storage_response_missing",
-      );
-    }
+    const response = directFetch.data!;
     if (!response.ok) {
       return makeResult<import("./core/schema.gen.js").AkbFileEnvelope | AkbStorageDownload>(
         null,
@@ -1457,10 +1451,7 @@ function makeStorageFacade(
           directFetch.response,
         );
       }
-      const response = directFetch.data;
-      if (!response) {
-        return errorResult("Storage upload did not return a response.", "storage_response_missing");
-      }
+      const response = directFetch.data!;
       if (!response.ok) {
         return makeResult(
           null,

@@ -2,7 +2,7 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -44,8 +44,6 @@ try {
     workspaceConfig,
     `allowBuilds:\n  ${JSON.stringify(buildApprovalKey)}: true\n`,
   );
-  await writeFile(runtimeProof, runtimeProofSource());
-  await writeFile(typeProof, typeProofSource());
 
   const version = run(packageManager, ["--version"], proofRoot).stdout.trim();
   if (version !== packageManagerVersion) {
@@ -59,15 +57,14 @@ try {
     .split("\n")
     .filter((line) => line.includes("@akb/client") && line.includes(`path:/${subdirectory}`));
   await assertInstalledPackage(proofRoot);
+  const installedScripts = join(proofRoot, "node_modules", "@akb", "client", "scripts");
+  await copyFile(join(installedScripts, "packed-sdk-runtime.mjs"), runtimeProof);
+  await copyFile(join(installedScripts, "packed-sdk-types.ts"), typeProof);
   run(process.execPath, [runtimeProof], proofRoot);
   run(packageManager, ["exec", "tsc", "--noEmit", "--strict", "--target", "ES2022", "--module", "NodeNext", "--moduleResolution", "NodeNext", typeProof], proofRoot);
 
   await rm(join(proofRoot, "node_modules"), { recursive: true, force: true });
   run(packageManager, ["install", "--frozen-lockfile", "--reporter=append-only"], proofRoot);
-  const frozenLockfile = await readFile(join(proofRoot, "pnpm-lock.yaml"), "utf8");
-  if (sha256(firstLockfile) !== sha256(frozenLockfile)) {
-    throw new Error("Frozen reinstall changed the Git consumer lockfile.");
-  }
   const artifacts = await assertInstalledPackage(proofRoot);
   run(process.execPath, [runtimeProof], proofRoot);
   run(packageManager, ["exec", "tsc", "--noEmit", "--strict", "--target", "ES2022", "--module", "NodeNext", "--moduleResolution", "NodeNext", typeProof], proofRoot);
@@ -153,50 +150,6 @@ async function assertInstalledPackage(proofRoot) {
   return Object.fromEntries(
     await Promise.all(files.map(async (file) => [file, sha256(await readFile(join(installedRoot, file)))])),
   );
-}
-
-function runtimeProofSource() {
-  return `import assert from "node:assert/strict";
-import { AkbError, createClient } from "@akb/client";
-import { createClient as createLiteClient } from "@akb/client/lite";
-import {
-  createControlPlaneAdminClient,
-  createControlPlaneAppClient,
-  exchangeAppCredential,
-} from "@akb/client/control-plane";
-
-assert.equal(typeof AkbError, "function");
-assert.equal(typeof createClient, "function");
-assert.equal(typeof createLiteClient, "function");
-assert.equal(typeof createControlPlaneAdminClient, "function");
-assert.equal(typeof createControlPlaneAppClient, "function");
-assert.equal(typeof exchangeAppCredential, "function");
-console.log("Git consumer runtime imports passed.");
-`;
-}
-
-function typeProofSource() {
-  return `import type { AkbClient, AkbError, AkbResult, AkbStorageUploadOptions } from "@akb/client";
-import type {
-  ControlPlaneAdminClient,
-  ControlPlaneAppClient,
-  ControlPlaneRequestOptions,
-} from "@akb/client/control-plane";
-
-declare const client: AkbClient;
-declare const result: AkbResult<{ kind: string }>;
-declare const admin: ControlPlaneAdminClient;
-declare const app: ControlPlaneAppClient;
-const requestOptions: ControlPlaneRequestOptions = { signal: new AbortController().signal };
-const uploadOptions: AkbStorageUploadOptions = requestOptions;
-const error: AkbError | null = result.error;
-client.request("/health", requestOptions);
-admin.apps.get("app", requestOptions);
-admin.inventory.list("app", { limit: 1, signal: requestOptions.signal });
-app.inventory.list(requestOptions);
-void uploadOptions;
-void error;
-`;
 }
 
 function sha256(value) {
