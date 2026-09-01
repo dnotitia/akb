@@ -1760,7 +1760,11 @@ class GitService:
             "-M",
             "--name-status",
         ]
-        if since_epoch is not None:
+        # Imported Git documents are created in AKB after their source commit.
+        # In that case a DB-created-at lower bound would hide the very commit
+        # that anchors the imported file's lineage, so retain the complete
+        # path history. Native AKB writes keep the bounded legacy behavior.
+        if since_epoch is not None and current.committed_date >= since_epoch:
             log_args.append(f"--since=@{since_epoch}")
         log_args.extend(["--format=%H%x00%ct", fixed_ref, "--", file_path])
         try:
@@ -1794,16 +1798,24 @@ class GitService:
             status = fields[0]
             if status.startswith("R") and len(fields) >= 3:
                 active["path_at_revision"] = fields[-1]
+                active["action"] = "move"
             elif len(fields) >= 2:
                 active["path_at_revision"] = fields[-1]
+                action = {
+                    "A": "create",
+                    "M": "update",
+                    "D": "delete",
+                }.get(status[:1])
+                if action is not None:
+                    active["action"] = action
         flush()
 
         # Git commit timestamps have one-second precision while the document
         # row's created_at has microseconds. Preserve the standard AKB action
         # so the migration bridge can stop at the newest create commit instead
         # of dropping that commit (or admitting an older same-path lifecycle)
-        # on timestamp comparison alone. Unknown historical commit formats
-        # remain supported through the bridge's timestamp fallback.
+        # on timestamp comparison alone. Plain imported Git commits retain the
+        # action inferred from their exact name-status record above.
         for entry in history:
             try:
                 commit = repo.commit(entry["legacy_git_oid"])

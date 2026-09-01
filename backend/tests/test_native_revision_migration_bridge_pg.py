@@ -448,7 +448,7 @@ async def test_inventory_accepts_plain_git_activity_without_akb_footers(tmp_path
                 """,
                 document_id,
                 namespace_id,
-                current_dt - timedelta(seconds=1),
+                current_dt + timedelta(seconds=1),
                 current_oid,
             )
 

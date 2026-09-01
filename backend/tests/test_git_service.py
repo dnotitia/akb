@@ -133,20 +133,21 @@ def test_manual_fixed_ref_history_infers_plain_git_create_activity(
         content="# Unrelated\n",
         message="Add unrelated document",
     )
+    current = Repo(str(git_service._bare_path(name))).commit(current_oid)
 
     snapshot = git_service.manual_fixed_ref_history(
         name,
         fixed_ref,
         "notes/imported.md",
         current_commit=current_oid,
+        since_epoch=current.committed_date + 1,
     )
 
     assert snapshot["body"] == b"# Imported\n\nPlain Git history.\n"
+    assert snapshot["history"][0]["action"] == "create"
     assert snapshot["activity"] == {
         "legacy_git_oid": current_oid,
-        "committed_at": Repo(str(git_service._bare_path(name)))
-        .commit(current_oid)
-        .committed_datetime,
+        "committed_at": current.committed_datetime,
         "actor": "Fixture Collector",
         "subject": "Import documentation",
         "summary": "",
@@ -182,14 +183,20 @@ def test_manual_fixed_ref_history_infers_plain_git_update_activity(
         author_name="Fixture Collector",
         author_email="collector@example.dev",
     )
+    current = Repo(str(git_service._bare_path(name))).commit(current_oid)
 
     snapshot = git_service.manual_fixed_ref_history(
         name,
         current_oid,
         "notes/imported.md",
         current_commit=current_oid,
+        since_epoch=current.committed_date + 1,
     )
 
+    assert [entry["action"] for entry in snapshot["history"]] == [
+        "update",
+        "create",
+    ]
     assert snapshot["activity"]["action"] == "update"
     assert snapshot["activity"]["actor"] == "Fixture Collector"
     assert snapshot["activity"]["subject"] == "Revise documentation"
