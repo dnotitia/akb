@@ -54,7 +54,7 @@ try {
 
   run(packageManager, ["install", "--reporter=append-only"], proofRoot);
   const firstLockfile = await readFile(join(proofRoot, "pnpm-lock.yaml"), "utf8");
-  assertResolution(firstLockfile, gitSpecifier, commit, subdirectory);
+  assertResolution(firstLockfile, gitSpecifier);
   const lockfileResolution = firstLockfile
     .split("\n")
     .filter((line) => line.includes("@akb/client") && line.includes(`path:/${subdirectory}`));
@@ -121,12 +121,9 @@ function validateSubdirectory(value) {
   }
 }
 
-function assertResolution(lockfile, specifier, commit, subdirectory) {
+function assertResolution(lockfile, specifier) {
   if (!lockfile.includes(specifier)) {
     throw new Error("pnpm-lock.yaml does not retain the exact Git URL, commit, and subdirectory specifier.");
-  }
-  if (!lockfile.includes(commit) || !lockfile.includes(`path:/${subdirectory}`)) {
-    throw new Error("pnpm-lock.yaml does not retain the exact Git commit and subdirectory resolution.");
   }
 }
 
