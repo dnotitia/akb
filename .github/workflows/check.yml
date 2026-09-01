@@ -54,9 +54,9 @@ jobs:
         run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Install @akb/client deps
         working-directory: packages/akb-client
-        # Its own pnpm store: typescript + vitest. The package's prepare
-        # lifecycle may emit dist/, while the contributor gate runs the
-        # explicit build again before its checks.
+        # Its own pnpm store: typescript + vitest. No postinstall build
+        # scripts, so a plain frozen install is enough for `pnpm run build`
+        # (tsc emit) and `pnpm exec vitest run` in scripts/check.sh.
         run: pnpm install --frozen-lockfile
 
       # ── Single entry point so CI and local pre-commit stay in sync ──
