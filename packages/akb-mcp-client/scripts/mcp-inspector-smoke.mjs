@@ -388,6 +388,9 @@ async function invoke(info, inputs, configPath, runtimeRoot, method, spawnProces
 }
 
 function scenarioForTarget(target) {
+  // Keep this seam concrete rather than turning it into a general DSL: the
+  // canary contract drives Inspector argv and assertions, while this adapter
+  // only preserves the existing smoke's second transport.
   if (target === HTTP_READ_ONLY_CANARY.target) return HTTP_READ_ONLY_CANARY;
   return Object.freeze({
     ...HTTP_READ_ONLY_CANARY,
