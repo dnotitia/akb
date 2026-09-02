@@ -5,14 +5,14 @@ import { HistoryList, type HistoryEntry } from "../history-list";
 
 const entries: HistoryEntry[] = [
   {
-    hash: "abcdef123456",
+    hash: "abcdef123456", // pragma: allowlist secret — synthetic Git commit
     author: "user-1",
     author_name: "Kim",
     message: "Initial document",
     date: "2026-05-19T00:00:00Z",
   },
   {
-    hash: "bcdefa234567",
+    hash: "bcdefa234567", // pragma: allowlist secret — synthetic Git commit
     author: "user-2",
     message: "Update architecture",
     date: "2026-05-19T01:00:00Z",

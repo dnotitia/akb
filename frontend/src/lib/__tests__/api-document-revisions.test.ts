@@ -23,7 +23,7 @@ describe("document revision API", () => {
       kind: "document_history",
       uri: "akb://demo/coll/notes/doc/guide.md",
       history: [{
-        hash: "abcdef123456",
+        hash: "abcdef123456", // pragma: allowlist secret — synthetic Git commit
         message: "Update guide",
         author: "user-1",
         author_name: "Kim",

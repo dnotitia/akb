@@ -580,7 +580,7 @@ describe("DocumentPage view toggle", () => {
           date: "2026-09-02T00:00:00Z",
         },
         {
-          hash: "1234567abcdef",
+          hash: "1234567abcdef", // pragma: allowlist secret — synthetic Git commit
           message: "Create document",
           author: "user-1",
           author_name: "Kim",

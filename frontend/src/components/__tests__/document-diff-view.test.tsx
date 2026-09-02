@@ -21,7 +21,7 @@ function result(overrides: Partial<DocumentDiff> = {}): DocumentDiff {
   return {
     kind: "document_diff",
     file: "notes/guide.md",
-    commit: "abcdef123456",
+    commit: "abcdef123456", // pragma: allowlist secret — synthetic Git commit
     type: "modified",
     diff: [
       "--- a/notes/guide.md",
@@ -53,7 +53,7 @@ function renderDiff(props: Partial<React.ComponentProps<typeof DocumentDiffView>
           vault="demo"
           docId="notes/guide.md"
           revision="abcdef123456"
-          baseRevision="123456abcdef"
+          baseRevision={"123456abcdef" /* pragma: allowlist secret — synthetic Git commit */}
           targetEntry={{
             hash: "abcdef123456",
             message: "Update guide",
