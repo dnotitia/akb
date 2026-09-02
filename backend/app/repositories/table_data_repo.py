@@ -123,21 +123,76 @@ def _sanitize_pg_part(s: str) -> str:
 
 
 # PostgreSQL truncates identifiers past NAMEDATALEN-1 (63 bytes by
-# default) *silently*. A truncated `vt_*` name could collide with a
-# different table — so we refuse, rather than truncate, names that
-# don't fit. `role_sync._is_safe_pg_table_name` enforces the same bound
-# as defense-in-depth; this constant is the single source for both.
+# default) *silently*, and a truncated `vt_*` name could collide with a
+# different table. `pg_table_name` below therefore never emits one over
+# this bound — it truncates deliberately and appends a digest of the
+# original pair, which is what makes the truncation collision-safe.
+# `role_sync._is_safe_pg_table_name` enforces the same bound as
+# defense-in-depth; this constant is the single source for both.
 # Note the bound is in *bytes*: `_sanitize_pg_part` maps every non-ASCII
 # character to `_`, so the identifier is pure ASCII and a `len()`
 # char-count equals PG's byte count — the equivalence breaks if a future
 # change ever lets multibyte characters through.
 PG_IDENT_MAX_LEN = 63
 
+# Reserved by the composed form itself: `vt_` and the `__` separator.
+_VT_FRAMING_LEN = len("vt_") + len("__")
+# `_` plus eight hex characters of digest, appended only when truncating.
+_VT_DIGEST_LEN = 9
+
 
 def pg_table_name(vault_name: str, table_name: str) -> str:
     """Return the PG table name for a vault-scoped table:
-    `vt_{sanitised_vault}__{sanitised_table}`."""
-    return f"vt_{_sanitize_pg_part(vault_name)}__{_sanitize_pg_part(table_name)}"
+    `vt_{sanitised_vault}__{sanitised_table}`, always within
+    ``PG_IDENT_MAX_LEN``.
+
+    Composing two names inside one 63-byte identifier means the pair can
+    exceed it, and this used to be refused. Refusing is a defensible
+    answer for a name a person chose and a useless one for a name a
+    program derived: a caller whose vault names are generated spends most
+    of the budget before naming a table at all, and then ordinary table
+    names cannot be created — not intermittently, but on an identifier
+    computed before any work is attempted.
+
+    So an over-long pair is fitted rather than refused, the same way
+    ``_constraint_name`` below already fits index and constraint names.
+    The rule is chosen for three properties, and each is load-bearing:
+
+    * **A pair that already fits is byte-identical.** Every table that
+      exists was created under the old rule, so it fits by construction;
+      leaving those alone is what makes this change need no migration.
+    * **The framing survives.** ``role_sync`` interpolates this name into
+      raw SQL behind ``^vt_[a-z0-9_]+__[a-z0-9_]+$``, so both sides and
+      the separator have to remain — truncating the composed string
+      blindly would cut before the `__` for a long enough vault name,
+      which is exactly the case this exists for.
+    * **The digest is over the ORIGINAL pair, not the truncated form.**
+      Two different pairs that truncate to the same prefix would
+      otherwise become one name. The physical-name fusion preflight in
+      ``table_service`` still guards the pre-existing collision case; this
+      keeps truncation from adding a new one.
+
+    The vault side is the side that gives way. In the case this is for,
+    it is the generated one and the table name is the one a reader
+    recognises.
+    """
+    vault = _sanitize_pg_part(vault_name)
+    table = _sanitize_pg_part(table_name)
+    composed = f"vt_{vault}__{table}"
+    if len(composed) <= PG_IDENT_MAX_LEN:
+        return composed
+
+    # usedforsecurity=False: a collision-avoidance tag for a PG identifier,
+    # not a security primitive — the same reasoning `_constraint_name` uses.
+    digest = hashlib.sha1(
+        "\x00".join([vault, table]).encode(), usedforsecurity=False
+    ).hexdigest()[:8]
+    budget = PG_IDENT_MAX_LEN - _VT_FRAMING_LEN - _VT_DIGEST_LEN
+    # Both sides must stay non-empty for the grammar above, so the table
+    # keeps at most all but one byte and the vault takes what is left.
+    table_keep = min(len(table), budget - 1)
+    vault_keep = min(len(vault), budget - table_keep)
+    return f"vt_{vault[:vault_keep]}__{table[:table_keep]}_{digest}"
 
 
 def pg_short_name(table_name: str) -> str:

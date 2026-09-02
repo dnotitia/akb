@@ -917,19 +917,14 @@ async def create_table(
                     vault_id, collection_path, conn=conn,
                 )
 
+            # Always within NAMEDATALEN: `pg_table_name` fits an over-long
+            # pair rather than refusing it, so there is no length check to
+            # make here. There used to be one, and it was correct while the
+            # composition could overflow — a clean 422 beat PG truncating
+            # silently and role_sync then failing to GRANT deep in the stack.
+            # What it could not do is let the table exist, and a vault named
+            # by a generator leaves too little room for ordinary table names.
             pg_name = table_data_repo.pg_table_name(vault["name"], name)
-            # Refuse names whose PG identifier would overflow NAMEDATALEN.
-            # PG truncates silently, and role_sync then refuses to GRANT on
-            # the over-long name (raising deep in the stack as a 500). Catch
-            # it here as a clean 422 that names the culprit, before any DDL.
-            if len(pg_name) > table_data_repo.PG_IDENT_MAX_LEN:
-                raise ValidationError(
-                    f"Table name too long: the PostgreSQL identifier "
-                    f"{pg_name!r} is {len(pg_name)} chars, over the "
-                    f"{table_data_repo.PG_IDENT_MAX_LEN}-char limit. Shorten "
-                    f"the vault name ({vault['name']!r}) or table name "
-                    f"({name!r})."
-                )
 
             # Cross-vault physical-name fusion preflight (issue #285).
             # `_sanitize_pg_part` maps `-` → `_` and `__` is also the

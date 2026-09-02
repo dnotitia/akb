@@ -166,9 +166,10 @@ def _is_safe_pg_table_name(name: str) -> bool:
     """Guard before interpolating a `vt_*` name into raw SQL. Upstream
     `pg_table_name` already sanitizes; this is defense-in-depth.
 
-    Over-long names are refused here too, but `table_service.create_table`
-    pre-validates the length and returns a clean 422 — so a well-formed
-    request never reaches this guard with an over-long name."""
+    The length bound is kept here even though `pg_table_name` now fits an
+    over-long pair rather than emitting one: this guard exists for a name
+    that reached raw SQL by some path that did not go through it, and a
+    bound it no longer enforces would be a bound nobody notices losing."""
     return bool(_VT_TABLE_RE.match(name)) and len(name) <= PG_IDENT_MAX_LEN
 
 

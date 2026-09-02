@@ -1,12 +1,20 @@
-"""Regression test for E08: `create_table` must refuse a vault+table
-name combination whose PG identifier (`vt_<vault>__<table>`) overflows
-NAMEDATALEN, returning a clean ``ValidationError`` (HTTP 422) *before*
-any DDL — instead of letting ``role_sync`` raise deep in the GRANT path
-and surface as an opaque 500.
+"""`create_table` and a vault+table pair whose composed PG identifier
+(`vt_<vault>__<table>`) would overflow NAMEDATALEN.
+
+This began as E08's regression: the pair was REFUSED with a clean 422
+before any DDL, which beat PG truncating silently and ``role_sync`` then
+failing to GRANT deep in the stack. That judgement held while the only
+names in play were ones a person chose. It stopped holding for a vault
+named by a generator, which spends most of a 63-byte budget before a
+table is named at all — ordinary table names then became uncreatable,
+not intermittently but on an identifier computed before any work.
+
+So the pair is now FITTED rather than refused, and these tests changed
+with it. What did not change is the property underneath: a name that
+reaches PG is within NAMEDATALEN and is not another table's.
 
 DB-free: a minimal fake pool/conn carries the create path as far as the
-length guard. ``create_dynamic_table`` is stubbed to blow up so the test
-also proves the guard short-circuits before touching PG.
+DDL call, which is stubbed so nothing touches PG.
 """
 from __future__ import annotations
 
@@ -64,23 +72,31 @@ class _FakePool:
         return _AsyncCtx(self._conn)
 
 
-async def test_create_table_rejects_overlong_pg_name(monkeypatch):
-    """The exact E08 trigger: vault(27) + table(32) → 64-char identifier."""
+async def test_create_table_fits_an_overlong_pair_instead_of_refusing(monkeypatch):
+    """The exact E08 trigger, which used to be a 422: vault(27) +
+    table(32) composes to 64 characters. It now reaches DDL under a name
+    that fits, because refusing left the table uncreatable and that is
+    the failure this surface actually has."""
     vault_name = "prod-conc-1780908249-8ml717"        # 27 chars
     table_name = "report_metrics_1780908249_8ml717"   # 32 chars
-    assert len(table_service.table_data_repo.pg_table_name(vault_name, table_name)) == 64
+
+    fitted = table_service.table_data_repo.pg_table_name(vault_name, table_name)
+    assert len(fitted) <= table_service.table_data_repo.PG_IDENT_MAX_LEN
 
     async def _fake_get_pool():
         return _FakePool(_FakeConn(vault_name))
 
     monkeypatch.setattr(table_service, "get_pool", _fake_get_pool)
 
-    async def _must_not_run(*a, **k):
-        raise AssertionError("create_dynamic_table must not run for an over-long name")
+    reached = {}
 
-    monkeypatch.setattr(table_service.table_data_repo, "create_dynamic_table", _must_not_run)
+    async def _reached_then_stop(conn, pg_name, *a, **k):
+        reached["pg_name"] = pg_name
+        raise RuntimeError("stop after naming")
 
-    with pytest.raises(ValidationError) as ei:
+    monkeypatch.setattr(table_service.table_data_repo, "create_dynamic_table", _reached_then_stop)
+
+    with pytest.raises(RuntimeError, match="stop after naming"):
         await table_service.create_table(
             uuid.uuid4(),
             table_name,
@@ -88,9 +104,9 @@ async def test_create_table_rejects_overlong_pg_name(monkeypatch):
             actor_id="tester",
         )
 
-    assert ei.value.status_code == 422
-    assert "too long" in ei.value.message.lower()
-    assert str(table_service.table_data_repo.PG_IDENT_MAX_LEN) in ei.value.message
+    # The DDL is reached, and with the fitted name rather than the raw one.
+    assert reached.get("pg_name") == fitted
+    assert len(reached["pg_name"]) <= table_service.table_data_repo.PG_IDENT_MAX_LEN
 
 
 async def test_create_table_accepts_pg_name_at_limit(monkeypatch):
