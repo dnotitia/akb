@@ -16,12 +16,14 @@ import {
 } from "@/lib/api";
 
 const getDocumentDiffMock = vi.mocked(getDocumentDiff);
+const TARGET_REVISION = "abcdef123456"; // pragma: allowlist secret — synthetic Git commit
+const BASE_REVISION = "123456abcdef"; // pragma: allowlist secret — synthetic Git commit
 
 function result(overrides: Partial<DocumentDiff> = {}): DocumentDiff {
   return {
     kind: "document_diff",
     file: "notes/guide.md",
-    commit: "abcdef123456", // pragma: allowlist secret — synthetic Git commit
+    commit: TARGET_REVISION,
     type: "modified",
     diff: [
       "--- a/notes/guide.md",
@@ -52,10 +54,10 @@ function renderDiff(props: Partial<React.ComponentProps<typeof DocumentDiffView>
         <DocumentDiffView
           vault="demo"
           docId="notes/guide.md"
-          revision="abcdef123456"
-          baseRevision={"123456abcdef" /* pragma: allowlist secret — synthetic Git commit */}
+          revision={TARGET_REVISION}
+          baseRevision={BASE_REVISION}
           targetEntry={{
-            hash: "abcdef123456",
+            hash: TARGET_REVISION,
             message: "Update guide",
             author: "user-1",
             author_name: "Kim",
