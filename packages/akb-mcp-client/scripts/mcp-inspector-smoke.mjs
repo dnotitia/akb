@@ -12,6 +12,12 @@ export const INSPECTOR_VERSION = "2.4.0";
 export const MIN_NODE_VERSION = "22.19.0";
 export const MODERN_PROTOCOL_VERSION = "2026-07-28";
 export const SERVER_NAME = "akb";
+export const HTTP_READ_ONLY_CANARY = Object.freeze({
+  target: "http",
+  transport: "streamable-http",
+  tool: "akb_list_vaults",
+  arguments: Object.freeze({}),
+});
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 export const PACKAGE_ROOT = resolve(SCRIPT_DIR, "..");
@@ -86,6 +92,12 @@ export function parseArguments(argv) {
   if (result.intent === "smoke") {
     if (!["http", "stdio", "both"].includes(result.target)) error("smoke target must be http, stdio, or both");
     if (!result.descriptor) error("smoke descriptor is required");
+    return result;
+  }
+  if (result.intent === "canary") {
+    if (result.target !== HTTP_READ_ONLY_CANARY.target) error("canary target must be http");
+    if (!result.descriptor) error("canary descriptor is required");
+    if (result.config) error("canary accepts --target and --descriptor only");
     return result;
   }
   if (result.intent === "interactive") {
@@ -280,16 +292,22 @@ function inspectorEnvironment(runtimeRoot, inputs) {
   return env;
 }
 
-function operationArgs(info, configPath, method) {
+function operationArgs(info, configPath, method, scenario = HTTP_READ_ONLY_CANARY) {
   const args = [info.entry, "--cli", "--config", configPath, "--stored-auth-only", "--server", SERVER_NAME, "--method", method];
   if (method === "tools/list") args.push("--strict");
   args.push("--format", "json");
-  if (method === "tools/call") args.push("--tool-name", "akb_list_vaults", "--tool-args-json", "{}");
+  if (method === "tools/call") args.push("--tool-name", scenario.tool, "--tool-args-json", JSON.stringify(scenario.arguments));
   return args;
 }
 
-async function invoke(info, inputs, configPath, runtimeRoot, method, spawnProcess, secrets) {
-  const child = spawnProcess(process.execPath, operationArgs(info, configPath, method), {
+export function assertReadOnlyCanaryResult(publicResult, isError) {
+  if (isError !== false || !Array.isArray(publicResult.vaults) || !Number.isInteger(publicResult.total) || !Number.isInteger(publicResult.returned) || publicResult.returned !== publicResult.vaults.length || publicResult.total < publicResult.returned) {
+    error("akb_list_vaults returned an invalid or error result");
+  }
+}
+
+async function invoke(info, inputs, configPath, runtimeRoot, method, spawnProcess, secrets, scenario = HTTP_READ_ONLY_CANARY) {
+  const child = spawnProcess(process.execPath, operationArgs(info, configPath, method, scenario), {
     cwd: REPOSITORY_ROOT,
     env: inspectorEnvironment(runtimeRoot, inputs),
     stdio: ["ignore", "pipe", "pipe"],
@@ -352,22 +370,33 @@ async function invoke(info, inputs, configPath, runtimeRoot, method, spawnProces
     const text = Array.isArray(payload.content) ? payload.content.find((item) => item?.type === "text")?.text : null;
     let publicResult;
     try {
-      publicResult = object(JSON.parse(text), "akb_list_vaults result");
+      publicResult = object(JSON.parse(text), `${scenario.tool} result`);
     } catch {
       result.status = "failed";
       result.error = "akb_list_vaults did not return a JSON object";
       return { result, parsed, readSchema: null, publicResult: null };
     }
-    if (payload.isError !== false || !Array.isArray(publicResult.vaults) || !Number.isInteger(publicResult.total) || !Number.isInteger(publicResult.returned) || publicResult.returned !== publicResult.vaults.length || publicResult.total < publicResult.returned) {
+    try {
+      assertReadOnlyCanaryResult(publicResult, payload.isError);
+    } catch {
       result.status = "failed";
-      result.error = "akb_list_vaults returned an invalid or error result";
+      result.error = `${scenario.tool} returned an invalid or error result`;
     }
     return { result, parsed, readSchema: null, publicResult };
   }
   return { result, parsed, readSchema: null, publicResult: null };
 }
 
-async function runTransport(info, inputs, credential, target, spawnProcess) {
+function scenarioForTarget(target) {
+  if (target === HTTP_READ_ONLY_CANARY.target) return HTTP_READ_ONLY_CANARY;
+  return Object.freeze({
+    ...HTTP_READ_ONLY_CANARY,
+    target,
+    transport: target === "stdio" ? "stdio" : target,
+  });
+}
+
+async function runTransport(info, inputs, credential, target, spawnProcess, scenario = scenarioForTarget(target)) {
   const runtimeRoot = await mkdtemp(join(tmpdir(), "akb-mcp-inspector-run-"));
   await chmod(runtimeRoot, 0o700);
   let temporary = null;
@@ -379,7 +408,7 @@ async function runTransport(info, inputs, credential, target, spawnProcess) {
     let readSchema = null;
     let publicResult = null;
     for (const method of SMOKE_OPERATIONS) {
-      const operation = await invoke(info, inputs, temporary.path, runtimeRoot, method, spawnProcess, credential.secrets);
+      const operation = await invoke(info, inputs, temporary.path, runtimeRoot, method, spawnProcess, credential.secrets, scenario);
       operations.push(operation.result);
       if (operation.readSchema) readSchema = operation.readSchema;
       if (operation.publicResult) publicResult = operation.publicResult;
@@ -430,6 +459,47 @@ export async function runSmoke({ info, descriptor, target, fetchImpl = globalThi
   }
 }
 
+export async function runCanary({ info, descriptor, fetchImpl = globalThis.fetch, spawnProcess = nodeSpawn } = {}) {
+  let secrets = [];
+  const scenario = HTTP_READ_ONLY_CANARY;
+  try {
+    const inputs = runtimeInputs(descriptor, scenario.target);
+    const coordinates = await discoverAndReset(inputs, fetchImpl);
+    const credential = await resolveCredential(inputs, coordinates, fetchImpl);
+    secrets = credential.secrets;
+    let transport;
+    try {
+      transport = await runTransport(info, inputs, credential, scenario.target, spawnProcess, scenario);
+    } catch (value) {
+      transport = {
+        transport: scenario.target,
+        status: "failed",
+        operations: SMOKE_OPERATIONS.map((operation) => ({ operation, status: "not_run" })),
+        error: redactText(messageOf(value), secrets),
+      };
+    }
+    return {
+      status: transport.status,
+      intent: "canary",
+      target: scenario.target,
+      transport: scenario.transport,
+      scenario,
+      inspector: { package: info.package, version: info.version, node_version: info.nodeVersion },
+      operations: transport.operations,
+      ...(transport.error ? { error: transport.error } : {}),
+    };
+  } catch (value) {
+    return {
+      status: "failed",
+      intent: "canary",
+      target: scenario.target,
+      transport: scenario.transport,
+      scenario,
+      error: redactText(messageOf(value), secrets),
+    };
+  }
+}
+
 export async function runInteractive(info, configPath, spawnProcess = nodeSpawn) {
   const path = resolve(configPath);
   if (!(await stat(path).then((value) => value.isFile()).catch(() => false))) error("interactive Inspector config file is missing");
@@ -443,7 +513,7 @@ export async function runInteractive(info, configPath, spawnProcess = nodeSpawn)
 }
 
 function usage() {
-  return "Usage: npm run inspect -- --intent smoke --target <http|stdio|both> --descriptor <path|->\n       npm run inspect -- --intent interactive --config <mcp-config.json>\n";
+  return "Usage: npm run inspect -- --intent canary --target http --descriptor <path|->\n       npm run inspect -- --intent smoke --target <http|stdio|both> --descriptor <path|->\n       npm run inspect -- --intent interactive --config <mcp-config.json>\n";
 }
 
 export async function main(argv = process.argv.slice(2)) {
@@ -457,7 +527,9 @@ export async function main(argv = process.argv.slice(2)) {
     const info = await inspectInstallation();
     if (args.intent === "interactive") return await runInteractive(info, args.config);
     const descriptor = await loadDescriptor(args.descriptor);
-    const output = await runSmoke({ info, descriptor, target: args.target });
+    const output = args.intent === "canary"
+      ? await runCanary({ info, descriptor })
+      : await runSmoke({ info, descriptor, target: args.target });
     process.stdout.write(`${JSON.stringify(output)}\n`);
     return output.status === "passed" ? 0 : 1;
   } catch (value) {

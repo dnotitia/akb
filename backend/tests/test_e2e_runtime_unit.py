@@ -52,6 +52,7 @@ COMPOSE_FILE = CI_DIR / "dependency-compose.yaml"
 BOOTSTRAP = CI_DIR / "ubuntu_e2e_bootstrap.sh"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "e2e.yml"
 LOCAL_CANONICAL_RUNNER = REPO_ROOT / "scripts" / "run_canonical_e2e.sh"
+INSPECTOR_CANARY_RUNNER = REPO_ROOT / "scripts" / "run_mcp_inspector_canary.sh"
 
 
 def make_config(tmp_path: Path, *, mode: str = "serve") -> RuntimeConfig:
@@ -1031,6 +1032,25 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
     local_runner = LOCAL_CANONICAL_RUNNER.read_text()
     assert "backend/scripts/ci/e2e_suite_runner.py" in local_runner
     assert "SUITES=(" not in local_runner
+
+
+def test_inspector_canary_runner_reuses_locked_runtime_and_cleans_up():
+    result = subprocess.run(["bash", "-n", str(INSPECTOR_CANARY_RUNNER)], check=False)
+    assert result.returncode == 0
+    runner = INSPECTOR_CANARY_RUNNER.read_text()
+    assert "uv sync --locked --extra dev --project backend" in runner
+    assert "npm ci --prefix" in runner
+    assert "backend/scripts/ci/e2e_runtime.py\" serve" in runner
+    assert "--scenario empty" in runner
+    assert "--profile tool-only" in runner
+    assert "--intent canary" in runner
+    assert "--target http" in runner
+    assert "trap cleanup EXIT" in runner
+    assert "trap 'exit 130' INT" in runner
+    assert "trap 'exit 143' TERM" in runner
+    assert 'rm -rf -- "${RUNTIME_ROOT}"' in runner
+    assert "AKB_E2E_USERNAME" in runner
+    assert "AKB_E2E_PASSWORD" in runner
 
 
 def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():

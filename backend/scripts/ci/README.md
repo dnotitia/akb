@@ -168,6 +168,25 @@ cleanup. The PAT is not placed in argv, logs, command output, reports, or
 uploaded artifacts. The focused package regression exercises the same public
 entrypoint with a synthetic marker and verifies config removal and redaction.
 
+The single HTTP read-only canary command used by the MCP Inspector E2E driver
+is:
+
+```bash
+bash scripts/run_mcp_inspector_canary.sh
+```
+
+It uses the locked backend environment and the package's exact-pinned
+Inspector dependency, starts the existing `e2e_runtime.py serve --scenario
+empty --profile tool-only` runtime, passes its schema-v2 ready descriptor to
+the package entrypoint, and runs `initialize`, `tools/list`, and
+`tools/call(akb_list_vaults, {})` over authenticated Streamable HTTP. The
+command generates per-run fixture credentials only in its process
+environment, keeps runtime/config state in a private temporary root, and
+stops the runtime on success, failure, or interruption. This canary reports
+only the HTTP read path; it is not a protocol compatibility matrix, a full
+tool-coverage claim, or a replacement for the existing stdio and direct HTTP
+E2E suites.
+
 For an interactive session, pass a user-owned Inspector config file. The
 entrypoint binds the Web server to `127.0.0.1` and keeps Inspector's normal
 session authentication; it does not create a user PAT file or alter the
