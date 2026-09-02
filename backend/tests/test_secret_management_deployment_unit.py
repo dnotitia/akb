@@ -25,9 +25,7 @@ def _documents(path: Path) -> list[dict]:
 
 def _one(path: Path, *, kind: str, name: str) -> dict:
     matches = [
-        item
-        for item in _documents(path)
-        if item.get("kind") == kind and item.get("metadata", {}).get("name") == name
+        item for item in _documents(path) if item.get("kind") == kind and item.get("metadata", {}).get("name") == name
     ]
     assert len(matches) == 1
     return matches[0]
@@ -38,9 +36,7 @@ def test_base_has_no_committed_secret_or_fixed_namespace_resource():
     assert not (_K8S / "namespace.yaml").exists()
     assert not (_K8S / "standalone-sso").exists()
     base_dir = _K8S / "base"
-    kustomization = yaml.safe_load(
-        (base_dir / "kustomization.yaml").read_text(encoding="utf-8")
-    )
+    kustomization = yaml.safe_load((base_dir / "kustomization.yaml").read_text(encoding="utf-8"))
     for resource in kustomization["resources"]:
         path = base_dir / resource
         for document in _documents(path):
@@ -75,6 +71,14 @@ def test_backend_and_postgres_share_platform_compatible_akb_secret_contract():
     }
 
 
+def test_well_known_ingress_route_is_valid_for_kubernetes_and_stays_on_backend():
+    ingress = _one(_K8S / "ingress.yaml", kind="Ingress", name="akb-ingress")
+    paths = {item["path"]: item for item in ingress["spec"]["rules"][0]["http"]["paths"]}
+    route = paths["/.well-known"]
+    assert route["pathType"] == "ImplementationSpecific"
+    assert route["backend"]["service"] == {"name": "backend", "port": {"number": 8000}}
+
+
 def test_vso_adapter_projects_only_contract_keys_and_has_bounded_rollout():
     path = _SECRETS / "vso-vault-compatible.yaml"
     operator = _one(path, kind="ServiceAccount", name="akb-secret-admin")
@@ -96,9 +100,7 @@ def test_vso_adapter_projects_only_contract_keys_and_has_bounded_rollout():
         "auth_runtime_generation",
         "auth_runtime_mode",
     }
-    assert runtime["spec"]["rolloutRestartTargets"] == [
-        {"kind": "Deployment", "name": "backend"}
-    ]
+    assert runtime["spec"]["rolloutRestartTargets"] == [{"kind": "Deployment", "name": "backend"}]
     redis = _one(path, kind="VaultStaticSecret", name="akb-redis")
     assert set(redis["spec"]["destination"]["transformation"]["templates"]) == {"password"}
     assert "rolloutRestartTargets" not in redis["spec"]
@@ -115,9 +117,7 @@ def test_sso_vso_adapter_projects_runtime_database_and_one_time_boundaries():
         "sso_browser_session_encryption_key",
         "sso_session_epoch",
     }.issubset(runtime_keys)
-    assert runtime["spec"]["rolloutRestartTargets"] == [
-        {"kind": "Deployment", "name": "backend"}
-    ]
+    assert runtime["spec"]["rolloutRestartTargets"] == [{"kind": "Deployment", "name": "backend"}]
 
     keycloak_db = _one(path, kind="VaultStaticSecret", name="akb-keycloak-database")
     db_templates = keycloak_db["spec"]["destination"]["transformation"]["templates"]
@@ -133,20 +133,14 @@ def test_sso_vso_adapter_projects_runtime_database_and_one_time_boundaries():
         item = _one(path, kind="VaultStaticSecret", name=name)
         assert item["spec"]["destination"]["name"] == destination
         assert set(item["spec"]["destination"]["transformation"]["templates"]) == {key}
-        assert item["spec"]["destination"]["annotations"] == {
-            "akb.dnotitia.com/lifecycle": "one-time-first-install"
-        }
+        assert item["spec"]["destination"]["annotations"] == {"akb.dnotitia.com/lifecycle": "one-time-first-install"}
         assert "rolloutRestartTargets" not in item["spec"]
 
 
 @pytest.mark.parametrize("engine", ["openbao", "hashicorp-vault"])
 def test_bundled_profiles_separate_ephemeral_development_from_ha_production(engine: str):
-    development = yaml.safe_load(
-        (_SECRETS / "values" / f"{engine}-development.yaml").read_text(encoding="utf-8")
-    )
-    production = yaml.safe_load(
-        (_SECRETS / "values" / f"{engine}-production.yaml").read_text(encoding="utf-8")
-    )
+    development = yaml.safe_load((_SECRETS / "values" / f"{engine}-development.yaml").read_text(encoding="utf-8"))
+    production = yaml.safe_load((_SECRETS / "values" / f"{engine}-production.yaml").read_text(encoding="utf-8"))
     assert development["server"]["dev"]["enabled"] is True
     assert development["server"]["dataStorage"]["enabled"] is False
     assert production["global"]["tlsDisable"] is False
@@ -240,12 +234,8 @@ def test_sso_material_is_independent_and_projects_complete_standalone_contract()
 def test_deploy_scripts_are_context_scoped_idempotent_and_fail_closed():
     deploy = (_K8S / "deploy.sh").read_text(encoding="utf-8")
     secret_deploy = (_SECRETS / "deploy.sh").read_text(encoding="utf-8")
-    production_init = (_SECRETS / "initialize-production-bundled.sh").read_text(
-        encoding="utf-8"
-    )
-    seal_validator = (_SECRETS / "validate-seal-inputs.sh").read_text(
-        encoding="utf-8"
-    )
+    production_init = (_SECRETS / "initialize-production-bundled.sh").read_text(encoding="utf-8")
+    seal_validator = (_SECRETS / "validate-seal-inputs.sh").read_text(encoding="utf-8")
     bootstrap = (_SECRETS / "bootstrap-bundled.sh").read_text(encoding="utf-8")
 
     assert 'KUBECTL+=(--context "${KUBE_CONTEXT}")' in deploy
@@ -255,7 +245,7 @@ def test_deploy_scripts_are_context_scoped_idempotent_and_fail_closed():
     assert "path: /spec/volumeClaimTemplates/0/spec/storageClassName" in deploy
     assert "path: /spec/storageClassName" in deploy
     assert "deployment rollout status follows" in deploy.lower()
-    assert 'rollout status deployment/backend' in deploy
+    assert "rollout status deployment/backend" in deploy
     assert "Backend not ready yet" not in deploy
     assert 'get values "${SECRET_STORE_RELEASE}" -n "${NAMESPACE}"' in secret_deploy
     assert ".server.dev.devRootToken // empty" in secret_deploy
@@ -267,7 +257,7 @@ def test_deploy_scripts_are_context_scoped_idempotent_and_fail_closed():
     assert "vso-vault-compatible-sso.yaml" in secret_deploy
     assert "SSO_AKB_PUBLIC_URL" in deploy
     assert "SSO_KEYCLOAK_PUBLIC_URL" in deploy
-    assert 'rollout status statefulset/keycloak' in deploy
+    assert "rollout status statefulset/keycloak" in deploy
     assert 'SECRET_STORE_RELEASE="akb-sm-${NAMESPACE_DIGEST}"' in secret_deploy  # pragma: allowlist secret
     assert 'SECRET_STORE_POD="${STATEFULSET}-0"' in secret_deploy
     assert 'PROFILE_FILE="${PROFILE_DIR}/profile.env"' in deploy
@@ -275,23 +265,23 @@ def test_deploy_scripts_are_context_scoped_idempotent_and_fail_closed():
     assert 'KUSTOMIZE_DIR="${KUSTOMIZE_DIR:-${PROFILE_DIR}}"' in deploy
     assert 'SECRET_SEAL_MODE="${SECRET_SEAL_MODE:-plaintext}"' in deploy
     assert 'SECRET_TOPOLOGY="${SECRET_TOPOLOGY:-production-ha}"' in deploy
+    assert 'IMAGE_PLATFORM="${IMAGE_PLATFORM:-linux/amd64}"' in deploy
+    assert 'docker buildx build --platform "${IMAGE_PLATFORM}"' in deploy
+    assert 'BOOTSTRAP_DOCKER_PLATFORM="${IMAGE_PLATFORM}"' in deploy
+    assert '--platform "${BOOTSTRAP_DOCKER_PLATFORM}"' in secret_deploy
+    assert '--platform "${BOOTSTRAP_DOCKER_PLATFORM}"' in bootstrap
     assert "validate-seal-inputs.sh" in deploy
-    assert (
-        "PGP mode requires SECRET_PGP_KEYS and SECRET_ROOT_TOKEN_PGP_KEY "
-        "before deployment"
-    ) in seal_validator
-    assert deploy.index("validate-seal-inputs.sh") < deploy.index(
-        'if [[ "${SKIP_BUILD}" == "true" ]]'
-    )
+    assert ("PGP mode requires SECRET_PGP_KEYS and SECRET_ROOT_TOKEN_PGP_KEY before deployment") in seal_validator
+    assert deploy.index("validate-seal-inputs.sh") < deploy.index('if [[ "${SKIP_BUILD}" == "true" ]]')
     assert "initialize-production-bundled.sh" in secret_deploy
     assert "rerun in external mode" not in secret_deploy
-    assert 'server.ha.replicas=${SECRET_STORE_REPLICAS}' in secret_deploy
+    assert "server.ha.replicas=${SECRET_STORE_REPLICAS}" in secret_deploy
     assert "operator init -format=json" in production_init
     assert '-pgp-keys="${remote_pgp_keys}"' in production_init
     assert '-root-token-pgp-key="${remote_root_key}"' in production_init
     assert '-recovery-pgp-keys="${remote_recovery_keys}"' in production_init
     assert "AwaitingKeyHolderUnseal" in production_init
-    assert 'write -format=json sys/unseal key=-' in production_init
+    assert "write -format=json sys/unseal key=-" in production_init
     assert "(.data.sealed == false) or (.sealed == false)" in production_init
     assert 'operator unseal -format=json "${key}"' not in production_init
     assert "Recovery Kit" not in production_init
@@ -303,10 +293,13 @@ def test_deploy_scripts_are_context_scoped_idempotent_and_fail_closed():
     assert "SECRET_STORE_CERT_ISSUER_NAME" in secret_deploy
     assert "certificate.yaml" in secret_deploy
     assert "SECRET_STORE_SEAL_CONFIG_SECRET" in secret_deploy
+    assert "VSO_MODE" in secret_deploy
+    assert "../../cluster/ensure-vso.sh" in secret_deploy
+    assert "INSTALL_VSO" not in secret_deploy
     assert "server.extraVolumes[0].type=secret" in secret_deploy
     assert "server.extraArgs=-config=" in secret_deploy
     assert 'path "auth/token/renew-self"' in bootstrap
-    assert 'role/${OPERATOR_ROLE}' in bootstrap
+    assert "role/${OPERATOR_ROLE}" in bootstrap
     assert "token_no_default_policy=true" in bootstrap
     assert '"${TOKEN_ENV}=${ROOT_TOKEN}"' not in bootstrap
     assert "IFS= read -r bootstrap_token" in bootstrap
@@ -331,12 +324,58 @@ def test_pgp_profile_rejects_missing_custody_inputs_before_deployment_action():
         },
     )
     assert result.returncode == 2
-    assert (
-        "PGP mode requires SECRET_PGP_KEYS and SECRET_ROOT_TOKEN_PGP_KEY "
-        "before deployment"
-    ) in result.stderr
+    assert ("PGP mode requires SECRET_PGP_KEYS and SECRET_ROOT_TOKEN_PGP_KEY before deployment") in result.stderr
     assert "Building Docker images" not in result.stdout
     assert "Creating namespace" not in result.stdout
+
+
+def test_vso_mode_validation_fails_before_cluster_commands():
+    result = subprocess.run(
+        ["bash", str(_K8S / "profiles" / "standalone-secret-manager" / "deploy.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "VSO_MODE": "surprise",
+        },
+    )
+    assert result.returncode == 2
+    assert "VSO_MODE must be auto, install, reuse, or disabled" in result.stderr
+    assert "Building Docker images" not in result.stdout
+    assert "Creating namespace" not in result.stdout
+
+
+def test_image_platform_validation_fails_before_cluster_commands():
+    result = subprocess.run(
+        ["bash", str(_K8S / "profiles" / "standalone" / "deploy.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "IMAGE_PLATFORM": "darwin/arm64",
+        },
+    )
+    assert result.returncode == 2
+    assert "IMAGE_PLATFORM must be linux/amd64 or linux/arm64" in result.stderr
+    assert "Creating namespace" not in result.stdout
+
+
+def test_cluster_vso_manager_disabled_mode_is_non_mutating():
+    manager = _ROOT / "deploy" / "cluster" / "ensure-vso.sh"
+    result = subprocess.run(
+        ["bash", str(manager)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env={"PATH": "/usr/bin:/bin", "VSO_MODE": "disabled"},
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == "VSO prerequisite check disabled"
 
 
 def test_kubernetes_profiles_are_symmetric_discoverable_entry_points():
@@ -354,9 +393,7 @@ def test_kubernetes_profiles_are_symmetric_discoverable_entry_points():
         profile_dir = profiles / name
         metadata = dict(
             line.split("#", maxsplit=1)[0].strip().split("=", maxsplit=1)
-            for line in (profile_dir / "profile.env").read_text(
-                encoding="utf-8"
-            ).splitlines()
+            for line in (profile_dir / "profile.env").read_text(encoding="utf-8").splitlines()
             if line
         )
         assert metadata == {
@@ -364,9 +401,7 @@ def test_kubernetes_profiles_are_symmetric_discoverable_entry_points():
             "PROFILE_SECRET": secret_mode,
         }
         assert (profile_dir / "kustomization.yaml").is_file()
-        application = yaml.safe_load(
-            (profile_dir / "kustomization.yaml").read_text(encoding="utf-8")
-        )
+        application = yaml.safe_load((profile_dir / "kustomization.yaml").read_text(encoding="utf-8"))
         assert application["resources"] == ["../../base"]
         if auth == "sso":
             assert application["components"] == ["../../components/sso"]
@@ -401,14 +436,8 @@ def test_all_kubernetes_profile_application_layers_render(tmp_path: Path):
             text=True,
             timeout=30,
         ).stdout
-        resources = [
-            item for item in yaml.safe_load_all(rendered) if isinstance(item, dict)
-        ]
-        statefulsets = {
-            item["metadata"]["name"]
-            for item in resources
-            if item.get("kind") == "StatefulSet"
-        }
+        resources = [item for item in yaml.safe_load_all(rendered) if isinstance(item, dict)]
+        statefulsets = {item["metadata"]["name"] for item in resources if item.get("kind") == "StatefulSet"}
         assert "postgres" in statefulsets
         assert ("keycloak" in statefulsets) is ("-sso" in name)
         assert not any(item.get("kind") == "Secret" for item in resources)
@@ -460,10 +489,7 @@ def test_cert_manager_adapter_covers_service_and_all_ha_member_dns_names():
     dns_names = set(certificate["spec"]["dnsNames"])
     assert "akb-sm-openbao.akb-rehearsal.svc" in dns_names
     for index in range(3):
-        assert (
-            f"akb-sm-openbao-{index}.akb-sm-openbao-internal."
-            "akb-rehearsal.svc.cluster.local"
-        ) in dns_names
+        assert (f"akb-sm-openbao-{index}.akb-sm-openbao-internal.akb-rehearsal.svc.cluster.local") in dns_names
 
 
 def test_kustomize_and_pinned_helm_profiles_render_when_tools_are_available():

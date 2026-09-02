@@ -7,6 +7,18 @@ expose the same deployment combinations. Kustomize operators can compose the
 canonical base and reusable components without copying complete manifest
 trees.
 
+Vault Secrets Operator is a cluster prerequisite shared across AKB namespaces.
+It is installed once by [`deploy/helm/akb-cluster`](../helm/akb-cluster/README.md)
+and is never owned by an individual AKB release. Each AKB Secret Manager
+profile owns only its namespace-local Vault connection, authentication,
+ServiceAccount, and Secret projection resources.
+
+The bundled Vault/OpenBao chart also creates a TokenReview
+`system:auth-delegator` binding for its own ServiceAccount. Kustomize profile
+release names are namespace-derived, while the AKB Helm chart qualifies this
+ClusterRoleBinding with both namespace and release to prevent cross-instance
+name collisions.
+
 Generic kustomize base for deploying AKB to a Kubernetes cluster. Pair
 with an operator-specific overlay for real hostnames, registries, and
 TLS issuers.
@@ -96,6 +108,9 @@ export PUBLIC_URL=https://akb.example.com    # printed at the end; optional
 # Required only when the cluster has no default StorageClass. The same value
 # is used for AKB/PostgreSQL and a production bundled Secret Manager.
 export STORAGE_CLASS=standard
+# The default is linux/amd64. Use linux/arm64 when both the target nodes and
+# caller-supplied/local bootstrap image are ARM64.
+export IMAGE_PLATFORM=linux/amd64
 
 # 2. Edit ingress.yaml and the app ConfigMap's public_base_url and
 #    local_session_issuer to the same real origin.
@@ -113,6 +128,13 @@ export GENERATE_MANUAL_SECRETS=true
 # 5. Apply.
 bash deploy/k8s/profiles/standalone/deploy.sh
 ```
+
+`IMAGE_PLATFORM` controls both source builds and the short-lived local
+container that generates bootstrap material. This keeps installation
+architecture-consistent instead of silently forcing an AMD64 helper on an
+ARM64 operator workstation or rehearsal cluster. Supported values are
+`linux/amd64` and `linux/arm64`; `SKIP_BUILD=true` callers must supply images
+matching the selected platform.
 
 After the script finishes:
 

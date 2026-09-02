@@ -30,6 +30,7 @@ OPERATOR_SERVICE_ACCOUNT="${SECRET_OPERATOR_SERVICE_ACCOUNT:-akb-secret-admin}"
 OPERATOR_TOKEN_TTL="${SECRET_OPERATOR_TOKEN_TTL:-30m}"
 OPERATOR_TOKEN_MAX_TTL="${SECRET_OPERATOR_TOKEN_MAX_TTL:-4h}"
 AUTH_PROFILE="${AUTH_PROFILE:-local}"
+BOOTSTRAP_DOCKER_PLATFORM="${BOOTSTRAP_DOCKER_PLATFORM:-linux/amd64}"
 REVOKE_ROOT_TOKEN="${REVOKE_ROOT_TOKEN:-false}"
 SECRET_STORE_LOCAL_ADDRESS="${SECRET_STORE_LOCAL_ADDRESS:-}"
 SECRET_STORE_CACERT="${SECRET_STORE_CACERT:-}"
@@ -40,6 +41,11 @@ if [[ ! "${OPERATOR_ROLE}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
    [[ ! "${OPERATOR_TOKEN_TTL}" =~ ^[1-9][0-9]*[smh]$ ]] ||
    [[ ! "${OPERATOR_TOKEN_MAX_TTL}" =~ ^[1-9][0-9]*[smh]$ ]]; then
   echo "Secret Manager operator role, ServiceAccount, or TTL is invalid" >&2
+  exit 2
+fi
+if [[ "${BOOTSTRAP_DOCKER_PLATFORM}" != "linux/amd64" &&
+      "${BOOTSTRAP_DOCKER_PLATFORM}" != "linux/arm64" ]]; then
+  echo "BOOTSTRAP_DOCKER_PLATFORM must be linux/amd64 or linux/arm64" >&2
   exit 2
 fi
 
@@ -169,7 +175,7 @@ if cli kv get -mount="${KV_MOUNT}" "${KV_PATH}" >/dev/null 2>&1; then
 else
   echo "Generating AKB Secret Contract v1 material (${AUTH_PROFILE})"
   { printf '%s\n' "${ROOT_TOKEN}"; \
-    docker run --rm --platform linux/amd64 \
+    docker run --rm --platform "${BOOTSTRAP_DOCKER_PLATFORM}" \
       -v "${SCRIPT_DIR}/bootstrap_material.py:/opt/akb/bootstrap_material.py:ro" \
       "${BACKEND_IMAGE}" python /opt/akb/bootstrap_material.py \
         --format vault --auth-profile "${AUTH_PROFILE}"; } | \

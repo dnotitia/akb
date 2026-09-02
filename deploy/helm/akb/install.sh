@@ -17,6 +17,7 @@ SECRET_TOPOLOGY="${SECRET_TOPOLOGY:-production-ha}"
 SECRET_KEY_SHARES="${SECRET_KEY_SHARES:-5}"
 SECRET_KEY_THRESHOLD="${SECRET_KEY_THRESHOLD:-3}"
 SECRET_STORE_SEAL_CONFIG_SECRET="${SECRET_STORE_SEAL_CONFIG_SECRET:-}"
+BOOTSTRAP_DOCKER_PLATFORM="${BOOTSTRAP_DOCKER_PLATFORM:-linux/amd64}"
 
 case "${AKB_PROFILE}" in
   standalone|standalone-sso)
@@ -31,9 +32,37 @@ case "${AKB_PROFILE}" in
     ;;
 esac
 
+if [[ -z "${VSO_MODE:-}" ]]; then
+  if [[ "${SECRET_MODE}" == "manual" ]]; then
+    VSO_MODE="disabled"
+  else
+    VSO_MODE="auto"
+  fi
+fi
+case "${VSO_MODE}" in
+  auto|install|reuse|disabled) ;;
+  *)
+    echo "VSO_MODE must be auto, install, reuse, or disabled" >&2
+    exit 2
+    ;;
+esac
+if [[ "${SECRET_MODE}" == "manual" && "${VSO_MODE}" != "disabled" ]]; then
+  echo "Manual Secret profiles require VSO_MODE=disabled" >&2
+  exit 2
+fi
+if [[ "${SECRET_MODE}" != "manual" && "${VSO_MODE}" == "disabled" ]]; then
+  echo "Bundled and external Secret Manager modes require VSO" >&2
+  exit 2
+fi
+
 if [[ ! "${RELEASE}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] ||
    [[ ! "${NAMESPACE}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
   echo "RELEASE and NAMESPACE must be DNS labels" >&2
+  exit 2
+fi
+if [[ "${BOOTSTRAP_DOCKER_PLATFORM}" != "linux/amd64" &&
+      "${BOOTSTRAP_DOCKER_PLATFORM}" != "linux/arm64" ]]; then
+  echo "BOOTSTRAP_DOCKER_PLATFORM must be linux/amd64 or linux/arm64" >&2
   exit 2
 fi
 
@@ -46,6 +75,35 @@ SECRET_ROOT_TOKEN_PGP_KEY="${SECRET_ROOT_TOKEN_PGP_KEY:-}" \
 SECRET_STORE_SEAL_CONFIG_SECRET="${SECRET_STORE_SEAL_CONFIG_SECRET}" \
   bash "${REPO_ROOT}/deploy/k8s/secrets/validate-seal-inputs.sh"
 
+if [[ "${SECRET_MODE}" == "external" ]]; then
+  : "${SECRET_STORE_ADDRESS:?Set SECRET_STORE_ADDRESS for external mode}"
+  case "${SECRET_ENGINE}" in
+    openbao|hashicorp-vault) ;;
+    *)
+      echo "External mode supports openbao or hashicorp-vault" >&2
+      exit 2
+      ;;
+  esac
+  if [[ "${SECRET_STORE_ADDRESS}" != https://* && "${ALLOW_INSECURE_EXTERNAL_HTTP:-false}" != "true" ]]; then
+    echo "External Secret Manager must use HTTPS unless ALLOW_INSECURE_EXTERNAL_HTTP=true." >&2
+    exit 2
+  fi
+elif [[ "${SECRET_MODE}" == "bundled" ]]; then
+  case "${SECRET_ENGINE}" in
+    openbao) ;;
+    hashicorp-vault)
+      if [[ "${HASHICORP_LICENSE_ACKNOWLEDGED:-false}" != "true" ]]; then
+        echo "Set HASHICORP_LICENSE_ACKNOWLEDGED=true after reviewing HashiCorp Vault terms" >&2
+        exit 2
+      fi
+      ;;
+    *)
+      echo "SECRET_ENGINE must be openbao or hashicorp-vault" >&2
+      exit 2
+      ;;
+  esac
+fi
+
 HELM=(helm)
 KUBECTL=(kubectl)
 if [[ -n "${KUBE_CONTEXT}" ]]; then
@@ -56,6 +114,16 @@ fi
 helm dependency build "${SCRIPT_DIR}" >/dev/null
 "${KUBECTL[@]}" create namespace "${NAMESPACE}" --dry-run=client -o yaml | \
   "${KUBECTL[@]}" apply -f -
+if [[ "${SECRET_MODE}" == "bundled" && "${SECRET_PROFILE}" == "production" &&
+      -z "${SECRET_STORE_CERT_ISSUER_NAME:-}" ]] &&
+   ! "${KUBECTL[@]}" get secret akb-secret-store-tls -n "${NAMESPACE}" >/dev/null 2>&1; then
+  echo "Production bundle requires an existing akb-secret-store-tls Secret or SECRET_STORE_CERT_ISSUER_NAME" >&2
+  exit 2
+fi
+if [[ "${SECRET_MODE}" != "manual" ]]; then
+  VSO_MODE="${VSO_MODE}" KUBE_CONTEXT="${KUBE_CONTEXT}" \
+    bash "${REPO_ROOT}/deploy/cluster/ensure-vso.sh"
+fi
 
 PROFILE_VALUES="${SCRIPT_DIR}/profiles/${AKB_PROFILE}.yaml"
 HELM_ARGS=(
@@ -104,7 +172,7 @@ if [[ "${SECRET_MODE}" == "manual" ]]; then
     auth_profile=local
     [[ "${AKB_PROFILE}" == *-sso ]] && auth_profile=sso
     backend_image="${BACKEND_IMAGE:-akb-backend:latest}"
-    docker run --rm --platform linux/amd64 \
+    docker run --rm --platform "${BOOTSTRAP_DOCKER_PLATFORM}" \
       -v "${REPO_ROOT}/deploy/k8s/secrets/bootstrap_material.py:/opt/akb/bootstrap_material.py:ro" \
       "${backend_image}" python /opt/akb/bootstrap_material.py \
       --format kubernetes --auth-profile "${auth_profile}" --namespace "${NAMESPACE}" | \
@@ -115,14 +183,6 @@ if [[ "${SECRET_MODE}" == "manual" ]]; then
 fi
 
 if [[ "${SECRET_MODE}" == "external" ]]; then
-  : "${SECRET_STORE_ADDRESS:?Set SECRET_STORE_ADDRESS for external mode}"
-  case "${SECRET_ENGINE}" in
-    openbao|hashicorp-vault) ;;
-    *)
-      echo "External mode supports openbao or hashicorp-vault" >&2
-      exit 2
-      ;;
-  esac
   HELM_ARGS+=(
     --set-string secretManager.mode=external
     --set-string "secretManager.engine=${SECRET_ENGINE}"
@@ -133,9 +193,6 @@ if [[ "${SECRET_MODE}" == "external" ]]; then
   )
   if [[ -n "${SECRET_STORE_CA_SECRET:-}" ]]; then
     HELM_ARGS+=(--set-string "secretManager.connection.caSecretName=${SECRET_STORE_CA_SECRET}")
-  fi
-  if [[ "${INSTALL_VSO:-false}" == "true" ]]; then
-    HELM_ARGS+=(--set vso.enabled=true)
   fi
   "${HELM[@]}" "${HELM_ARGS[@]}" --wait --timeout 10m "$@"
   exit 0
@@ -193,10 +250,6 @@ if [[ -n "${SECRET_STORE_CERT_ISSUER_NAME:-}" ]]; then
     --set-string "secretManager.tls.certificate.issuerKind=${SECRET_STORE_CERT_ISSUER_KIND:-ClusterIssuer}"
   )
 fi
-if [[ "${INSTALL_VSO:-true}" == "false" ]]; then
-  HELM_ARGS+=(--set vso.enabled=false)
-fi
-
 # The first pass intentionally does not --wait: a production Vault-compatible
 # server is sealed and AKB workloads wait for the Secret contract.
 "${HELM[@]}" "${HELM_ARGS[@]}" "$@"
@@ -207,6 +260,7 @@ SECRET_KEY_THRESHOLD="${SECRET_KEY_THRESHOLD}" \
 SECRET_PGP_KEYS="${SECRET_PGP_KEYS:-}" \
 SECRET_ROOT_TOKEN_PGP_KEY="${SECRET_ROOT_TOKEN_PGP_KEY:-}" \
 SECRET_RECOVERY_PGP_KEYS="${SECRET_RECOVERY_PGP_KEYS:-}" \
+BOOTSTRAP_DOCKER_PLATFORM="${BOOTSTRAP_DOCKER_PLATFORM}" \
   bash "${SCRIPT_DIR}/scripts/initialize-secret-manager.sh"
 
 # Reconcile once more and gate the complete stack after the Secret contract is

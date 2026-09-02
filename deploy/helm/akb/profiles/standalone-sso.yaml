@@ -6,8 +6,6 @@ secretManager:
   engine: ""
 secretSync:
   enabled: false
-vso:
-  enabled: false
 openbao:
   enabled: false
 hashicorpVault:

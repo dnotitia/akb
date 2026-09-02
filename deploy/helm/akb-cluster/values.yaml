@@ -1,0 +1,6 @@
+# This release is installed once per Kubernetes cluster. Individual AKB
+# releases own only namespaced VaultConnection/VaultAuth/Secret resources.
+vso:
+  enabled: true
+  controller:
+    replicas: 1

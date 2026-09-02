@@ -158,15 +158,12 @@ secretManager:
       issuerName: ""
       clusterDomain: cluster.local
 
-# Render namespace-scoped VSO connection/auth/sync resources. The operator may
-# be installed by this release (vso.enabled=true) or owned once by the cluster.
+# Render namespace-scoped VSO connection/auth/sync resources. The
+# cluster-scoped controller is owned separately by the akb-cluster release.
 secretSync:
   enabled: false
 
-# Official dependency switches. Profiles select these coherently.
-vso:
-  enabled: false
-
+# Official Secret Manager dependency switches. Profiles select these coherently.
 openbao:
   enabled: false
   fullnameOverride: akb-secret-store
@@ -217,7 +214,9 @@ openbao:
         mountPath: /openbao/tls
         readOnly: true
     serviceAccount: {create: true}
-    authDelegator: {enabled: true}
+    # AKB renders its own release+namespace-qualified ClusterRoleBinding so
+    # multiple instances never collide on the subchart's fixed fullname.
+    authDelegator: {enabled: false}
   ui: {enabled: false}
   csi: {enabled: false}
 
@@ -271,6 +270,7 @@ hashicorpVault:
         mountPath: /vault/tls
         readOnly: true
     serviceAccount: {create: true}
-    authDelegator: {enabled: true}
+    # See openbao.server.authDelegator above.
+    authDelegator: {enabled: false}
   ui: {enabled: false}
   csi: {enabled: false}

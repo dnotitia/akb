@@ -21,6 +21,9 @@
 #   SECRET_MODE    manual (default), bundled, or external. Bundled is selected
 #                  by the *-secret-manager profiles; external is an adapter
 #                  override for standalone / standalone-sso.
+#   VSO_MODE       auto (install once or reuse), install, reuse, or disabled.
+#                  Manual profiles use disabled; Secret Manager modes require
+#                  the cluster-scoped VSO prerequisite.
 #   SECRET_ENGINE  openbao or hashicorp-vault for bundled/external modes.
 #   SECRET_PROFILE development (default) or production for bundled mode.
 #   SECRET_SEAL_MODE plaintext (default), pgp, or auto for production bundles.
@@ -28,6 +31,8 @@
 #   SECRET_STORE_CERT_ISSUER_NAME Optional existing cert-manager CA issuer;
 #                  otherwise provision akb-secret-store-tls out-of-band.
 #   STORAGE_CLASS StorageClass for AKB/PostgreSQL and bundled-manager PVCs.
+#   IMAGE_PLATFORM Docker target used for builds and local bootstrap helpers
+#                  (default: linux/amd64; linux/arm64 is also supported).
 #
 # See deploy/k8s/profiles/README.md for supported combinations and
 # deploy/k8s/README.md for the operator-overlay pattern.
@@ -40,6 +45,7 @@ PROFILES_DIR="${SCRIPT_DIR}/profiles"
 NAMESPACE="${NAMESPACE:-akb}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-}"
 SKIP_BUILD="${SKIP_BUILD:-false}"
+IMAGE_PLATFORM="${IMAGE_PLATFORM:-linux/amd64}"
 SECRET_PROFILE="${SECRET_PROFILE:-development}"
 AKB_PROFILE="${AKB_PROFILE:-}"
 if [[ -z "${AKB_PROFILE}" ]]; then
@@ -80,6 +86,28 @@ elif [[ "${SECRET_MODE}" != "bundled" ]]; then
   exit 2
 fi
 
+if [[ -z "${VSO_MODE:-}" ]]; then
+  if [[ "${SECRET_MODE}" == "manual" ]]; then
+    VSO_MODE="disabled"
+  else
+    VSO_MODE="auto"
+  fi
+fi
+case "${VSO_MODE}" in
+  auto|install|reuse|disabled) ;;
+  *)
+    echo "VSO_MODE must be auto, install, reuse, or disabled" >&2
+    exit 2
+    ;;
+esac
+if [[ "${SECRET_MODE}" == "manual" && "${VSO_MODE}" != "disabled" ]]; then
+  echo "Manual Secret mode requires VSO_MODE=disabled" >&2
+  exit 2
+fi
+if [[ "${SECRET_MODE}" != "manual" && "${VSO_MODE}" == "disabled" ]]; then
+  echo "Bundled and external Secret Manager modes require VSO" >&2
+  exit 2
+fi
 SECRET_SEAL_MODE="${SECRET_SEAL_MODE:-plaintext}"
 SECRET_TOPOLOGY="${SECRET_TOPOLOGY:-production-ha}"
 SECRET_KEY_SHARES="${SECRET_KEY_SHARES:-5}"
@@ -99,6 +127,11 @@ if [[ ! "${NAMESPACE}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
   echo "NAMESPACE is not a valid DNS label" >&2
   exit 2
 fi
+if [[ "${IMAGE_PLATFORM}" != "linux/amd64" &&
+      "${IMAGE_PLATFORM}" != "linux/arm64" ]]; then
+  echo "IMAGE_PLATFORM must be linux/amd64 or linux/arm64" >&2
+  exit 2
+fi
 if [[ "${AUTH_PROFILE}" != "local" && "${AUTH_PROFILE}" != "sso" ]]; then
   echo "AUTH_PROFILE must be local or sso" >&2
   exit 2
@@ -116,6 +149,42 @@ SECRET_PGP_KEYS="${SECRET_PGP_KEYS}" \
 SECRET_ROOT_TOKEN_PGP_KEY="${SECRET_ROOT_TOKEN_PGP_KEY}" \
 SECRET_STORE_SEAL_CONFIG_SECRET="${SECRET_STORE_SEAL_CONFIG_SECRET}" \
   bash "${SCRIPT_DIR}/secrets/validate-seal-inputs.sh"
+if [[ "${SECRET_MODE}" == "bundled" ]]; then
+  case "${SECRET_ENGINE:-}" in
+    openbao) ;;
+    hashicorp-vault)
+      if [[ "${HASHICORP_LICENSE_ACKNOWLEDGED:-false}" != "true" ]]; then
+        echo "Set HASHICORP_LICENSE_ACKNOWLEDGED=true after reviewing HashiCorp Vault BSL terms." >&2
+        exit 2
+      fi
+      ;;
+    *)
+      echo "SECRET_ENGINE must be openbao or hashicorp-vault for bundled mode" >&2
+      exit 2
+      ;;
+  esac
+  if [[ ! -f "${SCRIPT_DIR}/secrets/values/${SECRET_ENGINE}-${SECRET_PROFILE}.yaml" ]]; then
+    echo "Unsupported SECRET_PROFILE: ${SECRET_PROFILE}" >&2
+    exit 2
+  fi
+  if [[ -n "${SECRET_STORE_EXTRA_VALUES:-}" && ! -f "${SECRET_STORE_EXTRA_VALUES}" ]]; then
+    echo "SECRET_STORE_EXTRA_VALUES does not exist: ${SECRET_STORE_EXTRA_VALUES}" >&2
+    exit 2
+  fi
+elif [[ "${SECRET_MODE}" == "external" ]]; then
+  case "${SECRET_ENGINE:-}" in
+    openbao|hashicorp-vault) ;;
+    *)
+      echo "External v1 supports openbao or hashicorp-vault through VSO." >&2
+      exit 2
+      ;;
+  esac
+  : "${SECRET_STORE_ADDRESS:?Set SECRET_STORE_ADDRESS for external mode}"
+  if [[ "${SECRET_STORE_ADDRESS}" != https://* && "${ALLOW_INSECURE_EXTERNAL_HTTP:-false}" != "true" ]]; then
+    echo "External Secret Manager must use HTTPS unless ALLOW_INSECURE_EXTERNAL_HTTP=true." >&2
+    exit 2
+  fi
+fi
 if [[ -n "${STORAGE_CLASS:-}" &&
       ! "${STORAGE_CLASS}" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]]; then
   echo "STORAGE_CLASS is not a valid StorageClass name" >&2
@@ -163,14 +232,14 @@ else
   : "${REGISTRY:?Set REGISTRY env (e.g. REGISTRY=ghcr.io/myorg)}"
   BACKEND_IMAGE="${REGISTRY}/akb-backend:latest"
   FRONTEND_IMAGE="${REGISTRY}/akb-frontend:latest"
-  echo "=== Building Docker images (linux/amd64) — version ${VERSION} ==="
-  docker buildx build --platform linux/amd64 \
+  echo "=== Building Docker images (${IMAGE_PLATFORM}) — version ${VERSION} ==="
+  docker buildx build --platform "${IMAGE_PLATFORM}" \
     -t "${REGISTRY}/akb-backend:${VERSION}" \
     -t "${BACKEND_IMAGE}" \
     --push \
     "${ROOT_DIR}/backend/"
 
-  docker buildx build --platform linux/amd64 \
+  docker buildx build --platform "${IMAGE_PLATFORM}" \
     -t "${REGISTRY}/akb-frontend:${VERSION}" \
     -t "${FRONTEND_IMAGE}" \
     --push \
@@ -186,6 +255,7 @@ NAMESPACE="${NAMESPACE}" \
 KUBE_CONTEXT="${KUBE_CONTEXT}" \
 AKB_PROFILE="${AKB_PROFILE}" \
 SECRET_MODE="${SECRET_MODE}" \
+VSO_MODE="${VSO_MODE}" \
 SECRET_ENGINE="${SECRET_ENGINE:-}" \
 SECRET_PROFILE="${SECRET_PROFILE}" \
 SECRET_SEAL_MODE="${SECRET_SEAL_MODE}" \
@@ -198,6 +268,7 @@ SECRET_RECOVERY_PGP_KEYS="${SECRET_RECOVERY_PGP_KEYS}" \
 SECRET_STORE_SEAL_CONFIG_SECRET="${SECRET_STORE_SEAL_CONFIG_SECRET}" \
 AUTH_PROFILE="${AUTH_PROFILE}" \
 BACKEND_IMAGE="${BACKEND_IMAGE}" \
+BOOTSTRAP_DOCKER_PLATFORM="${IMAGE_PLATFORM}" \
   bash "${SCRIPT_DIR}/secrets/deploy.sh"
 
 echo "=== Applying manifests (kustomize: ${KUSTOMIZE_DIR}) ==="

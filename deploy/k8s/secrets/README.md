@@ -203,20 +203,32 @@ unsafe development override is set.
 
 ## Vault Secrets Operator
 
-VSO is a cluster-scoped dependency. The installer reuses an existing VSO by
-default and will not silently add CRDs or cluster roles. On a new standalone
-cluster, explicitly opt in:
+VSO is a cluster-scoped dependency owned separately from every AKB namespace.
+The Kustomize and Helm installers share the same prerequisite policy:
 
 ```bash
-INSTALL_VSO=true ... bash deploy/k8s/profiles/standalone-secret-manager/deploy.sh
+VSO_MODE=auto ... bash deploy/k8s/profiles/standalone-secret-manager/deploy.sh
 ```
 
-This installs the pinned official HashiCorp VSO chart `1.5.1`. VSO is BSL 1.1,
-so deployments that require an entirely OSI-licensed stack must use and test a
-separate OpenBao/External Secrets Operator adapter before declaring that
-profile supported. The current OpenBao bundle intentionally uses the same
-Vault-compatible VSO adapter so both engines exercise an identical AKB
-contract; conformance is covered by the deployment E2E suite.
+`auto` installs the pinned `deploy/helm/akb-cluster` release when no controller
+or CRD exists and reuses one compatible Ready VSO installation otherwise.
+`install` can mutate only the dedicated `vault-secrets-operator/akb-cluster`
+release. `reuse` is read-only and fails if VSO is absent, unavailable,
+ambiguous, missing required CRDs, or outside the supported version range.
+`disabled` is valid only for manual Secret profiles.
+
+The pinned official HashiCorp VSO version is `1.5.1`; the currently supported
+reuse range is `>=1.4.0,<1.6.0`. VSO is BSL 1.1, so deployments that require an
+entirely OSI-licensed stack must use and test a separate OpenBao/External
+Secrets Operator adapter before declaring that profile supported. The current
+OpenBao bundle intentionally uses the same Vault-compatible VSO adapter so both
+engines exercise an identical AKB contract.
+
+One VSO controller installation can connect to many per-AKB Vault/OpenBao
+servers. Authentication remains namespaced: every AKB release owns a distinct
+ServiceAccount, `VaultConnection`, `VaultAuth`, Vault role/policy binding, CA
+reference, and destination Secret. There is no shared filesystem. Normal AKB
+uninstall never removes the cluster prerequisite.
 
 VSO authentication uses a projected, 10-minute ServiceAccount token with
 audience `vault`. The AKB backend has
@@ -499,5 +511,8 @@ bash deploy/k8s/profiles/standalone-secret-manager/deploy.sh
 
 Do not point a rehearsal at the existing `akb`, `akb-platform`, or managed
 workspace namespaces. The scripts create and mutate only the namespace passed
-through `NAMESPACE`, except for the explicit `INSTALL_VSO=true` cluster-scoped
+through `NAMESPACE`, except for `VSO_MODE=install` or the install branch of
+`VSO_MODE=auto`, which owns the cluster-scoped
+`vault-secrets-operator/akb-cluster` prerequisite release. That action must be
+run only against the intended cluster context.
 operator installation.

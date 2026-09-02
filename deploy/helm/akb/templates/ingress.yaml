@@ -20,7 +20,7 @@ spec:
     - host: {{ .Values.ingress.host | quote }}
       http:
         paths:
-          {{- range $path, $type := dict "/api" "Prefix" "/mcp" "Prefix" "/.well-known/" "Prefix" "/health" "Exact" "/livez" "Exact" "/readyz" "Exact" }}
+          {{- range $path, $type := dict "/api" "Prefix" "/mcp" "Prefix" "/.well-known" "ImplementationSpecific" "/health" "Exact" "/livez" "Exact" "/readyz" "Exact" }}
           - path: {{ $path }}
             pathType: {{ $type }}
             backend:

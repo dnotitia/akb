@@ -2,9 +2,10 @@
 
 This chart is the declarative, production-oriented AKB stack. Unlike the
 historical `deploy/all-in-one` single-container demo, one Helm release may own
-AKB, PostgreSQL, Keycloak, OpenBao or HashiCorp Vault, and Vault Secrets
-Operator while preserving separate Pods, PVCs, ServiceAccounts, and security
-boundaries.
+AKB, PostgreSQL, Keycloak, and OpenBao or HashiCorp Vault while preserving
+separate Pods, PVCs, ServiceAccounts, and security boundaries. Cluster-scoped
+prerequisites such as Vault Secrets Operator are deliberately owned by the
+separate `akb-cluster` release.
 
 ## Profiles
 
@@ -14,11 +15,11 @@ Profiles are explicit values files, not copied manifest trees:
 |---|---|---|---|
 | `standalone` | local | existing Kubernetes Secret | AKB + PostgreSQL |
 | `standalone-sso` | owned Keycloak | existing Kubernetes Secret | AKB + PostgreSQL + Keycloak + Keycloak DB |
-| `standalone-secret-manager` | local | bundled OpenBao/Vault | AKB + PostgreSQL + Secret Manager + VSO |
+| `standalone-secret-manager` | local | bundled OpenBao/Vault | AKB + PostgreSQL + Secret Manager |
 | `standalone-sso-secret-manager` | owned Keycloak | bundled OpenBao/Vault | complete standalone stack |
 
 The same templates render all profiles. `profile`, `sso.enabled`, Secret
-Manager mode, engine dependency, and VSO projection are validated as one
+Manager mode, engine dependency, and namespaced VSO projection are validated as one
 contract so incompatible combinations fail during `helm template`.
 
 ## Source-tree install
@@ -38,9 +39,16 @@ NAMESPACE=akb \
 AKB_PROFILE=standalone \
 BACKEND_IMAGE=ghcr.io/example/akb-backend:0.14.2 \
 FRONTEND_IMAGE=ghcr.io/example/akb-frontend:0.14.1 \
+BOOTSTRAP_DOCKER_PLATFORM=linux/amd64 \
 PUBLIC_URL=https://akb.example.com \
 bash deploy/helm/akb/install.sh
 ```
+
+The installer runs the backend image briefly on the operator workstation only
+when it must generate new bootstrap material. Set
+`BOOTSTRAP_DOCKER_PLATFORM=linux/arm64` when that image is ARM64; the supported
+values are `linux/amd64` and `linux/arm64`. It does not change Kubernetes node
+scheduling or an already published image manifest.
 
 Complete SSO + OpenBao example:
 
@@ -52,6 +60,7 @@ SECRET_ENGINE=openbao \
 SECRET_PROFILE=production \
 SECRET_SEAL_MODE=plaintext \
 SECRET_TOPOLOGY=production-ha \
+VSO_MODE=auto \
 SECRET_STORE_CERT_ISSUER_NAME=internal-ca \
 PUBLIC_URL=https://akb.example.com \
 SSO_KEYCLOAK_PUBLIC_URL=https://auth.akb.example.com \
@@ -105,17 +114,35 @@ for root or recovery material.
 
 ## VSO ownership
 
-The bundled profile enables the pinned official VSO dependency for a true
-single-release on-prem installation. A shared cluster should install VSO once
-under platform ownership and use:
+VSO is a cluster-scoped prerequisite, not a child of an AKB instance release.
+The pinned `akb-cluster` chart owns it once per Kubernetes cluster:
 
 ```bash
-INSTALL_VSO=false bash deploy/helm/akb/install.sh
+helm dependency build deploy/helm/akb-cluster
+helm upgrade --install akb-cluster deploy/helm/akb-cluster \
+  --namespace vault-secrets-operator --create-namespace --wait
 ```
 
-Namespace-scoped `VaultConnection`, `VaultAuth`, and `VaultStaticSecret`
-objects remain in each AKB release. Only the cluster-scoped controller is
-shared.
+`install.sh` performs the same prerequisite step automatically for bundled and
+external Secret Manager modes. `VSO_MODE=auto` installs the pinned release when
+no VSO exists and reuses a compatible Ready controller otherwise.
+`VSO_MODE=install` may install or upgrade only the dedicated
+`vault-secrets-operator/akb-cluster` release. `VSO_MODE=reuse` requires an
+existing compatible controller and never changes it. Manual Secret profiles
+use `VSO_MODE=disabled` and do not need VSO.
+
+Every AKB release still owns its namespace-local `VaultConnection`,
+`VaultAuth`, ServiceAccount, `VaultStaticSecret`, CA reference, and destination
+Secrets. A normal `helm uninstall akb` never removes or upgrades the shared
+controller. Clusters belonging to different security administrators should use
+separate Kubernetes clusters rather than competing VSO controllers against the
+same cluster-wide CRDs.
+
+A bundled Vault/OpenBao server also needs Kubernetes TokenReview permission.
+AKB therefore owns one narrowly scoped ClusterRoleBinding to the built-in
+`system:auth-delegator` role. Its name contains both namespace and Helm release,
+and its only subject is that instance's `akb-secret-store` ServiceAccount, so
+multiple AKB instances cannot collide or authenticate as one another.
 
 ## HashiCorp Vault and Auto Seal
 
@@ -136,4 +163,5 @@ remain native engine output.
 
 Use the same profile values on every upgrade. The chart never generates or
 rotates application secrets. `akb-vaultdata` and Secret Manager Raft PVCs are
-retained; deleting retained data is a separate, explicit operator action.
+retained; deleting retained data is a separate, explicit operator action. VSO
+is upgraded or removed only through the `akb-cluster` release.

@@ -13,9 +13,16 @@ SECRET_PROFILE="${SECRET_PROFILE:-development}"
 SECRET_SEAL_MODE="${SECRET_SEAL_MODE:-plaintext}"
 SECRET_TOPOLOGY="${SECRET_TOPOLOGY:-production-ha}"
 AUTH_PROFILE="${AUTH_PROFILE:-local}"
+BOOTSTRAP_DOCKER_PLATFORM="${BOOTSTRAP_DOCKER_PLATFORM:-linux/amd64}"
 SECRET_STORE_RELEASE="${SECRET_STORE_RELEASE:-}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-}"
-INSTALL_VSO="${INSTALL_VSO:-false}"
+if [[ -z "${VSO_MODE:-}" ]]; then
+  if [[ "${SECRET_MODE}" == "manual" ]]; then
+    VSO_MODE="disabled"
+  else
+    VSO_MODE="auto"
+  fi
+fi
 KV_MOUNT="${KV_MOUNT:-kv}"
 KV_PATH="${KV_PATH:-akb/runtime}"
 KUBERNETES_AUTH_MOUNT="${KUBERNETES_AUTH_MOUNT:-kubernetes}"
@@ -38,6 +45,26 @@ if [[ ! "${NAMESPACE}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
 fi
 if [[ "${AUTH_PROFILE}" != "local" && "${AUTH_PROFILE}" != "sso" ]]; then
   echo "AUTH_PROFILE must be local or sso" >&2
+  exit 2
+fi
+if [[ "${BOOTSTRAP_DOCKER_PLATFORM}" != "linux/amd64" &&
+      "${BOOTSTRAP_DOCKER_PLATFORM}" != "linux/arm64" ]]; then
+  echo "BOOTSTRAP_DOCKER_PLATFORM must be linux/amd64 or linux/arm64" >&2
+  exit 2
+fi
+case "${VSO_MODE}" in
+  auto|install|reuse|disabled) ;;
+  *)
+    echo "VSO_MODE must be auto, install, reuse, or disabled" >&2
+    exit 2
+    ;;
+esac
+if [[ "${SECRET_MODE}" == "manual" && "${VSO_MODE}" != "disabled" ]]; then
+  echo "Manual Secret mode requires VSO_MODE=disabled" >&2
+  exit 2
+fi
+if [[ "${SECRET_MODE}" != "manual" && "${VSO_MODE}" == "disabled" ]]; then
+  echo "Bundled and external Secret Manager modes require VSO" >&2
   exit 2
 fi
 if [[ "${SECRET_SEAL_MODE}" != "plaintext" &&
@@ -107,20 +134,8 @@ wait_for_contract() {
 }
 
 ensure_vso() {
-  if "${KUBECTL[@]}" get crd vaultstaticsecrets.secrets.hashicorp.com >/dev/null 2>&1; then
-    return
-  fi
-  if [[ "${INSTALL_VSO}" != "true" ]]; then
-    echo "Vault Secrets Operator CRDs are missing." >&2
-    echo "Set INSTALL_VSO=true to install the pinned official cluster-scoped chart." >&2
-    exit 2
-  fi
-  "${HELM[@]}" repo add hashicorp https://helm.releases.hashicorp.com --force-update >/dev/null
-  "${HELM[@]}" upgrade --install vault-secrets-operator hashicorp/vault-secrets-operator \
-    --version 1.5.1 \
-    --namespace vault-secrets-operator \
-    --create-namespace \
-    --wait --timeout 5m
+  VSO_MODE="${VSO_MODE}" KUBE_CONTEXT="${KUBE_CONTEXT}" \
+    bash "${SCRIPT_DIR}/../../cluster/ensure-vso.sh"
 }
 
 ensure_production_tls() {
@@ -218,7 +233,7 @@ case "${SECRET_MODE}" in
     if ! secret_contract_ready; then
       if [[ "${GENERATE_MANUAL_SECRETS:-false}" == "true" ]]; then
         echo "Generating namespace-local manual Secret Contract v1"
-        docker run --rm --platform linux/amd64 \
+        docker run --rm --platform "${BOOTSTRAP_DOCKER_PLATFORM}" \
           -v "${SCRIPT_DIR}/bootstrap_material.py:/opt/akb/bootstrap_material.py:ro" \
           "${BACKEND_IMAGE}" python /opt/akb/bootstrap_material.py \
           --format kubernetes --auth-profile "${AUTH_PROFILE}" \
@@ -232,7 +247,6 @@ case "${SECRET_MODE}" in
     fi
     ;;
   bundled)
-    ensure_vso
     if [[ -z "${SECRET_STORE_RELEASE}" ]]; then
       if "${HELM[@]}" status akb-secret-store -n "${NAMESPACE}" >/dev/null 2>&1; then
         # Preserve names for namespaces installed by the original profile.
@@ -328,6 +342,7 @@ case "${SECRET_MODE}" in
           --set-string "server.extraArgs=-config=${SECRET_STORE_HOME}/userconfig/${SECRET_STORE_SEAL_CONFIG_SECRET}/seal.hcl"
         )
       fi
+      ensure_vso
       if [[ "${SECRET_TOPOLOGY}" == "onprem-small" ]]; then
         SECRET_STORE_REPLICAS=1
         HELM_ARGS+=(--set "server.ha.disruptionBudget.enabled=false")
@@ -353,6 +368,7 @@ case "${SECRET_MODE}" in
       secret_contract_ready
       exit 0
     fi
+    ensure_vso
     # Reuse the development token recorded in this namespace's Helm release.
     # Generating a new token on every idempotent deploy breaks OnDelete chart
     # pods: their current environment still contains the previous token.
@@ -377,6 +393,7 @@ case "${SECRET_MODE}" in
       -n "${NAMESPACE}" --timeout=5m
     NAMESPACE="${NAMESPACE}" KUBE_CONTEXT="${KUBE_CONTEXT}" \
       SECRET_ENGINE="${SECRET_ENGINE}" ROOT_TOKEN="${ROOT_TOKEN}" \
+      BOOTSTRAP_DOCKER_PLATFORM="${BOOTSTRAP_DOCKER_PLATFORM}" \
       SECRET_STORE_POD="${STATEFULSET}-0" \
       BACKEND_IMAGE="${BACKEND_IMAGE}" KV_MOUNT="${KV_MOUNT}" KV_PATH="${KV_PATH}" \
       AUTH_PROFILE="${AUTH_PROFILE}" \
@@ -386,7 +403,6 @@ case "${SECRET_MODE}" in
     wait_for_contract
     ;;
   external)
-    ensure_vso
     case "${SECRET_ENGINE}" in
       openbao|hashicorp-vault) ;;
       *)
@@ -399,6 +415,7 @@ case "${SECRET_MODE}" in
       echo "External Secret Manager must use HTTPS unless ALLOW_INSECURE_EXTERNAL_HTTP=true." >&2
       exit 2
     fi
+    ensure_vso
     render_vso "${SECRET_STORE_ADDRESS}" false "${SECRET_STORE_CA_SECRET:-}"
     wait_for_contract
     ;;
