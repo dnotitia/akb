@@ -292,11 +292,11 @@ function inspectorEnvironment(runtimeRoot, inputs) {
   return env;
 }
 
-function operationArgs(info, configPath, method, scenario = HTTP_READ_ONLY_CANARY) {
+function operationArgs(info, configPath, method) {
   const args = [info.entry, "--cli", "--config", configPath, "--stored-auth-only", "--server", SERVER_NAME, "--method", method];
   if (method === "tools/list") args.push("--strict");
   args.push("--format", "json");
-  if (method === "tools/call") args.push("--tool-name", scenario.tool, "--tool-args-json", JSON.stringify(scenario.arguments));
+  if (method === "tools/call") args.push("--tool-name", HTTP_READ_ONLY_CANARY.tool, "--tool-args-json", JSON.stringify(HTTP_READ_ONLY_CANARY.arguments));
   return args;
 }
 
@@ -306,8 +306,8 @@ export function assertReadOnlyCanaryResult(publicResult, isError) {
   }
 }
 
-async function invoke(info, inputs, configPath, runtimeRoot, method, spawnProcess, secrets, scenario = HTTP_READ_ONLY_CANARY) {
-  const child = spawnProcess(process.execPath, operationArgs(info, configPath, method, scenario), {
+async function invoke(info, inputs, configPath, runtimeRoot, method, spawnProcess, secrets) {
+  const child = spawnProcess(process.execPath, operationArgs(info, configPath, method), {
     cwd: REPOSITORY_ROOT,
     env: inspectorEnvironment(runtimeRoot, inputs),
     stdio: ["ignore", "pipe", "pipe"],
@@ -370,7 +370,7 @@ async function invoke(info, inputs, configPath, runtimeRoot, method, spawnProces
     const text = Array.isArray(payload.content) ? payload.content.find((item) => item?.type === "text")?.text : null;
     let publicResult;
     try {
-      publicResult = object(JSON.parse(text), `${scenario.tool} result`);
+      publicResult = object(JSON.parse(text), `${HTTP_READ_ONLY_CANARY.tool} result`);
     } catch {
       result.status = "failed";
       result.error = "akb_list_vaults did not return a JSON object";
@@ -380,26 +380,14 @@ async function invoke(info, inputs, configPath, runtimeRoot, method, spawnProces
       assertReadOnlyCanaryResult(publicResult, payload.isError);
     } catch {
       result.status = "failed";
-      result.error = `${scenario.tool} returned an invalid or error result`;
+      result.error = `${HTTP_READ_ONLY_CANARY.tool} returned an invalid or error result`;
     }
     return { result, parsed, readSchema: null, publicResult };
   }
   return { result, parsed, readSchema: null, publicResult: null };
 }
 
-function scenarioForTarget(target) {
-  // Keep this seam concrete rather than turning it into a general DSL: the
-  // canary contract drives Inspector argv and assertions, while this adapter
-  // only preserves the existing smoke's second transport.
-  if (target === HTTP_READ_ONLY_CANARY.target) return HTTP_READ_ONLY_CANARY;
-  return Object.freeze({
-    ...HTTP_READ_ONLY_CANARY,
-    target,
-    transport: target === "stdio" ? "stdio" : target,
-  });
-}
-
-async function runTransport(info, inputs, credential, target, spawnProcess, scenario = scenarioForTarget(target)) {
+async function runTransport(info, inputs, credential, target, spawnProcess) {
   const runtimeRoot = await mkdtemp(join(tmpdir(), "akb-mcp-inspector-run-"));
   await chmod(runtimeRoot, 0o700);
   let temporary = null;
@@ -411,7 +399,7 @@ async function runTransport(info, inputs, credential, target, spawnProcess, scen
     let readSchema = null;
     let publicResult = null;
     for (const method of SMOKE_OPERATIONS) {
-      const operation = await invoke(info, inputs, temporary.path, runtimeRoot, method, spawnProcess, credential.secrets, scenario);
+      const operation = await invoke(info, inputs, temporary.path, runtimeRoot, method, spawnProcess, credential.secrets);
       operations.push(operation.result);
       if (operation.readSchema) readSchema = operation.readSchema;
       if (operation.publicResult) publicResult = operation.publicResult;
@@ -443,7 +431,7 @@ export async function runSmoke({ info, descriptor, target, fetchImpl = globalThi
     const transports = {};
     for (const name of targets) {
       try {
-        transports[name] = await runTransport(info, inputs, credential, name, spawnProcess);
+      transports[name] = await runTransport(info, inputs, credential, name, spawnProcess);
       } catch (value) {
         const errorMessage = redactText(messageOf(value), secrets);
         transports[name] = {
@@ -463,44 +451,24 @@ export async function runSmoke({ info, descriptor, target, fetchImpl = globalThi
 }
 
 export async function runCanary({ info, descriptor, fetchImpl = globalThis.fetch, spawnProcess = nodeSpawn } = {}) {
-  let secrets = [];
-  const scenario = HTTP_READ_ONLY_CANARY;
-  try {
-    const inputs = runtimeInputs(descriptor, scenario.target);
-    const coordinates = await discoverAndReset(inputs, fetchImpl);
-    const credential = await resolveCredential(inputs, coordinates, fetchImpl);
-    secrets = credential.secrets;
-    let transport;
-    try {
-      transport = await runTransport(info, inputs, credential, scenario.target, spawnProcess, scenario);
-    } catch (value) {
-      transport = {
-        transport: scenario.target,
-        status: "failed",
-        operations: SMOKE_OPERATIONS.map((operation) => ({ operation, status: "not_run" })),
-        error: redactText(messageOf(value), secrets),
-      };
-    }
-    return {
-      status: transport.status,
-      intent: "canary",
-      target: scenario.target,
-      transport: scenario.transport,
-      scenario,
-      inspector: { package: info.package, version: info.version, node_version: info.nodeVersion },
-      operations: transport.operations,
-      ...(transport.error ? { error: transport.error } : {}),
-    };
-  } catch (value) {
-    return {
-      status: "failed",
-      intent: "canary",
-      target: scenario.target,
-      transport: scenario.transport,
-      scenario,
-      error: redactText(messageOf(value), secrets),
-    };
-  }
+  const smoke = await runSmoke({
+    info,
+    descriptor,
+    target: HTTP_READ_ONLY_CANARY.target,
+    fetchImpl,
+    spawnProcess,
+  });
+  const transport = smoke.transports?.[HTTP_READ_ONLY_CANARY.target];
+  return {
+    status: smoke.status,
+    intent: "canary",
+    target: HTTP_READ_ONLY_CANARY.target,
+    transport: HTTP_READ_ONLY_CANARY.transport,
+    scenario: HTTP_READ_ONLY_CANARY,
+    inspector: smoke.inspector,
+    operations: transport?.operations ?? SMOKE_OPERATIONS.map((operation) => ({ operation, status: "not_run" })),
+    ...((transport?.error ?? smoke.error) ? { error: transport?.error ?? smoke.error } : {}),
+  };
 }
 
 export async function runInteractive(info, configPath, spawnProcess = nodeSpawn) {
