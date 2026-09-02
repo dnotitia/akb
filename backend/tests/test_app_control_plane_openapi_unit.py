@@ -80,8 +80,18 @@ def test_control_plane_fixture_matches_live_operation_contract():
 def test_registry_openapi_advertises_manifest_shape_and_natural_key_replay_contract():
     schema = app.openapi()
     manifest = schema["components"]["schemas"]["ReleaseManifest"]
-    assert manifest["required"] == ["steps"]
-    assert manifest["properties"]["steps"]["type"] == "array"
+    assert manifest["required"] == [
+        "manifest_version",
+        "app_key",
+        "source_revision",
+        "image_digest",
+        "schema_version",
+        "schema",
+        "transition_plans",
+    ]
+    assert manifest["additionalProperties"] is False
+    assert manifest["properties"]["manifest_version"]["const"] == 2
+    assert manifest["properties"]["transition_plans"]["type"] == "array"
 
     app_create = schema["paths"]["/api/v1/apps"]["post"]
     release_create = schema["paths"]["/api/v1/apps/{app_id}/releases"]["post"]

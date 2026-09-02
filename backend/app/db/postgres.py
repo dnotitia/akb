@@ -317,6 +317,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "092_native_revision_plan_supersession.py",  # release never-applied aborted-plan reservations for a fresh coverage version
         "093_external_git_retirement.py",  # durable offline retirement receipt for a Collector-adopted external Git mirror
         "094_native_revision_completed_reservation_transfer.py",  # let a fresh coverage run adopt completed work from an aborted pre-authority cutover
+        "095_app_release_manifest_v2.py",  # strict app release manifest v2 registry shape
     ):
         if filename in applied:
             continue

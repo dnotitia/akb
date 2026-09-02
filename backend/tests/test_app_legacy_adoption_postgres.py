@@ -17,6 +17,7 @@ import pytest
 from app.exceptions import ConflictError
 from app.services import app_legacy_adoption_service as adoption
 from app.services import app_inventory_service as inventory
+from app.services import app_rollout_service as rollout
 from app.services import table_migration_service
 from app.services import table_service
 from app.services.app_resource_service import canonical_table_fingerprint
@@ -32,6 +33,7 @@ _MIGRATIONS = [
     _BACKEND / "app" / "db" / "migrations" / "047_app_registry.py",
     _BACKEND / "app" / "db" / "migrations" / "052_app_inventory.py",
     _BACKEND / "app" / "db" / "migrations" / "077_legacy_adoptions.py",
+    _BACKEND / "app" / "db" / "migrations" / "095_app_release_manifest_v2.py",
 ]
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
@@ -94,7 +96,7 @@ def _admin() -> AuthenticatedUser:
     )
 
 
-async def _fixture(pool, *, label: str, fingerprint: str | None = None):
+async def _fixture(pool, *, label: str):
     app_id = uuid.uuid4()
     vault_id = uuid.uuid4()
     table_id = uuid.uuid4()
@@ -108,17 +110,44 @@ async def _fixture(pool, *, label: str, fingerprint: str | None = None):
         "indexes": [],
     }
     actual_fingerprint = canonical_table_fingerprint([descriptor])
-    expected = fingerprint or actual_fingerprint
-    manifest = {
-        "steps": [{"id": "prepare"}],
-        "expected_schema_fingerprint": expected,
+    app_key = f"legacy-{label}-{uuid.uuid4().hex}"
+    create_step = {
+        "id": "create_orders",
+        "phase": "expand",
+        "operation": "create_table",
+        "payload": {
+            "table": table_name,
+            "columns": columns,
+            "unique_keys": [],
+            "indexes": [],
+        },
     }
-    encoded = json.dumps(manifest, separators=(",", ":"))
+    create_step["checksum"] = hashlib.sha256(
+        json.dumps(create_step, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+    manifest_body = {
+        "manifest_version": 2,
+        "app_key": app_key,
+        "source_revision": "a" * 40,
+        "image_digest": "sha256:" + "b" * 64,
+        "schema_version": 3,
+        "schema": {"tables": [descriptor]},
+        "transition_plans": [{"source": "fresh", "steps": [create_step]}],
+    }
+    checksum = rollout.manifest_checksum(manifest_body, version="1.0.0")
+    normalized_manifest = rollout.validate_manifest(
+        manifest_body, checksum, version="1.0.0"
+    )
+    encoded = json.dumps(
+        rollout.manifest_storage_projection(normalized_manifest),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
     async with pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO app_definitions(id, app_key) VALUES($1, $2)",
             app_id,
-            f"legacy-{label}-{uuid.uuid4().hex}",
+            app_key,
         )
         release_id = await conn.fetchval(
             """
@@ -128,7 +157,7 @@ async def _fixture(pool, *, label: str, fingerprint: str | None = None):
             """,
             app_id,
             encoded,
-            hashlib.sha256(encoded.encode()).hexdigest(),
+            checksum,
         )
         await conn.execute(
             "INSERT INTO vaults(id, name, git_path) VALUES($1, $2, $3)",
@@ -170,7 +199,7 @@ async def _fixture(pool, *, label: str, fingerprint: str | None = None):
         "physical": physical,
         "row_id": row_id,
         "fingerprint": actual_fingerprint,
-        "expected": expected,
+        "expected": actual_fingerprint,
     }
 
 
@@ -237,7 +266,6 @@ async def test_migration_reapply_plan_read_only_apply_and_owned_table_protection
         target = {
             "vault_id": str(fixture["vault_id"]),
             "table_allowlist": [fixture["table_name"]],
-            "expected_schema_fingerprint": fixture["expected"],
         }
         key = str(uuid.uuid4())
 
@@ -381,7 +409,6 @@ async def test_post_plan_schema_drift_blocks_without_partial_metadata(monkeypatc
                 {
                     "vault_id": str(fixture["vault_id"]),
                     "table_allowlist": [fixture["table_name"]],
-                    "expected_schema_fingerprint": fixture["expected"],
                 }
             ],
             user=user,
@@ -435,12 +462,10 @@ async def test_concurrent_apply_partial_resume_cross_app_conflict_and_audit_immu
             {
                 "vault_id": str(fixture["vault_id"]),
                 "table_allowlist": [fixture["table_name"]],
-                "expected_schema_fingerprint": fixture["expected"],
             },
             {
                 "vault_id": str(second_vault_id),
                 "table_allowlist": [fixture["table_name"]],
-                "expected_schema_fingerprint": fixture["expected"],
             },
         ]
         plan = await adoption.create_legacy_adoption(
@@ -515,16 +540,57 @@ async def test_concurrent_apply_partial_resume_cross_app_conflict_and_audit_immu
         # A different app cannot adopt the already owned table, and the
         # immutable plan's idempotency key cannot be reused with new input.
         other_app_id = uuid.uuid4()
-        manifest = {
-            "steps": [{"id": "prepare"}],
-            "expected_schema_fingerprint": fixture["expected"],
+        other_app_key = f"legacy-other-{uuid.uuid4().hex}"
+        other_table = {
+            "name": fixture["table_name"],
+            "columns": [{"name": "amount", "type": "numeric"}],
+            "unique_keys": [],
+            "indexes": [],
         }
-        encoded_manifest = json.dumps(manifest, separators=(",", ":"))
+        other_create_step = {
+            "id": "create_orders",
+            "phase": "expand",
+            "operation": "create_table",
+            "payload": {
+                "table": fixture["table_name"],
+                "columns": other_table["columns"],
+                "unique_keys": [],
+                "indexes": [],
+            },
+        }
+        other_create_step["checksum"] = hashlib.sha256(
+            json.dumps(
+                other_create_step,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+        ).hexdigest()
+        manifest = {
+            "manifest_version": 2,
+            "app_key": other_app_key,
+            "source_revision": "a" * 40,
+            "image_digest": "sha256:" + "b" * 64,
+            "schema_version": 3,
+            "schema": {"tables": [other_table]},
+            "transition_plans": [
+                {"source": "fresh", "steps": [other_create_step]}
+            ],
+        }
+        other_checksum = rollout.manifest_checksum(manifest, version="1.0.0")
+        normalized_other_manifest = rollout.validate_manifest(
+            manifest, other_checksum, version="1.0.0"
+        )
+        encoded_manifest = json.dumps(
+            rollout.manifest_storage_projection(normalized_other_manifest),
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
         async with pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO app_definitions(id, app_key) VALUES($1, $2)",
                 other_app_id,
-                f"legacy-other-{uuid.uuid4().hex}",
+                other_app_key,
             )
             other_release_id = await conn.fetchval(
                 """
@@ -534,7 +600,7 @@ async def test_concurrent_apply_partial_resume_cross_app_conflict_and_audit_immu
                 """,
                 other_app_id,
                 encoded_manifest,
-                hashlib.sha256(encoded_manifest.encode()).hexdigest(),
+                other_checksum,
             )
         other_plan = await adoption.create_legacy_adoption(
             other_app_id,
@@ -569,7 +635,7 @@ async def test_concurrent_apply_partial_resume_cross_app_conflict_and_audit_immu
                 targets=[
                     {
                         **targets[0],
-                        "expected_schema_fingerprint": "b" * 64,
+                        "table_allowlist": ["different_table"],
                     }
                 ],
                 user=user,

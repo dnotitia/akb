@@ -30,6 +30,7 @@ from app.services.app_identity_service import (
 )
 from app.services.app_inventory_service import (
     classify_drift,
+    expected_schema_fingerprint,
     sanitize_checkpoint,
     sanitize_recent_error,
 )
@@ -40,7 +41,7 @@ LIFECYCLE_MODES = frozenset({"install", "restore", "fresh"})
 READABLE_LIFECYCLES = frozenset({"installing", "active", "upgrading", "blocked"})
 _SAFE_CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 _SAFE_RELEASE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,255}$")
-_SAFE_FINGERPRINT = re.compile(r"^[0-9A-Fa-f]{8,256}$")
+_SAFE_FINGERPRINT = re.compile(r"^[0-9A-Fa-f]{64}$")
 
 
 def normalize_capabilities(capabilities: list[str] | tuple[str, ...]) -> list[str]:
@@ -90,32 +91,7 @@ def _safe_fingerprint(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
     value = value.strip()
-    return value if _SAFE_FINGERPRINT.fullmatch(value) else None
-
-
-def _expected_schema_fingerprint(manifest: Any) -> str | None:
-    if isinstance(manifest, str):
-        try:
-            manifest = json.loads(manifest)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return None
-    if not isinstance(manifest, dict):
-        return None
-    candidates = (
-        manifest.get("expected_schema_fingerprint"),
-        manifest.get("schema_fingerprint"),
-        manifest.get("schema", {}).get("fingerprint")
-        if isinstance(manifest.get("schema"), dict)
-        else None,
-        manifest.get("schema", {}).get("expected_fingerprint")
-        if isinstance(manifest.get("schema"), dict)
-        else None,
-    )
-    for candidate in candidates:
-        safe = _safe_fingerprint(candidate)
-        if safe is not None:
-            return safe
-    return None
+    return value.lower() if _SAFE_FINGERPRINT.fullmatch(value) else None
 
 
 def _release_payload(release_id: Any, version: Any) -> dict[str, Any] | None:
@@ -645,7 +621,7 @@ async def _apply_existing_command(
             """,
             installation["id"],
         )
-        expected = _expected_schema_fingerprint(release["manifest"])
+        expected = expected_schema_fingerprint(release["manifest"])
         if (
             observed is None
             or observed["observed_release_id"] != release_id

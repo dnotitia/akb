@@ -71,6 +71,212 @@ DEFAULT_TIMEOUT_SECONDS = 180.0
 DEFAULT_PROFILE = "tool-only"
 
 
+def _canonical_fixture_json(value: object) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _fixture_table_descriptor(table: dict[str, object]) -> dict[str, object]:
+    columns: list[dict[str, object]] = []
+    inline_unique: list[dict[str, object]] = []
+    inline_indexes: list[dict[str, object]] = []
+    for raw_column in table.get("columns", []):
+        column = dict(raw_column)
+        if column.get("type") == "number":
+            column["type"] = "numeric"
+        elif column.get("type") == "json":
+            column["type"] = "jsonb"
+        for flag in ("required", "unique", "index"):
+            if column.get(flag) is False or column.get(flag) is None:
+                column.pop(flag, None)
+        for key in ("default", "check", "enum", "references", "on_delete"):
+            if column.get(key) is None:
+                column.pop(key, None)
+        if column.get("unique") is True:
+            inline_unique.append({"columns": [column["name"]]})
+        if column.get("index") is True:
+            inline_indexes.append(
+                {"columns": [{"name": column["name"], "order": "asc"}]}
+            )
+        column.pop("unique", None)
+        column.pop("index", None)
+        columns.append(column)
+    columns.sort(key=lambda column: str(column["name"]))
+    unique_keys = [
+        {"columns": list(key["columns"])}
+        for key in table.get("unique_keys", [])
+    ]
+    unique_identities = {tuple(key["columns"]) for key in unique_keys}
+    unique_keys.extend(
+        key
+        for key in inline_unique
+        if tuple(key["columns"]) not in unique_identities
+    )
+    unique_keys.sort(key=lambda key: _canonical_fixture_json(key["columns"]))
+    indexes: list[dict[str, object]] = []
+    for index in table.get("indexes", []):
+        index_columns: list[dict[str, str]] = []
+        for raw_column in index["columns"]:
+            if isinstance(raw_column, str):
+                index_columns.append({"name": raw_column, "order": "asc"})
+            else:
+                index_columns.append(
+                    {
+                        "name": str(raw_column["name"]),
+                        "order": str(raw_column.get("order", "asc")).lower(),
+                    }
+                )
+        indexes.append({"columns": index_columns})
+    index_identities = {
+        tuple((column["name"], column["order"]) for column in index["columns"])
+        for index in indexes
+    }
+    indexes.extend(
+        index
+        for index in inline_indexes
+        if tuple((column["name"], column["order"]) for column in index["columns"])
+        not in index_identities
+    )
+    indexes.sort(key=lambda index: _canonical_fixture_json(index["columns"]))
+    return {
+        "name": table["name"],
+        "columns": columns,
+        "unique_keys": unique_keys,
+        "indexes": indexes,
+    }
+
+
+def _fixture_schema_fingerprint(tables: Sequence[dict[str, object]]) -> str:
+    descriptors = [_fixture_table_descriptor(table) for table in tables]
+    descriptors.sort(key=lambda table: str(table["name"]))
+    return hashlib.sha256(_canonical_fixture_json(descriptors)).hexdigest()
+
+
+def _fixture_normalized_step(
+    step: dict[str, object],
+) -> dict[str, object]:
+    normalized = {
+        key: value for key, value in step.items() if key != "checksum"
+    }
+    if step.get("operation") == "create_table":
+        payload = step.get("payload")
+        if isinstance(payload, dict):
+            descriptor = _fixture_table_descriptor(
+                {
+                    "name": payload["table"],
+                    "columns": payload.get("columns", []),
+                    "unique_keys": payload.get("unique_keys", []),
+                    "indexes": payload.get("indexes", []),
+                }
+            )
+            normalized["payload"] = {
+                "table": descriptor["name"],
+                "columns": descriptor["columns"],
+                "unique_keys": descriptor["unique_keys"],
+                "indexes": descriptor["indexes"],
+            }
+    return normalized
+
+
+def _fixture_v2_manifest(
+    *,
+    app_key: str,
+    version: str,
+    tables: Sequence[dict[str, object]],
+    transition_plans: Sequence[
+        tuple[object, Sequence[dict[str, object]]]
+    ] | None = None,
+    valid: bool = True,
+) -> tuple[dict[str, object], str]:
+    desired_tables = [_fixture_table_descriptor(table) for table in tables]
+    desired_tables.sort(key=lambda table: str(table["name"]))
+    schema_fingerprint = _fixture_schema_fingerprint(desired_tables)
+
+    if transition_plans is None:
+        transition_plans = [
+            (
+                "fresh",
+                [
+                    {
+                        "id": f"create_{table['name']}",
+                        "phase": "expand",
+                        "operation": "create_table",
+                        "payload": {
+                            "table": table["name"],
+                            "columns": table.get("columns", []),
+                            "unique_keys": table.get("unique_keys", []),
+                            "indexes": table.get("indexes", []),
+                        },
+                    }
+                    for table in desired_tables
+                ],
+            )
+        ]
+
+    raw_plans: list[dict[str, object]] = []
+    normalized_plans: list[dict[str, object]] = []
+    for source, raw_steps in transition_plans:
+        steps = [dict(step) for step in raw_steps]
+        for step in steps:
+            canonical_step = _fixture_normalized_step(step)
+            step["checksum"] = hashlib.sha256(
+                _canonical_fixture_json(canonical_step)
+            ).hexdigest()
+        raw_plans.append({"source": source, "steps": steps})
+        normalized_plans.append(
+            {
+                "source": source,
+                "steps": [
+                    _fixture_normalized_step(step)
+                    for step in steps
+                ],
+            }
+        )
+    body: dict[str, object] = {
+        "manifest_version": 2,
+        "app_key": app_key,
+        "source_revision": "a" * 40,
+        "image_digest": "sha256:" + "b" * 64,
+        "schema_version": 3,
+        "schema": {
+            "tables": desired_tables,
+            "fingerprint": schema_fingerprint,
+        },
+        "transition_plans": raw_plans,
+    }
+    if not valid:
+        invalid_step = {
+            "id": "invalid_contract",
+            "phase": "contract",
+            "operation": "drop_table",
+            "payload": {"table": "rollout_data"},
+        }
+        invalid_step["checksum"] = hashlib.sha256(
+            _canonical_fixture_json(invalid_step)
+        ).hexdigest()
+        body["transition_plans"] = [{"source": "fresh", "steps": [invalid_step]}]
+        normalized_plans = [
+            {
+                "source": "fresh",
+                "steps": [
+                    _fixture_normalized_step(invalid_step)
+                ],
+            }
+        ]
+    checksum_payload = {
+        key: value
+        for key, value in body.items()
+        if key != "transition_plans"
+    }
+    checksum_payload["transition_plans"] = normalized_plans
+    checksum_payload["product_version"] = version
+    return body, hashlib.sha256(_canonical_fixture_json(checksum_payload)).hexdigest()
+
+
 @dataclasses.dataclass(frozen=True)
 class CapabilityProfile:
     """One explicit, fail-closed runtime capability selection."""
@@ -1691,12 +1897,19 @@ class E2ERuntime:
         *,
         app_id: uuid.UUID,
         version: str,
-        expected_fingerprint: str | None,
+        schema_tables: Sequence[dict[str, object]] = (),
     ) -> uuid.UUID:
-        manifest: dict[str, object] = {"steps": [{"id": "prepare"}]}
-        if expected_fingerprint is not None:
-            manifest["expected_schema_fingerprint"] = expected_fingerprint
-        encoded = json.dumps(manifest, separators=(",", ":"))
+        app_key = await connection.fetchval(
+            "SELECT app_key FROM app_definitions WHERE id=$1", app_id
+        )
+        if not isinstance(app_key, str):
+            raise ProvisioningFailure("fixture release app identity is unavailable")
+        manifest, checksum = _fixture_v2_manifest(
+            app_key=app_key,
+            version=version,
+            tables=schema_tables,
+        )
+        encoded = json.dumps(manifest, ensure_ascii=False, separators=(",", ":"))
         release_id = uuid.uuid4()
         await connection.execute(
             """
@@ -1707,7 +1920,7 @@ class E2ERuntime:
             app_id,
             version,
             encoded,
-            hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+            checksum,
         )
         return release_id
 
@@ -1719,12 +1932,33 @@ class E2ERuntime:
         version: str,
         valid: bool = True,
     ) -> tuple[uuid.UUID, str, dict[str, object]]:
-        """Insert a v1 release and return its immutable manifest coordinates."""
-        def canonical(value: object) -> bytes:
-            return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-
+        """Insert a v2 release and return its immutable manifest coordinates."""
+        app_key = await connection.fetchval(
+            "SELECT app_key FROM app_definitions WHERE id=$1", app_id
+        )
+        if not isinstance(app_key, str):
+            raise ProvisioningFailure("rollout fixture app identity is unavailable")
+        baseline_table = {
+            "name": "rollout_data",
+            "columns": [{"name": "value", "type": "text"}],
+            "unique_keys": [],
+            "indexes": [],
+        }
+        desired_table = {
+            "name": "rollout_data",
+            "columns": [
+                {"name": "value", "type": "text"},
+                {"name": "flag", "type": "text", "required": True},
+            ],
+            "unique_keys": [],
+            "indexes": [],
+        }
+        baseline_fingerprint = _fixture_schema_fingerprint([baseline_table])
+        transition_plans: Sequence[
+            tuple[object, Sequence[dict[str, object]]]
+        ] | None = None
         if valid:
-            steps: list[dict[str, object]] = [
+            transition_steps: list[dict[str, object]] = [
                 {
                     "id": "expand_flag",
                     "phase": "expand",
@@ -1754,26 +1988,38 @@ class E2ERuntime:
                     "payload": {"table": "rollout_data", "column": "flag"},
                 },
             ]
-            for step in steps:
-                step["checksum"] = hashlib.sha256(canonical(step)).hexdigest()
-            manifest: dict[str, object] = {"manifest_version": 1, "steps": steps}
-        else:
-            manifest = {
-                "manifest_version": 1,
-                "steps": [{"id": "contract", "phase": "contract", "operation": "drop_table", "payload": {"table": "rollout_data"}}],
-            }
-        manifest_steps = manifest["steps"]
-        assert isinstance(manifest_steps, list)
-        checksum_payload = {
-            "manifest_version": manifest["manifest_version"],
-            "steps": [
-                {key: value for key, value in step.items() if key != "checksum"}
-                for step in manifest_steps
-                if isinstance(step, dict)
-            ],
-        }
-        checksum = hashlib.sha256(canonical(checksum_payload)).hexdigest()
-        manifest["manifest_checksum"] = checksum
+            transition_plans = [
+                (
+                    "fresh",
+                    [
+                        {
+                            "id": "create_rollout_data",
+                            "phase": "expand",
+                            "operation": "create_table",
+                            "payload": {
+                                "table": "rollout_data",
+                                "columns": desired_table["columns"],
+                                "unique_keys": desired_table["unique_keys"],
+                                "indexes": desired_table["indexes"],
+                            },
+                        }
+                    ],
+                ),
+                (
+                    {
+                        "release_version": "1.0.0",
+                        "schema_fingerprint": baseline_fingerprint,
+                    },
+                    transition_steps,
+                ),
+            ]
+        manifest, checksum = _fixture_v2_manifest(
+            app_key=app_key,
+            version=version,
+            tables=[desired_table],
+            transition_plans=transition_plans,
+            valid=valid,
+        )
         release_id = uuid.uuid4()
         await connection.execute(
             "INSERT INTO app_releases(id, app_id, version, manifest, manifest_checksum) VALUES($1,$2,$3,$4::jsonb,$5)",
@@ -1825,6 +2071,16 @@ class E2ERuntime:
         )
         foreign_next, foreign_checksum, _foreign_next_manifest = await self._insert_rollout_release(
             connection, app_id=foreign_app_id, version="2.0.0", valid=True
+        )
+        rollout_baseline_fingerprint = _fixture_schema_fingerprint(
+            [
+                {
+                    "name": "rollout_data",
+                    "columns": [{"name": "value", "type": "text"}],
+                    "unique_keys": [],
+                    "indexes": [],
+                }
+            ]
         )
         target_grants = [(owner_id, "owner")]
         installations: list[dict[str, object]] = []
@@ -1880,11 +2136,12 @@ class E2ERuntime:
                 table_name,
             )
             await connection.execute(
-                "INSERT INTO app_installation_observed_states(installation_id,app_id,vault_id,observed_generation,observed_at,observed_release_id,observed_release_version,observed_grant_generation,checkpoint) VALUES($1,$2,$3,1,NOW(),$4,'1.0.0',1,'{}'::jsonb)",
+                "INSERT INTO app_installation_observed_states(installation_id,app_id,vault_id,observed_generation,observed_at,observed_release_id,observed_release_version,schema_fingerprint,observed_grant_generation,checkpoint) VALUES($1,$2,$3,1,NOW(),$4,'1.0.0',$5,1,'{}'::jsonb)",
                 installation_id,
                 target_app_id,
                 vault_id,
                 old_release,
+                rollout_baseline_fingerprint,
             )
             installations.append(
                 {
@@ -1932,6 +2189,7 @@ class E2ERuntime:
             resources=[("table", foreign_table_name, "owned")],
             observed_release_id=foreign_current,
             observed_release_version="1.0.0",
+            schema_fingerprint=rollout_baseline_fingerprint,
         )
         def rollout_coordinates(
             app_id: uuid.UUID,
@@ -2261,13 +2519,11 @@ class E2ERuntime:
             connection,
             app_id=app_uuid,
             version="3.0.0",
-            expected_fingerprint="a" * 64,
         )
         fresh_release_id = await self._insert_fixture_release(
             connection,
             app_id=app_uuid,
             version="4.0.0",
-            expected_fingerprint="c" * 64,
         )
         grants = [(owner_uuid, "owner")]
         restore_vault_id, restore_vault_name = await self._insert_fixture_vault(
@@ -2297,7 +2553,7 @@ class E2ERuntime:
             resources=[("table", f"{namespace}-restore-table", "retained")],
             observed_release_id=restore_release_id,
             observed_release_version="3.0.0",
-            schema_fingerprint="a" * 64,
+            schema_fingerprint=_fixture_schema_fingerprint(()),
         )
         fresh_installation_id = await self._insert_fixture_installation(
             connection,
@@ -2403,7 +2659,7 @@ class E2ERuntime:
             connection,
             app_id=app_uuid,
             version="5.0.0",
-            expected_fingerprint=fingerprint,
+            schema_tables=[descriptor],
         )
         vault_id, vault_name = await self._insert_fixture_vault(
             connection,
@@ -2497,7 +2753,6 @@ class E2ERuntime:
                     "vault_id": str(vault_id),
                     "baseline_release_id": str(release_id),
                     "table_allowlist": [table_name],
-                    "expected_schema_fingerprint": fingerprint,
                     "create": {
                         "service": "app",
                         "method": "POST",
@@ -2509,7 +2764,6 @@ class E2ERuntime:
                                 {
                                     "vault_id": str(vault_id),
                                     "table_allowlist": [table_name],
-                                    "expected_schema_fingerprint": fingerprint,
                                 }
                             ],
                         },
@@ -2629,25 +2883,21 @@ class E2ERuntime:
             connection,
             app_id=target_app_id,
             version="1.0.0",
-            expected_fingerprint="a" * 64,
         )
         release_b = await self._insert_fixture_release(
             connection,
             app_id=target_app_id,
             version="2.0.0",
-            expected_fingerprint="c" * 64,
         )
         release_unknown = await self._insert_fixture_release(
             connection,
             app_id=target_app_id,
             version="3.0.0",
-            expected_fingerprint=None,
         )
         foreign_release = await self._insert_fixture_release(
             connection,
             app_id=foreign_app_id,
             version="1.0.0",
-            expected_fingerprint="a" * 64,
         )
 
         fixtures: dict[str, dict[str, object]] = {}
@@ -2703,7 +2953,7 @@ class E2ERuntime:
             resources=[("table", f"{namespace}-active-table", "owned")],
             observed_release_id=release_a,
             observed_release_version="1.0.0",
-            schema_fingerprint="a" * 64,
+            schema_fingerprint=_fixture_schema_fingerprint(()),
         )
         await add_fixture(
             "status_active",
@@ -2723,7 +2973,7 @@ class E2ERuntime:
             resources=[("table", f"{namespace}-blocked-table", "owned")],
             observed_release_id=release_a,
             observed_release_version="1.0.0",
-            schema_fingerprint="a" * 64,
+            schema_fingerprint=_fixture_schema_fingerprint(()),
             blocked_reason="fixture_blocked",
         )
         await add_fixture(
@@ -2762,7 +3012,7 @@ class E2ERuntime:
             resources=[("table", f"{namespace}-restore-table", "retained")],
             observed_release_id=release_a,
             observed_release_version="1.0.0",
-            schema_fingerprint="a" * 64,
+            schema_fingerprint=_fixture_schema_fingerprint(()),
         )
         await add_fixture(
             "restore_compatible",
@@ -2802,7 +3052,7 @@ class E2ERuntime:
             resources=[("table", f"{namespace}-unknown-table", "retained")],
             observed_release_id=release_unknown,
             observed_release_version="3.0.0",
-            schema_fingerprint="a" * 64,
+            schema_fingerprint=_fixture_schema_fingerprint(()),
         )
         await add_fixture(
             "restore_unknown",
