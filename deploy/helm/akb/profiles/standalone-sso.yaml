@@ -1,6 +1,9 @@
 profile: standalone-sso
 sso:
   enabled: true
+  localRealmLogin:
+    enabled: true
+    displayName: AKB account
 secretManager:
   mode: manual
   engine: ""

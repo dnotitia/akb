@@ -8,14 +8,29 @@ not persist its values in release metadata.
 VSO will project Secret/{{ .Values.secretContract.name }} from
 {{ .Values.secretManager.connection.address }}.
 {{- else }}
-The bundled {{ .Values.secretManager.engine }} server starts sealed. Complete
-native init/unseal/bootstrap from the source tree with:
+{{- if .Values.secretManager.bootstrap.enabled }}
+The chart-managed Bootstrap Job initializes and performs the first unseal of
+the bundled {{ .Values.secretManager.engine }} server, configures the Secret
+Contract, revokes the initial root token, and waits for VSO projection.
+
+Store the recovery material off-cluster, then delete its one-time handoff:
+
+  kubectl get secret {{ .Values.secretManager.bootstrap.recoverySecretName }} \
+    -n {{ .Release.Namespace }} \
+    -o jsonpath='{.data.recovery\.json}' | base64 --decode
+  printf '\n'
+  kubectl delete secret {{ .Values.secretManager.bootstrap.recoverySecretName }} \
+    -n {{ .Release.Namespace }}
+
+The Secret is annotated with helm.sh/resource-policy=keep. Helm uninstall does
+not delete recovery material that has not yet been handed off.
+{{- else }}
+The bundled {{ .Values.secretManager.engine }} server starts sealed and
+chart-native bootstrap is disabled. Run the source-tree interactive initializer:
 
   RELEASE={{ .Release.Name }} NAMESPACE={{ .Release.Namespace }} \
     bash deploy/helm/akb/scripts/initialize-secret-manager.sh
-
-For a new installation prefer deploy/helm/akb/install.sh, which performs this
-two-phase lifecycle without putting recovery material in Helm hook logs.
+{{- end }}
 {{- end }}
 
 Application URL: {{ .Values.global.publicUrl }}

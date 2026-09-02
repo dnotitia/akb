@@ -95,6 +95,32 @@ the corresponding existing AKB tree. `deploy/all-in-one` remains the separate
 single-container demo image and does not bundle this production Secret Manager
 lifecycle.
 
+### Helm-native bundled lifecycle
+
+The umbrella Helm chart includes a normal, namespace-scoped bootstrap Job for
+both bundled profiles. One
+`helm upgrade --install --wait --wait-for-jobs` therefore installs the engine,
+performs native initialization and the first unseal, configures KV v2 and
+Kubernetes auth, creates Secret Contract v1, revokes the initial root token,
+waits for VSO projection, and finally allows the AKB workloads to become ready.
+No second Helm pass, workstation Docker helper, or AKB-specific recovery format
+is involved.
+
+Generated native output is not a Helm value, hook log, or release-metadata
+field. It is written once to retained Secret
+`akb-secret-manager-recovery/recovery.json` as an explicit custody handoff.
+For plaintext Shamir the Job uses the shares in memory for the first unseal and
+removes its transient root-token field after bootstrap. An operator must then
+copy `recovery.json` to approved off-cluster custody, verify the copy, and
+delete the Kubernetes Secret. Helm cannot verify a human's password-manager or
+HSM custody and deliberately does not pretend otherwise.
+
+PGP mode puts only native encrypted shares/root output in the handoff and waits
+for key holders to decrypt and submit the threshold. Auto Seal waits for the
+configured KMS/HSM/Transit provider. These waits are security properties, not
+missing automation. Set `secretManager.bootstrap.enabled=false` only when an
+external operator owns the lifecycle.
+
 ### Manual Secret ownership
 
 In manual mode, the operator owns the Secret lifecycle. Before adopting this
@@ -314,12 +340,14 @@ SECRET_TOPOLOGY=production-ha \
 bash deploy/k8s/profiles/standalone-sso-secret-manager/deploy.sh
 ```
 
-The installer prints the official `operator init` values once and waits for
-the operator to type `STORED`. It then uses the same in-memory shares to unseal
-all Raft members, configures KV and Kubernetes auth, seeds Secret Contract v1,
-creates the short-lived operator-admin login boundary described below, revokes
-the initial root token, verifies revocation, and lets VSO project the contract
-before databases or applications start. It creates no durable local key file.
+The Kustomize profile installer prints the official `operator init` values once
+and waits for the operator to type `STORED`. The Helm chart instead stores the
+same native output in its one-time recovery Secret so a non-interactive Helm
+client can finish. Both paths use the shares for the first unseal, configure KV
+and Kubernetes auth, seed Secret Contract v1, create the short-lived
+operator-admin login boundary described below, revoke the initial root token,
+and let VSO project the contract before databases or applications start.
+Neither creates a local AKB recovery file.
 
 #### PGP Shamir
 
@@ -363,11 +391,11 @@ The bootstrap administrator performs the same operation for the separately
 encrypted initial root token, enters it only when the installer asks, and does
 not retain it as day-2 authority after revocation succeeds.
 
-Because the installer cannot decrypt those shares, this mode intentionally
-requires key-holder participation during initial installation and every
-Shamir restart. Repeating one administrator's public key technically works but
-does not provide multi-party control; use plaintext mode for a single-holder
-installation instead.
+Because neither installer nor chart Job can decrypt those shares, this mode
+intentionally requires key-holder participation during initial installation
+and every Shamir restart. Repeating one administrator's public key technically
+works but does not provide multi-party control; use plaintext mode for a
+single-holder installation instead.
 
 #### Auto Seal
 
@@ -413,10 +441,12 @@ recovery policy are mandatory.
 
 ### Idempotency and recovery
 
-Successful production bootstrap records only a non-sensitive ConfigMap receipt
+Successful production bootstrap records a non-sensitive ConfigMap receipt
 (`akb-secret-manager-bootstrap`): cluster ID, engine, seal type, contract
 version, operator-role identity, and the fact that the initial root token was
-revoked. Reruns never call `operator init` again.
+revoked. Helm mode additionally retains the native recovery handoff Secret
+until its operator has copied and deleted it. Reruns never call `operator init`
+again and preserve an existing Secret Contract KV record.
 
 If a Shamir cluster is already initialized but sealed, the installer shows the
 native `operator unseal` command and waits for the operator or key holders. If

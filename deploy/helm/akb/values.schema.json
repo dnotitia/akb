@@ -58,7 +58,48 @@
         "engine": {"type": "string", "enum": ["", "openbao", "hashicorp-vault"]},
         "profile": {"type": "string", "enum": ["production"]},
         "sealMode": {"type": "string", "enum": ["plaintext", "pgp", "auto"]},
-        "topology": {"type": "string", "enum": ["onprem-small", "production-ha"]}
+        "topology": {"type": "string", "enum": ["onprem-small", "production-ha"]},
+        "bootstrap": {
+          "type": "object",
+          "required": [
+            "enabled",
+            "keyShares",
+            "keyThreshold",
+            "waitSeconds",
+            "recoverySecretName",
+            "inputSecretName",
+            "receiptConfigMapName",
+            "pgp",
+            "job"
+          ],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "keyShares": {"type": "integer", "minimum": 1},
+            "keyThreshold": {"type": "integer", "minimum": 1},
+            "waitSeconds": {"type": "integer", "minimum": 60},
+            "recoverySecretName": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"},
+            "inputSecretName": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"},
+            "receiptConfigMapName": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"},
+            "pgp": {
+              "type": "object",
+              "required": ["unsealPublicKeys", "recoveryPublicKeys", "rootTokenPublicKey"],
+              "properties": {
+                "unsealPublicKeys": {"type": "array", "items": {"type": "string"}},
+                "recoveryPublicKeys": {"type": "array", "items": {"type": "string"}},
+                "rootTokenPublicKey": {"type": "string"}
+              }
+            },
+            "job": {
+              "type": "object",
+              "required": ["backoffLimit", "ttlSecondsAfterFinished", "resources"],
+              "properties": {
+                "backoffLimit": {"type": "integer", "minimum": 0},
+                "ttlSecondsAfterFinished": {"type": "integer", "minimum": 0},
+                "resources": {"type": "object"}
+              }
+            }
+          }
+        }
       }
     }
   },

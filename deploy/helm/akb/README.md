@@ -24,14 +24,14 @@ contract so incompatible combinations fail during `helm template`.
 
 ## Prerequisites
 
-- Helm 3 and `kubectl`; the source-tree installer also uses `jq`, OpenSSL, and
-  standard POSIX command-line tools.
+- Helm 3 and `kubectl`; the source-tree installer also uses standard POSIX
+  command-line tools.
 - Kubernetes 1.29 or later for the AKB chart. Bundled OpenBao requires
   Kubernetes 1.30 or later because of the selected upstream chart.
 - A default StorageClass or `STORAGE_CLASS`, plus an ingress controller and
   operator-managed DNS/TLS for browser access.
-- Docker only when `install.sh` must generate bootstrap material from the
-  backend image on the operator workstation.
+- Docker only for the optional manual-Secret generator. Bundled Secret Manager
+  bootstrap runs inside the chart-managed Job from the backend image.
 - Cluster-administrator authority for `VSO_MODE=managed`. Use
   `VSO_MODE=external` when a separate platform team owns an existing compatible
   Vault Secrets Operator.
@@ -91,10 +91,27 @@ administrator identity first, route them to the ingresses, and replace every
 `example.com` placeholder before production use. The installer generates the
 one-time password separately; the username and email are not credentials.
 
-The first Helm pass creates the declarative release without waiting for a
-sealed server. The installer then performs native init/unseal/bootstrap in the
-trusted terminal, waits for VSO to project Secret Contract v1, and executes a
-second idempotent `helm upgrade --install --wait` to gate the complete stack.
+The installer validates inputs, reconciles VSO when requested, and performs one
+`helm upgrade --install --wait --wait-for-jobs`. The chart-managed bootstrap
+Job performs native init, the first unseal, policy/KV setup, Secret Contract v1
+generation, initial-root-token revocation, and the VSO projection gate. The
+application starts only after the projected Secrets exist.
+
+For the default plaintext-Shamir mode, Helm stores native initialization output
+once in the retained `akb-secret-manager-recovery` Secret. The Job uses those
+shares in memory for the first unseal and removes the transient root token after
+bootstrap. Copy `recovery.json` to an approved off-cluster password manager or
+secret custody system, verify the copy, and delete the Kubernetes Secret:
+
+```bash
+kubectl get secret akb-secret-manager-recovery -n akb \
+  -o jsonpath='{.data.recovery\.json}' | base64 --decode
+kubectl delete secret akb-secret-manager-recovery -n akb
+```
+
+Run the first command only in a trusted, non-recorded terminal; its output is
+the real native unseal/recovery material. Losing enough shares to fall below
+the threshold makes Shamir-sealed data unrecoverable.
 
 PGP mode requires the public keys before any namespace or release mutation:
 
@@ -108,9 +125,11 @@ SECRET_ROOT_TOKEN_PGP_KEY=/secure/bootstrap-root.asc \
 bash deploy/helm/akb/install.sh
 ```
 
-The encrypted shares are native OpenBao/Vault output. Threshold holders still
-decrypt and submit them interactively; no private key enters Helm or the
-installer.
+The encrypted shares are native OpenBao/Vault output. The Job publishes only
+those encrypted values, then waits. Threshold holders decrypt and submit the
+required shares directly to the engine and place the decrypted initial root
+token in the named bootstrap-input Secret so the Job can finish. No private
+key enters Helm, the Job, or the installer.
 
 ## Direct Helm usage
 
@@ -125,22 +144,26 @@ helm upgrade --install akb deploy/helm/akb \
   --set-string images.backend.tag=0.14.2 \
   --set-string images.frontend.repository=ghcr.io/example/akb-frontend \
   --set-string images.frontend.tag=0.14.1 \
-  --wait
+  --wait --wait-for-jobs --timeout 35m
 ```
 
-The command above requires an existing namespace-local `akb-secret`. For an SSO
-profile it must also contain the SSO Secret Contract fields and projections
-described in the [Secret management guide](../../k8s/secrets/README.md).
+The command above uses a manual-Secret profile and therefore requires an
+existing namespace-local `akb-secret`. For an SSO profile it must also contain
+the SSO Secret Contract fields and projections described in the
+[Secret management guide](../../k8s/secrets/README.md).
 
 Before directly installing a Secret Manager profile, install or validate VSO
-as described below. Raw Helm creates the Vault/OpenBao resources but correctly
-leaves a production server sealed. Run
-`scripts/initialize-secret-manager.sh` with the same release and namespace
-(plus the required key-holder inputs for PGP mode), then repeat the original
-`helm upgrade --install --wait`; or use
-`install.sh` for that complete two-phase flow. A Helm hook is intentionally not
-used because hook logs and release history are inappropriate custody channels
-for root or recovery material.
+as described below. Then select `standalone-secret-manager.yaml` or
+`standalone-sso-secret-manager.yaml` and add `--wait --wait-for-jobs`. A normal
+chart-managed Job completes the same lifecycle as `install.sh`; it is not a
+Helm hook, does not log generated values, and does not place generated values
+in Helm release metadata. The one-time recovery Secret is the explicit custody
+handoff.
+
+Set `secretManager.bootstrap.enabled=false` only when another operator owns
+initialization. In that advanced mode, `scripts/initialize-secret-manager.sh`
+remains a manual recovery/bring-your-own-bootstrap tool; Helm will install the
+components but cannot make a sealed store ready on its own.
 
 To review static resources without applying them:
 
@@ -152,8 +175,10 @@ helm template akb deploy/helm/akb \
   > rendered-akb.yaml
 ```
 
-This rendered file contains declarative resources only. It does not create
-external credentials or perform Vault/OpenBao init, unseal, or bootstrap.
+This rendered file contains the declarative bootstrap Job but does not execute
+it. Applying the complete rendered YAML does execute the Job, but unlike
+`helm --wait --wait-for-jobs`, plain `kubectl apply` does not wait for or report
+its completion automatically.
 
 ## VSO ownership
 
@@ -205,10 +230,11 @@ remain native engine output.
 
 ## Upgrade and uninstall
 
-Use the same profile values on every upgrade. The chart never generates or
-rotates application secrets. `akb-vaultdata` and Secret Manager Raft PVCs are
-retained; deleting retained data is a separate, explicit operator action. VSO
-is upgraded only through the `akb-cluster` release. Use
+Use the same profile values on every upgrade. Bootstrap generates application
+secrets only when the configured KV record is absent and otherwise preserves
+it; upgrades do not rotate values implicitly. `akb-vaultdata` and Secret
+Manager Raft PVCs are retained; deleting retained data is a separate, explicit
+operator action. VSO is upgraded only through the `akb-cluster` release. Use
 `deploy/cluster/status-vso.sh` to list AKB consumers and
 `deploy/cluster/uninstall-vso.sh` for guarded removal; the latter refuses to
 run while any VSO custom resource remains.

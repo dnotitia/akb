@@ -7,6 +7,23 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Added Helm-native bundled Secret Manager bootstrap
+
+The AKB Helm chart can now complete a new bundled OpenBao or HashiCorp Vault
+installation in one `helm upgrade --install --wait --wait-for-jobs` lifecycle.
+A short-lived, namespace-scoped bootstrap Job performs native initialization,
+the first plaintext-Shamir unseal, KV/Kubernetes-auth policy setup, Secret
+Contract generation, initial-root-token revocation, and the VSO projection
+gate. Native recovery material is handed off through a retained, one-time
+Kubernetes Secret that operators must copy to off-cluster custody and delete;
+generated shares and tokens are never Helm values or release metadata. PGP
+mode keeps shares/root authority encrypted and waits for key-holder input,
+while Auto Seal continues to depend on its configured KMS/HSM/Transit provider.
+
+SSO Helm profiles also expose the installation-owned Keycloak realm as the
+explicit `AKB account` login provider, so a freshly installed standalone SSO
+stack has a usable sign-in path without weakening broker-provider selection.
+
 ### Added the strict App Release Manifest v2 contract
 
 App release registration now requires a v2-only manifest with immutable app

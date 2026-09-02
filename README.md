@@ -576,9 +576,9 @@ Kustomize-based profile installers.
   [`deploy/k8s/profiles/*/deploy.sh`](./deploy/k8s/profiles/README.md) when the
   installer should coordinate the complete lifecycle, including Secret
   Manager initialization where selected.
-- Use raw Helm or rendered Kustomize YAML only when the required Secrets,
-  cluster prerequisites, and any native Vault/OpenBao init/unseal/bootstrap
-  steps are already managed separately.
+- Raw Helm supports the complete bundled lifecycle when a Secret Manager
+  profile is selected and `--wait --wait-for-jobs` is used. Rendered Kustomize
+  YAML still expects its Secret Manager lifecycle to be managed separately.
 - Vault Secrets Operator is a cluster-scoped prerequisite. Its ownership and
   guarded removal are documented under
   [`deploy/helm/akb-cluster`](./deploy/helm/akb-cluster/README.md).

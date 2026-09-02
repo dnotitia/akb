@@ -157,6 +157,30 @@ secretManager:
       issuerKind: ClusterIssuer
       issuerName: ""
       clusterDomain: cluster.local
+  # A normal, chart-managed Job owns native init, first unseal, policy/KV
+  # bootstrap, root-token revocation, and the VSO projection gate. Recovery
+  # material is written once to recoverySecretName for explicit off-cluster
+  # custody; Helm release metadata never contains generated secret values.
+  bootstrap:
+    enabled: false
+    keyShares: 5
+    keyThreshold: 3
+    waitSeconds: 1800
+    recoverySecretName: akb-secret-manager-recovery # pragma: allowlist secret
+    inputSecretName: akb-secret-manager-bootstrap-input # pragma: allowlist secret
+    receiptConfigMapName: akb-secret-manager-bootstrap
+    pgp:
+      # Public keys are safe Helm inputs. PGP Shamir requires one unseal key
+      # per share plus rootTokenPublicKey. Auto Seal may use recoveryPublicKeys.
+      unsealPublicKeys: []
+      recoveryPublicKeys: []
+      rootTokenPublicKey: ""
+    job:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 86400
+      resources:
+        requests: {cpu: 100m, memory: 128Mi}
+        limits: {cpu: "1", memory: 512Mi}
 
 # Render namespace-scoped VSO connection/auth/sync resources. The
 # cluster-scoped controller is owned separately by the akb-cluster release.

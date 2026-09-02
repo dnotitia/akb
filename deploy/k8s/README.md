@@ -8,14 +8,16 @@ automation:
 |---|---|
 | `profiles/<name>/kustomization.yaml` | Static AKB application resources only; suitable for rendering or an operator-owned overlay |
 | `profiles/<name>/deploy.sh` | Image build/reuse, Secret Contract preparation, optional VSO and bundled Secret Manager lifecycle, then Kustomize apply |
-| `deploy/helm/akb` | Declarative AKB, PostgreSQL, optional Keycloak, optional Vault/OpenBao, and namespace-local VSO resources |
-| `deploy/helm/akb/install.sh` | Helm release plus optional VSO prerequisite and native Vault/OpenBao init/unseal/bootstrap |
+| `deploy/helm/akb` | Declarative AKB, PostgreSQL, optional Keycloak/Vault/OpenBao, namespace-local VSO resources, and a native bootstrap Job |
+| `deploy/helm/akb/install.sh` | Thin Helm wrapper that validates inputs and optionally reconciles the shared VSO prerequisite |
 | `deploy/helm/akb-cluster` | Cluster-scoped Vault Secrets Operator shared by AKB namespaces |
 
 Kustomize operators can compose the canonical base and reusable components
-without copying complete manifest trees. Static YAML cannot safely encode a
-production Vault/OpenBao initialization ceremony, so use a complete installer
-or perform that lifecycle separately.
+without copying complete manifest trees. The AKB Helm chart additionally owns
+a namespace-scoped bootstrap Job, so one plain Helm installation can complete
+native initialization, first unseal, bootstrap, and Secret projection. Static
+Kustomize application profiles still require their lifecycle installer or an
+equivalent external operator.
 
 Vault Secrets Operator is a cluster prerequisite shared across AKB namespaces.
 It is owned by the separate
@@ -42,7 +44,7 @@ cluster prerequisite.
 
 - `kubectl`, `jq`, and standard POSIX command-line tools for a complete profile
   installer. Helm 3 is additionally required for bundled Secret Manager or
-  managed-VSO workflows; bundled bootstrap also uses OpenSSL.
+  managed-VSO workflows.
 - Docker Buildx when the profile installer builds images, and Docker when it
   generates application bootstrap material from the backend image.
 - A default StorageClass, or an explicit `STORAGE_CLASS`.
@@ -196,11 +198,13 @@ with the explicit load-restrictor option as shown above, review the resulting
 plain YAML, and apply it with `kubectl apply -f`.
 
 Use an overlay to change the namespace, image references, public origins,
-storage classes, or provider configuration. For `*-secret-manager` profiles,
-the static output still contains only the application layer: install VSO,
-install and initialize Vault/OpenBao, bootstrap its policy/KV record, and wait
-for `akb-secret` before applying it. The matching `deploy.sh` automates those
-steps. Raw Helm has the same native initialization boundary; see the
+storage classes, or provider configuration. For `*-secret-manager` Kustomize
+profiles, the static output still contains only the application layer: install
+VSO, install and initialize Vault/OpenBao, bootstrap its policy/KV record, and
+wait for `akb-secret` before applying it. The matching `deploy.sh` automates
+those steps. The Helm chart is different: its rendered resources include the
+bootstrap Job, and `helm upgrade --install --wait --wait-for-jobs` gates the
+full lifecycle. See the
 [`AKB Helm guide`](../helm/akb/README.md#direct-helm-usage).
 
 ## Operator-specific overlay (`internal/`)

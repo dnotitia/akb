@@ -7,92 +7,13 @@ The normal caller pipes stdout directly into a Vault-compatible KV v2 CLI or
 from __future__ import annotations
 
 import argparse
-import base64
 import json
-import secrets
-import tempfile
-import uuid
-from pathlib import Path
-
-import yaml
-
-from app.services.local_session_keys import generate_local_session_keyset
+from app.deployment_secret_material import generate_secret_contract_material
 
 
-def _base64url_32_bytes() -> str:
-    return base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
-
-
-def _material(auth_profile: str = "local") -> dict[str, str]:
-    if auth_profile not in {"local", "sso"}:
-        raise ValueError("auth_profile must be local or sso")
-    database_password = secrets.token_urlsafe(48)
-    system_hmac_secret = secrets.token_urlsafe(64)
-    redis_password = secrets.token_urlsafe(48)
-    legacy_jwt_secret = secrets.token_urlsafe(64)
-
-    with tempfile.TemporaryDirectory(prefix="akb-local-session-") as directory:
-        root = Path(directory) / "keyset"
-        generate_local_session_keyset(root)
-        private_pem = (root / "private.pem").read_text(encoding="utf-8")
-        public_jwks = (root / "jwks.json").read_text(encoding="utf-8")
-
-    secret_config = {
-        "db_password": database_password,
-        "system_hmac_secret": system_hmac_secret,
-        "embed_api_key": "",
-        "llm_api_key": "",
-        "rerank_api_key": "",
-        "vector_api_key": "",
-        "s3_access_key": "",
-        "s3_secret_key": "",
-        "redis_password": redis_password,
-    }
-    material = {
-        "db_password": database_password,
-        "system_hmac_secret": system_hmac_secret,
-        # Kept as a top-level compatibility projection, matching the latest
-        # akb-platform-owned Secret. It is deliberately absent from secret.yaml.
-        "jwt_secret": legacy_jwt_secret,
-        "local_session_private_pem": private_pem,
-        "local_session_jwks_json": public_jwks,
-        "secret_yaml": yaml.safe_dump(secret_config, sort_keys=True),
-        "redis_password": redis_password,
-        "auth_runtime_contract": "local-session-rs256-v2",
-        "auth_runtime_generation": "1",
-        "auth_runtime_mode": auth_profile,
-    }
-    if auth_profile == "sso":
-        sso_material = {
-            "keycloak_client_secret": secrets.token_urlsafe(48),
-            "keycloak_admin_client_secret": secrets.token_urlsafe(48),
-            "keycloak_management_client_secret": secrets.token_urlsafe(48),
-            "sso_browser_session_encryption_key": _base64url_32_bytes(),
-            "sso_session_epoch": str(uuid.uuid4()),
-            "keycloak_db_password": secrets.token_urlsafe(48),
-            "keycloak_bootstrap_client_secret": secrets.token_urlsafe(48),
-            "product_admin_bootstrap_password": secrets.token_urlsafe(32),
-        }
-        # The three client credentials, session boundary, and encryption key
-        # are durable AKB runtime inputs. Keycloak DB and first-install values
-        # stay outside secret.yaml and are projected into narrowly scoped
-        # Kubernetes Secrets by the SSO adapter.
-        secret_config.update(
-            {
-                key: sso_material[key]
-                for key in (
-                    "keycloak_client_secret",
-                    "keycloak_admin_client_secret",
-                    "keycloak_management_client_secret",
-                    "sso_browser_session_encryption_key",
-                    "sso_session_epoch",
-                )
-            }
-        )
-        material.update(sso_material)
-        material["secret_yaml"] = yaml.safe_dump(secret_config, sort_keys=True)
-        material["auth_runtime_contract"] = "sso-keycloak-broker-v3"
-    return material
+# Retain the source-tree helper name used by existing deployment contract tests
+# and downstream scripts while the implementation lives in the backend image.
+_material = generate_secret_contract_material
 
 
 def _kubernetes_list(material: dict[str, str], namespace: str) -> dict:
@@ -217,7 +138,7 @@ def main() -> int:
     parser.add_argument("--auth-profile", choices=("local", "sso"), default="local")
     parser.add_argument("--namespace")
     args = parser.parse_args()
-    material = _material(args.auth_profile)
+    material = generate_secret_contract_material(args.auth_profile)
     if args.format == "kubernetes":
         if not args.namespace:
             parser.error("--namespace is required for kubernetes output")

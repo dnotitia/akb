@@ -154,6 +154,8 @@ def test_profiles_render_one_coherent_stack(profile: str, wants_sso: bool, wants
         assert _container_env(keycloak_postgres, "postgres")["PGDATA"] == ("/var/lib/postgresql/data/pgdata")
         assert app["keycloak_internal_url"] == "http://keycloak:8080"
         assert backend["spec"]["template"]["spec"]["initContainers"][0]["name"] == ("bootstrap-standalone-sso")
+        assert app["sso_local_realm_login_enabled"] is True
+        assert app["sso_local_realm_display_name"] == "AKB account"
 
 
 def test_bundled_openbao_renders_production_raft_tls_and_vso_contract():
@@ -184,6 +186,62 @@ def test_bundled_openbao_renders_production_raft_tls_and_vso_contract():
             "namespace": "akb-helm-test",
         }
     ]
+
+
+def test_bundled_profile_renders_chart_native_bootstrap_job_and_scoped_rbac():
+    resources = _render("standalone-secret-manager")
+    jobs = [item for item in resources if item.get("kind") == "Job"]
+    bootstrap_jobs = [
+        item for item in jobs if item.get("metadata", {}).get("name", "").startswith("akb-secret-manager-bootstrap-")
+    ]
+    assert len(bootstrap_jobs) == 1
+    job = bootstrap_jobs[0]
+    pod_spec = job["spec"]["template"]["spec"]
+    assert pod_spec["serviceAccountName"] == "akb-secret-manager-bootstrap"
+    container = pod_spec["containers"][0]
+    assert container["command"] == ["python", "-m", "app.secret_manager_bootstrap"]
+    env = {item["name"]: item.get("value") for item in container["env"]}
+    assert env["SECRET_ENGINE"] == "openbao"  # pragma: allowlist secret
+    assert env["SECRET_SEAL_MODE"] == "plaintext"  # pragma: allowlist secret
+    assert env["SECRET_STORE_REPLICAS"] == "3"
+    assert env["RECOVERY_SECRET_NAME"] == "akb-secret-manager-recovery"  # pragma: allowlist secret
+
+    role = _one(resources, "Role", "akb-secret-manager-bootstrap")
+    assert not any("list" in rule["verbs"] for rule in role["rules"])
+    assert {"secrets", "configmaps"} == set(role["rules"][0]["resources"])
+    assert role["rules"][0]["verbs"] == ["create"]
+    assert "akb-secret" in role["rules"][1]["resourceNames"]
+
+
+def test_non_bundled_profiles_do_not_render_bootstrap_job():
+    for profile in ("standalone", "standalone-sso"):
+        resources = _render(profile)
+        assert not any(
+            item.get("kind") == "Job"
+            and item.get("metadata", {}).get("name", "").startswith("akb-secret-manager-bootstrap-")
+            for item in resources
+        )
+
+
+def test_chart_native_pgp_requires_public_keys_at_render_time():
+    result = subprocess.run(
+        [
+            _helm(),
+            "template",
+            "akb",
+            str(_CHART),
+            "--values",
+            str(_CHART / "profiles" / "standalone-secret-manager.yaml"),
+            "--set-string",
+            "secretManager.sealMode=pgp",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode != 0
+    assert "PGP bootstrap requires one unsealPublicKey per key share" in result.stderr
 
 
 def test_bundled_secret_manager_cluster_bindings_are_unique_per_instance():

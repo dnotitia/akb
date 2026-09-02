@@ -32,6 +32,23 @@
   {{- if not .Values.secretSync.enabled -}}
   {{- fail "bundled Secret Manager requires secretSync.enabled=true" -}}
   {{- end -}}
+  {{- if gt (int .Values.secretManager.bootstrap.keyThreshold) (int .Values.secretManager.bootstrap.keyShares) -}}
+  {{- fail "secretManager.bootstrap.keyThreshold cannot exceed keyShares" -}}
+  {{- end -}}
+  {{- if and .Values.secretManager.bootstrap.enabled (eq .Values.secretManager.sealMode "pgp") -}}
+    {{- if ne (len .Values.secretManager.bootstrap.pgp.unsealPublicKeys) (int .Values.secretManager.bootstrap.keyShares) -}}
+    {{- fail "PGP bootstrap requires one unsealPublicKey per key share" -}}
+    {{- end -}}
+    {{- if not .Values.secretManager.bootstrap.pgp.rootTokenPublicKey -}}
+    {{- fail "PGP bootstrap requires rootTokenPublicKey" -}}
+    {{- end -}}
+  {{- end -}}
+  {{- if and .Values.secretManager.bootstrap.enabled (eq .Values.secretManager.sealMode "auto") (gt (len .Values.secretManager.bootstrap.pgp.recoveryPublicKeys) 0) (ne (len .Values.secretManager.bootstrap.pgp.recoveryPublicKeys) (int .Values.secretManager.bootstrap.keyShares)) -}}
+  {{- fail "Auto Seal recoveryPublicKeys must be empty or match keyShares" -}}
+  {{- end -}}
+{{- end -}}
+{{- if and (ne .Values.secretManager.mode "bundled") .Values.secretManager.bootstrap.enabled -}}
+{{- fail "chart-native bootstrap is only valid for bundled Secret Manager mode" -}}
 {{- end -}}
 {{- if eq .Values.secretManager.mode "external" -}}
   {{- if not .Values.secretSync.enabled -}}

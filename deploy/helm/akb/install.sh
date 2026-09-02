@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Thin source-tree installer for the AKB Helm chart. Helm owns declarative
-# resources; the native Secret Manager script owns only init/unseal/bootstrap.
+# Optional convenience wrapper for the AKB Helm chart. The chart-managed
+# bootstrap Job owns native init/unseal/bootstrap; this script only validates
+# source-tree inputs, reconciles the shared VSO prerequisite, and passes values.
 
 set -euo pipefail
 
@@ -133,6 +134,8 @@ HELM_ARGS=(
   --set-string "secretManager.profile=${SECRET_PROFILE}"
   --set-string "secretManager.sealMode=${SECRET_SEAL_MODE}"
   --set-string "secretManager.topology=${SECRET_TOPOLOGY}"
+  --set "secretManager.bootstrap.keyShares=${SECRET_KEY_SHARES}"
+  --set "secretManager.bootstrap.keyThreshold=${SECRET_KEY_THRESHOLD}"
 )
 
 if [[ -n "${BACKEND_IMAGE:-}" ]]; then
@@ -198,6 +201,28 @@ if [[ "${SECRET_MODE}" == "external" ]]; then
   exit 0
 fi
 
+append_public_key_files() {
+  local setting="$1"
+  local csv="$2"
+  local item index=0
+  local old_ifs="${IFS}"
+  IFS=','
+  for item in ${csv}; do
+    IFS="${old_ifs}"
+    item="${item#${item%%[![:space:]]*}}"
+    item="${item%${item##*[![:space:]]}}"
+    [[ -n "${item}" ]] || continue
+    if [[ "${item}" == keybase:* || ! -s "${item}" ]]; then
+      echo "Chart-native bootstrap requires a readable local PGP public-key file: ${item}" >&2
+      exit 2
+    fi
+    HELM_ARGS+=(--set-file "${setting}[${index}]=${item}")
+    index=$((index + 1))
+    IFS=','
+  done
+  IFS="${old_ifs}"
+}
+
 case "${SECRET_ENGINE}" in
   openbao)
     HELM_ARGS+=(
@@ -243,6 +268,19 @@ if [[ "${SECRET_SEAL_MODE}" == "auto" ]]; then
     --set-string "${engine_values_prefix}.server.extraArgs=-config=${engine_home}/userconfig/${SECRET_STORE_SEAL_CONFIG_SECRET}/seal.hcl"
   )
 fi
+if [[ -n "${SECRET_PGP_KEYS:-}" ]]; then
+  append_public_key_files "secretManager.bootstrap.pgp.unsealPublicKeys" "${SECRET_PGP_KEYS}"
+fi
+if [[ -n "${SECRET_RECOVERY_PGP_KEYS:-}" ]]; then
+  append_public_key_files "secretManager.bootstrap.pgp.recoveryPublicKeys" "${SECRET_RECOVERY_PGP_KEYS}"
+fi
+if [[ -n "${SECRET_ROOT_TOKEN_PGP_KEY:-}" ]]; then
+  if [[ "${SECRET_ROOT_TOKEN_PGP_KEY}" == keybase:* || ! -s "${SECRET_ROOT_TOKEN_PGP_KEY}" ]]; then
+    echo "Chart-native bootstrap requires a readable root-token PGP public-key file" >&2
+    exit 2
+  fi
+  HELM_ARGS+=(--set-file "secretManager.bootstrap.pgp.rootTokenPublicKey=${SECRET_ROOT_TOKEN_PGP_KEY}")
+fi
 if [[ -n "${SECRET_STORE_CERT_ISSUER_NAME:-}" ]]; then
   HELM_ARGS+=(
     --set secretManager.tls.certificate.create=true
@@ -250,19 +288,9 @@ if [[ -n "${SECRET_STORE_CERT_ISSUER_NAME:-}" ]]; then
     --set-string "secretManager.tls.certificate.issuerKind=${SECRET_STORE_CERT_ISSUER_KIND:-ClusterIssuer}"
   )
 fi
-# The first pass intentionally does not --wait: a production Vault-compatible
-# server is sealed and AKB workloads wait for the Secret contract.
-"${HELM[@]}" "${HELM_ARGS[@]}" "$@"
-
-RELEASE="${RELEASE}" NAMESPACE="${NAMESPACE}" KUBE_CONTEXT="${KUBE_CONTEXT}" \
-SECRET_KEY_SHARES="${SECRET_KEY_SHARES}" \
-SECRET_KEY_THRESHOLD="${SECRET_KEY_THRESHOLD}" \
-SECRET_PGP_KEYS="${SECRET_PGP_KEYS:-}" \
-SECRET_ROOT_TOKEN_PGP_KEY="${SECRET_ROOT_TOKEN_PGP_KEY:-}" \
-SECRET_RECOVERY_PGP_KEYS="${SECRET_RECOVERY_PGP_KEYS:-}" \
-BOOTSTRAP_DOCKER_PLATFORM="${BOOTSTRAP_DOCKER_PLATFORM}" \
-  bash "${SCRIPT_DIR}/scripts/initialize-secret-manager.sh"
-
-# Reconcile once more and gate the complete stack after the Secret contract is
-# available. Helm remains the sole owner of declarative resources.
-"${HELM[@]}" "${HELM_ARGS[@]}" --wait --timeout 15m "$@"
+# The chart-managed Job initializes and unseals the bundled server, stores the
+# one-time recovery handoff, bootstraps the Secret Contract, and lets VSO start
+# the application. --wait-for-jobs makes this wrapper return only when that
+# lifecycle and all workloads are ready. Plain helm install remains supported.
+"${HELM[@]}" "${HELM_ARGS[@]}" --wait --wait-for-jobs \
+  --timeout "${HELM_INSTALL_TIMEOUT:-35m}" "$@"
