@@ -24,6 +24,7 @@ from app.services.app_identity_service import (
     authorize_app_request,
     record_app_audit,
 )
+from app.services.app_resource_service import canonical_table_fingerprint
 
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 200
@@ -37,7 +38,7 @@ TARGET_STATES = frozenset(
 
 _CURSOR_VERSION = 1
 _SAFE_CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
-_SAFE_FINGERPRINT = re.compile(r"^[0-9A-Fa-f]{8,256}$")
+_SAFE_FINGERPRINT = re.compile(r"^[0-9A-Fa-f]{64}$")
 _SAFE_RELEASE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,255}$")
 _SAFE_ISO = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
@@ -203,7 +204,7 @@ def _safe_fingerprint(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
     value = value.strip()
-    return value if _SAFE_FINGERPRINT.fullmatch(value) else None
+    return value.lower() if _SAFE_FINGERPRINT.fullmatch(value) else None
 
 
 def _safe_release(value: Any) -> str | None:
@@ -268,19 +269,21 @@ def _json_object(value: Any) -> dict[str, Any]:
 
 
 def expected_schema_fingerprint(manifest: Any) -> str | None:
-    """Read the optional expected schema fingerprint from a release manifest."""
+    """Derive the expected fingerprint from a strict v2 schema projection."""
     manifest = _json_object(manifest)
-    candidates = [
-        manifest.get("expected_schema_fingerprint"),
-        manifest.get("schema_fingerprint"),
-        _json_object(manifest.get("schema")).get("fingerprint"),
-        _json_object(manifest.get("schema")).get("expected_fingerprint"),
-    ]
-    for candidate in candidates:
-        value = _safe_fingerprint(candidate)
-        if value is not None:
-            return value
-    return None
+    if type(manifest.get("manifest_version")) is not int or manifest["manifest_version"] != 2:
+        return None
+    schema = manifest.get("schema")
+    if not isinstance(schema, dict) or not isinstance(schema.get("tables"), list):
+        return None
+    try:
+        computed = canonical_table_fingerprint(schema["tables"])
+    except (TypeError, ValueError, ValidationError):
+        return None
+    supplied = schema.get("fingerprint")
+    if supplied is not None and _safe_fingerprint(supplied) != computed:
+        return None
+    return computed
 
 
 def classify_drift(row: Any) -> dict[str, Any]:

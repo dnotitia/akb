@@ -10,6 +10,7 @@ import pytest
 from app.api.control_plane_models import InstallationProjection
 from app.exceptions import ValidationError
 from app.services import app_installation_service as installation
+from app.services import app_resource_service as resources
 
 
 def _row() -> dict:
@@ -24,8 +25,13 @@ def _row() -> dict:
         "desired_release_id": release_id,
         "desired_version": "1.2.3",
         "desired_manifest": {
-            "steps": [],
-            "expected_schema_fingerprint": "a" * 64,
+            "manifest_version": 2,
+            "app_key": "installation-test",
+            "source_revision": "a" * 40,
+            "image_digest": "sha256:" + "b" * 64,
+            "schema_version": 3,
+            "schema": {"tables": []},
+            "transition_plans": [{"source": "fresh", "steps": []}],
         },
         "current_release_id": release_id,
         "current_version": "1.2.3",
@@ -40,7 +46,7 @@ def _row() -> dict:
         "observed_at": datetime.now(timezone.utc),
         "observed_release_id": release_id,
         "observed_release_version": "1.2.3",
-        "schema_fingerprint": "a" * 64,
+        "schema_fingerprint": resources.canonical_table_fingerprint([]),
         "observed_grant_generation": 4,
         "checkpoint": {
             "phase": "ready",

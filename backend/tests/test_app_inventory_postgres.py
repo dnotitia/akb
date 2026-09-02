@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import json
 import os
@@ -15,6 +14,8 @@ import asyncpg
 import pytest
 
 from app.services import app_inventory_service as inventory
+from app.services import app_resource_service as resources
+from app.services import app_rollout_service as rollout
 
 pytestmark = pytest.mark.asyncio
 
@@ -24,6 +25,7 @@ _MIGRATIONS = [
     _BACKEND / "app" / "db" / "migrations" / "047_app_registry.py",
     _BACKEND / "app" / "db" / "migrations" / "051_app_credentials.py",
     _BACKEND / "app" / "db" / "migrations" / "052_app_inventory.py",
+    _BACKEND / "app" / "db" / "migrations" / "095_app_release_manifest_v2.py",
 ]
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
@@ -90,12 +92,23 @@ async def _app(pool, label: str) -> uuid.UUID:
 
 
 async def _release(pool, app_id: uuid.UUID, version: str = "1.0.0") -> uuid.UUID:
+    async with pool.acquire() as conn:
+        app_key = await conn.fetchval(
+            "SELECT app_key FROM app_definitions WHERE id=$1", app_id
+        )
     manifest = {
-        "steps": [{"id": "prepare"}],
-        "expected_schema_fingerprint": "a" * 64,
+        "manifest_version": 2,
+        "app_key": app_key,
+        "source_revision": "a" * 40,
+        "image_digest": "sha256:" + "b" * 64,
+        "schema_version": 3,
+        "schema": {"tables": []},
+        "transition_plans": [{"source": "fresh", "steps": []}],
     }
-    encoded = json.dumps(manifest, separators=(",", ":"))
-    checksum = hashlib.sha256(encoded.encode()).hexdigest()
+    checksum = rollout.manifest_checksum(manifest, version=version)
+    normalized = rollout.validate_manifest(manifest, checksum, version=version)
+    stored_manifest = rollout.manifest_storage_projection(normalized)
+    encoded = json.dumps(stored_manifest, separators=(",", ":"))
     async with pool.acquire() as conn:
         return await conn.fetchval(
             """
@@ -176,7 +189,7 @@ async def test_migration_reapply_and_observed_state_is_monotonic(inventory_pool)
         observed_generation=2,
         observed_at=observed_at,
         observed_release_id=release_id,
-        schema_fingerprint="a" * 64,
+        schema_fingerprint=resources.canonical_table_fingerprint([]),
         observed_grant_generation=1,
         checkpoint={"phase": "ready", "token": "secret-marker"},
         recent_error={"code": "none", "message": "secret-marker"},
@@ -188,7 +201,7 @@ async def test_migration_reapply_and_observed_state_is_monotonic(inventory_pool)
         observed_generation=1,
         observed_at=observed_at - timedelta(seconds=1),
         observed_release_id=release_id,
-        schema_fingerprint="a" * 64,
+        schema_fingerprint=resources.canonical_table_fingerprint([]),
     )
     assert stale["accepted"] is False
 

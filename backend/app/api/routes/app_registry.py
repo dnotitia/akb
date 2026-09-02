@@ -141,7 +141,9 @@ async def update_app(
         "the release. An identical manifest and checksum replay the existing "
         "projection with replayed=true; different content for the same version "
         "returns 409. No Idempotency-Key header is used for this registry "
-        "operation. The manifest must contain a steps array."
+        "operation. The manifest must be a strict App Release Manifest v2 with "
+        "provenance, a complete desired schema projection, and source-specific "
+        "transition plans."
     ),
 )
 async def create_release(
@@ -155,7 +157,7 @@ async def create_release(
     result = await create_app_release(
         app_id,
         version=req.version,
-        manifest=req.manifest.model_dump(),
+        manifest=req.manifest.model_dump(exclude_none=True, by_alias=True),
         manifest_checksum=req.manifest_checksum,
         user=user,
         correlation_id=request_correlation_id(request),
