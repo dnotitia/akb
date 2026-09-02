@@ -14,7 +14,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { SelectMenu } from "@/components/ui/select-menu";
 import { Textarea } from "@/components/ui/textarea";
-import type { VaultTableColumnInput } from "@/lib/api";
+import { TableRowConflictError, type VaultTableColumnInput } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 type RowMode = "create" | "edit";
@@ -26,7 +26,11 @@ interface TableRowDialogProps {
   table: string;
   columns: VaultTableColumnInput[];
   row?: Record<string, unknown> | null;
-  onSave: (values: Record<string, unknown>) => Promise<void>;
+  onSave: (
+    values: Record<string, unknown>,
+    options?: { force?: boolean },
+  ) => Promise<void>;
+  onReloadConflict?: () => Promise<Record<string, unknown> | null>;
 }
 
 const UNSET_OPTION = "__akb_unset__";
@@ -41,6 +45,7 @@ export function TableRowDialog({
   columns,
   row,
   onSave,
+  onReloadConflict,
 }: TableRowDialogProps) {
   const formRef = useRef<HTMLFormElement>(null);
   const formId = useId();
@@ -50,6 +55,8 @@ export function TableRowDialog({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const [submitError, setSubmitError] = useState("");
+  const [conflict, setConflict] = useState(false);
+  const [pendingValues, setPendingValues] = useState<Record<string, unknown> | null>(null);
 
   const editableColumns = useMemo(
     () => columns.filter((column) => !isSystemColumn(column.name)),
@@ -70,6 +77,8 @@ export function TableRowDialog({
     setTouched(new Set());
     setErrors({});
     setSubmitError("");
+    setConflict(false);
+    setPendingValues(null);
   }, [editableColumns, mode, open, row]);
 
   function updateValue(column: VaultTableColumnInput, value: string) {
@@ -137,16 +146,58 @@ export function TableRowDialog({
       return;
     }
 
+    setPendingValues(payload);
+    await save(payload);
+  }
+
+  async function save(payload: Record<string, unknown>, force = false) {
     setSaving(true);
+    setSubmitError("");
     try {
-      await onSave(payload);
+      await onSave(payload, { force });
+      setConflict(false);
       onOpenChange(false);
     } catch (caught: unknown) {
-      setSubmitError(
-        caught instanceof Error
-          ? caught.message
-          : `The row could not be ${mode === "create" ? "added" : "updated"}.`,
-      );
+      if (caught instanceof TableRowConflictError) {
+        setConflict(true);
+      } else {
+        setSubmitError(
+          caught instanceof Error
+            ? caught.message
+            : `The row could not be ${mode === "create" ? "added" : "updated"}.`,
+        );
+      }
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function reloadCurrentValues() {
+    if (!onReloadConflict) return;
+    setSaving(true);
+    setSubmitError("");
+    try {
+      const latest = await onReloadConflict();
+      if (!latest) {
+        setConflict(false);
+        setSubmitError("This row no longer exists. Close the editor to return to the table.");
+        return;
+      }
+      const nextValues: Record<string, string> = {};
+      const nextNulls = new Set<string>();
+      for (const column of editableColumns) {
+        const current = latest[column.name];
+        if (current === null) nextNulls.add(column.name);
+        nextValues[column.name] = valueForInput(current, column.type);
+      }
+      setValues(nextValues);
+      setNullColumns(nextNulls);
+      setTouched(new Set());
+      setErrors({});
+      setPendingValues(null);
+      setConflict(false);
+    } catch (caught: unknown) {
+      setSubmitError(caught instanceof Error ? caught.message : "The current row could not be loaded.");
     } finally {
       setSaving(false);
     }
@@ -253,6 +304,33 @@ export function TableRowDialog({
                   );
                 })}
               </fieldset>
+            )}
+            {conflict && (
+              <Alert variant="warning" title="This row has newer changes" className="mt-4">
+                <p>
+                  Another update was saved after you opened this row. Your draft is still here.
+                </p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void reloadCurrentValues()}
+                    disabled={saving || !onReloadConflict}
+                  >
+                    Reload current values
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="default"
+                    size="sm"
+                    onClick={() => pendingValues && void save(pendingValues, true)}
+                    disabled={saving || !pendingValues}
+                  >
+                    Overwrite anyway
+                  </Button>
+                </div>
+              </Alert>
             )}
             {submitError && (
               <Alert variant="destructive" title="Row could not be saved" className="mt-4">
