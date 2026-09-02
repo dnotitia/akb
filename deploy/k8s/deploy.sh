@@ -16,9 +16,8 @@
 #                 a single atomic apply — no placeholder window.
 #   PUBLIC_URL    Printed at the end. Cosmetic only — the actual host
 #                 lives in ingress.yaml (or its overlay patch).
-#   AKB_PROFILE   Compatibility selector. New installs execute the matching
-#                 deploy/k8s/profiles/<name>/deploy.sh path directly;
-#                 AUTH_PROFILE and SECRET_MODE remain compatibility inputs.
+#   AKB_PROFILE   Selected by deploy/k8s/profiles/<name>/deploy.sh. The common
+#                 engine is not a public installation entry point.
 #   SECRET_MODE    manual (default), bundled, or external. Bundled is selected
 #                  by the *-secret-manager profiles; external is an adapter
 #                  override for standalone / standalone-sso.
@@ -43,23 +42,9 @@ KUBE_CONTEXT="${KUBE_CONTEXT:-}"
 SKIP_BUILD="${SKIP_BUILD:-false}"
 SECRET_PROFILE="${SECRET_PROFILE:-development}"
 AKB_PROFILE="${AKB_PROFILE:-}"
-
-# Keep the original AUTH_PROFILE/SECRET_MODE inputs as a compatibility layer.
-# The supported combinations themselves live under profiles/<name>/profile.env
-# so `find deploy/k8s/profiles -name profile.env` is the source of truth and
-# adding a profile does not require another hidden branch in this script.
 if [[ -z "${AKB_PROFILE}" ]]; then
-  legacy_auth_profile="${AUTH_PROFILE:-local}"
-  legacy_secret_mode="${SECRET_MODE:-manual}"
-  if [[ "${legacy_auth_profile}" == "sso" && "${legacy_secret_mode}" == "bundled" ]]; then
-    AKB_PROFILE="standalone-sso-secret-manager"
-  elif [[ "${legacy_auth_profile}" == "sso" ]]; then
-    AKB_PROFILE="standalone-sso"
-  elif [[ "${legacy_secret_mode}" == "bundled" ]]; then
-    AKB_PROFILE="standalone-secret-manager"
-  else
-    AKB_PROFILE="standalone"
-  fi
+  echo "Choose a deployment profile and run deploy/k8s/profiles/<name>/deploy.sh" >&2
+  exit 2
 fi
 
 PROFILE_DIR="${PROFILES_DIR}/${AKB_PROFILE}"
@@ -83,12 +68,8 @@ if [[ "${PROFILE_AUTH}" != "local" && "${PROFILE_AUTH}" != "sso" ]] ||
   exit 2
 fi
 
-AUTH_PROFILE="${AUTH_PROFILE:-${PROFILE_AUTH}}"
+AUTH_PROFILE="${PROFILE_AUTH}"
 SECRET_MODE="${SECRET_MODE:-${PROFILE_SECRET}}"
-if [[ "${AUTH_PROFILE}" != "${PROFILE_AUTH}" ]]; then
-  echo "AUTH_PROFILE=${AUTH_PROFILE} conflicts with AKB_PROFILE=${AKB_PROFILE}" >&2
-  exit 2
-fi
 if [[ "${PROFILE_SECRET}" == "manual" ]]; then
   if [[ "${SECRET_MODE}" != "manual" && "${SECRET_MODE}" != "external" ]]; then
     echo "${AKB_PROFILE} supports SECRET_MODE=manual or external; use a *-secret-manager profile for bundled" >&2

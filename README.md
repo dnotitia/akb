@@ -618,8 +618,8 @@ akb/
 AKB follows [SemVer](https://semver.org/). The product version lives in
 `backend/pyproject.toml` (`[project].version`) and is mirrored to
 `frontend/package.json` via `scripts/bump-version.sh <x.y.z>`. Each
-`deploy/k8s/deploy.sh` run tags the Docker images with both the explicit
-version (`:${VERSION}`) and `:latest`, so historical builds remain
+A `deploy/k8s/profiles/*/deploy.sh` run tags the Docker images with both the
+explicit version (`:${VERSION}`) and `:latest`, so historical builds remain
 pullable for rollback.
 
 `packages/akb-mcp-client` (the `akb-mcp` npm proxy) follows its own npm

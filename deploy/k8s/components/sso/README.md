@@ -1,14 +1,14 @@
-# Standalone SSO Kubernetes bundle
+# SSO Kubernetes component
 
-This compatibility overlay composes the canonical AKB base with a reusable SSO
-component that adds a Keycloak 26.7 broker and a dedicated Keycloak PostgreSQL
-database. AKB and its PostgreSQL manifest are not copied. It owns exactly one
-AKB realm and is not
+This reusable Kustomize component adds a Keycloak 26.7 broker, a dedicated
+Keycloak PostgreSQL database, SSO ingress, and AKB auth patches. Public
+profiles compose it over the canonical base; AKB and its PostgreSQL manifest
+are not copied. It owns exactly one AKB realm and is not
 the deployment shape for a managed tenant that reuses a platform-owned
 Keycloak.
 
 For a customized existing namespace, first follow the
-[local-to-SSO cutover runbook](../../../docs/sso/kubernetes-cutover.md). This
+[local-to-SSO cutover runbook](../../../../docs/sso/kubernetes-cutover.md). This
 directory is a reference resource set, not an in-place migration patch: review
 resource names, selectors, StatefulSets, PVCs, Ingress, and retained companion
 workloads before applying a target-specific overlay.
@@ -77,7 +77,7 @@ commit their values.
 | Secret | Required keys | Lifecycle |
 |---|---|---|
 | `akb-keycloak-db-credentials` | `POSTGRES_DB=keycloak`, `POSTGRES_USER=keycloak`, `POSTGRES_PASSWORD` | durable |
-| `akb-secret` | `db_password`, `secret.yaml`, SSO runtime and Secret Contract v1 compatibility keys | durable |
+| `akb-secret` | `db_password`, `secret.yaml`, SSO runtime and stable platform projection keys | durable |
 | `akb-keycloak-bootstrap` | `client-secret` | one-time |
 | `akb-keycloak-upgrade` | `client-secret` | optional; one-time legacy-profile upgrade only |
 | `akb-product-admin-bootstrap` | `password` | one-time |
@@ -179,7 +179,7 @@ Render and validate the public overlay before applying:
 ```bash
 kubectl create namespace akb --dry-run=client -o yaml | kubectl apply -f -
 kubectl kustomize --load-restrictor=LoadRestrictionsNone \
-  deploy/k8s/standalone-sso > rendered-standalone-sso.yaml
+  deploy/k8s/profiles/standalone-sso > rendered-standalone-sso.yaml
 kubectl apply --dry-run=client --validate=false \
   -f rendered-standalone-sso.yaml
 ```
@@ -261,7 +261,7 @@ openssl rand -base64 48 | tr -d '\n' | kubectl -n akb create secret generic \
   --from-file=client-secret=/dev/stdin
 kubectl -n akb scale statefulset/keycloak --replicas=0
 kubectl -n akb wait --for=delete pod -l app=akb-keycloak --timeout=180s
-kubectl apply -f deploy/k8s/standalone-sso/legacy-profile-upgrade-job.yaml
+kubectl apply -f deploy/k8s/components/sso/legacy-profile-upgrade-job.yaml
 kubectl -n akb wait --for=condition=complete \
   job/akb-keycloak-profile-upgrade-authority --timeout=180s
 kubectl -n akb delete job akb-keycloak-profile-upgrade-authority

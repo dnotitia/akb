@@ -246,7 +246,7 @@ def test_single_container_demo_is_not_presented_as_secret_manager_boundary():
     "manifest",
     [
         _ROOT / "deploy" / "k8s" / "postgres.yaml",
-        _ROOT / "deploy" / "k8s" / "standalone-sso" / "keycloak-postgres.yaml",
+        _ROOT / "deploy" / "k8s" / "components" / "sso" / "keycloak-postgres.yaml",
     ],
 )
 def test_postgres_persistent_volumes_use_a_subdirectory(manifest: Path):

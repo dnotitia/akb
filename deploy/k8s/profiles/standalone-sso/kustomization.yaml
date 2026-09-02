@@ -4,4 +4,7 @@ kind: Kustomization
 namespace: akb
 
 resources:
-  - ../../standalone-sso
+  - ../../base
+
+components:
+  - ../../components/sso

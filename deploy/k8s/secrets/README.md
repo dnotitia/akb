@@ -16,7 +16,7 @@ This layout follows the current `akb-platform` workspace contract: PostgreSQL
 reads `akb-secret/db_password`, while the backend mounts
 `akb-secret/secret.yaml`. Standalone local auth additionally projects
 `local-session-private.pem` and `local-session-jwks.json` from the same Secret.
-With `AUTH_PROFILE=sso`, the same producer also projects the durable browser
+The two SSO profiles make the same producer project the durable browser
 session and three-client Keycloak contract, the dedicated Keycloak database
 credential, and two narrowly scoped first-install Secrets.
 
@@ -70,11 +70,11 @@ not mounted by AKB.
 
 ## Installation profiles
 
-`AKB_PROFILE` is the public installation choice. The lower-level
-`AUTH_PROFILE` and `SECRET_MODE` variables remain only for compatibility and
-external-store adapters.
+The profile directory is the public installation choice. Authentication is
+fixed by that profile; only the two non-bundled profiles accept the intentional
+`SECRET_MODE=external` adapter option.
 
-| `AKB_PROFILE` | Human auth | Bundled Secret Manager |
+| Profile directory | Human auth | Bundled Secret Manager |
 |---|---|---|
 | `standalone` | local | no |
 | `standalone-sso` | owned Keycloak | no |
@@ -87,9 +87,9 @@ an existing endpoint and does not add another workload. The two
 default.
 
 These are routing profiles, not four copied deployment trees. `standalone` and
-`standalone-secret-manager` apply the existing `deploy/k8s` base;
-`standalone-sso` and `standalone-sso-secret-manager` apply the existing
-`deploy/k8s/standalone-sso` Kustomize overlay. A `*-secret-manager` profile
+`standalone-secret-manager` compose `deploy/k8s/base`; `standalone-sso` and
+`standalone-sso-secret-manager` compose that same base with
+`deploy/k8s/components/sso`. A `*-secret-manager` profile
 first prepares the bundled Secret Manager and VSO Secret contract, then applies
 the corresponding existing AKB tree. `deploy/all-in-one` remains the separate
 single-container demo image and does not bundle this production Secret Manager
@@ -97,20 +97,18 @@ lifecycle.
 
 ### Manual Secret ownership
 
-The default is backward-compatible operator ownership. Existing installations
-must migrate their old `akb-secret-config`, `akb-local-session-keys`, and
-`postgres-credentials` material into `akb-secret` before applying the updated
-base. Do not decode values into shell history.
+In manual mode, the operator owns the Secret lifecycle. Before adopting this
+contract, an existing installation must consolidate its prior secret material
+into `akb-secret`. Do not decode values into shell history.
 
 For a brand-new disposable installation, the deploy script can generate the
 contract and pipe it directly to the Kubernetes API:
 
 ```bash
 NAMESPACE=akb-dev \
-AKB_PROFILE=standalone \
 GENERATE_MANUAL_SECRETS=true \
 REGISTRY=registry.example.com \
-bash deploy/k8s/deploy.sh
+bash deploy/k8s/profiles/standalone/deploy.sh
 ```
 
 Omit `GENERATE_MANUAL_SECRETS` for production. The script then fails closed
@@ -122,13 +120,11 @@ seed the external KV record with that database's current password and the
 existing signing/HMAC material before switching producers. Never let the
 development bootstrap invent a new password for an initialized database.
 
-For a new SSO + Secret Manager bundle, choose the combined profile and provide
-the public origins. The deployer selects `deploy/k8s/standalone-sso`
-automatically:
+For a new SSO + Secret Manager bundle, choose the combined profile path and
+provide the public origins:
 
 ```bash
 NAMESPACE=akb-sso-dev \
-AKB_PROFILE=standalone-sso-secret-manager \
 SSO_AKB_PUBLIC_URL=https://akb-sso.example.com \
 SSO_KEYCLOAK_PUBLIC_URL=https://auth-akb-sso.example.com \
 SSO_PRODUCT_ADMIN_USERNAME=admin \
@@ -136,7 +132,7 @@ SSO_PRODUCT_ADMIN_EMAIL=admin@example.com \
 SECRET_ENGINE=openbao \
 SECRET_PROFILE=development \
 REGISTRY=registry.example.com \
-bash deploy/k8s/deploy.sh
+bash deploy/k8s/profiles/standalone-sso-secret-manager/deploy.sh
 ```
 
 The generated product-admin password remains in the selected Secret Manager
@@ -148,11 +144,10 @@ do not erase it before handoff or before the receipt exists.
 
 ```bash
 NAMESPACE=akb-openbao \
-AKB_PROFILE=standalone-secret-manager \
 SECRET_ENGINE=openbao \
 SECRET_PROFILE=development \
 REGISTRY=registry.example.com \
-bash deploy/k8s/deploy.sh
+bash deploy/k8s/profiles/standalone-secret-manager/deploy.sh
 ```
 
 Pinned distribution:
@@ -168,12 +163,11 @@ BSL terms before enabling it.
 
 ```bash
 NAMESPACE=akb-vault \
-AKB_PROFILE=standalone-secret-manager \
 SECRET_ENGINE=hashicorp-vault \
 SECRET_PROFILE=development \
 HASHICORP_LICENSE_ACKNOWLEDGED=true \
 REGISTRY=registry.example.com \
-bash deploy/k8s/deploy.sh
+bash deploy/k8s/profiles/standalone-secret-manager/deploy.sh
 ```
 
 Pinned distribution:
@@ -189,7 +183,6 @@ namespace-local ServiceAccount, `VaultConnection`, `VaultAuth`, and the
 
 ```bash
 NAMESPACE=akb-external \
-AKB_PROFILE=standalone \
 SECRET_MODE=external \
 SECRET_ENGINE=hashicorp-vault \
 SECRET_STORE_ADDRESS=https://vault.example.com \
@@ -199,7 +192,7 @@ VAULT_ROLE=akb-runtime-reader \
 KV_MOUNT=kv \
 KV_PATH=akb/production/runtime \
 REGISTRY=registry.example.com \
-bash deploy/k8s/deploy.sh
+bash deploy/k8s/profiles/standalone/deploy.sh
 ```
 
 The external server must already have Kubernetes auth, a least-privilege role,
@@ -215,7 +208,7 @@ default and will not silently add CRDs or cluster roles. On a new standalone
 cluster, explicitly opt in:
 
 ```bash
-INSTALL_VSO=true ... bash deploy/k8s/deploy.sh
+INSTALL_VSO=true ... bash deploy/k8s/profiles/standalone-secret-manager/deploy.sh
 ```
 
 This installs the pinned official HashiCorp VSO chart `1.5.1`. VSO is BSL 1.1,
@@ -223,7 +216,7 @@ so deployments that require an entirely OSI-licensed stack must use and test a
 separate OpenBao/External Secrets Operator adapter before declaring that
 profile supported. The current OpenBao bundle intentionally uses the same
 Vault-compatible VSO adapter so both engines exercise an identical AKB
-contract; compatibility is covered by the deployment E2E suite.
+contract; conformance is covered by the deployment E2E suite.
 
 VSO authentication uses a projected, 10-minute ServiceAccount token with
 audience `vault`. The AKB backend has
@@ -270,7 +263,7 @@ TLS has two supported ownership paths:
 SECRET_STORE_CERT_ISSUER_NAME=workspace-ca \
 SECRET_STORE_CERT_ISSUER_KIND=ClusterIssuer \
 ... \
-bash deploy/k8s/deploy.sh
+bash deploy/k8s/profiles/standalone-secret-manager/deploy.sh
 ```
 
 The rendered Certificate covers the engine Service and all three possible Pod
@@ -296,13 +289,12 @@ No AKB-specific Recovery Kit, unlock code, or key-encryption format is created.
 Run from a trusted interactive terminal that is not recorded:
 
 ```bash
-AKB_PROFILE=standalone-sso-secret-manager \
 SECRET_ENGINE=openbao \
 SECRET_PROFILE=production \
 SECRET_SEAL_MODE=plaintext \
 SECRET_TOPOLOGY=production-ha \
 ... \
-bash deploy/k8s/deploy.sh
+bash deploy/k8s/profiles/standalone-sso-secret-manager/deploy.sh
 ```
 
 The installer prints the official `operator init` values once and waits for
@@ -320,7 +312,6 @@ ASCII-armoured (`.asc`) public exports are accepted; ASCII armour is normalized
 to the engine's required base64 packet form before upload:
 
 ```bash
-AKB_PROFILE=standalone-sso-secret-manager \
 SECRET_ENGINE=openbao \
 SECRET_PROFILE=production \
 SECRET_SEAL_MODE=pgp \
@@ -329,7 +320,7 @@ SECRET_KEY_THRESHOLD=3 \
 SECRET_PGP_KEYS=/secure/a.asc,/secure/b.asc,/secure/c.asc,/secure/d.asc,/secure/e.asc \
 SECRET_ROOT_TOKEN_PGP_KEY=/secure/bootstrap-admin.asc \
 ... \
-bash deploy/k8s/deploy.sh
+bash deploy/k8s/profiles/standalone-sso-secret-manager/deploy.sh
 ```
 
 `SECRET_PGP_KEYS`, `SECRET_ROOT_TOKEN_PGP_KEY`, a valid share count, and a valid
@@ -375,14 +366,13 @@ kubectl create secret generic akb-secret-store-seal \
   -n akb-production \
   --from-file=seal.hcl=/secure/seal.hcl
 
-AKB_PROFILE=standalone-sso-secret-manager \
 SECRET_ENGINE=openbao \
 SECRET_PROFILE=production \
 SECRET_SEAL_MODE=auto \
 SECRET_STORE_SEAL_CONFIG_SECRET=akb-secret-store-seal \
 SECRET_STORE_EXTRA_VALUES=/secure/openbao-workload-identity.yaml \
 ... \
-bash deploy/k8s/deploy.sh
+bash deploy/k8s/profiles/standalone-sso-secret-manager/deploy.sh
 ```
 
 `server.extraVolumes[0]` is reserved for this mounted seal-config Secret. Do
@@ -501,11 +491,10 @@ Always use a new namespace and explicit context for rehearsals:
 ```bash
 KUBE_CONTEXT=kubernetes-admin@kubernetes \
 NAMESPACE=akb-secret-openbao-<date> \
-AKB_PROFILE=standalone-secret-manager \
 SECRET_ENGINE=openbao \
 SECRET_PROFILE=development \
 ... \
-bash deploy/k8s/deploy.sh
+bash deploy/k8s/profiles/standalone-secret-manager/deploy.sh
 ```
 
 Do not point a rehearsal at the existing `akb`, `akb-platform`, or managed

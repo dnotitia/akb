@@ -28,6 +28,9 @@ Secret Manager chart and waits for VSO to produce Secret Contract v1 before
 applying that layer. Native init/unseal cannot be represented safely as a
 static manifest.
 
-`deploy/k8s/deploy.sh` remains the common execution engine and the legacy
-`AUTH_PROFILE`/`SECRET_MODE` entry point. Profile discovery and composition are
-owned by these directories rather than hidden in that script.
+`deploy/k8s/deploy.sh` is the internal common execution engine. It deliberately
+has no default profile and is not a public installation entry point. Profile
+discovery, authentication selection, and manifest composition are owned by
+these directories rather than hidden in that script. A non-bundled profile may
+set `SECRET_MODE=external` to connect its unchanged Secret Contract to an
+existing Vault-compatible endpoint.

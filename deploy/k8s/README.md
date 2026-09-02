@@ -1,11 +1,11 @@
-# Kubernetes deploy (Kustomize compatibility path)
+# AKB Kubernetes deployment
 
-New standalone installations should prefer the umbrella Helm chart under
-[`deploy/helm/akb`](../helm/akb/README.md). It exposes the same four profiles as
-explicit values files and keeps declarative resource ownership in Helm. This
-Kustomize path remains supported for existing operator overlays and migration;
-`deploy.sh` is a compatibility orchestrator, not the source of truth for the
-new Helm templates.
+AKB supports two explicit Kubernetes installation interfaces: the umbrella
+Helm chart under [`deploy/helm/akb`](../helm/akb/README.md), and the four
+Kustomize application profiles under [`profiles/`](profiles/README.md). Both
+expose the same deployment combinations. Kustomize operators can compose the
+canonical base and reusable components without copying complete manifest
+trees.
 
 Generic kustomize base for deploying AKB to a Kubernetes cluster. Pair
 with an operator-specific overlay for real hostnames, registries, and
@@ -19,28 +19,25 @@ and the selected Secret profile binds its reader identity to it.
 
 ```
 deploy/k8s/
-├── deploy.sh              # common compatibility execution engine
-├── kustomization.yaml     # legacy standalone entry point → base/
+├── deploy.sh              # internal execution engine used by profile wrappers
 ├── base/                  # canonical AKB + PostgreSQL resource composition
+├── components/
+│   └── sso/               # reusable Keycloak resources + AKB SSO patches
 ├── profiles/              # public, directly executable deployment combinations
 │   ├── standalone/
 │   ├── standalone-sso/
 │   ├── standalone-secret-manager/
 │   └── standalone-sso-secret-manager/
-├── namespace.yaml
 ├── postgres.yaml          # pgvector/pgvector:pg16 StatefulSet — hosts both
 │                          # the main DB and the vector_index schema
-├── qdrant.yaml            # optional Qdrant StatefulSet — add to
-│                          # kustomization.yaml only if you flip the
-│                          # backend's vector_store_driver to qdrant
+├── qdrant.yaml            # optional Qdrant StatefulSet — add from an
+│                          # operator overlay when vector_store_driver=qdrant
 ├── redis.yaml             # optional event-stream Redis; add from an overlay
 │                          # only when the OT Redis Operator is installed
 ├── backend.yaml           # Deployment + ConfigMap (vector_store_driver: pgvector)
 ├── frontend.yaml          # Deployment + Service
 ├── ingress.yaml           # placeholder host (akb.example.com)
 ├── secrets/               # stable Secret Contract v1 + manual/bundled/external producers
-├── standalone-sso/        # reusable SSO component + compatibility overlay;
-│                          # patches base rather than copying AKB/PostgreSQL
 └── internal/              # gitignored — operator-private overlays
     ├── deploy-internal.sh
     ├── cluster-issuer.yaml
@@ -51,8 +48,8 @@ deploy/k8s/
 **Vector store**: the base ships with `vector_store_driver: pgvector`
 inside the Postgres pod. Other options:
 
-- **Qdrant** as a separate StatefulSet — add `qdrant.yaml` to
-  `kustomization.yaml` and patch `akb-app-config` to set
+- **Qdrant** as a separate StatefulSet — add `qdrant.yaml` from an
+  operator overlay and patch `akb-app-config` to set
   `vector_store_driver: qdrant` + `vector_url: http://qdrant:6333`.
 - **Seahorse Cloud** (managed) — no extra StatefulSet; patch
   `akb-app-config` with `vector_store_driver: seahorse` +
@@ -61,7 +58,7 @@ inside the Postgres pod. Other options:
   Seahorse BFF (`https://console.seahorse.dnotitia.ai/bff`) for table
   lifecycle and the per-table host for data CRUD/search.
 
-The `internal/` overlay shows the Qdrant pattern for the production
+An operator-owned `internal/` overlay can add the Qdrant pattern for its own
 cluster.
 
 ## Backend process topology
@@ -85,9 +82,10 @@ single-writer gitd, MCP session, audit/throttle, and drift-recovery gates in
 are complete.
 
 For a standalone installation whose canonical human-auth mode is `sso`, use
-[`standalone-sso/README.md`](standalone-sso/README.md). That overlay owns its
-Keycloak lifecycle and dedicated database. Do not apply it to a managed tenant
-that reuses a platform-owned/shared Keycloak realm.
+the [`profiles/standalone-sso`](profiles/standalone-sso) entry point. It
+composes the reusable [`components/sso`](components/sso/README.md) resources,
+which own the Keycloak lifecycle and dedicated database. Do not apply them to
+a managed tenant that reuses a platform-owned/shared Keycloak realm.
 
 ## Quickstart (generic)
 
@@ -140,7 +138,8 @@ are applied in one render, then use a small wrapper script:
 export REGISTRY=my-registry.internal:5000
 export PUBLIC_URL=https://akb.mycorp.example
 kubectl apply -f "$(dirname "$0")/cluster-issuer.yaml"
-KUSTOMIZE_DIR="$(dirname "$0")" bash "$(dirname "$0")/../deploy.sh"
+KUSTOMIZE_DIR="$(dirname "$0")" \
+  bash "$(dirname "$0")/../profiles/standalone/deploy.sh"
 ```
 
 Anything you put under `internal/` is automatically excluded by the
@@ -171,10 +170,9 @@ contracts, pinned chart versions, TLS/Raft profiles, native Shamir/PGP/Auto
 Seal operations, rotation boundary, and migration notes in
 [`secrets/README.md`](secrets/README.md).
 
-The SSO profiles compose the standalone SSO component over the canonical base
-and require coherent
+The SSO profiles compose the SSO component over the canonical base and require coherent
 `SSO_AKB_PUBLIC_URL` and `SSO_KEYCLOAK_PUBLIC_URL` origins plus the
-product-admin identity. Lower-level `AUTH_PROFILE` and `SECRET_MODE` remain
-compatibility/adapter inputs, but new installations should execute the
-matching profile path so supported combinations are discoverable without
-reading the common script.
+product-admin identity. Authentication is fixed by the selected profile;
+`SECRET_MODE=external` is an intentional adapter option for either non-bundled
+profile. Always execute the matching profile path rather than the internal
+common script.

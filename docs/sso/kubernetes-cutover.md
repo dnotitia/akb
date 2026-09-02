@@ -3,7 +3,7 @@
 This runbook plans a mode-exclusive `auth_mode: local` to `auth_mode: sso`
 transition for an existing standalone Kubernetes installation. It complements
 the resource definitions in
-[`deploy/k8s/standalone-sso`](../../deploy/k8s/standalone-sso/README.md); it is
+[`deploy/k8s/components/sso`](../../deploy/k8s/components/sso/README.md); it is
 not permission to apply that reference overlay unchanged to a customized live
 namespace.
 
