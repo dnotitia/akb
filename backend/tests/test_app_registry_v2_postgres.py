@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import uuid
@@ -13,6 +14,7 @@ import asyncpg
 import pytest
 
 from app.exceptions import ConflictError, ValidationError
+from app.services import app_resource_service as resources
 from app.services import app_registry_service as registry
 from app.services import app_rollout_service as rollout
 from app.services.auth_service import AuthenticatedUser
@@ -95,6 +97,59 @@ def _manifest(app_key: str) -> dict:
         "schema": {"tables": []},
         "transition_plans": [{"source": "fresh", "steps": []}],
     }
+
+
+def _manifest_with_reordered_create_columns(app_key: str, version: str) -> dict:
+    columns = [
+        {"name": "alpha", "type": "text"},
+        {"name": "zeta", "type": "text", "required": True},
+    ]
+    descriptor = {
+        "name": "ordered_table",
+        "columns": columns,
+        "unique_keys": [],
+        "indexes": [],
+    }
+    create_step = {
+        "id": "create_ordered_table",
+        "phase": "expand",
+        "operation": "create_table",
+        "payload": {
+            "table": descriptor["name"],
+            "columns": list(reversed(columns)),
+            "unique_keys": [],
+            "indexes": [],
+        },
+    }
+    canonical_step = {
+        **create_step,
+        "payload": {
+            **create_step["payload"],
+            "columns": columns,
+        },
+    }
+    create_step["checksum"] = hashlib.sha256(
+        json.dumps(
+            canonical_step,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+    ).hexdigest()
+    manifest = {
+        "manifest_version": 2,
+        "app_key": app_key,
+        "source_revision": "a" * 40,
+        "image_digest": "sha256:" + "b" * 64,
+        "schema_version": 3,
+        "schema": {"tables": [descriptor]},
+        "transition_plans": [{"source": "fresh", "steps": [create_step]}],
+    }
+    manifest["schema"]["fingerprint"] = resources.canonical_table_fingerprint(
+        manifest["schema"]["tables"]
+    )
+    assert version
+    return manifest
 
 
 async def test_v2_release_replays_byte_equivalent_and_conflicts_without_partial_state(
@@ -199,3 +254,66 @@ async def test_v2_release_replays_byte_equivalent_and_conflicts_without_partial_
                 user=user,
                 correlation_id="registry-v2-v1-reject",
             )
+
+
+async def test_v2_release_replays_canonical_equivalent_stored_manifest(monkeypatch):
+    async with _fresh_database() as conn:
+        class _Pool:
+            def acquire(self):
+                return self
+
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *_args):
+                return False
+
+        async def get_test_pool():
+            return _Pool()
+
+        monkeypatch.setattr(registry, "get_pool", get_test_pool)
+        monkeypatch.setattr(registry, "record_app_audit", lambda *_args, **_kwargs: None)
+        user = _admin()
+        app_key = f"registry-v2-order-{uuid.uuid4().hex}"
+        app = await registry.create_app_definition(
+            app_key=app_key,
+            display_name="Registry v2 ordering",
+            description=None,
+            metadata={},
+            user=user,
+            correlation_id="registry-v2-order-app",
+        )
+        version = "1.0.0"
+        manifest = _manifest_with_reordered_create_columns(app_key, version)
+        checksum = rollout.manifest_checksum(manifest, version=version)
+
+        async with conn.transaction():
+            release_id = await conn.fetchval(
+                """
+                INSERT INTO app_releases(app_id, version, manifest, manifest_checksum)
+                VALUES($1, $2, $3::jsonb, $4)
+                RETURNING id
+                """,
+                uuid.UUID(app["id"]),
+                version,
+                json.dumps(manifest, ensure_ascii=False, separators=(",", ":")),
+                checksum,
+            )
+
+        projection = await registry.get_app_release(
+            app["id"],
+            release_id,
+            user=user,
+            correlation_id="registry-v2-order-read",
+        )
+        replay = await registry.create_app_release(
+            app["id"],
+            version=projection["version"],
+            manifest=projection["manifest"],
+            manifest_checksum=projection["manifest_checksum"],
+            user=user,
+            correlation_id="registry-v2-order-replay",
+        )
+
+        assert replay["replayed"] is True
+        assert replay["id"] == str(release_id)

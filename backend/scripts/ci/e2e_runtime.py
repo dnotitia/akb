@@ -2072,6 +2072,16 @@ class E2ERuntime:
         foreign_next, foreign_checksum, _foreign_next_manifest = await self._insert_rollout_release(
             connection, app_id=foreign_app_id, version="2.0.0", valid=True
         )
+        rollout_baseline_fingerprint = _fixture_schema_fingerprint(
+            [
+                {
+                    "name": "rollout_data",
+                    "columns": [{"name": "value", "type": "text"}],
+                    "unique_keys": [],
+                    "indexes": [],
+                }
+            ]
+        )
         target_grants = [(owner_id, "owner")]
         installations: list[dict[str, object]] = []
         tables: list[dict[str, object]] = []
@@ -2126,11 +2136,12 @@ class E2ERuntime:
                 table_name,
             )
             await connection.execute(
-                "INSERT INTO app_installation_observed_states(installation_id,app_id,vault_id,observed_generation,observed_at,observed_release_id,observed_release_version,observed_grant_generation,checkpoint) VALUES($1,$2,$3,1,NOW(),$4,'1.0.0',1,'{}'::jsonb)",
+                "INSERT INTO app_installation_observed_states(installation_id,app_id,vault_id,observed_generation,observed_at,observed_release_id,observed_release_version,schema_fingerprint,observed_grant_generation,checkpoint) VALUES($1,$2,$3,1,NOW(),$4,'1.0.0',$5,1,'{}'::jsonb)",
                 installation_id,
                 target_app_id,
                 vault_id,
                 old_release,
+                rollout_baseline_fingerprint,
             )
             installations.append(
                 {
@@ -2178,6 +2189,7 @@ class E2ERuntime:
             resources=[("table", foreign_table_name, "owned")],
             observed_release_id=foreign_current,
             observed_release_version="1.0.0",
+            schema_fingerprint=rollout_baseline_fingerprint,
         )
         def rollout_coordinates(
             app_id: uuid.UUID,

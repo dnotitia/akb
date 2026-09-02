@@ -152,6 +152,9 @@ async def test_rollout_request_is_idempotent_and_worker_resumes_backfill(monkeyp
         key = str(uuid.uuid4())
         first = await rollout.request_rollout(app_id, release_id=new_id, manifest_checksum_value=checksum, idempotency_key=key, requested_by_kind="admin", correlation_id="test", actor="test", actor_id="test")
         replay = await rollout.request_rollout(app_id, release_id=new_id, manifest_checksum_value=checksum, idempotency_key=key, requested_by_kind="admin", correlation_id="test", actor="test", actor_id="test")
+        assert first["replayed"] is False
+        assert first["status"] == "pending"
+        assert first["release_id"] == str(new_id)
         assert replay["replayed"] is True
         assert replay["job_id"] == first["job_id"]
         await worker.run_once()

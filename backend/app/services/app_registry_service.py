@@ -338,9 +338,15 @@ async def create_app_release(
                 version,
             )
             if existing is not None:
+                existing_manifest = validate_manifest(
+                    existing["manifest"],
+                    existing["manifest_checksum"],
+                    version=existing["version"],
+                )
                 same = (
                     existing["manifest_checksum"] == checksum
-                    and _canonical(existing["manifest"]) == _canonical(normalized_manifest)
+                    and _canonical(manifest_storage_projection(existing_manifest))
+                    == _canonical(normalized_manifest)
                 )
                 if not same:
                     _record_registry_error(
