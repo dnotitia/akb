@@ -3387,6 +3387,39 @@ class E2ERuntime:
                 await stop_task
         return 0
 
+    async def _run_inspector_command(
+        self,
+        *,
+        intent: str,
+        target: str,
+        log_name: str,
+        failure_message: str,
+    ) -> None:
+        try:
+            await self._run_logged_command(
+                [
+                    "npm",
+                    "--prefix",
+                    str(self.config.proxy_package_dir),
+                    "run",
+                    "--silent",
+                    "inspect",
+                    "--",
+                    "--intent",
+                    intent,
+                    "--target",
+                    target,
+                    "--descriptor",
+                    "-",
+                ],
+                log_path=self.config.logs_dir / log_name,
+                stdin_data=json.dumps(
+                    self.descriptor(), separators=(",", ":"), ensure_ascii=False
+                ).encode(),
+            )
+        except ProvisioningFailure as exc:
+            raise ProductAssertionFailure(failure_message) from exc
+
     async def _run_gate(self) -> int:
         suite_path = self.config.backend_dir / "scripts" / "ci" / "e2e_suite_runner.py"
         log_path = self.config.logs_dir / "gate.log"
@@ -3430,30 +3463,18 @@ class E2ERuntime:
                 }
             )
 
-            try:
-                await self._run_logged_command(
-                    [
-                        "npm",
-                        "--prefix",
-                        str(self.config.proxy_package_dir),
-                        "run",
-                        "--silent",
-                        "inspect",
-                        "--",
-                        "--intent",
-                        "smoke",
-                        "--target",
-                        "both",
-                        "--descriptor",
-                        "-",
-                    ],
-                    log_path=self.config.logs_dir / "mcp-inspector.log",
-                    stdin_data=json.dumps(
-                        self.descriptor(), separators=(",", ":"), ensure_ascii=False
-                    ).encode(),
-                )
-            except ProvisioningFailure as exc:
-                raise ProductAssertionFailure("MCP Inspector consumer smoke failed") from exc
+            await self._run_inspector_command(
+                intent="canary",
+                target="http",
+                log_name="mcp-inspector-canary.log",
+                failure_message="MCP Inspector canary failed",
+            )
+            await self._run_inspector_command(
+                intent="smoke",
+                target="both",
+                log_name="mcp-inspector.log",
+                failure_message="MCP Inspector consumer smoke failed",
+            )
 
         child_env = self._child_environment()
         with log_path.open("ab", buffering=0) as handle:

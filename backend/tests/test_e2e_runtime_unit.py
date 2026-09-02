@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import inspect
 import json
 import stat
 import subprocess
@@ -1051,6 +1052,80 @@ def test_inspector_canary_runner_reuses_locked_runtime_and_cleans_up():
     assert 'rm -rf -- "${RUNTIME_ROOT}"' in runner
     assert "AKB_E2E_USERNAME" in runner
     assert "AKB_E2E_PASSWORD" in runner
+
+
+@pytest.mark.asyncio
+async def test_transport_gate_invokes_canary_and_existing_smoke_with_one_descriptor(
+    tmp_path, monkeypatch
+):
+    runtime = E2ERuntime(
+        dataclasses.replace(make_config(tmp_path), profile="transport-proxy")
+    )
+    prepare_private_runtime_root(runtime.config.runtime_root)
+    calls = []
+
+    async def fake_run_logged_command(command, *, log_path, check=True, stdin_data=None):
+        calls.append(
+            {
+                "command": command,
+                "log_path": log_path,
+                "stdin_data": stdin_data,
+            }
+        )
+        return 0
+
+    class CompletedProcess:
+        pid = 12345
+        returncode = 0
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return CompletedProcess()
+
+    async def no_stdio_probe():
+        return None
+
+    monkeypatch.setattr(runtime, "_run_logged_command", fake_run_logged_command)
+    monkeypatch.setattr(runtime, "_probe_stdio_behavior", no_stdio_probe)
+    monkeypatch.setattr(
+        "e2e_runtime.asyncio.create_subprocess_exec", fake_create_subprocess_exec
+    )
+
+    assert await runtime._run_gate() == 0
+
+    inspector_calls = [
+        call for call in calls if call["command"][:6] == [
+            "npm",
+            "--prefix",
+            str(runtime.config.proxy_package_dir),
+            "run",
+            "--silent",
+            "inspect",
+        ]
+    ]
+    assert [
+        (call["command"][8], call["command"][10], call["command"][12])
+        for call in inspector_calls
+    ] == [
+        ("canary", "http", "-"),
+        ("smoke", "both", "-"),
+    ]
+    assert inspector_calls[0]["stdin_data"] == inspector_calls[1]["stdin_data"]
+    assert inspector_calls[0]["log_path"].name == "mcp-inspector-canary.log"
+    assert inspector_calls[1]["log_path"].name == "mcp-inspector.log"
+    assert "--intent canary" in INSPECTOR_CANARY_RUNNER.read_text()
+    assert "run --silent inspect" in INSPECTOR_CANARY_RUNNER.read_text()
+
+
+def test_transport_gate_keeps_canary_and_smoke_on_the_stdio_profile_path():
+    gate_source = inspect.getsource(E2ERuntime._run_gate)
+    assert "if self.profile.needs_stdio:" in gate_source
+    assert 'intent="canary"' in gate_source
+    assert 'target="http"' in gate_source
+    assert 'intent="smoke"' in gate_source
+    assert 'target="both"' in gate_source
 
 
 def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():

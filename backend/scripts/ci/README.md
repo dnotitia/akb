@@ -146,6 +146,9 @@ repository runtime and never needs a global Inspector install:
 
 ```bash
 npm --prefix packages/akb-mcp-client run --silent inspect -- \
+  --intent canary --target http --descriptor /path/to/descriptor.json
+
+npm --prefix packages/akb-mcp-client run --silent inspect -- \
   --intent smoke --target both --descriptor /path/to/descriptor.json
 
 npm --prefix packages/akb-mcp-client run --silent inspect -- \
@@ -167,6 +170,11 @@ directory's 0600 temporary Inspector config, which is deleted in `finally`
 cleanup. The PAT is not placed in argv, logs, command output, reports, or
 uploaded artifacts. The focused package regression exercises the same public
 entrypoint with a synthetic marker and verifies config removal and redaction.
+
+The transport-proxy runtime gate invokes this same package command for the
+HTTP canary with its already-running runtime descriptor on stdin, then keeps
+the existing both-transport smoke. It does not start another backend,
+database, or runtime.
 
 The single HTTP read-only canary command used by the MCP Inspector E2E driver
 is:
