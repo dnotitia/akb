@@ -1,4 +1,4 @@
-# AKB single-container demo (`all-in-one` compatibility path)
+# AKB single-container demo (`all-in-one`)
 
 The historical directory name is retained for image and documentation links,
 but this is a single-container demo bundle rather than the production
@@ -12,8 +12,8 @@ MinIO + backend + frontend behind nginx. Use cases:
 It deliberately does not run OpenBao/Vault or Keycloak inside the application
 container. Doing so would place the Secret Manager, its storage, and the
 secret-consuming application under the same root process and filesystem trust
-boundary. Use `deploy/helm/akb` for an all-in-one installation whose components
-remain isolated as Kubernetes workloads.
+boundary. Use `deploy/helm/akb` for a complete Kubernetes installation whose
+components remain isolated as separate workloads.
 
 ## Quick start (pre-built image)
 

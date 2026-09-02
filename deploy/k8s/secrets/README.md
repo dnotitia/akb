@@ -12,8 +12,8 @@ bundled Vault ───┘                  │
 external Vault-compatible store ───┘
 ```
 
-This layout follows the current `akb-platform` workspace contract: PostgreSQL
-reads `akb-secret/db_password`, while the backend mounts
+This layout uses one stable application-facing contract: PostgreSQL reads
+`akb-secret/db_password`, while the backend mounts
 `akb-secret/secret.yaml`. Standalone local auth additionally projects
 `local-session-private.pem` and `local-session-jwks.json` from the same Secret.
 The two SSO profiles make the same producer project the durable browser
@@ -26,11 +26,11 @@ an external engine may be shared, but its Kubernetes-auth role is bound to the
 exact `akb-secret-sync` ServiceAccount and namespace and its KV path must be
 unique to that workspace.
 
-Exactly one controller may own `akb-secret`. In a current
-`akb-platform`-managed namespace the `AkbInstance` reconciler already owns that
-Secret, so do not install this VSO destination beside it. Use these profiles
-for standalone AKB namespaces, or first add an explicit Secret-producer choice
-to the platform controller and transfer ownership in a coordinated rollout.
+Exactly one controller may own `akb-secret`. If an external operator already
+reconciles that Secret, do not install this VSO destination beside it. Use
+these profiles for standalone AKB namespaces, or first add an explicit
+Secret-producer choice to the external controller and transfer ownership in a
+coordinated rollout.
 
 ## Secret Contract v1
 
@@ -154,12 +154,15 @@ Pinned distribution:
 
 - official `openbao/openbao` Helm chart `0.29.3`
 - OpenBao `v2.6.2`
+- Kubernetes `>=1.30.0`, as required by that upstream chart
 
 ### Bundled HashiCorp Vault
 
-The AKB repository does not copy or mirror Vault. Helm fetches the official
-HashiCorp chart and image only when the operator chooses this mode. Review the
-BSL terms before enabling it.
+The Kustomize installer fetches the pinned official HashiCorp chart, while the
+AKB umbrella Helm chart vendors that upstream chart archive for reproducible
+source-tree installs. Neither path forks the Vault source or mirrors its
+container image, and AKB does not relicense those dependencies. Review the
+HashiCorp Vault and Vault Secrets Operator BSL terms before enabling them.
 
 ```bash
 NAMESPACE=akb-vault \
@@ -174,6 +177,7 @@ Pinned distribution:
 
 - official `hashicorp/vault` Helm chart `0.34.1`
 - HashiCorp Vault `2.0.4`
+- Kubernetes `>=1.20.0`, though the AKB Helm chart itself requires `>=1.29.0`
 
 ### External OpenBao or Vault
 
@@ -217,12 +221,13 @@ supported version range. Bundled profiles default to `managed`; external Secret
 Manager mode defaults to `external`; `disabled` is valid only for manual Secret
 profiles.
 
-The pinned official HashiCorp VSO version is `1.5.1`; the currently supported
-reuse range is `>=1.4.0,<1.6.0`. VSO is BSL 1.1, so deployments that require an
-entirely OSI-licensed stack must use and test a separate OpenBao/External
-Secrets Operator adapter before declaring that profile supported. The current
-OpenBao bundle intentionally uses the same Vault-compatible VSO adapter so both
-engines exercise an identical AKB contract.
+The pinned official HashiCorp VSO version is `1.5.1`; the supported external
+compatibility range is `>=1.4.0,<1.6.0`. VSO is BSL 1.1, so deployments that
+require an entirely OSI-licensed stack must use and test a separate
+OpenBao/External Secrets Operator adapter before declaring that profile
+supported. The current OpenBao bundle intentionally uses the same
+Vault-compatible VSO adapter so both engines exercise an identical AKB
+contract.
 
 One VSO controller installation can connect to many per-AKB Vault/OpenBao
 servers. Authentication remains namespaced: every AKB release owns a distinct
@@ -509,8 +514,8 @@ SECRET_PROFILE=development \
 bash deploy/k8s/profiles/standalone-secret-manager/deploy.sh
 ```
 
-Do not point a rehearsal at the existing `akb`, `akb-platform`, or managed
-workspace namespaces. The scripts create and mutate only the namespace passed
+Do not point a rehearsal at an existing production or operator-managed
+workspace namespace. The scripts create and mutate only the namespace passed
 through `NAMESPACE`, except for `VSO_MODE=managed`, which owns the
 cluster-scoped `vault-secrets-operator/akb-cluster` prerequisite release. That
 action must be run only against the intended cluster context. Use

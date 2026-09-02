@@ -1,8 +1,8 @@
 # AKB Kubernetes deployment profiles
 
-Every supported Kubernetes combination has one discoverable, directly
-executable path. The directories compose the canonical AKB base and optional
-SSO component; they do not copy complete manifest trees.
+Every supported Kubernetes combination has one discoverable directory. The
+directories compose the canonical AKB base and optional SSO component; they do
+not copy complete manifest trees.
 
 | Directory | Authentication | Secret source |
 |---|---|---|
@@ -10,6 +10,13 @@ SSO component; they do not copy complete manifest trees.
 | `standalone-sso/` | owned Keycloak | existing Kubernetes Secret or external adapter |
 | `standalone-secret-manager/` | local | bundled OpenBao or HashiCorp Vault |
 | `standalone-sso-secret-manager/` | owned Keycloak | bundled OpenBao or HashiCorp Vault |
+
+Each directory contains three deliberately different interfaces:
+
+- `kustomization.yaml` renders only the declarative application layer.
+- `profile.env` is repository-owned routing metadata for the installer.
+- `deploy.sh` runs the complete profile workflow, including the non-declarative
+  Secret Manager lifecycle when applicable.
 
 Run a complete profile from its own path:
 
@@ -26,12 +33,18 @@ Set `IMAGE_PLATFORM=linux/arm64` for ARM64 builds and bootstrap helpers. When
 `SKIP_BUILD=true`, the supplied backend and frontend images must support the
 same target architecture.
 
-The `kustomization.yaml` in each directory is the application layer and can be
-rendered independently. In `*-secret-manager` profiles, the sibling
-`deploy.sh` additionally installs and initializes the selected official
-Secret Manager chart and waits for VSO to produce Secret Contract v1 before
-applying that layer. Native init/unseal cannot be represented safely as a
-static manifest.
+The application layer can also be rendered independently:
+
+```bash
+kubectl kustomize --load-restrictor=LoadRestrictionsNone \
+  deploy/k8s/profiles/standalone > rendered-akb.yaml
+```
+
+It does not create the namespace, application Secret, VSO controller, or a
+Vault/OpenBao server. In `*-secret-manager` profiles, the sibling `deploy.sh`
+installs and initializes the selected official Secret Manager chart and waits
+for VSO to produce Secret Contract v1 before applying that layer. Native
+init/unseal cannot be represented safely as a static manifest.
 
 `deploy/k8s/deploy.sh` is the internal common execution engine. It deliberately
 has no default profile and is not a public installation entry point. Profile
@@ -41,9 +54,10 @@ set `SECRET_MODE=external` to connect its unchanged Secret Contract to an
 existing Vault-compatible endpoint.
 
 Secret Manager profiles use the cluster prerequisite policy in
-`deploy/cluster/ensure-vso.sh`. Bundled profiles default to
-`VSO_MODE=managed` and own the separate `akb-cluster` Helm release. External
-Secret Manager mode defaults to `VSO_MODE=external` and only validates a
-compatible Ready installation. The AKB profile itself owns only
+`deploy/cluster/ensure-vso.sh`. Bundled profile installers default to
+`VSO_MODE=managed` and reconcile the separate `akb-cluster` Helm release.
+External Secret Manager mode defaults to `VSO_MODE=external` and only validates
+a compatible Ready installation. An individual AKB instance owns only its
 namespace-scoped connection, authentication, and Secret synchronization
-resources.
+resources; the shared controller has a separate cluster-administrator
+lifecycle.

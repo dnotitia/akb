@@ -13,11 +13,13 @@ helm upgrade --install akb-cluster deploy/helm/akb-cluster \
   --wait --timeout 5m
 ```
 
-Normal AKB uninstall and upgrade operations never mutate this release. Use
-`deploy/cluster/ensure-vso.sh` with `VSO_MODE=managed` when this installation
-owns the cluster prerequisite, or `VSO_MODE=external` to perform read-only
-compatibility and readiness checks against a platform-owned VSO. The default
-chart runs two leader-elected replicas with a PodDisruptionBudget.
+A direct upgrade or uninstall of an individual AKB release never mutates this
+release. The complete AKB installers can reconcile it as a separate step: use
+`deploy/cluster/ensure-vso.sh` with `VSO_MODE=managed` when the AKB installation
+process is also authorized to manage cluster prerequisites, or
+`VSO_MODE=external` for read-only compatibility and readiness checks against a
+controller owned by another operations team. The default chart runs two
+leader-elected replicas with a PodDisruptionBudget.
 
 Inspect current AKB consumers without reading Secret values:
 
@@ -32,3 +34,6 @@ bash deploy/cluster/uninstall-vso.sh
 ```
 
 The uninstall helper refuses to continue while any VSO custom resource remains.
+Helm retains the VSO CRDs when removing the release. Review and remove retained
+CRDs only as a separate cluster-administrator operation after confirming that
+no controller or custom resource needs them.
