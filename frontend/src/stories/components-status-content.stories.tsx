@@ -28,20 +28,21 @@ type Story = StoryObj<typeof meta>;
 const history: HistoryEntry[] = [
   {
     hash: "story-a",
-    agent: "codex",
-    subject: "Add Storybook scenarios",
-    timestamp: new Date(Date.now() - 8 * 60_000).toISOString(),
+    author: "codex",
+    message: "Add Storybook scenarios",
+    date: new Date(Date.now() - 8 * 60_000).toISOString(),
   },
   {
     hash: "story-b",
     author: "jylkim",
-    subject: "Tune vault settings copy",
-    timestamp: new Date(Date.now() - 4 * 60 * 60_000).toISOString(),
+    message: "Tune vault settings copy",
+    date: new Date(Date.now() - 4 * 60 * 60_000).toISOString(),
   },
   {
-    agent: "importer",
-    subject: "Legacy entry without hash",
-    timestamp: new Date(Date.now() - 2 * 24 * 60 * 60_000).toISOString(),
+    hash: "story-c",
+    author: "importer",
+    message: "Import legacy document",
+    date: new Date(Date.now() - 2 * 24 * 60 * 60_000).toISOString(),
   },
 ];
 

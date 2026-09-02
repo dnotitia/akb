@@ -18,6 +18,7 @@ import {
   ExternalLink,
   FileText,
   FolderTree,
+  GitCompareArrows,
   GitCommitHorizontal,
   History,
   Info,
@@ -32,13 +33,14 @@ import {
   Share2,
 } from "lucide-react";
 import {
-  authenticatedFetch,
   ApiError,
   browseVault,
   deleteDocument,
   getDocument,
+  getDocumentHistoryWithFallback,
   getRelations,
   getVaultInfo,
+  type DocumentHistoryEntry,
   type RelationRow,
   unpublishDoc,
   updateDocument,
@@ -85,8 +87,10 @@ import {
 // Plate is heavy (~hundreds of KB gzipped); lazy-load so the read-only path
 // (Rendered / Raw) stays cheap.
 const MarkdownEditor = lazy(() => import("@/components/markdown-editor"));
+const DocumentDiffView = lazy(() => import("@/components/document-diff-view"));
 
-type DocView = "rendered" | "raw" | "edit";
+type DocView = "rendered" | "raw" | "edit" | "diff";
+const EMPTY_DOCUMENT_HISTORY: DocumentHistoryEntry[] = [];
 
 type BrowsedDocumentTitle = {
   type: "document";
@@ -122,11 +126,21 @@ export default function DocumentPage({
   const commitHash = searchParams.get("commit") || undefined;
   const rawView = searchParams.get("view");
   const view: DocView =
-    rawView === "raw" ? "raw" : rawView === "edit" ? "edit" : "rendered";
+    rawView === "raw"
+      ? "raw"
+      : rawView === "edit"
+        ? "edit"
+        : rawView === "diff" && commitHash
+          ? "diff"
+          : "rendered";
+  const isDiffMode = view === "diff";
+  // Diff owns revision validation and its compatibility/error states. Keep the
+  // surrounding document identity on HEAD so a stale or mistyped revision can
+  // still render the comparison frame instead of replacing the whole page with
+  // the generic document error state.
+  const documentVersion = isDiffMode ? undefined : commitHash;
   const [relations, setRelations] = useState<RelationRow[]>([]);
   const [relationsError, setRelationsError] = useState(false);
-  const [provenance, setProvenance] = useState<any[]>([]);
-  const [historyError, setHistoryError] = useState(false);
   const [pendingView, setPendingView] = useState<DocView | null>(null);
   const [pendingExistingPath, setPendingExistingPath] = useState<string | null>(null);
   const [docOverride, setDocOverride] = useState<any>(null);
@@ -149,6 +163,8 @@ export default function DocumentPage({
   const cancelEditButtonRef = useRef<HTMLButtonElement | null>(null);
   const editTitleRef = useRef<HTMLInputElement | null>(null);
   const titleConflictRef = useRef<HTMLDivElement | null>(null);
+  const diffOriginHashRef = useRef<string | null>(null);
+  const wasDiffModeRef = useRef(false);
   const restoreEditFocusRef = useRef(false);
   // Plate manages its own state; we remount via `editorKey` when hydrating
   // a fresh server value rather than treating `value` as controlled.
@@ -296,13 +312,21 @@ export default function DocumentPage({
   }, [view]);
 
   const docQuery = useQuery({
-    queryKey: ["document", name, docId, commitHash],
-    queryFn: () => getDocument(name!, docId, commitHash),
+    queryKey: ["document", name, docId, documentVersion],
+    queryFn: () => getDocument(name!, docId, documentVersion),
     enabled: !!name && !!docId,
     retry: false,
   });
 
   const doc = docOverride ?? docQuery.data ?? null;
+  const historyQuery = useQuery({
+    queryKey: ["document-history", name, doc?.path],
+    queryFn: () => getDocumentHistoryWithFallback(name!, doc!.path, 20),
+    enabled: Boolean(name && doc?.path),
+    staleTime: 30_000,
+    retry: false,
+  });
+  const provenance = historyQuery.data?.history ?? EMPTY_DOCUMENT_HISTORY;
   const currentUserId = currentUser?.user_id;
   const editTitleCandidatesQuery = useQuery({
     queryKey: ["document-edit-title-candidates", name],
@@ -367,10 +391,14 @@ export default function DocumentPage({
   const headQuery = useQuery({
     queryKey: ["document", name, docId, undefined],
     queryFn: () => getDocument(name!, docId),
-    enabled: !!name && !!docId && !!commitHash,
+    enabled: !!name && !!docId && !!commitHash && !isDiffMode,
     retry: false,
   });
-  const headCommit = commitHash ? headQuery.data?.current_commit : doc?.current_commit;
+  const headCommit = commitHash
+    ? isDiffMode
+      ? doc?.current_commit
+      : headQuery.data?.current_commit
+    : doc?.current_commit;
   // Genuinely historical only when the pin points at a commit OTHER than HEAD.
   // sameCommitRef does a prefix-tolerant compare (the commit log links 12-char
   // short hashes; current_commit is the full SHA) and returns false while HEAD
@@ -378,7 +406,43 @@ export default function DocumentPage({
   const isHistorical = !!commitHash && !sameCommitRef(commitHash, headCommit);
   const canEdit =
     !isHistorical &&
+    !isDiffMode &&
     (vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner");
+
+  const selectedHistoryIndex = useMemo(
+    () =>
+      commitHash
+        ? provenance.findIndex((entry) => sameCommitRef(entry.hash, commitHash))
+        : -1,
+    [commitHash, provenance],
+  );
+  const selectedHistoryEntry: DocumentHistoryEntry | undefined =
+    selectedHistoryIndex >= 0 ? provenance[selectedHistoryIndex] : undefined;
+  const baseHistoryEntry: DocumentHistoryEntry | undefined =
+    selectedHistoryIndex >= 0 ? provenance[selectedHistoryIndex + 1] : undefined;
+
+  useEffect(() => {
+    if (isDiffMode) {
+      wasDiffModeRef.current = true;
+      return;
+    }
+    if (!wasDiffModeRef.current || !diffOriginHashRef.current) return;
+    wasDiffModeRef.current = false;
+    const originHash = diffOriginHashRef.current;
+    setDetailsTab("history");
+    setDetailsOpen(true);
+    const firstFrame = window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        const triggers = document.querySelectorAll<HTMLButtonElement>(
+          "[data-document-diff-trigger]",
+        );
+        Array.from(triggers).find(
+          (trigger) => trigger.dataset.documentDiffTrigger === originHash,
+        )?.focus();
+      });
+    });
+    return () => window.cancelAnimationFrame(firstFrame);
+  }, [isDiffMode]);
   // Parse headings once for the outline-tab count (the outline + renderer each
   // re-scan internally; this removes the third pass that ran on every render).
   const headingSlugs = useMemo(() => parseHeadings(doc?.content || ""), [doc?.content]);
@@ -396,10 +460,8 @@ export default function DocumentPage({
   useEffect(() => {
     const d = docQuery.data;
     setDocOverride(null);
-    setProvenance([]);
     setRelations([]);
     setRelationsError(false);
-    setHistoryError(false);
     setBodyError("");
     setTitleTouched(false);
     setServerTitleConflict(null);
@@ -429,9 +491,6 @@ export default function DocumentPage({
       getRelations(name!, d.path)
         .then((r) => setRelations(r.relations || []))
         .catch(() => setRelationsError(true));
-    }
-    if (d.path) {
-      loadHistory(name!, d.path);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [docQuery.data]);
@@ -605,25 +664,6 @@ export default function DocumentPage({
     setView("rendered");
   }
 
-  // History = `git log -- <doc.path>` scoped to this document.
-  async function loadHistory(vault: string, docPath: string) {
-    try {
-      const r = await authenticatedFetch(
-        `/api/v1/activity/${encodeURIComponent(vault)}?collection=${encodeURIComponent(docPath)}&limit=20`,
-      );
-      if (!r.ok) {
-        setProvenance([]);
-        setHistoryError(true);
-        return;
-      }
-      const d = await r.json();
-      setProvenance(d.activity || []);
-    } catch {
-      setProvenance([]);
-      setHistoryError(true);
-    }
-  }
-
   // The vault guide is system-managed: its only editing surface is the guide
   // section in vault settings, so the plain full-page viewer bounces there.
   // Search preview is exempt so every document result keeps the same modal
@@ -687,7 +727,7 @@ export default function DocumentPage({
     }
   }
 
-  const commitShort = headCommit?.slice(0, 7);
+  const commitShort = (commitHash || headCommit)?.slice(0, 7);
   const inEditMode = view === "edit";
   const fileName = doc.path?.split("/").pop() || doc.title || "Document";
   const collectionPath = doc.path?.includes("/")
@@ -705,13 +745,32 @@ export default function DocumentPage({
     vaultRole,
     vaultKind,
     vaultReadOnly,
-    isHistorical,
+    isHistorical: isHistorical || isDiffMode,
   });
   const canDelete =
     canWrite &&
     !vaultReadOnly &&
     !isHistorical &&
+    !isDiffMode &&
     doc.path !== VAULT_SKILL_PATH;
+
+  const openVersion = (hash?: string, options: { replace?: boolean } = {}) => {
+    const params = new URLSearchParams(searchParams);
+    params.delete("view");
+    if (hash) params.set("commit", hash);
+    else params.delete("commit");
+    updateRouteParams(params, { replace: options.replace ?? false });
+  };
+
+  const openDiff = (hash: string, trigger: HTMLButtonElement) => {
+    diffOriginHashRef.current = hash;
+    trigger.blur();
+    setDetailsOpen(false);
+    const params = new URLSearchParams(searchParams);
+    params.set("commit", hash);
+    params.set("view", "diff");
+    updateRouteParams(params, { replace: false });
+  };
 
   const closeDetails = () => {
     setDetailsOpen(false);
@@ -742,7 +801,9 @@ export default function DocumentPage({
                 <h1 id="doc-title" className="truncate font-display text-base font-semibold text-foreground sm:text-lg">
                   {doc.title}
                 </h1>
-                {isHistorical ? (
+                {isDiffMode ? (
+                  <Badge variant="info-outline">Comparing</Badge>
+                ) : isHistorical ? (
                   <Badge variant="warning">Historical</Badge>
                 ) : (
                   <Badge variant={doc.status === "archived" ? "archived" : doc.status === "draft" ? "draft" : "active"}>
@@ -837,7 +898,30 @@ export default function DocumentPage({
           </div>
         </header>
 
-        {isHistorical && (
+        {isDiffMode ? (
+          <div
+            role="status"
+            aria-live="polite"
+            className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-info/30 bg-info-soft px-4 py-2 text-sm text-info-soft-foreground sm:px-6"
+          >
+            <div className="flex min-w-0 items-center gap-2">
+              <GitCompareArrows className="h-4 w-4 shrink-0" aria-hidden />
+              <span>
+                Comparing {baseHistoryEntry ? <code className="font-mono font-medium">{baseHistoryEntry.hash.slice(0, 7)}</code> : "the previous revision"}
+                <span aria-hidden> → </span>
+                <code className="font-mono font-medium">{commitHash?.slice(0, 7)}</code>
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button type="button" variant="outline" size="sm" onClick={() => openVersion(commitHash, { replace: true })}>
+                Back to version
+              </Button>
+              <Button type="button" variant="ghost" size="sm" onClick={() => openVersion(undefined, { replace: true })}>
+                Back to latest
+              </Button>
+            </div>
+          </div>
+        ) : isHistorical ? (
           <div
             role="status"
             aria-live="polite"
@@ -853,16 +937,12 @@ export default function DocumentPage({
               type="button"
               variant="outline"
               size="sm"
-              onClick={() => {
-                const p = new URLSearchParams(searchParams);
-                p.delete("commit");
-                updateRouteParams(p, { replace: false });
-              }}
+              onClick={() => openVersion()}
             >
               Back to latest
             </Button>
           </div>
-        )}
+        ) : null}
 
         {publishError && (
           <div className="shrink-0 border-b border-border bg-surface px-4 py-3 sm:px-6">
@@ -873,7 +953,10 @@ export default function DocumentPage({
         <div className="relative min-h-0 flex-1 overflow-hidden">
           <main
             id="document-reading-canvas"
-            className="h-full overflow-y-auto bg-background"
+            className={cn(
+              "h-full bg-background",
+              isDiffMode ? "overflow-hidden" : "overflow-y-auto",
+            )}
           >
             <article
               ref={setArticleEl}
@@ -882,10 +965,12 @@ export default function DocumentPage({
                 "w-full",
                 inEditMode
                   ? "px-3 py-4 sm:px-4 sm:py-5 lg:px-5 xl:px-6 2xl:px-8"
-                  : "p-2 sm:p-3",
+                  : isDiffMode
+                    ? "flex h-full min-h-0 flex-col p-2 sm:p-3"
+                    : "p-2 sm:p-3",
               )}
             >
-              <div className="mb-3 flex min-h-11 min-w-0 items-center gap-3 rounded-[var(--radius-lg)] border border-border bg-surface px-3 shadow-xs">
+              <div className="mb-3 flex min-h-11 shrink-0 min-w-0 items-center gap-3 rounded-[var(--radius-lg)] border border-border bg-surface px-3 shadow-xs">
                 <div className="flex min-w-0 items-center gap-2 text-xs text-foreground-muted">
                   <FolderTree className="h-3.5 w-3.5 shrink-0 text-link" aria-hidden />
                   <span className="truncate font-medium text-foreground">{collectionPath}</span>
@@ -1052,12 +1137,25 @@ export default function DocumentPage({
                     {bodyError && <Alert variant="destructive" className="mt-4">{bodyError}</Alert>}
                   </div>
                 </section>
+              ) : isDiffMode && commitHash ? (
+                <Suspense fallback={<DocumentDiffModuleLoading />}>
+                  <DocumentDiffView
+                    vault={name!}
+                    docId={doc.path || docId}
+                    revision={commitHash}
+                    baseRevision={baseHistoryEntry?.hash}
+                    targetEntry={selectedHistoryEntry}
+                    onBackToVersion={() => openVersion(commitHash, { replace: true })}
+                    onBackToLatest={() => openVersion(undefined, { replace: true })}
+                    onOpenBase={baseHistoryEntry ? () => openVersion(baseHistoryEntry.hash, { replace: true }) : undefined}
+                  />
+                </Suspense>
               ) : (
                 <DocumentView
                   vault={name!}
                   docId={docId}
                   version={commitHash}
-                  view={view}
+                  view={view === "raw" ? "raw" : "rendered"}
                   onViewChange={(next) => setView(next)}
                   appearance="file"
                 />
@@ -1274,21 +1372,37 @@ export default function DocumentPage({
                 <TabsContent value="history" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 pt-3 rail-scroll">
                   <div className="mb-3 border-b border-border pb-3">
                     <h3 className="text-sm font-semibold text-foreground">Version history</h3>
-                    <p className="mt-0.5 text-xs text-foreground-muted">Select a commit to inspect that version.</p>
+                    <p className="mt-0.5 text-xs text-foreground-muted">Open a version or inspect what changed from its parent.</p>
                   </div>
-                  {historyError ? (
-                    <Alert variant="destructive">Failed to load history.</Alert>
+                  {historyQuery.isPending ? (
+                    <LoadingState label="Loading version history" className="space-y-2">
+                      <Skeleton className="h-16 w-full rounded-[var(--radius-md)]" />
+                      <Skeleton className="h-16 w-full rounded-[var(--radius-md)]" />
+                      <Skeleton className="h-16 w-full rounded-[var(--radius-md)]" />
+                    </LoadingState>
+                  ) : historyQuery.isError ? (
+                    <Alert variant="destructive" title="Couldn't load version history">
+                      <div className="mt-2">
+                        <Button type="button" variant="outline" size="sm" onClick={() => void historyQuery.refetch()}>
+                          Try again
+                        </Button>
+                      </div>
+                    </Alert>
                   ) : (
-                    <HistoryList
-                      entries={provenance as any}
-                      selectedHash={commitHash}
-                      onSelect={(hash) => {
-                        const p = new URLSearchParams(searchParams);
-                        if (commitHash === hash) p.delete("commit");
-                        else p.set("commit", hash);
-                        updateRouteParams(p, { replace: false });
-                      }}
-                    />
+                    <div className="space-y-3">
+                      {historyQuery.data?.source === "activity" && (
+                        <Alert variant="info" title="Limited history from an older server">
+                          Version browsing remains available. Exact document lineage and change comparison require a newer backend.
+                        </Alert>
+                      )}
+                      <HistoryList
+                        entries={provenance}
+                        selectedHash={commitHash}
+                        diffHash={isDiffMode ? commitHash : undefined}
+                        onSelect={(hash) => openVersion(hash)}
+                        onCompare={openDiff}
+                      />
+                    </div>
                   )}
                 </TabsContent>
               </Tabs>
@@ -1496,6 +1610,34 @@ function documentMoveDisabledReason({
     isHistorical,
   });
   return reason?.replace("renaming", "moving") ?? null;
+}
+
+function DocumentDiffModuleLoading() {
+  return (
+    <LoadingState
+      label="Opening document changes"
+      className="min-h-0 flex-1 overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm"
+    >
+      <div className="flex h-full min-h-[28rem] flex-col">
+        <div className="flex min-h-16 items-center gap-3 border-b border-border px-4">
+          <Skeleton className="h-8 w-8 rounded-[var(--radius-md)]" />
+          <div className="flex-1 space-y-2">
+            <Skeleton className="h-4 w-40 rounded-[var(--radius-sm)]" />
+            <Skeleton className="h-3 w-64 rounded-[var(--radius-sm)]" />
+          </div>
+        </div>
+        <div className="flex min-h-11 items-center gap-2 border-b border-border bg-surface-2 px-3">
+          <Skeleton className="h-3 w-24 rounded-[var(--radius-sm)]" />
+          <Skeleton className="h-3 w-24 rounded-[var(--radius-sm)]" />
+        </div>
+        <div className="flex-1 space-y-2 p-4">
+          {Array.from({ length: 10 }, (_, index) => (
+            <Skeleton key={index} className="h-5 w-full rounded-[var(--radius-sm)]" />
+          ))}
+        </div>
+      </div>
+    </LoadingState>
+  );
 }
 
 function DocumentPageLoading({ presentation }: { presentation: "page" | "preview" }) {

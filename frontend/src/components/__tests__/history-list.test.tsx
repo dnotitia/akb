@@ -1,48 +1,70 @@
-import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+
 import { HistoryList, type HistoryEntry } from "../history-list";
 
 const entries: HistoryEntry[] = [
-  { hash: "hist-a1", agent: "kwoo24", subject: "Initial", timestamp: "2026-05-19T00:00:00Z" },
-  { hash: "hist-b2", agent: "kwoo24", subject: "Update", timestamp: "2026-05-19T01:00:00Z" },
+  {
+    hash: "abcdef123456", // pragma: allowlist secret — synthetic Git commit
+    author: "user-1",
+    author_name: "Kim",
+    message: "Initial document",
+    date: "2026-05-19T00:00:00Z",
+  },
+  {
+    hash: "bcdefa234567", // pragma: allowlist secret — synthetic Git commit
+    author: "user-2",
+    message: "Update architecture",
+    date: "2026-05-19T01:00:00Z",
+  },
 ];
 
 describe("HistoryList", () => {
-  it("read-only mode (no onSelect) renders rows as div", () => {
+  it("renders typed document lineage with readable messages and authors", () => {
     render(<HistoryList entries={entries} />);
-    expect(screen.getByText("hist-a1")).toBeTruthy();
-    // no button per row
-    expect(screen.queryByRole("button", { name: /View document at commit/i })).toBeNull();
+
+    expect(screen.getByText("Initial document")).toBeInTheDocument();
+    expect(screen.getByText("Kim")).toBeInTheDocument();
+    expect(screen.getByText("abcdef1")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /view changes/i })).toBeNull();
   });
 
-  it("clickable mode invokes onSelect with the full commit hash", () => {
+  it("opens the complete version from the primary row action", () => {
     const onSelect = vi.fn();
     render(<HistoryList entries={entries} onSelect={onSelect} />);
-    fireEvent.click(screen.getByRole("button", { name: /commit hist-a1/i }));
-    expect(onSelect).toHaveBeenCalledWith("hist-a1");
+
+    fireEvent.click(screen.getByRole("button", { name: /view version abcdef1/i }));
+    expect(onSelect).toHaveBeenCalledWith("abcdef123456");
   });
 
-  it("selectedHash marks matching row with aria-pressed=true", () => {
-    const onSelect = vi.fn();
-    render(<HistoryList entries={entries} onSelect={onSelect} selectedHash="hist-b2" />);
-    const buttons = screen.getAllByRole("button");
-    expect(buttons[0].getAttribute("aria-pressed")).toBe("false");
-    expect(buttons[1].getAttribute("aria-pressed")).toBe("true");
+  it("keeps the Changes action visible and passes its trigger for focus restoration", () => {
+    const onCompare = vi.fn();
+    render(<HistoryList entries={entries} onCompare={onCompare} />);
+
+    const trigger = screen.getByRole("button", { name: /view changes in version abcdef1/i });
+    fireEvent.click(trigger);
+    expect(onCompare).toHaveBeenCalledWith("abcdef123456", trigger);
   });
 
-  it("entry without a hash stays unclickable even in onSelect mode", () => {
-    const onSelect = vi.fn();
-    const withMissing: HistoryEntry[] = [
-      ...entries,
-      { agent: "unknown", subject: "Orphan", timestamp: "2026-05-19T02:00:00Z" },
-    ];
-    render(<HistoryList entries={withMissing} onSelect={onSelect} />);
-    const buttons = screen.getAllByRole("button");
-    expect(buttons.length).toBe(2); // only the two with hashes
+  it("marks a prefix-matched comparison without relying on color alone", () => {
+    render(
+      <HistoryList
+        entries={entries}
+        onCompare={vi.fn()}
+        selectedHash="bcdefa2"
+        diffHash="bcdefa2"
+      />,
+    );
+
+    const changes = screen.getByRole("button", {
+      name: /view changes in version bcdefa2/i,
+    });
+    expect(changes).toHaveAttribute("aria-pressed", "true");
+    expect(changes).toHaveTextContent("Changes");
   });
 
-  it("empty list renders 'No history yet.'", () => {
+  it("renders a clear empty state", () => {
     render(<HistoryList entries={[]} />);
-    expect(screen.getByText(/no history yet/i)).toBeTruthy();
+    expect(screen.getByText(/no versions yet/i)).toBeInTheDocument();
   });
 });
