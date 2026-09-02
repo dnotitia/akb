@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.3.1 — negotiate the legacy protocol version instead of hard-rejecting
+
+The legacy `initialize` path no longer returns `-32602 "Unsupported protocol
+version"` when the client names a revision other than `2025-06-18`. Per the MCP
+spec's version negotiation, the proxy now always answers with the revision it
+supports (`2025-06-18`) and lets the client decide whether to proceed. It still
+never echoes a revision it does not implement.
+
+The strict boundary added in 2.2.2 / 2.3.0 broke every client that negotiates a
+newer legacy revision — including Claude Code, which sends `2025-11-25` on the
+`initialize` method — because there was no downgrade path. This restores
+interoperability with those clients while keeping the modern `server/discover`
+(`2026-07-28`) surface unchanged.
+
 ## 2.3.0 — dual-generation MCP bridge
 
 The stdio proxy now exposes both supported client surfaces in one process:

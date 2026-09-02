@@ -73,7 +73,7 @@ itAsync("initialize falls back to a default protocol version when omitted", asyn
   assert.match(res.result.protocolVersion, /^\d{4}-\d{2}-\d{2}$/);
 });
 
-itAsync("initialize rejects an unsupported protocol version instead of echoing it", async () => {
+itAsync("initialize negotiates down to the supported version instead of echoing an unsupported one", async () => {
   const proxy = newProxy();
   proxy._startBackendMonitor = () => {};
   const res = await proxy._initialize(1, {
@@ -81,10 +81,14 @@ itAsync("initialize rejects an unsupported protocol version instead of echoing i
     capabilities: {},
   });
 
-  assert.equal(res.error.code, -32602);
-  assert.deepEqual(res.error.data.supported, ["2025-06-18"]);
-  assert.equal(res.result, undefined);
-  assert.equal(proxy._initialized, false);
+  // Spec-compliant negotiation: respond with OUR supported revision, never
+  // echo a revision we do not implement, and never hard-error — a hard error
+  // breaks any client offering a different revision (e.g. Claude Code's
+  // 2025-11-25 initialize).
+  assert.equal(res.error, undefined);
+  assert.equal(res.result.protocolVersion, "2025-06-18");
+  assert.notEqual(res.result.protocolVersion, "2099-01-01");
+  assert.equal(proxy._initialized, true);
 });
 
 itAsync("backend modern discovery carries vault-guide preflight without dropping client capabilities", async () => {

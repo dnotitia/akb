@@ -381,7 +381,7 @@ const UNSUPPORTED_PROTOCOL_VERSION = -32022;
 // local `initialize` response, so it must not silently drift on a proxy
 // behaviour change. There is no import of package.json here to keep lib/
 // zero-dependency and load-safe across Node versions.
-const PROXY_VERSION = "2.3.0";
+const PROXY_VERSION = "2.3.1";
 const VAULT_SKILL_PREFLIGHT_CAPABILITY =
   "io.dnotitia.akb/vault-skill-preflight";
 const PROXY_INSTRUCTIONS =
@@ -720,22 +720,14 @@ export class AKBProxy {
     // regardless of whether the backend is reachable right now. If the VPN
     // is down at startup, the server still registers; tools recover once
     // connectivity returns (see the monitor + tools/list_changed path).
-    const requestedProtocol =
-      params && typeof params.protocolVersion === "string" && params.protocolVersion;
-    if (requestedProtocol && requestedProtocol !== LEGACY_PROTOCOL_VERSION) {
-      // Never claim success by echoing a protocol revision this proxy does
-      // not implement.  A client can retry with the explicit supported
-      // revision; there is no fallback or downgrade path here.
-      return {
-        jsonrpc: "2.0",
-        id,
-        error: {
-          code: INVALID_PARAMS,
-          message: "Unsupported protocol version",
-          data: { supported: [LEGACY_PROTOCOL_VERSION], requested: requestedProtocol },
-        },
-      };
-    }
+    // MCP version negotiation (per spec): if the client requests a revision we
+    // support, echo it; otherwise respond with the revision we DO support and
+    // let the client decide whether to proceed. We must NOT hard-error here —
+    // that breaks every client negotiating any other revision (e.g. Claude
+    // Code sends 2025-11-25). This proxy is a thin JSON-RPC forwarder, so once
+    // a common version is agreed the actual tool traffic interoperates. We
+    // therefore always advertise our supported legacy revision below and never
+    // echo a revision we do not implement.
     this._clientCapabilities = isObject(params?.capabilities) ? params.capabilities : {};
     this._clientInfo = isObject(params?.clientInfo) ? params.clientInfo : null;
     this._initialized = true;
