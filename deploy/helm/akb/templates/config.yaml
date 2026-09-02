@@ -1,0 +1,76 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: akb-app-config
+  labels:
+    {{- include "akb.labels" . | nindent 4 }}
+data:
+  app.yaml: |
+    db_host: postgres
+    db_port: 5432
+    db_name: {{ .Values.postgres.database }}
+    db_user: {{ .Values.postgres.username }}
+    git_storage_path: /data/vaults
+    tokenizer_processes: {{ .Values.app.tokenizerProcesses }}
+    worker_shutdown_timeout_secs: {{ .Values.app.workerShutdownTimeoutSeconds }}
+    embed_base_url: {{ .Values.app.embedding.baseUrl | quote }}
+    embed_model: {{ .Values.app.embedding.model | quote }}
+    embed_dimensions: {{ .Values.app.embedding.dimensions }}
+    llm_base_url: {{ .Values.app.llm.baseUrl | quote }}
+    llm_model: {{ .Values.app.llm.model | quote }}
+    rerank_enabled: {{ .Values.app.rerank.enabled }}
+    rerank_provider: {{ .Values.app.rerank.provider }}
+    rerank_model: {{ .Values.app.rerank.model }}
+    rerank_prefetch: {{ .Values.app.rerank.prefetch }}
+    s3_endpoint_url: {{ .Values.app.objectStorage.endpointUrl | quote }}
+    s3_bucket: {{ .Values.app.objectStorage.bucket }}
+    auth_mode: {{ ternary "sso" "local" .Values.sso.enabled }}
+    jwt_algorithm: RS256
+    {{- if .Values.sso.enabled }}
+    auth_runtime_generation: 1
+    keycloak_enabled: true
+    keycloak_server_url: {{ .Values.sso.keycloakPublicUrl }}
+    keycloak_internal_url: http://keycloak:8080
+    keycloak_backchannel_logout_uri: http://backend:8000/api/v1/auth/keycloak/backchannel-logout
+    keycloak_realm: akb
+    keycloak_client_id: akb-web
+    keycloak_public_client: false
+    keycloak_admin_client_id: akb-admin
+    keycloak_management_client_id: akb-sso-manager
+    keycloak_enrollment_mode: {{ .Values.sso.enrollmentMode }}
+    keycloak_require_verified_email: {{ .Values.sso.requireVerifiedEmail }}
+    api_oauth_audience: {{ printf "%s/api" (.Values.global.publicUrl | trimSuffix "/") }}
+    keycloak_verify_ssl: true
+    {{- if .Values.sso.localRealmLogin.enabled }}
+    sso_local_realm_login_enabled: true
+    sso_local_realm_display_name: {{ .Values.sso.localRealmLogin.displayName | quote }}
+    {{- end }}
+    {{- else }}
+    local_session_issuer: {{ .Values.global.publicUrl }}
+    local_session_private_key_path: /etc/akb/local-session/private.pem
+    local_session_jwks_path: /etc/akb/local-session/jwks.json
+    {{- end }}
+    vector_store_driver: {{ .Values.app.vectorStore.driver }}
+    vector_store_dsn: {{ .Values.app.vectorStore.dsn | quote }}
+    vector_store_schema: {{ .Values.app.vectorStore.schema }}
+    vector_store_sparse_shape: {{ .Values.app.vectorStore.sparseShape }}
+    vector_url: {{ .Values.app.vectorStore.url | quote }}
+    vector_collection: {{ .Values.app.vectorStore.collection }}
+    public_base_url: {{ .Values.global.publicUrl }}
+    redis_url: {{ .Values.app.redis.url | quote }}
+    redis_event_stream: {{ .Values.app.redis.eventStream }}
+    redis_stream_maxlen: {{ .Values.app.redis.streamMaxlen }}
+{{- if .Values.sso.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: akb-sso-bootstrap-config
+  labels:
+    {{- include "akb.labels" . | nindent 4 }}
+data:
+  bootstrap-client-id: akb-bootstrap-temporary
+  upgrade-client-id: akb-bootstrap-upgrade-v2
+  product-admin-username: {{ .Values.sso.productAdmin.username | quote }}
+  product-admin-email: {{ .Values.sso.productAdmin.email | quote }}
+{{- end }}

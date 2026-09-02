@@ -1,4 +1,4 @@
-"""Static safety contracts for the generic standalone SSO Kustomize overlay."""
+"""Static safety contracts for the reusable standalone SSO component."""
 
 from __future__ import annotations
 
@@ -11,11 +11,13 @@ import yaml
 
 
 _ROOT = Path(__file__).resolve().parents[2]
-_OVERLAY = _ROOT / "deploy" / "k8s" / "standalone-sso"
+_K8S = _ROOT / "deploy" / "k8s"
+_COMPONENT = _K8S / "components" / "sso"
+_PROFILE = _K8S / "profiles" / "standalone-sso"
 
 
 def _documents(name: str) -> list[dict]:
-    with (_OVERLAY / name).open(encoding="utf-8") as source:
+    with (_COMPONENT / name).open(encoding="utf-8") as source:
         return [item for item in yaml.safe_load_all(source) if isinstance(item, dict)]
 
 
@@ -29,21 +31,20 @@ def _one(name: str, *, kind: str, resource_name: str | None) -> dict:
     return matches[0]
 
 
-def test_overlay_owns_dedicated_keycloak_and_database_without_committed_secrets():
-    kustomization = _one(
+def test_component_owns_dedicated_keycloak_and_database_without_committed_secrets():
+    component = _one(
         "kustomization.yaml",
-        kind="Kustomization",
+        kind="Component",
         resource_name=None,
     )
     assert {
-        "akb-postgres.yaml",
         "keycloak-postgres.yaml",
         "keycloak.yaml",
         "keycloak-ingress.yaml",
-    }.issubset(set(kustomization["resources"]))
+    }.issubset({Path(item).name for item in component["resources"]})
 
-    for path in _OVERLAY.glob("*.yaml"):
-        for document in _documents(path.name):
+    for path in _COMPONENT.rglob("*.yaml"):
+        for document in _documents(str(path.relative_to(_COMPONENT))):
             assert document.get("kind") != "Secret"
             assert "stringData" not in document
 
@@ -68,6 +69,26 @@ def test_keycloak_bootstrap_secret_is_required_for_first_boot_and_not_a_human_ad
     }
     assert "KC_BOOTSTRAP_ADMIN_USERNAME" not in env
     assert "KC_BOOTSTRAP_ADMIN_PASSWORD" not in env
+
+
+def test_akb_database_uses_the_shared_platform_secret_contract():
+    resources = [
+        item
+        for item in yaml.safe_load_all(
+            (_K8S / "postgres.yaml").read_text(encoding="utf-8")
+        )
+        if isinstance(item, dict)
+    ]
+    postgres = next(item for item in resources if item.get("kind") == "StatefulSet")
+    container = postgres["spec"]["template"]["spec"]["containers"][0]
+    assert "envFrom" not in container
+    env = {item["name"]: item for item in container["env"]}
+    assert env["POSTGRES_DB"]["value"] == "akb"
+    assert env["POSTGRES_USER"]["value"] == "akbuser"
+    assert env["POSTGRES_PASSWORD"]["valueFrom"]["secretKeyRef"] == {
+        "name": "akb-secret",
+        "key": "db_password",
+    }
 
 
 def test_backend_patch_removes_local_key_authority_and_mounts_one_time_inputs_only_in_init():
@@ -110,7 +131,7 @@ def test_backend_patch_removes_local_key_authority_and_mounts_one_time_inputs_on
 def test_legacy_profile_upgrade_job_is_explicit_opt_in_and_uses_temporary_service_admin():
     kustomization = _one(
         "kustomization.yaml",
-        kind="Kustomization",
+        kind="Component",
         resource_name=None,
     )
     assert "legacy-profile-upgrade-job.yaml" not in kustomization["resources"]
@@ -159,7 +180,7 @@ def test_sso_runtime_config_has_one_mode_and_three_distinct_confidential_clients
     assert config["keycloak_server_url"].startswith("https://")
 
 
-def test_kustomize_render_has_no_local_session_mount_when_kubectl_is_available():
+def test_sso_profile_render_has_no_local_session_mount_when_kubectl_is_available():
     kubectl = shutil.which("kubectl")
     if kubectl is None:
         pytest.skip("kubectl is not installed on this test host")
@@ -168,7 +189,7 @@ def test_kustomize_render_has_no_local_session_mount_when_kubectl_is_available()
             kubectl,
             "kustomize",
             "--load-restrictor=LoadRestrictionsNone",
-            str(_OVERLAY),
+            str(_PROFILE),
         ],
         check=True,
         capture_output=True,

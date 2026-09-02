@@ -1,0 +1,50 @@
+{{- $profiles := list "standalone" "standalone-sso" "standalone-secret-manager" "standalone-sso-secret-manager" -}}
+{{- if not (has .Values.profile $profiles) -}}
+{{- fail "profile must be standalone, standalone-sso, standalone-secret-manager, or standalone-sso-secret-manager" -}}
+{{- end -}}
+{{- $profileWantsSso := has .Values.profile (list "standalone-sso" "standalone-sso-secret-manager") -}}
+{{- if ne $profileWantsSso .Values.sso.enabled -}}
+{{- fail "sso.enabled conflicts with the selected profile" -}}
+{{- end -}}
+{{- $profileWantsBundle := has .Values.profile (list "standalone-secret-manager" "standalone-sso-secret-manager") -}}
+{{- if and $profileWantsBundle (ne .Values.secretManager.mode "bundled") -}}
+{{- fail "a *-secret-manager profile requires secretManager.mode=bundled" -}}
+{{- end -}}
+{{- if and (not $profileWantsBundle) (eq .Values.secretManager.mode "bundled") -}}
+{{- fail "bundled Secret Manager requires a *-secret-manager profile" -}}
+{{- end -}}
+{{- if eq .Values.secretManager.mode "bundled" -}}
+  {{- if not (has .Values.secretManager.engine (list "openbao" "hashicorp-vault")) -}}
+  {{- fail "bundled Secret Manager engine must be openbao or hashicorp-vault" -}}
+  {{- end -}}
+  {{- if eq .Values.secretManager.engine "openbao" -}}
+    {{- if or (not .Values.openbao.enabled) .Values.hashicorpVault.enabled -}}
+    {{- fail "engine=openbao requires only openbao.enabled=true" -}}
+    {{- end -}}
+  {{- else -}}
+    {{- if or (not .Values.hashicorpVault.enabled) .Values.openbao.enabled -}}
+    {{- fail "engine=hashicorp-vault requires only hashicorpVault.enabled=true" -}}
+    {{- end -}}
+    {{- if not .Values.secretManager.hashicorpLicenseAcknowledged -}}
+    {{- fail "HashiCorp Vault requires secretManager.hashicorpLicenseAcknowledged=true" -}}
+    {{- end -}}
+  {{- end -}}
+  {{- if not .Values.secretSync.enabled -}}
+  {{- fail "bundled Secret Manager requires secretSync.enabled=true" -}}
+  {{- end -}}
+{{- end -}}
+{{- if eq .Values.secretManager.mode "external" -}}
+  {{- if not .Values.secretSync.enabled -}}
+  {{- fail "external Secret Manager requires secretSync.enabled=true" -}}
+  {{- end -}}
+  {{- if not .Values.secretManager.connection.address -}}
+  {{- fail "external Secret Manager requires secretManager.connection.address" -}}
+  {{- end -}}
+{{- end -}}
+{{- if and .Values.sso.enabled (or (not .Values.sso.keycloakPublicUrl) (not .Values.sso.productAdmin.username) (not .Values.sso.productAdmin.email)) -}}
+{{- fail "SSO profiles require keycloakPublicUrl and product-admin identity" -}}
+{{- end -}}
+{{- if and .Values.secretManager.tls.certificate.create (not .Values.secretManager.tls.certificate.issuerName) -}}
+{{- fail "Secret Manager Certificate creation requires an existing issuerName" -}}
+{{- end -}}
+# Validation-only template. It deliberately emits no Kubernetes object.
