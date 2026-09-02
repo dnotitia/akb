@@ -405,6 +405,68 @@ async def test_inventory_is_fixed_ref_bounded_and_includes_archived_manual_vault
             ) == 0
 
 
+async def test_inventory_accepts_plain_git_activity_without_akb_footers(tmp_path):
+    async with _fresh_schema(tmp_path) as pool:
+        git = GitService(storage_path=str(tmp_path / "plain-import-git"))
+        vault_name = f"plain-import-{uuid.uuid4().hex}"
+        git.init_vault(vault_name)
+        current_oid = git.commit_file(
+            vault_name,
+            "notes/imported.md",
+            "# Imported\n\nPlain Git history.\n",
+            "Import documentation",
+            author_name="Fixture Collector",
+            author_email="collector@example.dev",
+        )
+        current_dt = Repo(str(git._bare_path(vault_name))).commit(
+            current_oid
+        ).committed_datetime
+        fixed_ref = git.commit_file(
+            vault_name,
+            "notes/unrelated.md",
+            "# Unrelated\n",
+            "Add unrelated document",
+        )
+
+        async with pool.acquire() as conn:
+            namespace_id = await conn.fetchval(
+                """
+                INSERT INTO vaults (name, git_path, status)
+                VALUES ($1, $2, 'active')
+                RETURNING id
+                """,
+                vault_name,
+                str(git._bare_path(vault_name)),
+            )
+            document_id = uuid.uuid4()
+            await conn.execute(
+                """
+                INSERT INTO documents
+                    (id, vault_id, path, title, created_at, updated_at,
+                     current_commit, source)
+                VALUES ($1, $2, 'notes/imported.md', 'Imported', $3, $3, $4, 'manual')
+                """,
+                document_id,
+                namespace_id,
+                current_dt + timedelta(seconds=1),
+                current_oid,
+            )
+
+        scope = await LegacyRevisionBridge(pool, git=git).capture_inventory_scope(
+            namespace_id=namespace_id,
+            fixed_ref=fixed_ref,
+            coverage_version="plain-import-v1",
+        )
+
+        assert len(scope.inventory.documents) == 1
+        document = scope.inventory.documents[0]
+        assert document.resource_id == document_id
+        assert document.activity.action == "create"
+        assert document.activity.actor == "Fixture Collector"
+        assert document.activity.subject == "Import documentation"
+        assert document.activity.summary == ""
+
+
 async def test_inventory_rejects_duplicate_completed_ordinal_zero_anchor(tmp_path):
     async with _fresh_schema(tmp_path) as pool:
         fixture = await _make_fixture(pool, tmp_path)

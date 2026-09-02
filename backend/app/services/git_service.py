@@ -1760,7 +1760,11 @@ class GitService:
             "-M",
             "--name-status",
         ]
-        if since_epoch is not None:
+        # Imported Git documents are created in AKB after their source commit.
+        # In that case a DB-created-at lower bound would hide the very commit
+        # that anchors the imported file's lineage, so retain the complete
+        # path history. Native AKB writes keep the bounded legacy behavior.
+        if since_epoch is not None and current.committed_date >= since_epoch:
             log_args.append(f"--since=@{since_epoch}")
         log_args.extend(["--format=%H%x00%ct", fixed_ref, "--", file_path])
         try:
@@ -1794,16 +1798,24 @@ class GitService:
             status = fields[0]
             if status.startswith("R") and len(fields) >= 3:
                 active["path_at_revision"] = fields[-1]
+                active["action"] = "move"
             elif len(fields) >= 2:
                 active["path_at_revision"] = fields[-1]
+                action = {
+                    "A": "create",
+                    "M": "update",
+                    "D": "delete",
+                }.get(status[:1])
+                if action is not None:
+                    active["action"] = action
         flush()
 
         # Git commit timestamps have one-second precision while the document
         # row's created_at has microseconds. Preserve the standard AKB action
         # so the migration bridge can stop at the newest create commit instead
         # of dropping that commit (or admitting an older same-path lifecycle)
-        # on timestamp comparison alone. Unknown historical commit formats
-        # remain supported through the bridge's timestamp fallback.
+        # on timestamp comparison alone. Plain imported Git commits retain the
+        # action inferred from their exact name-status record above.
         for entry in history:
             try:
                 commit = repo.commit(entry["legacy_git_oid"])
@@ -1832,8 +1844,9 @@ class GitService:
     def _manual_fixed_ref_activity(self, repo: Repo, commit, file_path: str) -> dict:
         """Freeze the legacy public activity projection for one file commit."""
         metadata = self._legacy_commit_metadata(commit)
-        action = metadata["action"]
-        if action not in {"create", "update", "move", "delete"}:
+        declared_action = metadata["action"]
+        supported_actions = {"create", "update", "move", "delete"}
+        if declared_action and declared_action not in supported_actions:
             raise FixedRefHistoryError(
                 "fixed-ref current commit has no supported public activity action"
             )
@@ -1881,11 +1894,17 @@ class GitService:
                             "path_to": file_path,
                         }
                     )
-        if len(changes) != 1 or changes[0]["change"] != action:
+        if len(changes) != 1:
             raise FixedRefHistoryError(
                 "fixed-ref current commit activity does not match the file action"
             )
         selected_change = changes[0]
+        inferred_action = selected_change["change"]
+        action = declared_action or inferred_action
+        if action != inferred_action:
+            raise FixedRefHistoryError(
+                "fixed-ref current commit activity does not match the file action"
+            )
         return {
             "legacy_git_oid": commit.hexsha,
             "committed_at": datetime.fromtimestamp(
