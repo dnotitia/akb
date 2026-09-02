@@ -154,3 +154,48 @@ async def test_create_table_invalid_name_is_422_not_500():
             actor_id="tester",
         )
     assert ei.value.status_code == 422
+
+
+async def test_create_table_still_refuses_a_table_name_over_the_limit(monkeypatch):
+    """The half that is the caller's stays refused.
+
+    Fitting the PAIR is not the same as accepting any table name: the vault
+    side is often generated and cannot be shortened, but the table name is
+    theirs, it is what `pg_short_name` hands back as `sql_name`, and one
+    longer than any identifier can be is a mistake they can fix.
+
+    This was found by CI, not here: `tests/test_mcp_e2e.sh` asserts a
+    70-character name comes back `invalid_argument`, and removing the
+    composed-length check removed the only thing refusing it — because the
+    other two length checks in this module guard constraint and index
+    names, not the table's. A local sweep grepping for the message text
+    missed it; the shell suite asserts the error CODE.
+    """
+    vault_name = "short"
+    table_name = "a" * 70
+
+    async def _fake_get_pool():
+        return _FakePool(_FakeConn(vault_name))
+
+    monkeypatch.setattr(table_service, "get_pool", _fake_get_pool)
+
+    async def _must_not_run(*a, **k):
+        raise AssertionError("create_dynamic_table must not run for an over-long table name")
+
+    monkeypatch.setattr(table_service.table_data_repo, "create_dynamic_table", _must_not_run)
+
+    with pytest.raises(ValidationError) as ei:
+        await table_service.create_table(
+            uuid.uuid4(),
+            table_name,
+            [{"name": "amount", "type": "int"}],
+            actor_id="tester",
+        )
+
+    assert ei.value.status_code == 422
+    assert "too long" in ei.value.message.lower()
+    # And the pair-fitting is untouched by it: the same vault with a table
+    # that only overflows once composed is still created.
+    assert len(
+        table_service.table_data_repo.pg_table_name("v" * 60, "t" * 20)
+    ) <= table_service.table_data_repo.PG_IDENT_MAX_LEN

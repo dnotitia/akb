@@ -175,6 +175,12 @@ def pg_table_name(vault_name: str, table_name: str) -> str:
     The vault side is the side that gives way. In the case this is for,
     it is the generated one and the table name is the one a reader
     recognises.
+
+    Fitting the PAIR is not the same as accepting any table name.
+    ``create_table`` still refuses a table name that is on its own longer
+    than an identifier can be: that half is the caller's, it is what
+    ``pg_short_name`` hands back as ``sql_name``, and it is a mistake they
+    can fix. Only the half they cannot fix is absorbed here.
     """
     vault = _sanitize_pg_part(vault_name)
     table = _sanitize_pg_part(table_name)
