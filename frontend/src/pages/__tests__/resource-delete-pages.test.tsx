@@ -1,28 +1,42 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { VaultRefreshProvider } from "@/contexts/vault-refresh-context";
 import FilePage from "@/pages/file";
 import TablePage from "@/pages/table";
 
-vi.mock("@/lib/api", () => ({
-  authenticatedFetch: vi.fn(),
-  createPublication: vi.fn(),
-  createPublicationSnapshot: vi.fn(),
-  deletePublication: vi.fn(),
-  getVaultInfo: vi.fn(),
-  getDocument: vi.fn(),
-  listPublications: vi.fn(),
-  previewTablePublicationQuery: vi.fn(),
-  deleteVaultFile: vi.fn(),
-  deleteVaultTable: vi.fn(),
-  deleteVaultTableRow: vi.fn(),
-  insertVaultTableRow: vi.fn(),
-  listVaultTableRows: vi.fn(),
-  listVaultTables: vi.fn(),
-  updateVaultTableRow: vi.fn(),
-}));
+vi.mock("@/lib/api", () => {
+  class ApiError extends Error {
+    status: number;
+    constructor(message: string, status: number) {
+      super(message);
+      this.status = status;
+    }
+  }
+  class TableRowConflictError extends Error {}
+  return {
+    ApiError,
+    TableRowConflictError,
+    authenticatedFetch: vi.fn(),
+    createPublication: vi.fn(),
+    createPublicationSnapshot: vi.fn(),
+    deletePublication: vi.fn(),
+    getVaultInfo: vi.fn(),
+    getDocument: vi.fn(),
+    getVaultTableRow: vi.fn(),
+    listPublications: vi.fn(),
+    previewTablePublicationQuery: vi.fn(),
+    deleteVaultFile: vi.fn(),
+    deleteVaultTable: vi.fn(),
+    deleteVaultTableRow: vi.fn(),
+    insertVaultTableRow: vi.fn(),
+    listVaultTableRows: vi.fn(),
+    listVaultTables: vi.fn(),
+    updateVaultTableRow: vi.fn(),
+  };
+});
 
 import {
   authenticatedFetch,
@@ -62,19 +76,24 @@ function LocationProbe() {
 }
 
 function renderRoute(path: string, refetchTree = vi.fn()) {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: 0 } },
+  });
   return {
     refetchTree,
     ...render(
-      <MemoryRouter initialEntries={[path]}>
-        <VaultRefreshProvider refetchVaults={vi.fn()} refetchTree={refetchTree}>
-          <Routes>
-            <Route path="/vault/:name/file/:id" element={<FilePage />} />
-            <Route path="/vault/:name/table/:table" element={<TablePage />} />
-            <Route path="/vault/:name" element={<div>Vault overview</div>} />
-          </Routes>
-          <LocationProbe />
-        </VaultRefreshProvider>
-      </MemoryRouter>,
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={[path]}>
+          <VaultRefreshProvider refetchVaults={vi.fn()} refetchTree={refetchTree}>
+            <Routes>
+              <Route path="/vault/:name/file/:id" element={<FilePage />} />
+              <Route path="/vault/:name/table/:table" element={<TablePage />} />
+              <Route path="/vault/:name" element={<div>Vault overview</div>} />
+            </Routes>
+            <LocationProbe />
+          </VaultRefreshProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
     ),
   };
 }

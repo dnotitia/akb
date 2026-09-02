@@ -1641,6 +1641,28 @@ export interface VaultTableQueryResult {
   total: number;
 }
 
+export interface VaultTableRowsQueryOptions {
+  limit?: number;
+  offset?: number;
+  order?: string;
+  filters?: Array<{ column: string; expression: string }>;
+  signal?: AbortSignal;
+}
+
+export class TableRowConflictError extends Error {
+  rowId: string;
+
+  constructor(rowId: string, action: "update" | "delete") {
+    super(
+      action === "update"
+        ? "This row changed after you opened it. Review the current values or overwrite them explicitly."
+        : "This row changed after you opened it. Its latest version must be reviewed before deletion.",
+    );
+    this.name = "TableRowConflictError";
+    this.rowId = rowId;
+  }
+}
+
 export const createVaultTable = (
   vault: string,
   input: VaultTableCreateInput,
@@ -1660,18 +1682,40 @@ export const listVaultTables = (vault: string) =>
 export const listVaultTableRows = (
   vault: string,
   table: string,
-  { limit = 50, offset = 0 }: { limit?: number; offset?: number } = {},
+  {
+    limit = 50,
+    offset = 0,
+    order = "created_at.desc,id.desc",
+    filters = [],
+    signal,
+  }: VaultTableRowsQueryOptions = {},
 ) => {
   const query = new URLSearchParams({
     limit: String(limit),
     offset: String(offset),
-    order: "created_at.desc",
+    order,
   });
+  for (const filter of filters) query.append(filter.column, filter.expression);
   return api<VaultTableQueryResult>(
     `/tables/${encodeURIComponent(vault)}/${encodeURIComponent(table)}/rows?${query}`,
-    { headers: { Prefer: "count=exact" } },
+    { headers: { Prefer: "count=exact" }, signal },
   );
 };
+
+export async function getVaultTableRow(
+  vault: string,
+  table: string,
+  rowId: string,
+  signal?: AbortSignal,
+): Promise<Record<string, unknown> | null> {
+  const result = await listVaultTableRows(vault, table, {
+    limit: 1,
+    order: "id.asc",
+    filters: [{ column: "id", expression: `eq.${rowId}` }],
+    signal,
+  });
+  return result.items[0] || null;
+}
 
 export const insertVaultTableRow = (
   vault: string,
@@ -1692,8 +1736,12 @@ export const updateVaultTableRow = (
   table: string,
   rowId: string,
   changes: Record<string, unknown>,
+  options: { expectedUpdatedAt?: string; force?: boolean } = {},
 ) => {
   const query = new URLSearchParams({ id: `eq.${rowId}`, select: "*" });
+  if (options.expectedUpdatedAt && !options.force) {
+    query.set("updated_at", `eq.${options.expectedUpdatedAt}`);
+  }
   return api<VaultTableQueryResult>(
     `/tables/${encodeURIComponent(vault)}/${encodeURIComponent(table)}/rows?${query}`,
     {
@@ -1701,22 +1749,36 @@ export const updateVaultTableRow = (
       headers: { Prefer: "return=representation" },
       body: JSON.stringify(changes),
     },
-  );
+  ).then((result) => {
+    if (options.expectedUpdatedAt && !options.force && result.items.length === 0) {
+      throw new TableRowConflictError(rowId, "update");
+    }
+    return result;
+  });
 };
 
 export const deleteVaultTableRow = (
   vault: string,
   table: string,
   rowId: string,
+  options: { expectedUpdatedAt?: string; force?: boolean } = {},
 ) => {
   const query = new URLSearchParams({ id: `eq.${rowId}`, select: "id" });
+  if (options.expectedUpdatedAt && !options.force) {
+    query.set("updated_at", `eq.${options.expectedUpdatedAt}`);
+  }
   return api<VaultTableQueryResult>(
     `/tables/${encodeURIComponent(vault)}/${encodeURIComponent(table)}/rows?${query}`,
     {
       method: "DELETE",
       headers: { Prefer: "return=representation" },
     },
-  );
+  ).then((result) => {
+    if (options.expectedUpdatedAt && !options.force && result.items.length === 0) {
+      throw new TableRowConflictError(rowId, "delete");
+    }
+    return result;
+  });
 };
 
 export const deleteVaultTable = (vault: string, tableName: string) =>

@@ -1,7 +1,11 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   Asterisk,
   Braces,
   CalendarClock,
@@ -42,20 +46,38 @@ import { ResourceDeleteDialog } from "@/components/resource-delete-dialog";
 import { PublicationSuccessBanner } from "@/components/publication-success-banner";
 import { TablePublishDialog } from "@/components/table-publish-dialog";
 import { TableRowDialog } from "@/components/table-row-dialog";
+import {
+  TableFilterBar,
+  TableFilterDialog,
+  TablePagination,
+} from "@/components/table-query-controls";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import {
+  ApiError,
   deleteVaultTable,
   deleteVaultTableRow,
+  getVaultTableRow,
   getVaultInfo,
   insertVaultTableRow,
   listVaultTableRows,
   listVaultTables,
   updateVaultTableRow,
+  TableRowConflictError,
   type Publication,
   type VaultTableColumnInput,
   type VaultTableInfo,
 } from "@/lib/api";
 import { ROLE_RANK, type Role } from "@/lib/roles";
+import {
+  DEFAULT_TABLE_SORT,
+  compileTableFilter,
+  parseTableQueryState,
+  tableOrder,
+  writeTableQueryState,
+  type TablePageSize,
+  type TableQueryState,
+  type TableSort,
+} from "@/lib/table-query-state";
 import { cn } from "@/lib/utils";
 
 type Column = VaultTableColumnInput;
@@ -70,18 +92,11 @@ const SYSTEM_COLUMN_TYPES: Record<string, string> = {
 export default function TablePage() {
   const { name: vault, table } = useParams<{ name: string; table: string }>();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
   const { refetchTree } = useVaultRefresh();
-  const [info, setInfo] = useState<VaultTableInfo | null>(null);
-  const [rows, setRows] = useState<Record<string, unknown>[]>([]);
-  const [cols, setCols] = useState<string[]>([]);
-  const [total, setTotal] = useState(0);
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [infoLoading, setInfoLoading] = useState(true);
   const [schemaOpen, setSchemaOpen] = useState(false);
-  const [canPublish, setCanPublish] = useState(false);
-  const [canDelete, setCanDelete] = useState(false);
-  const [canManageRows, setCanManageRows] = useState(false);
+  const [filtersOpen, setFiltersOpen] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [published, setPublished] = useState<Publication | null>(null);
@@ -91,86 +106,68 @@ export default function TablePage() {
   const [rowNotice, setRowNotice] = useState("");
   const schemaToggleRef = useRef<HTMLButtonElement | null>(null);
   const schemaCloseRef = useRef<HTMLButtonElement | null>(null);
-  const dataRequestRef = useRef(0);
-  const limit = 50;
+  const queryState = useMemo(() => parseTableQueryState(searchParams), [searchParams]);
 
-  useEffect(() => {
-    if (!vault) return;
-    let cancelled = false;
-    setCanPublish(false);
-    setCanDelete(false);
-    setCanManageRows(false);
-    getVaultInfo(vault)
-      .then((data) => {
-        const roleRank = ROLE_RANK[data?.role as Role] ?? 0;
-        const writable = !data?.is_archived && !data?.is_external_git;
-        if (!cancelled) {
-          setCanPublish(roleRank >= ROLE_RANK.writer && writable);
-          setCanDelete(roleRank >= ROLE_RANK.admin && writable);
-          setCanManageRows(roleRank >= ROLE_RANK.writer && writable);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setCanPublish(false);
-          setCanDelete(false);
-          setCanManageRows(false);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [vault]);
-
-  const refreshTableData = useCallback(
-    async (showLoading = false) => {
-      if (!vault || !table) return;
-      const requestId = ++dataRequestRef.current;
-      if (showLoading) {
-        setInfo(null);
-        setRows([]);
-        setCols([]);
-        setTotal(0);
-        setError("");
-        setLoading(true);
-        setInfoLoading(true);
-      }
-      try {
-        const [catalog, data] = await Promise.all([
-          listVaultTables(vault),
-          listVaultTableRows(vault, table, { limit }),
-        ]);
-        if (requestId !== dataRequestRef.current) return;
-        const found = catalog.items.find((item) => item.name === table) || null;
-        setInfo(found);
-        setRows(data.items || []);
-        setCols(data.columns || []);
-        setTotal(data.total ?? data.items?.length ?? 0);
-        setError("");
-      } catch (caught: unknown) {
-        if (requestId !== dataRequestRef.current) return;
-        setError(caught instanceof Error ? caught.message : "The table could not be loaded.");
-      } finally {
-        if (requestId === dataRequestRef.current) {
-          setLoading(false);
-          setInfoLoading(false);
-        }
-      }
+  const setQueryState = useCallback(
+    (next: TableQueryState) => {
+      setSearchParams(writeTableQueryState(searchParams, next), { replace: true });
     },
-    [limit, table, vault],
+    [searchParams, setSearchParams],
   );
+
+  const vaultInfoQuery = useQuery({
+    queryKey: ["vault-info", vault],
+    queryFn: () => getVaultInfo(vault!),
+    enabled: Boolean(vault),
+  });
+  const catalogQuery = useQuery({
+    queryKey: ["vault-tables", vault],
+    queryFn: () => listVaultTables(vault!),
+    enabled: Boolean(vault),
+  });
+  const rowsQuery = useQuery({
+    queryKey: [
+      "vault-table-rows",
+      vault,
+      table,
+      queryState.pageIndex,
+      queryState.pageSize,
+      queryState.sort,
+      queryState.filters,
+    ],
+    queryFn: async ({ signal }) => {
+      const result = await listVaultTableRows(vault!, table!, {
+        limit: queryState.pageSize,
+        offset: queryState.pageIndex * queryState.pageSize,
+        order: tableOrder(queryState.sort),
+        filters: queryState.filters.map(compileTableFilter),
+        signal,
+      });
+      return {
+        ...result,
+        queryPageIndex: queryState.pageIndex,
+        queryPageSize: queryState.pageSize,
+      };
+    },
+    enabled: Boolean(vault && table),
+    placeholderData: keepPreviousData,
+  });
+
+  const info: VaultTableInfo | null =
+    catalogQuery.data?.items.find((item) => item.name === table) || null;
+  const rows = rowsQuery.data?.items || [];
+  const cols = rowsQuery.data?.columns || [];
+  const total = rowsQuery.data?.total ?? 0;
+  const roleRank = ROLE_RANK[vaultInfoQuery.data?.role as Role] ?? 0;
+  const writeRestriction = rowWriteRestriction(vaultInfoQuery.data, roleRank);
+  const canManageRows = writeRestriction === null;
+  const canPublish = roleRank >= ROLE_RANK.writer && !writeRestriction;
+  const canDelete = roleRank >= ROLE_RANK.admin && !writeRestriction;
 
   const closeSchema = useCallback(() => {
     setSchemaOpen(false);
     window.requestAnimationFrame(() => schemaToggleRef.current?.focus());
   }, []);
-
-  useEffect(() => {
-    void refreshTableData(true);
-    return () => {
-      dataRequestRef.current += 1;
-    };
-  }, [refreshTableData]);
 
   useEffect(() => {
     if (!rowNotice) return;
@@ -193,6 +190,13 @@ export default function TablePage() {
     };
   }, [closeSchema, schemaOpen]);
 
+  useEffect(() => {
+    if (!rowsQuery.data || rowsQuery.isPlaceholderData) return;
+    const pageCount = Math.max(1, Math.ceil(total / queryState.pageSize));
+    if (queryState.pageIndex < pageCount) return;
+    setQueryState({ ...queryState, pageIndex: pageCount - 1 });
+  }, [queryState, rowsQuery.data, rowsQuery.isPlaceholderData, setQueryState, total]);
+
   const columnByName = useMemo(
     () =>
       new Map<string, Column>([
@@ -210,10 +214,37 @@ export default function TablePage() {
   const primaryKeyCount = info?.columns?.filter((column) => column.primary_key).length || 0;
   const requiredCount =
     info?.columns?.filter((column) => column.required || column.primary_key).length || 0;
-  const sampled = rowCount > rows.length;
+  const displayPageIndex = rowsQuery.data?.queryPageIndex ?? queryState.pageIndex;
+  const displayPageSize = rowsQuery.data?.queryPageSize ?? queryState.pageSize;
+  const pageStart = total === 0 ? 0 : displayPageIndex * displayPageSize + 1;
+  const pageEnd = total === 0 ? 0 : Math.min(pageStart + rows.length - 1, total);
+  const activeSort = queryState.sort || DEFAULT_TABLE_SORT;
+  const availableColumns = Array.from(columnByName.values());
+  const queryError = tableRowsError(rowsQuery.error, Boolean(info));
 
-  if (loading || infoLoading) {
+  if (vaultInfoQuery.isPending || catalogQuery.isPending || rowsQuery.isPending) {
     return <TablePageLoading />;
+  }
+
+  async function refreshTableData() {
+    await Promise.all([rowsQuery.refetch(), catalogQuery.refetch()]);
+  }
+
+  function updatePage(pageIndex: number) {
+    setQueryState({ ...queryState, pageIndex });
+  }
+
+  function updatePageSize(pageSize: TablePageSize) {
+    setQueryState({ ...queryState, pageIndex: 0, pageSize });
+  }
+
+  function updateSort(column: string) {
+    const next: TableSort = {
+      column,
+      direction:
+        activeSort.column === column && activeSort.direction === "asc" ? "desc" : "asc",
+    };
+    setQueryState({ ...queryState, pageIndex: 0, sort: next });
   }
 
   return (
@@ -245,22 +276,23 @@ export default function TablePage() {
                 {visibleColumnCount} columns
               </span>
             </div>
-            {canManageRows && (
-              <Button
-                type="button"
-                variant="accent"
-                size="sm"
-                onClick={() => {
-                  setSelectedRow(null);
-                  setRowDialogMode("create");
-                }}
-                disabled={!info?.columns?.length}
-                title={!info?.columns?.length ? "Schema metadata is required to add rows" : undefined}
-              >
-                <Plus className="h-4 w-4" aria-hidden />
-                <span className="hidden sm:inline">Add row</span>
-              </Button>
-            )}
+            <Button
+              type="button"
+              variant="accent"
+              size="sm"
+              onClick={() => {
+                setSelectedRow(null);
+                setRowDialogMode("create");
+              }}
+              disabled={!canManageRows || !info?.columns?.length}
+              title={
+                writeRestriction ||
+                (!info?.columns?.length ? "Schema metadata is required to add rows" : undefined)
+              }
+            >
+              <Plus className="h-4 w-4" aria-hidden />
+              <span className="hidden sm:inline">Add row</span>
+            </Button>
             <Button
               ref={schemaToggleRef}
               type="button"
@@ -310,7 +342,7 @@ export default function TablePage() {
               ) : (
                 <span className="inline-flex items-center gap-1.5 whitespace-nowrap tabular-nums">
                   <Rows3 className="h-3.5 w-3.5" aria-hidden />
-                  {sampled ? `${rows.length} of ${rowCount}` : `${rows.length} rows`}
+                  {pageStart}–{pageEnd} of {total}
                 </span>
               )
             }
@@ -318,19 +350,17 @@ export default function TablePage() {
             <div className="flex min-w-0 items-center gap-2 text-xs text-foreground-muted">
               <Info className="h-3.5 w-3.5 shrink-0 text-link" aria-hidden />
               <TooltipText
-                tip={
-                  info?.description ||
-                  (canManageRows
-                    ? "Add, edit, or remove records in this Vault table."
-                    : "A read-only view of this Vault table.")
-                }
+                tip={info?.description || "Browse records in this Vault table."}
                 className="truncate"
               >
-                {info?.description ||
-                  (canManageRows
-                    ? "Add, edit, or remove records in this Vault table."
-                    : "A read-only view of this Vault table.")}
+                {info?.description || "Browse records in this Vault table."}
               </TooltipText>
+              {writeRestriction && (
+                <>
+                  <span aria-hidden>·</span>
+                  <span className="truncate">{writeRestriction}</span>
+                </>
+              )}
             </div>
           </ResourceContextBar>
 
@@ -341,132 +371,213 @@ export default function TablePage() {
               <>
                 <span className="tabular-nums">{cols.length} columns</span>
                 <span className="hidden sm:inline">
-                  {sampled ? `Latest ${limit} rows` : "Complete result"}
+                  {queryState.filters.length > 0 ? `${total} matching` : `${total} rows`}
                 </span>
               </>
             }
             bodyClassName="overflow-hidden"
           >
-            {error ? (
-              <div className="p-4 sm:p-6">
-                <Alert variant="destructive" title="Query failed">
-                  <span className="font-mono">{error}</span>
-                </Alert>
-              </div>
-            ) : rows.length === 0 ? (
-              <div className="flex min-h-64 flex-col items-center justify-center px-6 py-12 text-center">
-                <Table2 className="h-9 w-9 text-foreground-muted" aria-hidden />
-                <h2 className="mt-4 text-sm font-semibold text-foreground">No rows yet</h2>
-                <p className="mt-1 max-w-sm text-sm text-foreground-muted">
-                  {canManageRows
-                    ? "The schema is ready. Add the first record to start using this table."
-                    : "The schema is ready, but this table does not contain any records."}
-                </p>
-                {canManageRows && info?.columns?.length ? (
-                  <Button
-                    type="button"
-                    variant="accent"
-                    size="sm"
-                    className="mt-5"
-                    onClick={() => {
-                      setSelectedRow(null);
-                      setRowDialogMode("create");
-                    }}
-                  >
-                    <Plus className="h-4 w-4" aria-hidden />
-                    Add first row
-                  </Button>
-                ) : null}
-              </div>
-            ) : (
-              <div
-                role="region"
-                aria-label={`Preview rows for ${table}`}
-                tabIndex={0}
-                className="h-full overflow-auto focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-              >
-                <table className="min-w-full border-separate border-spacing-0 text-sm">
-                  <thead>
-                    <tr>
-                      <th
-                        scope="col"
-                        className="sticky left-0 top-0 z-[var(--z-sticky)] w-12 border-b border-r border-border bg-surface-2 px-3 py-2.5 text-left text-xs font-medium text-foreground-muted"
-                      >
-                        #
-                      </th>
-                      {cols.map((columnName) => (
+            <div className="flex h-full min-h-0 flex-col">
+              <TableFilterBar
+                filters={queryState.filters}
+                onOpen={() => setFiltersOpen(true)}
+                onRemove={(index) =>
+                  setQueryState({
+                    ...queryState,
+                    pageIndex: 0,
+                    filters: queryState.filters.filter((_, filterIndex) => filterIndex !== index),
+                  })
+                }
+                onClear={() => setQueryState({ ...queryState, pageIndex: 0, filters: [] })}
+                onRefresh={() => void refreshTableData()}
+                refreshing={rowsQuery.isFetching}
+              />
+              {queryError && rowsQuery.data && (
+                <div className="shrink-0 border-b border-border p-3">
+                  <Alert variant="destructive" title="Records could not be refreshed">
+                    {queryError}
+                  </Alert>
+                </div>
+              )}
+              {queryError && !rowsQuery.data ? (
+                <div className="p-4 sm:p-6">
+                  <Alert variant="destructive" title="Records could not be loaded">
+                    {queryError}
+                  </Alert>
+                </div>
+              ) : rows.length === 0 ? (
+                <div className="flex min-h-64 flex-1 flex-col items-center justify-center px-6 py-12 text-center">
+                  <Table2 className="h-9 w-9 text-foreground-muted" aria-hidden />
+                  <h2 className="mt-4 text-sm font-semibold text-foreground">
+                    {queryState.filters.length > 0 ? "No records match these filters" : "No rows yet"}
+                  </h2>
+                  <p className="mt-1 max-w-sm text-sm text-foreground-muted">
+                    {queryState.filters.length > 0
+                      ? "Remove a filter or change its value to broaden the result."
+                      : canManageRows
+                        ? "The schema is ready. Add the first record to start using this table."
+                        : "The schema is ready, but this table does not contain any records."}
+                  </p>
+                  {queryState.filters.length > 0 ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="mt-5"
+                      onClick={() => setQueryState({ ...queryState, pageIndex: 0, filters: [] })}
+                    >
+                      Clear filters
+                    </Button>
+                  ) : canManageRows && info?.columns?.length ? (
+                    <Button
+                      type="button"
+                      variant="accent"
+                      size="sm"
+                      className="mt-5"
+                      onClick={() => {
+                        setSelectedRow(null);
+                        setRowDialogMode("create");
+                      }}
+                    >
+                      <Plus className="h-4 w-4" aria-hidden />
+                      Add first row
+                    </Button>
+                  ) : null}
+                </div>
+              ) : (
+                <div
+                  role="region"
+                  aria-label={`Records for ${table}`}
+                  aria-busy={rowsQuery.isFetching || undefined}
+                  tabIndex={0}
+                  className="min-h-0 flex-1 overflow-auto focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                >
+                  <table className="min-w-full border-separate border-spacing-0 text-sm">
+                    <thead>
+                      <tr>
                         <th
-                          key={columnName}
                           scope="col"
-                          className="sticky top-0 z-[var(--z-raised)] min-w-36 border-b border-r border-border bg-surface-2 px-3 py-2.5 text-left last:border-r-0"
+                          className="sticky left-0 top-0 z-[var(--z-sticky)] w-12 border-b border-r border-border bg-surface-2 px-3 py-2.5 text-left text-xs font-medium text-foreground-muted"
                         >
-                          <span className="block whitespace-nowrap font-mono text-xs font-medium text-foreground">
-                            {columnName}
-                          </span>
-                          {columnByName.get(columnName)?.type && (
-                            <span className="mt-0.5 block whitespace-nowrap text-xs font-normal text-foreground-muted">
-                              {columnByName.get(columnName)?.type}
-                            </span>
-                          )}
+                          #
                         </th>
-                      ))}
-                      {canManageRows && (
-                        <th
-                          scope="col"
-                          className="sticky right-0 top-0 z-[var(--z-sticky)] w-12 border-b border-l border-border bg-surface-2 px-2 py-2.5 text-center text-xs font-medium text-foreground-muted"
-                        >
-                          <span className="sr-only">Row actions</span>
-                        </th>
-                      )}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {rows.map((row, rowIndex) => (
-                      <tr
-                        key={typeof row.id === "string" ? row.id : rowIndex}
-                        className="group transition-colors hover:bg-surface-hover"
-                      >
-                        <td className="sticky left-0 z-[var(--z-raised)] border-b border-r border-border bg-surface px-3 py-2 text-xs text-foreground-muted tabular-nums group-hover:bg-surface-hover">
-                          {rowIndex + 1}
-                        </td>
                         {cols.map((columnName) => {
-                          const value = row[columnName];
-                          const numeric =
-                            typeof value === "number" ||
-                            isNumericColumnType(columnByName.get(columnName)?.type);
+                          const sorted = activeSort.column === columnName;
+                          const SortIcon = sorted
+                            ? activeSort.direction === "asc"
+                              ? ArrowUp
+                              : ArrowDown
+                            : ArrowUpDown;
                           return (
-                            <TooltipText key={columnName} asChild tip={formatCellFull(value)}>
-                              <td
-                                className={cn(
-                                  "max-w-md truncate whitespace-nowrap border-b border-r border-border px-3 py-2 text-foreground last:border-r-0",
-                                  numeric && "text-right tabular-nums",
-                                  value !== null && typeof value === "object" && "font-mono text-xs",
-                                  value === null && "italic text-foreground-muted",
-                                )}
+                            <th
+                              key={columnName}
+                              scope="col"
+                              aria-sort={
+                                sorted
+                                  ? activeSort.direction === "asc"
+                                    ? "ascending"
+                                    : "descending"
+                                  : "none"
+                              }
+                              className="sticky top-0 z-[var(--z-raised)] min-w-36 border-b border-r border-border bg-surface-2 p-0 text-left last:border-r-0"
+                            >
+                              <button
+                                type="button"
+                                className="flex min-h-11 w-full cursor-pointer items-center justify-between gap-3 px-3 py-2 text-left hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                                onClick={() => updateSort(columnName)}
+                                aria-label={`Sort by ${columnName}, ${
+                                  sorted ? activeSort.direction : "not currently sorted"
+                                }`}
                               >
-                                {formatCell(value)}
-                              </td>
-                            </TooltipText>
+                                <span className="min-w-0">
+                                  <span className="block truncate whitespace-nowrap font-mono text-xs font-medium text-foreground">
+                                    {columnName}
+                                  </span>
+                                  {columnByName.get(columnName)?.type && (
+                                    <span className="mt-0.5 block whitespace-nowrap text-xs font-normal text-foreground-muted">
+                                      {columnByName.get(columnName)?.type}
+                                    </span>
+                                  )}
+                                </span>
+                                <SortIcon
+                                  className={cn(
+                                    "h-3.5 w-3.5 shrink-0",
+                                    sorted ? "text-link" : "text-foreground-muted",
+                                  )}
+                                  aria-hidden
+                                />
+                              </button>
+                            </th>
                           );
                         })}
                         {canManageRows && (
-                          <td className="sticky right-0 z-[var(--z-raised)] border-b border-l border-border bg-surface px-1 py-1 text-center group-hover:bg-surface-hover">
-                            <RowActionsMenu
-                              rowNumber={rowIndex + 1}
-                              onEdit={() => {
-                                setSelectedRow(row);
-                                setRowDialogMode("edit");
-                              }}
-                              onDelete={() => setRowToDelete(row)}
-                            />
-                          </td>
+                          <th
+                            scope="col"
+                            className="sticky right-0 top-0 z-[var(--z-sticky)] w-12 border-b border-l border-border bg-surface-2 px-2 py-2.5 text-center text-xs font-medium text-foreground-muted"
+                          >
+                            <span className="sr-only">Row actions</span>
+                          </th>
                         )}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
+                    </thead>
+                    <tbody>
+                      {rows.map((row, rowIndex) => (
+                        <tr
+                          key={typeof row.id === "string" ? row.id : rowIndex}
+                          className="group transition-colors hover:bg-surface-hover"
+                        >
+                          <td className="sticky left-0 z-[var(--z-raised)] border-b border-r border-border bg-surface px-3 py-2 text-xs text-foreground-muted tabular-nums group-hover:bg-surface-hover">
+                            {displayPageIndex * displayPageSize + rowIndex + 1}
+                          </td>
+                          {cols.map((columnName) => {
+                            const value = row[columnName];
+                            const numeric =
+                              typeof value === "number" ||
+                              isNumericColumnType(columnByName.get(columnName)?.type);
+                            return (
+                              <TooltipText key={columnName} asChild tip={formatCellFull(value)}>
+                                <td
+                                  className={cn(
+                                    "max-w-md truncate whitespace-nowrap border-b border-r border-border px-3 py-2 text-foreground last:border-r-0",
+                                    numeric && "text-right tabular-nums",
+                                    value !== null && typeof value === "object" && "font-mono text-xs",
+                                    value === null && "italic text-foreground-muted",
+                                  )}
+                                >
+                                  {formatCell(value)}
+                                </td>
+                              </TooltipText>
+                            );
+                          })}
+                          {canManageRows && (
+                            <td className="sticky right-0 z-[var(--z-raised)] border-b border-l border-border bg-surface px-1 py-1 text-center group-hover:bg-surface-hover">
+                              <RowActionsMenu
+                                rowNumber={displayPageIndex * displayPageSize + rowIndex + 1}
+                                onEdit={() => {
+                                  setSelectedRow(row);
+                                  setRowDialogMode("edit");
+                                }}
+                                onDelete={() => setRowToDelete(row)}
+                              />
+                            </td>
+                          )}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              {rowsQuery.data && total > 0 && (
+                <TablePagination
+                  pageIndex={displayPageIndex}
+                  pageSize={displayPageSize}
+                  total={total}
+                  itemCount={rows.length}
+                  onPageChange={updatePage}
+                  onPageSizeChange={updatePageSize}
+                />
+              )}
+            </div>
           </ResourceViewerFrame>
         </ResourceCanvas>
 
@@ -597,6 +708,18 @@ export default function TablePage() {
         columns={info?.columns || []}
         onPublished={setPublished}
       />
+      <TableFilterDialog
+        open={filtersOpen}
+        onOpenChange={setFiltersOpen}
+        columns={availableColumns}
+        onAdd={(filter) =>
+          setQueryState({
+            ...queryState,
+            pageIndex: 0,
+            filters: [...queryState.filters, filter],
+          })
+        }
+      />
       <TableRowDialog
         open={rowDialogMode !== null}
         onOpenChange={(open) => {
@@ -608,19 +731,40 @@ export default function TablePage() {
         table={table || "Table"}
         columns={info?.columns || []}
         row={selectedRow}
-        onSave={async (values) => {
+        onSave={async (values, options) => {
           if (!vault || !table) return;
           if (rowDialogMode === "edit") {
             const rowId = selectedRow?.id;
             if (typeof rowId !== "string") throw new Error("This row does not have a valid id.");
-            await updateVaultTableRow(vault, table, rowId, values);
+            await updateVaultTableRow(vault, table, rowId, values, {
+              expectedUpdatedAt:
+                typeof selectedRow?.updated_at === "string" ? selectedRow.updated_at : undefined,
+              force: options?.force,
+            });
             setRowNotice("Row updated");
           } else {
             await insertVaultTableRow(vault, table, values);
-            setRowNotice("Row added");
+            setRowNotice(
+              queryState.filters.length > 0
+                ? "Row added · current filters may hide it"
+                : "Row added",
+            );
+            if (queryState.filters.length === 0 && queryState.pageIndex !== 0) {
+              setQueryState({ ...queryState, pageIndex: 0 });
+            }
           }
-          await refreshTableData();
+          await Promise.all([
+            queryClient.invalidateQueries({ queryKey: ["vault-table-rows", vault, table] }),
+            queryClient.invalidateQueries({ queryKey: ["vault-tables", vault] }),
+          ]);
           refetchTree();
+        }}
+        onReloadConflict={async () => {
+          if (!vault || !table || typeof selectedRow?.id !== "string") return null;
+          const latest = await getVaultTableRow(vault, table, selectedRow.id);
+          if (latest) setSelectedRow(latest);
+          await queryClient.invalidateQueries({ queryKey: ["vault-table-rows", vault, table] });
+          return latest;
         }}
       />
       <ConfirmDialog
@@ -634,8 +778,32 @@ export default function TablePage() {
           if (!vault || !table || typeof rowToDelete?.id !== "string") {
             throw new Error("This row does not have a valid id.");
           }
-          await deleteVaultTableRow(vault, table, rowToDelete.id);
-          await refreshTableData();
+          try {
+            await deleteVaultTableRow(vault, table, rowToDelete.id, {
+              expectedUpdatedAt:
+                typeof rowToDelete.updated_at === "string" ? rowToDelete.updated_at : undefined,
+            });
+          } catch (caught: unknown) {
+            if (!(caught instanceof TableRowConflictError)) throw caught;
+            const latest = await getVaultTableRow(vault, table, rowToDelete.id);
+            if (!latest) {
+              setRowNotice("Row was already deleted");
+              setRowToDelete(null);
+              await queryClient.invalidateQueries({
+                queryKey: ["vault-table-rows", vault, table],
+              });
+              return;
+            }
+            setRowToDelete(latest);
+            throw new Error(
+              "This row changed after you opened it. The latest version is now loaded; review it and choose Delete row again.",
+              { cause: caught },
+            );
+          }
+          await Promise.all([
+            queryClient.invalidateQueries({ queryKey: ["vault-table-rows", vault, table] }),
+            queryClient.invalidateQueries({ queryKey: ["vault-tables", vault] }),
+          ]);
           refetchTree();
           setRowNotice("Row deleted");
           setRowToDelete(null);
@@ -643,6 +811,27 @@ export default function TablePage() {
       />
     </ResourceWorkspace>
   );
+}
+
+function rowWriteRestriction(
+  vaultInfo: { role?: string; is_archived?: boolean; is_external_git?: boolean } | undefined,
+  roleRank: number,
+): string | null {
+  if (!vaultInfo) return "Permissions could not be verified, so rows are read only.";
+  if (vaultInfo.is_archived) return "Archived Vaults are read only.";
+  if (vaultInfo.is_external_git) {
+    return "This Vault is managed from an external Git source, so rows are read only here.";
+  }
+  if (roleRank < ROLE_RANK.writer) return "Writer role required to add, edit, or delete rows.";
+  return null;
+}
+
+function tableRowsError(error: Error | null, tableExists: boolean): string | null {
+  if (!error) return null;
+  if (tableExists && error instanceof ApiError && [404, 405].includes(error.status)) {
+    return "Structured row browsing is not supported by the connected AKB server yet. The table schema is still available.";
+  }
+  return error.message || "The table records could not be loaded.";
 }
 
 function RowActionsMenu({
