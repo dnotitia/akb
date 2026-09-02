@@ -207,15 +207,15 @@ VSO is a cluster-scoped dependency owned separately from every AKB namespace.
 The Kustomize and Helm installers share the same prerequisite policy:
 
 ```bash
-VSO_MODE=auto ... bash deploy/k8s/profiles/standalone-secret-manager/deploy.sh
+VSO_MODE=managed ... bash deploy/k8s/profiles/standalone-secret-manager/deploy.sh
 ```
 
-`auto` installs the pinned `deploy/helm/akb-cluster` release when no controller
-or CRD exists and reuses one compatible Ready VSO installation otherwise.
-`install` can mutate only the dedicated `vault-secrets-operator/akb-cluster`
-release. `reuse` is read-only and fails if VSO is absent, unavailable,
-ambiguous, missing required CRDs, or outside the supported version range.
-`disabled` is valid only for manual Secret profiles.
+`managed` installs or upgrades only the dedicated
+`vault-secrets-operator/akb-cluster` release. `external` is read-only and fails
+if VSO is absent, unavailable, ambiguous, missing required CRDs, or outside the
+supported version range. Bundled profiles default to `managed`; external Secret
+Manager mode defaults to `external`; `disabled` is valid only for manual Secret
+profiles.
 
 The pinned official HashiCorp VSO version is `1.5.1`; the currently supported
 reuse range is `>=1.4.0,<1.6.0`. VSO is BSL 1.1, so deployments that require an
@@ -511,8 +511,8 @@ bash deploy/k8s/profiles/standalone-secret-manager/deploy.sh
 
 Do not point a rehearsal at the existing `akb`, `akb-platform`, or managed
 workspace namespaces. The scripts create and mutate only the namespace passed
-through `NAMESPACE`, except for `VSO_MODE=install` or the install branch of
-`VSO_MODE=auto`, which owns the cluster-scoped
-`vault-secrets-operator/akb-cluster` prerequisite release. That action must be
-run only against the intended cluster context.
-operator installation.
+through `NAMESPACE`, except for `VSO_MODE=managed`, which owns the
+cluster-scoped `vault-secrets-operator/akb-cluster` prerequisite release. That
+action must be run only against the intended cluster context. Use
+`deploy/cluster/status-vso.sh` for an inventory and the guarded
+`deploy/cluster/uninstall-vso.sh` helper for removal.

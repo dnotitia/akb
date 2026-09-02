@@ -60,7 +60,7 @@ SECRET_ENGINE=openbao \
 SECRET_PROFILE=production \
 SECRET_SEAL_MODE=plaintext \
 SECRET_TOPOLOGY=production-ha \
-VSO_MODE=auto \
+VSO_MODE=managed \
 SECRET_STORE_CERT_ISSUER_NAME=internal-ca \
 PUBLIC_URL=https://akb.example.com \
 SSO_KEYCLOAK_PUBLIC_URL=https://auth.akb.example.com \
@@ -123,13 +123,12 @@ helm upgrade --install akb-cluster deploy/helm/akb-cluster \
   --namespace vault-secrets-operator --create-namespace --wait
 ```
 
-`install.sh` performs the same prerequisite step automatically for bundled and
-external Secret Manager modes. `VSO_MODE=auto` installs the pinned release when
-no VSO exists and reuses a compatible Ready controller otherwise.
-`VSO_MODE=install` may install or upgrade only the dedicated
-`vault-secrets-operator/akb-cluster` release. `VSO_MODE=reuse` requires an
-existing compatible controller and never changes it. Manual Secret profiles
-use `VSO_MODE=disabled` and do not need VSO.
+`install.sh` performs the same prerequisite step automatically. Bundled profiles
+default to `VSO_MODE=managed`, which installs or upgrades only the dedicated
+`vault-secrets-operator/akb-cluster` release. External Secret Manager mode
+defaults to `VSO_MODE=external`, which requires an existing compatible Ready
+controller and never changes it. Manual Secret profiles use
+`VSO_MODE=disabled` and do not need VSO.
 
 Every AKB release still owns its namespace-local `VaultConnection`,
 `VaultAuth`, ServiceAccount, `VaultStaticSecret`, CA reference, and destination
@@ -164,4 +163,7 @@ remain native engine output.
 Use the same profile values on every upgrade. The chart never generates or
 rotates application secrets. `akb-vaultdata` and Secret Manager Raft PVCs are
 retained; deleting retained data is a separate, explicit operator action. VSO
-is upgraded or removed only through the `akb-cluster` release.
+is upgraded only through the `akb-cluster` release. Use
+`deploy/cluster/status-vso.sh` to list AKB consumers and
+`deploy/cluster/uninstall-vso.sh` for guarded removal; the latter refuses to
+run while any VSO custom resource remains.

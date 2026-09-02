@@ -97,6 +97,25 @@ def test_chart_dependencies_are_pinned_and_source_installable():
         text=True,
         timeout=90,
     )
+    cluster_output = subprocess.run(
+        [
+            _helm(),
+            "template",
+            "akb-cluster",
+            str(_CLUSTER_CHART),
+            "--namespace",
+            "vault-secrets-operator",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=90,
+    ).stdout
+    cluster_resources = [item for item in yaml.safe_load_all(cluster_output) if isinstance(item, dict)]
+    controller = next(item for item in cluster_resources if item.get("kind") == "Deployment")
+    assert controller["spec"]["replicas"] == 2
+    disruption_budget = next(item for item in cluster_resources if item.get("kind") == "PodDisruptionBudget")
+    assert disruption_budget["spec"]["minAvailable"] == 1
 
 
 @pytest.mark.parametrize(

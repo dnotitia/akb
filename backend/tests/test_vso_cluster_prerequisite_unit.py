@@ -10,6 +10,7 @@ import subprocess
 
 _ROOT = Path(__file__).resolve().parents[2]
 _MANAGER = _ROOT / "deploy" / "cluster" / "ensure-vso.sh"
+_UNINSTALLER = _ROOT / "deploy" / "cluster" / "uninstall-vso.sh"
 
 
 def _deployment(*, version: str = "1.5.1", owned: bool = True, name: str = "vso") -> dict:
@@ -86,12 +87,12 @@ if [[ "$1" == "upgrade" ]]; then touch {state!s}; fi
     return env, log
 
 
-def test_reuse_is_read_only_for_one_compatible_ready_controller(tmp_path: Path):
+def test_external_is_read_only_for_one_compatible_ready_controller(tmp_path: Path):
     env, log = _fake_tools(
         tmp_path,
         deployments_before=[_deployment(version="1.4.0", owned=False)],
     )
-    env["VSO_MODE"] = "reuse"
+    env["VSO_MODE"] = "external"
     result = subprocess.run(
         ["bash", str(_MANAGER)],
         check=False,
@@ -106,13 +107,13 @@ def test_reuse_is_read_only_for_one_compatible_ready_controller(tmp_path: Path):
     assert not log.exists()
 
 
-def test_auto_installs_dedicated_release_only_when_vso_is_absent(tmp_path: Path):
+def test_managed_installs_dedicated_release_only_when_vso_is_absent(tmp_path: Path):
     env, log = _fake_tools(
         tmp_path,
         deployments_before=[],
         deployments_after=[_deployment()],
     )
-    env["VSO_MODE"] = "auto"
+    env["VSO_MODE"] = "managed"
     result = subprocess.run(
         ["bash", str(_MANAGER)],
         check=False,
@@ -134,7 +135,7 @@ def test_multiple_controllers_fail_closed_before_helm_mutation(tmp_path: Path):
         tmp_path,
         deployments_before=[_deployment(name="vso-a"), _deployment(name="vso-b")],
     )
-    env["VSO_MODE"] = "auto"
+    env["VSO_MODE"] = "managed"
     result = subprocess.run(
         ["bash", str(_MANAGER)],
         check=False,
@@ -148,12 +149,12 @@ def test_multiple_controllers_fail_closed_before_helm_mutation(tmp_path: Path):
     assert not log.exists()
 
 
-def test_install_refuses_to_take_over_foreign_release(tmp_path: Path):
+def test_managed_refuses_to_take_over_foreign_release(tmp_path: Path):
     env, log = _fake_tools(
         tmp_path,
         deployments_before=[_deployment(owned=False)],
     )
-    env["VSO_MODE"] = "install"
+    env["VSO_MODE"] = "managed"
     result = subprocess.run(
         ["bash", str(_MANAGER)],
         check=False,
@@ -165,3 +166,34 @@ def test_install_refuses_to_take_over_foreign_release(tmp_path: Path):
     assert result.returncode == 1
     assert "not owned by Helm release" in result.stderr
     assert not log.exists()
+
+
+def test_uninstall_refuses_while_any_vso_consumer_remains(tmp_path: Path):
+    helm_log = tmp_path / "helm.log"
+    _write_executable(
+        tmp_path / "kubectl",
+        """#!/usr/bin/env bash
+set -eu
+printf '%s\n' 'vaultstaticsecret.secrets.hashicorp.com/akb-runtime'
+""",
+    )
+    _write_executable(
+        tmp_path / "helm",
+        f"""#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$*" >> {helm_log!s}
+""",
+    )
+    env = dict(os.environ)
+    env["PATH"] = f"{tmp_path}:{env['PATH']}"
+    result = subprocess.run(
+        ["bash", str(_UNINSTALLER)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+    assert result.returncode == 1
+    assert "Refusing to remove VSO" in result.stderr
+    assert not helm_log.exists()

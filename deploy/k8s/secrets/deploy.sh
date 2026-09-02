@@ -17,11 +17,11 @@ BOOTSTRAP_DOCKER_PLATFORM="${BOOTSTRAP_DOCKER_PLATFORM:-linux/amd64}"
 SECRET_STORE_RELEASE="${SECRET_STORE_RELEASE:-}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-}"
 if [[ -z "${VSO_MODE:-}" ]]; then
-  if [[ "${SECRET_MODE}" == "manual" ]]; then
-    VSO_MODE="disabled"
-  else
-    VSO_MODE="auto"
-  fi
+  case "${SECRET_MODE}" in
+    manual) VSO_MODE="disabled" ;;
+    bundled) VSO_MODE="managed" ;;
+    external) VSO_MODE="external" ;;
+  esac
 fi
 KV_MOUNT="${KV_MOUNT:-kv}"
 KV_PATH="${KV_PATH:-akb/runtime}"
@@ -53,9 +53,9 @@ if [[ "${BOOTSTRAP_DOCKER_PLATFORM}" != "linux/amd64" &&
   exit 2
 fi
 case "${VSO_MODE}" in
-  auto|install|reuse|disabled) ;;
+  managed|external|disabled) ;;
   *)
-    echo "VSO_MODE must be auto, install, reuse, or disabled" >&2
+    echo "VSO_MODE must be managed, external, or disabled" >&2
     exit 2
     ;;
 esac

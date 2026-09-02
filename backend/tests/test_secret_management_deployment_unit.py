@@ -342,7 +342,7 @@ def test_vso_mode_validation_fails_before_cluster_commands():
         },
     )
     assert result.returncode == 2
-    assert "VSO_MODE must be auto, install, reuse, or disabled" in result.stderr
+    assert "VSO_MODE must be managed, external, or disabled" in result.stderr
     assert "Building Docker images" not in result.stdout
     assert "Creating namespace" not in result.stdout
 

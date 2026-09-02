@@ -21,9 +21,9 @@
 #   SECRET_MODE    manual (default), bundled, or external. Bundled is selected
 #                  by the *-secret-manager profiles; external is an adapter
 #                  override for standalone / standalone-sso.
-#   VSO_MODE       auto (install once or reuse), install, reuse, or disabled.
-#                  Manual profiles use disabled; Secret Manager modes require
-#                  the cluster-scoped VSO prerequisite.
+#   VSO_MODE       managed, external, or disabled. Bundled profiles default to
+#                  managed, external Secret Manager mode defaults to external,
+#                  and manual profiles use disabled.
 #   SECRET_ENGINE  openbao or hashicorp-vault for bundled/external modes.
 #   SECRET_PROFILE development (default) or production for bundled mode.
 #   SECRET_SEAL_MODE plaintext (default), pgp, or auto for production bundles.
@@ -87,16 +87,16 @@ elif [[ "${SECRET_MODE}" != "bundled" ]]; then
 fi
 
 if [[ -z "${VSO_MODE:-}" ]]; then
-  if [[ "${SECRET_MODE}" == "manual" ]]; then
-    VSO_MODE="disabled"
-  else
-    VSO_MODE="auto"
-  fi
+  case "${SECRET_MODE}" in
+    manual) VSO_MODE="disabled" ;;
+    bundled) VSO_MODE="managed" ;;
+    external) VSO_MODE="external" ;;
+  esac
 fi
 case "${VSO_MODE}" in
-  auto|install|reuse|disabled) ;;
+  managed|external|disabled) ;;
   *)
-    echo "VSO_MODE must be auto, install, reuse, or disabled" >&2
+    echo "VSO_MODE must be managed, external, or disabled" >&2
     exit 2
     ;;
 esac

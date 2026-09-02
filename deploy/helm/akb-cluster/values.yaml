@@ -3,4 +3,8 @@
 vso:
   enabled: true
   controller:
-    replicas: 1
+    replicas: 2
+    podDisruptionBudget:
+      enabled: true
+      maxUnavailable: ""
+      minAvailable: "1"

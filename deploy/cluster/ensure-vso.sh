@@ -8,30 +8,34 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CHART_DIR="${REPO_ROOT}/deploy/helm/akb-cluster"
 
-VSO_MODE="${VSO_MODE:-auto}"
+VSO_MODE="${VSO_MODE:-external}"
 VSO_VERSION="1.5.1"
 VSO_NAMESPACE="${VSO_NAMESPACE:-vault-secrets-operator}"
 VSO_RELEASE="${VSO_RELEASE:-akb-cluster}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-}"
 
 case "${VSO_MODE}" in
-  auto|install|reuse) ;;
+  managed|external) ;;
   disabled)
     echo "VSO prerequisite check disabled"
     exit 0
     ;;
   *)
-    echo "VSO_MODE must be auto, install, reuse, or disabled" >&2
+    echo "VSO_MODE must be managed, external, or disabled" >&2
     exit 2
     ;;
 esac
 
-for command_name in kubectl helm jq; do
+for command_name in kubectl jq; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "${command_name} is required to manage the VSO prerequisite" >&2
     exit 2
   fi
 done
+if [[ "${VSO_MODE}" == "managed" ]] && ! command -v helm >/dev/null 2>&1; then
+  echo "helm is required when VSO_MODE=managed" >&2
+  exit 2
+fi
 
 KUBECTL=(kubectl)
 HELM=(helm)
@@ -144,7 +148,7 @@ install_controller() {
     if [[ "${controller_release}" != "${VSO_RELEASE}" ||
           "${controller_release_namespace}" != "${VSO_NAMESPACE}" ]]; then
       echo "Existing VSO ${controller_record} is not owned by Helm release ${VSO_NAMESPACE}/${VSO_RELEASE}" >&2
-      echo "Use VSO_MODE=reuse, or let its cluster owner upgrade it" >&2
+      echo "Use VSO_MODE=external, or let its cluster owner upgrade it" >&2
       exit 1
     fi
   fi
@@ -157,20 +161,17 @@ install_controller() {
 }
 
 case "${VSO_MODE}" in
-  auto)
+  external)
     if ! discover_controller; then
-      echo "No VSO installation found; installing cluster prerequisite ${VSO_VERSION}"
-      install_controller
-    fi
-    ;;
-  reuse)
-    if ! discover_controller; then
-      echo "VSO_MODE=reuse requires an existing compatible VSO installation" >&2
+      echo "VSO_MODE=external requires an existing compatible VSO installation" >&2
       exit 1
     fi
     ;;
-  install)
+  managed)
     discover_controller || true
+    if [[ -z "${controller_record}" ]]; then
+      echo "No VSO installation found; installing cluster prerequisite ${VSO_VERSION}"
+    fi
     install_controller
     ;;
 esac

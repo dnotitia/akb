@@ -1,6 +1,7 @@
 {{- define "akb.labels" -}}
 app.kubernetes.io/name: akb
 app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/part-of: akb
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
 {{- end }}

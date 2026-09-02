@@ -41,7 +41,9 @@ set `SECRET_MODE=external` to connect its unchanged Secret Contract to an
 existing Vault-compatible endpoint.
 
 Secret Manager profiles use the cluster prerequisite policy in
-`deploy/cluster/ensure-vso.sh`. `VSO_MODE=auto` installs VSO once through the
-separate `akb-cluster` Helm release or reuses a compatible Ready installation;
-the AKB profile itself owns only namespace-scoped connection, authentication,
-and Secret synchronization resources.
+`deploy/cluster/ensure-vso.sh`. Bundled profiles default to
+`VSO_MODE=managed` and own the separate `akb-cluster` Helm release. External
+Secret Manager mode defaults to `VSO_MODE=external` and only validates a
+compatible Ready installation. The AKB profile itself owns only
+namespace-scoped connection, authentication, and Secret synchronization
+resources.
