@@ -41,6 +41,7 @@ data:
     # Required canonical human-login mode. This base deployment is local.
     auth_mode: local
     jwt_algorithm: RS256
+    local_session_issuer: https://akb.example.com
     local_session_private_key_path: /etc/akb/local-session/private.pem
     local_session_jwks_path: /etc/akb/local-session/jwks.json
 
@@ -55,7 +56,7 @@ data:
     vector_collection: chunks
 
     # Set to your public ingress URL for absolute /p/{slug} publication URLs.
-    public_base_url: ""
+    public_base_url: https://akb.example.com
 
     # Event stream (optional Redis fanout). Leave blank to disable —
     # PG `events` outbox still works.
@@ -64,8 +65,9 @@ data:
     redis_stream_maxlen: 100000
 
 ---
-# akb-secret-config — managed manually (kubectl edit / sealed-secrets / vault),
-# never committed. Mounted at /etc/akb/secret.yaml. Expected shape:
+# akb-secret — produced by the manual, bundled, or external Secret profile and
+# never committed. Its `secret.yaml` key is mounted at /etc/akb/secret.yaml.
+# Expected configuration payload:
 #
 #   stringData:
 #     secret.yaml: |
@@ -102,6 +104,9 @@ spec:
       labels:
         app: akb-backend
     spec:
+      # AKB consumes mounted configuration only. Secret managers and their
+      # sync operators own Kubernetes API access; the application pod does not.
+      automountServiceAccountToken: false
       # All worker stop signals are broadcast together and joined under the
       # 35-second application deadline. The remaining 10 seconds cover DB/HTTP
       # client close, audit drain, and interpreter teardown before SIGKILL.
@@ -230,11 +235,19 @@ spec:
             name: akb-app-config
         - name: secret-config
           secret:
-            secretName: akb-secret-config
+            # Shared contract with akb-platform-managed workspaces. The
+            # producer can be manual, bundled Vault/OpenBao, or an external
+            # secret store; the application always consumes this name.
+            secretName: akb-secret # pragma: allowlist secret
         - name: local-session-keys
           secret:
-            secretName: akb-local-session-keys # pragma: allowlist secret
+            secretName: akb-secret # pragma: allowlist secret
             defaultMode: 0400
+            items:
+              - key: local-session-private.pem
+                path: private.pem
+              - key: local-session-jwks.json
+                path: jwks.json
         - name: vaultdata
           persistentVolumeClaim:
             claimName: akb-vaultdata

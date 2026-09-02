@@ -44,8 +44,10 @@ spec:
           # return a proper 404 JSON instead of being caught by the
           # frontend SPA's index.html catch-all (which would deliver a
           # 200 HTML page that breaks the client's JSON parser).
-          - path: /.well-known/
-            pathType: Prefix
+          - path: /.well-known
+            # Kubernetes rejects a dot-prefixed path element with Prefix.
+            # NGINX still applies prefix routing for ImplementationSpecific.
+            pathType: ImplementationSpecific
             backend:
               service:
                 name: backend

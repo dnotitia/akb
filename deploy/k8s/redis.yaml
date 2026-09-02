@@ -7,15 +7,14 @@
 # Used by the events_publisher worker to fan out PG outbox events
 # (`akb:events` stream) to external subscribers via Redis Streams.
 #
-# The `redis-credentials` Secret holding the password is managed manually
-# (kubectl create secret) just like `akb-secret-config` — it's not in this
-# file because deploy.sh re-runs `kubectl kustomize | apply` on every
-# deploy, which would clobber a real password with a placeholder. Setup:
+# The `redis-credentials` Secret holding the password is a compatibility
+# destination of Secret Contract v1. Manual, bundled, and external profiles
+# create it without committing or clobbering a real password. Manual setup:
 #
 #     PW=$(openssl rand -base64 32)
 #     kubectl create secret generic redis-credentials -n akb \
 #       --from-literal=password="$PW"
-#     # then add `redis_password: "$PW"` to akb-secret-config (secret.yaml)
+#     # then add `redis_password: "$PW"` to akb-secret/secret.yaml
 #     # so the backend connects with the matching password.
 
 apiVersion: redis.redis.opstreelabs.in/v1beta2

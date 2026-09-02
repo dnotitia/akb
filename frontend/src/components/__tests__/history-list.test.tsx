@@ -34,7 +34,7 @@ describe("HistoryList", () => {
     render(<HistoryList entries={entries} onSelect={onSelect} />);
 
     fireEvent.click(screen.getByRole("button", { name: /view version abcdef1/i }));
-    expect(onSelect).toHaveBeenCalledWith("abcdef123456");
+    expect(onSelect).toHaveBeenCalledWith(entries[0].hash);
   });
 
   it("keeps the Changes action visible and passes its trigger for focus restoration", () => {
@@ -43,7 +43,7 @@ describe("HistoryList", () => {
 
     const trigger = screen.getByRole("button", { name: /view changes in version abcdef1/i });
     fireEvent.click(trigger);
-    expect(onCompare).toHaveBeenCalledWith("abcdef123456", trigger);
+    expect(onCompare).toHaveBeenCalledWith(entries[0].hash, trigger);
   });
 
   it("marks a prefix-matched comparison without relying on color alone", () => {

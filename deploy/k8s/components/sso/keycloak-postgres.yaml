@@ -1,65 +1,54 @@
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: postgres
+  name: keycloak-postgres
   namespace: akb
 spec:
-  serviceName: postgres
+  serviceName: keycloak-postgres
   replicas: 1
   selector:
     matchLabels:
-      app: akb-postgres
+      app: akb-keycloak-postgres
   template:
     metadata:
       labels:
-        app: akb-postgres
+        app: akb-keycloak-postgres
     spec:
       containers:
         - name: postgres
-          image: pgvector/pgvector:pg16@sha256:a36250871de0833b8757561c72f2477ef1ddd1101afa4e617fb552e0de514c6b
+          image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
           imagePullPolicy: IfNotPresent
-          args:
-            - -c
-            - shared_buffers=512MB
-            - -c
-            - effective_cache_size=1536MB
-            - -c
-            - max_connections=100
           ports:
             - name: postgres
               containerPort: 5432
           envFrom:
             - secretRef:
-                name: akb-postgres-credentials
+                name: akb-keycloak-db-credentials
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
           volumeMounts:
             - name: pgdata
               mountPath: /var/lib/postgresql/data
-            - name: dshm
-              mountPath: /dev/shm
           resources:
             requests:
-              cpu: 500m
-              memory: 1Gi
+              cpu: 250m
+              memory: 512Mi
             limits:
-              cpu: "2"
-              memory: 3Gi
+              cpu: "1"
+              memory: 1Gi
           readinessProbe:
             exec:
               command:
                 - pg_isready
                 - -U
-                - akbuser
+                - keycloak
                 - -d
-                - akb
+                - keycloak
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 12
-      volumes:
-        - name: dshm
-          emptyDir:
-            medium: Memory
-            sizeLimit: 1Gi
   volumeClaimTemplates:
     - metadata:
         name: pgdata
@@ -68,18 +57,18 @@ spec:
           - ReadWriteOnce
         resources:
           requests:
-            storage: 20Gi
+            storage: 10Gi
 
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: postgres
+  name: keycloak-postgres
   namespace: akb
 spec:
   clusterIP: None
   selector:
-    app: akb-postgres
+    app: akb-keycloak-postgres
   ports:
     - name: postgres
       port: 5432

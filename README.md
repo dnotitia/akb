@@ -80,7 +80,7 @@ agent, sign up with any email (a throwaway address is fine) and point the
 > ⚠️ **Throwaway demo.** It is public, wiped and re-seeded weekly, and runs on
 > minimal resources with **no uptime, privacy, or data guarantees**. Don't put
 > anything real or sensitive in it — treat every write as public and ephemeral.
-> For real use, [self-host](#quick-start) in three containers.
+> For real use, [self-host](#quick-start) with Docker Compose or Kubernetes.
 
 ## Why AKB
 
@@ -113,12 +113,12 @@ across systems (AKB: `bge-m3@1024`), so read this as a stack-level comparison.
 
 **Core stays small; flexibility comes from extension, not built-in
 automation.** AKB does not ship its own consolidator, summariser, or
-"knowledge gardener" — instead every write emits a structured event to a
-Redis Stream (`akb:events`). Operators wire any external consumer
-(periodic synthesis bot, doc-rot reaper, weekly-digest agent, audit
+"knowledge gardener" — instead every write records a structured event in the
+PostgreSQL outbox. When `redis_url` is configured, the publisher fans those
+events out to a Redis Stream (`akb:events`). Operators wire any external
+consumer (periodic synthesis bot, doc-rot reaper, weekly-digest agent, audit
 trail, …) on top, with no patches to the core. The base contract is a
-read/write store; opinions about *what to do with* the knowledge live
-outside.
+read/write store; opinions about *what to do with* the knowledge live outside.
 
 ## Architecture
 
@@ -276,8 +276,10 @@ down*; AKB stores, versions, searches, governs, and serves it to agents. See
 
 ## Quick Start
 
-AKB ships as a **3-container stack** (PostgreSQL with pgvector + backend +
-frontend). For semantic (dense) search you bring an OpenAI-compatible
+The default Docker Compose stack runs four long-lived services: PostgreSQL
+with pgvector, MinIO, the backend, and the frontend. A one-shot
+`minio-bootstrap` service creates the local file bucket before the backend
+starts. For semantic (dense) search you bring an OpenAI-compatible
 embedding endpoint (OpenAI, OpenRouter, self-hosted vLLM/TEI, etc.). It is
 not strictly required: with no embed endpoint (or during an outage) the
 pgvector and Qdrant drivers **degrade to BM25-only** lexical search rather
@@ -565,10 +567,25 @@ best-effort and never raises into the serving path. See
 
 ### Production deployment
 
-For Kubernetes, see [`deploy/k8s/README.md`](./deploy/k8s/README.md). The
-`deploy/k8s/` directory contains a generic kustomize base; provide your
-own registry, hostname, and TLS issuer via the documented env vars or an
-operator-private overlay under `deploy/k8s/internal/`.
+For Kubernetes, start with the
+[`deployment guide`](./deploy/k8s/README.md). AKB provides four explicit
+local/SSO and manual/bundled-Secret-Manager profiles through both Helm and the
+Kustomize-based profile installers.
+
+- Use [`deploy/helm/akb/install.sh`](./deploy/helm/akb/README.md) or a matching
+  [`deploy/k8s/profiles/*/deploy.sh`](./deploy/k8s/profiles/README.md) when the
+  installer should coordinate the complete lifecycle, including Secret
+  Manager initialization where selected.
+- Use raw Helm or rendered Kustomize YAML only when the required Secrets,
+  cluster prerequisites, and any native Vault/OpenBao init/unseal/bootstrap
+  steps are already managed separately.
+- Vault Secrets Operator is a cluster-scoped prerequisite. Its ownership and
+  guarded removal are documented under
+  [`deploy/helm/akb-cluster`](./deploy/helm/akb-cluster/README.md).
+
+Real hostnames, registries, storage classes, TLS issuers, and provider settings
+belong in Helm values or an operator-owned Kustomize overlay; do not commit
+production credentials to this repository.
 
 ## Project Structure
 
@@ -594,8 +611,17 @@ akb/
 │   ├── app.yaml.example      # Non-secret runtime settings
 │   └── secret.yaml.example   # API keys, passwords (gitignored when not .example)
 ├── deploy/
-│   └── k8s/                  # Generic kustomize base for Kubernetes
-└── docker-compose.yaml       # 3-container local stack (postgres + backend + frontend)
+│   ├── all-in-one/           # Single-container demo image
+│   ├── cluster/              # Shared VSO prerequisite lifecycle helpers
+│   ├── helm/
+│   │   ├── akb/              # AKB umbrella chart and four values profiles
+│   │   └── akb-cluster/      # Cluster-scoped VSO prerequisite chart
+│   └── k8s/
+│       ├── base/             # Canonical AKB + PostgreSQL application resources
+│       ├── components/       # Reusable additions such as owned Keycloak SSO
+│       ├── profiles/         # Four public Kustomize installer entry points
+│       └── secrets/          # Secret Contract and Vault/OpenBao lifecycle
+└── docker-compose.yaml       # Local stack (PG + MinIO + backend + frontend)
 ```
 
 ## Tech Stack
@@ -610,17 +636,19 @@ akb/
 - **Audit log** (optional): hash-chained append-only JSONL at the MCP
   dispatch point + optional WORM S3 handoff; producer-only (SIEM owns retention)
 - **Frontend**: React 19, TypeScript, Vite, Tailwind CSS v4, Radix UI
-- **Auth**: JWT + Personal Access Tokens (PATs)
+- **Auth**: local RS256 sessions or Keycloak SSO, plus Personal Access Tokens
+  (PATs) for API and MCP access
 - **MCP**: Streamable HTTP (backend) + stdio proxy (`akb-mcp` on npm)
 
 ## Versioning
 
-AKB follows [SemVer](https://semver.org/). The product version lives in
-`backend/pyproject.toml` (`[project].version`) and is mirrored to
-`frontend/package.json` via `scripts/bump-version.sh <x.y.z>`. Each
-`deploy/k8s/deploy.sh` run tags the Docker images with both the explicit
-version (`:${VERSION}`) and `:latest`, so historical builds remain
-pullable for rollback.
+AKB follows [SemVer](https://semver.org/). The backend product version lives in
+`backend/pyproject.toml` (`[project].version`). A coordinated release uses
+`scripts/bump-version.sh <x.y.z>` to update it together with
+`frontend/package.json`. With image building enabled, each
+`deploy/k8s/profiles/*/deploy.sh` run tags the Docker images with both the
+explicit backend version (`:${VERSION}`) and `:latest`, so historical builds
+remain pullable for rollback.
 
 `packages/akb-mcp-client` (the `akb-mcp` npm proxy) follows its own npm
 semver lifecycle and is **not** tied to the product version.

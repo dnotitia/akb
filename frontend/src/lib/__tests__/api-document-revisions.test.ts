@@ -48,7 +48,7 @@ describe("document revision API", () => {
         vault: "demo",
         total: 1,
         activity: [{
-          hash: "abcdef123456",
+          hash: "abcdef123456", // pragma: allowlist secret — synthetic Git commit
           subject: "Legacy update",
           agent: "legacy-user",
           author_name: "Legacy User",
