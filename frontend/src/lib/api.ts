@@ -1191,6 +1191,141 @@ export const getDocument = (vault: string, id: string, version?: string) => {
     version ? `${path}?version=${encodeURIComponent(version)}` : path,
   );
 };
+
+export interface DocumentHistoryEntry {
+  hash: string;
+  message: string;
+  author: string;
+  author_name?: string | null;
+  date: string;
+}
+
+export interface DocumentHistoryResult {
+  kind: "document_history";
+  uri?: string;
+  history: DocumentHistoryEntry[];
+  /**
+   * `activity` is an explicit compatibility mode for a frontend deployed in
+   * front of a server that predates the document-lineage endpoint. It keeps
+   * version browsing available, but the UI labels the reduced guarantee.
+   */
+  source: "document" | "activity";
+}
+
+export interface DocumentDiff {
+  kind: "document_diff";
+  file: string;
+  commit: string;
+  type: "added" | "deleted" | "modified" | "unknown" | "unchanged";
+  diff: string;
+  error?: string | null;
+  /** Additive fields understood by newer servers; the current UI does not require them. */
+  base_commit?: string | null;
+  additions?: number;
+  deletions?: number;
+  hunks?: number;
+  truncated?: boolean;
+}
+
+/**
+ * Status-preserving failure for the version-history surfaces.
+ *
+ * The generic API helper historically discarded status when FastAPI returned
+ * a string `detail`. History/Diff need the status to distinguish an old
+ * server's 404/405 from lost access or a retryable server failure.
+ */
+export class DocumentRevisionApiError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "DocumentRevisionApiError";
+    this.status = status;
+  }
+}
+
+async function documentRevisionJson<T>(path: string): Promise<T> {
+  const response = await authenticatedFetch(`${API_BASE}${path}`);
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    const detail = body?.detail;
+    const message =
+      typeof detail === "string"
+        ? detail
+        : typeof detail?.message === "string"
+          ? detail.message
+          : typeof body?.error === "string"
+            ? body.error
+            : `${response.status} ${response.statusText || "Request failed"}`;
+    throw new DocumentRevisionApiError(message, response.status);
+  }
+  return response.json() as Promise<T>;
+}
+
+export async function getDocumentHistory(
+  vault: string,
+  id: string,
+  limit = 20,
+): Promise<DocumentHistoryResult> {
+  const query = new URLSearchParams({ limit: String(limit) });
+  const result = await documentRevisionJson<{
+    kind: "document_history";
+    uri: string;
+    history: DocumentHistoryEntry[];
+  }>(
+    `/history/${encodeURIComponent(vault)}/${encodeURIComponent(id)}?${query}`,
+  );
+  return { ...result, source: "document" };
+}
+
+function activityEntryToDocumentHistory(entry: ActivityEntry): DocumentHistoryEntry | null {
+  if (!entry.hash) return null;
+  return {
+    hash: entry.hash,
+    message: entry.subject || entry.summary || "Document update",
+    author: entry.author || entry.agent || "Unknown author",
+    author_name: entry.author_name ?? null,
+    date: entry.date || entry.timestamp || "",
+  };
+}
+
+export async function getDocumentHistoryWithFallback(
+  vault: string,
+  id: string,
+  limit = 20,
+): Promise<DocumentHistoryResult> {
+  try {
+    return await getDocumentHistory(vault, id, limit);
+  } catch (error) {
+    if (
+      !(error instanceof DocumentRevisionApiError) ||
+      (error.status !== 404 && error.status !== 405)
+    ) {
+      throw error;
+    }
+  }
+
+  const legacy = await getVaultActivity(vault, { collection: id, limit });
+  return {
+    kind: "document_history",
+    history: legacy.activity
+      .map(activityEntryToDocumentHistory)
+      .filter((entry): entry is DocumentHistoryEntry => entry !== null),
+    source: "activity",
+  };
+}
+
+export function getDocumentDiff(
+  vault: string,
+  id: string,
+  commit: string,
+): Promise<DocumentDiff> {
+  const query = new URLSearchParams({ commit });
+  return documentRevisionJson<DocumentDiff>(
+    `/diff/${encodeURIComponent(vault)}/${encodeURIComponent(id)}?${query}`,
+  );
+}
+
 export const updateDocument = (vault: string, id: string, data: any) =>
   api<any>(`/documents/${vault}/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(data) });
 

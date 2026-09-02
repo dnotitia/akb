@@ -9,6 +9,7 @@ import { VAULT_SKILL_PATH } from "@/lib/skill";
 vi.mock("@/lib/api", () => ({
   authenticatedFetch: vi.fn(),
   getDocument: vi.fn(),
+  getDocumentHistoryWithFallback: vi.fn(),
   getVaultInfo: vi.fn(),
   getRelations: vi.fn(),
   deleteDocument: vi.fn(),
@@ -19,12 +20,14 @@ vi.mock("@/lib/api", () => ({
 import {
   authenticatedFetch,
   getDocument,
+  getDocumentHistoryWithFallback,
   getRelations,
   getVaultInfo,
 } from "@/lib/api";
 
 const authenticatedFetchMock = authenticatedFetch as unknown as ReturnType<typeof vi.fn>;
 const getDocumentMock = getDocument as unknown as ReturnType<typeof vi.fn>;
+const getDocumentHistoryMock = getDocumentHistoryWithFallback as unknown as ReturnType<typeof vi.fn>;
 const getRelationsMock = getRelations as unknown as ReturnType<typeof vi.fn>;
 const getVaultInfoMock = getVaultInfo as unknown as ReturnType<typeof vi.fn>;
 
@@ -55,10 +58,16 @@ function renderAt(url: string) {
 beforeEach(() => {
   authenticatedFetchMock.mockReset();
   getDocumentMock.mockReset();
+  getDocumentHistoryMock.mockReset();
   getRelationsMock.mockReset();
   getVaultInfoMock.mockReset();
 
   authenticatedFetchMock.mockResolvedValue({ ok: true, json: async () => ({ activity: [] }) });
+  getDocumentHistoryMock.mockResolvedValue({
+    kind: "document_history",
+    source: "document",
+    history: [],
+  });
   getDocumentMock.mockResolvedValue({
     path: VAULT_SKILL_PATH,
     title: "Vault guide",

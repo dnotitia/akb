@@ -13,6 +13,8 @@ vi.mock("@/lib/api", async (importOriginal) => {
   return {
     ...actual,
     getDocument: vi.fn(),
+    getDocumentDiff: vi.fn(),
+    getDocumentHistoryWithFallback: vi.fn(),
     getVaultInfo: vi.fn(),
     getRelations: vi.fn(),
     deleteDocument: vi.fn(),
@@ -44,8 +46,11 @@ vi.mock("@/components/markdown-editor", () => ({
 
 import {
   ApiError,
+  DocumentRevisionApiError,
   deleteDocument,
   getDocument,
+  getDocumentDiff,
+  getDocumentHistoryWithFallback,
   getVaultInfo,
   getRelations,
   browseVault,
@@ -55,6 +60,8 @@ import {
 
 const getDocumentMock = getDocument as unknown as ReturnType<typeof vi.fn>;
 const deleteDocumentMock = deleteDocument as unknown as ReturnType<typeof vi.fn>;
+const getDocumentDiffMock = getDocumentDiff as unknown as ReturnType<typeof vi.fn>;
+const getDocumentHistoryMock = getDocumentHistoryWithFallback as unknown as ReturnType<typeof vi.fn>;
 const getVaultInfoMock = getVaultInfo as unknown as ReturnType<typeof vi.fn>;
 const getRelationsMock = getRelations as unknown as ReturnType<typeof vi.fn>;
 const updateDocumentMock = updateDocument as unknown as ReturnType<typeof vi.fn>;
@@ -163,6 +170,8 @@ beforeEach(() => {
   localStorage.clear();
   getDocumentMock.mockReset();
   deleteDocumentMock.mockReset();
+  getDocumentDiffMock.mockReset();
+  getDocumentHistoryMock.mockReset();
   getVaultInfoMock.mockReset();
   getRelationsMock.mockReset();
   updateDocumentMock.mockReset();
@@ -172,6 +181,19 @@ beforeEach(() => {
   getDocumentMock.mockResolvedValue(makeDoc());
   getVaultInfoMock.mockResolvedValue({ role: "reader" });
   getRelationsMock.mockResolvedValue({ relations: [] });
+  getDocumentHistoryMock.mockResolvedValue({
+    kind: "document_history",
+    uri: "akb://v/coll/notes/doc/hello.md",
+    source: "document",
+    history: [],
+  });
+  getDocumentDiffMock.mockResolvedValue({
+    kind: "document_diff",
+    file: "notes/hello.md",
+    commit: "abcdef1234567",
+    type: "modified",
+    diff: "--- a/notes/hello.md\n+++ b/notes/hello.md\n@@ -1,2 +1,2 @@\n-Old title\n+New title\n body",
+  });
   updateDocumentMock.mockResolvedValue({
     current_commit: UPDATED_COMMIT,
     commit_hash: UPDATED_COMMIT,
@@ -194,7 +216,7 @@ beforeEach(() => {
   });
   deleteDocumentMock.mockResolvedValue({ deleted: true });
 
-  // /activity is fetched directly via fetch() — stub it to a no-op.
+  // Keep a safe transport fallback for components that issue direct requests.
   vi.stubGlobal(
     "fetch",
     vi.fn().mockResolvedValue({
@@ -528,6 +550,124 @@ describe("DocumentPage view toggle", () => {
     const relationsTab = await screen.findByRole("tab", { name: /^Relations/ });
     expect(relationsTab).toHaveTextContent(/^Relations1$/);
     expect(relationsTab).not.toHaveTextContent("2");
+  });
+
+  it("loads logical document lineage instead of path-scoped Vault activity", async () => {
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await screen.findByRole("heading", { level: 1, name: "DocTitle" });
+    await waitFor(() =>
+      expect(getDocumentHistoryMock).toHaveBeenCalledWith(
+        "v",
+        "notes/hello.md",
+        20,
+      ),
+    );
+  });
+
+  it("opens a History revision as a full-canvas Diff and restores History focus", async () => {
+    const user = userEvent.setup();
+    getDocumentHistoryMock.mockResolvedValue({
+      kind: "document_history",
+      uri: "akb://v/coll/notes/doc/hello.md",
+      source: "document",
+      history: [
+        {
+          hash: "abcdef1234567",
+          message: "Update title",
+          author: "user-1",
+          author_name: "Kim",
+          date: "2026-09-02T00:00:00Z",
+        },
+        {
+          hash: "1234567abcdef",
+          message: "Create document",
+          author: "user-1",
+          author_name: "Kim",
+          date: "2026-09-01T00:00:00Z",
+        },
+      ],
+    });
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await user.click(await screen.findByRole("button", { name: "History" }));
+    const changes = await screen.findByRole("button", {
+      name: "View changes in version abcdef1",
+    });
+    await user.click(changes);
+
+    expect(await screen.findByRole("table", { name: /unified document changes/i })).toBeInTheDocument();
+    expect(screen.getByTestId("location-search")).toHaveTextContent(
+      "commit=abcdef1234567&view=diff",
+    );
+    expect(document.getElementById("document-details-panel")).toHaveAttribute(
+      "aria-hidden",
+      "true",
+    );
+    expect(screen.queryByRole("tablist", { name: "Document view" })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Back to version" }));
+    await screen.findByRole("heading", { level: 2, name: "BodyHeading" });
+    expect(screen.getByTestId("location-search")).toHaveTextContent(
+      "commit=abcdef1234567",
+    );
+    expect(screen.getByTestId("location-search")).not.toHaveTextContent("view=diff");
+    expect(document.getElementById("document-details-panel")).toHaveAttribute(
+      "aria-hidden",
+      "false",
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "View changes in version abcdef1" }),
+      ).toHaveFocus(),
+    );
+  });
+
+  it("keeps Search preview route state while entering Diff", async () => {
+    const user = userEvent.setup();
+    getDocumentHistoryMock.mockResolvedValue({
+      kind: "document_history",
+      source: "document",
+      history: [{
+        hash: "abcdef1234567",
+        message: "Update title",
+        author: "user-1",
+        date: "2026-09-02T00:00:00Z",
+      }],
+    });
+    renderPreviewAt("/vault/v/doc/notes%2Fhello.md");
+
+    await user.click(await screen.findByRole("button", { name: "History" }));
+    await user.click(await screen.findByRole("button", {
+      name: "View changes in version abcdef1",
+    }));
+
+    expect(await screen.findByRole("table", { name: /unified document changes/i })).toBeInTheDocument();
+    expect(screen.getByTestId("location-state")).toHaveTextContent(
+      '"documentPreview":true',
+    );
+    expect(screen.getByTestId("location-search")).toHaveTextContent("view=diff");
+  });
+
+  it("keeps the Diff frame available for an unsupported direct revision URL", async () => {
+    getDocumentDiffMock.mockRejectedValue(
+      new DocumentRevisionApiError("Not found", 404),
+    );
+
+    renderAt(
+      "/vault/v/doc/notes%2Fhello.md?commit=missing-revision&view=diff",
+    );
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Changes are not available on this server",
+      }),
+    ).toBeInTheDocument();
+    expect(getDocumentMock).toHaveBeenCalledWith(
+      "v",
+      "notes/hello.md",
+      undefined,
+    );
   });
 
   it("?view=raw renders the raw markdown inside <pre>", async () => {
