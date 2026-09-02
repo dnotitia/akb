@@ -129,7 +129,12 @@ def test_chart_dependencies_are_pinned_and_source_installable():
 )
 def test_profiles_render_one_coherent_stack(profile: str, wants_sso: bool, wants_secret_manager: bool):
     resources = _render(profile)
-    assert not _names(resources, "Secret")
+    secret_names = _names(resources, "Secret")
+    if wants_secret_manager:
+        assert secret_names == {"akb-secret-manager-recovery"}
+        assert _one(resources, "Secret", "akb-secret-manager-recovery")["data"] == {}
+    else:
+        assert not secret_names
     assert {"backend", "frontend"}.issubset(_names(resources, "Deployment"))
     backend = _one(resources, "Deployment", "backend")
     assert _container_env(backend, "backend")["AKB_TOKENIZER_PROCESSES"] == "1"
@@ -205,12 +210,42 @@ def test_bundled_profile_renders_chart_native_bootstrap_job_and_scoped_rbac():
     assert env["SECRET_SEAL_MODE"] == "plaintext"  # pragma: allowlist secret
     assert env["SECRET_STORE_REPLICAS"] == "3"
     assert env["RECOVERY_SECRET_NAME"] == "akb-secret-manager-recovery"  # pragma: allowlist secret
+    assert pod_spec["securityContext"]["runAsNonRoot"] is True
+    assert pod_spec["securityContext"]["seccompProfile"] == {"type": "RuntimeDefault"}
+    assert container["securityContext"] == {
+        "allowPrivilegeEscalation": False,
+        "readOnlyRootFilesystem": True,
+        "capabilities": {"drop": ["ALL"]},
+    }
+    assert any(mount == {"name": "tmp", "mountPath": "/tmp"} for mount in container["volumeMounts"])
 
     role = _one(resources, "Role", "akb-secret-manager-bootstrap")
     assert not any("list" in rule["verbs"] for rule in role["rules"])
-    assert {"secrets", "configmaps"} == set(role["rules"][0]["resources"])
-    assert role["rules"][0]["verbs"] == ["create"]
-    assert "akb-secret" in role["rules"][1]["resourceNames"]
+    assert not any("create" in rule["verbs"] for rule in role["rules"])
+    assert all(rule.get("resourceNames") for rule in role["rules"])
+    secret_rules = [rule for rule in role["rules"] if rule["resources"] == ["secrets"]]
+    recovery_rule = next(rule for rule in secret_rules if rule["resourceNames"] == ["akb-secret-manager-recovery"])
+    input_rule = next(rule for rule in secret_rules if rule["resourceNames"] == ["akb-secret-manager-bootstrap-input"])
+    projection_rule = next(rule for rule in secret_rules if "akb-secret" in rule["resourceNames"])
+    assert recovery_rule["verbs"] == ["get", "patch"]
+    assert input_rule["verbs"] == ["get", "delete"]
+    assert projection_rule["verbs"] == ["get"]
+
+
+def test_bootstrap_job_name_changes_with_immutable_pod_inputs():
+    baseline = next(
+        item["metadata"]["name"] for item in _render("standalone-secret-manager") if item.get("kind") == "Job"
+    )
+    variants = (
+        ("--set-string", "secretContract.name=other-akb-secret"),
+        ("--set-string", "secretManager.tls.secretName=other-tls"),
+        ("--set-string", "images.backend.pullPolicy=IfNotPresent"),
+        ("--set-string", "global.imagePullSecrets[0].name=private-registry"),
+    )
+    for extra in variants:
+        rendered = _render("standalone-secret-manager", *extra)
+        job_name = next(item["metadata"]["name"] for item in rendered if item.get("kind") == "Job")
+        assert job_name != baseline
 
 
 def test_non_bundled_profiles_do_not_render_bootstrap_job():

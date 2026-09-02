@@ -131,18 +131,12 @@ class KubernetesClient:
         return response.json()
 
     def upsert(self, plural: str, name: str, resource: dict[str, Any]) -> None:
-        existing = self.get(plural, name)
-        if existing is None:
-            response = self.client.post(self._resource_path(plural), json=resource)
-            expected = 201
-        else:
-            response = self.client.patch(
-                self._resource_path(plural, name),
-                json=resource,
-                headers={"Content-Type": "application/merge-patch+json"},
-            )
-            expected = 200
-        if response.status_code != expected:
+        response = self.client.patch(
+            self._resource_path(plural, name),
+            json=resource,
+            headers={"Content-Type": "application/merge-patch+json"},
+        )
+        if response.status_code != 200:
             raise BootstrapError(f"Kubernetes write {plural}/{name} failed with HTTP {response.status_code}")
 
     def delete(self, plural: str, name: str) -> None:
@@ -265,11 +259,15 @@ class Settings:
 
     def receipt_contract(self) -> dict[str, str]:
         return {
-            "contract": "akb-secret-manager-bootstrap-v2",
+            "contract": "akb-secret-manager-bootstrap-v3",
             "engine": self.engine,
             "seal-mode": self.seal_mode,
             "auth-profile": self.auth_profile,
             "kv-path": f"{self.kv_mount}/{self.kv_path}",
+            "auth-mount": self.auth_mount,
+            "runtime-role": self.runtime_role,
+            "key-shares": str(self.key_shares),
+            "key-threshold": str(self.key_threshold),
             "operator-role": self.operator_role,
             "operator-service-account": self.operator_service_account,
         }
@@ -382,8 +380,10 @@ def _write_recovery_secret(
     settings: Settings,
     recovery: dict[str, Any],
     root_token: str,
+    deadline: float,
 ) -> None:
-    data = {"recovery.json": _b64(json.dumps(recovery, separators=(",", ":")))}
+    recovery_json = json.dumps(recovery, separators=(",", ":"))
+    data = {"recovery.json": _b64(recovery_json)}
     if not settings.pgp_root_key:
         data["bootstrap-root-token"] = _b64(root_token)
     resource = {
@@ -404,7 +404,23 @@ def _write_recovery_secret(
         "type": "Opaque",
         "data": data,
     }
-    kube.upsert("secrets", settings.recovery_secret, resource)
+    # Initialization cannot be rolled back. Keep the only copy in memory and
+    # retry transient Kubernetes failures until a read-after-write confirms
+    # the exact native recovery payload. Exiting after an ambiguous API error
+    # could otherwise leave an initialized cluster without recoverable shares.
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            kube.upsert("secrets", settings.recovery_secret, resource)
+            stored = kube.decoded_secret(settings.recovery_secret) or {}
+            if stored.get("recovery.json") == recovery_json and (
+                settings.pgp_root_key or stored.get("bootstrap-root-token") == root_token
+            ):
+                return
+        except (BootstrapError, httpx.HTTPError) as exc:
+            last_error = exc
+        time.sleep(2)
+    raise BootstrapError("Timed out persisting Secret Manager recovery material") from last_error
 
 
 def _load_root_token(kube: KubernetesClient, settings: Settings, deadline: float) -> str:
@@ -591,20 +607,32 @@ def _write_receipt(
     kube.upsert("configmaps", settings.receipt, resource)
 
 
-def _validate_receipt(settings: Settings, receipt: dict[str, Any]) -> str:
+def _validate_receipt(settings: Settings, receipt: dict[str, Any], current_cluster_id: str = "") -> str:
     data = receipt.get("data", {})
     contract = data.get("contract")
     if contract not in {
         "akb-secret-manager-bootstrap-v1",
         "akb-secret-manager-bootstrap-v2",
+        "akb-secret-manager-bootstrap-v3",
     }:
         raise BootstrapError("Existing bootstrap receipt has an unsupported contract")
     expected_contract = settings.receipt_contract()
-    for key, expected in expected_contract.items():
-        if key == "contract":
-            continue
+    legacy_keys = {
+        "engine",
+        "seal-mode",
+        "auth-profile",
+        "kv-path",
+        "operator-role",
+        "operator-service-account",
+    }
+    keys = expected_contract.keys() - {"contract"} if contract.endswith("-v3") else legacy_keys
+    for key in keys:
+        expected = expected_contract[key]
         if data.get(key) != expected:
             raise BootstrapError(f"Existing bootstrap receipt conflicts at {key}; refusing reinterpretation")
+    recorded_cluster_id = str(data.get("cluster-id", ""))
+    if current_cluster_id and recorded_cluster_id != current_cluster_id:
+        raise BootstrapError("Existing bootstrap receipt belongs to a different Secret Manager cluster")
     if contract == "akb-secret-manager-bootstrap-v1":
         return "complete" if data.get("root-token-revoked") == "true" else "bootstrapped"
     return str(data.get("status", ""))
@@ -636,13 +664,23 @@ def run() -> None:
 
     leader_status = _wait_for_status(bootstrap_node, deadline)
     receipt = kube.get("configmaps", settings.receipt)
-    receipt_status = _validate_receipt(settings, receipt) if receipt else ""
+    current_cluster_id = str(leader_status.get("cluster_id", ""))
+    has_receipt = bool(receipt and receipt.get("data", {}).get("contract"))
+    receipt_status = _validate_receipt(settings, receipt or {}, current_cluster_id) if has_receipt else ""
     if receipt_status == "complete":
         if leader_status.get("sealed") is True:
             raise BootstrapError(
                 "Secret Manager is sealed after completed bootstrap; use stored shares or repair Auto Seal"
             )
         _wait_for_contract(kube, settings, deadline)
+        if receipt and receipt.get("data", {}).get("contract") != settings.receipt_contract()["contract"]:
+            _write_receipt(
+                kube,
+                settings,
+                status="complete",
+                cluster_id=current_cluster_id,
+                root_token_revoked=True,
+            )
         print("Secret Manager bootstrap is already complete", flush=True)
         return
 
@@ -652,7 +690,7 @@ def run() -> None:
     if leader_status.get("initialized") is not True:
         init_data = bootstrap_node.request("PUT", "sys/init", body=_init_payload(settings)).json()
         recovery, root_token = _extract_recovery(settings, init_data)
-        _write_recovery_secret(kube, settings, recovery, root_token)
+        _write_recovery_secret(kube, settings, recovery, root_token, deadline)
         print(
             f"Recovery material is ready in Secret/{settings.recovery_secret}; "
             "store it off-cluster and delete the Secret after verification",
@@ -688,6 +726,12 @@ def run() -> None:
         root_token = (kube.decoded_secret(settings.recovery_secret) or {}).get("bootstrap-root-token", "")
     if not root_token and settings.pgp_root_key:
         root_token = _load_root_token(kube, settings, deadline)
+    recovery_resource = kube.get("secrets", settings.recovery_secret)
+    if recovery_resource is None:
+        raise BootstrapError("Recovery handoff was removed before bootstrap completed")
+    recovery_data = recovery_resource.get("data", {}).get("recovery.json")
+    if not recovery_data:
+        raise BootstrapError("Recovery handoff is missing its native recovery payload")
     if root_token:
         leader.request(
             "POST",
@@ -700,20 +744,29 @@ def run() -> None:
             allowed={200, 204, 403} if receipt_status == "bootstrapped" else {200, 204},
         )
     kube.delete("secrets", settings.input_secret)
-    recovery_resource = kube.get("secrets", settings.recovery_secret)
-    if recovery_resource is not None:
-        kube.upsert(
-            "secrets",
-            settings.recovery_secret,
-            {
-                "metadata": {
-                    "name": settings.recovery_secret,
-                    "namespace": settings.namespace,
-                    "annotations": {"akb.dnotitia.com/bootstrap-status": "complete"},
+    kube.upsert(
+        "secrets",
+        settings.recovery_secret,
+        {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": settings.recovery_secret,
+                "namespace": settings.namespace,
+                "labels": {
+                    "app.kubernetes.io/name": "akb",
+                    "app.kubernetes.io/component": "secret-manager-recovery",
                 },
-                "data": {"bootstrap-root-token": None},
+                "annotations": {
+                    "akb.dnotitia.com/recovery-material": "store-off-cluster-then-delete",
+                    "akb.dnotitia.com/bootstrap-status": "complete",
+                    "helm.sh/resource-policy": "keep",
+                },
             },
-        )
+            "type": "Opaque",
+            "data": {"recovery.json": recovery_data, "bootstrap-root-token": None},
+        },
+    )
     status = leader.seal_status()
     _write_receipt(
         kube,

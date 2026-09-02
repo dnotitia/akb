@@ -107,8 +107,9 @@ No second Helm pass, workstation Docker helper, or AKB-specific recovery format
 is involved.
 
 Generated native output is not a Helm value, hook log, or release-metadata
-field. It is written once to retained Secret
-`akb-secret-manager-recovery/recovery.json` as an explicit custody handoff.
+field. Helm declares the retained handoff Secret without data; the Job has
+named-resource patch access and writes the native output once to
+`akb-secret-manager-recovery/recovery.json`.
 For plaintext Shamir the Job uses the shares in memory for the first unseal and
 removes its transient root-token field after bootstrap. An operator must then
 copy `recovery.json` to approved off-cluster custody, verify the copy, and

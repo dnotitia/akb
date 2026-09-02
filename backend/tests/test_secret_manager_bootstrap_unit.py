@@ -14,6 +14,7 @@ from app.secret_manager_bootstrap import (
     _init_payload,
     _validate_receipt,
     _wait_for_active,
+    _write_recovery_secret,
     normalize_pgp_public_key,
 )
 
@@ -120,6 +121,47 @@ def test_receipt_accepts_completed_v1_but_rejects_profile_reinterpretation():
     data["auth-profile"] = "sso"
     with pytest.raises(BootstrapError, match="auth-profile"):
         _validate_receipt(settings, {"data": data})
+
+
+def test_current_receipt_rejects_cluster_or_immutable_bootstrap_changes():
+    settings = _settings()
+    data = {
+        **settings.receipt_contract(),
+        "cluster-id": "cluster-a",
+        "status": "complete",
+        "root-token-revoked": "true",
+    }
+    with pytest.raises(BootstrapError, match="different Secret Manager cluster"):
+        _validate_receipt(settings, {"data": data}, "cluster-b")
+
+    changed = dict(data)
+    changed["key-threshold"] = "4"
+    with pytest.raises(BootstrapError, match="key-threshold"):
+        _validate_receipt(settings, {"data": changed}, "cluster-a")
+
+
+def test_recovery_handoff_retries_until_read_after_write_succeeds(monkeypatch):
+    class Kube:
+        def __init__(self):
+            self.calls = 0
+            self.stored = None
+
+        def upsert(self, _plural, _name, resource):
+            self.calls += 1
+            if self.calls == 1:
+                raise BootstrapError("transient Kubernetes write failure")
+            self.stored = {key: base64.b64decode(value).decode("utf-8") for key, value in resource["data"].items()}
+
+        def decoded_secret(self, _name):
+            return self.stored
+
+    monkeypatch.setattr("app.secret_manager_bootstrap.time.sleep", lambda _seconds: None)
+    kube = Kube()
+    settings = _settings()
+    recovery = {"shares": ["one", "two", "three", "four", "five"]}
+    _write_recovery_secret(kube, settings, recovery, "root", time.monotonic() + 1)
+    assert kube.calls == 2
+    assert kube.stored["bootstrap-root-token"] == "root"  # pragma: allowlist secret
 
 
 def test_wait_for_active_skips_transient_standby_member():

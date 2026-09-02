@@ -97,8 +97,10 @@ Job performs native init, the first unseal, policy/KV setup, Secret Contract v1
 generation, initial-root-token revocation, and the VSO projection gate. The
 application starts only after the projected Secrets exist.
 
-For the default plaintext-Shamir mode, Helm stores native initialization output
-once in the retained `akb-secret-manager-recovery` Secret. The Job uses those
+For the default plaintext-Shamir mode, Helm declares an empty, retained
+`akb-secret-manager-recovery` Secret and the Job patches native initialization
+output into it once. This lets the Job hold only named-resource patch access;
+the generated values still never enter Helm release metadata. The Job uses the
 shares in memory for the first unseal and removes the transient root token after
 bootstrap. Copy `recovery.json` to an approved off-cluster password manager or
 secret custody system, verify the copy, and delete the Kubernetes Secret:

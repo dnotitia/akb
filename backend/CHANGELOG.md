@@ -19,6 +19,10 @@ Kubernetes Secret that operators must copy to off-cluster custody and delete;
 generated shares and tokens are never Helm values or release metadata. PGP
 mode keeps shares/root authority encrypted and waits for key-holder input,
 while Auto Seal continues to depend on its configured KMS/HSM/Transit provider.
+The Job verifies the persisted recovery handoff before proceeding, binds its
+receipt to the actual Secret Manager cluster and immutable bootstrap settings,
+and receives named-resource patch access rather than namespace-wide Secret
+creation authority.
 
 SSO Helm profiles also expose the installation-owned Keycloak realm as the
 explicit `AKB account` login provider, so a freshly installed standalone SSO
