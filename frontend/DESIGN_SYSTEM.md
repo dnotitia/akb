@@ -574,15 +574,20 @@ commits` control and `Full commit log` route. Below `xl`, the work area stacks
   wrapping chips, and column-header buttons expose single-column sort with
   `aria-sort`. Page, 25/50/100 row size, sort, and repeated filters round-trip
   through the route query string so refresh, Back, and shared links restore the
-  same view. The footer reports the exact visible range and total and provides
-  first/previous/direct-page/next/last navigation. Server pagination—not a
+  same view. Multi-value filters use comma-delimited input; when a declared enum
+  choice itself contains a comma, the UI keeps exact `is` matching available and
+  omits the ambiguous multi-value condition. The footer reports the exact
+  visible range and total and provides first/previous/direct-page/next/last
+  navigation. Server pagination—not a
   client-side slice or an all-row fetch—is the large-table boundary; prior rows
   stay visible and `aria-busy` during a transition. Every order adds the system
   UUID as a deterministic tie-breaker.
   Interactive edits and deletes add the row's loaded `updated_at` to their UUID
   predicate. A zero-row mutation is a concurrency conflict, never a silent
   success: Edit preserves the draft and offers Reload current values or an
-  explicit Overwrite anyway; Delete refreshes the row and requires a second
+  explicit Overwrite anyway. Overwrite revalidates and serializes the current
+  visible draft rather than replaying the payload that first encountered the
+  conflict. Delete refreshes the row and requires a second
   reviewed confirmation. Rows without legacy audit metadata retain exact-ID
   mutation behavior without claiming conflict protection.
   DDL remains a separately governed concern rather than sharing the frequent

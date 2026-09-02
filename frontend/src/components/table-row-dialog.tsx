@@ -56,7 +56,6 @@ export function TableRowDialog({
   const [saving, setSaving] = useState(false);
   const [submitError, setSubmitError] = useState("");
   const [conflict, setConflict] = useState(false);
-  const [pendingValues, setPendingValues] = useState<Record<string, unknown> | null>(null);
 
   const editableColumns = useMemo(
     () => columns.filter((column) => !isSystemColumn(column.name)),
@@ -78,7 +77,6 @@ export function TableRowDialog({
     setErrors({});
     setSubmitError("");
     setConflict(false);
-    setPendingValues(null);
   }, [editableColumns, mode, open, row]);
 
   function updateValue(column: VaultTableColumnInput, value: string) {
@@ -113,6 +111,10 @@ export function TableRowDialog({
 
   async function submit(event: FormEvent) {
     event.preventDefault();
+    await saveCurrentDraft();
+  }
+
+  async function saveCurrentDraft(force = false) {
     setSubmitError("");
     const nextErrors: Record<string, string> = {};
     const payload: Record<string, unknown> = {};
@@ -146,8 +148,7 @@ export function TableRowDialog({
       return;
     }
 
-    setPendingValues(payload);
-    await save(payload);
+    await save(payload, force);
   }
 
   async function save(payload: Record<string, unknown>, force = false) {
@@ -194,7 +195,6 @@ export function TableRowDialog({
       setNullColumns(nextNulls);
       setTouched(new Set());
       setErrors({});
-      setPendingValues(null);
       setConflict(false);
     } catch (caught: unknown) {
       setSubmitError(caught instanceof Error ? caught.message : "The current row could not be loaded.");
@@ -324,8 +324,8 @@ export function TableRowDialog({
                     type="button"
                     variant="default"
                     size="sm"
-                    onClick={() => pendingValues && void save(pendingValues, true)}
-                    disabled={saving || !pendingValues}
+                    onClick={() => void saveCurrentDraft(true)}
+                    disabled={saving}
                   >
                     Overwrite anyway
                   </Button>

@@ -71,6 +71,19 @@ describe("table query state", () => {
       ),
     ).toEqual(["eq", "neq", "in", "is_null", "not_null"]);
     expect(
+      tableFilterOperators({
+        name: "severity",
+        type: "enum",
+        enum: ["low", "high, urgent"],
+      }).map((item) => item.value),
+    ).toEqual(["eq", "neq", "is_null", "not_null"]);
+    expect(
+      validateTableFilter(
+        { column: "severity", operator: "in", value: "low, high, urgent" },
+        { name: "severity", type: "enum", enum: ["low", "high, urgent"] },
+      ),
+    ).toBe("This choice list contains commas. Use “is” to match one exact choice.");
+    expect(
       validateTableFilter(
         { column: "score", operator: "gte", value: "not-a-number" },
         { name: "score", type: "numeric" },

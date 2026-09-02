@@ -424,7 +424,9 @@ function valuePlaceholder(type: string, operator: TableFilterOperator): string {
 }
 
 function valueHelp(type: string, operator: TableFilterOperator): string {
-  if (operator === "in") return "Separate multiple exact values with commas.";
+  if (operator === "in") {
+    return "Separate exact values with commas. Use “is” for one value that contains a comma.";
+  }
   if (type === "jsonb") return "Enter the JSON object or array that each matching row must contain.";
   if (type === "timestamp") return "Use an ISO 8601 timestamp including a timezone when possible.";
   return "Filtering is applied by the server across the entire table.";

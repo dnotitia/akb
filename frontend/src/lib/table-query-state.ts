@@ -128,7 +128,13 @@ export function tableFilterOperators(column: VaultTableColumnInput): TableFilter
   if (type === "boolean") {
     operators = ["is_true", "is_false", "is_null", "not_null"];
   } else if (type === "enum" || Boolean(column.enum?.length)) {
-    operators = ["eq", "neq", "in", "is_null", "not_null"];
+    operators = [
+      "eq",
+      "neq",
+      ...(enumSupportsListFilter(column) ? (["in"] as TableFilterOperator[]) : []),
+      "is_null",
+      "not_null",
+    ];
   } else if (["int", "float", "numeric", "date", "timestamp"].includes(type)) {
     operators = NUMBER_DATE_OPERATORS;
   } else if (type === "uuid") {
@@ -157,6 +163,9 @@ export function validateTableFilter(
   if (!tableFilterNeedsValue(filter.operator)) return null;
   const value = filter.value.trim();
   if (!value) return "Enter a value for this filter.";
+  if (filter.operator === "in" && !enumSupportsListFilter(column)) {
+    return "This choice list contains commas. Use “is” to match one exact choice.";
+  }
 
   const type = normalizeTableColumnType(column.type);
   const values = filter.operator === "in" ? splitListValue(value) : [value];
@@ -304,4 +313,8 @@ function splitListValue(value: string): string[] {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function enumSupportsListFilter(column: VaultTableColumnInput): boolean {
+  return !(column.enum || []).some((item) => String(item).includes(","));
 }

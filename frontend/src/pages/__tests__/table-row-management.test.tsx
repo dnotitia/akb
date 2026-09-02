@@ -288,13 +288,16 @@ describe("table row management", () => {
     await user.clear(severity);
     await user.type(severity, "critical");
     await user.click(within(dialog).getByRole("button", { name: "Save changes" }));
+    const title = within(dialog).getByLabelText("title");
+    await user.clear(title);
+    await user.type(title, "API outage revised");
     await user.click(await within(dialog).findByRole("button", { name: "Overwrite anyway" }));
 
     await waitFor(() => expect(updateRowMock).toHaveBeenLastCalledWith(
       "ops",
       "incidents",
       rowId,
-      { severity: "critical" },
+      { title: "API outage revised", severity: "critical" },
       { expectedUpdatedAt: "2026-09-01T04:45:00Z", force: true },
     ));
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Edit row" })).not.toBeInTheDocument());
