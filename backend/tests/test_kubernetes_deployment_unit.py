@@ -40,8 +40,8 @@ def test_backend_and_postgres_consume_the_operator_owned_runtime_secret():
     pod = backend["spec"]["template"]["spec"]
     assert pod["automountServiceAccountToken"] is False
     volumes = {item["name"]: item for item in pod["volumes"]}
-    assert volumes["secret-config"]["secret"]["secretName"] == "akb-secret"
-    assert volumes["local-session-keys"]["secret"]["secretName"] == "akb-secret"
+    assert volumes["secret-config"]["secret"]["secretName"] == "akb-secret"  # pragma: allowlist secret
+    assert volumes["local-session-keys"]["secret"]["secretName"] == "akb-secret"  # pragma: allowlist secret
 
     postgres = _one(_K8S / "postgres.yaml", kind="StatefulSet", name="postgres")
     env = {item["name"]: item for item in postgres["spec"]["template"]["spec"]["containers"][0]["env"]}
