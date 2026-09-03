@@ -128,6 +128,79 @@ class NativeDocumentService(DocumentService):
             raise NotFoundError("Vault", vault)
         return vault_id
 
+    @staticmethod
+    def _has_complete_native_frontmatter(frontmatter: dict) -> bool:
+        """Return whether a native payload carries the public metadata core.
+
+        Normal Native writes always produce these fields.  Existing-database
+        migration may instead preserve an external Git payload byte-for-byte;
+        those payloads can omit metadata that Legacy served from PostgreSQL.
+        """
+
+        return all(
+            key in frontmatter
+            for key in ("title", "type", "status", "created_at", "updated_at", "tags")
+        )
+
+    async def _document_frontmatter(
+        self,
+        vault_id: uuid.UUID,
+        snapshot: NativeRevisionSnapshot,
+    ) -> tuple[dict, str]:
+        """Parse one payload and restore missing frozen Legacy projection data.
+
+        Cutover deliberately retains the old ``documents`` rows while Native
+        owns revision authority.  For a migrated external-Git document, the
+        immutable body may not contain fields such as ``status`` even though
+        Legacy served them from that retained row.  Fill only absent fields;
+        explicit Native frontmatter always wins.  Complete Native payloads do
+        not pay a legacy projection read.
+        """
+
+        frontmatter, body = _parse_markdown(snapshot.text)
+        if self._has_complete_native_frontmatter(frontmatter):
+            return frontmatter, body
+
+        pool = await self._pool()
+        async with pool.acquire() as conn:
+            legacy = await conn.fetchrow(
+                """
+                SELECT title, doc_type, status, summary, domain, created_by,
+                       created_at, updated_at, tags, metadata
+                  FROM documents
+                 WHERE vault_id = $1 AND id = $2
+                """,
+                vault_id,
+                snapshot.resource_id,
+            )
+        if legacy is None:
+            return frontmatter, body
+
+        row = dict(legacy)
+        fallback = {
+            "title": row.get("title"),
+            "type": row.get("doc_type") or "note",
+            "status": row.get("status") or "draft",
+            "summary": row.get("summary"),
+            "domain": row.get("domain"),
+            "created_by": row.get("created_by"),
+            "created_at": (
+                row["created_at"].isoformat()
+                if isinstance(row.get("created_at"), datetime)
+                else row.get("created_at")
+            ),
+            "updated_at": (
+                row["updated_at"].isoformat()
+                if isinstance(row.get("updated_at"), datetime)
+                else row.get("updated_at")
+            ),
+            "tags": list(row.get("tags") or []),
+        }
+        for key, value in fallback.items():
+            if key not in frontmatter and value is not None:
+                frontmatter[key] = value
+        return frontmatter, body
+
     async def _native(self) -> NativeRevisionService:
         """Compose the substrate on the frozen P1 searchable-body placement.
 
@@ -267,7 +340,7 @@ class NativeDocumentService(DocumentService):
                 resource_id=row["resource_id"],
                 revision_id=row["head_revision_id"],
             )
-            frontmatter, _ = _parse_markdown(snapshot.text)
+            frontmatter, _ = await self._document_frontmatter(vault_id, snapshot)
             candidate_title = to_nfc(str(frontmatter.get("title") or "")).strip()
             if candidate_title == expected_title:
                 return snapshot.path, candidate_title
@@ -327,7 +400,7 @@ class NativeDocumentService(DocumentService):
         public_selector: str | None = None,
     ) -> DocumentResponse:
         selected = selected or current
-        current_fm, _ = _parse_markdown(current.text)
+        current_fm, _ = await self._document_frontmatter(vault_id, current)
         _, selected_body = _parse_markdown(selected.text)
         created_by = current_fm.get("created_by")
         # Sequential on purpose. These two reads are independent and a
@@ -605,7 +678,7 @@ class NativeDocumentService(DocumentService):
                 raise ConflictError(
                     f"current_commit moved: expected {req.expected_commit}, actual {current.revision_id}"
                 )
-            frontmatter, current_body = _parse_markdown(current.text)
+            frontmatter, current_body = await self._document_frontmatter(vault_id, current)
             previous_hash = _body_content_hash(current_body)
             if req.expected_content_hash and req.expected_content_hash != previous_hash:
                 raise ConflictError(f"content_hash moved: expected {req.expected_content_hash}, actual {previous_hash}")
@@ -730,7 +803,7 @@ class NativeDocumentService(DocumentService):
             if base_path == current.path:
                 raise ValidationError("move is a no-op: the target path equals the current path")
             if title_conflict_policy == "reject":
-                frontmatter, _ = _parse_markdown(current.text)
+                frontmatter, _ = await self._document_frontmatter(vault_id, current)
                 current_title = str(frontmatter.get("title") or current.path.rsplit("/", 1)[-1])
                 existing = await self._find_native_title_conflict(
                     vault_id,
@@ -1039,7 +1112,7 @@ class NativeDocumentService(DocumentService):
                 resource_id=row["resource_id"],
                 revision_id=row["revision_id"],
             )
-            frontmatter, body = _parse_markdown(snapshot.text)
+            frontmatter, body = await self._document_frontmatter(vault_id, snapshot)
             status = frontmatter.get("status") or "draft"
             if not include_archived and status == "archived":
                 continue

@@ -1658,6 +1658,40 @@ async def test_completed_backfill_bridges_multi_commit_frozen_activity_semantics
         assert fixture["later_file_tip"][:12] not in {entry["hash"] for entry in activity}
 
 
+async def test_completed_backfill_preserves_pg_only_public_document_metadata(tmp_path):
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _make_fixture(pool, tmp_path)
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE documents
+                   SET status = 'active', doc_type = 'reference',
+                       summary = 'PG-only summary', domain = 'migration',
+                       tags = ARRAY['fixture', 'replacement']::text[]
+                 WHERE id = $1
+                """,
+                fixture["document_one"],
+            )
+        backfill = NativeRevisionBackfill(pool, git=fixture["git"])
+        run, _ = await backfill.prepare_run(
+            namespace_id=fixture["namespace_id"],
+            fixed_ref=fixture["unrelated_tip"],
+            coverage_version="c9-public-metadata-continuity",
+        )
+        assert (await backfill.backfill_run(run.run_id)).status == "complete"
+
+        documents = NativeDocumentService(pool=pool, legacy_git=fixture["git"])
+        current = await documents.get(fixture["vault_name"], "renamed.md")
+
+        assert current.title == "renamed"
+        assert current.type == "reference"
+        assert current.status == "active"
+        assert current.summary == "PG-only summary"
+        assert current.domain == "migration"
+        assert current.tags == ["fixture", "replacement"]
+        assert current.content == "new v2"
+
+
 async def test_native_move_keeps_completed_legacy_paths_for_historical_reads(tmp_path):
     async with _fresh_schema(tmp_path) as pool:
         fixture = await _make_fixture(pool, tmp_path)
