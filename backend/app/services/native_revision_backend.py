@@ -28,6 +28,7 @@ from app.services.native_payload_verification import (
     verify_native_head_body,
 )
 from app.services.native_revision_service import NativeRevisionService
+from app.services.user_directory import resolve_display_names
 
 
 class NativeRevisionBackend:
@@ -66,6 +67,25 @@ class NativeRevisionBackend:
         pool = await self._pool()
         async with pool.acquire() as conn:
             return await conn.fetchval("SELECT id FROM vaults WHERE name = $1", vault)
+
+    async def _annotate_history_authors(
+        self, entries: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Apply the same id-or-username display-name contract as Legacy."""
+
+        authors = [entry.get("author") for entry in entries]
+        names = await resolve_display_names(authors, pool=await self._pool())
+        for entry in entries:
+            author = entry.get("author")
+            if isinstance(author, str) and author in names:
+                entry["author_name"] = names[author]
+        return entries
+
+    async def _annotated_history_payload(
+        self, payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload["history"] = await self._annotate_history_authors(payload["history"])
+        return payload
 
     @staticmethod
     def _public_action(action: str) -> str:
@@ -584,7 +604,7 @@ class NativeRevisionBackend:
         native = await self.document_service.history(vault, doc_ref, limit=limit)
         resolved = await self._resolve_resource(vault, doc_ref)
         if resolved is None:
-            return native
+            return await self._annotated_history_payload(native)
         vault_id, resource = resolved
         migration = NativeRevisionMigrationRepository(await self._pool())
         try:
@@ -593,15 +613,15 @@ class NativeRevisionBackend:
                 resource_id=resource["resource_id"],
             )
         except asyncpg.UndefinedTableError:
-            return native
+            return await self._annotated_history_payload(native)
         if not mappings:
-            return native
+            return await self._annotated_history_payload(native)
 
         fixed_refs = {mapping.fixed_git_oid for mapping in mappings}
         if len(fixed_refs) != 1:
             # Completed immutable mappings are expected to describe one
             # frozen lineage.  Do not synthesize history across authorities.
-            return native
+            return await self._annotated_history_payload(native)
         frozen_head = mappings[-1]
         try:
             snapshot = await asyncio.to_thread(
@@ -612,17 +632,17 @@ class NativeRevisionBackend:
                 current_commit=frozen_head.legacy_git_oid,
             )
         except FixedRefHistoryError:
-            return native
+            return await self._annotated_history_payload(native)
         rows = snapshot.get("history")
         if not isinstance(rows, list):
-            return native
+            return await self._annotated_history_payload(native)
         by_oid = {
             row.get("legacy_git_oid"): row
             for row in rows
             if isinstance(row, dict) and isinstance(row.get("legacy_git_oid"), str)
         }
         if any(mapping.legacy_git_oid not in by_oid for mapping in mappings):
-            return native
+            return await self._annotated_history_payload(native)
 
         # Native genesis represents the same head as the newest legacy
         # mapping. Replace that internal token with the public Git history,
@@ -649,9 +669,10 @@ class NativeRevisionBackend:
                     "date": committed_at.isoformat(),
                 }
             )
+        combined = (native_only + legacy)[:limit]
         return {
             "uri": native["uri"],
-            "history": (native_only + legacy)[:limit],
+            "history": await self._annotate_history_authors(combined),
         }
 
 
