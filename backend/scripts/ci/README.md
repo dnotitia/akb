@@ -43,6 +43,38 @@ fails the gate. `EMPTY_COUNT_ALLOWED` is intentionally empty. Hosted CI,
 the isolated runtime, and `scripts/run_canonical_e2e.sh` all execute this same
 runner, so there is no second suite array to keep synchronized.
 
+### MCP pytest behavior suite
+
+The first MCP behavior scenario is an authenticated read-only
+`akb_list_vaults({})` call through the official MCP Python SDK. The fixture
+uses the SDK's public `Client` and Streamable HTTP transport in the pytest
+process; it does not invoke Inspector, Node, or a separate MCP driver.
+
+The repository runtime remains the owner of backend startup, readiness,
+fixture reset, credentials, and teardown. Give the same schema-v2 descriptor
+to the local and hosted command through stdin:
+
+```bash
+uv run --locked --extra dev --project backend python -m pytest \
+  backend/tests/mcp_e2e -v --tb=short \
+  --confcutdir=backend/tests/mcp_e2e --runtime-descriptor -
+```
+
+To consume a descriptor file instead, pass its path to the same option:
+
+```bash
+uv run --locked --extra dev --project backend python -m pytest \
+  backend/tests/mcp_e2e -v --tb=short \
+  --confcutdir=backend/tests/mcp_e2e \
+  --runtime-descriptor /path/to/descriptor.json
+```
+
+The descriptor must come from `backend/scripts/ci/e2e_runtime.py serve` or the
+Ubuntu bootstrap. The fixture consumes the descriptor's app/fixture origins,
+health and reset operations, discovery-declared credential environment names,
+and the existing `empty` reset contract. It does not create another backend,
+database, port topology, or credential fixture.
+
 ### 2. Repository-owned isolated runtime
 
 The runtime supervisor is `e2e_runtime.py`. It owns the test infrastructure
@@ -62,6 +94,7 @@ The topology is deliberately small:
 | embedding stub | Ubuntu host process | `127.0.0.1:8888` | deterministic `/v1/embeddings` responses |
 | backend | Ubuntu host process | `127.0.0.1:8000` | AKB application under test |
 | fixture control | supervisor-owned in-process app | `127.0.0.1:8889` | health, discovery, and empty reset |
+| MCP pytest behavior suite | Ubuntu host process | no public listener | authenticated `akb_list_vaults` scenario through the official Python SDK |
 | curated suite runner | Ubuntu host process | no public listener | exact 15-suite gate and count semantics |
 
 Only PostgreSQL and MinIO are managed by
@@ -80,7 +113,8 @@ The supervisor has two modes:
 
 - `gate`: starts dependencies, fixture control, embedding stub, and backend;
   waits for readiness; prints the schema v2 descriptor; runs the shared
-  curated suite runner; then stops child processes and dependency resources.
+  pytest behavior scenario and curated suite runner; then stops child
+  processes and dependency resources.
 - `serve`: starts the same stack, prints the ready descriptor, and remains in
   the foreground until SIGINT/SIGTERM. The fixture's `POST /reset` performs a
   safe empty reset and waits for backend readiness again.
