@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -21,13 +22,20 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
-def _read_descriptor(source: str) -> str:
+def _read_descriptor(source: str, capture_manager: Any = None) -> str:
     if source == "-":
+        suspended = False
         try:
+            if capture_manager is not None:
+                capture_manager.suspend_global_capture(in_=True)
+                suspended = True
             with os.fdopen(os.dup(0), "r", encoding="utf-8") as stream:
                 return stream.read()
         except OSError:
             raise RuntimeSetupError("runtime descriptor stdin could not be read") from None
+        finally:
+            if suspended:
+                capture_manager.resume_global_capture()
     try:
         return Path(source).read_text(encoding="utf-8")
     except OSError:
@@ -41,7 +49,8 @@ def runtime_session(request: pytest.FixtureRequest) -> Iterator[RuntimeSession]:
         pytest.fail("--runtime-descriptor is required for the live MCP scenario")
     session: RuntimeSession | None = None
     try:
-        session = RuntimeSession.from_json(_read_descriptor(source))
+        capture_manager = request.config.pluginmanager.getplugin("capturemanager")
+        session = RuntimeSession.from_json(_read_descriptor(source, capture_manager))
         session.prepare()
     except RuntimeSetupError as exc:
         if session is not None:

@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -90,6 +94,32 @@ def test_runtime_session_reuses_descriptor_reset_and_redacts_pat_environment(mon
     assert mint[3] == {"Authorization": "Bearer session-secret"}
     session.close()
     assert client.closed
+
+
+def test_descriptor_stdin_survives_pytest_capture(tmp_path: Path) -> None:
+    probe = tmp_path / "test_descriptor_pipe.py"
+    probe.write_text(
+        "import json\n"
+        "from mcp_e2e.conftest import _read_descriptor\n"
+        "\n"
+        "def test_pipe(request):\n"
+        "    manager = request.config.pluginmanager.getplugin('capturemanager')\n"
+        "    assert json.loads(_read_descriptor('-', manager)) == {'ok': True}\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    test_root = Path(__file__).resolve().parents[1]
+    env["PYTHONPATH"] = f"{test_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", str(probe), "-q"],
+        cwd=tmp_path,
+        env=env,
+        input='{"ok":true}\n',
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize(
