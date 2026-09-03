@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
 import os
 import uuid
@@ -52,7 +53,7 @@ _DSN = os.environ.get(
 async def _reachable() -> bool:
     try:
         conn = await asyncpg.connect(_DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
+    except OSError, asyncpg.PostgresError:
         return False
     await conn.close()
     return True
@@ -90,6 +91,7 @@ async def _fresh_schema(tmp_path: Path):
             "048_native_revision_core.py",
             "053_native_revision_m1_pg_body.py",
             "060_native_revision_migration_bridge.py",
+            "097_native_revision_migration_inventory.py",
         ):
             await _load(filename).migrate(conn=conn)
         await conn.close()
@@ -210,9 +212,7 @@ async def _make_fixture(pool, tmp_path: Path) -> dict:
     }
 
 
-async def _make_compact_failpoint_fixtures(pool, tmp_path: Path) -> tuple[
-    GitService, list[dict]
-]:
+async def _make_compact_failpoint_fixtures(pool, tmp_path: Path) -> tuple[GitService, list[dict]]:
     """Build one short manual-vault case per registered failpoint.
 
     The loop intentionally avoids the multi-second chronology fixture above:
@@ -237,9 +237,7 @@ async def _make_compact_failpoint_fixtures(pool, tmp_path: Path) -> tuple[
                 "unrelated\n",
                 "unrelated fixed-ref tip",
             )
-            current_dt = Repo(str(git._bare_path(vault_name))).commit(
-                current_oid
-            ).committed_datetime
+            current_dt = Repo(str(git._bare_path(vault_name))).commit(current_oid).committed_datetime
             namespace_id = await conn.fetchval(
                 """
                 INSERT INTO vaults (name, git_path, status)
@@ -299,10 +297,7 @@ async def test_inventory_is_fixed_ref_bounded_and_includes_archived_manual_vault
             coverage_version="c9-v1",
         )
         inventory = scope.inventory
-        doc = next(
-            item for item in inventory.documents
-            if item.resource_id == fixture["document_one"]
-        )
+        doc = next(item for item in inventory.documents if item.resource_id == fixture["document_one"])
         assert doc.current_path == "renamed.md"
         assert doc.current_commit == fixture["current_oid"]
         assert not hasattr(doc, "body")
@@ -316,7 +311,9 @@ async def test_inventory_is_fixed_ref_bounded_and_includes_archived_manual_vault
             fixture["current_oid"],
         ]
         assert [entry.path_at_revision for entry in doc.lineage] == [
-            "same.md", "renamed.md", "renamed.md",
+            "same.md",
+            "renamed.md",
+            "renamed.md",
         ]
         assert fixture["old_oid"] not in {entry.legacy_git_oid for entry in doc.lineage}
         assert fixture["unrelated_tip"] not in {entry.legacy_git_oid for entry in doc.lineage}
@@ -357,9 +354,7 @@ async def test_inventory_is_fixed_ref_bounded_and_includes_archived_manual_vault
             fixed_ref=fixture["unrelated_tip"],
             coverage_version="c9-v4",
         )
-        assert [item.resource_id for item in mixed_inventory.documents] == [
-            fixture["document_two"]
-        ]
+        assert [item.resource_id for item in mixed_inventory.documents] == [fixture["document_two"]]
 
         async with pool.acquire() as conn:
             await conn.execute(
@@ -399,10 +394,13 @@ async def test_inventory_is_fixed_ref_bounded_and_includes_archived_manual_vault
                 coverage_version="c9-v6",
             )
         async with pool.acquire() as conn:
-            assert await conn.fetchval(
-                "SELECT count(*) FROM native_resources WHERE namespace_id = $1",
-                fixture["namespace_id"],
-            ) == 0
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM native_resources WHERE namespace_id = $1",
+                    fixture["namespace_id"],
+                )
+                == 0
+            )
 
 
 async def test_inventory_accepts_plain_git_activity_without_akb_footers(tmp_path):
@@ -418,9 +416,7 @@ async def test_inventory_accepts_plain_git_activity_without_akb_footers(tmp_path
             author_name="Fixture Collector",
             author_email="collector@example.dev",
         )
-        current_dt = Repo(str(git._bare_path(vault_name))).commit(
-            current_oid
-        ).committed_datetime
+        current_dt = Repo(str(git._bare_path(vault_name))).commit(current_oid).committed_datetime
         fixed_ref = git.commit_file(
             vault_name,
             "notes/unrelated.md",
@@ -558,29 +554,17 @@ async def test_backfill_inventory_is_metadata_only_and_materializes_one_body_at_
 
 
 async def test_capture_releases_each_source_body_before_reading_the_next(tmp_path):
-    class LiveBody(bytes):
-        active = 0
-        max_active = 0
-
-        def __new__(cls, value):
-            instance = super().__new__(cls, value)
-            cls.active += 1
-            cls.max_active = max(cls.max_active, cls.active)
-            return instance
-
-        def __del__(self):
-            type(self).active -= 1
-
     async with _fresh_schema(tmp_path) as pool:
         fixture = await _make_fixture(pool, tmp_path)
-        original_history = fixture["git"].manual_fixed_ref_history
+        original_batch = fixture["git"].manual_fixed_ref_history_batch
+        observed_snapshots = []
 
-        def tracked_history(*args, **kwargs):
-            snapshot = original_history(*args, **kwargs)
-            snapshot["body"] = LiveBody(snapshot["body"])
-            return snapshot
+        def tracked_batch(*args, **kwargs):
+            snapshots = original_batch(*args, **kwargs)
+            observed_snapshots.extend(snapshots)
+            return snapshots
 
-        fixture["git"].manual_fixed_ref_history = tracked_history
+        fixture["git"].manual_fixed_ref_history_batch = tracked_batch
         bridge = LegacyRevisionBridge(pool, git=fixture["git"])
 
         inventory = await bridge.capture_inventory(
@@ -590,8 +574,10 @@ async def test_capture_releases_each_source_body_before_reading_the_next(tmp_pat
         )
 
         assert len(inventory.documents) == 2
-        assert LiveBody.max_active == 1
-        assert LiveBody.active == 0
+        assert len(observed_snapshots) == 2
+        assert all("body" not in snapshot for snapshot in observed_snapshots)
+        assert all("body_digest" in snapshot for snapshot in observed_snapshots)
+        assert all("byte_size" in snapshot for snapshot in observed_snapshots)
 
 
 async def test_p95_inventory_uses_one_validated_scope_and_one_body_read_per_item(
@@ -607,6 +593,7 @@ async def test_p95_inventory_uses_one_validated_scope_and_one_body_read_per_item
             self.bodies: dict[str, bytes] = {}
             self.commits: dict[str, str] = {}
             self.history_calls = 0
+            self.history_batch_calls = 0
             self.body_read_calls = 0
 
         def manual_fixed_ref_history(
@@ -620,6 +607,9 @@ async def test_p95_inventory_uses_one_validated_scope_and_one_body_read_per_item
         ):
             del vault_name, since_epoch
             self.history_calls += 1
+            return self._snapshot(observed_fixed_ref, file_path, current_commit)
+
+        def _snapshot(self, observed_fixed_ref, file_path, current_commit):
             assert observed_fixed_ref == fixed_ref
             assert current_commit == self.commits[file_path]
             return {
@@ -642,11 +632,34 @@ async def test_p95_inventory_uses_one_validated_scope_and_one_body_read_per_item
                     "action": "create",
                     "path_from": None,
                     "path_to": file_path,
-                    "changed_paths": [
-                        {"status": "A", "path_from": None, "path_to": file_path}
-                    ],
+                    "changed_paths": [{"status": "A", "path_from": None, "path_to": file_path}],
                 },
             }
+
+        def manual_fixed_ref_history_batch(
+            self,
+            vault_name,
+            observed_fixed_ref,
+            requests,
+            *,
+            include_bodies=True,
+        ):
+            del vault_name
+            self.history_batch_calls += 1
+            snapshots = [
+                self._snapshot(
+                    observed_fixed_ref,
+                    request["file_path"],
+                    request["current_commit"],
+                )
+                for request in requests
+            ]
+            if not include_bodies:
+                for snapshot in snapshots:
+                    body = snapshot.pop("body")
+                    snapshot["body_digest"] = hashlib.sha256(body).hexdigest()
+                    snapshot["byte_size"] = len(body)
+            return snapshots
 
         def read_file(self, vault_name, file_path, commit=None):
             del vault_name
@@ -742,10 +755,33 @@ async def test_p95_inventory_uses_one_validated_scope_and_one_body_read_per_item
 
         assert result.status == "complete"
         assert bridge.run_scope_validations == 1
-        assert canonical_calls == 2
-        assert repository.manual_vault_queries == 2
-        assert git.history_calls == document_count * 2
+        assert canonical_calls == 3
+        assert repository.manual_vault_queries == 3
+        assert git.history_batch_calls == 1
+        assert git.history_calls == 0
         assert git.body_read_calls == document_count
+
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                DELETE FROM legacy_revision_mappings
+                 WHERE run_id = $1
+                   AND resource_id = (
+                       SELECT native_resource_id
+                         FROM native_revision_migration_items
+                        WHERE run_id = $1
+                        ORDER BY native_resource_id
+                        LIMIT 1
+                   )
+                """,
+                run.run_id,
+            )
+        with pytest.raises(
+            MigrationInventoryDriftError,
+            match="selector closure drifted",
+        ):
+            await bridge.inventory_scope_for_run(run)
+        assert git.history_batch_calls == 1
 
 
 async def test_every_backfill_failpoint_rolls_back_then_retries_once(tmp_path):
@@ -868,22 +904,28 @@ async def test_every_backfill_failpoint_rolls_back_then_retries_once(tmp_path):
             repeated = await clean.backfill_run(run.run_id)
             assert repeated.status == "complete"
             async with pool.acquire() as conn:
-                assert await conn.fetchval(
-                    """
+                assert (
+                    await conn.fetchval(
+                        """
                     SELECT count(*)
                       FROM native_resources
                      WHERE namespace_id = $1
                     """,
-                    fixture["namespace_id"],
-                ) == 1
-                assert await conn.fetchval(
-                    """
+                        fixture["namespace_id"],
+                    )
+                    == 1
+                )
+                assert (
+                    await conn.fetchval(
+                        """
                     SELECT count(*)
                       FROM legacy_revision_mappings
                      WHERE namespace_id = $1
                     """,
-                    fixture["namespace_id"],
-                ) == 1
+                        fixture["namespace_id"],
+                    )
+                    == 1
+                )
 
 
 async def test_mixed_manual_and_external_documents_exclude_external_noop(tmp_path):
@@ -901,52 +943,68 @@ async def test_mixed_manual_and_external_documents_exclude_external_noop(tmp_pat
             fixed_ref=fixture["unrelated_tip"],
             coverage_version="c9-mixed-source",
         )
-        assert [item.resource_id for item in inventory.documents] == [
-            fixture["document_one"]
-        ]
+        assert [item.resource_id for item in inventory.documents] == [fixture["document_one"]]
 
         result = await backfill.backfill_run(run.run_id)
         assert result.status == "complete"
         async with pool.acquire() as conn:
-            assert await conn.fetchval(
-                "SELECT count(*) FROM native_revision_migration_items WHERE run_id = $1",
-                run.run_id,
-            ) == 1
-            assert await conn.fetchval(
-                """
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM native_revision_migration_items WHERE run_id = $1",
+                    run.run_id,
+                )
+                == 1
+            )
+            assert (
+                await conn.fetchval(
+                    """
                 SELECT count(*)
                   FROM native_revision_migration_items
                  WHERE run_id = $1 AND legacy_document_id = $2
                 """,
-                run.run_id,
-                fixture["document_two"],
-            ) == 0
-            assert await conn.fetchval(
-                "SELECT count(*) FROM native_resources WHERE namespace_id = $1",
-                fixture["namespace_id"],
-            ) == 1
-            assert await conn.fetchval(
-                """
+                    run.run_id,
+                    fixture["document_two"],
+                )
+                == 0
+            )
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM native_resources WHERE namespace_id = $1",
+                    fixture["namespace_id"],
+                )
+                == 1
+            )
+            assert (
+                await conn.fetchval(
+                    """
                 SELECT count(*)
                   FROM native_resources
                  WHERE namespace_id = $1 AND resource_id = $2
                 """,
-                fixture["namespace_id"],
-                fixture["document_two"],
-            ) == 0
-            assert await conn.fetchval(
-                """
+                    fixture["namespace_id"],
+                    fixture["document_two"],
+                )
+                == 0
+            )
+            assert (
+                await conn.fetchval(
+                    """
                 SELECT count(*)
                   FROM legacy_revision_mappings
                  WHERE namespace_id = $1 AND resource_id = $2
                 """,
-                fixture["namespace_id"],
-                fixture["document_two"],
-            ) == 0
-            assert await conn.fetchval(
-                "SELECT source FROM documents WHERE id = $1",
-                fixture["document_two"],
-            ) == "external_git"
+                    fixture["namespace_id"],
+                    fixture["document_two"],
+                )
+                == 0
+            )
+            assert (
+                await conn.fetchval(
+                    "SELECT source FROM documents WHERE id = $1",
+                    fixture["document_two"],
+                )
+                == "external_git"
+            )
 
 
 async def test_current_move_activity_semantics_are_preserved(tmp_path):
@@ -960,9 +1018,7 @@ async def test_current_move_activity_semantics_are_preserved(tmp_path):
             "move body\n",
             "[create] same.md\n\nagent: legacy-writer\naction: create\nsummary: create same",
         )
-        initial_dt = Repo(str(git._bare_path(vault_name))).commit(
-            initial_oid
-        ).committed_datetime
+        initial_dt = Repo(str(git._bare_path(vault_name))).commit(initial_oid).committed_datetime
         move_oid = git.move_file(
             vault_name,
             "same.md",
@@ -1054,10 +1110,7 @@ async def test_selector_is_hidden_until_run_complete(tmp_path):
             fixed_ref=fixture["unrelated_tip"],
             coverage_version="c9-selector",
         )
-        document = next(
-            item for item in inventory.documents
-            if item.resource_id == fixture["document_one"]
-        )
+        document = next(item for item in inventory.documents if item.resource_id == fixture["document_one"])
         body_store = M1PgBodyStore(pool)
         scope = await backfill.bridge.validated_inventory_scope(inventory)
         async with backfill.bridge.materialize_body(scope, document) as body:
@@ -1145,10 +1198,13 @@ async def test_atomic_retry_chronology_selector_shapes_and_legacy_unchanged(tmp_
                 """,
                 fixture["document_one"],
             )
-            assert await conn.fetchval(
-                "SELECT count(*) FROM native_resources WHERE namespace_id = $1",
-                fixture["namespace_id"],
-            ) == 0
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM native_resources WHERE namespace_id = $1",
+                    fixture["namespace_id"],
+                )
+                == 0
+            )
 
         async with pool.acquire() as conn:
             await conn.execute(
@@ -1182,22 +1238,29 @@ async def test_atomic_retry_chronology_selector_shapes_and_legacy_unchanged(tmp_
         with pytest.raises(BackfillFailpointError):
             await failing.backfill_run(run.run_id)
         async with pool.acquire() as conn:
-            assert await conn.fetchval(
-                "SELECT count(*) FROM native_resources WHERE namespace_id = $1",
-                fixture["namespace_id"],
-            ) == 0
-            assert await conn.fetchval(
-                "SELECT count(*) FROM legacy_revision_mappings"
-            ) == 0
-            assert await conn.fetchval(
-                "SELECT count(*) FROM m1_reference_payloads WHERE namespace_id = $1",
-                fixture["namespace_id"],
-            ) == 1
-            assert await conn.fetchval(
-                "SELECT status FROM native_revision_migration_items WHERE run_id = $1 AND legacy_document_id = $2",
-                run.run_id,
-                fixture["document_one"],
-            ) == "pending"
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM native_resources WHERE namespace_id = $1",
+                    fixture["namespace_id"],
+                )
+                == 0
+            )
+            assert await conn.fetchval("SELECT count(*) FROM legacy_revision_mappings") == 0
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM m1_reference_payloads WHERE namespace_id = $1",
+                    fixture["namespace_id"],
+                )
+                == 1
+            )
+            assert (
+                await conn.fetchval(
+                    "SELECT status FROM native_revision_migration_items WHERE run_id = $1 AND legacy_document_id = $2",
+                    run.run_id,
+                    fixture["document_one"],
+                )
+                == "pending"
+            )
 
         result = await backfill.backfill_run(run.run_id)
         assert result.status == "complete"
@@ -1303,8 +1366,7 @@ async def test_atomic_retry_chronology_selector_shapes_and_legacy_unchanged(tmp_
         assert current.kind == "native"
         assert current.native_revision_id == revision_id
         document_one_inventory = next(
-            item for item in inventory.documents
-            if item.resource_id == fixture["document_one"]
+            item for item in inventory.documents if item.resource_id == fixture["document_one"]
         )
         old_oid = document_one_inventory.lineage[0].legacy_git_oid
         old = await bridge.resolve_selector(
@@ -1537,19 +1599,25 @@ async def test_alias_mutation_after_prepare_fails_closed_before_publication(tmp_
             await backfill.backfill_run(run.run_id)
 
         async with pool.acquire() as conn:
-            assert await conn.fetchval(
-                "SELECT count(*) FROM native_resources WHERE resource_id = $1",
-                document.resource_id,
-            ) == 0
-            assert await conn.fetchval(
-                """
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM native_resources WHERE resource_id = $1",
+                    document.resource_id,
+                )
+                == 0
+            )
+            assert (
+                await conn.fetchval(
+                    """
                 SELECT count(*)
                   FROM native_resource_path_aliases
                  WHERE resource_id = $1
                    AND old_path = 'post-freeze.md'
                 """,
-                document.resource_id,
-            ) == 0
+                    document.resource_id,
+                )
+                == 0
+            )
 
 
 async def test_completed_backfill_bridges_multi_commit_frozen_activity_semantics(tmp_path):

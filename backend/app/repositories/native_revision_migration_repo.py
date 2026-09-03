@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import secrets
+import json
 import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -148,7 +149,10 @@ class NativeRevisionMigrationRepository:
         self.pool = pool
 
     async def get_manual_vault(
-        self, namespace_id: uuid.UUID, *, conn: asyncpg.Connection | None = None,
+        self,
+        namespace_id: uuid.UUID,
+        *,
+        conn: asyncpg.Connection | None = None,
     ) -> dict | None:
         sql = """
             SELECT v.id, v.name, v.git_path,
@@ -167,7 +171,8 @@ class NativeRevisionMigrationRepository:
 
     @staticmethod
     async def list_documents(
-        conn: asyncpg.Connection, namespace_id: uuid.UUID,
+        conn: asyncpg.Connection,
+        namespace_id: uuid.UUID,
     ) -> list[dict]:
         rows = await conn.fetch(
             """
@@ -182,7 +187,9 @@ class NativeRevisionMigrationRepository:
 
     @staticmethod
     async def list_document_aliases(
-        conn: asyncpg.Connection, namespace_id: uuid.UUID, resource_id: uuid.UUID,
+        conn: asyncpg.Connection,
+        namespace_id: uuid.UUID,
+        resource_id: uuid.UUID,
     ) -> list[dict]:
         rows = await conn.fetch(
             """
@@ -198,8 +205,28 @@ class NativeRevisionMigrationRepository:
         )
         return [dict(row) for row in rows]
 
+    @staticmethod
+    async def list_namespace_document_aliases(
+        conn: asyncpg.Connection,
+        namespace_id: uuid.UUID,
+    ) -> list[dict]:
+        rows = await conn.fetch(
+            """
+            SELECT resource_id, old_ref, created_at
+              FROM resource_aliases
+             WHERE vault_id = $1
+               AND resource_type = 'document'
+             ORDER BY resource_id, created_at, old_ref
+            """,
+            namespace_id,
+        )
+        return [dict(row) for row in rows]
+
     async def get_run(
-        self, run_id: uuid.UUID, *, conn: asyncpg.Connection | None = None,
+        self,
+        run_id: uuid.UUID,
+        *,
+        conn: asyncpg.Connection | None = None,
     ) -> MigrationRun | None:
         sql = """
             SELECT run_id, namespace_id, fixed_git_oid, coverage_version,
@@ -214,6 +241,99 @@ class NativeRevisionMigrationRepository:
             async with self.pool.acquire() as acquired:
                 row = await acquired.fetchrow(sql, run_id)
         return _run(row) if row is not None else None
+
+    async def store_inventory_snapshot(
+        self,
+        run: MigrationRun,
+        payload: dict[str, Any],
+        *,
+        conn: asyncpg.Connection | None = None,
+    ) -> None:
+        """Persist the canonical fixed-ref inventory once for later phases."""
+
+        async def _store(acquired: asyncpg.Connection) -> None:
+            encoded = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            await acquired.execute(
+                """
+                INSERT INTO native_revision_migration_inventories (
+                    run_id, namespace_id, fixed_git_oid, coverage_version,
+                    inventory_digest, payload
+                ) VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                ON CONFLICT (run_id) DO NOTHING
+                """,
+                run.run_id,
+                run.namespace_id,
+                run.fixed_git_oid,
+                run.coverage_version,
+                run.inventory_digest,
+                encoded,
+            )
+            observed = await acquired.fetchrow(
+                """
+                SELECT namespace_id, fixed_git_oid, coverage_version,
+                       inventory_digest, payload
+                  FROM native_revision_migration_inventories
+                 WHERE run_id = $1
+                """,
+                run.run_id,
+            )
+            if observed is None:
+                raise MigrationIntegrityError("migration inventory snapshot disappeared")
+            observed_payload = observed["payload"]
+            if isinstance(observed_payload, str):
+                observed_payload = json.loads(observed_payload)
+            if (
+                observed["namespace_id"] != run.namespace_id
+                or observed["fixed_git_oid"] != run.fixed_git_oid
+                or observed["coverage_version"] != run.coverage_version
+                or observed["inventory_digest"] != run.inventory_digest
+                or observed_payload != payload
+            ):
+                raise MigrationInventoryDriftError("persisted fixed-ref migration inventory drifted")
+
+        if conn is not None:
+            await _store(conn)
+            return
+        async with self.pool.acquire() as acquired:
+            async with acquired.transaction():
+                await _store(acquired)
+
+    async def get_inventory_snapshot(
+        self,
+        run_id: uuid.UUID,
+        *,
+        conn: asyncpg.Connection | None = None,
+    ) -> dict[str, Any] | None:
+        sql = """
+            SELECT namespace_id, fixed_git_oid, coverage_version,
+                   inventory_digest, payload
+              FROM native_revision_migration_inventories
+             WHERE run_id = $1
+        """
+        if conn is not None:
+            row = await conn.fetchrow(sql, run_id)
+        else:
+            async with self.pool.acquire() as acquired:
+                row = await acquired.fetchrow(sql, run_id)
+        if row is None:
+            return None
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        if not isinstance(payload, dict):
+            raise MigrationIntegrityError("migration inventory snapshot is not an object")
+        return {
+            "namespace_id": row["namespace_id"],
+            "fixed_git_oid": row["fixed_git_oid"],
+            "coverage_version": row["coverage_version"],
+            "inventory_digest": row["inventory_digest"],
+            "payload": payload,
+        }
 
     async def get_or_create_run(
         self,
@@ -279,9 +399,7 @@ class NativeRevisionMigrationRepository:
             if row["inventory_digest"] != inventory_digest:
                 raise MigrationInventoryDriftError()
             if row["status"] == "superseded":
-                raise MigrationIntegrityError(
-                    "migration run was superseded; plan with a new coverage version"
-                )
+                raise MigrationIntegrityError("migration run was superseded; plan with a new coverage version")
             return _run(row)
 
         if conn is not None:
@@ -490,10 +608,7 @@ class NativeRevisionMigrationRepository:
                                 *expected,
                             )
                     except asyncpg.UniqueViolationError as exc:
-                        if (
-                            exc.constraint_name
-                            != "native_revision_migration_items_active_resource_head_key"
-                        ):
+                        if exc.constraint_name != "native_revision_migration_items_active_resource_head_key":
                             raise
                         adopted = await self._adopt_aborted_completed_reservation(
                             acquired,
@@ -518,9 +633,7 @@ class NativeRevisionMigrationRepository:
                         row["byte_size"],
                     )
                     if observed_identity != expected:
-                        raise MigrationInventoryDriftError(
-                            "migration item facts differ from the frozen inventory"
-                        )
+                        raise MigrationInventoryDriftError("migration item facts differ from the frozen inventory")
                     if row["status"] == "failed":
                         await acquired.execute(
                             """
@@ -556,7 +669,10 @@ class NativeRevisionMigrationRepository:
                 return await _ensure(acquired)
 
     async def list_items(
-        self, run_id: uuid.UUID, *, conn: asyncpg.Connection | None = None,
+        self,
+        run_id: uuid.UUID,
+        *,
+        conn: asyncpg.Connection | None = None,
     ) -> list[MigrationItem]:
         sql = """
             SELECT run_id, namespace_id, legacy_document_id, native_resource_id,
@@ -651,13 +767,16 @@ class NativeRevisionMigrationRepository:
         for_update: bool = False,
     ) -> MigrationItem | None:
         suffix = " FOR UPDATE" if for_update else ""
-        sql = """
+        sql = (
+            """
             SELECT run_id, namespace_id, legacy_document_id, native_resource_id,
                    captured_path, legacy_head_oid, native_head_revision_id,
                    body_digest, byte_size, status, error_code
               FROM native_revision_migration_items
              WHERE run_id = $1 AND legacy_document_id = $2
-        """ + suffix
+        """
+            + suffix
+        )
         if conn is not None:
             row = await conn.fetchrow(sql, run_id, legacy_document_id)
         else:
@@ -788,7 +907,8 @@ class NativeRevisionMigrationRepository:
 
     @staticmethod
     async def all_items_complete(
-        conn: asyncpg.Connection, run_id: uuid.UUID,
+        conn: asyncpg.Connection,
+        run_id: uuid.UUID,
     ) -> bool:
         return bool(
             await conn.fetchval(
@@ -874,9 +994,7 @@ class NativeRevisionMigrationRepository:
                 row["lineage_ordinal"],
             )
             if observed != expected:
-                raise MigrationIntegrityError(
-                    "legacy revision mapping conflicts with frozen lineage"
-                )
+                raise MigrationIntegrityError("legacy revision mapping conflicts with frozen lineage")
         row = await conn.fetchrow(
             """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
@@ -946,6 +1064,32 @@ class NativeRevisionMigrationRepository:
                AND m.lineage_ordinal = 0
                AND r.status = 'complete'
              ORDER BY m.resource_id, m.legacy_git_oid
+        """
+        if conn is not None:
+            rows = await conn.fetch(sql, namespace_id)
+        else:
+            async with self.pool.acquire() as acquired:
+                rows = await acquired.fetch(sql, namespace_id)
+        return [_mapping(row) for row in rows]
+
+    async def list_namespace_completed_mappings(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        conn: asyncpg.Connection | None = None,
+    ) -> list[LegacyRevisionMapping]:
+        """List the complete published Legacy selector closure for one vault."""
+
+        sql = """
+            SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
+                   m.path_at_revision, m.resolution, m.native_revision_id,
+                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+              FROM legacy_revision_mappings m
+              JOIN native_revision_migration_runs r
+                ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
+             WHERE m.namespace_id = $1
+               AND r.status = 'complete'
+             ORDER BY m.resource_id, m.lineage_ordinal, m.legacy_git_oid
         """
         if conn is not None:
             rows = await conn.fetch(sql, namespace_id)
