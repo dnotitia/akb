@@ -118,6 +118,8 @@ async def _fresh_schema(*, cutover_migrations: bool = True):
                     "092_native_revision_plan_supersession.py",
                     "093_external_git_retirement.py",
                     "094_native_revision_completed_reservation_transfer.py",
+                    "096_native_revision_cutover_fence.py",
+                    "097_native_revision_migration_inventory.py",
                 ]
             )
         for filename in filenames:
@@ -1032,6 +1034,7 @@ async def test_plan_supersession_migration_releases_legacy_aborted_reservations(
                 "089_native_file_projection_outbox.py",
                 "090_native_revision_vault_purge_fence.py",
                 "091_native_revision_committed_receipt_guard.py",
+                "097_native_revision_migration_inventory.py",
             ):
                 await _load(filename).migrate(conn=conn)
 
@@ -1096,6 +1099,7 @@ async def test_completed_reservation_transfer_migration_upgrades_aborted_applied
                 "091_native_revision_committed_receipt_guard.py",
                 "092_native_revision_plan_supersession.py",
                 "093_external_git_retirement.py",
+                "097_native_revision_migration_inventory.py",
             ):
                 await _load(filename).migrate(conn=conn)
 
@@ -1231,7 +1235,7 @@ async def test_commit_rejects_an_omitted_eligible_file_and_leaves_writes_open(tm
                 file_id,
             )
 
-        with pytest.raises(CutoverVerificationError, match="File inventory drifted"):
+        with pytest.raises(CutoverVerificationError, match="File catalog drifted"):
             await cutover.commit(planned.cutover_id, identity=_identity("omitted-file"))
 
         async with pool.acquire() as conn:
@@ -1288,6 +1292,43 @@ async def test_commit_rejects_a_post_plan_vault_and_rolls_back_the_fence(tmp_pat
             )
 
 
+async def test_commit_rejects_native_head_drift_before_fencing(tmp_path):
+    async with _fresh_schema() as pool:
+        git = GitService(storage_path=str(tmp_path / "git-native-head-drift"))
+        vault = await _manual_vault(pool, git, label="native-head-drift")
+        cutover = NativeRevisionCutover(
+            pool,
+            backfill=NativeRevisionBackfill(pool, git=git),
+            verifier=_FixtureVerifier(pool),
+        )
+        planned = await cutover.plan(
+            vaults=[vault],
+            coverage_version="fixture-native-head-drift-v1",
+        )
+        await cutover.apply(planned.cutover_id)
+        await cutover.verify(planned.cutover_id)
+
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE native_resources SET current_path = 'drift.md' WHERE namespace_id = $1",
+                vault.namespace_id,
+            )
+
+        with pytest.raises(CutoverVerificationError, match="Native head binding drifted"):
+            await cutover.commit(
+                planned.cutover_id,
+                identity=_identity("native-head-drift"),
+            )
+
+        async with pool.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT state FROM native_revision_legacy_write_fence"
+            ) == "open"
+            assert await conn.fetchval(
+                "SELECT count(*) FROM native_revision_existing_authority"
+            ) == 0
+
+
 async def test_commit_revalidates_file_bytes_and_current_git_refs(tmp_path):
     async with _fresh_schema() as pool:
         git = GitService(storage_path=str(tmp_path / "git-final-revalidation"))
@@ -1338,8 +1379,19 @@ async def test_commit_revalidates_file_bytes_and_current_git_refs(tmp_path):
             await cutover.commit(planned.cutover_id, identity=identity)
 
         async with pool.acquire() as conn:
-            assert await conn.fetchval("SELECT state FROM native_revision_legacy_write_fence") == "open"
+            assert await conn.fetchval("SELECT state FROM native_revision_legacy_write_fence") == "fenced"
+            assert await conn.fetchval(
+                "SELECT count(*) FROM native_revision_existing_authority_fence"
+            ) == 1
             assert await conn.fetchval("SELECT count(*) FROM native_revision_existing_authority") == 0
+            with pytest.raises(
+                asyncpg.ObjectNotInPrerequisiteStateError,
+                match="Native cutover writes are fenced",
+            ):
+                await conn.execute(
+                    "UPDATE vault_files SET description = description WHERE id = $1",
+                    file_id,
+                )
 
 
 async def test_text_mime_with_invalid_nul_or_oversized_bytes_is_preserved_binary(
@@ -1469,21 +1521,18 @@ async def test_authority_mint_is_the_boundary_and_fences_external_git_and_receip
                         file_id,
                     )
                 )
-                await asyncio.sleep(0.1)
-                assert not raced_insert.done()
-                assert not raced_receipt_delete.done()
-                reader.release.set()
-                authority = await commit_task
                 with pytest.raises(
                     asyncpg.ObjectNotInPrerequisiteStateError,
                     match="Legacy revision writes are fenced",
                 ):
-                    await raced_insert
+                    await asyncio.wait_for(raced_insert, timeout=2)
                 with pytest.raises(
                     asyncpg.ObjectNotInPrerequisiteStateError,
-                    match="committed Native revision cutover receipt",
+                    match="Native cutover writes are fenced",
                 ):
-                    await raced_receipt_delete
+                    await asyncio.wait_for(raced_receipt_delete, timeout=2)
+                reader.release.set()
+                authority = await commit_task
         finally:
             reader.release.set()
 
@@ -1925,6 +1974,8 @@ async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop
             "092_native_revision_plan_supersession.py",
             "093_external_git_retirement.py",
             "094_native_revision_completed_reservation_transfer.py",
+            "096_native_revision_cutover_fence.py",
+            "097_native_revision_migration_inventory.py",
         }
         assert cutover_files <= registered
 
@@ -1951,6 +2002,8 @@ async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop
                 "092_native_revision_plan_supersession.py",
                 "093_external_git_retirement.py",
                 "094_native_revision_completed_reservation_transfer.py",
+                "096_native_revision_cutover_fence.py",
+                "097_native_revision_migration_inventory.py",
             ]
             assert await conn.fetchval("SELECT state FROM native_revision_legacy_write_fence") == "open"
             assert await conn.fetchval("SELECT to_regclass('public.native_file_projection_outbox') IS NOT NULL") is True
@@ -1964,7 +2017,7 @@ async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop
                     "SELECT count(*) FROM schema_migrations WHERE filename = ANY($1::text[])",
                     list(cutover_files),
                 )
-                == 7
+                == 9
             )
 
 

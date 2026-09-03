@@ -23,18 +23,15 @@ import asyncpg
 from app.exceptions import AKBError, ConflictError, NotFoundError
 from app.repositories.native_revision_repo import NativeRevisionRepository
 from app.services.document_service import _parse_markdown
-from app.services.git_service import FixedRefHistoryError, GitService
+from app.services.git_service import GitService
 from app.services.legacy_revision_bridge import (
     LegacyInventoryDocument,
-    LogicalLineageProjectionError,
-    project_logical_lineage,
 )
 from app.services.native_revision_service import NativeRevisionService
 from app.services.uri_service import doc_uri
 
 
 _OID_RE = re.compile(r"^[0-9a-f]{40}$")
-_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$")
 _NATIVE_ACTIVITY_MIGRATION_ACTOR = "akb-native-revision-migration"
 _NATIVE_ACTIVITY_AUDIT_PROFILE = "akb-native-revision-p2-activity-audit/v1"
 
@@ -115,8 +112,6 @@ class _LegacyMaterialization:
     fixed_ref: str
     current_commit: str
     body: bytes
-    history: tuple[dict[str, Any], ...]
-    activity: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,10 +160,26 @@ def _parsed_body(text: str) -> tuple[dict[str, Any], str]:
 def _validate_lineage(document: LegacyInventoryDocument) -> None:
     if not document.lineage or document.lineage[-1].legacy_git_oid != document.current_commit:
         raise ShadowReaderScopeError("shadow reader inventory lineage has no current-head boundary")
+    seen: set[str] = set()
     for entry in document.lineage:
         _require_oid(entry.legacy_git_oid, "lineage selector")
         if not isinstance(entry.path_at_revision, str) or not entry.path_at_revision.strip():
             raise ShadowReaderScopeError("shadow reader inventory lineage has an invalid path")
+        if entry.legacy_git_oid in seen:
+            raise ShadowReaderScopeError("shadow reader inventory lineage has a duplicate revision")
+        seen.add(entry.legacy_git_oid)
+    activity = document.activity
+    if (
+        activity.legacy_git_oid != document.current_commit
+        or activity.committed_at != document.lineage[-1].committed_at
+        or not activity.actor
+        or not activity.subject
+        or not isinstance(activity.summary, str)
+        or activity.action not in {"create", "update", "move", "delete"}
+        or activity.path_to != document.current_path
+        or (activity.action == "move") != (activity.path_from is not None)
+    ):
+        raise ShadowReaderScopeError("shadow reader inventory activity is invalid")
 
 
 def _snapshot_diff(text: str) -> str:
@@ -193,119 +204,6 @@ def _canonical_transition(parent_text: str, current_text: str) -> str:
         raise ShadowReaderScopeError("shadow reader transition could not reproduce current body")
     _, body = _parsed_body(rebuilt)
     return _snapshot_diff(body)
-
-
-def _apply_unified_patch(parent_text: str, patch: str, diff_type: str) -> str:
-    """Apply the exact Git patch to an independently read parent body."""
-    patch_lines = patch.split("\n")
-    if patch_lines and patch_lines[-1] == "":
-        patch_lines.pop()
-    hunk_indexes = [index for index, line in enumerate(patch_lines) if _HUNK_RE.fullmatch(line)]
-    if not hunk_indexes:
-        prefix = "+" if diff_type == "added" else "-" if diff_type == "deleted" else None
-        if prefix is None or any(not line.startswith(prefix) for line in patch_lines):
-            raise ShadowReaderScopeError("legacy fixed-ref diff patch is not canonical unified data")
-        materialized = "\n".join(line[1:] for line in patch_lines)
-        if diff_type == "deleted":
-            if materialized != parent_text:
-                raise ShadowReaderScopeError("legacy fixed-ref diff patch differs from parent body")
-            return ""
-        if parent_text:
-            raise ShadowReaderScopeError("legacy fixed-ref added patch has a non-empty parent")
-        return materialized
-
-    if hunk_indexes[0] != 0:
-        allowed_headers = {"diff --git", "index ", "--- ", "+++ "}
-        if any(
-            not any(line.startswith(prefix) for prefix in allowed_headers) for line in patch_lines[: hunk_indexes[0]]
-        ):
-            raise ShadowReaderScopeError("legacy fixed-ref diff patch has invalid headers")
-
-    source = parent_text.split("\n") if parent_text else []
-    source_has_newline = parent_text.endswith("\n")
-    if source_has_newline:
-        source.pop()
-    output: list[tuple[str, bool]] = []
-    source_index = 0
-    patch_index = hunk_indexes[0]
-    old_terminal_closed = False
-    new_terminal_closed = False
-    while patch_index < len(patch_lines):
-        header = _HUNK_RE.fullmatch(patch_lines[patch_index])
-        if header is None:
-            raise ShadowReaderScopeError("legacy fixed-ref diff patch has trailing data")
-        old_start = int(header.group(1))
-        old_count = int(header.group(2)) if header.group(2) is not None else 1
-        new_count = int(header.group(4)) if header.group(4) is not None else 1
-        hunk_source = 0 if old_start == 0 else old_start - 1
-        if hunk_source < source_index or hunk_source > len(source):
-            raise ShadowReaderScopeError("legacy fixed-ref diff patch has an invalid parent range")
-        if old_terminal_closed and hunk_source > source_index:
-            raise ShadowReaderScopeError("legacy fixed-ref diff patch has an invalid newline marker")
-        if new_terminal_closed and hunk_source > source_index:
-            raise ShadowReaderScopeError("legacy fixed-ref diff patch has an invalid newline marker")
-        output.extend(
-            (
-                source[index],
-                index < len(source) - 1 or source_has_newline,
-            )
-            for index in range(source_index, hunk_source)
-        )
-        source_index = hunk_source
-        observed_old = 0
-        observed_new = 0
-        patch_index += 1
-        while patch_index < len(patch_lines) and _HUNK_RE.fullmatch(patch_lines[patch_index]) is None:
-            line = patch_lines[patch_index]
-            patch_index += 1
-            if line == r"\ No newline at end of file":
-                raise ShadowReaderScopeError("legacy fixed-ref diff patch has an invalid newline marker")
-            if not line or line[0] not in {" ", "+", "-"}:
-                raise ShadowReaderScopeError("legacy fixed-ref diff patch has invalid hunk data")
-            marker, value = line[0], line[1:]
-            no_newline = False
-            if patch_index < len(patch_lines) and patch_lines[patch_index] == r"\ No newline at end of file":
-                no_newline = True
-                patch_index += 1
-            old_line = marker in {" ", "-"}
-            new_line = marker in {" ", "+"}
-            if old_line and old_terminal_closed or new_line and new_terminal_closed:
-                raise ShadowReaderScopeError("legacy fixed-ref diff patch has an invalid newline marker")
-            if marker in {" ", "-"}:
-                if source_index >= len(source) or source[source_index] != value:
-                    raise ShadowReaderScopeError("legacy fixed-ref diff patch differs from parent body")
-                source_line_has_newline = source_index < len(source) - 1 or source_has_newline
-                if no_newline != (not source_line_has_newline):
-                    raise ShadowReaderScopeError("legacy fixed-ref diff patch has an invalid newline marker")
-                source_line = source[source_index]
-                source_index += 1
-                observed_old += 1
-                if no_newline:
-                    old_terminal_closed = True
-            else:
-                source_line = ""
-            if marker in {" ", "+"}:
-                if marker == " ":
-                    output.append((source_line, not no_newline))
-                else:
-                    output.append((value, not no_newline))
-                observed_new += 1
-                if no_newline:
-                    new_terminal_closed = True
-        if (observed_old, observed_new) != (old_count, new_count):
-            raise ShadowReaderScopeError("legacy fixed-ref diff patch has invalid hunk counts")
-    if old_terminal_closed and source_index != len(source):
-        raise ShadowReaderScopeError("legacy fixed-ref diff patch has an invalid newline marker")
-    if new_terminal_closed and source_index != len(source):
-        raise ShadowReaderScopeError("legacy fixed-ref diff patch has an invalid newline marker")
-    output.extend(
-        (
-            source[index],
-            index < len(source) - 1 or source_has_newline,
-        )
-        for index in range(source_index, len(source))
-    )
-    return "".join(value + ("\n" if has_newline else "") for value, has_newline in output)
 
 
 def _history_entries(
@@ -358,56 +256,6 @@ class LegacyFixedRefShadowReader:
         except UnicodeDecodeError as exc:
             raise ShadowReaderScopeError("legacy fixed-ref body is not valid UTF-8") from exc
 
-        expected_history = [
-            (entry.legacy_git_oid, entry.path_at_revision, entry.committed_at) for entry in reversed(document.lineage)
-        ]
-        try:
-            projected = project_logical_lineage(
-                snapshot.history,
-                current_commit=document.current_commit,
-                current_path=document.current_path,
-                created_at=document.created_at,
-                oldest_anchor_oid=document.lineage[0].legacy_git_oid,
-            )
-        except LogicalLineageProjectionError as exc:
-            raise ShadowReaderScopeError("legacy fixed-ref history is invalid") from exc
-        observed_history = [
-            (entry.legacy_git_oid, entry.path_at_revision, entry.committed_at)
-            for entry in reversed(projected)
-        ]
-        if observed_history != expected_history:
-            raise ShadowReaderScopeError("legacy fixed-ref history differs from C9 inventory")
-
-        activity = document.activity
-        expected_activity = (
-            activity.legacy_git_oid,
-            activity.committed_at,
-            activity.actor,
-            activity.subject,
-            activity.summary,
-            activity.action,
-            activity.path_from,
-            activity.path_to,
-            tuple(dict(change) for change in activity.changed_paths),
-        )
-        raw_activity = snapshot.activity
-        changed_paths = raw_activity.get("changed_paths")
-        if not isinstance(changed_paths, (list, tuple)):
-            raise ShadowReaderScopeError("legacy fixed-ref activity is invalid")
-        observed_activity = (
-            raw_activity.get("legacy_git_oid"),
-            raw_activity.get("committed_at"),
-            raw_activity.get("actor"),
-            raw_activity.get("subject"),
-            raw_activity.get("summary"),
-            raw_activity.get("action"),
-            raw_activity.get("path_from"),
-            raw_activity.get("path_to"),
-            tuple(dict(change) for change in changed_paths if isinstance(change, Mapping)),
-        )
-        if observed_activity != expected_activity:
-            raise ShadowReaderScopeError("legacy fixed-ref activity differs from C9 inventory")
-
     async def _fixed_snapshot(
         self,
         document: LegacyInventoryDocument,
@@ -439,42 +287,20 @@ class LegacyFixedRefShadowReader:
             # prior Resource's body through a later cache hit.
             self._snapshot_cache = None
             try:
-                raw_snapshot = await asyncio.to_thread(
-                    self.git.manual_fixed_ref_history,
+                text = await asyncio.to_thread(
+                    self.git.read_file,
                     self.vault_name,
-                    fixed_ref,
                     document.current_path,
-                    current_commit=document.current_commit,
-                    since_epoch=int(document.created_at.timestamp()),
+                    commit=document.current_commit,
                 )
-            except (FixedRefHistoryError, OSError, ValueError) as exc:
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
                 raise ShadowReaderScopeError("legacy fixed-ref materialization failed") from exc
-            if not isinstance(raw_snapshot, Mapping):
-                raise ShadowReaderScopeError("legacy fixed-ref materialization is invalid")
-            body = raw_snapshot.get("body")
-            history = raw_snapshot.get("history")
-            activity = raw_snapshot.get("activity")
-            materialized_fixed_ref = raw_snapshot.get("fixed_ref")
-            materialized_current_commit = raw_snapshot.get("current_commit")
-            if not isinstance(body, bytes):
+            if not isinstance(text, str):
                 raise ShadowReaderScopeError("legacy fixed-ref materialization returned no body")
-            if not isinstance(history, list) or not all(isinstance(entry, Mapping) for entry in history):
-                raise ShadowReaderScopeError("legacy fixed-ref history is invalid")
-            if not history or history[0].get("legacy_git_oid") != document.current_commit:
-                raise ShadowReaderScopeError("legacy fixed-ref history does not start at current head")
-            if not isinstance(activity, Mapping):
-                raise ShadowReaderScopeError("legacy fixed-ref activity is invalid")
-            if not isinstance(materialized_fixed_ref, str) or not isinstance(
-                materialized_current_commit,
-                str,
-            ):
-                raise ShadowReaderScopeError("legacy fixed-ref materialization has invalid scope")
             snapshot = _LegacyMaterialization(
-                fixed_ref=materialized_fixed_ref,
-                current_commit=materialized_current_commit,
-                body=bytes(body),
-                history=tuple(dict(entry) for entry in history),
-                activity=dict(activity),
+                fixed_ref=fixed_ref,
+                current_commit=document.current_commit,
+                body=text.encode("utf-8"),
             )
             self._validate_materialization(snapshot, document, fixed_ref=fixed_ref)
             self._snapshot_cache = (key, snapshot)
@@ -535,71 +361,28 @@ class LegacyFixedRefShadowReader:
         if selector != document.current_commit:
             raise ShadowReaderScopeError("legacy diff selector is outside the frozen current head")
         snapshot = await self._fixed_snapshot(document, fixed_ref=fixed_ref)
-        try:
-            raw_diff = await asyncio.to_thread(
-                self.git.file_diff,
-                self.vault_name,
-                document.current_path,
-                selector,
-            )
-        except (OSError, ValueError) as exc:
-            raise ShadowReaderScopeError("legacy fixed-ref diff failed") from exc
-        if not isinstance(raw_diff, Mapping):
-            raise ShadowReaderScopeError("legacy fixed-ref diff is invalid")
-        diff_type = raw_diff.get("type")
-        allowed_types = {
-            "create": {"added"},
-            "update": {"modified"},
-            "move": {"added", "modified"},
-            "delete": {"deleted"},
-        }[document.activity.action]
-        if (
-            raw_diff.get("file") != document.current_path
-            or raw_diff.get("commit") != selector
-            or diff_type not in allowed_types
-            or not isinstance(raw_diff.get("diff"), str)
-            or not raw_diff.get("diff")
-        ):
-            raise ShadowReaderScopeError("legacy fixed-ref diff differs from C9 inventory")
         previous = document.lineage[-2] if len(document.lineage) > 1 else None
         try:
-            current_text, parent_text = await asyncio.gather(
-                asyncio.to_thread(
-                    self.git.read_file,
-                    self.vault_name,
-                    document.current_path,
-                    commit=selector,
-                ),
-                asyncio.to_thread(
+            parent_text = (
+                await asyncio.to_thread(
                     self.git.read_file,
                     self.vault_name,
                     previous.path_at_revision,
                     commit=previous.legacy_git_oid,
                 )
                 if previous is not None
-                else asyncio.sleep(0, result=""),
+                else ""
             )
         except (OSError, ValueError) as exc:
             raise ShadowReaderScopeError("legacy fixed-ref diff body reads failed") from exc
-        if not isinstance(current_text, str) or not isinstance(parent_text, str):
+        if not isinstance(parent_text, str):
             raise ShadowReaderScopeError("legacy fixed-ref diff body facts are missing")
-        snapshot_text = snapshot.body.decode("utf-8")
-        if current_text != snapshot_text:
-            raise ShadowReaderScopeError("legacy fixed-ref diff current body differs from C9 facts")
-        if previous is None and diff_type == "modified":
-            transition_parent = ""
-            applied = current_text
-        else:
-            patch_parent = "" if diff_type == "added" else parent_text
-            transition_parent = parent_text
-            applied = _apply_unified_patch(patch_parent, raw_diff["diff"], diff_type)
-        if applied != current_text:
-            raise ShadowReaderScopeError("legacy fixed-ref diff patch differs from current body")
+        current_text = snapshot.body.decode("utf-8")
         return {
             "file": document.current_path,
             "commit": selector,
             "basis": "git-parent",
-            "text": _canonical_transition(transition_parent, applied),
+            "text": _canonical_transition(parent_text, current_text),
             "format": "unified",
         }
 

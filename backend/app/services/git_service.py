@@ -27,6 +27,7 @@ environment, pins DNS, and blocks non-https transports. See
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import logging
 import os
 import re
@@ -37,7 +38,7 @@ import subprocess
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -271,6 +272,16 @@ class GitHistoryCommandError(AKBError, RuntimeError):
             status_code=503,
             code=GIT_HISTORY_FAILED,
         )
+
+
+class _FixedRefHistoryIndex:
+    """Call-local full-ref name history plus lazy per-commit read caches."""
+
+    def __init__(self, commits: tuple[tuple[str, datetime, tuple[dict[str, str | None], ...]], ...]):
+        self.commits = commits
+        self.lock = threading.RLock()
+        self.metadata_by_oid: dict[str, dict[str, Any]] = {}
+        self.diff_tree_by_oid: dict[str, tuple[dict[str, str | None], ...]] = {}
 
 
 class GitService:
@@ -1677,6 +1688,463 @@ class GitService:
                 return self._stream_path_at_revision(repo, fixed_ref, file_path, target)
         except (BadName, BadObject, FileNotFoundError, ValueError):
             return None
+
+    @staticmethod
+    def _parse_name_status_changes(output: str) -> tuple[dict[str, str | None], ...]:
+        """Parse one Git name-status stream into path changes."""
+        changes: list[dict[str, str | None]] = []
+        for line in str(output).splitlines():
+            fields = line.split("\t")
+            if len(fields) < 2:
+                continue
+            status = fields[0]
+            if status.startswith(("R", "C")) and len(fields) >= 3:
+                changes.append(
+                    {
+                        "status": status,
+                        "path_from": fields[-2],
+                        "path_to": fields[-1],
+                    }
+                )
+            else:
+                changes.append(
+                    {
+                        "status": status,
+                        "path_from": None,
+                        "path_to": fields[-1],
+                    }
+                )
+        return tuple(changes)
+
+    @staticmethod
+    def _parse_fixed_ref_history_log(
+        output: str,
+    ) -> tuple[tuple[str, datetime, tuple[dict[str, str | None], ...]], ...]:
+        """Parse a full ``git log --name-status -z`` stream.
+
+        The commit format contributes ``oid<NUL>epoch<NUL>`` and ``-z`` makes
+        each status/path field NUL-delimited. A full OID followed by a decimal
+        epoch is therefore the only commit-boundary marker needed; paths are
+        consumed according to the status arity before the next boundary is
+        inspected.
+        """
+        tokens = str(output).split("\x00")
+        commits: list[tuple[str, datetime, tuple[dict[str, str | None], ...]]] = []
+        position = 0
+        full_oid = re.compile(r"^[0-9a-f]{40}$")
+
+        def is_commit_header(offset: int) -> bool:
+            return (
+                offset + 1 < len(tokens)
+                and full_oid.fullmatch(tokens[offset]) is not None
+                and re.fullmatch(r"-?[0-9]+", tokens[offset + 1]) is not None
+            )
+
+        while position < len(tokens):
+            while position < len(tokens) and not tokens[position]:
+                position += 1
+            if position >= len(tokens):
+                break
+            if not is_commit_header(position):
+                raise ValueError("fixed-ref history has a malformed commit header")
+            oid = tokens[position]
+            epoch = tokens[position + 1]
+            position += 2
+            try:
+                committed_at = datetime.fromtimestamp(int(epoch), tz=timezone.utc)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("fixed-ref history has an invalid commit timestamp") from exc
+
+            changes: list[dict[str, str | None]] = []
+            while position < len(tokens) and not is_commit_header(position):
+                if not tokens[position]:
+                    position += 1
+                    continue
+                status = tokens[position].lstrip("\r\n")
+                position += 1
+                if not status:
+                    continue
+                if status.startswith(("R", "C")):
+                    if position + 1 >= len(tokens):
+                        raise ValueError("fixed-ref history has a malformed rename")
+                    changes.append(
+                        {
+                            "status": status,
+                            "path_from": tokens[position],
+                            "path_to": tokens[position + 1],
+                        }
+                    )
+                    position += 2
+                else:
+                    if position >= len(tokens):
+                        raise ValueError("fixed-ref history has a malformed path change")
+                    changes.append(
+                        {
+                            "status": status,
+                            "path_from": None,
+                            "path_to": tokens[position],
+                        }
+                    )
+                    position += 1
+            commits.append((oid, committed_at, tuple(changes)))
+        return tuple(commits)
+
+    def _build_fixed_ref_history_index(
+        self,
+        repo: Repo,
+        fixed_ref: str,
+    ) -> _FixedRefHistoryIndex:
+        """Build the immutable full-ref index with exactly one Git log walk."""
+        try:
+            output = repo.git.log(
+                "-M",
+                "--name-status",
+                "-z",
+                "--format=%H%x00%ct",
+                fixed_ref,
+                "--",
+            )
+            commits = self._parse_fixed_ref_history_log(output)
+        except (GitError, ValueError) as exc:
+            raise FixedRefHistoryError("fixed-ref history could not be read") from exc
+        return _FixedRefHistoryIndex(commits)
+
+    def _indexed_commit_metadata(
+        self,
+        repo: Repo,
+        index: _FixedRefHistoryIndex,
+        oid: str,
+    ) -> dict[str, Any]:
+        """Load and cache display/activity metadata once per commit."""
+        with index.lock:
+            cached = index.metadata_by_oid.get(oid)
+            if cached is not None:
+                return cached
+            try:
+                commit = repo.commit(oid)
+                cached = {
+                    "message": str(commit.message).strip(),
+                    "author": str(commit.author),
+                    "legacy": self._legacy_commit_metadata(commit),
+                }
+            except (BadName, BadObject, GitError, KeyError, TypeError, ValueError) as exc:
+                raise FixedRefHistoryError("fixed-ref history could not read commit metadata") from exc
+            index.metadata_by_oid[oid] = cached
+            return cached
+
+    def _indexed_diff_tree_changes(
+        self,
+        repo: Repo,
+        index: _FixedRefHistoryIndex,
+        commit_oid: str,
+    ) -> tuple[dict[str, str | None], ...]:
+        """Load and cache one commit's diff-tree path changes."""
+        with index.lock:
+            cached = index.diff_tree_by_oid.get(commit_oid)
+            if cached is not None:
+                return cached
+            try:
+                output = repo.git.diff_tree(
+                    "--root",
+                    "-r",
+                    "--name-status",
+                    "-M",
+                    commit_oid,
+                )
+                cached = self._parse_name_status_changes(output)
+            except (GitError, ValueError) as exc:
+                raise FixedRefHistoryError(
+                    "fixed-ref current commit activity could not be read"
+                ) from exc
+            index.diff_tree_by_oid[commit_oid] = cached
+            return cached
+
+    @staticmethod
+    def _indexed_path_change(
+        changes: tuple[dict[str, str | None], ...],
+        active_path: str,
+    ) -> dict[str, str | None] | None:
+        """Project one full-ref change as ``git log --follow`` would see it."""
+        for change in changes:
+            status = change.get("status") or ""
+            path_from = change.get("path_from")
+            path_to = change.get("path_to")
+            if status.startswith("R"):
+                if path_to == active_path:
+                    return {
+                        "path_at_revision": path_to,
+                        "action": "move",
+                        "next_path": path_from,
+                    }
+                if path_from == active_path:
+                    # A path-specific log asked for the old side of a rename
+                    # sees Git's synthesized deletion rather than the R row.
+                    return {
+                        "path_at_revision": path_from,
+                        "action": "delete",
+                        "next_path": None,
+                    }
+                continue
+            if path_to != active_path:
+                continue
+            return {
+                "path_at_revision": path_to,
+                "action": {
+                    "A": "create",
+                    "M": "update",
+                    "D": "delete",
+                }.get(status[:1]),
+                "next_path": None,
+            }
+        return None
+
+    def _manual_fixed_ref_activity_from_changes(
+        self,
+        *,
+        commit_oid: str,
+        committed_at: datetime,
+        file_path: str,
+        metadata: dict[str, str],
+        changes: tuple[dict[str, str | None], ...],
+    ) -> dict:
+        """Apply the legacy activity validation to cached diff-tree rows."""
+        declared_action = metadata["action"]
+        supported_actions = {"create", "update", "move", "delete"}
+        if declared_action and declared_action not in supported_actions:
+            raise FixedRefHistoryError(
+                "fixed-ref current commit has no supported public activity action"
+            )
+        if not metadata["subject"] or not metadata["agent"]:
+            raise FixedRefHistoryError(
+                "fixed-ref current commit has incomplete activity identity"
+            )
+
+        selected_changes: list[dict[str, str | None]] = []
+        for change in changes:
+            status = change.get("status") or ""
+            path_to = change.get("path_to")
+            if status.startswith(("R", "C")) and path_to == file_path:
+                selected_changes.append(
+                    {
+                        "change": "move",
+                        "path_from": change.get("path_from"),
+                        "path_to": path_to,
+                    }
+                )
+            elif path_to == file_path:
+                change_kind = {
+                    "A": "create",
+                    "M": "update",
+                    "D": "delete",
+                }.get(status[:1])
+                if change_kind is not None:
+                    selected_changes.append(
+                        {
+                            "change": change_kind,
+                            "path_from": None,
+                            "path_to": file_path,
+                        }
+                    )
+        if len(selected_changes) != 1:
+            raise FixedRefHistoryError(
+                "fixed-ref current commit activity does not match the file action"
+            )
+        selected_change = selected_changes[0]
+        inferred_action = selected_change["change"]
+        action = declared_action or inferred_action
+        if action != inferred_action:
+            raise FixedRefHistoryError(
+                "fixed-ref current commit activity does not match the file action"
+            )
+        return {
+            "legacy_git_oid": commit_oid,
+            "committed_at": committed_at,
+            "actor": metadata["agent"],
+            "subject": metadata["subject"],
+            "summary": metadata["summary"],
+            "action": action,
+            "path_from": selected_change["path_from"],
+            "path_to": selected_change["path_to"],
+            "changed_paths": selected_changes,
+        }
+
+    def manual_fixed_ref_history_batch(
+        self,
+        vault_name: str,
+        fixed_ref: str,
+        requests: Iterable[Mapping[str, object]],
+        *,
+        include_bodies: bool = True,
+    ) -> list[dict]:
+        """Read many manual documents from one cached fixed-ref history index.
+
+        ``requests`` is an iterable of mappings containing ``file_path``,
+        ``current_commit`` and optional ``since_epoch``. Results preserve input
+        order and use the exact snapshot shape returned by
+        :meth:`manual_fixed_ref_history`. One full ``git log --name-status``
+        walk is performed for this batch's ``(vault_name, fixed_ref)``; commit
+        metadata and diff-tree rows are memoized by commit within that index.
+        Body reads are intentionally performed per request. Callers that only
+        need immutable inventory facts may set ``include_bodies=False`` to
+        retain only each body's digest and byte size instead of all bodies.
+        """
+        full_oid = re.compile(r"^[0-9a-f]{40}$")
+        if not full_oid.fullmatch(fixed_ref):
+            raise FixedRefHistoryError("fixed_ref must be a full lowercase 40-hex commit OID")
+
+        normalized: list[tuple[str, str, int | None]] = []
+        for request in requests:
+            if not isinstance(request, Mapping):
+                raise FixedRefHistoryError("fixed-ref history request must be a mapping")
+            file_path = request.get("file_path")
+            current_commit = request.get("current_commit")
+            since_epoch = request.get("since_epoch")
+            if not isinstance(file_path, str):
+                raise FixedRefHistoryError("fixed-ref history file_path must be a string")
+            if not isinstance(current_commit, str) or not full_oid.fullmatch(current_commit):
+                raise FixedRefHistoryError(
+                    "current_commit must be a full lowercase 40-hex commit OID"
+                )
+            if since_epoch is not None and not isinstance(since_epoch, int):
+                raise FixedRefHistoryError("fixed-ref history since_epoch must be an integer")
+            normalized.append((file_path, current_commit, since_epoch))
+
+        if not normalized:
+            return []
+        if self._is_mirror(vault_name):
+            raise FixedRefHistoryError("fixed-ref history is limited to manual vaults")
+
+        try:
+            with _managed_repo(self._get_repo(vault_name)) as repo:
+                repo.commit(fixed_ref)
+                validated_current: dict[str, Any] = {}
+                for _file_path, current_commit, _since_epoch in normalized:
+                    if current_commit in validated_current:
+                        continue
+                    try:
+                        current = repo.commit(current_commit)
+                        repo.git.merge_base("--is-ancestor", current_commit, fixed_ref)
+                    except (
+                        BadName,
+                        BadObject,
+                        FileNotFoundError,
+                        GitError,
+                        KeyError,
+                        TypeError,
+                        ValueError,
+                    ) as exc:
+                        raise FixedRefHistoryError(
+                            "fixed-ref history could not resolve the requested commit or body"
+                        ) from exc
+                    validated_current[current_commit] = current
+                index = self._build_fixed_ref_history_index(repo, fixed_ref)
+                snapshots: list[dict] = []
+                for file_path, current_commit, since_epoch in normalized:
+                    current = validated_current[current_commit]
+                    try:
+                        blob = current.tree / file_path
+                        body = blob.data_stream.read()
+                    except (
+                        BadName,
+                        BadObject,
+                        FileNotFoundError,
+                        GitError,
+                        KeyError,
+                        TypeError,
+                        ValueError,
+                    ) as exc:
+                        raise FixedRefHistoryError(
+                            "fixed-ref history could not resolve the requested commit or body"
+                        ) from exc
+
+                    try:
+                        body.decode("utf-8", errors="strict")
+                    except UnicodeDecodeError as exc:
+                        raise FixedRefHistoryError("fixed-ref body is not valid UTF-8") from exc
+
+                    effective_since = (
+                        since_epoch
+                        if since_epoch is not None and current.committed_date >= since_epoch
+                        else None
+                    )
+                    history: list[dict] = []
+                    active_path = file_path
+                    for oid, committed_at, changes in index.commits:
+                        if (
+                            effective_since is not None
+                            and int(committed_at.timestamp()) < effective_since
+                        ):
+                            continue
+                        selected = self._indexed_path_change(changes, active_path)
+                        if selected is None:
+                            continue
+                        entry = {
+                            "legacy_git_oid": oid,
+                            "committed_at": committed_at,
+                            "path_at_revision": selected["path_at_revision"],
+                        }
+                        action = selected.get("action")
+                        if action is not None:
+                            entry["action"] = action
+                        metadata = self._indexed_commit_metadata(repo, index, oid)
+                        entry["message"] = metadata["message"]
+                        entry["author"] = metadata["author"]
+                        declared_action = metadata["legacy"].get("action")
+                        if declared_action in {"create", "update", "move", "delete"}:
+                            entry["action"] = declared_action
+                        history.append(entry)
+                        next_path = selected.get("next_path")
+                        if next_path is not None:
+                            active_path = next_path
+
+                    current_metadata = self._indexed_commit_metadata(
+                        repo,
+                        index,
+                        current_commit,
+                    )
+                    activity_changes = self._indexed_diff_tree_changes(
+                        repo,
+                        index,
+                        commit_oid=current_commit,
+                    )
+                    activity = self._manual_fixed_ref_activity_from_changes(
+                        commit_oid=current_commit,
+                        committed_at=datetime.fromtimestamp(
+                            current.committed_date,
+                            tz=timezone.utc,
+                        ),
+                        file_path=file_path,
+                        metadata=current_metadata["legacy"],
+                        changes=activity_changes,
+                    )
+                    snapshot: dict[str, Any] = {
+                        "fixed_ref": fixed_ref,
+                        "current_commit": current_commit,
+                        "history": history,
+                        "activity": activity,
+                    }
+                    if include_bodies:
+                        snapshot["body"] = body
+                    else:
+                        if b"\x00" in body:
+                            raise FixedRefHistoryError(
+                                "fixed-ref body contains NUL bytes"
+                            )
+                        snapshot["body_digest"] = hashlib.sha256(body).hexdigest()
+                        snapshot["byte_size"] = len(body)
+                    snapshots.append(snapshot)
+                return snapshots
+        except (
+            BadName,
+            BadObject,
+            FileNotFoundError,
+            GitError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise FixedRefHistoryError(
+                "fixed-ref history could not resolve the requested commit or body"
+            ) from exc
 
     def manual_fixed_ref_history(
         self,

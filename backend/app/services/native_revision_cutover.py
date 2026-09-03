@@ -22,6 +22,7 @@ from app.repositories.native_revision_cutover_repo import (
     NativeRevisionCutoverRepository,
 )
 from app.repositories.native_revision_migration_repo import (
+    MigrationInventoryDriftError,
     NativeRevisionMigrationRepository,
 )
 from app.services.native_revision_backfill import NativeRevisionBackfill
@@ -31,11 +32,13 @@ from app.services.adapters import s3_adapter
 from app.services.git_service import GitService
 from app.services.legacy_revision_bridge import (
     InventoryEligibilityError,
+    LegacyInventory,
     LegacyRevisionBridge,
 )
 from app.services.native_revision_authority import (
     NativeAuthorityIdentity,
-    mint_existing_database_authority,
+    begin_existing_database_authority,
+    finalize_existing_database_authority,
 )
 from app.services.native_revision_shadow import NativeRevisionShadowComparator
 from app.services.native_revision_shadow_reader import (
@@ -623,9 +626,8 @@ class NativeRevisionCutover:
         conn: asyncpg.Connection,
         files: Sequence[CutoverFile],
     ) -> None:
-        for file in files:
-            native = await conn.fetchrow(
-                """
+        rows = await conn.fetch(
+            """
                 SELECT r.namespace_id, r.resource_id, r.surface, r.lifecycle,
                        r.current_path, r.head_revision_id,
                        pm.digest, pm.byte_size
@@ -635,10 +637,13 @@ class NativeRevisionCutover:
                    AND nr.revision_id = r.head_revision_id
              LEFT JOIN native_payload_manifests pm
                     ON pm.payload_manifest_id = nr.payload_manifest_id
-                 WHERE r.resource_id = $1
-                """,
-                file.file_id,
-            )
+                 WHERE r.resource_id = ANY($1::uuid[])
+            """,
+            [file.file_id for file in files],
+        )
+        native_by_id = {row["resource_id"]: row for row in rows}
+        for file in files:
+            native = native_by_id.get(file.file_id)
             if file.disposition == "preserved_binary":
                 if native is not None:
                     raise CutoverVerificationError(f"binary File {file.file_id} unexpectedly gained text authority")
@@ -670,7 +675,135 @@ class NativeRevisionCutover:
             if observed != expected:
                 raise CutoverVerificationError(f"File {file.file_id} Native searchable projection drifted")
 
-    async def _revalidate_authority_inventory(
+    async def _require_source_file_bindings(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        namespace_ids: Sequence[uuid.UUID],
+        files: Sequence[CutoverFile],
+    ) -> None:
+        rows = await conn.fetch(
+            """
+            SELECT vf.vault_id AS namespace_id, vf.id AS file_id,
+                   CASE WHEN c.path IS NULL THEN vf.name
+                        ELSE c.path || '/' || vf.name END AS logical_path,
+                   COALESCE(NULLIF(vf.mime_type, ''), 'application/octet-stream')
+                       AS mime_type,
+                   vf.content_hash, vf.size_bytes, vf.s3_key,
+                   vf.etag, vf.storage_version, vf.created_by
+              FROM vault_files vf
+         LEFT JOIN collections c ON c.id = vf.collection_id
+             WHERE vf.vault_id = ANY($1::uuid[])
+               AND vf.kind = 'file'
+               AND vf.upload_state = 'confirmed'
+               AND vf.hash_verified_at IS NOT NULL
+               AND vf.content_hash ~ '^[0-9a-f]{64}$'
+               AND vf.size_bytes >= 0
+             ORDER BY vf.vault_id, vf.id
+            """,
+            list(namespace_ids),
+        )
+        observed = [
+            {
+                "namespace_id": str(row["namespace_id"]),
+                "file_id": str(row["file_id"]),
+                "logical_path": row["logical_path"],
+                "mime_type": row["mime_type"],
+                "content_hash": row["content_hash"],
+                "byte_size": int(row["size_bytes"]),
+                "s3_key": row["s3_key"],
+                "etag": row["etag"],
+                "storage_version": row["storage_version"],
+                "created_by": row["created_by"],
+            }
+            for row in rows
+        ]
+        expected = [
+            {key: value for key, value in self._file_inventory_fact(file).items() if key != "disposition"}
+            for file in files
+        ]
+        if observed != expected:
+            raise CutoverVerificationError("cutover File catalog drifted after planning")
+
+    async def _require_native_document_bindings(
+        self,
+        conn: asyncpg.Connection,
+        inventory: LegacyInventory,
+    ) -> None:
+        """Recheck frozen Native heads and payload facts without reading bodies."""
+
+        mappings = await self.backfill.repository.list_namespace_completed_mappings(
+            namespace_id=inventory.namespace_id,
+            conn=conn,
+        )
+        current_mappings = {
+            (mapping.resource_id, mapping.legacy_git_oid): mapping
+            for mapping in mappings
+            if mapping.resolution == "native"
+        }
+        resource_ids = [document.resource_id for document in inventory.documents]
+        rows = await conn.fetch(
+            """
+            SELECT resource.resource_id, resource.namespace_id, resource.surface,
+                   resource.lifecycle, resource.current_path,
+                   resource.head_revision_id, revision.parent_revision_id,
+                   revision.action, revision.path_at_revision,
+                   manifest.digest, manifest.byte_size
+              FROM native_resources resource
+              JOIN native_revisions revision
+                ON revision.resource_id = resource.resource_id
+               AND revision.revision_id = resource.head_revision_id
+              JOIN native_payload_manifests manifest
+                ON manifest.payload_manifest_id = revision.payload_manifest_id
+             WHERE resource.resource_id = ANY($1::uuid[])
+             ORDER BY resource.resource_id
+            """,
+            resource_ids,
+        )
+        by_resource = {row["resource_id"]: row for row in rows}
+        if len(by_resource) != len(resource_ids):
+            raise CutoverVerificationError(
+                f"vault {inventory.namespace_id} Native document closure drifted"
+            )
+        for document in inventory.documents:
+            mapping = current_mappings.get(
+                (document.resource_id, document.current_commit)
+            )
+            native = by_resource.get(document.resource_id)
+            if mapping is None or mapping.native_revision_id is None or native is None:
+                raise CutoverVerificationError(
+                    f"document {document.resource_id} Native head binding drifted"
+                )
+            observed = (
+                native["namespace_id"],
+                native["surface"],
+                native["lifecycle"],
+                native["current_path"],
+                native["head_revision_id"],
+                native["parent_revision_id"],
+                native["action"],
+                native["path_at_revision"],
+                native["digest"],
+                int(native["byte_size"]),
+            )
+            expected = (
+                inventory.namespace_id,
+                "document",
+                "live",
+                document.current_path,
+                mapping.native_revision_id,
+                None,
+                "create",
+                document.current_path,
+                document.body_digest,
+                document.byte_size,
+            )
+            if observed != expected:
+                raise CutoverVerificationError(
+                    f"document {document.resource_id} Native head binding drifted"
+                )
+
+    async def _revalidate_authority_catalog(
         self,
         conn: asyncpg.Connection,
         *,
@@ -705,54 +838,84 @@ class NativeRevisionCutover:
         if exclusions:
             raise CutoverVerificationError("cutover exclusion inventory drifted after external Git retirement")
 
-        retained_by_id = {row["id"]: row for row in retained}
         for vault in vaults:
-            row = retained_by_id[vault.namespace_id]
+            if vault.status != "verified" or vault.verification_digest is None:
+                raise CutoverVerificationError(f"vault {vault.namespace_id} verification receipt disappeared")
+            migration_run = await self.backfill.repository.get_run(
+                vault.migration_run_id,
+                conn=conn,
+            )
+            if (
+                migration_run is None
+                or migration_run.status != "complete"
+                or migration_run.namespace_id != vault.namespace_id
+                or migration_run.fixed_git_oid != vault.fixed_git_oid
+                or migration_run.inventory_digest != vault.inventory_digest
+            ):
+                raise CutoverVerificationError(f"vault {vault.namespace_id} migration run disappeared")
+            try:
+                scope = await self.backfill.bridge.inventory_scope_for_run(
+                    migration_run,
+                    conn=conn,
+                )
+            except (InventoryEligibilityError, MigrationInventoryDriftError) as exc:
+                raise CutoverVerificationError(
+                    f"vault {vault.namespace_id} inventory drifted after verification"
+                ) from exc
+            await self._require_native_document_bindings(conn, scope.inventory)
+
+        await self._require_source_file_bindings(
+            conn,
+            namespace_ids=[item.namespace_id for item in vaults],
+            files=files,
+        )
+        await self._require_native_file_bindings(conn, files)
+
+        if run.inventory_digest != self._cutover_inventory_digest(
+            vaults=vaults,
+            files=files,
+            exclusions=exclusions,
+        ):
+            raise CutoverVerificationError("cutover inventory digest drifted after planning")
+
+    async def _revalidate_authority_external(
+        self,
+        *,
+        cutover_id: uuid.UUID,
+    ) -> None:
+        """Recheck immutable Git/S3 source objects outside a database transaction."""
+
+        run = await self._required_run(cutover_id)
+        if run.status != "verified":
+            raise CutoverVerificationError("cutover must remain verified at authority mint")
+        vaults = await self.repository.list_vaults(cutover_id)
+        files = await self.repository.list_files(cutover_id)
+        retained = {row["id"]: row for row in await self._retained_vault_inventory()}
+        for vault in vaults:
+            row = retained.get(vault.namespace_id)
+            if row is None:
+                raise CutoverVerificationError(f"vault {vault.namespace_id} disappeared after fencing")
             current_ref = await asyncio.to_thread(
                 self.backfill.git.current_commit,
                 row["name"],
             )
             if current_ref != vault.fixed_git_oid:
                 raise CutoverVerificationError(f"vault {vault.namespace_id} Git ref drifted after verification")
-            migration_run = await self.backfill.repository.get_run(vault.migration_run_id)
-            if migration_run is None:
-                raise CutoverVerificationError(f"vault {vault.namespace_id} migration run disappeared")
+
+        for file in files:
+            data = await asyncio.to_thread(self.file_reader, file.s3_key)
             try:
-                inventory = await self.backfill.bridge.capture_inventory(
-                    namespace_id=vault.namespace_id,
-                    fixed_ref=vault.fixed_git_oid,
-                    coverage_version=migration_run.coverage_version,
+                disposition = self._classify_file_bytes(
+                    file_id=file.file_id,
+                    mime_type=file.mime_type,
+                    content_hash=file.content_hash,
+                    byte_size=file.byte_size,
+                    data=data,
                 )
-            except InventoryEligibilityError as exc:
-                raise CutoverVerificationError(
-                    f"vault {vault.namespace_id} inventory drifted after verification"
-                ) from exc
-            if inventory.inventory_digest != vault.inventory_digest:
-                raise CutoverVerificationError(f"vault {vault.namespace_id} inventory drifted after verification")
-            receipt = await self.verifier.compare_run(vault.migration_run_id)
-            self._require_passed_receipt(vault, receipt)
-            if _digest(receipt) != vault.verification_digest:
-                raise CutoverVerificationError(f"vault {vault.namespace_id} verification receipt drifted")
-
-        try:
-            live_files = await self._file_inventory(
-                [item.namespace_id for item in vaults],
-                conn=conn,
-            )
-        except CutoverApplyError as exc:
-            raise CutoverVerificationError(str(exc)) from exc
-        if [self._file_inventory_fact(item) for item in live_files] != [
-            self._file_inventory_fact(item) for item in files
-        ]:
-            raise CutoverVerificationError("cutover File inventory drifted after planning")
-        await self._require_native_file_bindings(conn, files)
-
-        if run.inventory_digest != self._cutover_inventory_digest(
-            vaults=vaults,
-            files=live_files,
-            exclusions=exclusions,
-        ):
-            raise CutoverVerificationError("cutover inventory digest drifted after planning")
+            except CutoverApplyError as exc:
+                raise CutoverVerificationError(str(exc)) from exc
+            if disposition != file.disposition:
+                raise CutoverVerificationError(f"File {file.file_id} classification drifted after verification")
 
     async def commit(
         self,
@@ -768,15 +931,26 @@ class NativeRevisionCutover:
         retained = await self._retained_vault_inventory()
         async with self._hold_git_write_fences([row["name"] for row in retained]):
             async with self.pool.acquire() as conn:
-                authority_id = await mint_existing_database_authority(
+                fence = await begin_existing_database_authority(
                     conn,
                     identity=identity,
                     cutover_id=cutover_id,
-                    revalidate=lambda transaction_conn: self._revalidate_authority_inventory(
+                    preflight=lambda transaction_conn: self._revalidate_authority_catalog(
                         transaction_conn,
                         cutover_id=cutover_id,
                     ),
                 )
+            if fence.authority_id is None:
+                await self._revalidate_authority_external(cutover_id=cutover_id)
+                async with self.pool.acquire() as conn:
+                    authority_id = await finalize_existing_database_authority(
+                        conn,
+                        identity=identity,
+                        fence=fence,
+                    )
+            else:
+                authority_id = fence.authority_id
+            async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(
                     """
                     SELECT authority_id, cutover_id, inventory_digest, status
