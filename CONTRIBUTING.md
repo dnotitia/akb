@@ -95,6 +95,30 @@ unset AKB_E2E_USERNAME AKB_E2E_PASSWORD
 cd frontend && pnpm test
 ```
 
+The authenticated MCP pytest scenario is run by the repository-owned runtime
+gate and can also consume a ready schema-v2 descriptor directly. Local and
+hosted CI use the same pytest entrypoint and the same `akb_list_vaults({})`
+assertion:
+
+```bash
+uv run --locked --extra dev --project backend python -m pytest \
+  backend/tests/mcp_e2e -v --tb=short \
+  --confcutdir=backend/tests/mcp_e2e --runtime-descriptor -
+```
+
+For a descriptor file, replace `-` with its path:
+
+```bash
+uv run --locked --extra dev --project backend python -m pytest \
+  backend/tests/mcp_e2e -v --tb=short \
+  --confcutdir=backend/tests/mcp_e2e \
+  --runtime-descriptor /path/to/descriptor.json
+```
+
+The descriptor must come from `backend/scripts/ci/e2e_runtime.py serve` or the
+Ubuntu bootstrap. This pytest command consumes the existing runtime; it does
+not start or tear down a backend, database, or fixture service.
+
 The E2E suites create ephemeral users and vaults and clean up after
 themselves. They poll `/health` for indexing completion before running search
 assertions, so a slow remote embedding endpoint won't cause flakes. An

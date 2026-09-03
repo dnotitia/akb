@@ -35,8 +35,9 @@ jobs:
 
       - name: Run unit tests
         working-directory: backend
-        # `-k 'not _e2e'` excludes the two e2e files that need a live
-        # backend pod (test_indexable_e2e.py, test_rerank_e2e.py).
+        # `-k 'not _e2e'` excludes live tests, including the authenticated
+        # MCP scenario under tests/mcp_e2e. The repository-owned runtime gate
+        # runs that scenario explicitly with its schema-v2 descriptor.
         # Shell e2e suites under tests/*.sh aren't picked up by pytest.
         run: pytest tests/ -k 'not _e2e' -v --tb=short
 
