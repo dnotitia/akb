@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 import uuid
 
+import asyncpg
 import pytest
 
 from app.services.native_document_service import NativeDocumentService
@@ -186,4 +187,23 @@ async def test_expected_commit_accepts_only_completed_mapping_to_current_native_
         resource_id=resource_id,
         expected_commit="3" * 40,
         current_revision_id=native_head,
+    )
+
+
+@pytest.mark.asyncio
+async def test_expected_commit_without_migration_schema_remains_a_normal_mismatch(monkeypatch):
+    pool, _ = _pool()
+    service = NativeDocumentService(pool=pool)
+    lookup = AsyncMock(side_effect=asyncpg.UndefinedTableError("missing migration bridge"))
+    monkeypatch.setattr(
+        "app.repositories.native_revision_migration_repo."
+        "NativeRevisionMigrationRepository.mapping_for_native_revision",
+        lookup,
+    )
+
+    assert not await service._expected_commit_matches_current(
+        namespace_id=uuid.uuid4(),
+        resource_id=uuid.uuid4(),
+        expected_commit="1" * 40,
+        current_revision_id="2" * 40,
     )

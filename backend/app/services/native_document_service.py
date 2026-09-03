@@ -268,13 +268,19 @@ class NativeDocumentService(DocumentService):
         """
         if expected_commit == current_revision_id:
             return True
-        mapping = await NativeRevisionMigrationRepository(
-            await self._pool()
-        ).mapping_for_native_revision(
-            namespace_id=namespace_id,
-            resource_id=resource_id,
-            native_revision_id=current_revision_id,
-        )
+        try:
+            mapping = await NativeRevisionMigrationRepository(
+                await self._pool()
+            ).mapping_for_native_revision(
+                namespace_id=namespace_id,
+                resource_id=resource_id,
+                native_revision_id=current_revision_id,
+            )
+        except asyncpg.UndefinedTableError:
+            # Native-only test/install schemas can intentionally omit the
+            # optional migration bridge. Preserve their historical mismatch
+            # behavior instead of turning a stale token into a server error.
+            return False
         return mapping is not None and mapping.legacy_git_oid == expected_commit
 
     async def _path_is_owned(self, vault_id: uuid.UUID, path: str) -> bool:
