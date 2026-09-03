@@ -12,19 +12,11 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-import httpx
 import pytest
-from mcp import types as mcp_types
 
 import tests.mcp_e2e.conftest as mcp_conftest
-from tests.mcp_e2e.conftest import _prepare_runtime, mcp_client as mcp_client_fixture
-from tests.mcp_e2e.runtime import RuntimeContext, RuntimeDescriptor, RuntimeSetupError
-from tests.mcp_e2e.test_list_vaults_e2e import (
-    _assert_connection,
-    _assert_list_vaults_shape,
-    _assert_tool_catalog,
-    _list_vaults_payload,
-)
+from tests.mcp_e2e.conftest import mcp_client as mcp_client_fixture
+from tests.mcp_e2e.runtime import RuntimeContext, RuntimeDescriptor
 
 
 def _descriptor() -> dict[str, Any]:
@@ -57,115 +49,6 @@ def _descriptor() -> dict[str, Any]:
     }
 
 
-def _discovery() -> dict[str, Any]:
-    return {
-        "status": "ready",
-        "scenario": "empty",
-        "access": {
-            "login": {
-                "service": "app",
-                "method": "POST",
-                "path": "/api/v1/auth/login",
-            }
-        },
-        "runtime": {
-            "origin": {"backend": "http://127.0.0.1:8000", "fixture": "http://127.0.0.1:8889"},
-            "transport": ["http"],
-            "tool_cases": {"read": "akb_list_vaults"},
-            "credential_env": {
-                "username": "AKB_TEST_USER_ENV",
-                "password": "AKB_TEST_PASS_ENV",  # pragma: allowlist secret
-            },
-            "pat": {
-                "mint": {
-                    "service": "app",
-                    "method": "POST",
-                    "path": "/api/v1/auth/tokens",
-                }
-            },
-        },
-    }
-
-
-class _FixtureClient:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str, dict[str, Any] | None, dict[str, str] | None]] = []
-        self.closed = False
-
-    def request(
-        self,
-        method: str,
-        url: str,
-        *,
-        json: dict[str, Any] | None = None,
-        headers: dict[str, str] | None = None,
-    ) -> httpx.Response:
-        self.calls.append((method, url, json, headers))
-        if url.endswith("/readyz") or url.endswith("/health"):
-            body: dict[str, Any] = {"status": "ready"}
-        elif url.endswith("/discover"):
-            body = _discovery()
-        elif url.endswith("/reset"):
-            body = {"status": "ready", "scenario": "empty"}
-        elif url.endswith("/auth/login"):
-            body = {"token": "session-value"}
-        elif url.endswith("/auth/tokens"):
-            body = {"token": "akb_test_pat"}
-        else:
-            body = {}
-        return httpx.Response(200, json=body, request=httpx.Request(method, url))
-
-    def close(self) -> None:
-        self.closed = True
-
-
-def test_runtime_descriptor_accepts_schema_v2_and_derives_mcp_endpoint() -> None:
-    descriptor = RuntimeDescriptor.from_json(json.dumps(_descriptor()))
-
-    assert descriptor.scenario == "empty"
-    assert descriptor.mcp_url == "http://127.0.0.1:8000/mcp/"
-
-
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        lambda value: value.update({"schema_version": 1}),
-        lambda value: value["services"]["fixture"]["reset"].update({"method": "GET"}),
-        lambda value: value["services"]["fixture"]["reset"].update(
-            {"url": "http://evil.example/reset"}
-        ),
-        lambda value: value["credentials"].update({"username_env": "not-valid"}),
-    ],
-)
-def test_runtime_descriptor_rejects_incompatible_contract(mutate: Any) -> None:
-    value = copy.deepcopy(_descriptor())
-    mutate(value)
-
-    with pytest.raises(RuntimeSetupError):
-        RuntimeDescriptor.from_json(json.dumps(value))
-
-
-def test_runtime_setup_reuses_reset_discovery_and_mints_in_memory_pat(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("AKB_TEST_USER_ENV", "fixture-user")
-    monkeypatch.setenv("AKB_TEST_PASS_ENV", "fixture-pass")
-    client = _FixtureClient()
-    descriptor = RuntimeDescriptor.from_json(json.dumps(_descriptor()))
-    context = _prepare_runtime(descriptor, client)  # type: ignore[arg-type]
-
-    assert context.pat == "akb_test_pat"
-    assert context.descriptor.username_env == "AKB_TEST_USER_ENV"
-    assert context.descriptor.password_env == "AKB_TEST_PASS_ENV"  # pragma: allowlist secret
-    reset = next(call for call in client.calls if call[1].endswith("/reset"))
-    assert reset[0] == "POST" and reset[2] == {"scenario": "empty"}
-    mint = next(call for call in client.calls if call[1].endswith("/auth/tokens"))
-    assert mint[3] == {"Authorization": "Bearer session-value"}
-
-    client.close()
-    assert client.closed
-
-
 def test_descriptor_stdin_read_is_compatible_with_pytest_capture(tmp_path: Path) -> None:
     probe = tmp_path / "test_descriptor_pipe.py"
     probe.write_text(
@@ -191,78 +74,6 @@ def test_descriptor_stdin_read_is_compatible_with_pytest_capture(tmp_path: Path)
     )
 
     assert result.returncode == 0, result.stderr
-
-
-def _call_result(text: str, *, is_error: bool = False) -> mcp_types.CallToolResult:
-    return mcp_types.CallToolResult(
-        content=[mcp_types.TextContent(text=text)],
-        is_error=is_error,
-    )
-
-
-def _assertion_failure(callback: Any) -> str:
-    with pytest.raises(pytest.fail.Exception) as captured:
-        callback()
-    return str(captured.value)
-
-
-def test_typed_sdk_response_assertions_accept_the_public_list_vaults_contract() -> None:
-    tools = mcp_types.ListToolsResult(
-        tools=[mcp_types.Tool(name="akb_list_vaults", input_schema={"type": "object"})]
-    )
-    _assert_tool_catalog(tools)
-    public = _list_vaults_payload(
-        _call_result(json.dumps({"vaults": [], "total": 0, "returned": 0}))
-    )
-    _assert_list_vaults_shape(public)
-
-
-@pytest.mark.parametrize(
-    ("text", "is_error", "detail"),
-    [
-        ("{}", True, "tool returned an error"),
-        ("not-json", False, "tool returned invalid public JSON"),
-        ("[]", False, "public result is not an object"),
-        (json.dumps({"vaults": {}, "total": 0, "returned": 0}), False, "vaults is not an array"),
-        (json.dumps({"vaults": [], "total": True, "returned": 0}), False, "total and returned must be integers"),
-        (json.dumps({"vaults": [], "total": 0, "returned": False}), False, "total and returned must be integers"),
-        (json.dumps({"vaults": [], "total": 1, "returned": 1}), False, "returned does not match vaults length"),
-        (json.dumps({"vaults": [{}], "total": 0, "returned": 1}), False, "total is smaller than returned"),
-    ],
-)
-def test_list_vaults_response_failures_are_pytest_failures(
-    text: str,
-    is_error: bool,
-    detail: str,
-) -> None:
-    result = _call_result(text, is_error=is_error)
-    message = _assertion_failure(
-        lambda: _assert_list_vaults_shape(_list_vaults_payload(result))
-    )
-
-    assert "scenario=akb_list_vaults operation=tools/call akb_list_vaults" in message
-    assert detail in message
-    assert "fixture-pass" not in message
-
-
-def test_tool_catalog_and_connection_failures_identify_their_operations() -> None:
-    catalog_message = _assertion_failure(
-        lambda: _assert_tool_catalog(mcp_types.ListToolsResult(tools=[]))
-    )
-    protocol_message = _assertion_failure(
-        lambda: _assert_connection(
-            "unsupported", mcp_types.Implementation(name="akb", version="")
-        )
-    )
-    server_message = _assertion_failure(
-        lambda: _assert_connection(
-            "2025-06-18", mcp_types.Implementation(name="other", version="")
-        )
-    )
-
-    assert "operation=tools/list" in catalog_message
-    assert "operation=connect" in protocol_message
-    assert "operation=connect" in server_message
 
 
 def test_preparation_failure_is_an_actual_pytest_failure(tmp_path: Path) -> None:

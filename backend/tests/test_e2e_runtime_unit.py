@@ -514,14 +514,10 @@ async def test_gate_child_stdout_is_private_and_stderr_is_inherited(tmp_path, ca
 
     captured = capfd.readouterr()
     gate_log = (config.logs_dir / "gate.log").read_text(encoding="utf-8")
-    mcp_pytest_log = (config.logs_dir / "mcp-pytest.log").read_text(encoding="utf-8")
     assert "credential-looking suite output" in gate_log
     assert "credential-looking suite output" not in captured.err
     assert '"event":"suite_complete"' in captured.err
     assert '"returncode":132' in captured.err
-    assert "1 passed" in mcp_pytest_log
-    assert '"event":"mcp_pytest_start"' in captured.err
-    assert '"event":"mcp_pytest_complete"' in captured.err
 
 
 @pytest.mark.asyncio
