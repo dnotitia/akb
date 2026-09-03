@@ -81,10 +81,9 @@ source /etc/os-release 2>/dev/null || die "cannot inspect /etc/os-release"
 "${SUDO[@]}" apt-get install -y curl ca-certificates \
   || die "curl/CA package installation failed"
 
-# The transport profiles execute the repository's real zero-dependency Node
-# consumer after this host layer completes.  Use the Ubuntu 24.04 archive
-# rather than an unpinned third-party installer so a clean VM gets the same
-# package-managed node/npm toolchain as the rest of its base image.
+# The MCP pytest driver executes the repository's pinned Inspector package
+# after this host layer completes.  Keep the host package install idempotent,
+# then fail closed if the image's Node major is too old for that package.
 "${SUDO[@]}" apt-get install -y nodejs npm \
   || die "Node.js/npm package installation failed"
 command -v node >/dev/null 2>&1 \
@@ -93,9 +92,75 @@ command -v npm >/dev/null 2>&1 \
   || die "npm executable is unavailable after package installation"
 NODE_VERSION=$(node --version) \
   || die "Node.js version check failed"
-NPM_VERSION=$(npm --version) \
+node_version_meets_floor() {
+  local version=${1#v} major minor patch extra
+  IFS=. read -r major minor patch extra <<< "$version"
+  [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ && "$patch" =~ ^[0-9]+$ ]] || return 1
+  [ "$major" -gt 22 ] \
+    || { [ "$major" -eq 22 ] && [ "$minor" -gt 19 ]; } \
+    || { [ "$major" -eq 22 ] && [ "$minor" -eq 19 ] && [ "$patch" -ge 0 ]; }
+}
+
+NODE_BIN=$(command -v node)
+NPM_BIN=$(command -v npm)
+if ! node_version_meets_floor "$NODE_VERSION"; then
+  # Ubuntu 24.04's archive may still provide Node 18. Install the exact
+  # fallback system-wide so a later operator shell, which does not inherit
+  # this process's PATH, resolves the same runtime.
+  NODE_RELEASE=22.19.0
+  case "$(uname -m)" in
+    x86_64)
+      NODE_ARCH=x64
+      NODE_SHA256=c0649af18e6a24f6fe5535a3e86b341dd49a8e71117c8b68bde973ef834f16f2
+      ;;
+    aarch64|arm64)
+      NODE_ARCH=arm64
+      NODE_SHA256=0b2d9f564b6594222a62c82e1df2efe119dd4a4aff29644f4dd325bf360b6bcc
+      ;;
+    *)
+      die "Node.js >=22.19.0 is unavailable for host architecture $(uname -m)"
+      ;;
+  esac
+  NODE_ARCHIVE="$RUNTIME_ROOT/node-v${NODE_RELEASE}-linux-${NODE_ARCH}.tar.xz"
+  NODE_URL="https://nodejs.org/dist/v${NODE_RELEASE}/node-v${NODE_RELEASE}-linux-${NODE_ARCH}.tar.xz"
+  curl --fail --location --silent --show-error "$NODE_URL" --output "$NODE_ARCHIVE" \
+    || die "Node.js ${NODE_RELEASE} download failed"
+  chmod 600 -- "$NODE_ARCHIVE" \
+    || die "could not make the Node.js archive private"
+  command -v sha256sum >/dev/null 2>&1 \
+    || die "sha256sum is required to verify the Node.js archive"
+  printf '%s  %s\n' "$NODE_SHA256" "$NODE_ARCHIVE" | sha256sum --check --status - \
+    || die "Node.js ${NODE_RELEASE} archive checksum failed"
+  "${SUDO[@]}" tar -xJf "$NODE_ARCHIVE" -C /usr/local/lib \
+    || die "Node.js ${NODE_RELEASE} archive extraction failed"
+  NODE_PREFIX="/usr/local/lib/node-v${NODE_RELEASE}-linux-${NODE_ARCH}"
+  NODE_BIN="$NODE_PREFIX/bin/node"
+  NPM_BIN="$NODE_PREFIX/bin/npm"
+  NPMX_BIN="$NODE_PREFIX/bin/npx"
+  [ -x "$NODE_BIN" ] && [ -x "$NPM_BIN" ] && [ -x "$NPMX_BIN" ] \
+    || die "Node.js ${NODE_RELEASE} installation is incomplete"
+  "${SUDO[@]}" ln -sfn "$NODE_BIN" /usr/local/bin/node \
+    || die "could not expose Node.js on PATH"
+  "${SUDO[@]}" ln -sfn "$NPM_BIN" /usr/local/bin/npm \
+    || die "could not expose npm on PATH"
+  "${SUDO[@]}" ln -sfn "$NPMX_BIN" /usr/local/bin/npx \
+    || die "could not expose npx on PATH"
+  export PATH="/usr/local/bin:$(dirname "$NODE_BIN"):$PATH"
+  NODE_VERSION=$("$NODE_BIN" --version) \
+    || die "private Node.js version check failed"
+  node_version_meets_floor "$NODE_VERSION" \
+    || die "private Node.js >=22.19.0 verification failed"
+fi
+NPM_VERSION=$("$NPM_BIN" --version) \
   || die "npm version check failed"
 echo "Node.js ${NODE_VERSION}, npm ${NPM_VERSION} ready" >&2
+
+[ -f "$CHECKOUT/packages/akb-mcp-client/package.json" ] \
+  || die "checkout is missing packages/akb-mcp-client/package.json"
+[ -f "$CHECKOUT/packages/akb-mcp-client/package-lock.json" ] \
+  || die "checkout is missing packages/akb-mcp-client/package-lock.json"
+"$NPM_BIN" ci --prefix "$CHECKOUT/packages/akb-mcp-client" \
+  || die "locked MCP Inspector installation failed"
 
 if ! command -v docker >/dev/null 2>&1; then
   "${SUDO[@]}" apt-get install -y docker.io \
@@ -146,6 +211,8 @@ chmod 700 -- "$RUNTIME_ROOT/bin" "$RUNTIME_ROOT/uv-cache" \
 UV_BIN="${UV_BIN:-}"
 if [ -n "$UV_BIN" ] && command -v "$UV_BIN" >/dev/null 2>&1; then
   UV_BIN=$(command -v "$UV_BIN")
+elif command -v uv >/dev/null 2>&1; then
+  UV_BIN=$(command -v uv)
 else
   UV_BIN="$RUNTIME_ROOT/bin/uv"
   if [ ! -x "$UV_BIN" ]; then
@@ -156,6 +223,12 @@ else
   fi
 fi
 [ -x "$UV_BIN" ] || die "uv executable was not installed"
+if [ "$UV_BIN" != "/usr/local/bin/uv" ]; then
+  "${SUDO[@]}" install -m 0755 "$UV_BIN" /usr/local/bin/uv \
+    || die "could not expose uv on PATH"
+fi
+UV_BIN=/usr/local/bin/uv
+export PATH="/usr/local/bin:$PATH"
 "$UV_BIN" --version >/dev/null \
   || die "uv is installed but cannot execute"
 

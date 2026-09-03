@@ -81,6 +81,7 @@ AKB_URL=http://localhost:8000 bash backend/tests/test_security_edge_e2e.sh
 # CI-equivalent isolated full gate (uses the repository-owned runtime and
 # its private PostgreSQL/MinIO dependency stack, not the root Compose app)
 uv sync --locked --extra dev --project backend
+(cd packages/akb-mcp-client && npm ci)
 RUNTIME_ROOT="$(mktemp -d /tmp/akb-e2e-runtime.XXXXXX)"
 export AKB_E2E_USERNAME="$(uv run --locked --project backend python -c \
   'import secrets; print(f"akb-e2e-{secrets.token_hex(8)}")')"
@@ -94,6 +95,18 @@ unset AKB_E2E_USERNAME AKB_E2E_PASSWORD
 # Frontend
 cd frontend && pnpm test
 ```
+
+The authenticated MCP pytest seam is run by the repository-owned runtime gate
+and can also consume a ready schema-v2 descriptor directly. Local and hosted
+CI use the same command and the same `akb_list_vaults({})` assertion:
+
+```bash
+uv run --locked --project backend python -m pytest \
+  backend/tests/mcp_e2e -v --tb=short --runtime-descriptor -
+```
+
+The descriptor must come from `backend/scripts/ci/e2e_runtime.py serve` or the
+Ubuntu bootstrap; this command does not start or tear down a backend.
 
 The E2E suites create ephemeral users and vaults and clean up after
 themselves. They poll `/health` for indexing completion before running search

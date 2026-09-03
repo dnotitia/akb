@@ -3389,6 +3389,7 @@ class E2ERuntime:
 
     async def _run_gate(self) -> int:
         suite_path = self.config.backend_dir / "scripts" / "ci" / "e2e_suite_runner.py"
+        mcp_pytest_path = self.config.checkout / "backend" / "tests" / "mcp_e2e"
         log_path = self.config.logs_dir / "gate.log"
         emit_gate_event(
             {
@@ -3401,6 +3402,47 @@ class E2ERuntime:
                 "capabilities": list(self.selected_capabilities),
                 "source_revision": self._source_revision(),
             },
+        )
+
+        emit_gate_event(
+            {
+                "event": "mcp_pytest_start",
+                "process": "mcp_pytest",
+                "scenario": "akb_list_vaults",
+                "suite": str(mcp_pytest_path),
+                "stage": "product_assertion",
+                "profile": self.profile.name,
+            }
+        )
+        try:
+            await self._run_logged_command(
+                [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    str(mcp_pytest_path),
+                    "-v",
+                    "--tb=short",
+                    "--runtime-descriptor",
+                    "-",
+                ],
+                log_path=self.config.logs_dir / "mcp-pytest.log",
+                stdin_data=json.dumps(
+                    self.descriptor(), separators=(",", ":"), ensure_ascii=False
+                ).encode(),
+            )
+        except ProvisioningFailure as exc:
+            raise ProductAssertionFailure("MCP pytest E2E scenario failed") from exc
+        emit_gate_event(
+            {
+                "event": "mcp_pytest_complete",
+                "process": "mcp_pytest",
+                "scenario": "akb_list_vaults",
+                "suite": str(mcp_pytest_path),
+                "stage": "product_assertion",
+                "profile": self.profile.name,
+                "returncode": 0,
+            }
         )
 
         if self.profile.needs_stdio:

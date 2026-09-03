@@ -488,6 +488,18 @@ async def test_gate_child_stdout_is_private_and_stderr_is_inherited(tmp_path, ca
         "\"suite\":\"test_fake.sh\",\"returncode\":132}', file=sys.stderr)\n",
         encoding="utf-8",
     )
+    mcp_pytest_path = checkout / "backend" / "tests" / "mcp_e2e"
+    mcp_pytest_path.mkdir(parents=True)
+    (mcp_pytest_path / "conftest.py").write_text(
+        "def pytest_addoption(parser):\n"
+        "    parser.addoption('--runtime-descriptor')\n",
+        encoding="utf-8",
+    )
+    (mcp_pytest_path / "test_fake.py").write_text(
+        "def test_fake():\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
     config = RuntimeConfig(
         checkout=checkout,
         runtime_root=tmp_path / "runtime",
@@ -1043,6 +1055,11 @@ def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
     assert 'apt-get install -y nodejs npm' in text
     assert 'command -v node' in text
     assert 'command -v npm' in text
+    assert 'Node.js >=22.19.0 is unavailable' in text
+    assert 'sha256sum --check --status' in text
+    assert 'ln -sfn "$NODE_BIN" /usr/local/bin/node' in text
+    assert 'install -m 0755 "$UV_BIN" /usr/local/bin/uv' in text
+    assert 'ci --prefix "$CHECKOUT/packages/akb-mcp-client"' in text
     assert "Node.js/npm package installation failed" in text
     assert "uv sync --locked" in text
     assert "exec 1>&3 3>&-" in text

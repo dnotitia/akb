@@ -43,6 +43,28 @@ fails the gate. `EMPTY_COUNT_ALLOWED` is intentionally empty. Hosted CI,
 the isolated runtime, and `scripts/run_canonical_e2e.sh` all execute this same
 runner, so there is no second suite array to keep synchronized.
 
+### MCP pytest behavior suite
+
+The first MCP behavior scenario is a pytest seam for the authenticated
+`akb_list_vaults({})` flow. The scenario owns its public assertions while the
+driver interface hides process orchestration; the concrete adapter invokes the
+exact-pinned Inspector CLI from `packages/akb-mcp-client`.
+
+The repository runtime remains the owner of backend startup, readiness,
+fixture reset, credentials, and teardown. Give the same schema-v2 descriptor
+to the local and hosted command through stdin:
+
+```bash
+uv run --locked --project backend python -m pytest \
+  backend/tests/mcp_e2e -v --tb=short --runtime-descriptor -
+```
+
+`e2e_runtime.py gate` invokes this exact pytest command before the existing
+shell and transport checks. A direct invocation must be run while a
+repository-owned `serve` runtime is ready and must receive its one descriptor
+line on stdin; it must not start another backend, database, port topology, or
+credential fixture.
+
 ### 2. Repository-owned isolated runtime
 
 The runtime supervisor is `e2e_runtime.py`. It owns the test infrastructure
@@ -62,6 +84,7 @@ The topology is deliberately small:
 | embedding stub | Ubuntu host process | `127.0.0.1:8888` | deterministic `/v1/embeddings` responses |
 | backend | Ubuntu host process | `127.0.0.1:8000` | AKB application under test |
 | fixture control | supervisor-owned in-process app | `127.0.0.1:8889` | health, discovery, and empty reset |
+| MCP pytest behavior suite | Ubuntu host process | no public listener | authenticated `akb_list_vaults` scenario through Inspector |
 | curated suite runner | Ubuntu host process | no public listener | exact 15-suite gate and count semantics |
 
 Only PostgreSQL and MinIO are managed by
@@ -79,8 +102,9 @@ unchanged for the canonical local and CI paths.
 The supervisor has two modes:
 
 - `gate`: starts dependencies, fixture control, embedding stub, and backend;
-  waits for readiness; prints the schema v2 descriptor; runs the shared
-  curated suite runner; then stops child processes and dependency resources.
+  waits for readiness; prints the schema v2 descriptor; runs the shared pytest
+  behavior suite, curated suite runner, and selected transport checks; then
+  stops child processes and dependency resources.
 - `serve`: starts the same stack, prints the ready descriptor, and remains in
   the foreground until SIGINT/SIGTERM. The fixture's `POST /reset` performs a
   safe empty reset and waits for backend readiness again.
@@ -204,10 +228,13 @@ to the descriptor, logs, argv, or committed files.
 contain runtime lifecycle logic. On a clean Ubuntu 24.04 host it:
 
 1. verifies the base image and installs `curl`/CA certificates as needed;
-2. installs the Ubuntu archive's `nodejs`/`npm` packages and verifies both
-   executables before any selected stdio profile is validated;
+2. installs the Ubuntu archive's `nodejs`/`npm` packages, verifies Node.js
+   `>=22.19.0` (using a checksum-verified host-wide Node `22.19.0` runtime
+   when the archive is older), and runs the locked `npm ci` for
+   `packages/akb-mcp-client`;
 3. installs and starts Docker Engine plus Compose v2 idempotently;
-4. installs/verifies `uv` and Python 3.14 under the private runtime root;
+4. installs/verifies `uv` on the host PATH and Python 3.14 under the private
+   runtime root;
 5. runs `uv sync --locked --extra dev --project backend`; and
 6. `exec`s the same Python supervisor in `gate` or `serve` mode.
 

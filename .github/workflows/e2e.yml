@@ -50,7 +50,7 @@ jobs:
           uv run --locked --project backend python -c \
             'import sys; assert sys.version_info[:2] == (3, 14), sys.version'
 
-      - name: Run the repository-owned E2E runtime
+      - name: Run repository-owned pytest and shell E2E runtime
         env:
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/akb-e2e-python
           UV_CACHE_DIR: ${{ runner.temp }}/akb-e2e-uv-cache
