@@ -250,6 +250,33 @@ class NativeDocumentService(DocumentService):
         )
         return vault_id, snapshot
 
+    async def _expected_commit_matches_current(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        resource_id: uuid.UUID,
+        expected_commit: str,
+        current_revision_id: str,
+    ) -> bool:
+        """Accept a migrated Legacy head token only while it names this Head.
+
+        Existing clients retain the public ``current_commit`` returned before
+        an in-place Native cutover. The completed migration mapping is the
+        authority that binds that Legacy Git OID to the replacement Native
+        Revision. Once a Native write advances Head, the mapping no longer
+        points at current and the old token becomes stale again.
+        """
+        if expected_commit == current_revision_id:
+            return True
+        mapping = await NativeRevisionMigrationRepository(
+            await self._pool()
+        ).mapping_for_native_revision(
+            namespace_id=namespace_id,
+            resource_id=resource_id,
+            native_revision_id=current_revision_id,
+        )
+        return mapping is not None and mapping.legacy_git_oid == expected_commit
+
     async def _path_is_owned(self, vault_id: uuid.UUID, path: str) -> bool:
         repository = NativeRevisionRepository(await self._pool())
         return (
@@ -674,7 +701,12 @@ class NativeDocumentService(DocumentService):
         native = await self._native()
         race_count = 0
         while True:
-            if req.expected_commit and req.expected_commit != current.revision_id:
+            if req.expected_commit and not await self._expected_commit_matches_current(
+                namespace_id=vault_id,
+                resource_id=resource_id,
+                expected_commit=req.expected_commit,
+                current_revision_id=current.revision_id,
+            ):
                 raise ConflictError(
                     f"current_commit moved: expected {req.expected_commit}, actual {current.revision_id}"
                 )
@@ -900,7 +932,12 @@ class NativeDocumentService(DocumentService):
         native = await self._native()
         race_count = 0
         while True:
-            if base_commit and base_commit != current.revision_id:
+            if base_commit and not await self._expected_commit_matches_current(
+                namespace_id=vault_id,
+                resource_id=resource_id,
+                expected_commit=base_commit,
+                current_revision_id=current.revision_id,
+            ):
                 raise ConflictError(f"current_commit moved: expected {base_commit}, actual {current.revision_id}")
             _, body = _parse_markdown(current.text)
             occurrences = body.count(old_string)

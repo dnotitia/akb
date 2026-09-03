@@ -15,6 +15,8 @@ import asyncpg
 import pytest
 from git import Repo
 
+from app.exceptions import ConflictError
+from app.models.document import DocumentUpdateRequest
 from app.repositories.native_revision_migration_repo import (
     MigrationInventoryDriftError,
     NativeRevisionMigrationRepository,
@@ -1690,6 +1692,78 @@ async def test_completed_backfill_preserves_pg_only_public_document_metadata(tmp
         assert current.domain == "migration"
         assert current.tags == ["fixture", "replacement"]
         assert current.content == "new v2"
+
+
+async def test_completed_backfill_accepts_only_the_mapped_legacy_head_for_first_native_update(
+    tmp_path,
+):
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _make_fixture(pool, tmp_path)
+        backfill = NativeRevisionBackfill(pool, git=fixture["git"])
+        run, _ = await backfill.prepare_run(
+            namespace_id=fixture["namespace_id"],
+            fixed_ref=fixture["unrelated_tip"],
+            coverage_version="c9-first-native-write-legacy-token",
+        )
+        assert (await backfill.backfill_run(run.run_id)).status == "complete"
+
+        documents = NativeDocumentService(pool=pool, legacy_git=fixture["git"])
+        migrated = await documents.get(fixture["vault_name"], "renamed.md")
+        assert migrated.current_commit != fixture["current_oid"]
+
+        with pytest.raises(ConflictError, match="current_commit moved"):
+            await documents.update(
+                fixture["vault_name"],
+                "renamed.md",
+                DocumentUpdateRequest(
+                    content="must stay rejected",
+                    expected_commit=fixture["move_oid"],
+                ),
+                agent_id="collector",
+            )
+
+        migrated_other = await documents.get(fixture["vault_name"], "other.md")
+        edited = await documents.edit(
+            fixture["vault_name"],
+            "other.md",
+            "other",
+            "first post-cutover edit",
+            base_commit=fixture["other_oid"],
+            agent_id="existing-client",
+        )
+        assert edited.previous_commit == migrated_other.current_commit
+        with pytest.raises(ConflictError, match="current_commit moved"):
+            await documents.edit(
+                fixture["vault_name"],
+                "other.md",
+                "first post-cutover edit",
+                "stale token must not work twice",
+                base_commit=fixture["other_oid"],
+                agent_id="existing-client",
+            )
+
+        updated = await documents.update(
+            fixture["vault_name"],
+            "renamed.md",
+            DocumentUpdateRequest(
+                content="first post-cutover write",
+                expected_commit=fixture["current_oid"],
+            ),
+            agent_id="collector",
+        )
+        assert updated.previous_commit == migrated.current_commit
+        assert updated.current_commit != migrated.current_commit
+
+        with pytest.raises(ConflictError, match="current_commit moved"):
+            await documents.update(
+                fixture["vault_name"],
+                "renamed.md",
+                DocumentUpdateRequest(
+                    content="stale token must not work twice",
+                    expected_commit=fixture["current_oid"],
+                ),
+                agent_id="collector",
+            )
 
 
 async def test_native_move_keeps_completed_legacy_paths_for_historical_reads(tmp_path):

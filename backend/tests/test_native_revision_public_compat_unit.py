@@ -144,3 +144,46 @@ async def test_native_history_annotates_mapped_and_native_authors(monkeypatch):
         ["owner", "11111111-1111-1111-1111-111111111111", "external-committer"],
         pool=pool,
     )
+
+
+@pytest.mark.asyncio
+async def test_expected_commit_accepts_only_completed_mapping_to_current_native_head(monkeypatch):
+    pool, _ = _pool()
+    service = NativeDocumentService(pool=pool)
+    namespace_id = uuid.uuid4()
+    resource_id = uuid.uuid4()
+    legacy_head = "1" * 40
+    native_head = "2" * 40
+    lookup = AsyncMock(return_value=SimpleNamespace(legacy_git_oid=legacy_head))
+    monkeypatch.setattr(
+        "app.repositories.native_revision_migration_repo."
+        "NativeRevisionMigrationRepository.mapping_for_native_revision",
+        lookup,
+    )
+
+    assert await service._expected_commit_matches_current(
+        namespace_id=namespace_id,
+        resource_id=resource_id,
+        expected_commit=native_head,
+        current_revision_id=native_head,
+    )
+    lookup.assert_not_awaited()
+
+    assert await service._expected_commit_matches_current(
+        namespace_id=namespace_id,
+        resource_id=resource_id,
+        expected_commit=legacy_head,
+        current_revision_id=native_head,
+    )
+    lookup.assert_awaited_once_with(
+        namespace_id=namespace_id,
+        resource_id=resource_id,
+        native_revision_id=native_head,
+    )
+
+    assert not await service._expected_commit_matches_current(
+        namespace_id=namespace_id,
+        resource_id=resource_id,
+        expected_commit="3" * 40,
+        current_revision_id=native_head,
+    )
