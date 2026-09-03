@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import AsyncIterator, Iterator, Mapping
 from pathlib import Path
@@ -184,23 +185,64 @@ async def mcp_client(runtime_session: RuntimeContext) -> AsyncIterator[Client]:
         follow_redirects=True,
         trust_env=False,
     )
-    client = Client(
-        streamable_http_client(runtime_session.descriptor.mcp_url, http_client=http_client),
-        mode="auto",
-        read_timeout_seconds=30.0,
-        cache=None,
-    )
-    entered = False
     try:
-        async with client:
-            entered = True
-            yield client
-    except Exception as exc:
-        if entered:
-            raise
-        pytest.fail(
-            "scenario=akb_list_vaults SDK connection: "
-            + redact_error(exc, runtime_session.secrets)
+        client = Client(
+            streamable_http_client(runtime_session.descriptor.mcp_url, http_client=http_client),
+            mode="auto",
+            read_timeout_seconds=30.0,
+            cache=None,
         )
-    finally:
+    except BaseException:
         await http_client.aclose()
+        raise
+
+    close_requested = asyncio.Event()
+    ready = asyncio.Event()
+    finished = asyncio.Event()
+    lifecycle_error: BaseException | None = None
+
+    async def run_client() -> None:
+        nonlocal lifecycle_error
+        try:
+            async with client:
+                ready.set()
+                await close_requested.wait()
+        except BaseException as exc:
+            lifecycle_error = exc
+            ready.set()
+        finally:
+            try:
+                await http_client.aclose()
+            except BaseException as exc:
+                if lifecycle_error is None:
+                    lifecycle_error = exc
+            finally:
+                finished.set()
+
+    async def wait_for_finish() -> None:
+        cancelled = False
+        while not finished.is_set():
+            try:
+                await asyncio.shield(finished.wait())
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+
+    task = asyncio.create_task(run_client(), name="mcp-sdk-client")
+    reported_startup_error = False
+    try:
+        await ready.wait()
+        if lifecycle_error is not None:
+            reported_startup_error = True
+            pytest.fail(
+                "scenario=akb_list_vaults SDK connection: "
+                + redact_error(lifecycle_error, runtime_session.secrets)
+            )
+        yield client
+    finally:
+        close_requested.set()
+        await wait_for_finish()
+        if lifecycle_error is not None and not reported_startup_error:
+            raise lifecycle_error
+        await task
