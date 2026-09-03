@@ -84,6 +84,38 @@ async def test_complete_native_frontmatter_never_reads_legacy_document_projectio
 
 
 @pytest.mark.asyncio
+async def test_empty_migrated_status_uses_frozen_legacy_status():
+    pool, conn = _pool(
+        row={
+            "title": "Imported",
+            "doc_type": "reference",
+            "status": "active",
+            "summary": None,
+            "domain": None,
+            "created_by": None,
+            "created_at": None,
+            "updated_at": None,
+            "tags": [],
+        }
+    )
+    service = NativeDocumentService(pool=pool)
+    snapshot = SimpleNamespace(
+        resource_id=uuid.uuid4(),
+        text=(
+            "---\ntitle: Imported\ntype: reference\nstatus:\n"
+            "created_at: '2026-09-03T01:02:03+00:00'\n"
+            "updated_at: '2026-09-03T01:02:03+00:00'\n"
+            "tags: []\n---\nbody\n"
+        ),
+    )
+
+    frontmatter, _ = await service._document_frontmatter(uuid.uuid4(), snapshot)
+
+    assert frontmatter["status"] == "active"
+    conn.fetchrow.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_native_history_annotates_mapped_and_native_authors(monkeypatch):
     pool, _ = _pool()
     backend = NativeRevisionBackend(pool=pool)

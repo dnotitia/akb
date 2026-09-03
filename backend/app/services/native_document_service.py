@@ -137,9 +137,9 @@ class NativeDocumentService(DocumentService):
         those payloads can omit metadata that Legacy served from PostgreSQL.
         """
 
-        return all(
-            key in frontmatter
-            for key in ("title", "type", "status", "created_at", "updated_at", "tags")
+        return (
+            all(frontmatter.get(key) for key in ("title", "type", "status", "created_at", "updated_at"))
+            and "tags" in frontmatter
         )
 
     async def _document_frontmatter(
@@ -166,7 +166,7 @@ class NativeDocumentService(DocumentService):
             legacy = await conn.fetchrow(
                 """
                 SELECT title, doc_type, status, summary, domain, created_by,
-                       created_at, updated_at, tags, metadata
+                       created_at, updated_at, tags
                   FROM documents
                  WHERE vault_id = $1 AND id = $2
                 """,
@@ -197,7 +197,7 @@ class NativeDocumentService(DocumentService):
             "tags": list(row.get("tags") or []),
         }
         for key, value in fallback.items():
-            if key not in frontmatter and value is not None:
+            if frontmatter.get(key) is None and value is not None:
                 frontmatter[key] = value
         return frontmatter, body
 
