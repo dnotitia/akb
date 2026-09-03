@@ -10,7 +10,7 @@ from mcp import Client
 from mcp import types as mcp_types
 from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSIONS
 
-from .runtime import RuntimeSession, redact_error
+from .runtime import RuntimeContext, redact_error
 
 
 SCENARIO = "akb_list_vaults"
@@ -23,7 +23,7 @@ def _fail(operation: str, detail: str) -> None:
 
 async def test_akb_list_vaults_mcp_e2e(
     mcp_client: Client,
-    runtime_session: RuntimeSession,
+    runtime_session: RuntimeContext,
 ) -> None:
     if mcp_client.protocol_version not in SUPPORTED_PROTOCOLS:
         _fail("connect", f"unsupported negotiated protocol {mcp_client.protocol_version!r}")

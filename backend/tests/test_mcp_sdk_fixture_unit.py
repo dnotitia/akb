@@ -13,7 +13,8 @@ from typing import Any
 import httpx
 import pytest
 
-from tests.mcp_e2e.runtime import RuntimeDescriptor, RuntimeSession, RuntimeSetupError
+from tests.mcp_e2e.conftest import _prepare_runtime
+from tests.mcp_e2e.runtime import RuntimeDescriptor, RuntimeSetupError
 
 
 def _descriptor() -> dict[str, Any]:
@@ -41,7 +42,6 @@ def _descriptor() -> dict[str, Any]:
         "credentials": {
             "username_env": "AKB_TEST_USER_ENV",
             "password_env": "AKB_TEST_PASS_ENV",  # pragma: allowlist secret
-            "pat_env": "AKB_TEST_PAT_ENV",
             "login_path": "/api/v1/auth/login",
         },
     }
@@ -65,7 +65,6 @@ def _discovery() -> dict[str, Any]:
             "credential_env": {
                 "username": "AKB_TEST_USER_ENV",
                 "password": "AKB_TEST_PASS_ENV",  # pragma: allowlist secret
-                "pat": "AKB_TEST_PAT_ENV",
             },
             "pat": {
                 "mint": {
@@ -136,33 +135,25 @@ def test_runtime_descriptor_rejects_incompatible_contract(mutate: Any) -> None:
         RuntimeDescriptor.from_json(json.dumps(value))
 
 
-def test_runtime_session_reuses_reset_discovery_and_mints_in_memory_pat(
+def test_runtime_setup_reuses_reset_discovery_and_mints_in_memory_pat(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("AKB_TEST_USER_ENV", "fixture-user")
     monkeypatch.setenv("AKB_TEST_PASS_ENV", "fixture-pass")
-    monkeypatch.setenv("AKB_TEST_PAT_ENV", "stale-pat")
     client = _FixtureClient()
-    session = RuntimeSession.from_json(json.dumps(_descriptor()), client=client)  # type: ignore[arg-type]
+    descriptor = RuntimeDescriptor.from_json(json.dumps(_descriptor()))
+    context = _prepare_runtime(descriptor, client)  # type: ignore[arg-type]
 
-    session.prepare()
-
-    assert session.pat == "akb_test_pat"
-    assert session.credential_env_names == (
-        "AKB_TEST_USER_ENV",
-        "AKB_TEST_PASS_ENV",
-        "AKB_TEST_PAT_ENV",
-    )
+    assert context.pat == "akb_test_pat"
+    assert context.descriptor.username_env == "AKB_TEST_USER_ENV"
+    assert context.descriptor.password_env == "AKB_TEST_PASS_ENV"  # pragma: allowlist secret
     reset = next(call for call in client.calls if call[1].endswith("/reset"))
     assert reset[0] == "POST" and reset[2] == {"scenario": "empty"}
     mint = next(call for call in client.calls if call[1].endswith("/auth/tokens"))
     assert mint[3] == {"Authorization": "Bearer session-value"}
 
-    session.close()
-    session.close()
+    client.close()
     assert client.closed
-    assert session.pat == ""
-    assert session.secrets == ()
 
 
 def test_descriptor_stdin_read_is_compatible_with_pytest_capture(tmp_path: Path) -> None:
