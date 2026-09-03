@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: akb
+
+resources:
+  - postgres.yaml
+  - backend.yaml
+  - frontend.yaml
+  - ingress.yaml
+
+# PostgreSQL includes pgvector and remains the default derived vector index.
+# Redis and Qdrant are optional resources; add redis.yaml or qdrant.yaml from
+# an operator-owned overlay only when the matching runtime configuration is set.
+
+# Secrets are intentionally absent. Provision Secret/akb-secret before apply.

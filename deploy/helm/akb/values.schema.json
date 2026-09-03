@@ -1,16 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "required": ["profile", "global", "images", "secretContract", "sso", "secretManager"],
+  "required": ["profile", "global", "images", "secretContract", "sso"],
   "properties": {
     "profile": {
       "type": "string",
-      "enum": [
-        "standalone",
-        "standalone-sso",
-        "standalone-secret-manager",
-        "standalone-sso-secret-manager"
-      ]
+      "enum": ["standalone", "standalone-sso"]
     },
     "global": {
       "type": "object",
@@ -48,17 +43,6 @@
             "email": {"type": "string", "minLength": 3}
           }
         }
-      }
-    },
-    "secretManager": {
-      "type": "object",
-      "required": ["mode", "engine", "profile", "sealMode", "topology"],
-      "properties": {
-        "mode": {"type": "string", "enum": ["manual", "bundled", "external"]},
-        "engine": {"type": "string", "enum": ["", "openbao", "hashicorp-vault"]},
-        "profile": {"type": "string", "enum": ["production"]},
-        "sealMode": {"type": "string", "enum": ["plaintext", "pgp", "auto"]},
-        "topology": {"type": "string", "enum": ["onprem-small", "production-ha"]}
       }
     }
   },

@@ -1,121 +1,30 @@
 #!/usr/bin/env bash
-#
-# AKB Kubernetes deploy — builds + pushes images, applies a kustomize tree.
-#
-# Image inputs:
-#   Normal build: REGISTRY is required and images are built/pushed there.
-#   Existing images: set SKIP_BUILD=true plus BACKEND_IMAGE and FRONTEND_IMAGE.
-#
-# Optional env:
-#   NAMESPACE     K8s namespace (default: akb).
-#   KUBE_CONTEXT  Explicit kubectl context. Defaults to the current context.
-#   KUSTOMIZE_DIR Directory passed to `kubectl kustomize`. Defaults to the
-#                 selected profiles/<name> application layer. Set to
-#                 an overlay (e.g. deploy/k8s/internal) to apply private
-#                 hostnames, ClusterIssuers, and ConfigMap overrides in
-#                 a single atomic apply — no placeholder window.
-#   PUBLIC_URL    Printed at the end. Cosmetic only — the actual host
-#                 lives in ingress.yaml (or its overlay patch).
-#   AKB_PROFILE   Selected by deploy/k8s/profiles/<name>/deploy.sh. The common
-#                 engine is not a public installation entry point.
-#   SECRET_MODE    manual (default), bundled, or external. Bundled is selected
-#                  by the *-secret-manager profiles; external is an adapter
-#                  override for standalone / standalone-sso.
-#   VSO_MODE       managed, external, or disabled. Bundled profiles default to
-#                  managed, external Secret Manager mode defaults to external,
-#                  and manual profiles use disabled.
-#   SECRET_ENGINE  openbao or hashicorp-vault for bundled/external modes.
-#   SECRET_PROFILE development (default) or production for bundled mode.
-#   SECRET_SEAL_MODE plaintext (default), pgp, or auto for production bundles.
-#   SECRET_TOPOLOGY onprem-small (one Raft member) or production-ha (three).
-#   SECRET_STORE_CERT_ISSUER_NAME Optional existing cert-manager CA issuer;
-#                  otherwise provision akb-secret-store-tls out-of-band.
-#   STORAGE_CLASS StorageClass for AKB/PostgreSQL and bundled-manager PVCs.
-#   IMAGE_PLATFORM Docker target used for builds and local bootstrap helpers
-#                  (default: linux/amd64; linux/arm64 is also supported).
-#
-# See deploy/k8s/profiles/README.md for supported combinations and
-# deploy/k8s/README.md for the operator-overlay pattern.
+# Build or reuse images, then apply the standalone or standalone-sso manifests.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="${SCRIPT_DIR}/../.."
-PROFILES_DIR="${SCRIPT_DIR}/profiles"
 NAMESPACE="${NAMESPACE:-akb}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-}"
+AKB_PROFILE="${AKB_PROFILE:-standalone}"
 SKIP_BUILD="${SKIP_BUILD:-false}"
 IMAGE_PLATFORM="${IMAGE_PLATFORM:-linux/amd64}"
-SECRET_PROFILE="${SECRET_PROFILE:-development}"
-AKB_PROFILE="${AKB_PROFILE:-}"
-if [[ -z "${AKB_PROFILE}" ]]; then
-  echo "Choose a deployment profile and run deploy/k8s/profiles/<name>/deploy.sh" >&2
-  exit 2
-fi
 
-PROFILE_DIR="${PROFILES_DIR}/${AKB_PROFILE}"
-PROFILE_FILE="${PROFILE_DIR}/profile.env"
-if [[ ! -f "${PROFILE_FILE}" ]]; then
-  echo "Unknown AKB_PROFILE=${AKB_PROFILE}. Available profile paths:" >&2
-  for candidate in "${PROFILES_DIR}"/*/profile.env; do
-    [[ -f "${candidate}" ]] && echo "  $(basename "$(dirname "${candidate}")")" >&2
-  done
-  exit 2
-fi
-
-PROFILE_AUTH=""
-PROFILE_SECRET="" # pragma: allowlist secret
-# profile.env is repository-owned static metadata, never operator input.
-# shellcheck disable=SC1090
-source "${PROFILE_FILE}"
-if [[ "${PROFILE_AUTH}" != "local" && "${PROFILE_AUTH}" != "sso" ]] ||
-   [[ "${PROFILE_SECRET}" != "manual" && "${PROFILE_SECRET}" != "bundled" ]]; then
-  echo "Invalid repository profile metadata: ${PROFILE_FILE}" >&2
-  exit 2
-fi
-
-AUTH_PROFILE="${PROFILE_AUTH}"
-SECRET_MODE="${SECRET_MODE:-${PROFILE_SECRET}}"
-if [[ "${PROFILE_SECRET}" == "manual" ]]; then
-  if [[ "${SECRET_MODE}" != "manual" && "${SECRET_MODE}" != "external" ]]; then
-    echo "${AKB_PROFILE} supports SECRET_MODE=manual or external; use a *-secret-manager profile for bundled" >&2
-    exit 2
-  fi
-elif [[ "${SECRET_MODE}" != "bundled" ]]; then
-  echo "${AKB_PROFILE} requires SECRET_MODE=bundled" >&2
-  exit 2
-fi
-
-if [[ -z "${VSO_MODE:-}" ]]; then
-  case "${SECRET_MODE}" in
-    manual) VSO_MODE="disabled" ;;
-    bundled) VSO_MODE="managed" ;;
-    external) VSO_MODE="external" ;;
-  esac
-fi
-case "${VSO_MODE}" in
-  managed|external|disabled) ;;
+case "${AKB_PROFILE}" in
+  standalone)
+    AUTH_PROFILE=local
+    PROFILE_DIR="${SCRIPT_DIR}"
+    ;;
+  standalone-sso)
+    AUTH_PROFILE=sso
+    PROFILE_DIR="${SCRIPT_DIR}/standalone-sso"
+    ;;
   *)
-    echo "VSO_MODE must be managed, external, or disabled" >&2
+    echo "AKB_PROFILE must be standalone or standalone-sso" >&2
     exit 2
     ;;
 esac
-if [[ "${SECRET_MODE}" == "manual" && "${VSO_MODE}" != "disabled" ]]; then
-  echo "Manual Secret mode requires VSO_MODE=disabled" >&2
-  exit 2
-fi
-if [[ "${SECRET_MODE}" != "manual" && "${VSO_MODE}" == "disabled" ]]; then
-  echo "Bundled and external Secret Manager modes require VSO" >&2
-  exit 2
-fi
-SECRET_SEAL_MODE="${SECRET_SEAL_MODE:-plaintext}"
-SECRET_TOPOLOGY="${SECRET_TOPOLOGY:-production-ha}"
-SECRET_KEY_SHARES="${SECRET_KEY_SHARES:-5}"
-SECRET_KEY_THRESHOLD="${SECRET_KEY_THRESHOLD:-3}"
-SECRET_PGP_KEYS="${SECRET_PGP_KEYS:-}"
-SECRET_ROOT_TOKEN_PGP_KEY="${SECRET_ROOT_TOKEN_PGP_KEY:-}"
-SECRET_RECOVERY_PGP_KEYS="${SECRET_RECOVERY_PGP_KEYS:-}"
-SECRET_STORE_SEAL_CONFIG_SECRET="${SECRET_STORE_SEAL_CONFIG_SECRET:-}"
 KUSTOMIZE_DIR="${KUSTOMIZE_DIR:-${PROFILE_DIR}}"
 
 KUBECTL=(kubectl)
@@ -127,63 +36,9 @@ if [[ ! "${NAMESPACE}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
   echo "NAMESPACE is not a valid DNS label" >&2
   exit 2
 fi
-if [[ "${IMAGE_PLATFORM}" != "linux/amd64" &&
-      "${IMAGE_PLATFORM}" != "linux/arm64" ]]; then
+if [[ "${IMAGE_PLATFORM}" != "linux/amd64" && "${IMAGE_PLATFORM}" != "linux/arm64" ]]; then
   echo "IMAGE_PLATFORM must be linux/amd64 or linux/arm64" >&2
   exit 2
-fi
-if [[ "${AUTH_PROFILE}" != "local" && "${AUTH_PROFILE}" != "sso" ]]; then
-  echo "AUTH_PROFILE must be local or sso" >&2
-  exit 2
-fi
-if [[ "${SECRET_TOPOLOGY}" != "onprem-small" &&
-      "${SECRET_TOPOLOGY}" != "production-ha" ]]; then
-  echo "SECRET_TOPOLOGY must be onprem-small or production-ha" >&2
-  exit 2
-fi
-SECRET_MODE="${SECRET_MODE}" SECRET_PROFILE="${SECRET_PROFILE}" \
-SECRET_SEAL_MODE="${SECRET_SEAL_MODE}" \
-SECRET_KEY_SHARES="${SECRET_KEY_SHARES}" \
-SECRET_KEY_THRESHOLD="${SECRET_KEY_THRESHOLD}" \
-SECRET_PGP_KEYS="${SECRET_PGP_KEYS}" \
-SECRET_ROOT_TOKEN_PGP_KEY="${SECRET_ROOT_TOKEN_PGP_KEY}" \
-SECRET_STORE_SEAL_CONFIG_SECRET="${SECRET_STORE_SEAL_CONFIG_SECRET}" \
-  bash "${SCRIPT_DIR}/secrets/validate-seal-inputs.sh"
-if [[ "${SECRET_MODE}" == "bundled" ]]; then
-  case "${SECRET_ENGINE:-}" in
-    openbao) ;;
-    hashicorp-vault)
-      if [[ "${HASHICORP_LICENSE_ACKNOWLEDGED:-false}" != "true" ]]; then
-        echo "Set HASHICORP_LICENSE_ACKNOWLEDGED=true after reviewing HashiCorp Vault BSL terms." >&2
-        exit 2
-      fi
-      ;;
-    *)
-      echo "SECRET_ENGINE must be openbao or hashicorp-vault for bundled mode" >&2
-      exit 2
-      ;;
-  esac
-  if [[ ! -f "${SCRIPT_DIR}/secrets/values/${SECRET_ENGINE}-${SECRET_PROFILE}.yaml" ]]; then
-    echo "Unsupported SECRET_PROFILE: ${SECRET_PROFILE}" >&2
-    exit 2
-  fi
-  if [[ -n "${SECRET_STORE_EXTRA_VALUES:-}" && ! -f "${SECRET_STORE_EXTRA_VALUES}" ]]; then
-    echo "SECRET_STORE_EXTRA_VALUES does not exist: ${SECRET_STORE_EXTRA_VALUES}" >&2
-    exit 2
-  fi
-elif [[ "${SECRET_MODE}" == "external" ]]; then
-  case "${SECRET_ENGINE:-}" in
-    openbao|hashicorp-vault) ;;
-    *)
-      echo "External v1 supports openbao or hashicorp-vault through VSO." >&2
-      exit 2
-      ;;
-  esac
-  : "${SECRET_STORE_ADDRESS:?Set SECRET_STORE_ADDRESS for external mode}"
-  if [[ "${SECRET_STORE_ADDRESS}" != https://* && "${ALLOW_INSECURE_EXTERNAL_HTTP:-false}" != "true" ]]; then
-    echo "External Secret Manager must use HTTPS unless ALLOW_INSECURE_EXTERNAL_HTTP=true." >&2
-    exit 2
-  fi
 fi
 if [[ -n "${STORAGE_CLASS:-}" &&
       ! "${STORAGE_CLASS}" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]]; then
@@ -217,10 +72,47 @@ if [[ "${AUTH_PROFILE}" == "sso" ]]; then
   fi
 fi
 
-# Product version is the single source of truth in backend/pyproject.toml.
-# Each build publishes :${VERSION} (immutable, for rollback / pin) and :latest
-# (what the running Deployment references, so `kubectl rollout restart`
-# picks it up under imagePullPolicy: Always).
+echo "=== Creating namespace ==="
+"${KUBECTL[@]}" create namespace "${NAMESPACE}" --dry-run=client -o yaml | \
+  "${KUBECTL[@]}" apply -f -
+
+required_secrets=(akb-secret)
+if [[ "${AUTH_PROFILE}" == "sso" ]]; then
+  required_secrets+=(
+    akb-keycloak-db-credentials
+    akb-keycloak-bootstrap
+    akb-product-admin-bootstrap
+  )
+fi
+
+echo "=== Checking operator-owned Kubernetes Secrets ==="
+for secret_name in "${required_secrets[@]}"; do
+  if ! "${KUBECTL[@]}" get secret "${secret_name}" -n "${NAMESPACE}" >/dev/null 2>&1; then
+    echo "Secret/${secret_name} is required in namespace ${NAMESPACE}." >&2
+    echo "Provision it out of band before deploying AKB; this script never generates credentials." >&2
+    exit 2
+  fi
+  owners="$("${KUBECTL[@]}" get secret "${secret_name}" -n "${NAMESPACE}" \
+    -o 'jsonpath={range .metadata.ownerReferences[*]}{.apiVersion}{"|"}{.kind}{"\n"}{end}')"
+  if printf '%s\n' "${owners}" | grep -qE '^secrets\.hashicorp\.com/.+\|VaultStaticSecret$'; then
+    echo "Secret/${secret_name} is still owned by VaultStaticSecret." >&2
+    echo "Follow the legacy bundle removal procedure in deploy/k8s/README.md before deploying." >&2
+    exit 2
+  fi
+done
+
+# Redis is optional, but preserve the same legacy-owner guard when its Secret
+# exists so removing an old projection cannot silently delete that credential.
+if "${KUBECTL[@]}" get secret redis-credentials -n "${NAMESPACE}" >/dev/null 2>&1; then
+  redis_owners="$("${KUBECTL[@]}" get secret redis-credentials -n "${NAMESPACE}" \
+    -o 'jsonpath={range .metadata.ownerReferences[*]}{.apiVersion}{"|"}{.kind}{"\n"}{end}')"
+  if printf '%s\n' "${redis_owners}" | grep -qE '^secrets\.hashicorp\.com/.+\|VaultStaticSecret$'; then
+    echo "Secret/redis-credentials is still owned by VaultStaticSecret." >&2
+    echo "Follow the legacy bundle removal procedure in deploy/k8s/README.md before deploying." >&2
+    exit 2
+  fi
+fi
+
 VERSION="$(awk -F'"' '/^version = /{print $2; exit}' "${ROOT_DIR}/backend/pyproject.toml")"
 : "${VERSION:?Could not read [project].version from backend/pyproject.toml}"
 
@@ -229,66 +121,29 @@ if [[ "${SKIP_BUILD}" == "true" ]]; then
   : "${FRONTEND_IMAGE:?Set FRONTEND_IMAGE when SKIP_BUILD=true}"
   echo "=== Reusing caller-supplied images ==="
 else
-  : "${REGISTRY:?Set REGISTRY env (e.g. REGISTRY=ghcr.io/myorg)}"
+  : "${REGISTRY:?Set REGISTRY env (for example, ghcr.io/myorg)}"
   BACKEND_IMAGE="${REGISTRY}/akb-backend:latest"
   FRONTEND_IMAGE="${REGISTRY}/akb-frontend:latest"
   echo "=== Building Docker images (${IMAGE_PLATFORM}) — version ${VERSION} ==="
   docker buildx build --platform "${IMAGE_PLATFORM}" \
-    -t "${REGISTRY}/akb-backend:${VERSION}" \
-    -t "${BACKEND_IMAGE}" \
-    --push \
+    -t "${REGISTRY}/akb-backend:${VERSION}" -t "${BACKEND_IMAGE}" --push \
     "${ROOT_DIR}/backend/"
-
   docker buildx build --platform "${IMAGE_PLATFORM}" \
-    -t "${REGISTRY}/akb-frontend:${VERSION}" \
-    -t "${FRONTEND_IMAGE}" \
-    --push \
+    -t "${REGISTRY}/akb-frontend:${VERSION}" -t "${FRONTEND_IMAGE}" --push \
     "${ROOT_DIR}/frontend/"
 fi
 
-echo "=== Creating namespace ==="
-"${KUBECTL[@]}" create namespace "${NAMESPACE}" \
-  --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
-
-echo "=== Preparing secret contract (${AKB_PROFILE}; ${SECRET_MODE}/${SECRET_ENGINE:-none}) ==="
-NAMESPACE="${NAMESPACE}" \
-KUBE_CONTEXT="${KUBE_CONTEXT}" \
-AKB_PROFILE="${AKB_PROFILE}" \
-SECRET_MODE="${SECRET_MODE}" \
-VSO_MODE="${VSO_MODE}" \
-SECRET_ENGINE="${SECRET_ENGINE:-}" \
-SECRET_PROFILE="${SECRET_PROFILE}" \
-SECRET_SEAL_MODE="${SECRET_SEAL_MODE}" \
-SECRET_TOPOLOGY="${SECRET_TOPOLOGY}" \
-SECRET_KEY_SHARES="${SECRET_KEY_SHARES}" \
-SECRET_KEY_THRESHOLD="${SECRET_KEY_THRESHOLD}" \
-SECRET_PGP_KEYS="${SECRET_PGP_KEYS}" \
-SECRET_ROOT_TOKEN_PGP_KEY="${SECRET_ROOT_TOKEN_PGP_KEY}" \
-SECRET_RECOVERY_PGP_KEYS="${SECRET_RECOVERY_PGP_KEYS}" \
-SECRET_STORE_SEAL_CONFIG_SECRET="${SECRET_STORE_SEAL_CONFIG_SECRET}" \
-AUTH_PROFILE="${AUTH_PROFILE}" \
-BACKEND_IMAGE="${BACKEND_IMAGE}" \
-BOOTSTRAP_DOCKER_PLATFORM="${IMAGE_PLATFORM}" \
-  bash "${SCRIPT_DIR}/secrets/deploy.sh"
-
-echo "=== Applying manifests (kustomize: ${KUSTOMIZE_DIR}) ==="
-# --load-restrictor=LoadRestrictionsNone lets an overlay reference the
-# base via `../foo.yaml`. No-op for the base (which only references local
-# files), needed when KUSTOMIZE_DIR is an overlay sitting inside the
-# base tree.
+echo "=== Rendering ${AKB_PROFILE} ==="
 RENDER_DIR="$(mktemp -d "${TMPDIR:-/tmp}/akb-kustomize.XXXXXX")"
 trap 'rm -rf "${RENDER_DIR}"' EXIT
 KUSTOMIZE_SOURCE="$(cd "${KUSTOMIZE_DIR}" && pwd)"
-# Kustomize rejects an absolute path in `resources` even with unrestricted
-# loading. A temporary symlink keeps the generated parent overlay portable
-# while preserving the caller's source tree untouched.
 ln -s "${KUSTOMIZE_SOURCE}" "${RENDER_DIR}/source"
 printf '%s\n' \
   'apiVersion: kustomize.config.k8s.io/v1beta1' \
   'kind: Kustomization' \
   "namespace: ${NAMESPACE}" \
   'resources:' \
-  '  - source' > "${RENDER_DIR}/kustomization.yaml"
+  '  - source' >"${RENDER_DIR}/kustomization.yaml"
 
 if [[ -n "${STORAGE_CLASS:-}" ]]; then
   cat >>"${RENDER_DIR}/kustomization.yaml" <<EOF
@@ -307,6 +162,9 @@ patches:
       - op: add
         path: /spec/volumeClaimTemplates/0/spec/storageClassName
         value: ${STORAGE_CLASS}
+EOF
+  if [[ "${AUTH_PROFILE}" == "sso" ]]; then
+    cat >>"${RENDER_DIR}/kustomization.yaml" <<EOF
   - target:
       kind: StatefulSet
       name: keycloak-postgres
@@ -315,6 +173,7 @@ patches:
         path: /spec/volumeClaimTemplates/0/spec/storageClassName
         value: ${STORAGE_CLASS}
 EOF
+  fi
 fi
 
 kubectl kustomize --load-restrictor=LoadRestrictionsNone "${RENDER_DIR}" | \
@@ -336,38 +195,22 @@ fi
 
 "${KUBECTL[@]}" apply -f "${RENDER_DIR}/rendered.yaml"
 
-echo "=== Rolling restart to pick up :latest image ==="
-# `imagePullPolicy: Always` only pulls on pod creation; if the Deployment
-# spec is unchanged k8s doesn't reschedule, so `:latest` edits silently
-# no-op. Trigger a rollout so the new image is actually deployed.
-"${KUBECTL[@]}" rollout restart "deployment/backend"  -n "${NAMESPACE}"
-"${KUBECTL[@]}" rollout restart "deployment/frontend" -n "${NAMESPACE}"
+echo "=== Restarting application workloads ==="
+"${KUBECTL[@]}" rollout restart deployment/backend -n "${NAMESPACE}"
+"${KUBECTL[@]}" rollout restart deployment/frontend -n "${NAMESPACE}"
 if [[ "${AUTH_PROFILE}" == "sso" ]]; then
-  "${KUBECTL[@]}" rollout restart "statefulset/keycloak" -n "${NAMESPACE}"
+  "${KUBECTL[@]}" rollout restart statefulset/keycloak -n "${NAMESPACE}"
 fi
 
-echo "=== Waiting for pods ==="
 "${KUBECTL[@]}" wait --for=condition=ready pod -l app=akb-postgres -n "${NAMESPACE}" --timeout=180s
 if [[ "${AUTH_PROFILE}" == "sso" ]]; then
   "${KUBECTL[@]}" wait --for=condition=ready pod -l app=akb-keycloak-postgres \
     -n "${NAMESPACE}" --timeout=180s
   "${KUBECTL[@]}" rollout status statefulset/keycloak -n "${NAMESPACE}" --timeout=300s
 fi
-# A label-based pod wait captures the old pod during a Recreate/RollingUpdate
-# transition and then waits forever for that deleted object to become Ready.
-# Deployment rollout status follows the controller's current revision instead.
 "${KUBECTL[@]}" rollout status deployment/backend -n "${NAMESPACE}" --timeout=180s
 "${KUBECTL[@]}" rollout status deployment/frontend -n "${NAMESPACE}" --timeout=120s
 
-echo ""
 echo "=== Deployment complete ==="
 [ -n "${PUBLIC_URL:-}" ] && echo "URL: ${PUBLIC_URL}"
-echo "Status:"
 "${KUBECTL[@]}" get pods -n "${NAMESPACE}"
-echo ""
-echo "Next steps if not done:"
-echo "  kubectl edit configmap akb-app-config -n ${NAMESPACE}  # Adjust app.yaml"
-echo "  kubectl get secret akb-secret -n ${NAMESPACE}  # Stable Secret Contract v1"
-if [[ "${AUTH_PROFILE}" == "sso" ]]; then
-  echo "  Preserve the one-time product-admin password, then follow the SSO retirement runbook."
-fi

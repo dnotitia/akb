@@ -1,9 +1,0 @@
-dependencies:
-- name: openbao
-  repository: https://openbao.github.io/openbao-helm
-  version: 0.29.3
-- name: vault
-  repository: https://helm.releases.hashicorp.com
-  version: 0.34.1
-digest: sha256:a43b34df478c9dc4279b1ba5f92da6e3c25ef3e209dbc23f31ce4ce50e3fd497
-generated: "2026-09-02T14:37:31.384573+09:00"

@@ -1,22 +1,9 @@
 AKB profile {{ .Values.profile }} was rendered for release {{ .Release.Name }}
 in namespace {{ .Release.Namespace }}.
 
-{{- if eq .Values.secretManager.mode "manual" }}
 AKB consumes Secret/{{ .Values.secretContract.name }}. Helm intentionally does
-not persist its values in release metadata.
-{{- else if eq .Values.secretManager.mode "external" }}
-VSO will project Secret/{{ .Values.secretContract.name }} from
-{{ .Values.secretManager.connection.address }}.
-{{- else }}
-The bundled {{ .Values.secretManager.engine }} server starts sealed. Complete
-native init/unseal/bootstrap from the source tree with:
-
-  RELEASE={{ .Release.Name }} NAMESPACE={{ .Release.Namespace }} \
-    bash deploy/helm/akb/scripts/initialize-secret-manager.sh
-
-For a new installation prefer deploy/helm/akb/install.sh, which performs this
-two-phase lifecycle without putting recovery material in Helm hook logs.
-{{- end }}
+not create it or persist its values in release metadata. Create and manage the
+Secret before installing or upgrading this release.
 
 Application URL: {{ .Values.global.publicUrl }}
 {{- if .Values.sso.enabled }}

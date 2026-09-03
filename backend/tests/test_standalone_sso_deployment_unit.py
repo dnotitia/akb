@@ -1,4 +1,4 @@
-"""Static safety contracts for the reusable standalone SSO component."""
+"""Static safety contracts for the standalone SSO deployment."""
 
 from __future__ import annotations
 
@@ -12,12 +12,11 @@ import yaml
 
 _ROOT = Path(__file__).resolve().parents[2]
 _K8S = _ROOT / "deploy" / "k8s"
-_COMPONENT = _K8S / "components" / "sso"
-_PROFILE = _K8S / "profiles" / "standalone-sso"
+_SSO = _K8S / "standalone-sso"
 
 
 def _documents(name: str) -> list[dict]:
-    with (_COMPONENT / name).open(encoding="utf-8") as source:
+    with (_SSO / name).open(encoding="utf-8") as source:
         return [item for item in yaml.safe_load_all(source) if isinstance(item, dict)]
 
 
@@ -31,20 +30,20 @@ def _one(name: str, *, kind: str, resource_name: str | None) -> dict:
     return matches[0]
 
 
-def test_component_owns_dedicated_keycloak_and_database_without_committed_secrets():
-    component = _one(
+def test_sso_tree_owns_dedicated_keycloak_and_database_without_committed_secrets():
+    kustomization = _one(
         "kustomization.yaml",
-        kind="Component",
+        kind="Kustomization",
         resource_name=None,
     )
     assert {
         "keycloak-postgres.yaml",
         "keycloak.yaml",
         "keycloak-ingress.yaml",
-    }.issubset({Path(item).name for item in component["resources"]})
+    }.issubset({Path(item).name for item in kustomization["resources"]})
 
-    for path in _COMPONENT.rglob("*.yaml"):
-        for document in _documents(str(path.relative_to(_COMPONENT))):
+    for path in _SSO.rglob("*.yaml"):
+        for document in _documents(str(path.relative_to(_SSO))):
             assert document.get("kind") != "Secret"
             assert "stringData" not in document
 
@@ -74,9 +73,7 @@ def test_keycloak_bootstrap_secret_is_required_for_first_boot_and_not_a_human_ad
 def test_akb_database_uses_the_shared_platform_secret_contract():
     resources = [
         item
-        for item in yaml.safe_load_all(
-            (_K8S / "postgres.yaml").read_text(encoding="utf-8")
-        )
+        for item in yaml.safe_load_all((_K8S / "postgres.yaml").read_text(encoding="utf-8"))
         if isinstance(item, dict)
     ]
     postgres = next(item for item in resources if item.get("kind") == "StatefulSet")
@@ -131,7 +128,7 @@ def test_backend_patch_removes_local_key_authority_and_mounts_one_time_inputs_on
 def test_legacy_profile_upgrade_job_is_explicit_opt_in_and_uses_temporary_service_admin():
     kustomization = _one(
         "kustomization.yaml",
-        kind="Component",
+        kind="Kustomization",
         resource_name=None,
     )
     assert "legacy-profile-upgrade-job.yaml" not in kustomization["resources"]
@@ -189,7 +186,7 @@ def test_sso_profile_render_has_no_local_session_mount_when_kubectl_is_available
             kubectl,
             "kustomize",
             "--load-restrictor=LoadRestrictionsNone",
-            str(_PROFILE),
+            str(_SSO),
         ],
         check=True,
         capture_output=True,
@@ -202,11 +199,7 @@ def test_sso_profile_render_has_no_local_session_mount_when_kubectl_is_available
         for item in rendered
         if item.get("kind") == "Deployment" and item.get("metadata", {}).get("name") == "backend"
     )
-    main = next(
-        item
-        for item in backend["spec"]["template"]["spec"]["containers"]
-        if item["name"] == "backend"
-    )
+    main = next(item for item in backend["spec"]["template"]["spec"]["containers"] if item["name"] == "backend")
     assert {mount["name"] for mount in main["volumeMounts"]} == {
         "app-config",
         "secret-config",

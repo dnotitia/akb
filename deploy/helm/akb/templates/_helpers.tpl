@@ -18,15 +18,3 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- define "akb.keycloakHost" -}}
 {{- .Values.sso.keycloakPublicUrl | trimPrefix "https://" | trimPrefix "http://" | trimSuffix "/" -}}
 {{- end }}
-
-{{- define "akb.secretStoreAddress" -}}
-{{- if eq .Values.secretManager.mode "bundled" -}}
-https://akb-secret-store.{{ .Release.Namespace }}.svc:8200
-{{- else -}}
-{{- .Values.secretManager.connection.address -}}
-{{- end -}}
-{{- end }}
-
-{{- define "akb.vsoTemplate" -}}
-{{ printf "{{ get .Secrets %q }}" . }}
-{{- end }}
