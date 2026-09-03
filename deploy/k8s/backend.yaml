@@ -65,8 +65,8 @@ data:
     redis_stream_maxlen: 100000
 
 ---
-# akb-secret — produced by the manual, bundled, or external Secret profile and
-# never committed. Its `secret.yaml` key is mounted at /etc/akb/secret.yaml.
+# akb-secret — provisioned by the operator and never committed. Its
+# `secret.yaml` key is mounted at /etc/akb/secret.yaml.
 # Expected configuration payload:
 #
 #   stringData:
@@ -104,8 +104,8 @@ spec:
       labels:
         app: akb-backend
     spec:
-      # AKB consumes mounted configuration only. Secret managers and their
-      # sync operators own Kubernetes API access; the application pod does not.
+      # AKB consumes mounted configuration only. The application Pod does not
+      # need Kubernetes API access to read its Secret volume.
       automountServiceAccountToken: false
       # All worker stop signals are broadcast together and joined under the
       # 35-second application deadline. The remaining 10 seconds cover DB/HTTP
@@ -236,8 +236,7 @@ spec:
         - name: secret-config
           secret:
             # Shared contract with akb-platform-managed workspaces. The
-            # producer can be manual, bundled Vault/OpenBao, or an external
-            # secret store; the application always consumes this name.
+            # operator owns how this Kubernetes Secret is provisioned.
             secretName: akb-secret # pragma: allowlist secret
         - name: local-session-keys
           secret:

@@ -1,14 +1,14 @@
-# SSO Kubernetes component
+# Standalone SSO Kubernetes deployment
 
-This reusable Kustomize component adds a Keycloak 26.7 broker, a dedicated
-Keycloak PostgreSQL database, SSO ingress, and AKB auth patches. Public
-profiles compose it over the canonical base; AKB and its PostgreSQL manifest
-are not copied. It owns exactly one AKB realm and is not
+This Kustomization combines AKB with a Keycloak 26.7 broker, a dedicated
+Keycloak PostgreSQL database, SSO ingress, and AKB auth patches. It references
+the shared AKB manifests from the parent directory without copying them. It
+owns exactly one AKB realm and is not
 the deployment shape for a managed tenant that reuses a platform-owned
 Keycloak.
 
 For a customized existing namespace, first follow the
-[local-to-SSO cutover runbook](../../../../docs/sso/kubernetes-cutover.md). This
+[local-to-SSO cutover runbook](../../../docs/sso/kubernetes-cutover.md). This
 directory is a reference resource set, not an in-place migration patch: review
 resource names, selectors, StatefulSets, PVCs, Ingress, and retained companion
 workloads before applying a target-specific overlay.
@@ -56,10 +56,9 @@ intentionally unable to mutate clients.
 
 ## Required operator inputs
 
-When using `deploy/k8s/profiles/standalone-sso/deploy.sh` or
-`deploy/k8s/profiles/standalone-sso-secret-manager/deploy.sh`, provide these
-public values as environment variables. The common deployer validates them and
-replaces the public placeholders in one render, before anything is applied:
+When using `deploy/k8s/deploy.sh` with `AKB_PROFILE=standalone-sso`, provide
+these public values as environment variables. The deployer validates them and
+replaces the public placeholders in one render before anything is applied:
 
 - `SSO_AKB_PUBLIC_URL` (for example `https://akb.example.com`)
 - `SSO_KEYCLOAK_PUBLIC_URL` (for example `https://auth.akb.example.com`)
@@ -70,9 +69,9 @@ replaces the public placeholders in one render, before anything is applied:
 An operator-specific Kustomize overlay may still patch those fields directly,
 but it must be passed with `KUSTOMIZE_DIR` and use the same coherent origins.
 
-The following Secrets are deliberately absent from Kustomize output. Create
-them with a secret manager, Sealed Secrets, or `kubectl create secret`; never
-commit their values.
+The following Secrets are deliberately absent from Kustomize output. Provision
+them through the cluster's operator-owned credential process; never commit
+their values.
 
 | Secret | Required keys | Lifecycle |
 |---|---|---|
@@ -103,28 +102,25 @@ email, and Keycloak forces `UPDATE_PASSWORD` on first login. The realm enforces
 the same lean policy for the replacement password. The bootstrap client secret
 is not the product-admin password.
 
-The unified Secret Manager deployment creates these projections for manual,
-bundled OpenBao, bundled HashiCorp Vault, and external Vault-compatible modes.
-For a fresh isolated installation:
+After provisioning the namespace-local Secrets, the convenience deployer can
+apply the stack:
 
 ```bash
 NAMESPACE=akb-sso-example \
+AKB_PROFILE=standalone-sso \
 SSO_AKB_PUBLIC_URL=https://akb.example.com \
 SSO_KEYCLOAK_PUBLIC_URL=https://auth.akb.example.com \
 SSO_PRODUCT_ADMIN_USERNAME=admin \
 SSO_PRODUCT_ADMIN_EMAIL=admin@example.com \
-SECRET_ENGINE=openbao \
-SECRET_PROFILE=development \
 REGISTRY=registry.example.com \
-bash deploy/k8s/profiles/standalone-sso-secret-manager/deploy.sh
+bash deploy/k8s/deploy.sh
 ```
 
-The SSO profiles automatically select this Kustomize tree. The Secret profile
-first makes the complete contract ready, then the deployer applies AKB, the
-dedicated Keycloak database, Keycloak, and both ingresses. It waits for both
-databases and Keycloak before accepting the backend rollout. Reusing a KV path
-created for local auth is rejected; authentication cutover is a separate
-migration, not an implicit secret rewrite.
+The deployer checks that the required Secret objects exist and are not still
+owned by a legacy projection resource. Secret values remain operator-owned and
+are never generated or rewritten. It then applies AKB, the dedicated Keycloak
+database, Keycloak, and both ingresses and waits for the workloads. Authentication
+cutover remains an explicit migration.
 
 `sso_session_epoch` is not a credential. Generate it once with
 `python -c 'import uuid; print(uuid.uuid4())'` and keep it stable across normal
@@ -179,7 +175,7 @@ Render and validate the public overlay before applying:
 ```bash
 kubectl create namespace akb --dry-run=client -o yaml | kubectl apply -f -
 kubectl kustomize --load-restrictor=LoadRestrictionsNone \
-  deploy/k8s/profiles/standalone-sso > rendered-standalone-sso.yaml
+  deploy/k8s/standalone-sso > rendered-standalone-sso.yaml
 kubectl apply --dry-run=client --validate=false \
   -f rendered-standalone-sso.yaml
 ```
@@ -261,7 +257,7 @@ openssl rand -base64 48 | tr -d '\n' | kubectl -n akb create secret generic \
   --from-file=client-secret=/dev/stdin
 kubectl -n akb scale statefulset/keycloak --replicas=0
 kubectl -n akb wait --for=delete pod -l app=akb-keycloak --timeout=180s
-kubectl apply -f deploy/k8s/components/sso/legacy-profile-upgrade-job.yaml
+kubectl apply -f deploy/k8s/standalone-sso/legacy-profile-upgrade-job.yaml
 kubectl -n akb wait --for=condition=complete \
   job/akb-keycloak-profile-upgrade-authority --timeout=180s
 kubectl -n akb delete job akb-keycloak-profile-upgrade-authority

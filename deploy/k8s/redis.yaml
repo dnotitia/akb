@@ -7,9 +7,8 @@
 # Used by the events_publisher worker to fan out PG outbox events
 # (`akb:events` stream) to external subscribers via Redis Streams.
 #
-# The `redis-credentials` Secret holding the password is a compatibility
-# destination of Secret Contract v1. Manual, bundled, and external profiles
-# create it without committing or clobbering a real password. Manual setup:
+# The operator provisions the `redis-credentials` Secret without committing
+# or clobbering a real password. Example setup:
 #
 #     PW=$(openssl rand -base64 32)
 #     kubectl create secret generic redis-credentials -n akb \

@@ -568,20 +568,15 @@ best-effort and never raises into the serving path. See
 ### Production deployment
 
 For Kubernetes, start with the
-[`deployment guide`](./deploy/k8s/README.md). AKB provides four explicit
-local/SSO and manual/bundled-Secret-Manager profiles through both Helm and the
-Kustomize-based profile installers.
+[`deployment guide`](./deploy/k8s/README.md). AKB provides standalone local and
+standalone-SSO resource sets through both Helm and Kustomize.
 
-- Use [`deploy/helm/akb/install.sh`](./deploy/helm/akb/README.md) or a matching
-  [`deploy/k8s/profiles/*/deploy.sh`](./deploy/k8s/profiles/README.md) when the
-  installer should coordinate the complete lifecycle, including Secret
-  Manager initialization where selected.
-- Use raw Helm or rendered Kustomize YAML only when the required Secrets,
-  cluster prerequisites, and any native Vault/OpenBao init/unseal/bootstrap
-  steps are already managed separately.
-- Vault Secrets Operator is a cluster-scoped prerequisite. Its ownership and
-  guarded removal are documented under
-  [`deploy/helm/akb-cluster`](./deploy/helm/akb-cluster/README.md).
+- Use the dependency-free [`AKB Helm chart`](./deploy/helm/akb/README.md) for a
+  standard `helm upgrade --install` workflow.
+- Use [`deploy/k8s`](./deploy/k8s/README.md) for the standalone Kustomization or
+  `deploy/k8s/standalone-sso` for an installation-owned Keycloak stack.
+- Both paths consume pre-existing, operator-owned Kubernetes Secrets. AKB does
+  not install or operate a credential service or synchronization controller.
 
 Real hostnames, registries, storage classes, TLS issuers, and provider settings
 belong in Helm values or an operator-owned Kustomize overlay; do not commit
@@ -612,15 +607,11 @@ akb/
 │   └── secret.yaml.example   # API keys, passwords (gitignored when not .example)
 ├── deploy/
 │   ├── all-in-one/           # Single-container demo image
-│   ├── cluster/              # Shared VSO prerequisite lifecycle helpers
 │   ├── helm/
-│   │   ├── akb/              # AKB umbrella chart and four values profiles
-│   │   └── akb-cluster/      # Cluster-scoped VSO prerequisite chart
+│   │   └── akb/              # AKB chart with local and standalone-SSO profiles
 │   └── k8s/
-│       ├── base/             # Canonical AKB + PostgreSQL application resources
-│       ├── components/       # Reusable additions such as owned Keycloak SSO
-│       ├── profiles/         # Four public Kustomize installer entry points
-│       └── secrets/          # Secret Contract and Vault/OpenBao lifecycle
+│       ├── *.yaml            # Standalone AKB + PostgreSQL resources
+│       └── standalone-sso/   # Standalone plus owned Keycloak and its database
 └── docker-compose.yaml       # Local stack (PG + MinIO + backend + frontend)
 ```
 
@@ -646,7 +637,7 @@ AKB follows [SemVer](https://semver.org/). The backend product version lives in
 `backend/pyproject.toml` (`[project].version`). A coordinated release uses
 `scripts/bump-version.sh <x.y.z>` to update it together with
 `frontend/package.json`. With image building enabled, each
-`deploy/k8s/profiles/*/deploy.sh` run tags the Docker images with both the
+`deploy/k8s/deploy.sh` run tags the Docker images with both the
 explicit backend version (`:${VERSION}`) and `:latest`, so historical builds
 remain pullable for rollback.
 

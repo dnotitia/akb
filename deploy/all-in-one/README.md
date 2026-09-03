@@ -9,11 +9,9 @@ MinIO + backend + frontend behind nginx. Use cases:
 - Quick demos (one `docker run` brings up the full stack)
 - Self-hosted single-box deployments
 
-It deliberately does not run OpenBao/Vault or Keycloak inside the application
-container. Doing so would place the Secret Manager, its storage, and the
-secret-consuming application under the same root process and filesystem trust
-boundary. Use `deploy/helm/akb` for a complete Kubernetes installation whose
-components remain isolated as separate workloads.
+It deliberately does not run Keycloak inside the application container. Use
+`deploy/helm/akb` for a Kubernetes installation whose application, database,
+and optional SSO components remain isolated as separate workloads.
 
 ## Quick start (pre-built image)
 

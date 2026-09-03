@@ -1,12 +1,3 @@
 profile: standalone
 sso:
   enabled: false
-secretManager:
-  mode: manual
-  engine: ""
-secretSync:
-  enabled: false
-openbao:
-  enabled: false
-hashicorpVault:
-  enabled: false
