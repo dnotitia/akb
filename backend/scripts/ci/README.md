@@ -55,7 +55,7 @@ fixture reset, credentials, and teardown. Give the same schema-v2 descriptor
 to the local and hosted command through stdin:
 
 ```bash
-uv run --locked --project backend python -m pytest \
+uv run --locked --extra dev --project backend python -m pytest \
   backend/tests/mcp_e2e -v --tb=short --runtime-descriptor -
 ```
 

@@ -101,7 +101,7 @@ and can also consume a ready schema-v2 descriptor directly. Local and hosted
 CI use the same command and the same `akb_list_vaults({})` assertion:
 
 ```bash
-uv run --locked --project backend python -m pytest \
+uv run --locked --extra dev --project backend python -m pytest \
   backend/tests/mcp_e2e -v --tb=short --runtime-descriptor -
 ```
 
