@@ -215,7 +215,6 @@ async def test_frontend_start_uses_private_root_and_per_run_backend_target(tmp_p
     assert log_name == "frontend.log"
     assert command == [
         str(REPO_ROOT / "frontend" / "node_modules" / ".bin" / "vite"),
-        "--root",
         str(REPO_ROOT / "frontend"),
         "--config",
         str(REPO_ROOT / "frontend" / "vite.config.ts"),
@@ -1182,6 +1181,7 @@ def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
     assert "--with-frontend" in text
     assert "pnpm install --frozen-lockfile" in text
     assert "node@22.19.0" in text
+    assert '"${SUDO[@]}" npm install --global --prefix /usr/local node@22.19.0' in text
     assert 'apt-get install -y nodejs npm' in text
     assert 'command -v node' in text
     assert 'command -v npm' in text

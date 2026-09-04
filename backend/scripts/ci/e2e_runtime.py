@@ -1703,7 +1703,6 @@ class E2ERuntime:
             "frontend",
             [
                 str(vite),
-                "--root",
                 str(self.config.frontend_dir),
                 "--config",
                 str(self.config.frontend_dir / "vite.config.ts"),

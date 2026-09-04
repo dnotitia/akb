@@ -186,7 +186,7 @@ esac
 if [ "$WITH_FRONTEND" -eq 1 ]; then
   # Vite 8 requires a modern Node runtime. Keep the frontend path explicit
   # and reproducible without changing the default backend/MCP bootstrap.
-  npm install --global --prefix /usr/local node@22.19.0 \
+  "${SUDO[@]}" npm install --global --prefix /usr/local node@22.19.0 \
     || die "Node.js 22.19.0 installation failed for the frontend runtime"
   export PATH="/usr/local/bin:$PATH"
   NODE_VERSION=$(node --version) \
