@@ -1180,8 +1180,9 @@ def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
     assert "app-installation-lifecycle" in text
     assert "--with-frontend" in text
     assert "pnpm install --frozen-lockfile" in text
-    assert "node@22.19.0" in text
-    assert '"${SUDO[@]}" npm install --global --prefix /usr/local node@22.19.0' in text
+    assert "node@22.19.0 pnpm@11.21.0" in text
+    assert '"${SUDO[@]}" npm install --global --prefix /usr/local node@22.19.0 pnpm@11.21.0' in text
+    assert "command -v pnpm" in text
     assert 'apt-get install -y nodejs npm' in text
     assert 'command -v node' in text
     assert 'command -v npm' in text

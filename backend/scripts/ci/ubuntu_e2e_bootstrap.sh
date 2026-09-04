@@ -186,8 +186,8 @@ esac
 if [ "$WITH_FRONTEND" -eq 1 ]; then
   # Vite 8 requires a modern Node runtime. Keep the frontend path explicit
   # and reproducible without changing the default backend/MCP bootstrap.
-  "${SUDO[@]}" npm install --global --prefix /usr/local node@22.19.0 \
-    || die "Node.js 22.19.0 installation failed for the frontend runtime"
+  "${SUDO[@]}" npm install --global --prefix /usr/local node@22.19.0 pnpm@11.21.0 \
+    || die "Node.js/pnpm frontend toolchain installation failed"
   export PATH="/usr/local/bin:$PATH"
   NODE_VERSION=$(node --version) \
     || die "Node.js version check failed for the frontend runtime"
@@ -196,18 +196,9 @@ if [ "$WITH_FRONTEND" -eq 1 ]; then
     *) die "Node.js 22.19.0 verification failed for the frontend runtime (found $NODE_VERSION)" ;;
   esac
 
-  PNPM_COMMAND=()
-  if command -v pnpm >/dev/null 2>&1; then
-    PNPM_COMMAND=(pnpm)
-  elif command -v corepack >/dev/null 2>&1; then
-    export COREPACK_HOME="$RUNTIME_ROOT/corepack"
-    mkdir -p -- "$COREPACK_HOME"
-    chmod 700 -- "$COREPACK_HOME"
-    PNPM_COMMAND=(corepack pnpm)
-  else
-    die "pnpm or corepack is required for the frontend dependency bootstrap"
-  fi
-  (cd -- "$CHECKOUT/frontend" && "${PNPM_COMMAND[@]}" install --frozen-lockfile) \
+  command -v pnpm >/dev/null 2>&1 \
+    || die "pnpm is unavailable after frontend toolchain installation"
+  (cd -- "$CHECKOUT/frontend" && pnpm install --frozen-lockfile) \
     || die "frontend pnpm install --frozen-lockfile failed"
 fi
 
