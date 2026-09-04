@@ -242,7 +242,7 @@ siblings without an extra lookup.
 ---
 title: "Payment API v2 migration plan"
 type: plan              # note | report | decision | spec | plan | session | task | reference
-status: active          # draft | active | archived | superseded
+status: active          # draft | active | archived
 tags: [payments, api]
 domain: engineering
 summary: "REST → gRPC transition plan."
