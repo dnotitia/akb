@@ -457,7 +457,10 @@ class MeasurementFileService:
             await conn.execute("DELETE FROM m1_file_transfer_intents WHERE id = $1", intent_id)
 
     async def get_download_url(self, vault_id: uuid.UUID, file_id: str) -> dict:
-        fid = uuid.UUID(file_id)
+        try:
+            fid = uuid.UUID(file_id)
+        except (ValueError, AttributeError):
+            raise ValidationError("file_id must be a UUID") from None
         token = _new_token()
         pool = await get_pool()
         async with pool.acquire() as conn:
