@@ -3,8 +3,10 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "path";
 
-// Dev proxy target — the local backend started by docker-compose.
-const target = "http://localhost:8000";
+// Dev proxy target — the local backend started by docker-compose unless an
+// isolated repository runtime supplies its per-run backend origin.
+const target = process.env.AKB_FRONTEND_BACKEND_URL || "http://localhost:8000";
+const cacheDir = process.env.AKB_FRONTEND_CACHE_DIR;
 const isHttps = false;
 
 export default defineConfig(() => {
@@ -23,6 +25,7 @@ export default defineConfig(() => {
     optimizeDeps: {
       include: ["react-force-graph-2d", "react-kapsule"],
     },
+    cacheDir,
     server: {
       proxy: {
         "/api": {

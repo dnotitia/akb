@@ -128,6 +128,133 @@ def test_descriptor_is_schema_v2_and_never_contains_credential_values(tmp_path, 
     assert "external-password-value" not in serialized
 
 
+def test_frontend_descriptor_exposes_web_origin_and_backend_proxy_target(tmp_path):
+    runtime = E2ERuntime(
+        dataclasses.replace(
+            make_config(tmp_path),
+            frontend_enabled=True,
+            frontend_port=3017,
+        )
+    )
+
+    descriptor = runtime.descriptor()
+    assert descriptor["services"]["web"] == {
+        "origin": "http://127.0.0.1:3017",
+        "health": {
+            "method": "GET",
+            "url": "http://127.0.0.1:3017",
+        },
+    }
+    evidence = descriptor["evidence"]
+    assert evidence["origin"]["frontend"] == "http://127.0.0.1:3017"
+    assert evidence["frontend"] == {
+        "service": "web",
+        "origin": "http://127.0.0.1:3017",
+        "health": {
+            "method": "GET",
+            "url": "http://127.0.0.1:3017",
+        },
+        "backend_proxy_target": "http://127.0.0.1:8000",
+        "browser_input": "AKB_FRONTEND_URL",
+    }
+
+    discovery = runtime.fixture_discovery()
+    assert discovery["web"] == {
+        "service": "web",
+        "origin": "http://127.0.0.1:3017",
+        "health": {"method": "GET", "path": "/"},
+        "backend_proxy_target": "http://127.0.0.1:8000",
+    }
+
+
+def test_frontend_runtime_requires_explicit_flag_and_supports_isolated_port():
+    default = _parse_args(["serve"])
+    assert default.frontend_enabled is False
+    assert default.frontend_port == 3000
+
+    configured = _parse_args(
+        ["serve", "--with-frontend", "--frontend-port", "3017"]
+    )
+    assert configured.frontend_enabled is True
+    assert configured.frontend_port == 3017
+
+
+@pytest.mark.asyncio
+async def test_frontend_start_uses_private_root_and_per_run_backend_target(tmp_path):
+    runtime = E2ERuntime(
+        dataclasses.replace(
+            make_config(tmp_path),
+            frontend_enabled=True,
+            frontend_port=3017,
+        )
+    )
+    started: list[tuple[str, list[str], str, dict[str, str] | None]] = []
+    waited: list[tuple[str, str]] = []
+
+    async def fake_spawn(
+        name: str,
+        command: list[str],
+        log_name: str,
+        *,
+        environment: dict[str, str] | None = None,
+    ) -> None:
+        started.append((name, command, log_name, environment))
+
+    async def fake_wait(label: str, url: str, _predicate) -> bytes:
+        waited.append((label, url))
+        return b""
+
+    runtime._spawn_host_process = fake_spawn  # type: ignore[method-assign]
+    runtime._wait_http = fake_wait  # type: ignore[method-assign]
+
+    await runtime._start_frontend()
+
+    assert len(started) == 1
+    name, command, log_name, environment = started[0]
+    assert name == "frontend"
+    assert log_name == "frontend.log"
+    assert command == [
+        str(REPO_ROOT / "frontend" / "node_modules" / ".bin" / "vite"),
+        "--root",
+        str(REPO_ROOT / "frontend"),
+        "--config",
+        str(REPO_ROOT / "frontend" / "vite.config.ts"),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "3017",
+        "--strictPort",
+    ]
+    assert environment == {
+        "AKB_FRONTEND_BACKEND_URL": "http://127.0.0.1:8000",
+        "AKB_FRONTEND_CACHE_DIR": str(tmp_path / "runtime" / "frontend-cache"),
+    }
+    assert waited == [("frontend", "http://127.0.0.1:3017")]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_stops_frontend_with_the_owned_runtime_processes(tmp_path):
+    runtime = E2ERuntime(
+        dataclasses.replace(make_config(tmp_path), frontend_enabled=True)
+    )
+    runtime._children["frontend"] = ManagedProcess(_LifecycleProcess())
+    stopped: list[str] = []
+
+    async def record_stop(name: str) -> None:
+        stopped.append(name)
+
+    async def record_compose(*_arguments: str, **_kwargs: object) -> int:
+        return 0
+
+    runtime._stop_fixture_control = lambda: asyncio.sleep(0)  # type: ignore[method-assign]
+    runtime._stop_named_process = record_stop  # type: ignore[method-assign]
+    runtime._compose = record_compose  # type: ignore[method-assign]
+
+    await runtime.cleanup()
+
+    assert stopped == ["stdio", "frontend", "backend", "embed"]
+
+
 def test_fixture_discovery_declares_auth_and_observability_without_secrets(
     tmp_path, monkeypatch
 ):
@@ -1052,6 +1179,9 @@ def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
     assert "exec 3>&1 1>&2" in text
     assert "--scenario empty" in text
     assert "app-installation-lifecycle" in text
+    assert "--with-frontend" in text
+    assert "pnpm install --frozen-lockfile" in text
+    assert "node@22.19.0" in text
     assert 'apt-get install -y nodejs npm' in text
     assert 'command -v node' in text
     assert 'command -v npm' in text

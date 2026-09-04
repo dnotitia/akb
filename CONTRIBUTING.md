@@ -119,6 +119,22 @@ The descriptor must come from `backend/scripts/ci/e2e_runtime.py serve` or the
 Ubuntu bootstrap. This pytest command consumes the existing runtime; it does
 not start or tear down a backend, database, or fixture service.
 
+For an isolated browser session, the same runtime can own the existing Vite
+frontend and point its `/api` and `/mcp` proxy at the run's backend:
+
+```bash
+(cd frontend && pnpm install --frozen-lockfile)
+uv run --locked --project backend python \
+  backend/scripts/ci/e2e_runtime.py serve \
+  --with-frontend --frontend-port 3000 \
+  --scenario empty --checkout "$PWD" --runtime-root "$RUNTIME_ROOT"
+```
+
+Use `services.web.origin` from the ready schema-v2 descriptor as
+`AKB_FRONTEND_URL` for `cd frontend && pnpm exec playwright test`. The
+frontend flag is opt-in so the existing backend/MCP `gate` and `serve` paths
+keep their current process and dependency requirements.
+
 The E2E suites create ephemeral users and vaults and clean up after
 themselves. They poll `/health` for indexing completion before running search
 assertions, so a slow remote embedding endpoint won't cause flakes. An

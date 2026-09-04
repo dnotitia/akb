@@ -16,11 +16,12 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 DEFAULT_CHECKOUT=$(cd -- "$SCRIPT_DIR/../../.." && pwd)
 MODE="${1:-}"
 [ "$MODE" = "gate" ] || [ "$MODE" = "serve" ] \
-  || die "usage: $0 {gate|serve} [--profile tool-only|transport-proxy|oidc-resource-server|transport-oidc] [--capability stdio|oidc] [--scenario empty|app-installation-lifecycle|app-release-rollout|app-control-plane] [--checkout PATH] [--runtime-root PATH] [supervisor options]"
+  || die "usage: $0 {gate|serve} [--with-frontend] [--profile tool-only|transport-proxy|oidc-resource-server|transport-oidc] [--capability stdio|oidc] [--scenario empty|app-installation-lifecycle|app-release-rollout|app-control-plane] [--checkout PATH] [--runtime-root PATH] [supervisor options]"
 shift
 
 CHECKOUT="${AKB_CHECKOUT:-$DEFAULT_CHECKOUT}"
 RUNTIME_ROOT="${AKB_RUNTIME_ROOT:-}"
+WITH_FRONTEND=0
 FORWARD_ARGS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -33,6 +34,11 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || die "--runtime-root requires a path"
       RUNTIME_ROOT=$2
       shift 2
+      ;;
+    --with-frontend)
+      WITH_FRONTEND=1
+      FORWARD_ARGS+=("$1")
+      shift
       ;;
     *)
       FORWARD_ARGS+=("$1")
@@ -176,6 +182,34 @@ case "$PYTHON_VERSION" in
   3.14.*) ;;
   *) die "uv-managed Python 3.14 verification failed (found $PYTHON_VERSION)" ;;
 esac
+
+if [ "$WITH_FRONTEND" -eq 1 ]; then
+  # Vite 8 requires a modern Node runtime. Keep the frontend path explicit
+  # and reproducible without changing the default backend/MCP bootstrap.
+  npm install --global --prefix /usr/local node@22.19.0 \
+    || die "Node.js 22.19.0 installation failed for the frontend runtime"
+  export PATH="/usr/local/bin:$PATH"
+  NODE_VERSION=$(node --version) \
+    || die "Node.js version check failed for the frontend runtime"
+  case "$NODE_VERSION" in
+    v22.19.*) ;;
+    *) die "Node.js 22.19.0 verification failed for the frontend runtime (found $NODE_VERSION)" ;;
+  esac
+
+  PNPM_COMMAND=()
+  if command -v pnpm >/dev/null 2>&1; then
+    PNPM_COMMAND=(pnpm)
+  elif command -v corepack >/dev/null 2>&1; then
+    export COREPACK_HOME="$RUNTIME_ROOT/corepack"
+    mkdir -p -- "$COREPACK_HOME"
+    chmod 700 -- "$COREPACK_HOME"
+    PNPM_COMMAND=(corepack pnpm)
+  else
+    die "pnpm or corepack is required for the frontend dependency bootstrap"
+  fi
+  (cd -- "$CHECKOUT/frontend" && "${PNPM_COMMAND[@]}" install --frozen-lockfile) \
+    || die "frontend pnpm install --frozen-lockfile failed"
+fi
 
 SUPERVISOR_COMMAND=(
   "$UV_BIN" run --locked --project "$CHECKOUT/backend" python

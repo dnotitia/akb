@@ -93,6 +93,7 @@ The topology is deliberately small:
 | MinIO | dependency Compose | pinned `minio/minio:RELEASE.2025-09-07T16-13-09Z`, `127.0.0.1:9000` by default | S3-compatible file storage |
 | embedding stub | Ubuntu host process | `127.0.0.1:8888` | deterministic `/v1/embeddings` responses |
 | backend | Ubuntu host process | `127.0.0.1:8000` | AKB application under test |
+| frontend (`--with-frontend`) | Ubuntu host process | `127.0.0.1:3000` by default | existing Vite SPA and per-run backend proxy |
 | fixture control | supervisor-owned in-process app | `127.0.0.1:8889` | health, discovery, and empty reset |
 | MCP pytest behavior suite | Ubuntu host process | no public listener | authenticated `akb_list_vaults` scenario through the official Python SDK |
 | curated suite runner | Ubuntu host process | no public listener | exact 15-suite gate and count semantics |
@@ -116,8 +117,11 @@ The supervisor has two modes:
   pytest behavior scenario and curated suite runner; then stops child
   processes and dependency resources.
 - `serve`: starts the same stack, prints the ready descriptor, and remains in
-  the foreground until SIGINT/SIGTERM. The fixture's `POST /reset` performs a
-  safe empty reset and waits for backend readiness again.
+  the foreground until SIGINT/SIGTERM. Pass `--with-frontend` to also start
+  the existing Vite SPA on `--frontend-port` (default `3000`), with its `/api`
+  and `/mcp` proxy pointed at this run's backend origin. The fixture's
+  `POST /reset` performs a safe empty reset and waits for backend readiness
+  again; the frontend process remains owned by the same serve lifecycle.
 
 Each invocation also selects one explicit capability profile. The default
 `tool-only` profile starts only the HTTP backend, PAT fixture, and shared
@@ -157,6 +161,13 @@ selected capabilities, tool-case coordinates, fixture reset, and whether the
 stdio initialize/tools-list/read probes crossed the process boundary. The
 OIDC discovery object exposes issuer/JWKS/token coordinates and variant names,
 never an access token or signing key.
+
+With `serve --with-frontend`, the same descriptor adds a `web` service whose
+`origin` is the screen address and whose `health` operation is `GET` on that
+origin. Its fixture discovery adds the same `web` origin, the browser input
+name `AKB_FRONTEND_URL`, and the backend proxy target. This keeps the web
+address, readiness check, and API connection source-neutral while preserving
+the existing `app` and `fixture` services.
 
 `gate` runs the existing curated HTTP suite runner for every profile. A
 transport profile additionally runs the existing proxy contract/reconnect
@@ -216,6 +227,29 @@ uv run --locked --project backend python \
   --scenario empty --checkout "$PWD" --runtime-root "$RUNTIME_ROOT"
 unset AKB_E2E_USERNAME AKB_E2E_PASSWORD
 ```
+
+To run the existing frontend against that isolated backend, install the
+frontend's locked dependencies first, then use the public `serve` entrypoint:
+
+```bash
+(cd frontend && pnpm install --frozen-lockfile)
+RUNTIME_ROOT="$(mktemp -d /tmp/akb-fe-runtime.XXXXXX)"
+export AKB_E2E_USERNAME="$(uv run --locked --project backend python -c \
+  'import secrets; print(f"akb-fe-{secrets.token_hex(8)}")')"
+export AKB_E2E_PASSWORD="$(uv run --locked --project backend python -c \
+  'import secrets; print(secrets.token_urlsafe(24))')"
+uv run --locked --project backend python \
+  backend/scripts/ci/e2e_runtime.py serve \
+  --with-frontend --frontend-port 3000 \
+  --scenario empty --checkout "$PWD" --runtime-root "$RUNTIME_ROOT"
+```
+
+The first stdout line containing the ready schema-v2 JSON is the public
+descriptor. Set `AKB_FRONTEND_URL` to its `services.web.origin` when running
+the existing browser smoke (`cd frontend && pnpm exec playwright test`). Stop
+the foreground command with SIGINT/SIGTERM; the supervisor then cleans the
+frontend, backend, embedding process, fixture control, and dependency Compose
+resources for that run only.
 
 On gate completion or SIGINT/SIGTERM, the supervisor stops its child
 processes and dependency Compose resources. It intentionally leaves the
@@ -314,6 +348,8 @@ When changing this area, preserve all of the following:
   processes;
 - Python `>=3.14` and `backend/uv.lock` are used with `uv sync --locked`;
 - the suite manifest and fail-closed assertion-count semantics remain shared;
+- the optional frontend process uses an explicit `--with-frontend` flag, an
+  isolated `--frontend-port`, and the run's backend origin for Vite proxying;
 - descriptor stdout stays parseable as one schema v2 JSON line; and
 - runtime state stays private and outside the checkout.
 
