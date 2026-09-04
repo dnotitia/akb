@@ -63,10 +63,8 @@ export function parseArguments(argv) {
     ({ values } = parseArgs({
       args: argv,
       options: {
-        intent: { type: "string" },
         target: { type: "string" },
         descriptor: { type: "string" },
-        config: { type: "string" },
         help: { type: "boolean", short: "h" },
       },
       strict: true,
@@ -76,24 +74,14 @@ export function parseArguments(argv) {
     error("invalid command options");
   }
   const result = {
-    intent: values.intent ?? null,
     target: values.target ?? null,
     descriptor: values.descriptor ?? null,
-    config: values.config ?? null,
     help: values.help === true,
   };
   if (result.help) return result;
-  if (result.intent === "smoke") {
-    if (!["http", "stdio", "both"].includes(result.target)) error("smoke target must be http, stdio, or both");
-    if (!result.descriptor) error("smoke descriptor is required");
-    return result;
-  }
-  if (result.intent === "interactive") {
-    if (!result.config) error("interactive Inspector config is required");
-    if (result.target || result.descriptor) error("interactive accepts --config only");
-    return result;
-  }
-  error("intent must be smoke or interactive");
+  if (!["http", "stdio", "both"].includes(result.target)) error("smoke target must be http, stdio, or both");
+  if (!result.descriptor) error("smoke descriptor is required");
+  return result;
 }
 
 export async function inspectInstallation({ packageRoot = PACKAGE_ROOT, nodeVersion = process.versions.node } = {}) {
@@ -430,20 +418,8 @@ export async function runSmoke({ info, descriptor, target, fetchImpl = globalThi
   }
 }
 
-export async function runInteractive(info, configPath, spawnProcess = nodeSpawn) {
-  const path = resolve(configPath);
-  if (!(await stat(path).then((value) => value.isFile()).catch(() => false))) error("interactive Inspector config file is missing");
-  const env = { ...process.env, HOST: "127.0.0.1" };
-  delete env.DANGEROUSLY_OMIT_AUTH;
-  const child = spawnProcess(process.execPath, [info.entry, "--web", "--config", path], { cwd: REPOSITORY_ROOT, env, stdio: ["ignore", "inherit", "inherit"] });
-  return await new Promise((resolveClose) => {
-    child.once("error", () => resolveClose(1));
-    child.once("close", (value) => resolveClose(value ?? 1));
-  });
-}
-
 function usage() {
-  return "Usage: npm run inspect -- --intent smoke --target <http|stdio|both> --descriptor <path|->\n       npm run inspect -- --intent interactive --config <mcp-config.json>\n";
+  return "Usage: npm run inspect -- --target <http|stdio|both> --descriptor <path|->\n";
 }
 
 export async function main(argv = process.argv.slice(2)) {
@@ -455,13 +431,12 @@ export async function main(argv = process.argv.slice(2)) {
       return 0;
     }
     const info = await inspectInstallation();
-    if (args.intent === "interactive") return await runInteractive(info, args.config);
     const descriptor = await loadDescriptor(args.descriptor);
     const output = await runSmoke({ info, descriptor, target: args.target });
     process.stdout.write(`${JSON.stringify(output)}\n`);
     return output.status === "passed" ? 0 : 1;
   } catch (value) {
-    process.stdout.write(`${JSON.stringify({ status: "failed", intent: args?.intent ?? null, target: args?.target ?? null, error: messageOf(value) })}\n`);
+    process.stdout.write(`${JSON.stringify({ status: "failed", target: args?.target ?? null, error: messageOf(value) })}\n`);
     return 1;
   }
 }

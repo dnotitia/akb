@@ -3484,8 +3484,6 @@ class E2ERuntime:
                         "--silent",
                         "inspect",
                         "--",
-                        "--intent",
-                        "smoke",
                         "--target",
                         "both",
                         "--descriptor",

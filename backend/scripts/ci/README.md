@@ -174,16 +174,13 @@ client's existing npm workflow:
 (cd packages/akb-mcp-client && npm ci)
 ```
 
-The same package entrypoint provides a machine-readable smoke and an
-interactive Web diagnostic. It consumes the ready descriptor printed by the
-repository runtime and never needs a global Inspector install:
+The package entrypoint provides the machine-readable consumer smoke. It
+consumes the ready descriptor printed by the repository runtime and never
+needs a global Inspector install:
 
 ```bash
 npm --prefix packages/akb-mcp-client run --silent inspect -- \
-  --intent smoke --target both --descriptor /path/to/descriptor.json
-
-npm --prefix packages/akb-mcp-client run --silent inspect -- \
-  --intent interactive --config /path/to/mcp-config.json
+  --target both --descriptor /path/to/descriptor.json
 ```
 
 The smoke uses Node.js `>=22.19.0` and the exact-pinned
@@ -201,12 +198,6 @@ directory's 0600 temporary Inspector config, which is deleted in `finally`
 cleanup. The PAT is not placed in argv, logs, command output, reports, or
 uploaded artifacts. The focused package regression exercises the same public
 entrypoint with a synthetic marker and verifies config removal and redaction.
-
-For an interactive session, pass a user-owned Inspector config file. The
-entrypoint binds the Web server to `127.0.0.1` and keeps Inspector's normal
-session authentication; it does not create a user PAT file or alter the
-user's credential boundary. The existing `transport-proxy` runtime profile
-can be used when the interactive config includes stdio.
 
 For a direct local gate, use the uv-managed Python environment to generate
 per-run values and export them without placing a credential value in the

@@ -9,7 +9,6 @@ import {
   PACKAGE_ROOT,
   inspectInstallation,
   parseArguments,
-  runInteractive,
   runSmoke,
 } from "../scripts/mcp-inspector-smoke.mjs";
 
@@ -56,41 +55,13 @@ async function consumerRoot() {
   return root;
 }
 
-test("parses the small smoke and interactive interfaces", () => {
-  assert.deepEqual(parseArguments(["--intent", "smoke", "--target", "both", "--descriptor", "-"]), {
-    intent: "smoke", target: "both", descriptor: "-", config: null, help: false,
+test("parses the smoke interface and rejects removed mode options", () => {
+  assert.deepEqual(parseArguments(["--target", "both", "--descriptor", "-"]), {
+    target: "both", descriptor: "-", help: false,
   });
-  assert.deepEqual(parseArguments(["--intent", "interactive", "--config", "config.json"]), {
-    intent: "interactive", target: null, descriptor: null, config: "config.json", help: false,
-  });
-  assert.throws(() => parseArguments(["--intent", "interactive", "--config", "x", "--target", "http"]));
-});
-
-test("interactive launch keeps loopback binding and Inspector session auth", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "akb-inspector-interactive-test-"));
-  const configPath = join(directory, "config.json");
-  await writeFile(configPath, '{"mcpServers":{}}\n', { mode: 0o600 });
-  const captured = {};
-  const spawnProcess = (_command, args, options) => {
-    captured.args = args;
-    captured.options = options;
-    const child = new EventEmitter();
-    queueMicrotask(() => child.emit("close", 0));
-    return child;
-  };
-  const oldOmitAuth = process.env.DANGEROUSLY_OMIT_AUTH;
-  process.env.DANGEROUSLY_OMIT_AUTH = "true";
-  try {
-    const code = await runInteractive(await inspectInstallation(), configPath, spawnProcess);
-    assert.equal(code, 0);
-    assert.deepEqual(captured.args.slice(1), ["--web", "--config", configPath]);
-    assert.equal(captured.options.env.HOST, "127.0.0.1");
-    assert.equal(captured.options.env.DANGEROUSLY_OMIT_AUTH, undefined);
-    await stat(configPath);
-  } finally {
-    if (oldOmitAuth === undefined) delete process.env.DANGEROUSLY_OMIT_AUTH; else process.env.DANGEROUSLY_OMIT_AUTH = oldOmitAuth;
-    await rm(directory, { recursive: true, force: true });
-  }
+  assert.throws(() => parseArguments(["--intent", "smoke", "--target", "both", "--descriptor", "-"]));
+  assert.throws(() => parseArguments(["--config", "config.json"]));
+  assert.throws(() => parseArguments(["--intent", "interactive", "--config", "config.json"]));
 });
 
 test("preflights the exact installed public Inspector", async () => {
