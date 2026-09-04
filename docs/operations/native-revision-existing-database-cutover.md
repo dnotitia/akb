@@ -93,9 +93,30 @@ commit.
 ## Start Native
 
 Set `document_revision_backend: postgres_native` with the exact identity used by
-`commit`, then start the API and workers. Verify original current and historical
-Document reads, ACLs, File metadata/downloads, and worker drain before reopening
-writes.
+`commit`, then start the API and workers.
+
+For an already qualified image/schema/cutover implementation, use the
+**conversion-first completion profile**:
+
+1. Keep the complete product `plan → apply → verify → commit` sequence above.
+   In particular, do not replace `verify` with sampling: it compares the
+   migrated Native authority with the fixed Legacy source inventory.
+2. After Native startup, verify readiness and perform a short public smoke over
+   representative current, historical, pinned and diff reads, ACL denial, File
+   metadata/download, and one first Native write/readback.
+3. Observe pending vector indexing, File projection, invalidation and delete
+   outboxes, but do not require every derived-work count to reach zero before
+   reopening ordinary reads and writes. Vector search or searchable-File
+   projection may be reported as warming while those workers catch up.
+4. Keep OOM/memory events, process replacement/restart, immutable identity
+   drift, failed correctness operations, failed/stuck workers, and incomplete
+   conversion evidence as hard stops.
+
+The older **settled completion profile** waits for every derived-work count to
+reach zero before the public smoke. It remains useful for a qualification
+fixture or when fully warmed search is required at the first reopened request,
+but it is not required merely to make Native the authoritative revision
+backend.
 
 Authority commit is the forward-only boundary. Operational rollback after that
 point is restoration of the coherent pre-cutover PostgreSQL and Git recovery
