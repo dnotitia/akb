@@ -2186,10 +2186,6 @@ class GitService:
         if include_bodies:
             snapshot["body"] = body
         else:
-            if b"\x00" in body:
-                raise FixedRefHistoryError(
-                    "fixed-ref body contains NUL bytes"
-                )
             snapshot["body_digest"] = hashlib.sha256(body).hexdigest()
             snapshot["byte_size"] = len(body)
         return snapshot
