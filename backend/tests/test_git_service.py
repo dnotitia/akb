@@ -299,6 +299,53 @@ def test_manual_fixed_ref_history_infers_plain_git_update_activity(
     ]
 
 
+def test_manual_fixed_ref_history_normalizes_legacy_edit_action(
+    git_service: GitService,
+) -> None:
+    """Pre-v2 commits used ``edit`` for the public ``update`` action."""
+    name = f"legacy_edit_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    git_service.commit_file(
+        vault_name=name,
+        file_path="notes/imported.md",
+        content="# Imported\n",
+        message="Import documentation",
+    )
+    current_oid = git_service.commit_file(
+        vault_name=name,
+        file_path="notes/imported.md",
+        content="# Imported\n\nRevised.\n",
+        message=(
+            "Revise documentation\n\n"
+            "agent: fixture-collector\n"
+            "action: edit\n"
+            "summary: historical edit vocabulary"
+        ),
+    )
+
+    snapshot = git_service.manual_fixed_ref_history(
+        name,
+        current_oid,
+        "notes/imported.md",
+        current_commit=current_oid,
+    )
+    batched = git_service.manual_fixed_ref_history_batch(
+        name,
+        current_oid,
+        [
+            {
+                "file_path": "notes/imported.md",
+                "current_commit": current_oid,
+                "since_epoch": None,
+            }
+        ],
+    )[0]
+
+    assert snapshot["history"][0]["action"] == "update"
+    assert snapshot["activity"]["action"] == "update"
+    assert batched == snapshot
+
+
 def test_manual_fixed_ref_history_rejects_declared_activity_that_conflicts_with_git(
     git_service: GitService,
 ) -> None:
