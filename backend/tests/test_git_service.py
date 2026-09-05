@@ -346,6 +346,40 @@ def test_manual_fixed_ref_history_normalizes_legacy_edit_action(
     assert batched == snapshot
 
 
+def test_manual_fixed_ref_history_batch_preserves_unicode_activity_path(
+    git_service: GitService,
+) -> None:
+    name = f"unicode_activity_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    path = "research/dynamo/전체-아키텍처.md"
+    current_oid = git_service.commit_file(
+        vault_name=name,
+        file_path=path,
+        content="# 전체 아키텍처\n",
+        message=(
+            "Import documentation\n\n"
+            "agent: fixture-collector\n"
+            "action: create\n"
+            "summary: unicode path"
+        ),
+    )
+
+    snapshot = git_service.manual_fixed_ref_history_batch(
+        name,
+        current_oid,
+        [
+            {
+                "file_path": path,
+                "current_commit": current_oid,
+                "since_epoch": None,
+            }
+        ],
+    )[0]
+
+    assert snapshot["activity"]["action"] == "create"
+    assert snapshot["activity"]["path_to"] == path
+
+
 def test_manual_fixed_ref_history_rejects_declared_activity_that_conflicts_with_git(
     git_service: GitService,
 ) -> None:
