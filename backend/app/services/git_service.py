@@ -2110,7 +2110,12 @@ class GitService:
                     )
                     history: list[dict] = []
                     active_path = file_path
+                    reached_recorded_head = False
                     for oid, committed_at, changes in index.commits:
+                        if not reached_recorded_head:
+                            if oid != current_commit:
+                                continue
+                            reached_recorded_head = True
                         if (
                             effective_since is not None
                             and int(committed_at.timestamp()) < effective_since
@@ -2277,7 +2282,11 @@ class GitService:
         # path history. Native AKB writes keep the bounded legacy behavior.
         if since_epoch is not None and current.committed_date >= since_epoch:
             log_args.append(f"--since=@{since_epoch}")
-        log_args.extend(["--format=%H%x00%ct", fixed_ref, "--", file_path])
+        # ``documents.current_commit`` is the Legacy document authority.  A
+        # later orphan write may reuse the same path without updating that DB
+        # row, so history must stop at the recorded document head rather than
+        # absorbing unrelated path activity between it and the vault tip.
+        log_args.extend(["--format=%H%x00%ct", current_commit, "--", file_path])
         try:
             output = repo.git.log(*log_args)
         except (GitError, ValueError) as exc:

@@ -610,6 +610,55 @@ def test_manual_fixed_ref_history_batch_respects_same_path_recreate_boundary(
     assert [entry["legacy_git_oid"] for entry in batched[0]["history"]] == [recreated]
 
 
+def test_manual_fixed_ref_history_stops_at_recorded_current_commit(
+    git_service: GitService,
+) -> None:
+    """Later writes to a reused path do not belong to an older DB document."""
+    name = f"indexed_recorded_head_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    recorded = _commit_file_at(
+        git_service,
+        name,
+        "notes/reused.md",
+        "recorded document\n",
+        "recorded create",
+        "2026-01-01T00:00:00+0000",
+    )
+    _commit_file_at(
+        git_service,
+        name,
+        "notes/reused.md",
+        "later orphan write\n",
+        "later create",
+        "2026-01-01T00:00:01+0000",
+    )
+    fixed_ref = _commit_file_at(
+        git_service,
+        name,
+        "unrelated.md",
+        "unrelated\n",
+        "unrelated tip",
+        "2026-01-01T00:00:02+0000",
+    )
+    request = {
+        "file_path": "notes/reused.md",
+        "current_commit": recorded,
+        "since_epoch": None,
+    }
+
+    single = git_service.manual_fixed_ref_history(
+        name,
+        fixed_ref,
+        request["file_path"],
+        current_commit=request["current_commit"],
+    )
+    batched = git_service.manual_fixed_ref_history_batch(name, fixed_ref, [request])
+
+    assert single["body"] == b"recorded document\n"
+    assert [entry["legacy_git_oid"] for entry in single["history"]] == [recorded]
+    assert batched == [single]
+
+
 def test_manual_fixed_ref_history_batch_keeps_same_second_commits(
     git_service: GitService,
 ) -> None:
