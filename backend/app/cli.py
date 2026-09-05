@@ -77,6 +77,7 @@ STANDALONE_SSO_BOOTSTRAP_USAGE = (
 MIGRATE_REVISION_BACKEND_USAGE = (
     "Usage: python -m app.cli migrate-revision-backend "
     "{plan --coverage-version VERSION|apply|verify|commit|abort --cutover-id UUID|"
+    "supersede-orphan --migration-run-id UUID|"
     "retire-external-git --vault-id UUID --manifest-file PATH --idempotency-key UUID "
     "--requested-by ID --confirm-planned-downtime RETIRE-EXTERNAL-GIT:UUID}"
 )
@@ -652,6 +653,8 @@ def _native_revision_cutover_parser() -> argparse.ArgumentParser:
     for phase in ("apply", "verify", "commit", "abort"):
         command = phases.add_parser(phase, add_help=False)
         command.add_argument("--cutover-id", required=True)
+    orphan = phases.add_parser("supersede-orphan", add_help=False)
+    orphan.add_argument("--migration-run-id", required=True)
     retire = phases.add_parser("retire-external-git", add_help=False)
     retire.add_argument("--vault-id", required=True)
     retire.add_argument("--manifest-file", required=True)
@@ -718,6 +721,7 @@ async def _execute_native_revision_cutover(
     *,
     coverage_version: str | None,
     cutover_id: str | None,
+    migration_run_id: str | None = None,
 ) -> dict[str, object]:
     """Run one thin operator phase over the product cutover services."""
     from app.db.postgres import close_pool, get_pool, init_db
@@ -759,6 +763,9 @@ async def _execute_native_revision_cutover(
                 vaults=vaults,
                 coverage_version=coverage_version,
             )
+        elif phase == "supersede-orphan":
+            assert migration_run_id is not None
+            result = await cutover.supersede_orphan_plan(uuid.UUID(migration_run_id))
         else:
             assert cutover_id is not None
             parsed_id = uuid.UUID(cutover_id)
@@ -801,11 +808,19 @@ async def _migrate_revision_backend(args: list[str]) -> int:
                 planned_downtime_confirmation=parsed.confirm_planned_downtime,
             )
         else:
-            report = await _execute_native_revision_cutover(
-                parsed.phase,
-                coverage_version=getattr(parsed, "coverage_version", None),
-                cutover_id=getattr(parsed, "cutover_id", None),
-            )
+            if parsed.phase == "supersede-orphan":
+                report = await _execute_native_revision_cutover(
+                    parsed.phase,
+                    coverage_version=None,
+                    cutover_id=None,
+                    migration_run_id=parsed.migration_run_id,
+                )
+            else:
+                report = await _execute_native_revision_cutover(
+                    parsed.phase,
+                    coverage_version=getattr(parsed, "coverage_version", None),
+                    cutover_id=getattr(parsed, "cutover_id", None),
+                )
     except (ValueError, RuntimeError) as exc:
         prefix = (
             "revision_backend_retirement_failed"

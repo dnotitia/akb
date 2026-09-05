@@ -120,6 +120,39 @@ def test_native_revision_cutover_cli_routes_abort(monkeypatch) -> None:
     assert calls == [("abort", {"coverage_version": None, "cutover_id": cutover_id})]
 
 
+def test_native_revision_cutover_cli_routes_exact_orphan_supersession(monkeypatch) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_execute(phase: str, **kwargs):
+        calls.append((phase, kwargs))
+        return {"status": "superseded"}
+
+    monkeypatch.setattr(cli, "_execute_native_revision_cutover", fake_execute)
+    migration_run_id = "00000000-0000-0000-0000-000000000003"
+
+    assert (
+        cli.main(
+            [
+                "migrate-revision-backend",
+                "supersede-orphan",
+                "--migration-run-id",
+                migration_run_id,
+            ]
+        )
+        == 0
+    )
+    assert calls == [
+        (
+            "supersede-orphan",
+            {
+                "coverage_version": None,
+                "cutover_id": None,
+                "migration_run_id": migration_run_id,
+            },
+        )
+    ]
+
+
 def test_native_revision_cutover_cli_rejects_incomplete_arguments(capsys) -> None:
     assert cli.main(["migrate-revision-backend", "apply"]) == 2
     assert "migrate-revision-backend" in capsys.readouterr().err

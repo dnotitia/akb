@@ -23,6 +23,7 @@ from app.db import postgres
 from app.exceptions import ForbiddenError
 from app.models.document import DocumentUpdateRequest
 from app.repositories.native_revision_migration_repo import MigrationIntegrityError
+from app.repositories.native_revision_cutover_repo import CutoverIntegrityError
 from app.services import access_service
 from app.services.document_service import DocumentService
 from app.services.external_git_service import ExternalGitService
@@ -47,6 +48,7 @@ from app.services.native_revision_cutover import (
     NativeRevisionCutover,
     NativeRevisionCutoverVerifier,
 )
+from app.services.legacy_revision_bridge import InventoryEligibilityError
 from app.services.native_revision_backend import NativeRevisionBackend
 from app.services.uri_service import doc_uri, split_uri
 
@@ -532,6 +534,8 @@ async def test_aborting_classification_plan_releases_pending_item_reservations(t
         assert [item.namespace_id for item in classification.vaults] == [manual.namespace_id]
         assert [item.namespace_id for item in classification.exclusions] == [mirror_id]
         classification_run_id = classification.vaults[0].migration_run_id
+        with pytest.raises(CutoverIntegrityError, match="not an unlinked all-pending plan"):
+            await cutover.supersede_orphan_plan(classification_run_id)
         with pytest.raises(
             asyncpg.UniqueViolationError,
             match="native_revision_migration_items_active_resource_head_key",
@@ -593,6 +597,112 @@ async def test_aborting_classification_plan_releases_pending_item_reservations(t
             await cutover.apply(classification.cutover_id)
         with pytest.raises(MigrationIntegrityError, match="superseded"):
             await backfill.backfill_run(classification_run_id)
+
+
+async def test_operator_supersedes_one_exact_unlinked_pending_orphan(tmp_path):
+    """An operator can release a stranded pre-cutover plan by exact run ID."""
+    async with _fresh_schema() as pool:
+        git = GitService(storage_path=str(tmp_path / "git-unlinked-orphan"))
+        vault = await _manual_vault(pool, git, label="unlinked-orphan")
+        backfill = NativeRevisionBackfill(pool, git=git)
+        orphan, _ = await backfill.prepare_run(
+            namespace_id=vault.namespace_id,
+            fixed_ref=vault.fixed_ref,
+            coverage_version="fixture-unlinked-orphan-v1",
+        )
+
+        cutover = NativeRevisionCutover(
+            pool,
+            backfill=backfill,
+            verifier=_FixtureVerifier(pool),
+        )
+        superseded = await cutover.supersede_orphan_plan(orphan.run_id)
+        assert superseded.run_id == orphan.run_id
+        assert superseded.status == "superseded"
+        planned = await cutover.plan(
+            vaults=[vault],
+            coverage_version="fixture-unlinked-orphan-v2",
+        )
+
+        assert planned.vaults[0].migration_run_id != orphan.run_id
+        async with pool.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT status FROM native_revision_migration_runs WHERE run_id = $1",
+                    orphan.run_id,
+                )
+                == "superseded"
+            )
+            assert (
+                await conn.fetchval(
+                    "SELECT reservation_active FROM native_revision_migration_items WHERE run_id = $1",
+                    orphan.run_id,
+                )
+                is False
+            )
+
+
+async def test_plan_failure_compensates_previously_prepared_unlinked_vaults(tmp_path, monkeypatch):
+    """A later vault validation error leaves no active reservation from this plan."""
+    async with _fresh_schema() as pool:
+        git = GitService(storage_path=str(tmp_path / "git-plan-compensation"))
+        vaults = sorted(
+            [
+                await _manual_vault(pool, git, label="plan-compensation-one"),
+                await _manual_vault(pool, git, label="plan-compensation-two"),
+            ],
+            key=lambda item: str(item.namespace_id),
+        )
+        backfill = NativeRevisionBackfill(pool, git=git)
+        prepare_run = backfill.prepare_run
+
+        async def fail_second_prepare(*, namespace_id, fixed_ref, coverage_version):
+            if namespace_id == vaults[1].namespace_id:
+                raise InventoryEligibilityError("fixture second-vault failure")
+            return await prepare_run(
+                namespace_id=namespace_id,
+                fixed_ref=fixed_ref,
+                coverage_version=coverage_version,
+            )
+
+        monkeypatch.setattr(backfill, "prepare_run", fail_second_prepare)
+        cutover = NativeRevisionCutover(
+            pool,
+            backfill=backfill,
+            verifier=_FixtureVerifier(pool),
+        )
+        with pytest.raises(InventoryEligibilityError, match="second-vault failure"):
+            await cutover.plan(
+                vaults=vaults,
+                coverage_version="fixture-plan-compensation-v1",
+            )
+
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT run.run_id, run.status, item.reservation_active
+                  FROM native_revision_migration_runs run
+                  JOIN native_revision_migration_items item ON item.run_id = run.run_id
+                 WHERE run.coverage_version = 'fixture-plan-compensation-v1'
+                """
+            )
+            assert row is not None
+            assert row["status"] == "superseded"
+            assert row["reservation_active"] is False
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM native_revision_cutover_vaults WHERE migration_run_id = $1",
+                    row["run_id"],
+                )
+                == 0
+            )
+
+        monkeypatch.setattr(backfill, "prepare_run", prepare_run)
+        fresh = await cutover.plan(
+            vaults=vaults,
+            coverage_version="fixture-plan-compensation-v2",
+        )
+        assert len(fresh.vaults) == 2
 
 
 async def test_external_git_retirement_reclassifies_a_collector_adoption_and_requires_a_fresh_plan(tmp_path):
