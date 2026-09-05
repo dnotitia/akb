@@ -146,6 +146,11 @@ def _canonical_legacy_activity_action(action: str) -> str:
     return _LEGACY_ACTIVITY_ACTION_ALIASES.get(action, action)
 
 
+def _legacy_activity_matches_git_change(declared: str, inferred: str | None) -> bool:
+    """Accept Legacy resource creation when an orphan already owns the path."""
+    return not declared or declared == inferred or (declared == "create" and inferred == "update")
+
+
 def _marker_state(marker: Path) -> str:
     """Classify the on-disk ``_MIRROR_MARKER`` entry, fail-CLOSED.
 
@@ -1993,7 +1998,7 @@ class GitService:
         selected_change = selected_changes[0]
         inferred_action = selected_change["change"]
         action = declared_action or inferred_action
-        if action != inferred_action:
+        if not _legacy_activity_matches_git_change(declared_action, inferred_action):
             raise FixedRefHistoryError(
                 "fixed-ref current commit activity does not match the file action"
             )
@@ -2420,7 +2425,7 @@ class GitService:
         selected_change = changes[0]
         inferred_action = selected_change["change"]
         action = declared_action or inferred_action
-        if action != inferred_action:
+        if not _legacy_activity_matches_git_change(declared_action, inferred_action):
             raise FixedRefHistoryError(
                 "fixed-ref current commit activity does not match the file action"
             )
