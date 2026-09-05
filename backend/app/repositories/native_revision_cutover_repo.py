@@ -281,6 +281,28 @@ class NativeRevisionCutoverRepository:
                     inventory_digest,
                 )
                 if row is None:
+                    migration_rows = await conn.fetch(
+                        """
+                        SELECT run_id, namespace_id, fixed_git_oid,
+                               inventory_digest, status
+                          FROM native_revision_migration_runs
+                         WHERE run_id = ANY($1::uuid[])
+                         ORDER BY run_id
+                         FOR UPDATE
+                        """,
+                        [item[1] for item in expected],
+                    )
+                    observed_runs = sorted(
+                        (
+                            item["namespace_id"],
+                            item["run_id"],
+                            item["fixed_git_oid"],
+                            item["inventory_digest"],
+                        )
+                        for item in migration_rows
+                    )
+                    if observed_runs != expected or any(item["status"] != "planned" for item in migration_rows):
+                        raise CutoverIntegrityError("cutover migration runs are not exact pending plans")
                     row = await conn.fetchrow(
                         """
                         INSERT INTO native_revision_cutover_runs
