@@ -1699,6 +1699,39 @@ class GitService:
     @staticmethod
     def _parse_name_status_changes(output: str) -> tuple[dict[str, str | None], ...]:
         """Parse one Git name-status stream into path changes."""
+        if "\x00" in output:
+            fields = output.split("\x00")
+            if fields and fields[-1] == "":
+                fields.pop()
+            nul_changes: list[dict[str, str | None]] = []
+            index = 0
+            while index < len(fields):
+                status = fields[index]
+                index += 1
+                if status.startswith(("R", "C")):
+                    if index + 1 >= len(fields):
+                        raise ValueError("incomplete NUL-delimited rename/copy change")
+                    nul_changes.append(
+                        {
+                            "status": status,
+                            "path_from": fields[index],
+                            "path_to": fields[index + 1],
+                        }
+                    )
+                    index += 2
+                else:
+                    if index >= len(fields):
+                        raise ValueError("incomplete NUL-delimited path change")
+                    nul_changes.append(
+                        {
+                            "status": status,
+                            "path_from": None,
+                            "path_to": fields[index],
+                        }
+                    )
+                    index += 1
+            return tuple(nul_changes)
+
         changes: list[dict[str, str | None]] = []
         for line in str(output).splitlines():
             fields = line.split("\t")
@@ -1854,7 +1887,9 @@ class GitService:
                 output = repo.git.diff_tree(
                     "--root",
                     "-r",
+                    "--no-commit-id",
                     "--name-status",
+                    "-z",
                     "-M",
                     commit_oid,
                 )
