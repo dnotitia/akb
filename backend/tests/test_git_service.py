@@ -846,6 +846,55 @@ def test_manual_fixed_ref_history_batches_independent_imported_lineages(
     ]
 
 
+def test_independent_commit_oids_streams_large_revision_sets(
+    git_service: GitService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lineage discovery must not expand the revision set into process argv."""
+    name = f"indexed_streamed_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    parent = git_service.commit_file(
+        vault_name=name,
+        file_path="seed.md",
+        content="seed\n",
+        message="seed",
+    )
+    repo = Repo(str(git_service._bare_path(name)))
+    tree = repo.git.rev_parse(f"{parent}^{{tree}}")
+    current_oids: list[str] = []
+    with repo.git.custom_environment(
+        GIT_AUTHOR_NAME="Fixture",
+        GIT_AUTHOR_EMAIL="fixture@example.dev",
+        GIT_COMMITTER_NAME="Fixture",
+        GIT_COMMITTER_EMAIL="fixture@example.dev",
+    ):
+        for index in range(128):
+            parent = repo.git.commit_tree(
+                tree,
+                "-p",
+                parent,
+                "-m",
+                f"streamed lineage {index}",
+            ).strip()
+            current_oids.append(parent)
+
+    git_type = type(repo.git)
+    original_execute = git_type.execute
+
+    def reject_large_argv(self, command, *args, **kwargs):
+        if len(command) > 16:
+            raise OSError("simulated ARG_MAX overflow")
+        return original_execute(self, command, *args, **kwargs)
+
+    monkeypatch.setattr(git_type, "execute", reject_large_argv)
+    try:
+        tips = git_service._independent_commit_oids(repo, current_oids)
+    finally:
+        repo.close()
+
+    assert tips == (current_oids[-1],)
+
+
 def test_manual_fixed_ref_history_batch_keeps_same_second_commits(
     git_service: GitService,
 ) -> None:
