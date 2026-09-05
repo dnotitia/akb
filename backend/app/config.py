@@ -658,6 +658,11 @@ class Settings(BaseModel):
     keycloak_realm: str = "akb"
     keycloak_client_id: str = "akb-web"
     keycloak_client_secret: str = ""       # secret.yaml — blank for public (PKCE) clients
+    # Accepted for configuration compatibility with the newer product-admin
+    # client.  The 0.14.x hybrid runtime does not use this credential itself;
+    # retaining it here lets a shared secret.yaml be mounted without weakening
+    # strict rejection of every other unknown setting.
+    keycloak_admin_client_secret: str = ""
     keycloak_public_client: bool = False   # true → PKCE (no client_secret); false → confidential
     keycloak_verify_ssl: bool = True       # set false only for local self-signed Keycloak
     # Exact identity is issuer/subject and does not require email. During the
