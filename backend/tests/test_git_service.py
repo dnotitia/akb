@@ -602,7 +602,7 @@ def test_manual_fixed_ref_history_batch_matches_per_path_history_for_lifecycle(
         assert compact["byte_size"] == len(full["body"])
 
 
-def test_manual_fixed_ref_history_batch_compact_inventory_rejects_nul(
+def test_manual_fixed_ref_history_batch_compact_inventory_preserves_nul(
     git_service: GitService,
 ) -> None:
     name = f"indexed_nul_{uuid.uuid4().hex[:8]}"
@@ -626,19 +626,21 @@ def test_manual_fixed_ref_history_batch_compact_inventory_rejects_nul(
     repo.index.commit("binary body")
     fixed_ref = repo.git.rev_parse("HEAD").strip()
 
-    with pytest.raises(FixedRefHistoryError, match="contains NUL bytes"):
-        git_service.manual_fixed_ref_history_batch(
-            name,
-            fixed_ref,
-            [
-                {
-                    "file_path": "binary.md",
-                    "current_commit": fixed_ref,
-                    "since_epoch": None,
-                }
-            ],
-            include_bodies=False,
-        )
+    snapshots = git_service.manual_fixed_ref_history_batch(
+        name,
+        fixed_ref,
+        [
+            {
+                "file_path": "binary.md",
+                "current_commit": fixed_ref,
+                "since_epoch": None,
+            }
+        ],
+        include_bodies=False,
+    )
+
+    assert snapshots[0]["body_digest"] == hashlib.sha256(b"before\x00after").hexdigest()
+    assert snapshots[0]["byte_size"] == len(b"before\x00after")
 
 
 def test_manual_fixed_ref_history_batch_respects_same_path_recreate_boundary(

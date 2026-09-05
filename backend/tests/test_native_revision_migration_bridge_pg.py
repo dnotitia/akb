@@ -405,6 +405,46 @@ async def test_inventory_is_fixed_ref_bounded_and_includes_archived_manual_vault
             )
 
 
+async def test_inventory_and_pg_body_store_preserve_utf8_nul_bytes(tmp_path):
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _make_fixture(pool, tmp_path)
+        text = "before\x00after\n"
+        current_oid = fixture["git"].commit_file(
+            fixture["vault_name"],
+            "renamed.md",
+            text,
+            "[update] renamed.md\n\nagent: legacy-writer\naction: update\nsummary: preserve NUL text",
+        )
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE documents SET current_commit = $2 WHERE id = $1",
+                fixture["document_one"],
+                current_oid,
+            )
+
+        bridge = LegacyRevisionBridge(pool, git=fixture["git"])
+        scope = await bridge.capture_inventory_scope(
+            namespace_id=fixture["namespace_id"],
+            fixed_ref=current_oid,
+            coverage_version="c9-nul-compat",
+        )
+        document = scope.documents_by_id[fixture["document_one"]]
+        expected = text.encode("utf-8")
+
+        assert document.body_digest == hashlib.sha256(expected).hexdigest()
+        assert document.byte_size == len(expected)
+        async with bridge.materialize_body(scope, document) as body:
+            assert body == expected
+            prepared = await M1PgBodyStore(pool).prepare_text(
+                namespace_id=fixture["namespace_id"],
+                payload=body,
+                expected_digest=document.body_digest,
+                expected_size=document.byte_size,
+            )
+
+        assert await M1PgBodyStore(pool).open_verified(prepared.payload_id) == expected
+
+
 async def test_inventory_accepts_plain_git_activity_without_akb_footers(tmp_path):
     async with _fresh_schema(tmp_path) as pool:
         git = GitService(storage_path=str(tmp_path / "plain-import-git"))
