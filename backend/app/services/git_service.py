@@ -35,6 +35,7 @@ import selectors
 import shutil
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -1855,6 +1856,64 @@ class GitService:
             raise FixedRefHistoryError("fixed-ref history could not be read") from exc
         return _FixedRefHistoryIndex(commits)
 
+    @staticmethod
+    def _independent_commit_oids(
+        repo: Repo,
+        current_oids: Iterable[str],
+    ) -> tuple[str, ...]:
+        """Resolve independent lineage tips without placing OIDs in argv.
+
+        ``git merge-base --independent`` accepts revisions only as command-line
+        arguments and exceeds ``ARG_MAX`` for large imported vaults. Feed the
+        revisions to one topological ``rev-list --stdin`` walk instead. A
+        current commit first encountered outside the ancestry already covered
+        by another current commit is an independent lineage tip.
+        """
+        current_set = set(current_oids)
+        if not current_set:
+            return ()
+        try:
+            with tempfile.TemporaryFile(mode="w+b") as revisions:
+                revisions.write(
+                    "".join(f"{oid}\n" for oid in sorted(current_set)).encode("ascii")
+                )
+                revisions.seek(0)
+                output = repo.git.rev_list(
+                    "--stdin",
+                    "--topo-order",
+                    "--parents",
+                    istream=revisions,
+                )
+        except (GitError, OSError, ValueError) as exc:
+            raise FixedRefHistoryError(
+                "fixed-ref history could not resolve current lineages"
+            ) from exc
+
+        covered: set[str] = set()
+        seen_current: set[str] = set()
+        lineage_tips: list[str] = []
+        for line in str(output).splitlines():
+            fields = line.split()
+            if not fields:
+                continue
+            oid, *parents = fields
+            is_covered = oid in covered
+            covered.discard(oid)
+            is_current = oid in current_set
+            if is_current:
+                seen_current.add(oid)
+            is_tip = is_current and not is_covered
+            if is_tip:
+                lineage_tips.append(oid)
+            if is_covered or is_tip:
+                covered.update(parents)
+
+        if seen_current != current_set or not lineage_tips:
+            raise FixedRefHistoryError(
+                "fixed-ref history could not resolve current lineages"
+            )
+        return tuple(sorted(lineage_tips))
+
     def _indexed_commit_metadata(
         self,
         repo: Repo,
@@ -2218,22 +2277,7 @@ class GitService:
                     validated_current[current_commit] = current
 
                 current_oids = sorted(validated_current)
-                try:
-                    lineage_tips = tuple(
-                        oid
-                        for oid in str(
-                            repo.git.merge_base("--independent", *current_oids)
-                        ).splitlines()
-                        if oid
-                    )
-                except GitError as exc:
-                    raise FixedRefHistoryError(
-                        "fixed-ref history could not resolve current lineages"
-                    ) from exc
-                if not lineage_tips:
-                    raise FixedRefHistoryError(
-                        "fixed-ref history could not resolve current lineages"
-                    )
+                lineage_tips = self._independent_commit_oids(repo, current_oids)
 
                 positions_by_current: dict[str, list[int]] = {}
                 for position, (
