@@ -409,6 +409,55 @@ def test_manual_fixed_ref_history_rejects_declared_activity_that_conflicts_with_
         )
 
 
+def test_manual_fixed_ref_history_accepts_create_on_reused_git_path(
+    git_service: GitService,
+) -> None:
+    """A new DB resource may reuse a path that still exists in Legacy Git."""
+    name = f"reused_create_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    git_service.commit_file(
+        vault_name=name,
+        file_path="notes/reused.md",
+        content="orphaned prior body\n",
+        message="orphaned prior write",
+    )
+    current_oid = git_service.commit_file(
+        vault_name=name,
+        file_path="notes/reused.md",
+        content="new resource body\n",
+        message=(
+            "Create replacement resource\n\n"
+            "agent: fixture-user\n"
+            "action: create\n"
+            "summary: create on reused path"
+        ),
+    )
+
+    single = git_service.manual_fixed_ref_history(
+        name,
+        current_oid,
+        "notes/reused.md",
+        current_commit=current_oid,
+    )
+    batched = git_service.manual_fixed_ref_history_batch(
+        name,
+        current_oid,
+        [
+            {
+                "file_path": "notes/reused.md",
+                "current_commit": current_oid,
+                "since_epoch": None,
+            }
+        ],
+    )[0]
+
+    assert single["activity"]["action"] == "create"
+    assert single["activity"]["changed_paths"] == [
+        {"change": "update", "path_from": None, "path_to": "notes/reused.md"}
+    ]
+    assert batched == single
+
+
 def test_manual_fixed_ref_history_batch_matches_per_path_history_for_lifecycle(
     git_service: GitService,
 ) -> None:
