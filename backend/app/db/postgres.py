@@ -87,6 +87,33 @@ async def close_pool() -> None:
         await pool.close()
 
 
+@asynccontextmanager
+async def _migration_pool():
+    """Use one dedicated connection without request-path query timeouts.
+
+    Data migrations can legitimately scan or rewrite an existing corpus for
+    longer than the 30-second request budget.  They still run under the
+    migration runner's bounded ``lock_timeout``, so waiting to acquire a table
+    lock remains fail-fast while work performed after the lock is acquired can
+    finish atomically.
+    """
+    pool = await asyncpg.create_pool(
+        dsn=settings.asyncpg_dsn,
+        min_size=1,
+        max_size=1,
+        command_timeout=None,
+        server_settings={
+            "application_name": "akb-schema-migration",
+            "idle_in_transaction_session_timeout": "60000",
+            "statement_timeout": "0",
+        },
+    )
+    try:
+        yield pool
+    finally:
+        await pool.close()
+
+
 async def init_db(max_retries: int = 10, delay: float = 2.0) -> None:
     """Run init.sql to create tables, then apply pending migrations.
     Retries on connection failure.
@@ -103,7 +130,8 @@ async def init_db(max_retries: int = 10, delay: float = 2.0) -> None:
             sql = init_sql.read_text()
             async with pool.acquire() as conn:
                 await conn.execute(sql)
-            await _apply_migrations()
+            async with _migration_pool() as migration_pool:
+                await _apply_migrations(migration_pool)
             return
         except ConnectionRefusedError, asyncpg.CannotConnectNowError, OSError:
             if attempt < max_retries - 1:
@@ -149,12 +177,12 @@ async def _run_one_migration(pool_or_conn, filename: str, module, *, retries: in
 
     Migrations that ALTER `chunks` need an ACCESS EXCLUSIVE lock. During a
     rolling deploy the outgoing pod's workers may still hold an open
-    transaction on that table; without a bound the ALTER would block until
-    the connection's 30s statement_timeout cancels it (QueryCanceledError),
-    crashing startup. A short lock_timeout makes us fail fast and retry
-    until the lock clears (the server also kills idle-in-transaction holders
-    at 60s). The pooled connection's state is reset on release, so the
-    per-migration `SET lock_timeout` does not leak to other callers.
+    transaction on that table. A short lock_timeout makes us fail fast and
+    retry until the lock clears (the server also kills idle-in-transaction
+    holders at 60s). Once acquired, the dedicated migration pool allows a
+    large atomic data rewrite to exceed the request path's 30-second budget.
+    The pooled connection's state is reset on release, so the per-migration
+    `SET lock_timeout` does not leak to other callers.
     """
     import logging
 
@@ -198,7 +226,7 @@ async def _run_one_migration(pool_or_conn, filename: str, module, *, retries: in
                 raise
 
 
-async def _apply_migrations() -> None:
+async def _apply_migrations(pool=None) -> None:
     """Apply migration scripts once each, in order. Safe to call repeatedly.
 
     A `schema_migrations` ledger records applied files so steady-state boots
@@ -207,7 +235,8 @@ async def _apply_migrations() -> None:
     live workers during a rolling deploy). Unrecorded migrations run via
     :func:`_run_one_migration` (bounded lock_timeout + retry).
     """
-    pool = await get_pool()
+    if pool is None:
+        pool = await get_pool()
     async with pool.acquire() as conn:
         # Session lock serializes the read-of-ledger + apply + ledger-write
         # sequence across API/worker pods during a rolling deployment.

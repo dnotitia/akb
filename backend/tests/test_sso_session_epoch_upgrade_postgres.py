@@ -118,7 +118,12 @@ async def _run_current_init_db(monkeypatch, pool) -> None:
     async def get_test_pool():
         return pool
 
+    @asynccontextmanager
+    async def get_test_migration_pool():
+        yield pool
+
     monkeypatch.setattr(postgres, "get_pool", get_test_pool)
+    monkeypatch.setattr(postgres, "_migration_pool", get_test_migration_pool)
     await postgres.init_db(max_retries=1, delay=0)
 
 
