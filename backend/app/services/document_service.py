@@ -250,9 +250,52 @@ def _compose_markdown(fm_dict: dict, body: str) -> str:
     return frontmatter.dumps(post)
 
 
-def _parse_markdown(content: str) -> tuple[dict, str]:
-    post = frontmatter.loads(content)
+def _parse_markdown(
+    content: str,
+    *,
+    fallback_metadata: dict | None = None,
+) -> tuple[dict, str]:
+    """Read canonical Markdown and recover bodies from malformed legacy YAML.
+
+    The retired external-Git importer could persist a source file whose leading
+    ``---`` block was not valid YAML.  Such a document still has authoritative
+    metadata in PostgreSQL, but a strict ``frontmatter.loads`` made current
+    reads and every repair write fail before the new body could replace it.
+
+    Match the established historical-read behavior: strip one complete leading
+    frontmatter envelope when parsing fails, otherwise retain the raw text.  A
+    caller that is about to rewrite the document may supply the DB-backed
+    metadata so the repair commit preserves AKB's known title/lifecycle fields.
+    """
+
+    try:
+        post = frontmatter.loads(content)
+    except Exception:  # noqa: BLE001 - compatibility boundary for legacy payloads
+        body = re.sub(
+            r"\A---\r?\n.*?\r?\n---(?:\r?\n|\Z)",
+            "",
+            content,
+            count=1,
+            flags=re.DOTALL,
+        )
+        return dict(fallback_metadata or {}), body
     return dict(post.metadata), post.content
+
+
+def _document_row_frontmatter(row: dict) -> dict:
+    """Project DB-authoritative metadata for a malformed legacy repair write."""
+
+    metadata = {
+        "title": row["title"],
+        "type": row.get("doc_type") or "note",
+        "status": row.get("status") or "draft",
+        "tags": list(row.get("tags") or []),
+    }
+    for key in ("created_at", "updated_at", "created_by", "domain", "summary"):
+        value = row.get(key)
+        if value is not None:
+            metadata[key] = value
+    return metadata
 
 
 def _body_content_hash(body: str) -> str:
@@ -1071,7 +1114,10 @@ class DocumentService:
         if current_content is None:
             raise NotFoundError("Document file", file_path)
 
-        current_fm, current_body = _parse_markdown(current_content)
+        current_fm, current_body = _parse_markdown(
+            current_content,
+            fallback_metadata=_document_row_frontmatter(row),
+        )
         current_hash, _ = await self._ensure_document_hash(doc_repo, row, current_body, conn=conn)
         if req.expected_content_hash and req.expected_content_hash != current_hash:
             raise ConflictError(
@@ -1550,7 +1596,10 @@ class DocumentService:
         if current_content is None:
             raise NotFoundError("Document file", file_path)
 
-        current_fm, current_body = _parse_markdown(current_content)
+        current_fm, current_body = _parse_markdown(
+            current_content,
+            fallback_metadata=_document_row_frontmatter(row),
+        )
 
         # Apply edit — validate old_string and find occurrences
         if not old_string:
