@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 from git import Repo
@@ -152,6 +153,48 @@ def _move_file_at(
         return repo.git.rev_parse("HEAD").strip()
     finally:
         repo.close()
+
+
+def _import_detached_history(
+    git_service: GitService,
+    vault_name: str,
+    source_path: Path,
+    file_path: str,
+    bodies: list[str],
+) -> list[str]:
+    """Import objects from a source lineage without attaching a target ref."""
+    source = Repo.init(source_path)
+    commits: list[str] = []
+    try:
+        writer = source.config_writer()
+        writer.set_value("user", "name", "Fixture Collector")
+        writer.set_value("user", "email", "collector@example.dev")
+        writer.release()
+        target = source_path / file_path
+        for position, body in enumerate(bodies):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body, encoding="utf-8")
+            source.git.add("--", file_path)
+            action = "create" if position == 0 else "update"
+            source.git.commit(
+                "-m",
+                (
+                    f"Imported {action}\n\n"
+                    "agent: fixture-collector\n"
+                    f"action: {action}\n"
+                    "summary: detached source history"
+                ),
+            )
+            commits.append(source.head.commit.hexsha)
+
+        target_repo = Repo(str(git_service._bare_path(vault_name)))
+        try:
+            target_repo.git.fetch(str(source_path), source.active_branch.path)
+        finally:
+            target_repo.close()
+    finally:
+        source.close()
+    return commits
 
 
 def _block_chdir(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -706,6 +749,101 @@ def test_manual_fixed_ref_history_stops_at_recorded_current_commit(
     assert single["body"] == b"recorded document\n"
     assert [entry["legacy_git_oid"] for entry in single["history"]] == [recorded]
     assert batched == [single]
+
+
+def test_manual_fixed_ref_history_batches_independent_imported_lineages(
+    git_service: GitService,
+    tmp_path: Path,
+) -> None:
+    """DB heads remain authoritative when imported objects are not on HEAD."""
+    name = f"indexed_detached_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    git_service.commit_file(
+        vault_name=name,
+        file_path="laws/one.md",
+        content="one current\n",
+        message="materialize one in the vault snapshot",
+    )
+    fixed_ref = git_service.commit_file(
+        vault_name=name,
+        file_path="laws/two.md",
+        content="two current\n",
+        message="materialize two in the vault snapshot",
+    )
+    one_history = _import_detached_history(
+        git_service,
+        name,
+        tmp_path / "source-one",
+        "laws/one.md",
+        ["one original\n", "one current\n"],
+    )
+    two_history = _import_detached_history(
+        git_service,
+        name,
+        tmp_path / "source-two",
+        "laws/two.md",
+        ["two original\n", "two current\n"],
+    )
+    repo_path = git_service._bare_path(name)
+    for current_commit in (one_history[-1], two_history[-1]):
+        ancestry = subprocess.run(
+            [
+                "git",
+                "--git-dir",
+                str(repo_path),
+                "merge-base",
+                "--is-ancestor",
+                current_commit,
+                fixed_ref,
+            ],
+            check=False,
+            capture_output=True,
+        )
+        assert ancestry.returncode == 1
+
+    requests = [
+        {
+            "file_path": "laws/one.md",
+            "current_commit": one_history[-1],
+            "since_epoch": None,
+        },
+        {
+            "file_path": "laws/two.md",
+            "current_commit": two_history[-1],
+            "since_epoch": None,
+        },
+    ]
+    batched = git_service.manual_fixed_ref_history_batch(
+        name,
+        fixed_ref,
+        requests,
+    )
+    expected = [
+        git_service.manual_fixed_ref_history(
+            name,
+            fixed_ref,
+            file_path,
+            current_commit=current_commit,
+        )
+        for file_path, current_commit in (
+            ("laws/one.md", one_history[-1]),
+            ("laws/two.md", two_history[-1]),
+        )
+    ]
+
+    assert batched == expected
+    assert [snapshot["body"] for snapshot in batched] == [
+        b"one current\n",
+        b"two current\n",
+    ]
+    assert [entry["action"] for entry in batched[0]["history"]] == [
+        "update",
+        "create",
+    ]
+    assert [entry["action"] for entry in batched[1]["history"]] == [
+        "update",
+        "create",
+    ]
 
 
 def test_manual_fixed_ref_history_batch_keeps_same_second_commits(
