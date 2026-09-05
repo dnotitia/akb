@@ -137,6 +137,13 @@ _PATH_AT_REVISION_MAX_ENTRIES = 10_000
 _PATH_AT_REVISION_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 _PATH_AT_REVISION_READ_CHUNK_BYTES = 64 * 1024
 _PATH_AT_REVISION_DEFAULT_TIMEOUT_SECS = 30.0
+_PUBLIC_ACTIVITY_ACTIONS = frozenset({"create", "update", "move", "delete"})
+_LEGACY_ACTIVITY_ACTION_ALIASES = {"edit": "update"}
+
+
+def _canonical_legacy_activity_action(action: str) -> str:
+    """Map historical public action names onto the current wire vocabulary."""
+    return _LEGACY_ACTIVITY_ACTION_ALIASES.get(action, action)
 
 
 def _marker_state(marker: Path) -> str:
@@ -1908,9 +1915,8 @@ class GitService:
         changes: tuple[dict[str, str | None], ...],
     ) -> dict:
         """Apply the legacy activity validation to cached diff-tree rows."""
-        declared_action = metadata["action"]
-        supported_actions = {"create", "update", "move", "delete"}
-        if declared_action and declared_action not in supported_actions:
+        declared_action = _canonical_legacy_activity_action(metadata["action"])
+        if declared_action and declared_action not in _PUBLIC_ACTIVITY_ACTIONS:
             raise FixedRefHistoryError(
                 "fixed-ref current commit has no supported public activity action"
             )
@@ -2089,8 +2095,10 @@ class GitService:
                         metadata = self._indexed_commit_metadata(repo, index, oid)
                         entry["message"] = metadata["message"]
                         entry["author"] = metadata["author"]
-                        declared_action = metadata["legacy"].get("action")
-                        if declared_action in {"create", "update", "move", "delete"}:
+                        declared_action = _canonical_legacy_activity_action(
+                            metadata["legacy"].get("action", "")
+                        )
+                        if declared_action in _PUBLIC_ACTIVITY_ACTIONS:
                             entry["action"] = declared_action
                         history.append(entry)
                         next_path = selected.get("next_path")
@@ -2297,8 +2305,8 @@ class GitService:
             # fields it owns.
             entry["message"] = str(commit.message).strip()
             entry["author"] = str(commit.author)
-            action = metadata.get("action")
-            if action in {"create", "update", "move", "delete"}:
+            action = _canonical_legacy_activity_action(metadata.get("action", ""))
+            if action in _PUBLIC_ACTIVITY_ACTIONS:
                 entry["action"] = action
 
         return {
@@ -2312,9 +2320,8 @@ class GitService:
     def _manual_fixed_ref_activity(self, repo: Repo, commit, file_path: str) -> dict:
         """Freeze the legacy public activity projection for one file commit."""
         metadata = self._legacy_commit_metadata(commit)
-        declared_action = metadata["action"]
-        supported_actions = {"create", "update", "move", "delete"}
-        if declared_action and declared_action not in supported_actions:
+        declared_action = _canonical_legacy_activity_action(metadata["action"])
+        if declared_action and declared_action not in _PUBLIC_ACTIVITY_ACTIONS:
             raise FixedRefHistoryError(
                 "fixed-ref current commit has no supported public activity action"
             )
