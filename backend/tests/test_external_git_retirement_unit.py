@@ -8,11 +8,16 @@ import pytest
 
 from app.services.external_git_retirement import (
     ExternalGitRetirementError,
+    _MAX_MANIFEST_BYTES,
     parse_adoption_manifest,
 )
 
 
 _REF = "a" * 40
+
+
+def test_operator_manifest_limit_covers_large_body_free_inventories() -> None:
+    assert _MAX_MANIFEST_BYTES == 32 * 1024 * 1024
 
 
 def _manifest() -> dict:

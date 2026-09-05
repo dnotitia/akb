@@ -58,7 +58,10 @@ _DOCUMENT_KEYS = frozenset(
     }
 )
 _MANAGED_METADATA_KEYS = frozenset({"managed", "title", "type", "tags", "summary", "domain"})
-_MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+# Large repositories can legitimately need tens of thousands of body-free
+# document facts. Keep the operator input bounded while leaving enough room
+# for that inventory and its canonical metadata.
+_MAX_MANIFEST_BYTES = 32 * 1024 * 1024
 
 
 class ExternalGitRetirementError(RuntimeError):
