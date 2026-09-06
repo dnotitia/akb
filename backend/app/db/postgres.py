@@ -349,6 +349,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "095_app_release_manifest_v2.py",  # strict app release manifest v2 registry shape
         "096_native_revision_cutover_fence.py",  # short durable two-phase authority fence
         "097_native_revision_migration_inventory.py",  # one immutable fixed-ref inventory per run
+        "098_native_revision_nul_payload.py",  # permit UTF-8 NUL bytes in Native text payloads while retaining DB validation
     ):
         if filename in applied:
             continue

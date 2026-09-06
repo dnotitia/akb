@@ -717,6 +717,7 @@ class LegacyRevisionBridge:
                 fixed_ref,
                 requests,
                 include_bodies=False,
+                require_fixed_ref_current=True,
             )
         except FixedRefHistoryError as exc:
             raise InventoryEligibilityError("fixed-ref inventory history could not be read") from exc
