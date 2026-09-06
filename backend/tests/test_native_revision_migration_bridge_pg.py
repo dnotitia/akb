@@ -94,6 +94,7 @@ async def _fresh_schema(tmp_path: Path):
             "053_native_revision_m1_pg_body.py",
             "060_native_revision_migration_bridge.py",
             "097_native_revision_migration_inventory.py",
+            "098_native_revision_nul_payload.py",
         ):
             await _load(filename).migrate(conn=conn)
         await conn.close()
@@ -443,6 +444,15 @@ async def test_inventory_and_pg_body_store_preserve_utf8_nul_bytes(tmp_path):
             )
 
         assert await M1PgBodyStore(pool).open_verified(prepared.payload_id) == expected
+        async with pool.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT akb_is_utf8_payload($1::bytea)",
+                expected,
+            )
+            assert not await conn.fetchval(
+                "SELECT akb_is_utf8_payload($1::bytea)",
+                b"\xff",
+            )
 
 
 async def test_inventory_accepts_plain_git_activity_without_akb_footers(tmp_path):
@@ -685,8 +695,10 @@ async def test_p95_inventory_uses_one_validated_scope_and_one_body_read_per_item
             requests,
             *,
             include_bodies=True,
+            require_fixed_ref_current=False,
         ):
             del vault_name
+            assert require_fixed_ref_current is True
             self.history_batch_calls += 1
             snapshots = [
                 self._snapshot(

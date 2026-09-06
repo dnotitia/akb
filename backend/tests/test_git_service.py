@@ -8,6 +8,7 @@ tests never touch the real `/data/vaults` directory.
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import shutil
 import subprocess
@@ -36,6 +37,16 @@ def _mirror_git(git_http, tmp_path) -> GitService:
         storage_path=str(tmp_path / "vaults"),
         ext_runner=build_runner(git_http.port),
     )
+
+
+def test_nul_stream_tokens_preserve_utf8_split_across_read_boundary() -> None:
+    prefix = "a" * ((64 * 1024) - 1)
+    payload = f"{prefix}한글\x00tail\x00".encode()
+
+    assert list(GitService._iter_nul_stream_tokens(io.BytesIO(payload))) == [
+        f"{prefix}한글",
+        "tail",
+    ]
 
 
 @pytest.fixture
@@ -819,6 +830,7 @@ def test_manual_fixed_ref_history_batches_independent_imported_lineages(
         name,
         fixed_ref,
         requests,
+        require_fixed_ref_current=True,
     )
     expected = [
         git_service.manual_fixed_ref_history(
@@ -950,7 +962,7 @@ def test_manual_fixed_ref_history_batch_keeps_same_second_commits(
     assert [entry["legacy_git_oid"] for entry in batched[0]["history"]] == [updated, created]
 
 
-def test_manual_fixed_ref_history_batch_traverses_once_per_batch(
+def test_manual_fixed_ref_history_batch_streams_once_without_materialized_index(
     git_service: GitService,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -982,6 +994,7 @@ def test_manual_fixed_ref_history_batch_traverses_once_per_batch(
         return original_execute(self, command, *args, **kwargs)
 
     monkeypatch.setattr(git_type, "execute", counting_execute)
+
     request = {
         "file_path": "notes/cached.md",
         "current_commit": current,
@@ -993,6 +1006,50 @@ def test_manual_fixed_ref_history_batch_traverses_once_per_batch(
 
     assert first[0] == first[1] == second[0]
     assert calls == {"log": 2, "diff_tree": 2}
+
+
+def test_manual_fixed_ref_history_batch_routes_only_changed_paths(
+    git_service: GitService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = f"indexed_route_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    requests = []
+    for index in range(24):
+        path = f"notes/{index:03d}.md"
+        current_commit = git_service.commit_file(
+            vault_name=name,
+            file_path=path,
+            content=f"body-{index}\n",
+            message=f"create {path}",
+        )
+        requests.append(
+            {
+                "file_path": path,
+                "current_commit": current_commit,
+                "since_epoch": None,
+            }
+        )
+
+    original = git_service._indexed_path_change
+    path_change_calls = 0
+
+    def counted_path_change(changes, active_path):
+        nonlocal path_change_calls
+        path_change_calls += 1
+        return original(changes, active_path)
+
+    monkeypatch.setattr(git_service, "_indexed_path_change", counted_path_change)
+    snapshots = git_service.manual_fixed_ref_history_batch(
+        name,
+        requests[-1]["current_commit"],
+        requests,
+        include_bodies=False,
+    )
+
+    assert len(snapshots) == len(requests)
+    assert all(len(snapshot["history"]) == 1 for snapshot in snapshots)
+    assert path_change_calls <= len(requests) * 2
 
 
 @pytest.mark.parametrize(
