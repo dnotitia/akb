@@ -1898,8 +1898,8 @@ async def _prove_local_realm_migration(state: dict[str, object]) -> dict[str, ob
         "first_login": "membership_required-and-recorded",
         "approval": "explicit-existing-user-id",
         "second_login": "same-akb-user-id",
-        "legacy_akb_password_route": "disabled-in-sso-mode",
-        "legacy_password_hash": "preserved-for-controlled-rollback-only",
+        "legacy_akb_password_route": "disabled-in-sso-mode",  # pragma: allowlist secret
+        "legacy_password_hash": "preserved-for-controlled-rollback-only",  # pragma: allowlist secret
         "pat_continuity": True,
         "vault_and_acl_continuity": True,
         "record_drained": True,
