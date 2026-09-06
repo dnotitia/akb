@@ -86,6 +86,7 @@ keycloak_client_id: fixture-browser
 keycloak_public_client: true
 keycloak_enrollment_mode: invite_only
 keycloak_verify_ssl: false
+sso_local_realm_login_enabled: true
 public_base_url: https://broker.localhost:19443
 api_oauth_audience: https://broker.localhost:19443/api
 db_host: localhost

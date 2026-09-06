@@ -9,6 +9,7 @@ from html import unescape
 from html.parser import HTMLParser
 import json
 import os
+from pathlib import Path
 import secrets
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlsplit
@@ -17,11 +18,13 @@ import uuid
 import httpx
 import jwt
 
+from app.config import settings
 from app.db import postgres
 from app.exceptions import AKBError
 from app.services import auth_service, keycloak_oidc
 from app.services.access_service import check_vault_access
 from app.services.auth_verifier_profiles import verify_keycloak_access_v1
+from app.services.local_session_keys import generate_local_session_keyset
 from app.services.admission_service import (
     approve_pending_admission,
     list_pending_admissions,
@@ -220,6 +223,11 @@ async def _authorization_code_tokens(
     tokens = _require_object(token_response.json(), "fixture_token_response_invalid")
     if not isinstance(tokens.get("access_token"), str):
         raise _fail("fixture_access_token_missing")
+    # The real browser-session verifier binds the ID token to the nonce from
+    # this exact authorization request. Keep it beside the disposable token
+    # response so the fixture can exercise that boundary too; it is never
+    # printed in the secret-free receipt.
+    tokens["_fixture_nonce"] = params["nonce"]
     return tokens
 
 
@@ -770,6 +778,7 @@ async def _seed_akb(upstream_subject: str) -> dict[str, object]:
     return {
         "pool": pool,
         "user_id": user_id,
+        "other_user_id": other_user_id,
         "token_id": token_id,
         "raw_pat": raw_pat,
         "owned_vault_id": owned_vault_id,
@@ -864,6 +873,10 @@ INVITED_UPSTREAM_PASSWORD = "fixture-only-invitee-password"  # pragma: allowlist
 MIGRANT_EMAIL = "migrant@example.com"
 MIGRANT_UPSTREAM_USERNAME = "migrant"
 MIGRANT_UPSTREAM_PASSWORD = "fixture-only-migrant-password"  # pragma: allowlist secret
+LOCAL_MIGRANT_EMAIL = "local-migrant@example.com"
+LOCAL_MIGRANT_USERNAME = "local-migrant"
+LOCAL_MIGRANT_PASSWORD = "fixture-only-keycloak-local-password"  # pragma: allowlist secret
+LOCAL_AKB_PASSWORD = "fixture-only-legacy-akb-password"  # pragma: allowlist secret
 
 
 def _seeded_account_payload() -> dict[str, Any]:
@@ -1124,6 +1137,50 @@ async def _create_upstream_person(
     if not subject:
         raise _fail("fixture_upstream_location_invalid")
     return subject
+
+
+async def _create_broker_local_person(
+    client: httpx.AsyncClient,
+    *,
+    username: str,
+    email: str,
+    password: str,
+) -> str:
+    """Create one credentialed user in the installation-owned realm."""
+    broker_admin = await _admin_token(client, BROKER)
+    created = await client.post(
+        f"{BROKER}/admin/realms/akb/users",
+        headers={"Authorization": f"Bearer {broker_admin}"},
+        json={
+            "username": username,
+            "email": email,
+            "emailVerified": True,
+            "enabled": True,
+            "firstName": "Local",
+            "lastName": "Fixture",
+            "credentials": [
+                {"type": "password", "value": password, "temporary": False}
+            ],
+        },
+    )
+    if created.status_code != 201:
+        raise _evidence(
+            "fixture_broker_local_create_failed",
+            {"status_code": created.status_code},
+        )
+    subject = urlsplit(created.headers.get("location") or "").path.rsplit("/", 1)[-1]
+    if not subject:
+        raise _fail("fixture_broker_local_location_invalid")
+    return subject
+
+
+async def _remove_broker_person(client: httpx.AsyncClient, subject: str) -> None:
+    removed = await client.delete(
+        f"{BROKER}/admin/realms/akb/users/{subject}",
+        headers={"Authorization": f"Bearer {await _admin_token(client, BROKER)}"},
+    )
+    if removed.status_code != 204:
+        raise _fail("fixture_broker_local_remove_failed")
 
 
 async def _remove_person(
@@ -1544,6 +1601,311 @@ async def _prove_admission_chain(state: dict[str, object]) -> dict[str, object]:
     }
 
 
+async def _prove_local_realm_migration(state: dict[str, object]) -> dict[str, object]:
+    """Move a real legacy-local AKB account behind Keycloak's local realm.
+
+    The account starts with AKB's own bcrypt credential and no external
+    identity. A distinct password is installed in the real broker realm. The
+    first Keycloak-local login is still refused by ``invite_only`` and records
+    the exact broker subject; explicit approval attaches that subject to the
+    pre-existing AKB UUID. The second login must reach that same UUID while its
+    PAT, owned Vault and writer grant survive.
+
+    The legacy hash stays byte-for-byte intact for a controlled rollback, but
+    it cannot authenticate while the deployment is in canonical SSO mode and
+    the account is marked ``keycloak``. This proves the exception path without
+    reintroducing a hybrid runtime.
+    """
+    pool = state["pool"]
+    assert hasattr(pool, "acquire")
+    user_id = uuid.uuid4()
+    token_id = uuid.uuid4()
+    owned_vault_id = uuid.uuid4()
+    raw_pat, token_hash, token_prefix = auth_service.generate_pat()
+    legacy_hash = auth_service.hash_password(LOCAL_AKB_PASSWORD)
+
+    async with httpx.AsyncClient(verify=False, timeout=20.0) as client:
+        broker_admin = await _admin_token(client, BROKER)
+        if await _realm_accounts(
+            client,
+            admin_token=broker_admin,
+            email=LOCAL_MIGRANT_EMAIL,
+        ):
+            raise _fail("fixture_local_realm_precondition_not_empty")
+        broker_subject = await _create_broker_local_person(
+            client,
+            username=LOCAL_MIGRANT_USERNAME,
+            email=LOCAL_MIGRANT_EMAIL,
+            password=LOCAL_MIGRANT_PASSWORD,
+        )
+        realm_accounts = await _realm_accounts(
+            client,
+            admin_token=broker_admin,
+            email=LOCAL_MIGRANT_EMAIL,
+        )
+    if len(realm_accounts) != 1 or realm_accounts[0]["subject"] != broker_subject:
+        raise _evidence("fixture_local_realm_account_not_exact", realm_accounts)
+    if (
+        realm_accounts[0]["credential_types"] != ["password"]
+        or realm_accounts[0]["federated_identities"]
+        or realm_accounts[0]["federation_link"] is not None
+    ):
+        raise _evidence("fixture_local_realm_account_not_local", realm_accounts[0])
+
+    async with pool.acquire() as conn:  # type: ignore[union-attr]
+        async with conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO users (
+                    id, username, email, password_hash, display_name, is_admin,
+                    auth_provider, account_status, account_kind
+                ) VALUES ($1, $2, $3, $4, 'Legacy Local', false,
+                          'local', 'active', 'human')
+                """,
+                user_id,
+                LOCAL_MIGRANT_USERNAME,
+                LOCAL_MIGRANT_EMAIL,
+                legacy_hash,
+            )
+            await conn.execute(
+                """
+                INSERT INTO tokens (
+                    id, user_id, name, token_hash, token_prefix, scopes, key_class
+                ) VALUES ($1, $2, 'legacy-local-pat', $3, $4,
+                          ARRAY['read', 'write'], 'pat')
+                """,
+                token_id,
+                user_id,
+                token_hash,
+                token_prefix,
+            )
+            await conn.execute(
+                """
+                INSERT INTO vaults (id, name, git_path, owner_id)
+                VALUES ($1, 'legacy-local-owned', '/tmp/legacy-local-owned.git', $2)
+                """,
+                owned_vault_id,
+                user_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO vault_access (vault_id, user_id, role, granted_by)
+                VALUES ($1, $2, 'writer', $3)
+                """,
+                state["shared_vault_id"],
+                user_id,
+                state["other_user_id"],
+            )
+
+    # Exercise the explicit staged lane before moving this account behind SSO.
+    # The broker-chain process normally runs only in canonical SSO mode, so it
+    # creates a disposable local-session keyset and temporarily selects the
+    # canonical local policy. This is not hybrid mode: only one authority is
+    # active at a time, and the original SSO settings are restored immediately.
+    local_keyset = generate_local_session_keyset(
+        Path("config") / "local-session-migration-probe"
+    )
+    local_setting_names = (
+        "auth_mode",
+        "local_session_private_key_path",
+        "local_session_jwks_path",
+        "local_session_issuer",
+        "local_session_audience",
+    )
+    local_setting_backup = {
+        name: getattr(settings, name) for name in local_setting_names
+    }
+    try:
+        object.__setattr__(settings, "auth_mode", "local")
+        object.__setattr__(
+            settings,
+            "local_session_private_key_path",
+            str(local_keyset["private_key_path"]),
+        )
+        object.__setattr__(
+            settings,
+            "local_session_jwks_path",
+            str(local_keyset["jwks_path"]),
+        )
+        object.__setattr__(
+            settings,
+            "local_session_issuer",
+            "https://fixture-local.invalid",
+        )
+        object.__setattr__(
+            settings,
+            "local_session_audience",
+            "https://fixture-local.invalid/api",
+        )
+        local_login = await auth_service.login(
+            LOCAL_MIGRANT_USERNAME,
+            LOCAL_AKB_PASSWORD,
+        )
+    finally:
+        for name, value in local_setting_backup.items():
+            object.__setattr__(settings, name, value)
+    if local_login.get("user", {}).get("id") != str(user_id):
+        raise _fail("fixture_pre_transition_local_login_changed_account")
+
+    if await _recorded_arrivals():
+        raise _fail("fixture_local_realm_precondition_records_not_empty")
+
+    async def local_tokens() -> tuple[dict[str, Any], Any]:
+        tokens = await _authorization_code_tokens(
+            issuer=BROKER_ISSUER,
+            client_id="fixture-browser",
+            redirect_uri="https://client.localhost/callback",
+            username=LOCAL_MIGRANT_USERNAME,
+            password=LOCAL_MIGRANT_PASSWORD,
+        )
+        access_token = tokens.get("access_token")
+        id_token = tokens.get("id_token")
+        nonce = tokens.get("_fixture_nonce")
+        if not all(isinstance(value, str) for value in (access_token, id_token, nonce)):
+            raise _fail("fixture_local_realm_tokens_incomplete")
+        principal = await verify_keycloak_access_v1(access_token, "api")
+        if principal is None or principal.subject != broker_subject:
+            raise _fail("fixture_local_realm_access_token_rejected")
+        if principal.issuer != BROKER_ISSUER or principal.claims.get("identity_provider") is not None:
+            raise _fail("fixture_local_realm_access_token_misclassified")
+        id_claims = await keycloak_oidc.get_keycloak_oidc().verify_browser_id_token(
+            id_token,
+            expected_nonce=nonce,
+            access_token=access_token,
+            expected_provider_alias="local",
+        )
+        if id_claims.get("identity_provider") is not None:
+            raise _fail("fixture_local_realm_id_token_misclassified")
+        return tokens, principal
+
+    _, first_principal = await local_tokens()
+    if await auth_service.project_verified_principal(first_principal) is not None:
+        raise _fail("fixture_local_realm_admitted_without_approval")
+    try:
+        await auth_service._resolve_or_provision_keycloak_user(  # noqa: SLF001
+            dict(first_principal.claims)
+        )
+    except AKBError as refusal:
+        if getattr(refusal, "code", None) != "membership_required":
+            raise _evidence(
+                "fixture_local_realm_refused_for_another_reason",
+                {"code": getattr(refusal, "code", None)},
+            ) from None
+    else:
+        raise _fail("fixture_local_realm_admitted_without_approval")
+
+    records = [
+        item
+        for item in await _recorded_arrivals()
+        if item.get("issuer") == BROKER_ISSUER
+        and item.get("subject") == broker_subject
+    ]
+    if len(records) != 1 or not isinstance(records[0].get("id"), str):
+        raise _evidence("fixture_local_realm_arrival_not_recorded", records)
+    await approve_pending_admission(
+        records[0]["id"],
+        actor_id="fixture-product-admin",
+        existing_user_id=str(user_id),
+    )
+
+    _, second_principal = await local_tokens()
+    migrated = await auth_service.project_verified_principal(second_principal)
+    if migrated is None or migrated.user_id != str(user_id):
+        raise _fail("fixture_local_realm_login_did_not_keep_the_account")
+
+    async with pool.acquire() as conn:  # type: ignore[union-attr]
+        user = await conn.fetchrow(
+            """
+            SELECT id, auth_provider, password_hash, account_status, account_kind
+              FROM users WHERE id = $1
+            """,
+            user_id,
+        )
+        bindings = await conn.fetch(
+            """
+            SELECT issuer, subject FROM external_identities
+             WHERE user_id = $1 ORDER BY issuer, subject
+            """,
+            user_id,
+        )
+        token_owner = await conn.fetchval(
+            "SELECT user_id FROM tokens WHERE id = $1",
+            token_id,
+        )
+        owned = await conn.fetchval(
+            "SELECT owner_id FROM vaults WHERE id = $1",
+            owned_vault_id,
+        )
+        role = await conn.fetchval(
+            "SELECT role FROM vault_access WHERE vault_id = $1 AND user_id = $2",
+            state["shared_vault_id"],
+            user_id,
+        )
+    if (
+        user is None
+        or user["id"] != user_id
+        or user["auth_provider"] != "keycloak"
+        or user["password_hash"] != legacy_hash
+        or user["account_status"] != "active"
+        or user["account_kind"] != "human"
+    ):
+        raise _fail("fixture_local_realm_akb_account_changed")
+    if [(row["issuer"], row["subject"]) for row in bindings] != [
+        (BROKER_ISSUER, broker_subject)
+    ]:
+        raise _evidence(
+            "fixture_local_realm_binding_not_exact",
+            [[row["issuer"], row["subject"]] for row in bindings],
+        )
+    if token_owner != user_id or owned != user_id or role != "writer":
+        raise _fail("fixture_local_realm_authorization_continuity_failed")
+    pat_user = await auth_service.resolve_rest_user_authorization(f"Bearer {raw_pat}")
+    if pat_user is None or pat_user.user_id != str(user_id):
+        raise _fail("fixture_local_realm_pat_continuity_failed")
+    owned_access = await check_vault_access(str(user_id), "legacy-local-owned", "owner")
+    shared_access = await check_vault_access(str(user_id), "continuity-shared", "writer")
+    if owned_access["role"] != "owner" or shared_access["role"] != "writer":
+        raise _fail("fixture_local_realm_vault_access_continuity_failed")
+    try:
+        await auth_service.login(LOCAL_MIGRANT_USERNAME, LOCAL_AKB_PASSWORD)
+    except AKBError as refusal:
+        if getattr(refusal, "code", None) != "local_auth_disabled":
+            raise _evidence(
+                "fixture_legacy_local_login_refused_for_another_reason",
+                {"code": getattr(refusal, "code", None)},
+            ) from None
+    else:
+        raise _fail("fixture_legacy_local_login_remained_enabled")
+
+    async with httpx.AsyncClient(verify=False, timeout=20.0) as client:
+        await _remove_broker_person(client, broker_subject)
+        broker_admin = await _admin_token(client, BROKER)
+        if await _realm_accounts(
+            client,
+            admin_token=broker_admin,
+            email=LOCAL_MIGRANT_EMAIL,
+        ):
+            raise _fail("fixture_local_realm_cleanup_not_observed")
+    async with pool.acquire() as conn:  # type: ignore[union-attr]
+        await conn.execute("DELETE FROM vaults WHERE id = $1", owned_vault_id)
+        await conn.execute("DELETE FROM users WHERE id = $1", user_id)
+    if any(item.get("subject") == broker_subject for item in await _recorded_arrivals()):
+        raise _fail("fixture_local_realm_record_not_drained")
+
+    return {
+        "keycloak_account": "realm-local-password-no-federation",
+        "pre_transition_local_login": "same-akb-user-id",
+        "first_login": "membership_required-and-recorded",
+        "approval": "explicit-existing-user-id",
+        "second_login": "same-akb-user-id",
+        "legacy_akb_password_route": "disabled-in-sso-mode",
+        "legacy_password_hash": "preserved-for-controlled-rollback-only",
+        "pat_continuity": True,
+        "vault_and_acl_continuity": True,
+        "record_drained": True,
+    }
+
+
 async def main() -> None:
     control = KeycloakProviderControl(
         KeycloakAdminConfig(
@@ -1680,6 +2042,7 @@ async def main() -> None:
     # create, and the shape admission produces.
     seeding_dead_end = await _prove_seeding_is_a_dead_end()
     admission = await _prove_admission_chain(state)
+    local_realm_migration = await _prove_local_realm_migration(state)
 
     upstream_tokens = await _authorization_code_tokens(
         issuer=UPSTREAM_ISSUER,
@@ -1746,7 +2109,7 @@ async def main() -> None:
     print(
         json.dumps(
             {
-                "schema_version": 5,
+                "schema_version": 6,
                 "provider_type": enabled.provider_type,
                 "alias": enabled.alias,
                 "configure_state": configured.state,
@@ -1763,6 +2126,7 @@ async def main() -> None:
                 "authority_boundary": authority_boundary,
                 "seeding_dead_end": seeding_dead_end,
                 "admission_chain": admission,
+                "local_realm_migration": local_realm_migration,
                 "client_secret_exposed": False,
             },
             sort_keys=True,
