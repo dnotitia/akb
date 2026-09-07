@@ -1193,7 +1193,7 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
     workflow = WORKFLOW.read_text()
     assert "scripts/ci/e2e_runtime.py gate" in workflow
     assert "--scenario empty" in workflow
-    assert "frontend-runtime:" in workflow
+    assert "frontend-e2e:" in workflow
     assert "scripts/ci/e2e_runtime.py serve" in workflow
     assert "--with-frontend" in workflow
     assert "pnpm run build" in workflow
