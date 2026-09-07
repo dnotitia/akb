@@ -93,8 +93,8 @@ TABLE_RESP=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT" \
   -H "Authorization: Bearer $PAT" \
   -H 'Content-Type: application/json' \
   -d '{"name":"mcp_items","description":"MCP boundary table","columns":[{"name":"product","type":"text"}]}' 2>/dev/null)
-TABLE_ID=$(echo "$TABLE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
-[ -n "$TABLE_ID" ] && pass "REST table setup" || fail "REST table setup" "no id"
+TABLE_URI=$(echo "$TABLE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("uri",""))' 2>/dev/null)
+[ -n "$TABLE_URI" ] && pass "REST table setup" || fail "REST table setup" "no uri"
 
 REST_SQL=$(curl -sk "$BASE_URL/api/v1/tables/$VAULT" \
   -H "Authorization: Bearer $PAT" \
@@ -105,8 +105,8 @@ DOC_RESP=$(curl -sk -X POST "$BASE_URL/api/v1/documents" \
   -H "Authorization: Bearer $PAT" \
   -H 'Content-Type: application/json' \
   -d "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"REST Boundary Document\",\"content\":\"## Public\\n\\nREST boundary check.\",\"type\":\"note\",\"tags\":[]}" 2>/dev/null)
-DOC_ID=$(echo "$DOC_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("doc_id",""))' 2>/dev/null)
-[ -n "$DOC_ID" ] && pass "REST document setup" || fail "REST document setup" "no doc_id"
+DOC_URI=$(echo "$DOC_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("uri",""))' 2>/dev/null)
+[ -n "$DOC_URI" ] && pass "REST document setup" || fail "REST document setup" "no uri"
 
 PROFILE=$(curl -sk -X PATCH "$BASE_URL/api/v1/auth/me" \
   -H "Authorization: Bearer $PAT" \
@@ -115,8 +115,10 @@ PROFILE=$(curl -sk -X PATCH "$BASE_URL/api/v1/auth/me" \
 PROFILE_OK=$(echo "$PROFILE" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("updated",False))' 2>/dev/null)
 [ "$PROFILE_OK" = "True" ] && pass "REST profile update" || fail "REST profile update" "not updated"
 
-PUBLISH_RESP=$(curl -sk -X POST "$BASE_URL/api/v1/documents/$VAULT/$DOC_ID/publish" \
-  -H "Authorization: Bearer $PAT")
+PUBLISH_RESP=$(curl -sk -X POST "$BASE_URL/api/v1/publications/$VAULT/create" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"uri\":\"$DOC_URI\"}")
 PUB_SLUG=$(echo "$PUBLISH_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
 [ -n "$PUB_SLUG" ] && pass "REST publish" || fail "REST publish" "no slug"
 
@@ -124,7 +126,7 @@ PUB_TITLE=$(curl -sk "$BASE_URL/api/v1/public/$PUB_SLUG" \
   | python3 -c 'import sys,json; print(json.load(sys.stdin).get("title",""))' 2>/dev/null)
 [ "$PUB_TITLE" = "REST Boundary Document" ] && pass "REST public access" || fail "REST public access" "wrong title: $PUB_TITLE"
 
-curl -sk -X POST "$BASE_URL/api/v1/documents/$VAULT/$DOC_ID/unpublish" \
+curl -sk -X DELETE "$BASE_URL/api/v1/publications/$VAULT/$PUB_SLUG" \
   -H "Authorization: Bearer $PAT" >/dev/null 2>&1
 PUBLIC_STATUS=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$PUB_SLUG" 2>/dev/null)
 [ "$PUBLIC_STATUS" = "404" ] && pass "REST unpublish revokes public access" || fail "REST unpublish" "expected 404, got $PUBLIC_STATUS"
