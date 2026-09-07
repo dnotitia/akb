@@ -158,21 +158,24 @@ def _prepare_runtime(descriptor: RuntimeDescriptor, client: httpx.Client) -> Run
     return RuntimeContext(descriptor=descriptor, pat=pat, secrets=(*secrets, pat))
 
 
-@pytest.fixture
-def runtime_session(request: pytest.FixtureRequest) -> Iterator[RuntimeContext]:
+@pytest.fixture(scope="session")
+def runtime_descriptor(request: pytest.FixtureRequest) -> RuntimeDescriptor:
     source = request.config.getoption("--runtime-descriptor")
     if not source:
         pytest.fail("scenario=akb_list_vaults preparation: --runtime-descriptor is required")
     try:
         capture_manager = request.config.pluginmanager.getplugin("capturemanager")
-        descriptor = RuntimeDescriptor.from_json(_read_descriptor(source, capture_manager))
+        return RuntimeDescriptor.from_json(_read_descriptor(source, capture_manager))
     except Exception as exc:
         pytest.fail(f"scenario=akb_list_vaults preparation: {redact_error(exc)}")
 
+
+@pytest.fixture
+def runtime_session(runtime_descriptor: RuntimeDescriptor) -> Iterator[RuntimeContext]:
     client = httpx.Client(timeout=30.0)
     try:
         try:
-            context = _prepare_runtime(descriptor, client)
+            context = _prepare_runtime(runtime_descriptor, client)
         except Exception as exc:
             pytest.fail(f"scenario=akb_list_vaults preparation: {redact_error(exc)}")
         yield context

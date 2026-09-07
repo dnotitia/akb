@@ -76,6 +76,60 @@ def test_descriptor_stdin_read_is_compatible_with_pytest_capture(tmp_path: Path)
     assert result.returncode == 0, result.stderr
 
 
+def test_runtime_descriptor_stdin_is_reused_across_function_scoped_sessions(
+    tmp_path: Path,
+) -> None:
+    probe = tmp_path / "test_descriptor_reuse.py"
+    probe.write_text(
+        "import pytest\n"
+        "import tests.mcp_e2e.conftest as mcp_conftest\n"
+        "from tests.mcp_e2e.runtime import RuntimeContext\n"
+        "\n"
+        "pytest_plugins = ('tests.mcp_e2e.conftest',)\n"
+        "\n"
+        "def _fake_prepare(descriptor, client):\n"
+        "    return RuntimeContext(descriptor=descriptor, pat='akb_test_pat', secrets=('fixture-user', 'fixture-pass', 'akb_test_pat'))\n"
+        "\n"
+        "@pytest.fixture(autouse=True)\n"
+        "def patch_prepare(monkeypatch):\n"
+        "    monkeypatch.setattr(mcp_conftest, '_prepare_runtime', _fake_prepare)\n"
+        "\n"
+        "def test_first(runtime_session):\n"
+        "    assert runtime_session.descriptor.scenario == 'empty'\n"
+        "\n"
+        "def test_second(runtime_session):\n"
+        "    assert runtime_session.descriptor.scenario == 'empty'\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    tests_root = Path(__file__).resolve().parent
+    env["PYTHONPATH"] = f"{tests_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "tests.mcp_e2e.conftest",
+            str(probe),
+            "--runtime-descriptor",
+            "-",
+            "-q",
+            "--tb=short",
+        ],
+        cwd=tmp_path,
+        env=env,
+        input=json.dumps(_descriptor()),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2 passed" in result.stdout
+
+
 def test_preparation_failure_is_an_actual_pytest_failure(tmp_path: Path) -> None:
     descriptor = copy.deepcopy(_descriptor())
     descriptor["services"]["app"]["origin"] = "http://127.0.0.1:1"
