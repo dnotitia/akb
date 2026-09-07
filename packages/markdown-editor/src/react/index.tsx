@@ -6,7 +6,6 @@ import type { Editor } from '@tiptap/core'
 import { createMarkdownExtensions } from '../extensions.js'
 import { markdownCommands } from '../core.js'
 import type {
-  MarkdownAdapters,
   MarkdownCommands,
   MarkdownEditorConfig,
   MarkdownProfile,
@@ -18,7 +17,6 @@ export interface UseMarkdownEditorOptions {
   initialMarkdown?: string
   profile?: MarkdownProfile
   editable?: boolean
-  adapters?: MarkdownAdapters
   onChange?: MarkdownEditorConfig['onChange']
   onSlash?: (context: MarkdownSlashContext) => void
 }
@@ -122,7 +120,6 @@ function MarkdownSurface({ editor, editable, children, ...props }: MarkdownSurfa
 export interface MarkdownEditorProps extends Omit<MarkdownSurfaceProps, 'editor' | 'editable'> {
   markdown: string
   profile?: MarkdownProfile
-  adapters?: MarkdownAdapters
   onChange?: MarkdownEditorConfig['onChange']
   onSlash?: (context: MarkdownSlashContext) => void
 }
@@ -130,7 +127,6 @@ export interface MarkdownEditorProps extends Omit<MarkdownSurfaceProps, 'editor'
 export function MarkdownEditor({
   markdown,
   profile = 'preserve',
-  adapters,
   onChange,
   onSlash,
   ...props
@@ -139,7 +135,6 @@ export function MarkdownEditor({
     initialMarkdown: markdown,
     profile,
     editable: true,
-    adapters,
     onChange,
     onSlash,
   })
@@ -158,20 +153,17 @@ export function MarkdownEditor({
 export interface MarkdownViewerProps extends Omit<MarkdownSurfaceProps, 'editor' | 'editable'> {
   markdown: string
   profile?: MarkdownProfile
-  adapters?: MarkdownAdapters
 }
 
 export function MarkdownViewer({
   markdown,
   profile = 'preserve',
-  adapters,
   ...props
 }: MarkdownViewerProps) {
   const editor = useMarkdownEditor({
     initialMarkdown: markdown,
     profile,
     editable: false,
-    adapters,
   })
 
   useEffect(() => {

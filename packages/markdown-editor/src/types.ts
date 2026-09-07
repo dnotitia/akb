@@ -53,7 +53,6 @@ export interface MarkdownEditorConfig extends MarkdownParseOptions {
   initialMarkdown?: string
   editable?: boolean
   element?: EditorOptions['element']
-  adapters?: MarkdownAdapters
   onChange?: (markdown: string, editor: Editor) => void
   onSlash?: (context: MarkdownSlashContext) => void
 }
