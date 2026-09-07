@@ -28,6 +28,7 @@ CURATED_SUITES: tuple[str, ...] = (
     "test_mcp_e2e.sh",
     "test_edit_e2e.sh",
     "test_security_edge_e2e.sh",
+    "test_vault_name_conflict_e2e.sh",
     "test_pg_rbac_e2e.sh",
     "test_vault_scope_e2e.sh",
     "test_vault_scope_sql_e2e.sh",

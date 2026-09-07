@@ -7,6 +7,7 @@ import * as api from "@/lib/api";
 
 vi.mock("@/lib/api", () => ({
   listVaultTemplates: vi.fn(),
+  listVaults: vi.fn(),
   createVault: vi.fn(),
 }));
 
@@ -48,6 +49,7 @@ async function openTemplateMenu() {
 describe("VaultNewPage template selection", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    (api.listVaults as any).mockResolvedValue({ vaults: [] });
     (api.createVault as any).mockResolvedValue({ vault_id: "v1", name: "x" });
   });
 

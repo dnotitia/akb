@@ -19,7 +19,7 @@ import asyncpg
 import frontmatter
 import pytest
 
-from app.exceptions import ConflictError, NotFoundError, ValidationError
+from app.exceptions import ConflictError, NotFoundError, ValidationError, VaultNameUnavailableError
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.native_revision_repo import NativeRevisionRepository
 from app.services.document_service import VAULT_SKILL_SEED_TEMPLATE
@@ -938,7 +938,10 @@ async def test_native_vault_create_concurrent_same_name_returns_one_conflict(mon
         )
 
         assert len([result for result in outcomes if isinstance(result, str)]) == 1
-        assert len([result for result in outcomes if isinstance(result, ConflictError)]) == 1
+        conflicts = [result for result in outcomes if isinstance(result, VaultNameUnavailableError)]
+        assert len(conflicts) == 1
+        assert conflicts[0].code == "vault_name_unavailable"
+        assert str(conflicts[0]) == "Vault name is unavailable. Choose a different name."
         async with pool.acquire() as conn:
             winner = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", vault_name)
             assert winner is not None
