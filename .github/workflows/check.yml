@@ -36,11 +36,12 @@ jobs:
           package_json_file: frontend/package.json
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '22.19.0'
           cache: pnpm
           cache-dependency-path: |
             frontend/pnpm-lock.yaml
             packages/akb-client/pnpm-lock.yaml
+            packages/markdown-editor/pnpm-lock.yaml
       - name: Install stdio proxy deps
         working-directory: packages/akb-mcp-client
         run: npm ci
@@ -58,6 +59,12 @@ jobs:
         # scripts, so a plain frozen install is enough for `pnpm run build`
         # (tsc emit) and `pnpm exec vitest run` in scripts/check.sh.
         run: pnpm install --frozen-lockfile
+      - name: Install Markdown editor deps
+        working-directory: packages/markdown-editor
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Install Chromium for Markdown editor conformance
+        working-directory: packages/markdown-editor
+        run: pnpm exec playwright install --with-deps chromium
 
       # ── Single entry point so CI and local pre-commit stay in sync ──
       - name: Run scripts/check.sh

@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.vite/
+coverage/
+test-results/
+playwright-report/
+.artifacts/
