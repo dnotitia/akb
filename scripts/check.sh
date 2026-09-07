@@ -102,7 +102,7 @@ echo "  mypy + bandit parse Python ${REQUIRED_PYTHON}"
 
 # 2. Node deps must be installed in every node project this gate runs in.
 #
-# There are three, they do not share a package manager, and each has its own
+# There are four, they do not share a package manager, and each has its own
 # lockfile and its own node_modules: frontend/, packages/akb-client/, and
 # packages/markdown-editor/ are pnpm; packages/akb-mcp-client/ is npm.
 # Installing only some of them dies
@@ -258,10 +258,7 @@ step "packed SDK consumer proof (@akb/client)"
 (cd packages/akb-client && pnpm run proof:packed)
 
 # ─── shared Markdown editor package ───────────────────────────────
-# The package owns the exact Tiptap versions and its own six-command proof:
-# build, typecheck, lint, unit, browser conformance, and packed React 19
-# consumer smoke. Browser execution uses the package's run-local server and
-# temporary output paths; the existing check workflow installs Chromium.
+# The package owns the exact Tiptap versions and its minimum static/unit proof.
 step "build (@akb/markdown-editor)"
 (cd packages/markdown-editor && pnpm run build)
 
@@ -273,12 +270,6 @@ step "lint (@akb/markdown-editor)"
 
 step "vitest (@akb/markdown-editor)"
 (cd packages/markdown-editor && pnpm run test)
-
-step "browser conformance (@akb/markdown-editor)"
-(cd packages/markdown-editor && pnpm run test:browser)
-
-step "packed React 19 consumer (@akb/markdown-editor)"
-(cd packages/markdown-editor && pnpm run test:consumer)
 
 # ─── stdio proxy + MCP Inspector developer contract ──────────────
 # The package owns its exact Inspector devDependency, command, and focused

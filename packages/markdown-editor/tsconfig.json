@@ -13,8 +13,8 @@
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
     "forceConsistentCasingInFileNames": true,
-    "types": ["node", "vitest/globals"]
+    "types": ["vitest/globals"]
   },
-  "include": ["src", "test", "scripts", "vite.config.ts", "playwright.config.ts"],
-  "exclude": ["dist", "node_modules", ".artifacts", "consumer"]
+  "include": ["src", "test"],
+  "exclude": ["dist", "node_modules"]
 }

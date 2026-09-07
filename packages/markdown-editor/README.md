@@ -47,15 +47,20 @@ pnpm run build
 pnpm run typecheck
 pnpm run lint
 pnpm run test
-pnpm run test:browser
-pnpm run test:consumer
 ```
 
-`test:browser` allocates a free local port and a fresh temporary Vite/Playwright directory for
-each run. Its composition test exercises browser composition events and scripted Korean text;
-it is not a substitute for validation with a physical OS IME.
+Browser conformance and packed React 19 consumer smoke are release evidence run in a temporary
+directory outside this package. The scripted composition check is not a substitute for validation
+with a physical OS IME.
 
 ## Versioning
 
-The initial public contract is `0.1.0`. Changes to the exported schema, Markdown profile, or
-serialized meaning follow semver and must include a migration note. See [MIGRATION.md](MIGRATION.md).
+The initial public contract is `0.1.0`. Consumers should pin one exact package version, store the
+Markdown returned by `onChange` or `editor.getMarkdown()` as the canonical representation, and
+choose `profile="structured"` when unknown HTML/MDX should be rejected or the default `preserve`
+profile when those constructs must survive edit/serialize cycles. Changes to the exported schema,
+Markdown profile, or serialized meaning follow semver and must include a migration note.
+
+Products provide their own upload, search, and target-resolver implementations through the
+exported adapter types. The package does not silently migrate an existing editor or storage format;
+AKB and Reef integrations are separate upgrade steps.

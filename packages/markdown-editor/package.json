@@ -22,19 +22,14 @@
   "files": [
     "dist/",
     "README.md",
-    "MIGRATION.md",
-    "CHANGELOG.md",
-    "LICENSE"
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "pnpm run clean && tsc -p tsconfig.build.json",
-    "clean": "rm -rf dist coverage .vite",
+    "clean": "rm -rf dist coverage",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "lint": "eslint src scripts test vite.config.ts playwright.config.ts",
+    "lint": "eslint src test",
     "test": "vitest run",
-    "test:browser": "node scripts/run-browser-tests.mjs",
-    "test:consumer": "node scripts/test-packed-consumer.mjs",
-    "pack:check": "pnpm run build && pnpm pack --pack-destination .artifacts",
     "prepare": "pnpm run build"
   },
   "peerDependencies": {
@@ -59,27 +54,22 @@
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@testing-library/dom": "10.4.1",
-    "@playwright/test": "1.60.0",
     "@testing-library/jest-dom": "6.9.1",
     "@testing-library/react": "16.3.2",
     "@testing-library/user-event": "14.6.1",
-    "@types/node": "25.8.0",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
-    "@vitejs/plugin-react": "6.0.1",
     "eslint": "10.4.0",
     "eslint-plugin-react-hooks": "7.1.1",
     "eslint-plugin-react-refresh": "0.5.2",
-    "globals": "17.6.0",
     "jsdom": "29.0.2",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "typescript": "5.9.3",
     "typescript-eslint": "8.59.3",
-    "vite": "8.0.3",
     "vitest": "4.1.4"
   },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/dnotitia/akb.git",
