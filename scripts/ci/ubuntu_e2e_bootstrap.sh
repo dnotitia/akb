@@ -96,7 +96,7 @@ printf '%s\n' 'net.ipv4.tcp_mtu_probing = 2' \
   || die "could not apply TCP MTU probing configuration"
 SYSCTL_VALUE=$("${SUDO[@]}" sysctl -n net.ipv4.tcp_mtu_probing) \
   || die "could not verify TCP MTU probing configuration"
-[ "$SYSCTL_VALUE" = "1" ] \
+[ "$SYSCTL_VALUE" = "2" ] \
   || die "TCP MTU probing verification failed (found $SYSCTL_VALUE)"
 
 "${SUDO[@]}" apt-get update \

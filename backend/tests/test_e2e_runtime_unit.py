@@ -1215,6 +1215,7 @@ def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
     assert ubuntu_check < sysctl_persist < apt_update
     assert "net.ipv4.tcp_mtu_probing = 2" in text
     assert 'sysctl --load "$SYSCTL_CONF"' in text
+    assert '[ "$SYSCTL_VALUE" = "2" ]' in text
     assert "TCP MTU probing configuration" in text
     assert "--scenario empty" in text
     assert "app-installation-lifecycle" in text
