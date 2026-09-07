@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "path";
@@ -9,9 +9,66 @@ const target = process.env.AKB_FRONTEND_BACKEND_URL || "http://localhost:8000";
 const cacheDir = process.env.AKB_FRONTEND_CACHE_DIR;
 const isHttps = false;
 
+function mockControlPlugin(): Plugin {
+  return {
+    name: "akb-mock-control",
+    configureServer(server) {
+      if (process.env.VITE_AKB_TEST_MODE !== "mock") return;
+      server.middlewares.use((request, response, next) => {
+        const pathname = new URL(request.url || "/", "http://localhost").pathname;
+        if (!pathname.startsWith("/__akb_mock__/")) {
+          next();
+          return;
+        }
+
+        const origin = `http://${request.headers.host || "127.0.0.1:4173"}`;
+        response.setHeader("Content-Type", "application/json");
+        if (pathname === "/__akb_mock__/health" && request.method === "GET") {
+          response.end(JSON.stringify({ status: "ready", mode: "mock" }));
+          return;
+        }
+        if (pathname === "/__akb_mock__/discover" && request.method === "GET") {
+          response.end(
+            JSON.stringify({
+              schema_version: 2,
+              status: "ready",
+              mode: "mock",
+              scenario: "empty",
+              services: {
+                web: {
+                  origin,
+                  health: { method: "GET", url: `${origin}/__akb_mock__/health` },
+                  discovery: { method: "GET", url: `${origin}/__akb_mock__/discover` },
+                  reset: {
+                    method: "POST",
+                    url: `${origin}/__akb_mock__/reset`,
+                    body: { scenario: "empty" },
+                  },
+                },
+              },
+              access: { login: { method: "browser", url: `${origin}/auth` } },
+              mock: {
+                worker_url: `${origin}/mockServiceWorker.js`,
+                unhandled_api: "error",
+              },
+            }),
+          );
+          return;
+        }
+        if (pathname === "/__akb_mock__/reset" && request.method === "POST") {
+          response.end(JSON.stringify({ status: "ready", mode: "mock", scenario: "empty" }));
+          return;
+        }
+        response.statusCode = 404;
+        response.end(JSON.stringify({ error: "mock_control_not_found" }));
+      });
+    },
+  };
+}
+
 export default defineConfig(() => {
   return {
-    plugins: [react(), tailwindcss()],
+    plugins: [react(), tailwindcss(), mockControlPlugin()],
     resolve: {
       alias: {
         "@": path.resolve(__dirname, "./src"),

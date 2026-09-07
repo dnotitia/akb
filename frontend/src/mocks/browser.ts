@@ -23,37 +23,11 @@ async function jsonBody(request: Request): Promise<Record<string, unknown>> {
 }
 
 const handlers = [
-  http.get("/__akb_mock__/health", () =>
-    HttpResponse.json({ status: "ready", mode: "mock" }),
-  ),
-  http.get("/__akb_mock__/discover", () =>
-    HttpResponse.json({
-      schema_version: 2,
-      mode: "mock",
-      status: "ready",
-      scenario: "empty",
-      services: {
-        web: {
-          origin: window.location.origin,
-          health: { method: "GET", url: "/__akb_mock__/health" },
-          discovery: { method: "GET", url: "/__akb_mock__/discover" },
-          reset: {
-            method: "POST",
-            url: "/__akb_mock__/reset",
-            body: { scenario: "empty" },
-          },
-        },
-      },
-      credentials: { required: false, mode: "mock" },
-      access: { login: { method: "browser", path: "/auth" } },
-      mock: { worker_url: "/mockServiceWorker.js", unhandled_api: "error" },
-    }),
-  ),
+  http.get(`${API}/auth/config`, () => HttpResponse.json(localAuthConfig)),
   http.post("/__akb_mock__/reset", () => {
     resetState();
     return HttpResponse.json({ status: "ready", mode: "mock", scenario: "empty" });
   }),
-  http.get(`${API}/auth/config`, () => HttpResponse.json(localAuthConfig)),
   http.get(`${API}/auth/me`, () => HttpResponse.json(user)),
   http.post(`${API}/auth/register`, async ({ request }) => {
     const body = await jsonBody(request);
@@ -133,7 +107,7 @@ const worker = setupWorker(...handlers);
 export async function startMockWorker() {
   resetState();
   await worker.start({
-    onUnhandledRequest: "error",
+    onUnhandledRequest: "bypass",
     serviceWorker: { url: "/mockServiceWorker.js" },
   });
 }

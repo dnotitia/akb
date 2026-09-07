@@ -51,12 +51,15 @@ test("signup → land in shell → profile edit round-trip", async ({ page }) =>
   });
 
   if (process.env.AKB_FE_E2E_MODE === "mock") {
-    const resetStatus = await page.evaluate(async () => {
+    const resetResult = await page.evaluate(async () => {
       const response = await fetch("/__akb_mock__/reset", { method: "POST" });
-      return response.status;
+      const me = await fetch("/api/v1/auth/me", { cache: "no-store" }).then((result) => result.json());
+      return { status: response.status, me };
     });
-    expect(resetStatus).toBe(200);
-    await page.reload();
+    expect(resetResult.status).toBe(200);
+    expect(resetResult.me.display_name).toBe("JY Kim");
+    await page.goto("/");
+    await page.goto("/settings?tab=profile");
     await expect(page.getByLabel("DISPLAY NAME")).toHaveValue("JY Kim", {
       timeout: 5_000,
     });
