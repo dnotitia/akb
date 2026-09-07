@@ -31,6 +31,7 @@ import asyncio
 import hashlib
 import logging
 import re
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Literal
@@ -311,6 +312,9 @@ class PgvectorStore:
                 """
             )
         else:  # posting
+            # Fresh databases can score postings without heap reads. Existing
+            # tables are intentionally not rebuilt during startup; see the
+            # explicit concurrent-index maintenance SQL for upgrades.
             await conn.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS "{self._schema}".chunks (
@@ -332,7 +336,7 @@ class PgvectorStore:
                     term_id   BIGINT NOT NULL,
                     chunk_id  UUID NOT NULL REFERENCES "{self._schema}".chunks(chunk_id) ON DELETE CASCADE,
                     weight    REAL NOT NULL,
-                    PRIMARY KEY (term_id, chunk_id)
+                    PRIMARY KEY (term_id, chunk_id) INCLUDE (weight)
                 )
                 """
             )
@@ -370,13 +374,13 @@ class PgvectorStore:
         await conn.execute(
             f"""
             CREATE INDEX IF NOT EXISTS idx_vi_chunks_source_id
-                ON "{self._schema}".chunks (source_id)
+                ON "{self._schema}".chunks (source_id) INCLUDE (chunk_id)
             """
         )
         await conn.execute(
             f"""
             CREATE INDEX IF NOT EXISTS idx_vi_chunks_vault_id
-                ON "{self._schema}".chunks (vault_id)
+                ON "{self._schema}".chunks (vault_id) INCLUDE (chunk_id)
             """
         )
         # HNSW for dense KNN, partial on `WHERE dense IS NOT NULL` so
@@ -603,6 +607,13 @@ class PgvectorStore:
         vault_ids: list[str] | None = None,
     ) -> list[VectorHit]:
         del query_text  # debug-only on this driver; keep signature parity
+        started = time.perf_counter()
+
+        # None means no filter; an explicitly empty authorized set means no
+        # results, never an expensive unscoped scan.
+        if source_ids == [] or vault_ids == []:
+            return []
+
         await self.ensure_collection()
 
         has_dense = query_dense is not None and len(query_dense) > 0
@@ -632,27 +643,39 @@ class PgvectorStore:
             filter_uuids = None
             filter_col = "source_id"  # unused when filter_uuids is None
         pool = await self._pool()
+        timings: dict[str, float] = {}
 
         async def _dense_leg() -> list[str]:
             assert query_dense is not None  # gated by has_dense in caller; for mypy
-            async with pool.acquire() as c:
-                await self._ensure_codec(c)
-                return await self._search_dense(
-                    c, query_dense=query_dense,
-                    filter_uuids=filter_uuids, filter_col=filter_col,
-                    limit=prefetch_per_leg,
-                )
+            begin = time.perf_counter()
+            try:
+                async with pool.acquire() as c:
+                    timings["dense_wait"] = time.perf_counter() - begin
+                    await self._ensure_codec(c)
+                    return await self._search_dense(
+                        c, query_dense=query_dense,
+                        filter_uuids=filter_uuids, filter_col=filter_col,
+                        limit=prefetch_per_leg,
+                    )
+            finally:
+                timings["dense"] = time.perf_counter() - begin
 
         async def _sparse_leg() -> list[str]:
-            async with pool.acquire() as c:
-                await self._ensure_codec(c)
-                return await self._search_sparse(
-                    c, terms=list(query_sparse_indices),
-                    weights=list(query_sparse_values),
-                    filter_uuids=filter_uuids, filter_col=filter_col,
-                    limit=prefetch_per_leg,
-                )
+            begin = time.perf_counter()
+            try:
+                async with pool.acquire() as c:
+                    timings["sparse_wait"] = time.perf_counter() - begin
+                    await self._ensure_codec(c)
+                    return await self._search_sparse(
+                        c, terms=list(query_sparse_indices),
+                        weights=list(query_sparse_values),
+                        filter_uuids=filter_uuids, filter_col=filter_col,
+                        limit=prefetch_per_leg,
+                    )
+            finally:
+                timings["sparse"] = time.perf_counter() - begin
 
+        succeeded = False
         try:
             # Two legs run in parallel — same PG, different conns. asyncpg
             # serialises queries on a single conn, so the two legs need
@@ -681,17 +704,36 @@ class PgvectorStore:
                 scoring = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)[:limit]
                 top_ids = [cid for cid, _ in scoring]
 
+            payload_started = time.perf_counter()
             async with pool.acquire() as c:
                 await self._ensure_codec(c)
                 rows = await self._fetch_payloads(c, top_ids)
+            timings["payload"] = time.perf_counter() - payload_started
             by_id = {r["chunk_id"]: r for r in rows}
-            return [
+            hits = [
                 _row_to_hit(by_id[cid], score=score)
                 for cid, score in scoring
                 if cid in by_id
             ]
+            succeeded = True
+            return hits
         except asyncpg.PostgresError as e:
             raise VectorStoreUnavailable(f"search failed: {e}") from e
+        finally:
+            # No query text, source IDs, content, or credentials in diagnostics.
+            # Legs overlap; their durations include pool wait and are not additive.
+            logger.info(
+                "hybrid_timing ok=%s filter=%s filter_count=%d terms=%d "
+                "dense_ms=%.2f dense_wait_ms=%.2f sparse_ms=%.2f sparse_wait_ms=%.2f "
+                "payload_ms=%.2f total_ms=%.2f",
+                succeeded, filter_col if filter_uuids is not None else "none",
+                len(filter_uuids) if filter_uuids is not None else 0,
+                len(query_sparse_indices),
+                *(timings.get(key, 0.0) * 1000 for key in (
+                    "dense", "dense_wait", "sparse", "sparse_wait", "payload",
+                )),
+                (time.perf_counter() - started) * 1000,
+            )
 
     async def _search_dense(
         self,
