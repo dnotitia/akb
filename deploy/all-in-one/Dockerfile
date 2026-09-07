@@ -41,6 +41,7 @@ RUN npx vite build
 
 # ---------- final image ----------
 FROM pgvector/pgvector:pg16
+ARG TARGETARCH
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/venv/bin:$PATH \
@@ -57,9 +58,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # MinIO server + mc client (bucket bootstrap)
-RUN curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio \
+RUN curl -fsSL https://dl.min.io/server/minio/release/linux-${TARGETARCH}/minio \
         -o /usr/local/bin/minio && chmod +x /usr/local/bin/minio && \
-    curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc \
+    curl -fsSL https://dl.min.io/client/mc/release/linux-${TARGETARCH}/mc \
         -o /usr/local/bin/mc && chmod +x /usr/local/bin/mc
 
 # Backend requires Python >=3.14 (backend/pyproject.toml). The pgvector
@@ -92,8 +93,8 @@ RUN rm -rf /app/backend/config
 COPY --from=frontend-builder /src/dist /var/www/akb
 
 # All-in-one bundle config + supervisord + nginx + entrypoint.
-COPY deploy/all-in-one/app.yaml /etc/akb/app.yaml
-COPY deploy/all-in-one/secret.yaml.template /etc/akb/secret.yaml.template
+COPY deploy/all-in-one/app.yaml /opt/akb/app.yaml
+COPY deploy/all-in-one/configure.py /usr/local/bin/akb-demo-configure.py
 COPY deploy/all-in-one/supervisord.conf /etc/supervisor/conf.d/akb.conf
 COPY deploy/all-in-one/nginx.conf /etc/nginx/sites-available/akb
 COPY deploy/all-in-one/entrypoint.sh /usr/local/bin/entrypoint.sh
@@ -108,5 +109,7 @@ RUN mkdir -p /data/vaults /data/minio /data/pgsql /var/log/akb /var/lib/akb && \
     chown -R www-data:www-data /var/www/akb
 
 EXPOSE 8080
+HEALTHCHECK --interval=15s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8080/readyz >/dev/null && /opt/venv/bin/python -m app.worker_health
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["/usr/bin/supervisord", "-n", "-c", "/etc/supervisor/supervisord.conf"]

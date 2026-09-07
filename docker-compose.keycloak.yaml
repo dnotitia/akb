@@ -24,6 +24,11 @@
 #   keycloak_client_secret: "local-akb-dev-secret"
 #   keycloak_admin_client_secret: "local-akb-admin-dev-secret"
 #   sso_browser_session_encryption_key: <independent 32-byte base64url value>
+#   sso_session_epoch: <generate and persist an installation UUID>
+#
+# This development realm has no akb-sso-manager credential. Provider control
+# is delegated; add a separate realm-scoped management client if testing AKB's
+# provider-management UI. Never use the realm bootstrap administrator there.
 #
 # Pre-bind the imported product-admin fixture before opening
 # http://localhost:3000/admin (password: product-admin-password):
@@ -72,7 +77,7 @@
 
 services:
   keycloak:
-    image: quay.io/keycloak/keycloak:26.0
+    image: quay.io/keycloak/keycloak:26.7.0@sha256:0f198be292568439d700cdbfb893e69a6009bb43a94a06a945b1d3d506c76b13
     command: ["start-dev", "--import-realm"]
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin

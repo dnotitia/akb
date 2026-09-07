@@ -322,6 +322,10 @@ any deployment. Process composition is the narrow exception:
 deployment container. The Kubernetes base owns those two operational values;
 business, auth, storage, and provider settings remain in the YAML files.
 
+Compose also runs the API and worker separately. See the
+[local deployment guide](deploy/compose/README.md) for existing-volume upgrades,
+configuration changes, and remote-access URLs.
+
 Ordinary registration always creates a non-admin account, including on an
 empty database. Administrator bootstrap is available only through the
 operator CLI; there is no unauthenticated HTTP bootstrap endpoint. The CLI
@@ -612,7 +616,7 @@ akb/
 │   └── k8s/
 │       ├── *.yaml            # Standalone AKB + PostgreSQL resources
 │       └── standalone-sso/   # Standalone plus owned Keycloak and its database
-└── docker-compose.yaml       # Local stack (PG + MinIO + backend + frontend)
+└── docker-compose.yaml       # Local stack (PG + MinIO + API + worker + frontend)
 ```
 
 ## Tech Stack

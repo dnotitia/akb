@@ -16,7 +16,7 @@ and optional SSO components remain isolated as separate workloads.
 ## Quick start (pre-built image)
 
 ```bash
-docker run --rm -p 8080:8080 dnseahorse/akb
+docker run --rm --stop-timeout 120 -p 8080:8080 dnseahorse/akb
 ```
 
 | What                   | URL                                                 |
@@ -34,13 +34,13 @@ The container prints the demo `DEMO_PAT` on first boot — grep
 
 ```bash
 docker build -f deploy/all-in-one/Dockerfile -t dnseahorse/akb .
-docker run --rm -p 8080:8080 dnseahorse/akb
+docker run --rm --stop-timeout 120 -p 8080:8080 dnseahorse/akb
 ```
 
 ## With embeddings + search enabled
 
 ```bash
-docker run --rm -p 8080:8080 \
+docker run --rm --stop-timeout 120 -p 8080:8080 \
     -e EMBED_BASE_URL=https://api.openai.com/v1 \
     -e EMBED_MODEL=text-embedding-3-small \
     -e EMBED_DIMENSIONS=1536 \
@@ -58,14 +58,50 @@ MinIO bucket, generated secrets + PAT) persist across restarts.
 Pin the PAT (handy when registering the container as a Glama Connector):
 
 ```bash
-docker run --rm -p 8080:8080 \
+docker run --rm --stop-timeout 120 -p 8080:8080 \
     -e DEMO_PAT=akb_my-fixed-token-for-glama \
     dnseahorse/akb
 ```
 
 Any of `DEMO_USERNAME`, `DEMO_EMAIL`, `DEMO_PASSWORD`, `DEMO_VAULT`,
-`DEMO_PAT` can be supplied; missing values are auto-generated on first
-boot and persisted in `/var/lib/akb/state.env`.
+`DEMO_PAT` can be supplied on first installation; missing values are generated
+and persisted in `/var/lib/akb/state.env`. An existing state file always wins
+on restart, so a new environment value cannot silently rotate credentials.
+
+## Runtime configuration
+
+API and worker consume the same `/etc/akb/app.yaml`, `secret.yaml` and persistent
+local-session keyset, matching the Kubernetes runtime contract. Optional files
+mounted read-only at `/etc/akb-overrides/app.yaml` and
+`/etc/akb-overrides/secret.yaml` accept the current backend setting names,
+including newer settings without adding a corresponding environment variable.
+Precedence is demo defaults, legacy `EMBED_*`/`LLM_*`/`PUBLIC_BASE_URL`
+environment overrides, then mounted YAML. Unknown fields fail backend validation.
+Do not place credentials in app.yaml. Override files are partial mappings.
+
+For example, mount a directory with `app.yaml` containing your `embed_model`,
+`embed_dimensions`, `rerank_base_url` or `search_prefetch` settings and
+`secret.yaml` containing your provider API keys:
+
+```bash
+docker run --rm --stop-timeout 120 -p 8080:8080 \
+  -v "$PWD/demo-config:/etc/akb-overrides:ro" \
+  -v akb-data:/data -v akb-state:/var/lib/akb \
+  dnseahorse/akb
+```
+
+The bundled database, MinIO credentials/bucket, Redis endpoint, Git path and
+local-auth signer paths are owned by the demo bootstrap; conflicting overrides
+are rejected. Use Compose or Kubernetes for externally managed infrastructure
+and SSO. `s3_public_url` defaults to `public_base_url`, so downloads use the
+public nginx endpoint rather than the container's internal MinIO address.
+For remote access, configure the actual public origin.
+
+API and worker have separate processes and 45-second shutdown windows.
+`tokenizer_processes` in app.yaml controls the worker pool; the API has one
+query tokenizer. Supervisor automatically restarts either process after exit.
+Allow 120 seconds for Docker to stop the entire supervisor bundle and its database.
+The image health check verifies both API readiness and the worker heartbeat.
 
 ## What runs inside
 
@@ -73,6 +109,7 @@ boot and persisted in `/var/lib/akb/state.env`.
 |------------|-----------|-------------|
 | nginx      | 8080      | supervisord |
 | backend    | 8000      | supervisord |
+| worker     | –         | supervisord |
 | postgres   | 5432      | supervisord |
 | redis      | 6379      | supervisord |
 | minio      | 9000/9001 | supervisord |
