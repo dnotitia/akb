@@ -146,7 +146,7 @@ describe("SearchPage · semantic (dense) mode", () => {
     });
     renderAt("/search?q=postgres");
     await waitFor(() =>
-      expect(mockedSearch).toHaveBeenCalledWith("postgres", [], 25),
+      expect(mockedSearch).toHaveBeenCalledWith("postgres", [], 25, expect.any(Object)),
     );
     expect(await screen.findByText("PostgreSQL tuning")).toBeTruthy();
     expect(screen.getByText("Top match")).toBeTruthy();
@@ -217,7 +217,7 @@ describe("SearchPage · semantic (dense) mode", () => {
     const u = userEvent.setup();
     await u.click(screen.getByRole("button", { name: "deployment guide" }));
     await waitFor(() =>
-      expect(mockedSearch).toHaveBeenCalledWith("deployment guide", [], 25),
+      expect(mockedSearch).toHaveBeenCalledWith("deployment guide", [], 25, expect.any(Object)),
     );
 
     await u.click(screen.getByRole("button", { name: "Clear search query" }));
@@ -260,7 +260,7 @@ describe("SearchPage · semantic (dense) mode", () => {
 
     await user.click(screen.getByRole("button", { name: /worker isolation/i }));
     await waitFor(() =>
-      expect(mockedSearch).toHaveBeenCalledWith("worker isolation", [], 25),
+      expect(mockedSearch).toHaveBeenCalledWith("worker isolation", [], 25, expect.any(Object)),
     );
   });
 });
@@ -356,6 +356,6 @@ describe("SearchPage · mode toggle re-issues the correct call", () => {
       .find((b) => b.hasAttribute("aria-pressed"));
     if (!toggle) throw new Error("Literal toggle button not found");
     await u.click(toggle);
-    await waitFor(() => expect(mockedGrep).toHaveBeenCalledWith("k8s", []));
+    await waitFor(() => expect(mockedGrep).toHaveBeenCalledWith("k8s", [], 20, expect.objectContaining({ regex: false, case_sensitive: false })));
   });
 });

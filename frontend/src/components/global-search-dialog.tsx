@@ -101,7 +101,6 @@ export function GlobalSearchDialog() {
   const location = useLocation();
   const inputRef = useRef<HTMLInputElement>(null);
   const requestId = useRef(0);
-  const activeSourceRef = useRef<SearchSourceFilter>("all");
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<GlobalSearchResult[]>([]);
@@ -121,12 +120,7 @@ export function GlobalSearchDialog() {
     },
     { document: 0, table: 0, file: 0 } as Record<SearchSource, number>,
   );
-  const visibleResults =
-    activeSource === "all"
-      ? results
-      : results.filter(
-          (result) => (result.source_type || "document") === activeSource,
-        );
+  const visibleResults = loading || error ? [] : results;
   const hasRecentSearches = recentSearches.length > 0;
   const hasRecentDocuments = recentDocuments.length > 0;
 
@@ -184,22 +178,15 @@ export function GlobalSearchDialog() {
     setResults([]);
     setError(null);
     setActiveIndex(-1);
+    setLoading(true);
     const timer = window.setTimeout(() => {
-      setLoading(true);
-      void searchDocs(normalizedQuery, [], 12)
+      void searchDocs(normalizedQuery, [], 12, { source_type: activeSource === "all" ? undefined : activeSource })
         .then((response) => {
           if (currentRequest !== requestId.current) return;
           const nextResults = (response.results || []) as GlobalSearchResult[];
-          const selectedSource = activeSourceRef.current;
-          const nextVisibleResults =
-            selectedSource === "all"
-              ? nextResults
-              : nextResults.filter(
-                  (result) =>
-                    (result.source_type || "document") === selectedSource,
-                );
           setResults(nextResults);
-          setActiveIndex(nextVisibleResults.length > 0 ? 0 : -1);
+          setActiveIndex(nextResults.length > 0 ? 0 : -1);
+          if (response.degraded) setError("Search is incomplete; the retrieval service is temporarily unavailable. Please retry.");
         })
         .catch((caught: unknown) => {
           if (currentRequest !== requestId.current) return;
@@ -213,7 +200,7 @@ export function GlobalSearchDialog() {
     }, 220);
 
     return () => window.clearTimeout(timer);
-  }, [normalizedQuery, open, retryKey]);
+  }, [normalizedQuery, open, retryKey, activeSource]);
 
   function rememberGlobalSearch() {
     if (!currentUserId || !normalizedQuery) return;
@@ -323,7 +310,7 @@ export function GlobalSearchDialog() {
                 visibleResults.length > 0 ? "global-search-results" : undefined
               }
               aria-activedescendant={
-                activeIndex >= 0 ? `global-search-result-${activeIndex}` : undefined
+                activeIndex >= 0 && activeIndex < visibleResults.length ? `global-search-result-${activeIndex}` : undefined
               }
               autoComplete="off"
               spellCheck={false}
@@ -385,7 +372,6 @@ export function GlobalSearchDialog() {
                       : label
                   }
                   onClick={() => {
-                    activeSourceRef.current = key;
                     setActiveSource(key);
                     setActiveIndex(
                       key === "all"
@@ -604,40 +590,9 @@ export function GlobalSearchDialog() {
               <p className="mt-1 text-xs text-foreground-muted">
                 Try fewer words or open advanced search for exact matching.
               </p>
+              {activeSource !== "all" && <Button type="button" variant="outline" className="mt-3" onClick={() => setActiveSource("all")}>Show all results</Button>}
             </div>
           )}
-
-          {normalizedQuery &&
-            !loading &&
-            !error &&
-            results.length > 0 &&
-            visibleResults.length === 0 && (
-              <div className="flex min-h-56 flex-col items-center justify-center px-5 text-center">
-                <Search className="h-5 w-5 text-foreground-muted" aria-hidden />
-                <p className="mt-3 text-sm font-semibold text-foreground">
-                  No{" "}
-                  {SOURCE_FILTERS.find(
-                    (filter) => filter.key === activeSource,
-                  )?.label.toLowerCase()} in these matches
-                </p>
-                <p className="mt-1 text-xs text-foreground-muted">
-                  The query has results in another content type.
-                </p>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="mt-3"
-                  onClick={() => {
-                    activeSourceRef.current = "all";
-                    setActiveSource("all");
-                    setActiveIndex(0);
-                  }}
-                >
-                  Show all results
-                </Button>
-              </div>
-            )}
 
           {visibleResults.length > 0 && !loading && !error && (
             <section aria-labelledby="global-search-results-heading">
@@ -728,7 +683,10 @@ export function GlobalSearchDialog() {
             onClick={() => {
               rememberGlobalSearch();
               setOpen(false);
-              navigate(normalizedQuery ? `/search?q=${encodeURIComponent(normalizedQuery)}` : "/search");
+              const params = new URLSearchParams();
+              if (normalizedQuery) params.set("q", normalizedQuery);
+              if (activeSource !== "all") params.set("source", activeSource);
+              navigate(`/search?${params}`);
             }}
             className="inline-flex h-8 items-center gap-1.5 rounded-[var(--radius-sm)] px-2 text-xs font-medium text-link transition-token hover:bg-surface-hover hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >

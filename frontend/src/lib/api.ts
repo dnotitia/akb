@@ -1861,9 +1861,31 @@ export interface SearchResponse {
 const vaultScopeParams = (vaults?: string[] | string): string[] =>
   (Array.isArray(vaults) ? vaults : vaults ? [vaults] : []).filter(Boolean);
 
-export const searchDocs = (query: string, vaults?: string[] | string, limit = 10) => {
+export interface SearchOptions {
+  collection?: string;
+  source_type?: "document" | "file" | "table";
+  doc_types?: string[];
+  tags?: string[];
+  include_archived?: boolean;
+  regex?: boolean;
+  case_sensitive?: boolean;
+}
+
+function appendSearchOptions(p: URLSearchParams, options: SearchOptions, literal: boolean) {
+  if (options.collection) p.set("collection", options.collection);
+  for (const type of options.doc_types || []) p.append("doc_types", type);
+  for (const tag of options.tags || []) p.append("tags", tag);
+  if (options.include_archived !== undefined) p.set("include_archived", String(options.include_archived));
+  if (literal) {
+    if (options.regex !== undefined) p.set("regex", String(options.regex));
+    if (options.case_sensitive !== undefined) p.set("case_sensitive", String(options.case_sensitive));
+  } else if (options.source_type) p.set("source_type", options.source_type);
+}
+
+export const searchDocs = (query: string, vaults?: string[] | string, limit = 10, options: SearchOptions = {}) => {
   const p = new URLSearchParams({ q: query, limit: String(limit) });
   for (const v of vaultScopeParams(vaults)) p.append("vault", v);
+  appendSearchOptions(p, options, false);
   return api<SearchResponse>(`/search?${p}`);
 };
 
@@ -1894,9 +1916,10 @@ export interface GrepResponse {
   hint?: string | null;
   results: GrepDoc[];
 }
-export const grepDocs = (query: string, vaults?: string[] | string, limit = 20) => {
+export const grepDocs = (query: string, vaults?: string[] | string, limit = 20, options: SearchOptions = {}) => {
   const p = new URLSearchParams({ q: query, limit: String(limit) });
   for (const v of vaultScopeParams(vaults)) p.append("vault", v);
+  appendSearchOptions(p, options, true);
   return api<GrepResponse>(`/grep?${p}`);
 };
 

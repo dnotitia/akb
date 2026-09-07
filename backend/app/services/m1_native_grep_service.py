@@ -649,6 +649,9 @@ class M1NativeGrepService:
         replace: str | None = None,
         actor: str | None = None,
         include_text_files: bool = False,
+        doc_types: list[str] | None = None,
+        tags: list[str] | None = None,
+        include_archived: bool = True,
     ) -> dict[str, Any]:
         if pattern == "":
             raise ValidationError("grep pattern must not be empty")
@@ -690,6 +693,13 @@ class M1NativeGrepService:
             resource_id=resource_id,
             surfaces=self._selected_surfaces(include_text_files=include_text_files),
         )
+        if doc_types or tags or not include_archived:
+            from app.services.search_filters import metadata_matches
+
+            bodies = [body for body in bodies if (
+                body.surface == "document"
+                and metadata_matches(_parse_markdown(body.text)[0], doc_types, tags, include_archived)
+            ) or (body.surface != "document" and not (doc_types or tags))]
         searched_bytes = sum(body.byte_size for body in bodies)
         if searched_bytes > NATIVE_GREP_MAX_SEARCH_BYTES:
             raise ValidationError(

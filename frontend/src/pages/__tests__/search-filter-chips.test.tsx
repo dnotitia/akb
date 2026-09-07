@@ -1,204 +1,260 @@
-// RTL coverage for doc-type filter chips on SearchPage.
-//
-// The chips filter `doc_type` on dense results client-side — no backend
-// changes needed. This file covers:
-//   - chip row renders with ALL_TYPES including "skill"
-//   - toggling a chip off hides matching results without a re-fetch
-//
-// DenseResult shape: { source_type, uri, vault, path, title, doc_type, score }
-// The filter field is `doc_type` (not `type`).
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, cleanup } from "@testing-library/react";
+import { render, screen, cleanup, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter } from "react-router-dom";
-
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import SearchPage from "../search";
-import { searchDocs, listVaults } from "@/lib/api";
+import { searchDocs, grepDocs, listVaults } from "@/lib/api";
 
 vi.mock("@/lib/api", () => ({
   searchDocs: vi.fn(),
   grepDocs: vi.fn(),
   listVaults: vi.fn(),
 }));
-
-const mockedSearch = vi.mocked(searchDocs);
-const mockedListVaults = vi.mocked(listVaults);
-
-afterEach(cleanup);
-beforeEach(() => {
-  vi.clearAllMocks();
-  mockedListVaults.mockResolvedValue({ vaults: [] });
+const search = vi.mocked(searchDocs);
+const grep = vi.mocked(grepDocs);
+const response = (results: object[] = []) => ({
+  query: "x",
+  total: results.length,
+  returned: results.length,
+  total_matches: results.length,
+  results,
 });
-
-function renderAt(url: string) {
+const hit = (title: string) => ({
+  title,
+  uri: "akb://v/doc/x.md",
+  vault: "v",
+  path: "x.md",
+  source_type: "document",
+  doc_type: "report",
+  score: 1,
+});
+function Navigation() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  return (
+    <>
+      <output data-testid="url">{location.search}</output>
+      <button onClick={() => navigate(-1)}>Back</button>
+    </>
+  );
+}
+function renderAt(url = "/search?q=x") {
   return render(
     <MemoryRouter initialEntries={[url]}>
       <SearchPage />
+      <Navigation />
     </MemoryRouter>,
   );
 }
-
-describe("Search filter chips", () => {
-  it("progressively reveals type filters when results exist", async () => {
-    mockedSearch.mockResolvedValue({
-      query: "test",
-      total: 1,
-      returned: 1,
-      total_matches: 1,
-      results: [
-        {
-          source_type: "document",
-          uri: "akb://v/document/d-1",
-          vault: "v",
-          path: "overview/vault-skill.md",
-          title: "A skill doc",
-          doc_type: "skill",
-          score: 0.95,
-        },
-      ],
-    });
-    const u = userEvent.setup();
-    renderAt("/search?q=test");
-    await screen.findByText("A skill doc");
-    await u.click(
-      screen.getByRole("button", { name: "Filter by document type" }),
-    );
-    expect(screen.getByRole("button", { name: /toggle skill/i })).toBeTruthy();
-    expect(screen.getByRole("button", { name: /toggle note/i })).toBeTruthy();
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.mocked(listVaults).mockResolvedValue({ vaults: [] });
+  search.mockResolvedValue(response());
+  grep.mockResolvedValue({
+    pattern: "x",
+    regex: false,
+    total_docs: 0,
+    total_matches: 0,
+    results: [],
   });
+});
+afterEach(cleanup);
+const openFilters = async (user: ReturnType<typeof userEvent.setup>) =>
+  user.click(screen.getByRole("button", { name: "Filter by document type" }));
 
-  it("toggling NOTE off hides NOTE results but keeps SKILL results", async () => {
-    mockedSearch.mockResolvedValue({
-      query: "x",
-      total: 2,
-      returned: 2,
-      total_matches: 2,
-      results: [
-        {
-          source_type: "document",
-          uri: "akb://v/document/d-1",
-          vault: "v",
-          path: "overview/vault-skill.md",
-          title: "A skill doc",
-          doc_type: "skill",
-          score: 0.95,
-        },
-        {
-          source_type: "document",
-          uri: "akb://v/document/d-2",
-          vault: "v",
-          path: "n.md",
-          title: "A note",
-          doc_type: "note",
-          score: 0.85,
-        },
-      ],
-    });
-    const u = userEvent.setup();
-    renderAt("/search?q=x");
-
-    // wait for results to render
-    await screen.findByText("A skill doc");
-    expect(screen.queryByText("A note")).toBeTruthy();
-
-    // toggle NOTE chip off
-    await u.click(
-      screen.getByRole("button", { name: "Filter by document type" }),
-    );
-    await u.click(screen.getByRole("button", { name: /toggle note/i }));
-
-    // NOTE is now filtered out client-side; skill doc remains
-    expect(screen.queryByText("A note")).toBeNull();
-    expect(screen.queryByText("A skill doc")).toBeTruthy();
-
-    // only one searchDocs call — no re-fetch
-    expect(mockedSearch).toHaveBeenCalledTimes(1);
-  });
-
-  it("filters resource kinds in the progressive filter tray without re-fetching", async () => {
-    mockedSearch.mockResolvedValue({
-      query: "platform",
-      total: 2,
-      returned: 2,
-      total_matches: 2,
-      results: [
-        {
-          source_type: "document",
-          uri: "akb://v/document/d-1",
-          vault: "v",
-          path: "platform.md",
-          title: "Platform guide",
-          doc_type: "note",
-          score: 0.95,
-        },
-        {
-          source_type: "table",
-          uri: "akb://v/table/services",
-          vault: "v",
-          path: "services",
-          title: "Services",
-          score: 0.84,
-        },
-      ],
-    });
+describe("server search filters", () => {
+  it("keeps filters available before results and after a zero-match response", async () => {
+    renderAt();
     const user = userEvent.setup();
-    renderAt("/search?q=platform");
+    await openFilters(user);
+    expect(screen.getByRole("button", { name: "Toggle report" })).toBeEnabled();
+    expect(screen.getByLabelText("Tags (match any)")).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Tables" })).toBeEnabled();
+  });
 
-    await screen.findByText("Platform guide");
-    expect(screen.getByText("Services")).toBeTruthy();
-    await user.click(
-      screen.getByRole("button", { name: "Filter by document type" }),
+  it("finds a matching document outside the initial 25 results by re-searching on the server", async () => {
+    const first25 = Array.from({ length: 25 }, (_, i) => hit(`Initial ${i}`));
+    search.mockImplementation(async (_q, _v, _l, options) =>
+      response(
+        options?.doc_types?.includes("report")
+          ? [hit("Previously outside top 25")]
+          : first25,
+      ),
     );
+    renderAt();
+    const user = userEvent.setup();
+    await screen.findByText("Initial 0");
+    await openFilters(user);
+    await user.click(screen.getByRole("button", { name: "Toggle report" }));
+    await screen.findByText("Previously outside top 25");
+    expect(screen.queryByText("Initial 0")).not.toBeInTheDocument();
+    expect(search).toHaveBeenLastCalledWith(
+      "x",
+      [],
+      25,
+      expect.objectContaining({
+        doc_types: ["report"],
+        source_type: "document",
+      }),
+    );
+    expect(screen.getByTestId("url")).toHaveTextContent("doc_type=report");
+    await user.click(screen.getByRole("button", { name: "Back" }));
+    await screen.findByText("Initial 0");
+    expect(
+      screen.getByRole("button", { name: "Toggle report" }),
+    ).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("sends resource type, collection, tags and archive filters rather than slicing results", async () => {
+    renderAt();
+    const user = userEvent.setup();
+    await openFilters(user);
     await user.click(screen.getByRole("button", { name: "Tables" }));
-
-    expect(screen.queryByText("Platform guide")).toBeNull();
-    expect(screen.getByText("Services")).toBeTruthy();
-    expect(mockedSearch).toHaveBeenCalledTimes(1);
+    await waitFor(() =>
+      expect(search).toHaveBeenLastCalledWith(
+        "x",
+        [],
+        25,
+        expect.objectContaining({ source_type: "table" }),
+      ),
+    );
+    await user.type(
+      screen.getByLabelText("Collection path (including children)"),
+      "guides/api",
+    );
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await user.type(
+      screen.getByLabelText("Tags (match any)"),
+      "rare-tag{Enter}",
+    );
+    await user.click(screen.getByLabelText("Include archived documents"));
+    await waitFor(() =>
+      expect(search).toHaveBeenLastCalledWith(
+        "x",
+        [],
+        25,
+        expect.objectContaining({
+          collection: "guides/api",
+          tags: ["rare-tag"],
+          source_type: "document",
+          include_archived: true,
+        }),
+      ),
+    );
+    await user.click(screen.getByRole("button", { name: "Reset filters" }));
+    await waitFor(() =>
+      expect(search).toHaveBeenLastCalledWith(
+        "x",
+        [],
+        25,
+        expect.objectContaining({
+          collection: undefined,
+          tags: [],
+          source_type: undefined,
+          include_archived: false,
+        }),
+      ),
+    );
   });
 
-  it("filters optional backend tags locally and cleans indexed context headers", async () => {
-    mockedSearch.mockResolvedValue({
-      query: "worker",
-      total: 2,
-      returned: 2,
-      total_matches: 2,
+  it("restores full URL state and preserves filters across mode changes", async () => {
+    renderAt(
+      "/search?q=API&v=eng&collection=guides&doc_type=report&doc_type=note&tag=ops&include_archived=true&regex=true&case_sensitive=true",
+    );
+    const user = userEvent.setup();
+    await waitFor(() => expect(search).toHaveBeenCalled());
+    await user.click(
+      screen.getByRole("button", { name: "Literal", pressed: false }),
+    );
+    await waitFor(() =>
+      expect(grep).toHaveBeenLastCalledWith(
+        "API",
+        ["eng"],
+        20,
+        expect.objectContaining({
+          collection: "guides",
+          doc_types: ["report", "note"],
+          tags: ["ops"],
+          include_archived: true,
+          regex: true,
+          case_sensitive: true,
+        }),
+      ),
+    );
+    await openFilters(user);
+    expect(screen.getByLabelText("Regular expression")).toBeChecked();
+    await user.click(screen.getByLabelText("Case sensitive"));
+    await waitFor(() =>
+      expect(grep).toHaveBeenLastCalledWith(
+        "API",
+        ["eng"],
+        20,
+        expect.objectContaining({ case_sensitive: false }),
+      ),
+    );
+  });
+
+  it("does not call an incomplete empty response a genuine zero-match and retries unchanged queries", async () => {
+    search.mockResolvedValue({
+      ...response(),
+      degraded: true,
+      degradation_reason: "vector_store_unavailable",
+    });
+    renderAt();
+    const user = userEvent.setup();
+    await screen.findByText(/Search is incomplete/);
+    expect(
+      screen.queryByRole("heading", { name: /No results/ }),
+    ).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+    expect(search).toHaveBeenCalledTimes(2);
+    await user.click(screen.getByRole("button", { name: "Search" }));
+    await waitFor(() => expect(search).toHaveBeenCalledTimes(3));
+  });
+
+  it("uses literal-specific truncation copy and exact line/document counts", async () => {
+    grep.mockResolvedValue({
+      pattern: "x",
+      regex: false,
+      total_docs: 40,
+      total_matches: 60,
+      returned_docs: 1,
+      returned_matches: 1,
+      truncated: true,
       results: [
-        {
-          source_type: "document",
-          uri: "akb://v/document/d-1",
-          vault: "v",
-          path: "worker.md",
-          title: "Worker guide",
-          doc_type: "note",
-          tags: ["runtime", "operations"],
-          matched_section:
-            "[# Worker guide > ## Results] * API stays available while the worker restarts.",
-          score: 0.95,
-        },
-        {
-          source_type: "document",
-          uri: "akb://v/document/d-2",
-          vault: "v",
-          path: "auth.md",
-          title: "Authentication guide",
-          doc_type: "note",
-          tags: ["security"],
-          score: 0.85,
-        },
+        { ...hit("Literal result"), matches: [{ section: null, text: "x" }] },
       ],
     });
-    const user = userEvent.setup();
-    renderAt("/search?q=worker");
+    renderAt("/search?q=x&mode=literal");
+    await screen.findByText("Literal result");
+    expect(
+      screen.getByText("Showing some matching documents"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/1 of 40 documents and 1 of 60/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/Semantic search returns/),
+    ).not.toBeInTheDocument();
+  });
 
-    expect(await screen.findByText("API stays available while the worker restarts.")).toBeTruthy();
-    expect(screen.queryByText(/\[# Worker guide/)).toBeNull();
-    await user.click(
-      screen.getByRole("button", { name: "Filter by document type" }),
+  it("ignores an older response that arrives after a filter request", async () => {
+    let resolveOld!: (value: ReturnType<typeof response>) => void;
+    search.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveOld = resolve;
+      }),
     );
-    await user.click(screen.getByRole("button", { name: "Toggle tag security" }));
-
-    expect(screen.queryByText("Worker guide")).toBeNull();
-    expect(screen.getByText("Authentication guide")).toBeTruthy();
-    expect(mockedSearch).toHaveBeenCalledTimes(1);
+    search.mockResolvedValue(response([hit("Current result")]));
+    renderAt();
+    const user = userEvent.setup();
+    await openFilters(user);
+    await user.click(screen.getByRole("button", { name: "Toggle report" }));
+    await screen.findByText("Current result");
+    resolveOld(response([hit("Stale result")]));
+    await waitFor(() =>
+      expect(screen.queryByText("Stale result")).not.toBeInTheDocument(),
+    );
+    expect(screen.getByText("Current result")).toBeInTheDocument();
   });
 });

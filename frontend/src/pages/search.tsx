@@ -49,6 +49,14 @@ import { cleanSearchContext, safeSearchTags } from "@/lib/search-display";
 import { parseUri } from "@/lib/uri";
 import { cn } from "@/lib/utils";
 import { documentPreviewState } from "@/lib/document-preview-navigation";
+import { Input } from "@/components/ui/input";
+import { TagInput } from "@/components/ui/tag-input";
+import { InlineLoadingState } from "@/components/ui/loading-state";
+import {
+  readSearchOptions,
+  SEARCH_FILTER_KEYS,
+  setSearchValues,
+} from "@/lib/search-state";
 
 type Mode = "dense" | "literal";
 type SourceType = "document" | "table" | "file";
@@ -136,6 +144,10 @@ export default function SearchPage() {
   const mode: Mode =
     searchParams.get("mode") === "literal" ? "literal" : "dense";
   const vaultParam = searchParams.get("v") || "";
+  const options = useMemo(
+    () => readSearchOptions(searchParams),
+    [searchParams],
+  );
   const scopeVaults = useMemo(
     () =>
       scopedVault
@@ -159,25 +171,25 @@ export default function SearchPage() {
   const [searched, setSearched] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [vaults, setVaults] = useState<{ name: string }[]>([]);
-  const [activeTypes, setActiveTypes] = useState<Set<DocTypeFilter>>(
-    () => new Set(ALL_TYPES),
+  const activeTypes = new Set(options.doc_types);
+  const activeSource: SourceFilter = options.source_type || "all";
+  const activeTags = new Set(options.tags);
+  const [collectionDraft, setCollectionDraft] = useState(
+    options.collection || "",
   );
-  const [activeSource, setActiveSource] = useState<SourceFilter>("all");
-  const [activeTags, setActiveTags] = useState<Set<string>>(() => new Set());
+  const [degradationReason, setDegradationReason] = useState<string | null>(
+    null,
+  );
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [draft, setDraft] = useState(q);
   const [recentSearches, setRecentSearches] = useState<RecentSearch[]>([]);
-  const [recentDocuments, setRecentDocuments] = useState<
-    RecentDocumentView[]
-  >([]);
+  const [recentDocuments, setRecentDocuments] = useState<RecentDocumentView[]>(
+    [],
+  );
   const reqId = useRef(0);
 
   const doSearch = useCallback(
-    async (
-      searchQuery: string,
-      searchMode: Mode,
-      selectedVaults: string[],
-    ) => {
+    async (searchQuery: string, searchMode: Mode, selectedVaults: string[]) => {
       if (!searchQuery.trim()) return;
       const id = ++reqId.current;
       setLoading(true);
@@ -186,7 +198,12 @@ export default function SearchPage() {
 
       try {
         if (searchMode === "dense") {
-          const response = await searchDocs(searchQuery, selectedVaults, 25);
+          const response = await searchDocs(
+            searchQuery,
+            selectedVaults,
+            25,
+            options,
+          );
           if (id !== reqId.current) return;
           setDenseResults(response.results);
           setLiteralResults([]);
@@ -196,8 +213,14 @@ export default function SearchPage() {
           setReturnedMatches(0);
           setTruncated(Boolean(response.truncated));
           setDegraded(Boolean(response.degraded));
+          setDegradationReason(response.degradation_reason || null);
         } else {
-          const response = await grepDocs(searchQuery, selectedVaults);
+          const response = await grepDocs(
+            searchQuery,
+            selectedVaults,
+            20,
+            options,
+          );
           if (id !== reqId.current) return;
           setLiteralResults(response.results);
           setDenseResults([]);
@@ -234,7 +257,7 @@ export default function SearchPage() {
         if (id === reqId.current) setLoading(false);
       }
     },
-    [currentUserId],
+    [currentUserId, options],
   );
 
   useEffect(() => {
@@ -251,10 +274,10 @@ export default function SearchPage() {
     setDraft(q);
   }, [q]);
 
-  useEffect(() => {
-    setActiveSource("all");
-    setActiveTags(new Set());
-  }, [q, mode]);
+  useEffect(
+    () => setCollectionDraft(options.collection || ""),
+    [options.collection],
+  );
 
   useEffect(() => {
     if (!scopedVault) {
@@ -295,7 +318,7 @@ export default function SearchPage() {
     if (trimmed) next.set("q", trimmed);
     if (nextMode === "dense") next.delete("mode");
     else next.set("mode", nextMode);
-    setSearchParams(next, { replace: true });
+    setSearchParams(next);
   }
 
   function setScopeVaults(selectedVaults: string[]) {
@@ -304,25 +327,42 @@ export default function SearchPage() {
     if (trimmed) next.set("q", trimmed);
     if (selectedVaults.length) next.set("v", selectedVaults.join(","));
     else next.delete("v");
-    setSearchParams(next, { replace: true });
+    setSearchParams(next);
   }
 
   function toggleType(type: DocTypeFilter) {
-    setActiveTypes((current) => {
-      const next = new Set(current);
-      if (next.has(type)) next.delete(type);
-      else next.add(type);
-      return next;
-    });
+    setFilter(
+      "doc_type",
+      activeTypes.has(type)
+        ? [...activeTypes].filter((t) => t !== type)
+        : [...activeTypes, type],
+    );
   }
 
   function toggleTag(tag: string) {
-    setActiveTags((current) => {
-      const next = new Set(current);
-      if (next.has(tag)) next.delete(tag);
-      else next.add(tag);
-      return next;
-    });
+    setFilter(
+      "tag",
+      activeTags.has(tag)
+        ? [...activeTags].filter((t) => t !== tag)
+        : [...activeTags, tag],
+    );
+  }
+
+  function setFilter(key: string, values: string[]) {
+    const next = setSearchValues(searchParams, key, values);
+    if ((key === "doc_type" || key === "tag") && values.length)
+      next.set("source", "document");
+    if (key === "source" && values[0] !== "document") {
+      next.delete("doc_type");
+      next.delete("tag");
+    }
+    setSearchParams(next);
+  }
+
+  function resetFilters() {
+    const next = new URLSearchParams(searchParams);
+    for (const key of SEARCH_FILTER_KEYS) next.delete(key);
+    setSearchParams(next);
   }
 
   function commitQuery(value: string) {
@@ -330,8 +370,10 @@ export default function SearchPage() {
     const next = new URLSearchParams(searchParams);
     if (trimmed) next.set("q", trimmed);
     else next.delete("q");
+    if (next.toString() === searchParams.toString() && trimmed)
+      void doSearch(trimmed, mode, scopeVaults);
     setDraft(trimmed);
-    setSearchParams(next, { replace: true });
+    setSearchParams(next);
   }
 
   function repeatRecentSearch(item: RecentSearch) {
@@ -344,7 +386,7 @@ export default function SearchPage() {
       else next.delete("v");
     }
     setDraft(item.query);
-    setSearchParams(next, { replace: true });
+    setSearchParams(next);
   }
 
   function clearSearchHistory() {
@@ -362,24 +404,7 @@ export default function SearchPage() {
       normalizedQuery === normalizedQuery.toUpperCase());
   const showLiteralHint =
     mode === "dense" && looksLikeIdentifier && searched && !loading;
-  const allTypesActive = activeTypes.size === ALL_TYPES.length;
-  const knownTypes = new Set<string>(ALL_TYPES);
-  const typeFilteredDense = allTypesActive
-    ? denseResults
-    : denseResults.filter(
-        (result) =>
-          !result.doc_type ||
-          !knownTypes.has(result.doc_type) ||
-          activeTypes.has(result.doc_type as DocTypeFilter),
-      );
-  const filteredDense =
-    activeTags.size === 0
-      ? typeFilteredDense
-      : typeFilteredDense.filter((result) =>
-          safeSearchTags(result.tags).some((tag) => activeTags.has(tag)),
-        );
-  const groupedDense = groupByType(filteredDense);
-  const sourceCounts = groupByType(denseResults);
+  const allTypesActive = activeTypes.size === 0;
   const tagCounts = new Map<string, number>();
   for (const result of denseResults) {
     for (const tag of safeSearchTags(result.tags)) {
@@ -390,34 +415,28 @@ export default function SearchPage() {
     ([leftTag, leftCount], [rightTag, rightCount]) =>
       rightCount - leftCount || leftTag.localeCompare(rightTag),
   );
-  const visibleDense =
-    activeSource === "all" ? filteredDense : groupedDense[activeSource];
+  const visibleDense = denseResults;
   const resultCount =
     mode === "dense" ? visibleDense.length : literalResults.length;
   const hasResults = resultCount > 0;
-  const hasRawResults =
-    mode === "dense" ? denseResults.length > 0 : literalResults.length > 0;
 
-  const denseCountSummary =
-    activeSource !== "all" || !allTypesActive
-      ? `${visibleDense.length} visible · ${returnedDocs} loaded`
-      : returnedDocs !== total
-        ? `${returnedDocs} of ${total} top results loaded`
-        : `${visibleDense.length} result${visibleDense.length === 1 ? "" : "s"}`;
+  const denseCountSummary = `${returnedDocs} top results loaded`;
   const literalCountSummary =
     returnedDocs !== total || returnedMatches !== totalMatches
       ? `${returnedDocs} of ${total} ${total === 1 ? "doc" : "docs"} · ${returnedMatches} of ${totalMatches} ${totalMatches === 1 ? "match" : "matches"}`
       : `${total} ${total === 1 ? "doc" : "docs"} · ${totalMatches} ${totalMatches === 1 ? "match" : "matches"}`;
-  const allVaultsHref = `/search${
-    q
-      ? `?q=${encodeURIComponent(q)}${mode !== "dense" ? `&mode=${mode}` : ""}`
-      : ""
-  }`;
+  const allVaultParams = new URLSearchParams(searchParams);
+  allVaultParams.delete("v");
+  const allVaultsHref = `/search?${allVaultParams}`;
 
   const activeFilterCount =
     (activeSource === "all" ? 0 : 1) +
     (allTypesActive ? 0 : 1) +
-    (activeTags.size === 0 ? 0 : 1);
+    (activeTags.size === 0 ? 0 : 1) +
+    Number(Boolean(options.collection)) +
+    Number(options.include_archived) +
+    Number(options.regex) +
+    Number(options.case_sensitive);
   const accessibleVaultNames = new Set(
     scopedVault ? [scopedVault] : vaults.map((vault) => vault.name),
   );
@@ -433,9 +452,11 @@ export default function SearchPage() {
       ? "Search unavailable"
       : !searched
         ? "Ready to search"
-        : mode === "dense"
-          ? denseCountSummary
-          : literalCountSummary;
+        : degraded
+          ? "Search incomplete"
+          : mode === "dense"
+            ? denseCountSummary
+            : literalCountSummary;
 
   return (
     <div
@@ -450,9 +471,11 @@ export default function SearchPage() {
             ? "Search failed"
             : !searched
               ? ""
-              : !hasResults
-                ? `No visible results for ${q}`
-                : `${resultCount} results for ${q}`}
+              : degraded
+                ? "Search incomplete; results may be missing"
+                : !hasResults
+                  ? `No visible results for ${q}`
+                  : `${resultCount} results for ${q}`}
       </p>
 
       <section
@@ -478,39 +501,39 @@ export default function SearchPage() {
                 : "Literal search matches exact text or a regular expression."}
             </span>
             <div className="flex h-10 min-w-0 flex-1 basis-72 items-center rounded-[var(--radius-md)] border border-border-strong bg-surface-2 px-3 shadow-xs transition-token focus-within:border-primary focus-within:bg-background focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2 focus-within:ring-offset-surface">
-                <SearchIcon
-                  className="mr-2.5 h-4 w-4 shrink-0 text-foreground-muted"
-                  aria-hidden
-                />
-                <label htmlFor="vault-search" className="sr-only">
-                  Search query
-                </label>
-                <input
-                  id="vault-search"
-                  type="search"
-                  enterKeyHint="search"
-                  aria-describedby="search-query-help"
-                  placeholder="Search documents, tables, and files…"
-                  value={draft}
-                  onChange={(event) => setDraft(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Escape" && draft) {
-                      event.preventDefault();
-                      commitQuery("");
-                    }
-                  }}
-                  className="min-w-0 flex-1 appearance-none bg-transparent text-sm text-foreground placeholder:text-foreground-muted focus:outline-none [&::-webkit-search-cancel-button]:hidden"
-                />
-                {draft && !loading && (
-                  <button
-                    type="button"
-                    aria-label="Clear search query"
-                    onClick={() => commitQuery("")}
-                    className="ml-2 inline-flex h-8 shrink-0 cursor-pointer items-center justify-center rounded-[var(--radius-sm)] px-2 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    Clear
-                  </button>
-                )}
+              <SearchIcon
+                className="mr-2.5 h-4 w-4 shrink-0 text-foreground-muted"
+                aria-hidden
+              />
+              <label htmlFor="vault-search" className="sr-only">
+                Search query
+              </label>
+              <input
+                id="vault-search"
+                type="search"
+                enterKeyHint="search"
+                aria-describedby="search-query-help"
+                placeholder="Search documents, tables, and files…"
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape" && draft) {
+                    event.preventDefault();
+                    commitQuery("");
+                  }
+                }}
+                className="min-w-0 flex-1 appearance-none bg-transparent text-sm text-foreground placeholder:text-foreground-muted focus:outline-none [&::-webkit-search-cancel-button]:hidden"
+              />
+              {draft && !loading && (
+                <button
+                  type="button"
+                  aria-label="Clear search query"
+                  onClick={() => commitQuery("")}
+                  className="ml-2 inline-flex h-8 shrink-0 cursor-pointer items-center justify-center rounded-[var(--radius-sm)] px-2 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  Clear
+                </button>
+              )}
             </div>
             <div
               role="group"
@@ -539,7 +562,7 @@ export default function SearchPage() {
               </button>
             </div>
 
-            {mode === "dense" && (
+            {
               <button
                 type="button"
                 aria-label="Filter by document type"
@@ -559,7 +582,7 @@ export default function SearchPage() {
                   <Badge variant="secondary">{activeFilterCount}</Badge>
                 )}
               </button>
-            )}
+            }
 
             <Button
               type="submit"
@@ -580,7 +603,9 @@ export default function SearchPage() {
               data-testid="search-scope-row"
               className="flex min-w-0 flex-1 flex-wrap items-center gap-2 text-foreground-muted"
             >
-              <span className="shrink-0 font-medium text-foreground">Search in</span>
+              <span className="shrink-0 font-medium text-foreground">
+                Search in
+              </span>
               {scopedVault ? (
                 <>
                   <div
@@ -619,30 +644,27 @@ export default function SearchPage() {
 
             <div className="flex w-full shrink-0 items-center justify-between gap-2 text-foreground-muted sm:w-auto sm:justify-start">
               <span className="tabular-nums">{resultStatus}</span>
-              <span className="hidden sm:inline" aria-hidden>·</span>
+              <span className="hidden sm:inline" aria-hidden>
+                ·
+              </span>
               <span className="hidden sm:inline">
-                {mode === "dense" ? "Meaning and context" : "Exact text or regex"}
+                {mode === "dense"
+                  ? "Meaning and context"
+                  : "Exact text or regex"}
               </span>
             </div>
           </div>
 
-          {filtersOpen && mode === "dense" && (
+          {filtersOpen && (
             <aside
               id="search-filter-tray"
               aria-label="Search filters"
-              className="border-b border-border-strong bg-surface px-3 py-3 sm:px-4"
+              className="max-h-[50vh] overflow-y-auto border-b border-border-strong bg-surface px-3 py-3 sm:px-4"
             >
-              {denseResults.length > 0 ? (
-                <div
-                  className={cn(
-                    "grid gap-4",
-                    availableTags.length > 0
-                      ? "lg:grid-cols-2 xl:grid-cols-[minmax(16rem,0.8fr)_minmax(0,1.35fr)_minmax(15rem,1fr)]"
-                      : "lg:grid-cols-[minmax(18rem,0.8fr)_minmax(0,1.6fr)]",
-                  )}
-                >
+              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+                {mode === "dense" && (
                   <fieldset>
-                    <legend className="mb-2 text-xs font-semibold text-foreground">
+                    <legend className="mb-2 text-xs font-semibold">
                       Content
                     </legend>
                     <div
@@ -650,275 +672,343 @@ export default function SearchPage() {
                       role="group"
                       aria-label="Filter by content kind"
                     >
-                      {SOURCE_FILTERS.map(({ key, label, icon: Icon }) => {
-                        const count =
-                          key === "all"
-                            ? denseResults.length
-                            : sourceCounts[key].length;
-                        return (
-                          <button
-                            key={key}
-                            type="button"
-                            aria-label={label}
-                            aria-pressed={activeSource === key}
-                            disabled={count === 0}
-                            onClick={() => setActiveSource(key)}
-                            className={sourceFilterClass(activeSource === key)}
-                          >
-                            <Icon className="h-3.5 w-3.5" aria-hidden />
-                            {label}
-                            <span className="tabular-nums text-foreground-muted">
-                              {count}
-                            </span>
-                          </button>
-                        );
-                      })}
+                      {SOURCE_FILTERS.map(({ key, label, icon: Icon }) => (
+                        <button
+                          key={key}
+                          type="button"
+                          aria-label={label}
+                          aria-pressed={activeSource === key}
+                          onClick={() =>
+                            setFilter("source", key === "all" ? [] : [key])
+                          }
+                          className={sourceFilterClass(activeSource === key)}
+                        >
+                          <Icon className="h-3.5 w-3.5" aria-hidden />
+                          {label}
+                        </button>
+                      ))}
                     </div>
                   </fieldset>
-
-                  <fieldset>
-                    <legend className="mb-2 text-xs font-semibold text-foreground">
-                      Document type
-                    </legend>
-                    <div
-                      className="flex flex-wrap gap-1.5"
-                      role="group"
-                      aria-label="Filter by document type"
+                )}
+                <fieldset>
+                  <legend className="mb-2 text-xs font-semibold">
+                    Document type
+                  </legend>
+                  <div
+                    className="flex flex-wrap gap-1.5"
+                    role="group"
+                    aria-label="Filter by document type"
+                  >
+                    <button
+                      type="button"
+                      aria-label="Show all types"
+                      aria-pressed={allTypesActive}
+                      onClick={() => setFilter("doc_type", [])}
+                      className={filterButtonClass(allTypesActive)}
                     >
+                      All types
+                    </button>
+                    {ALL_TYPES.map((type) => (
                       <button
+                        key={type}
                         type="button"
-                        aria-label="Show all types"
-                        aria-pressed={allTypesActive}
-                        onClick={() => setActiveTypes(new Set(ALL_TYPES))}
-                        className={filterButtonClass(allTypesActive)}
+                        aria-label={`Toggle ${type}`}
+                        aria-pressed={activeTypes.has(type)}
+                        onClick={() => toggleType(type)}
+                        className={filterButtonClass(activeTypes.has(type))}
                       >
-                        All types
+                        <span className="capitalize">{type}</span>
                       </button>
-                      {ALL_TYPES.map((type) => {
-                        const count = denseResults.filter(
-                          (result) => result.doc_type === type,
-                        ).length;
-                        return (
-                          <button
-                            key={type}
-                            type="button"
-                            aria-label={`Toggle ${type}`}
-                            aria-pressed={activeTypes.has(type)}
-                            disabled={count === 0}
-                            onClick={() => toggleType(type)}
-                            className={filterButtonClass(activeTypes.has(type))}
-                          >
-                            <span className="capitalize">{type}</span>
-                            <span className="tabular-nums text-foreground-muted">
-                              {count}
-                            </span>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </fieldset>
-
+                    ))}
+                  </div>
+                </fieldset>
+                <div>
+                  <label
+                    htmlFor="search-tags"
+                    className="mb-2 block text-xs font-semibold"
+                  >
+                    Tags (match any)
+                  </label>
+                  <TagInput
+                    id="search-tags"
+                    value={[...activeTags]}
+                    onChange={(tags) => setFilter("tag", tags)}
+                  />
                   {availableTags.length > 0 && (
-                    <fieldset>
-                      <legend className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-foreground">
-                        <Tag className="h-3.5 w-3.5 text-foreground-muted" aria-hidden />
-                        Tags
-                      </legend>
-                      <div
-                        className="flex flex-wrap gap-1.5"
-                        role="group"
-                        aria-label="Filter by tag"
-                      >
-                        {availableTags.slice(0, 12).map(([tag, count]) => (
-                          <button
-                            key={tag}
-                            type="button"
-                            aria-label={`Toggle tag ${tag}`}
-                            aria-pressed={activeTags.has(tag)}
-                            onClick={() => toggleTag(tag)}
-                            className={filterButtonClass(activeTags.has(tag))}
-                          >
-                            <span>{tag}</span>
-                            <span className="tabular-nums text-foreground-muted">
-                              {count}
-                            </span>
-                          </button>
-                        ))}
-                      </div>
-                    </fieldset>
+                    <div
+                      className="mt-2 flex flex-wrap gap-1.5"
+                      role="group"
+                      aria-label="Suggested tags from loaded results"
+                    >
+                      {availableTags.slice(0, 12).map(([tag]) => (
+                        <button
+                          key={tag}
+                          type="button"
+                          aria-label={`Toggle tag ${tag}`}
+                          aria-pressed={activeTags.has(tag)}
+                          onClick={() => toggleTag(tag)}
+                          className={filterButtonClass(activeTags.has(tag))}
+                        >
+                          <Tag className="h-3 w-3" aria-hidden />
+                          {tag}
+                        </button>
+                      ))}
+                    </div>
                   )}
                 </div>
-              ) : (
+                <form
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    setFilter("collection", [
+                      collectionDraft.trim().replace(/^\/+|\/+$/g, ""),
+                    ]);
+                  }}
+                >
+                  <label
+                    htmlFor="search-collection"
+                    className="mb-2 block text-xs font-semibold"
+                  >
+                    Collection path (including children)
+                  </label>
+                  <div className="flex gap-2">
+                    <Input
+                      id="search-collection"
+                      value={collectionDraft}
+                      onChange={(event) =>
+                        setCollectionDraft(event.target.value)
+                      }
+                      placeholder="e.g. guides/api"
+                    />
+                    <Button type="submit" variant="outline" size="sm">
+                      Apply
+                    </Button>
+                  </div>
+                  <p className="mt-1 text-xs text-foreground-muted">
+                    The same path is used in each selected Vault.
+                  </p>
+                </form>
+                <div className="flex flex-col gap-3 text-sm">
+                  <label className="flex min-h-9 items-center gap-2">
+                    <input
+                      type="checkbox"
+                      className="accent-primary focus-visible:outline-ring"
+                      checked={Boolean(options.include_archived)}
+                      onChange={(event) =>
+                        setFilter(
+                          "include_archived",
+                          event.target.checked ? ["true"] : [],
+                        )
+                      }
+                    />
+                    Include archived documents
+                  </label>
+                  {mode === "literal" && (
+                    <>
+                      <label className="flex min-h-9 items-center gap-2">
+                        <input
+                          type="checkbox"
+                          className="accent-primary focus-visible:outline-ring"
+                          checked={Boolean(options.regex)}
+                          onChange={(event) =>
+                            setFilter(
+                              "regex",
+                              event.target.checked ? ["true"] : [],
+                            )
+                          }
+                        />
+                        Regular expression
+                      </label>
+                      <label className="flex min-h-9 items-center gap-2">
+                        <input
+                          type="checkbox"
+                          className="accent-primary focus-visible:outline-ring"
+                          checked={Boolean(options.case_sensitive)}
+                          onChange={(event) =>
+                            setFilter(
+                              "case_sensitive",
+                              event.target.checked ? ["true"] : [],
+                            )
+                          }
+                        />
+                        Case sensitive
+                      </label>
+                    </>
+                  )}
+                </div>
+              </div>
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
                 <p className="text-xs text-foreground-muted">
-                  Content and document-type filters appear after AKB finds
-                  matches.
+                  {mode === "literal"
+                    ? "Literal search searches document bodies only. Content-kind selection is retained for Semantic search."
+                    : "Document type and tag filters search documents only. Filters apply on the server before the result limit."}
                 </p>
-              )}
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={resetFilters}
+                >
+                  Reset filters
+                </Button>
+              </div>
             </aside>
           )}
         </header>
 
-          <div
-            role="region"
-            aria-label="Search results"
-            data-testid="search-results-pane"
-            className="rail-scroll min-h-0 min-w-0 flex-1 overflow-y-auto bg-surface"
-          >
-            {degraded && (
-              <Alert
-                variant="warning"
-                className="rounded-none border-x-0 border-t-0"
+        <div
+          role="region"
+          aria-label="Search results"
+          aria-busy={loading}
+          data-testid="search-results-pane"
+          className="rail-scroll min-h-0 min-w-0 flex-1 overflow-y-auto bg-surface"
+        >
+          {degraded && !loading && (
+            <Alert
+              variant="warning"
+              className="rounded-none border-x-0 border-t-0"
+            >
+              Search is incomplete.{" "}
+              {degradationReason === "sparse_encoder_degraded"
+                ? "Keyword retrieval is temporarily unavailable."
+                : "The retrieval service is temporarily unavailable."}{" "}
+              <button
+                type="button"
+                onClick={() => void doSearch(q, mode, scopeVaults)}
+                className={inlineActionClass}
               >
-                Search is degraded, so these results may be incomplete. Try
-                again shortly or switch to{" "}
-                <button
-                  type="button"
-                  onClick={() => switchMode("literal")}
-                  className={inlineActionClass}
-                >
-                  Literal
-                </button>{" "}
-                search.
-              </Alert>
-            )}
-
-            {showLiteralHint && (
-              <Alert
-                variant="info"
-                className="rounded-none border-x-0 border-t-0"
+                Retry
+              </button>{" "}
+              or switch to{" "}
+              <button
+                type="button"
+                onClick={() => switchMode("literal")}
+                className={inlineActionClass}
               >
-                Short identifiers are usually easier to find with{" "}
-                <button
-                  type="button"
-                  onClick={() => switchMode("literal")}
-                  className={inlineActionClass}
-                >
-                  Literal
-                </button>{" "}
-                search.
-              </Alert>
-            )}
+                Literal
+              </button>{" "}
+              search.
+            </Alert>
+          )}
 
-            {loading && <SearchLoadingState />}
-
-            {error && !loading && (
-              <Alert
-                variant="destructive"
-                title="Search unavailable"
-                className="rounded-none border-x-0 border-t-0"
+          {showLiteralHint && (
+            <Alert
+              variant="info"
+              className="rounded-none border-x-0 border-t-0"
+            >
+              Short identifiers are usually easier to find with{" "}
+              <button
+                type="button"
+                onClick={() => switchMode("literal")}
+                className={inlineActionClass}
               >
-                {error}.{" "}
-                <button
-                  type="button"
-                  onClick={() => void doSearch(q, mode, scopeVaults)}
-                  className={inlineActionClass}
-                >
-                  Retry
-                </button>
-              </Alert>
-            )}
+                Literal
+              </button>{" "}
+              search.
+            </Alert>
+          )}
 
-            {!searched && (
-              <SearchStartState
-                mode={mode}
-                recentSearches={visibleRecentSearches}
-                recentDocuments={visibleRecentDocuments}
-                onRepeatSearch={repeatRecentSearch}
-                onClearSearches={clearSearchHistory}
-                onSuggestion={commitQuery}
-              />
-            )}
+          {loading &&
+            (hasResults ? (
+              <InlineLoadingState label="Updating search; previous results shown" />
+            ) : (
+              <SearchLoadingState />
+            ))}
 
-            {searched && !loading && !error && !hasRawResults && (
-              <section aria-labelledby="no-search-results-heading">
-                <div className="border-b border-border bg-surface-2/60 px-4 py-3 sm:px-5">
-                  <h2
-                    id="no-search-results-heading"
-                    className="text-sm font-semibold text-foreground"
-                  >
-                    No results for “{q}”
-                  </h2>
-                  <p className="mt-1 text-xs leading-relaxed text-foreground-muted">
-                    {mode === "dense"
-                      ? "Try fewer terms, broaden the Vault scope, or look for the exact phrase."
-                      : "Check the phrase or switch to meaning-based search."}
-                  </p>
-                </div>
-                <div className="flex flex-wrap gap-2 px-4 py-4 sm:px-5">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() =>
-                      switchMode(mode === "dense" ? "literal" : "dense")
-                    }
-                  >
-                    Try {mode === "dense" ? "Literal" : "Semantic"}
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => commitQuery("")}
-                  >
-                    Clear query
-                  </Button>
-                </div>
-              </section>
-            )}
-
-            {!loading && !error && hasRawResults && !hasResults && (
-              <Alert
-                variant="info"
-                className="rounded-none border-x-0 border-t-0"
+          {error && !loading && (
+            <Alert
+              variant="destructive"
+              title="Search unavailable"
+              className="rounded-none border-x-0 border-t-0"
+            >
+              {error}.{" "}
+              <button
+                type="button"
+                onClick={() => void doSearch(q, mode, scopeVaults)}
+                className={inlineActionClass}
               >
-                No results match the active filters.{" "}
-                <button
-                  type="button"
-                  onClick={() => {
-                    setActiveSource("all");
-                    setActiveTypes(new Set(ALL_TYPES));
-                    setActiveTags(new Set());
-                  }}
-                  className={inlineActionClass}
-                >
-                  Reset filters
-                </button>
-              </Alert>
-            )}
+                Retry
+              </button>
+            </Alert>
+          )}
 
-            {truncated && hasResults && !loading && (
-              <Alert
-                variant="info"
-                title="Showing the strongest matches"
-                className="rounded-none border-x-0 border-t-0"
-              >
-                Semantic search ranks a focused result set. Refine the query, or
-                use{" "}
-                <button
-                  type="button"
-                  onClick={() => switchMode("literal")}
-                  className={inlineActionClass}
-                >
-                  Literal
-                </button>{" "}
-                for an exact count.
-              </Alert>
-            )}
+          {!searched && (
+            <SearchStartState
+              mode={mode}
+              recentSearches={visibleRecentSearches}
+              recentDocuments={visibleRecentDocuments}
+              onRepeatSearch={repeatRecentSearch}
+              onClearSearches={clearSearchHistory}
+              onSuggestion={commitQuery}
+            />
+          )}
 
-            {!loading && !error && hasResults && (
-              <section aria-labelledby="search-results-heading">
-                <h2 id="search-results-heading" className="sr-only">
-                  Results for {q}
+          {searched && !loading && !error && !degraded && !hasResults && (
+            <section aria-labelledby="no-search-results-heading">
+              <div className="border-b border-border bg-surface-2/60 px-4 py-3 sm:px-5">
+                <h2
+                  id="no-search-results-heading"
+                  className="text-sm font-semibold text-foreground"
+                >
+                  No results for “{q}”
                 </h2>
-                {mode === "dense" ? (
-                  <DenseResultList items={visibleDense} />
-                ) : (
-                  <LiteralResultList items={literalResults} />
-                )}
-              </section>
-            )}
-          </div>
+                <p className="mt-1 text-xs leading-relaxed text-foreground-muted">
+                  {mode === "dense"
+                    ? "Try fewer terms, broaden the Vault scope, or look for the exact phrase."
+                    : "Check the phrase or switch to meaning-based search."}
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-2 px-4 py-4 sm:px-5">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    switchMode(mode === "dense" ? "literal" : "dense")
+                  }
+                >
+                  Try {mode === "dense" ? "Literal" : "Semantic"}
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => commitQuery("")}
+                >
+                  Clear query
+                </Button>
+              </div>
+            </section>
+          )}
+
+          {truncated && !loading && !error && (
+            <Alert
+              variant="info"
+              title={
+                mode === "dense"
+                  ? "Showing the strongest matches"
+                  : "Showing some matching documents"
+              }
+              className="rounded-none border-x-0 border-t-0"
+            >
+              {mode === "dense"
+                ? "Semantic search returns a ranked candidate set, not an exhaustive count. Narrow the filters or use Literal for text-match counts."
+                : `${returnedDocs} of ${total} documents and ${returnedMatches} of ${totalMatches} matching lines returned. Narrow the query or filters to see the remaining matches.`}
+            </Alert>
+          )}
+
+          {hasResults && (
+            <section aria-labelledby="search-results-heading">
+              <h2 id="search-results-heading" className="sr-only">
+                Results for {q}
+              </h2>
+              {mode === "dense" ? (
+                <DenseResultList items={visibleDense} />
+              ) : (
+                <LiteralResultList items={literalResults} />
+              )}
+            </section>
+          )}
+        </div>
       </section>
     </div>
   );
@@ -980,110 +1070,131 @@ function SearchStartState({
             )}
           >
             {hasSearches && (
-            <section aria-labelledby="recent-searches-heading">
-              <div className="flex min-h-11 items-center justify-between gap-3 border-b border-border bg-surface-2/60 px-4 sm:px-5">
-                <div className="flex min-w-0 items-center gap-2">
-                  <Clock3 className="h-3.5 w-3.5 shrink-0 text-foreground-muted" aria-hidden />
-                  <h2
-                    id="recent-searches-heading"
-                    className="text-xs font-semibold text-foreground"
-                  >
-                    Recent searches
-                  </h2>
-                </div>
-                <button
-                  type="button"
-                  onClick={onClearSearches}
-                  className="inline-flex h-8 cursor-pointer items-center rounded-[var(--radius-sm)] px-2 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  Clear
-                </button>
-              </div>
-              <div className="divide-y divide-border" aria-label="Recent searches">
-                {visibleSearches.map((search) => (
-                  <button
-                    key={`${search.surface}:${search.mode}:${search.vaults.join(",")}:${search.query}`}
-                    type="button"
-                    onClick={() => onRepeatSearch(search)}
-                    className="group flex min-h-14 w-full cursor-pointer items-center gap-3 px-4 py-2.5 text-left transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-5"
-                  >
-                    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface-2 text-foreground-muted transition-colors group-hover:text-link">
-                      <SearchIcon className="h-4 w-4" aria-hidden />
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-sm font-medium text-foreground">
-                        {search.query}
-                      </span>
-                      <span className="mt-0.5 flex min-w-0 items-center gap-1.5 text-xs text-foreground-muted">
-                        <span>{search.mode === "semantic" ? "Semantic" : "Literal"}</span>
-                        <span aria-hidden>·</span>
-                        <span className="truncate">
-                          {search.vaults.length === 0
-                            ? "All vaults"
-                            : search.vaults.length === 1
-                              ? search.vaults[0]
-                              : `${search.vaults.length} vaults`}
-                        </span>
-                      </span>
-                    </span>
-                    <RelativeTime
-                      iso={search.searchedAt}
-                      className="hidden shrink-0 text-xs text-foreground-muted sm:block"
+              <section aria-labelledby="recent-searches-heading">
+                <div className="flex min-h-11 items-center justify-between gap-3 border-b border-border bg-surface-2/60 px-4 sm:px-5">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <Clock3
+                      className="h-3.5 w-3.5 shrink-0 text-foreground-muted"
+                      aria-hidden
                     />
-                  </button>
-                ))}
-              </div>
-            </section>
-            )}
-
-            {hasDocuments && (
-            <section
-              aria-labelledby="recent-documents-heading"
-              className={cn(hasSearches && "border-t border-border lg:border-l lg:border-t-0")}
-            >
-              <div className="flex min-h-11 items-center justify-between gap-3 border-b border-border bg-surface-2/60 px-4 sm:px-5">
-                <div className="flex min-w-0 items-center gap-2">
-                  <FileText className="h-3.5 w-3.5 shrink-0 text-foreground-muted" aria-hidden />
-                  <h2
-                    id="recent-documents-heading"
-                    className="text-xs font-semibold text-foreground"
+                    <h2
+                      id="recent-searches-heading"
+                      className="text-xs font-semibold text-foreground"
+                    >
+                      Recent searches
+                    </h2>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={onClearSearches}
+                    className="inline-flex h-8 cursor-pointer items-center rounded-[var(--radius-sm)] px-2 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
-                    Recently viewed
-                  </h2>
+                    Clear
+                  </button>
                 </div>
-                <span className="text-xs text-foreground-muted">This browser</span>
-              </div>
-              <div className="divide-y divide-border" aria-label="Recently viewed documents">
-                {visibleDocuments.map((document, index) => {
-                  const returnFocusId = `recent-search-document-${index}`;
-                  return (
-                    <Link
-                      key={`${document.vault}:${document.path}`}
-                      id={returnFocusId}
-                      to={`/vault/${document.vault}/doc/${encodeURIComponent(document.path)}`}
-                      state={documentPreviewState(location, returnFocusId)}
-                      className="group flex min-h-14 items-center gap-3 px-4 py-2.5 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-5"
+                <div
+                  className="divide-y divide-border"
+                  aria-label="Recent searches"
+                >
+                  {visibleSearches.map((search) => (
+                    <button
+                      key={`${search.surface}:${search.mode}:${search.vaults.join(",")}:${search.query}`}
+                      type="button"
+                      onClick={() => onRepeatSearch(search)}
+                      className="group flex min-h-14 w-full cursor-pointer items-center gap-3 px-4 py-2.5 text-left transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-5"
                     >
                       <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface-2 text-foreground-muted transition-colors group-hover:text-link">
-                        <FileText className="h-4 w-4" aria-hidden />
+                        <SearchIcon className="h-4 w-4" aria-hidden />
                       </span>
                       <span className="min-w-0 flex-1">
-                        <span className="block truncate text-sm font-medium text-foreground transition-colors group-hover:text-link">
-                          {document.title}
+                        <span className="block truncate text-sm font-medium text-foreground">
+                          {search.query}
                         </span>
-                        <span className="mt-0.5 block truncate text-xs text-foreground-muted">
-                          {document.vault} · {document.path}
+                        <span className="mt-0.5 flex min-w-0 items-center gap-1.5 text-xs text-foreground-muted">
+                          <span>
+                            {search.mode === "semantic"
+                              ? "Semantic"
+                              : "Literal"}
+                          </span>
+                          <span aria-hidden>·</span>
+                          <span className="truncate">
+                            {search.vaults.length === 0
+                              ? "All vaults"
+                              : search.vaults.length === 1
+                                ? search.vaults[0]
+                                : `${search.vaults.length} vaults`}
+                          </span>
                         </span>
                       </span>
                       <RelativeTime
-                        iso={document.viewedAt}
+                        iso={search.searchedAt}
                         className="hidden shrink-0 text-xs text-foreground-muted sm:block"
                       />
-                    </Link>
-                  );
-                })}
-              </div>
-            </section>
+                    </button>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {hasDocuments && (
+              <section
+                aria-labelledby="recent-documents-heading"
+                className={cn(
+                  hasSearches &&
+                    "border-t border-border lg:border-l lg:border-t-0",
+                )}
+              >
+                <div className="flex min-h-11 items-center justify-between gap-3 border-b border-border bg-surface-2/60 px-4 sm:px-5">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <FileText
+                      className="h-3.5 w-3.5 shrink-0 text-foreground-muted"
+                      aria-hidden
+                    />
+                    <h2
+                      id="recent-documents-heading"
+                      className="text-xs font-semibold text-foreground"
+                    >
+                      Recently viewed
+                    </h2>
+                  </div>
+                  <span className="text-xs text-foreground-muted">
+                    This browser
+                  </span>
+                </div>
+                <div
+                  className="divide-y divide-border"
+                  aria-label="Recently viewed documents"
+                >
+                  {visibleDocuments.map((document, index) => {
+                    const returnFocusId = `recent-search-document-${index}`;
+                    return (
+                      <Link
+                        key={`${document.vault}:${document.path}`}
+                        id={returnFocusId}
+                        to={`/vault/${document.vault}/doc/${encodeURIComponent(document.path)}`}
+                        state={documentPreviewState(location, returnFocusId)}
+                        className="group flex min-h-14 items-center gap-3 px-4 py-2.5 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-5"
+                      >
+                        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface-2 text-foreground-muted transition-colors group-hover:text-link">
+                          <FileText className="h-4 w-4" aria-hidden />
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-sm font-medium text-foreground transition-colors group-hover:text-link">
+                            {document.title}
+                          </span>
+                          <span className="mt-0.5 block truncate text-xs text-foreground-muted">
+                            {document.vault} · {document.path}
+                          </span>
+                        </span>
+                        <RelativeTime
+                          iso={document.viewedAt}
+                          className="hidden shrink-0 text-xs text-foreground-muted sm:block"
+                        />
+                      </Link>
+                    );
+                  })}
+                </div>
+              </section>
             )}
           </div>
         )}
@@ -1343,20 +1454,4 @@ function filterButtonClass(active: boolean) {
       ? "border-border-strong bg-surface-selected text-surface-selected-foreground"
       : "border-border bg-surface text-foreground-muted hover:border-border-strong hover:bg-surface-hover hover:text-foreground",
   );
-}
-
-function groupByType(
-  results: DenseResult[],
-): Record<SourceType, DenseResult[]> {
-  const groups: Record<SourceType, DenseResult[]> = {
-    document: [],
-    table: [],
-    file: [],
-  };
-  for (const result of results) {
-    const type = (result.source_type || "document") as SourceType;
-    if (groups[type]) groups[type].push(result);
-    else groups.document.push(result);
-  }
-  return groups;
 }

@@ -46,7 +46,7 @@ describe("SearchPage · multi-vault scope", () => {
   it("passes the comma-joined ?v= as a string[] to searchDocs", async () => {
     renderAt("/search?q=postgres&v=alpha,beta");
     await waitFor(() =>
-      expect(mockedSearch).toHaveBeenCalledWith("postgres", ["alpha", "beta"], 25),
+      expect(mockedSearch).toHaveBeenCalledWith("postgres", ["alpha", "beta"], 25, expect.any(Object)),
     );
   });
 
@@ -74,12 +74,12 @@ describe("SearchPage · multi-vault scope · interactions (write path)", () => {
     const user = userEvent.setup();
     renderAt("/search?q=x&v=alpha");
     await waitFor(() =>
-      expect(mockedSearch).toHaveBeenCalledWith("x", ["alpha"], 25),
+      expect(mockedSearch).toHaveBeenCalledWith("x", ["alpha"], 25, expect.any(Object)),
     );
     await user.click(await screen.findByRole("button", { name: /Search scope/ }));
     await user.click(await screen.findByRole("menuitemcheckbox", { name: "beta" }));
     await waitFor(() =>
-      expect(mockedSearch).toHaveBeenLastCalledWith("x", ["alpha", "beta"], 25),
+      expect(mockedSearch).toHaveBeenLastCalledWith("x", ["alpha", "beta"], 25, expect.any(Object)),
     );
   });
 
@@ -87,13 +87,13 @@ describe("SearchPage · multi-vault scope · interactions (write path)", () => {
     const user = userEvent.setup();
     renderAt("/search?q=x&v=alpha,beta");
     await waitFor(() =>
-      expect(mockedSearch).toHaveBeenCalledWith("x", ["alpha", "beta"], 25),
+      expect(mockedSearch).toHaveBeenCalledWith("x", ["alpha", "beta"], 25, expect.any(Object)),
     );
     await user.click(
       await screen.findByRole("button", { name: "Remove alpha from search scope" }),
     );
     await waitFor(() =>
-      expect(mockedSearch).toHaveBeenLastCalledWith("x", ["beta"], 25),
+      expect(mockedSearch).toHaveBeenLastCalledWith("x", ["beta"], 25, expect.any(Object)),
     );
   });
 
@@ -104,7 +104,7 @@ describe("SearchPage · multi-vault scope · interactions (write path)", () => {
     await user.click(await screen.findByRole("button", { name: /Search scope/ }));
     await user.click(await screen.findByRole("menuitem", { name: /Clear/ }));
     await waitFor(() =>
-      expect(mockedSearch).toHaveBeenLastCalledWith("x", [], 25),
+      expect(mockedSearch).toHaveBeenLastCalledWith("x", [], 25, expect.any(Object)),
     );
     expect(await screen.findByText("All vaults (3)")).toBeTruthy();
   });
