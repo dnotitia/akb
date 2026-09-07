@@ -20,6 +20,7 @@ from typing import Literal
 from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import ValidationError
+from app.services.search_filters import collection_predicate, escape_like, metadata_matches
 from app.models.document import SearchResponse, SearchResult
 from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.services import sparse_encoder
@@ -237,6 +238,7 @@ class SearchService:
         tags: list[str] | None,
         include_archived: bool,
         source_uris: list[str] | None,
+        doc_types: list[str] | None = None,
     ) -> list[str]:
         conditions = ["r.surface = 'document'", "r.lifecycle = 'live'"]
         params: list = []
@@ -324,10 +326,7 @@ class SearchService:
             metadata = await asyncio.to_thread(_verified_native_metadata, row)
             if doc_type and (metadata.get("type") or "note") != doc_type:
                 continue
-            row_tags = set(metadata.get("tags") or [])
-            if tags and not row_tags.intersection(tags):
-                continue
-            if not include_archived and metadata.get("status", "draft") == "archived":
+            if not metadata_matches(metadata, doc_types, tags, include_archived):
                 continue
             candidates.append(str(row["resource_id"]))
         return candidates
@@ -345,6 +344,8 @@ class SearchService:
         user_id: str | None = None,
         include_archived: bool = False,
         source_uris: list[str] | None = None,
+        doc_types: list[str] | None = None,
+        source_type: Literal["document", "file", "table"] | None = None,
     ) -> SearchResponse:
         """Hybrid search across documents. See module docstring for flow.
 
@@ -417,7 +418,7 @@ class SearchService:
         # pre-upgrade pgvector point carries its vault_id, fall back to the
         # source-id path so a user can't miss their own un-backfilled docs.
         from app.services import vault_backfill
-        use_vault_path = vault_path_eligible(
+        use_vault_path = not (doc_types or source_type or not include_archived) and vault_path_eligible(
             collection=collection, doc_type=doc_type, tags=tags, source_uris=source_uris,
         ) and vault_backfill.is_ready()
 
@@ -483,14 +484,17 @@ class SearchService:
                     conditions.append(f"v.name = ANY(${idx})")
                     params.append(vaults); idx += 1
                 if collection:
-                    conditions.append(f"d.path LIKE ${idx} || '%'")
-                    params.append(collection); idx += 1
+                    conditions.append(collection_predicate("d.path", collection, params))
+                    idx = len(params) + 1
                 if doc_type:
                     conditions.append(f"d.doc_type = ${idx}")
                     params.append(doc_type); idx += 1
                 if tags:
                     conditions.append(f"d.tags && ${idx}")
                     params.append(tags); idx += 1
+                if doc_types:
+                    conditions.append(f"d.doc_type = ANY(${idx}::text[])")
+                    params.append(doc_types); idx += 1
                 acl_sql, acl_params = _vault_acl(idx)
                 if acl_sql:
                     conditions.append(acl_sql)
@@ -507,7 +511,9 @@ class SearchService:
                     conditions.append("d.status != 'archived'")
 
                 where_sql = " AND ".join(conditions) if conditions else "TRUE"
-                if document_source == NATIVE_DOCUMENT_SOURCE:
+                if source_type in {"file", "table"}:
+                    candidate_source_ids = []
+                elif document_source == NATIVE_DOCUMENT_SOURCE:
                     candidate_source_ids = await self._native_document_candidates(
                         conn,
                         user_uuid=user_uuid,
@@ -518,6 +524,7 @@ class SearchService:
                         tags=tags,
                         include_archived=include_archived,
                         source_uris=source_uris,
+                        doc_types=doc_types,
                     )
                 else:
                     rows = await conn.fetch(
@@ -530,10 +537,8 @@ class SearchService:
                     )
                     candidate_source_ids = [str(r["id"]) for r in rows]
 
-                # Tables (skip when doc_type explicitly constrains to a
-                # non-table source). Tags/collection apply to documents
-                # only.
-                if not doc_type or doc_type == "table":
+                # Document metadata filters never admit unrelated files/tables.
+                if (not doc_type or doc_type == "table") and not (doc_types or tags) and source_type in {None, "table"}:
                     t_params: list = []
                     t_conds: list[str] = []
                     if vaults:
@@ -546,13 +551,15 @@ class SearchService:
                     if source_uris:
                         t_conds.append(f"t.id = ANY(${len(t_params) + 1}::uuid[])")
                         t_params.append(src_table_ids)
-                    q = "SELECT t.id FROM vault_tables t JOIN vaults v ON t.vault_id = v.id"
+                    if collection:
+                        t_conds.append(collection_predicate("col.path", collection, t_params))
+                    q = "SELECT t.id FROM vault_tables t JOIN vaults v ON t.vault_id = v.id LEFT JOIN collections col ON col.id = t.collection_id"
                     if t_conds:
                         q += " WHERE " + " AND ".join(t_conds)
                     trows = await conn.fetch(q, *t_params)
                     candidate_source_ids.extend(str(r["id"]) for r in trows)
 
-                if not doc_type or doc_type == "file":
+                if (not doc_type or doc_type == "file") and not (doc_types or tags) and source_type in {None, "file"}:
                     f_params: list = []
                     # Editor attachments are storage implementation details,
                     # never standalone searchable File resources.
@@ -565,8 +572,7 @@ class SearchService:
                         # migration 020 → collection_id FK. Filter via the
                         # joined collections.path with a prefix match, same
                         # semantics as the documents branch above.
-                        f_conds.append(f"c.path LIKE ${len(f_params) + 1} || '%'")
-                        f_params.append(collection)
+                        f_conds.append(collection_predicate("c.path", collection, f_params))
                     acl_sql, acl_params = _vault_acl(len(f_params) + 1)
                     if acl_sql:
                         f_conds.append(acl_sql)
@@ -1239,6 +1245,9 @@ class SearchService:
         count_only: bool = False,
         files_with_matches: bool = False,
         measurement_include_text_files: bool = False,
+        doc_types: list[str] | None = None,
+        tags: list[str] | None = None,
+        include_archived: bool = True,
     ) -> dict:
         """Exact text / regex search across document content.
 
@@ -1278,13 +1287,7 @@ class SearchService:
             try:
                 _re.compile(pattern)
             except _re.error as e:
-                return {
-                    "error": f"Invalid regex pattern: {e}",
-                    "pattern": pattern,
-                    "total_docs": 0,
-                    "total_matches": 0,
-                    "results": [],
-                }
+                raise ValidationError(f"Invalid regex pattern: {e}") from e
 
         vaults = _normalize_vault_scope(vault)  # str | list | None → canonical list | None
         # ACL guard: when no vault is given we MUST have a user_id so the
@@ -1325,6 +1328,7 @@ class SearchService:
                 count_only=count_only,
                 files_with_matches=files_with_matches,
                 include_text_files=measurement_include_text_files,
+                doc_types=doc_types, tags=tags, include_archived=include_archived,
             )
 
         if replace is not None and doc_service is None:
@@ -1346,7 +1350,7 @@ class SearchService:
                     conditions.append(f"c.content LIKE '%' || ${idx} || '%'")
                 else:
                     conditions.append(f"c.content ILIKE '%' || ${idx} || '%'")
-                params.append(pattern)
+                params.append(escape_like(pattern))
             idx += 1
 
             if vaults:
@@ -1368,9 +1372,17 @@ class SearchService:
                 idx += 1
 
             if collection:
-                conditions.append(f"d.path LIKE ${idx} || '%'")
-                params.append(collection)
+                conditions.append(collection_predicate("d.path", collection, params))
+                idx = len(params) + 1
+            if doc_types:
+                conditions.append(f"d.doc_type = ANY(${idx}::text[])")
+                params.append(doc_types)
                 idx += 1
+            if tags:
+                conditions.append(f"d.tags && ${idx}")
+                params.append(tags)
+            if not include_archived:
+                conditions.append("d.status != 'archived'")
 
             where_sql = " AND ".join(conditions)
             # No prefetch cap. The old `LIMIT (limit * 5)` cap was inherited

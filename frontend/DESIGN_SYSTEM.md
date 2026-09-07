@@ -722,9 +722,9 @@ A connected two-row command bar leads the page: the first row owns the strongly
 bounded query field, Semantic / Literal mode, on-demand Filters, and Search
 action; the thinner second row owns Vault scope plus honest loading/result
 status. The remaining height belongs to one independently scrolling,
-full-working-width results ledger. Source-kind and document-type facets stay
-behind the labelled Filters control and appear only after results provide useful
-counts; active filters remain visible through the control's count badge. This
+full-working-width results ledger. Source-kind and document-type filters stay
+behind the labelled Filters control and remain available before searching and
+after zero results; active filters remain visible through the control's count badge. This
 keeps refinement close to the query without allowing a fixed rail to tax every
 result row or compete with the collapsed Collections rail. On narrow screens,
 the first row wraps controls below the query without separating mode from its
@@ -744,13 +744,19 @@ only—never result bodies—and silently disappears when browser storage is not
 available. Each semantic or literal row uses a stable,
 non-zero-padded rank followed by source identity, compact location, one focused
 match context, and a calibrated label or literal match count. Optional backend
-tags progressively add compact result badges and a local tag facet; older
-responses omit both without reserving empty space. Indexed chunk headers and
+tags progressively add compact result badges and optional tag suggestions.
+Tag entry remains available independently of loaded results. Indexed chunk headers and
 markdown list markers are presentation metadata and are cleaned from semantic
 previews, while Literal results keep their source text intact. Raw semantic
 scores are ranking inputs, not percentages, so the UI never presents them as
-confidence or relevance percentages. Filters update the visible ledger without
-re-fetching unless the matching strategy or Vault scope changes.
+confidence or relevance percentages. Filters are URL-backed server predicates:
+source kind, collection (including children), document types, tags and archived
+inclusion all re-fetch before the result limit. Document metadata filters target
+documents only. Literal search uses document-body grep with optional regex and
+case sensitivity; its exact counts are distinct from Semantic's top-K candidate
+counts. Degraded empty responses never appear as a genuine zero-match. Confirmed
+filter changes create browser history entries; pending requests retain the
+previous ledger with explicit busy feedback and discard stale responses.
 Document rows open the route-backed document preview described in the Document
 workspace contract in both Semantic and Literal modes; table and file rows
 continue to open their native resource routes. Closing with Escape, the close
@@ -772,8 +778,8 @@ user-scoped recent global queries beside recently viewed documents, followed by
 the shared suggestions. Recent document history is browser-local and must be
 filtered through the current accessible Vault list before rendering; either
 history block disappears cleanly when no valid entries exist. The source choice
-persists into the result ledger and filters client-side without issuing another
-request. If the selected kind has no matches, the stable empty state provides a
+persists into the result ledger, requests a server-filtered result set and carries
+into the advanced-search URL. If the selected kind has no matches, the stable empty state provides a
 `Show all results` recovery action rather than silently resetting the choice.
 Selecting a document opens the same route-backed preview over the launching
 page; tables and files go directly to their native resource. The full Search route remains
