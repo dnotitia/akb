@@ -76,7 +76,7 @@ class OIDCFixture:
 
     @property
     def metadata_uri(self) -> str:
-        return f"{self.origin.rstrip('/')}/.well-known/openid-configuration"
+        return f"{self.issuer}/.well-known/openid-configuration"
 
     @property
     def health_uri(self) -> str:
@@ -187,7 +187,7 @@ class OIDCFixture:
         async def oidc_health() -> dict[str, object]:
             return {"status": "ready", "issuer": self.issuer, "jwks_key_count": 1}
 
-        @app.get("/.well-known/openid-configuration", include_in_schema=True)
+        @app.get(f"/realms/{self.realm}/.well-known/openid-configuration", include_in_schema=True)
         async def oidc_metadata() -> dict[str, object]:
             return self.metadata()
 

@@ -704,6 +704,7 @@ class FakeFixtureRuntime:
     def __init__(self, scenario="empty"):
         self.reset_count = 0
         self.scenario = scenario
+        self.oidc_fixture = None
 
     def fixture_health(self):
         return {"status": "ready", "scenario": self.scenario, "app_ready": True}
@@ -738,7 +739,7 @@ class FakeFixtureRuntime:
             "redaction_scan": {"private_value_hits": 0, "raw_log_exposed": False},
         }
 
-    def fixture_control(self, action, target, enabled, kind=None):
+    async def fixture_control(self, action, target, enabled, kind=None):
         return {
             "status": "accepted",
             "scenario": self.scenario,
@@ -1265,7 +1266,8 @@ async def test_oidc_profile_serves_jwks_metadata_and_deterministic_variants(tmp_
         transport=httpx.ASGITransport(app=app), base_url=runtime.config.fixture_origin
     ) as client:
         health = await client.get("/oidc/health")
-        metadata = await client.get("/.well-known/openid-configuration")
+        metadata_path = runtime.oidc_fixture.metadata_uri.removeprefix(runtime.config.fixture_origin)
+        metadata = await client.get(metadata_path)
         jwks = await client.get(jwks_path)
         token = await client.post("/oidc/token", json={"variant": "valid"})
         bad = await client.post("/oidc/token", json={"variant": "wrong_issuer"})
