@@ -38,10 +38,20 @@ def test_pg_body_candidate_verifies_one_canonical_utf8_representation():
     )
 
 
-@pytest.mark.parametrize("payload", [b"bad\x00text", b"\xff"])
+@pytest.mark.parametrize("payload", [b"\xff"])
 def test_pg_body_candidate_rejects_non_searchable_bytes(payload: bytes):
     with pytest.raises(ValidationError):
         M1PgBodyStore._verified_bytes(payload)
+
+
+def test_pg_body_candidate_preserves_utf8_nul_bytes():
+    payload = b"before\x00after"
+
+    canonical, digest = M1PgBodyStore._verified_bytes(payload)
+
+    assert canonical == payload
+    assert digest == hashlib.sha256(payload).hexdigest()
+    assert M1PgBodyStore._verify_row(_row(payload)) == payload
 
 
 def test_pg_body_candidate_rejects_oversize_before_text_scan(monkeypatch):

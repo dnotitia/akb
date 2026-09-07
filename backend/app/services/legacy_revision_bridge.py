@@ -548,8 +548,6 @@ class LegacyRevisionBridge:
         if not isinstance(history, list) or not isinstance(raw_activity, Mapping):
             raise InventoryEligibilityError(f"document {resource_id} returned invalid fixed-ref metadata")
         if isinstance(body, bytes):
-            if b"\x00" in body:
-                raise InventoryEligibilityError(f"document {resource_id} body contains NUL bytes")
             try:
                 body.decode("utf-8", errors="strict")
             except UnicodeDecodeError as exc:
@@ -719,6 +717,7 @@ class LegacyRevisionBridge:
                 fixed_ref,
                 requests,
                 include_bodies=False,
+                require_fixed_ref_current=True,
             )
         except FixedRefHistoryError as exc:
             raise InventoryEligibilityError("fixed-ref inventory history could not be read") from exc
@@ -917,8 +916,6 @@ class LegacyRevisionBridge:
         del text
         if len(body) != document.byte_size or hashlib.sha256(body).hexdigest() != document.body_digest:
             raise InventoryEligibilityError(f"document {document.resource_id} body differs from the frozen inventory")
-        if b"\x00" in body:
-            raise InventoryEligibilityError(f"document {document.resource_id} body contains NUL bytes")
         try:
             body.decode("utf-8", errors="strict")
         except UnicodeDecodeError as exc:

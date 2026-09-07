@@ -542,6 +542,81 @@ class NativeRevisionMigrationRepository:
         )
         return True
 
+    async def supersede_unlinked_pending_runs(
+        self,
+        run_ids: Iterable[uuid.UUID],
+    ) -> tuple[uuid.UUID, ...]:
+        """Compensate only all-pending runs not yet linked to a cutover."""
+
+        ordered = sorted(set(run_ids), key=str)
+        superseded: list[uuid.UUID] = []
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                for run_id in ordered:
+                    run = await conn.fetchrow(
+                        """
+                        SELECT run_id, status
+                          FROM native_revision_migration_runs
+                         WHERE run_id = $1
+                         FOR UPDATE
+                        """,
+                        run_id,
+                    )
+                    if run is None or run["status"] != "planned":
+                        continue
+                    if await conn.fetchval(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1
+                              FROM native_revision_cutover_vaults
+                             WHERE migration_run_id = $1
+                        )
+                        """,
+                        run_id,
+                    ):
+                        continue
+                    items = await conn.fetch(
+                        """
+                        SELECT status, reservation_active
+                          FROM native_revision_migration_items
+                         WHERE run_id = $1
+                         FOR UPDATE
+                        """,
+                        run_id,
+                    )
+                    if any(item["status"] != "pending" or not item["reservation_active"] for item in items):
+                        continue
+                    await conn.execute(
+                        """
+                        UPDATE native_revision_migration_items
+                           SET reservation_active = FALSE,
+                               updated_at = NOW()
+                         WHERE run_id = $1
+                           AND status = 'pending'
+                           AND reservation_active
+                        """,
+                        run_id,
+                    )
+                    changed = await conn.fetchval(
+                        """
+                        UPDATE native_revision_migration_runs
+                           SET status = 'superseded'
+                         WHERE run_id = $1
+                           AND status = 'planned'
+                           AND NOT EXISTS (
+                               SELECT 1
+                                 FROM native_revision_cutover_vaults
+                                WHERE migration_run_id = $1
+                           )
+                        RETURNING run_id
+                        """,
+                        run_id,
+                    )
+                    if changed is None:
+                        raise MigrationIntegrityError("orphan migration run became linked during compensation")
+                    superseded.append(run_id)
+        return tuple(superseded)
+
     async def ensure_pending_items(
         self,
         run: MigrationRun,

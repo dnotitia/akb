@@ -23,6 +23,7 @@ from app.repositories.native_revision_cutover_repo import (
 )
 from app.repositories.native_revision_migration_repo import (
     MigrationInventoryDriftError,
+    MigrationRun,
     NativeRevisionMigrationRepository,
 )
 from app.services.native_revision_backfill import NativeRevisionBackfill
@@ -404,39 +405,60 @@ class NativeRevisionCutover:
             raise ValueError("cutover requires at least one eligible manual vault")
 
         prepared: list[CutoverVault] = []
-        for item in eligible:
-            migration_run, _ = await self.backfill.prepare_run(
-                namespace_id=item.namespace_id,
-                fixed_ref=item.fixed_ref,
-                coverage_version=coverage_version,
-            )
-            prepared.append(
-                CutoverVault(
-                    cutover_id=uuid.UUID(int=0),
-                    namespace_id=migration_run.namespace_id,
-                    migration_run_id=migration_run.run_id,
-                    fixed_git_oid=migration_run.fixed_git_oid,
-                    inventory_digest=migration_run.inventory_digest,
-                    status="planned",
-                    verification_digest=None,
-                    applied_at=None,
-                    verified_at=None,
+        try:
+            for item in eligible:
+                migration_run, _ = await self.backfill.prepare_run(
+                    namespace_id=item.namespace_id,
+                    fixed_ref=item.fixed_ref,
+                    coverage_version=coverage_version,
                 )
+                prepared.append(
+                    CutoverVault(
+                        cutover_id=uuid.UUID(int=0),
+                        namespace_id=migration_run.namespace_id,
+                        migration_run_id=migration_run.run_id,
+                        fixed_git_oid=migration_run.fixed_git_oid,
+                        inventory_digest=migration_run.inventory_digest,
+                        status="planned",
+                        verification_digest=None,
+                        applied_at=None,
+                        verified_at=None,
+                    )
+                )
+            files = await self._file_inventory([item.namespace_id for item in eligible])
+            inventory_digest = self._cutover_inventory_digest(
+                vaults=prepared,
+                files=files,
+                exclusions=exclusions,
             )
-        files = await self._file_inventory([item.namespace_id for item in eligible])
-        inventory_digest = self._cutover_inventory_digest(
-            vaults=prepared,
-            files=files,
-            exclusions=exclusions,
-        )
-        run = await self.repository.get_or_create_run(
-            coverage_version=coverage_version,
-            inventory_digest=inventory_digest,
-            vaults=prepared,
-            files=files,
-            exclusions=exclusions,
-        )
+            run = await self.repository.get_or_create_run(
+                coverage_version=coverage_version,
+                inventory_digest=inventory_digest,
+                vaults=prepared,
+                files=files,
+                exclusions=exclusions,
+            )
+        except Exception as exc:
+            try:
+                if prepared:
+                    await self.backfill.repository.supersede_unlinked_pending_runs(
+                        item.migration_run_id for item in prepared
+                    )
+            except Exception as cleanup_exc:
+                exc.add_note(f"failed to compensate unlinked migration plans: {cleanup_exc}")
+            raise
         return await self._state(run)
+
+    async def supersede_orphan_plan(self, migration_run_id: uuid.UUID) -> MigrationRun:
+        """Release one exact never-applied run that has no outer cutover."""
+
+        superseded = await self.backfill.repository.supersede_unlinked_pending_runs([migration_run_id])
+        if superseded != (migration_run_id,):
+            raise CutoverIntegrityError("migration run is not an unlinked all-pending plan")
+        run = await self.backfill.repository.get_run(migration_run_id)
+        if run is None or run.status != "superseded":
+            raise CutoverIntegrityError("orphan migration run supersession was not durable")
+        return run
 
     @staticmethod
     def _validate_text_file(file: CutoverFile, data: bytes) -> str:

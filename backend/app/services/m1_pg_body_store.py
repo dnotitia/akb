@@ -84,9 +84,9 @@ class M1PgBodyStore:
             canonical.decode("utf-8", errors="strict")
         except UnicodeDecodeError as exc:
             raise ValidationError("PostgreSQL text body must be valid UTF-8") from exc
-        if b"\x00" in canonical:
-            raise ValidationError("PostgreSQL text body must not contain NUL bytes")
-
+        # ``canonical_bytes`` is BYTEA, not PostgreSQL TEXT.  Preserve U+0000
+        # because the legacy document API accepts it as valid UTF-8 and native
+        # cutover must remain byte-compatible with those existing Documents.
         digest = hashlib.sha256(canonical).hexdigest()
         if expected_digest is not None and expected_digest != digest:
             raise ValidationError("PostgreSQL body digest does not match expected digest")
@@ -218,8 +218,6 @@ class M1PgBodyStore:
             canonical.decode("utf-8", errors="strict")
         except UnicodeDecodeError as exc:
             raise PgBodyIntegrityError("PostgreSQL body is not valid UTF-8") from exc
-        if b"\x00" in canonical:
-            raise PgBodyIntegrityError("PostgreSQL body contains NUL bytes")
         if row["selected_placement"] != cls.selected_placement:
             raise PgBodyIntegrityError("PostgreSQL body placement mismatch")
         if row["verification_profile"] != cls.verification_profile:
