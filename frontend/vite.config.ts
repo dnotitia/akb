@@ -8,6 +8,7 @@ import path from "path";
 const target = process.env.AKB_FRONTEND_BACKEND_URL || "http://localhost:8000";
 const cacheDir = process.env.AKB_FRONTEND_CACHE_DIR;
 const isHttps = false;
+let mockResetGeneration = 0;
 
 function mockControlPlugin(): Plugin {
   return {
@@ -24,7 +25,13 @@ function mockControlPlugin(): Plugin {
         const origin = `http://${request.headers.host || "127.0.0.1:4173"}`;
         response.setHeader("Content-Type", "application/json");
         if (pathname === "/__akb_mock__/health" && request.method === "GET") {
-          response.end(JSON.stringify({ status: "ready", mode: "mock" }));
+          response.end(
+            JSON.stringify({
+              status: "ready",
+              mode: "mock",
+              reset_generation: mockResetGeneration,
+            }),
+          );
           return;
         }
         if (pathname === "/__akb_mock__/discover" && request.method === "GET") {
@@ -56,7 +63,15 @@ function mockControlPlugin(): Plugin {
           return;
         }
         if (pathname === "/__akb_mock__/reset" && request.method === "POST") {
-          response.end(JSON.stringify({ status: "ready", mode: "mock", scenario: "empty" }));
+          mockResetGeneration += 1;
+          response.end(
+            JSON.stringify({
+              status: "ready",
+              mode: "mock",
+              scenario: "empty",
+              reset_generation: mockResetGeneration,
+            }),
+          );
           return;
         }
         response.statusCode = 404;

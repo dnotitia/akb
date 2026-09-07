@@ -13,9 +13,29 @@ type MockUser = typeof fixtureUser & { auth_method: "local" };
 
 const initialUser: MockUser = { ...fixtureUser, auth_method: "local" };
 let user: MockUser = { ...initialUser };
+let appliedResetGeneration = 0;
 
 function resetState() {
   user = { ...initialUser };
+}
+
+async function syncPublicReset() {
+  try {
+    const response = await fetch("/__akb_mock__/health", { cache: "no-store" });
+    if (!response.ok) return;
+    const body = (await response.json()) as { reset_generation?: unknown };
+    const generation = body.reset_generation;
+    if (
+      typeof generation === "number" &&
+      Number.isInteger(generation) &&
+      generation > appliedResetGeneration
+    ) {
+      resetState();
+      appliedResetGeneration = generation;
+    }
+  } catch {
+    // The mock API remains usable if the optional control probe is unavailable.
+  }
 }
 
 async function jsonBody(request: Request): Promise<Record<string, unknown>> {
@@ -24,12 +44,12 @@ async function jsonBody(request: Request): Promise<Record<string, unknown>> {
 
 const handlers = [
   http.get(`${API}/auth/config`, () => HttpResponse.json(localAuthConfig)),
-  http.post("/__akb_mock__/reset", () => {
-    resetState();
-    return HttpResponse.json({ status: "ready", mode: "mock", scenario: "empty" });
+  http.get(`${API}/auth/me`, async () => {
+    await syncPublicReset();
+    return HttpResponse.json(user);
   }),
-  http.get(`${API}/auth/me`, () => HttpResponse.json(user)),
   http.post(`${API}/auth/register`, async ({ request }) => {
+    await syncPublicReset();
     const body = await jsonBody(request);
     user = {
       ...user,
@@ -40,8 +60,12 @@ const handlers = [
     };
     return HttpResponse.json({ token: MOCK_TOKEN });
   }),
-  http.post(`${API}/auth/login`, () => HttpResponse.json({ token: MOCK_TOKEN })),
+  http.post(`${API}/auth/login`, async () => {
+    await syncPublicReset();
+    return HttpResponse.json({ token: MOCK_TOKEN });
+  }),
   http.patch(`${API}/auth/me`, async ({ request }) => {
+    await syncPublicReset();
     const body = await jsonBody(request);
     user = {
       ...user,
@@ -106,6 +130,7 @@ const worker = setupWorker(...handlers);
 
 export async function startMockWorker() {
   resetState();
+  appliedResetGeneration = 0;
   await worker.start({
     onUnhandledRequest: "bypass",
     serviceWorker: { url: "/mockServiceWorker.js" },

@@ -25,7 +25,7 @@ const PASS = "test-pass-1234";
 
 test.describe.configure({ mode: "serial" });
 
-test("signup → land in shell → profile edit round-trip", async ({ page }) => {
+test("signup → land in shell → profile edit round-trip", async ({ page, request }) => {
   // ── 1. Register ────────────────────────────────────────────
   await page.goto("/auth");
   await page.getByRole("tab", { name: /^register$/i }).click();
@@ -51,15 +51,13 @@ test("signup → land in shell → profile edit round-trip", async ({ page }) =>
   });
 
   if (process.env.AKB_FE_E2E_MODE === "mock") {
-    const resetResult = await page.evaluate(async () => {
-      const response = await fetch("/__akb_mock__/reset", { method: "POST" });
-      const me = await fetch("/api/v1/auth/me", { cache: "no-store" }).then((result) => result.json());
-      return { status: response.status, me };
+    const resetResponse = await request.post("/__akb_mock__/reset", {
+      data: { scenario: "empty" },
     });
-    expect(resetResult.status).toBe(200);
-    expect(resetResult.me.display_name).toBe("JY Kim");
-    await page.goto("/");
-    await page.goto("/settings?tab=profile");
+    expect(resetResponse.status()).toBe(200);
+    const resetBody = await resetResponse.json();
+    expect(resetBody.reset_generation).toBeGreaterThan(0);
+    await page.reload();
     await expect(page.getByLabel("DISPLAY NAME")).toHaveValue("JY Kim", {
       timeout: 5_000,
     });

@@ -84,9 +84,11 @@ Playwright e2e specs live in `e2e/`. Choose `mock` or `real` explicitly:
 - `pnpm run test:e2e:mock` starts Vite with the browser MSW worker, exposes
   mock readiness/discovery/reset at `/__akb_mock__/health`,
   `/__akb_mock__/discover`, and `POST /__akb_mock__/reset`, and fails
-  unhandled `/api` requests with a 501 response. A source-blind validator
-  calls the public reset before creating a fresh browser context; the browser
-  worker starts each context from the same deterministic fixture state.
+  unhandled `/api` requests with a 501 response. The public reset increments
+  the Vite run's reset generation; the browser worker reads that generation
+  before the next auth request and resets its in-memory fixture state, so an
+  external HTTP client can reset the active browser run without reaching into
+  the page.
 - `AKB_FRONTEND_URL=<services.web.origin> pnpm run test:e2e:real` consumes the
   common schema-v2 descriptor. The backend, fixture reset, and process shutdown
   remain owned by the repository runtime.
