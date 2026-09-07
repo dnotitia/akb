@@ -276,9 +276,10 @@ to the descriptor, logs, argv, or committed files.
 contain runtime lifecycle logic. On a clean Ubuntu 24.04 host it:
 
 1. verifies the base image and installs `curl`/CA certificates as needed;
-2. persists and immediately applies `net.ipv4.tcp_mtu_probing=1` through
+2. persists and immediately applies `net.ipv4.tcp_mtu_probing=2` through
    `/etc/sysctl.d/99-akb-e2e-tcp-mtu-probing.conf` before any network download;
-   failure is a provisioning failure and the bootstrap stops;
+   mode 2 keeps probing proactively enabled for VPN/Docker Hub black-hole
+   paths, and failure is a provisioning failure that stops the bootstrap;
 3. installs the Ubuntu archive's `nodejs`/`npm` packages and verifies both
    executables before any selected stdio profile is validated;
 4. installs and starts Docker Engine plus Compose v2 idempotently;
