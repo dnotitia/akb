@@ -35,6 +35,8 @@ async def search_documents(
     collection: str | None = Query(None),
     type: str | None = Query(None),
     tags: list[str] | None = Query(None),
+    doc_types: list[str] | None = Query(None, description="Document types (OR); intersects legacy type."),
+    source_type: Literal["document", "file", "table"] | None = Query(None),
     limit: int = Query(10, ge=1, le=100),
     include_archived: bool = Query(False, description="Include archived documents (hidden from search by default)."),
     source_uris: list[str] | None = Query(
@@ -49,6 +51,7 @@ async def search_documents(
         doc_type=type, tags=tags, limit=limit,
         user_id=user.user_id, include_archived=include_archived,
         source_uris=source_uris,
+        doc_types=doc_types, source_type=source_type,
     )
 
 
@@ -88,6 +91,9 @@ async def grep_documents(
     collection: str | None = Query(None),
     regex: bool = Query(False),
     case_sensitive: bool = Query(False),
+    doc_types: list[str] | None = Query(None),
+    tags: list[str] | None = Query(None),
+    include_archived: bool = Query(True, description="Legacy default includes archived documents; the search UI explicitly excludes them."),
     limit: int = Query(20, ge=1, le=100),
     count_only: bool = Query(False, description="grep -c — per-doc counts + total"),
     files_with_matches: bool = Query(False, description="grep -l — URIs with matches"),
@@ -103,6 +109,7 @@ async def grep_documents(
         count_only=count_only, files_with_matches=files_with_matches,
         measurement_include_text_files=measurement_include_text_files,
         user_id=user.user_id,
+        doc_types=doc_types, tags=tags, include_archived=include_archived,
     )
     response.setdefault("regex", regex)
     return {"kind": "grep", **response}

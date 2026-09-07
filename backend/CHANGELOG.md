@@ -7,6 +7,16 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Applied search filters before result limits
+
+REST search now supports repeated document types and explicit resource kinds.
+Collection scope is boundary-aware for documents, files and tables, and document
+metadata filters no longer admit unrelated resources. Grep accepts document types,
+tags and explicit archived inclusion, preserves its legacy archive default, and
+reports invalid regex patterns as validation errors. Native and standard search
+paths share metadata semantics. The web Search workspace uses URL-backed server
+filters, regex/case options and distinct incomplete, truncated and empty states.
+
 ### Made globally reserved Vault-name conflicts non-disclosing
 
 Vault creation now returns the same `vault_name_unavailable` conflict for an
