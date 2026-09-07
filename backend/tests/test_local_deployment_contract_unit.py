@@ -128,8 +128,8 @@ def test_demo_state_honors_first_install_input_and_preserves_it(tmp_path):
 @pytest.fixture
 def demo_env():
     return {
-        "DB_PASSWORD": "test-db",
-        "SYSTEM_HMAC_SECRET": "test-hmac",
+        "DB_PASSWORD": "test-db",  # pragma: allowlist secret -- synthetic test fixture
+        "SYSTEM_HMAC_SECRET": "test-hmac",  # pragma: allowlist secret -- synthetic test fixture
         "S3_ACCESS_KEY": "test-access",
         "S3_SECRET_KEY": 'test-quote"\\\nvalue',
         "EMBED_API_KEY": 'test-key"\\\nvalue',
@@ -150,7 +150,7 @@ def test_demo_yaml_preserves_values_and_mounted_overrides(tmp_path, demo_env):
     assert app["embed_dimensions"] == 768
     assert app["rerank_enabled"] is True
     assert app["search_prefetch"] == 80
-    assert private["embed_api_key"] == "mounted-test-key"
+    assert private["embed_api_key"] == "mounted-test-key"  # pragma: allowlist secret -- synthetic fixture
     assert private["s3_secret_key"] == demo_env["S3_SECRET_KEY"]
     assert app["s3_public_url"] == app["public_base_url"]
     assert (output / "secret.yaml").stat().st_mode & 0o777 == 0o600
