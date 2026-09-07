@@ -36,7 +36,7 @@ test("signup → land in shell → profile edit round-trip", async ({ page }) =>
 
   // The authenticated shell sets up nav links — "Home" is the
   // first NavLink in components/layout.tsx.
-  await expect(page.getByRole("link", { name: "Home" })).toBeVisible({
+  await expect(page.getByRole("link", { name: "Home", exact: true })).toBeVisible({
     timeout: 10_000,
   });
 
