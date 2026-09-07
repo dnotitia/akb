@@ -1,7 +1,8 @@
 # Local Compose deployment
 
-The repository root `docker-compose.yaml` is the only service definition.
-`deploy/docker-compose.yaml` includes it for compatibility (Compose 2.20+).
+The repository root `docker-compose.yaml` is the only base Compose entry point.
+Run `docker compose up -d` from the repository root. On a fresh installation,
+Compose creates its named volumes; subsequent starts reuse them.
 Follow the root README to copy the YAML configuration, generate persistent
 local-session keys, and provision the administrator.
 
@@ -28,18 +29,36 @@ volume names (`postgres_data`, `vault_data`, `minio_data`) are unchanged.
 
 The historical `deploy/docker-compose.yaml` used `pgdata` and `vaultdata`,
 database service `db`, and environment variables no longer read by AKB.
-Its compatibility entry point maps the new logical volume keys to the existing
-`<project>_pgdata` and `<project>_vaultdata` names automatically. Keep the same
-Compose project name. These are external volumes: existing legacy Compose
-labels are accepted, and a missing volume fails instead of silently creating
-an empty replacement. Use the root entry point for a fresh installation.
-Before upgrading, back up the database and Git data and
-prepare the YAML files and persistent local-session keys using the existing
-database credential. If your old volume names were customized, preserve those
-names with an operator-owned override. Switching to the root entry point changes
-the default volume names; continue using the compatibility entry point until
-you explicitly map your existing volumes. No data migration is performed.
-Existing volumes are never deleted by this change. Do not use `down -v`.
+That obsolete entry point has been removed. Its deletion does not delete Docker
+volumes, but the root entry point uses different default volume names. Do not
+start an existing installation against new empty volumes unintentionally.
+
+Before switching, back up the database and Git data, stop the old application
+processes, and identify the actual volume names with `docker volume ls` and
+`docker volume inspect`. Prepare the YAML files and persistent local-session
+keys using the existing database credential. Preserve existing keys if present.
+Translate the old environment settings into the current YAML setting names.
+
+For this one-time transition, create an operator-owned override outside the
+repository, replacing both placeholders with the verified existing volume names:
+
+```yaml
+volumes:
+  postgres_data:
+    external: true
+    name: REPLACE_WITH_EXISTING_DATABASE_VOLUME
+  vault_data:
+    external: true
+    name: REPLACE_WITH_EXISTING_GIT_VOLUME
+```
+
+From the repository root, use
+`docker compose -f docker-compose.yaml -f /absolute/path/legacy-volumes.yaml up -d`.
+Continue supplying that override on subsequent Compose operations. The explicit
+external mappings are only for existing installations, not fresh installs.
+Verify the expected vaults and documents before retiring the old containers;
+never run both application stacks against the same data concurrently.
+No data is migrated or deleted automatically. Do not use `down -v`.
 
 The Keycloak and Qdrant overlays remain optional. Keycloak still requires the
 SSO settings and persistent session encryption key documented in its overlay;

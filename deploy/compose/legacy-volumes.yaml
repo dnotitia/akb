@@ -1,9 +1,0 @@
-# Applied within the compatibility include, before resources are imported.
-# The root Compose entry point retains its own existing volume names.
-volumes:
-  postgres_data:
-    external: true
-    name: ${COMPOSE_PROJECT_NAME}_pgdata
-  vault_data:
-    external: true
-    name: ${COMPOSE_PROJECT_NAME}_vaultdata

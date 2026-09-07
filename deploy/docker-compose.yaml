@@ -1,7 +1,0 @@
-# Compatibility entry point (Docker Compose >= 2.20).
-# The root file owns the runtime definition; do not copy services here.
-# Existing installations: see deploy/compose/README.md before changing volumes.
-include:
-  - path:
-      - ../docker-compose.yaml
-      - ./compose/legacy-volumes.yaml

@@ -170,7 +170,7 @@ def test_demo_rejects_infrastructure_override_without_exposing_value(tmp_path, d
     assert "do-not-print-this" not in str(failure.value)
 
 
-def test_compose_entrypoints_resolve_same_services():
+def test_root_compose_creates_managed_volumes_for_fresh_installations():
     import json
 
     if not shutil.which("docker"):
@@ -185,11 +185,9 @@ def test_compose_entrypoints_resolve_same_services():
         )
 
     root = render("docker-compose.yaml")
-    legacy = render("deploy/docker-compose.yaml")
-    assert root["services"] == legacy["services"]
+    assert not (ROOT / "deploy/docker-compose.yaml").exists()
+    assert not (ROOT / "deploy/compose/legacy-volumes.yaml").exists()
     assert root["volumes"]["postgres_data"]["name"] == "akb-contract_postgres_data"
     assert root["volumes"]["vault_data"]["name"] == "akb-contract_vault_data"
-    assert legacy["volumes"]["postgres_data"]["name"] == "akb-contract_pgdata"
-    assert legacy["volumes"]["vault_data"]["name"] == "akb-contract_vaultdata"
-    assert legacy["volumes"]["postgres_data"]["external"] is True
-    assert legacy["volumes"]["vault_data"]["external"] is True
+    for volume in root["volumes"].values():
+        assert not volume.get("external", False)
