@@ -1,0 +1,12 @@
+.git
+.agents
+.codex
+**/node_modules
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/config/app.yaml
+**/config/secret.yaml
+**/config/local-session
+deploy/k8s/internal
+frontend/dist
