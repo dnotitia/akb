@@ -77,8 +77,8 @@ jobs:
           path: ${{ runner.temp }}/akb-e2e-runtime/logs
           if-no-files-found: ignore
 
-  frontend-runtime:
-    name: frontend runtime smoke
+  frontend-e2e:
+    name: frontend e2e
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -111,7 +111,7 @@ jobs:
         working-directory: frontend
         run: pnpm run build
 
-      - name: Install Chromium for the existing smoke
+      - name: Install Chromium for frontend E2E
         working-directory: frontend
         run: pnpm exec playwright install --with-deps chromium
 
@@ -126,7 +126,7 @@ jobs:
           uv run --locked --project backend python -c \
             'import sys; assert sys.version_info[:2] == (3, 14), sys.version'
 
-      - name: Run existing browser smoke on the common runtime
+      - name: Run frontend E2E tests on the common runtime
         env:
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/akb-fe-runtime-python
           UV_CACHE_DIR: ${{ runner.temp }}/akb-fe-runtime-uv-cache
