@@ -13,9 +13,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from mcp import types as mcp_types
 
 import tests.mcp_e2e.conftest as mcp_conftest
 from tests.mcp_e2e.conftest import mcp_client as mcp_client_fixture
+from tests.mcp_e2e.test_product_e2e import _call_json as product_call_json
 from tests.mcp_e2e.runtime import RuntimeContext, RuntimeDescriptor
 
 
@@ -175,6 +177,28 @@ def _runtime_context() -> RuntimeContext:
         pat="akb_test_pat",
         secrets=("fixture-user", "fixture-pass", "akb_test_pat"),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sdk_is_error", [False, True])
+async def test_product_error_envelope_does_not_require_sdk_is_error(
+    sdk_is_error: bool,
+) -> None:
+    class RecordingClient:
+        async def call_tool(self, _name: str, _arguments: dict[str, Any]) -> mcp_types.CallToolResult:
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(text='{"error":"denied","code":"forbidden"}')],
+                isError=sdk_is_error,
+            )
+
+    result = await product_call_json(
+        RecordingClient(),  # type: ignore[arg-type]
+        _runtime_context(),
+        "akb_browse",
+        {"vault": "missing"},
+        expect_error=True,
+    )
+    assert result == {"error": "denied", "code": "forbidden"}
 
 
 class _RecordingHttpClient:

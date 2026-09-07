@@ -44,19 +44,25 @@ async def _call_json(
     except Exception as exc:
         pytest.fail(f"scenario={SCENARIO} operation={operation}: {redact_error(exc, runtime_session.secrets)}")
 
-    if bool(result.is_error) != expect_error:
-        state = "error" if result.is_error else "success"
-        pytest.fail(
-            f"scenario={SCENARIO} operation={operation}: expected "
-            f"{('an error' if expect_error else 'success')}, got {state}"
-        )
-
     try:
         public = json.loads(_text_content(result, operation))
     except (TypeError, ValueError) as exc:
         pytest.fail(f"scenario={SCENARIO} operation={operation}: tool returned invalid public JSON: {exc}")
     if not isinstance(public, dict):
         pytest.fail(f"scenario={SCENARIO} operation={operation}: public result is not an object")
+
+    # The HTTP MCP backend returns product failures as a JSON error envelope;
+    # the SDK's is_error flag is not guaranteed to mirror that application
+    # payload. Keep the shell suite's public error-envelope contract while
+    # still rejecting protocol-level failures on successful calls.
+    if expect_error:
+        if "error" not in public:
+            state = "SDK error" if result.is_error else "success"
+            pytest.fail(
+                f"scenario={SCENARIO} operation={operation}: expected an error envelope, got {state}"
+            )
+    elif result.is_error:
+        pytest.fail(f"scenario={SCENARIO} operation={operation}: tool returned an SDK error")
     return public
 
 
