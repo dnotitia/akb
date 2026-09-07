@@ -16,7 +16,7 @@
 //
 // Run locally:
 //   docker compose up -d
-//   cd frontend && pnpm exec playwright test
+//   cd frontend && pnpm run test:e2e:real
 import { test, expect } from "@playwright/test";
 
 const RUN = Date.now();
@@ -50,10 +50,12 @@ test("signup → land in shell → profile edit round-trip", async ({ page }) =>
     timeout: 5_000,
   });
 
-  await page.reload();
-  await expect(page.getByLabel("DISPLAY NAME")).toHaveValue(`${USER} Renamed`, {
-    timeout: 5_000,
-  });
+  if (process.env.AKB_FE_E2E_MODE === "real") {
+    await page.reload();
+    await expect(page.getByLabel("DISPLAY NAME")).toHaveValue(`${USER} Renamed`, {
+      timeout: 5_000,
+    });
+  }
 });
 
 test("logged-out user redirects to /auth (layout auth gate)", async ({

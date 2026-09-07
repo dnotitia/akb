@@ -131,7 +131,7 @@ uv run --locked --project backend python \
 ```
 
 Use `services.web.origin` from the ready schema-v2 descriptor as
-`AKB_FRONTEND_URL` for `cd frontend && pnpm exec playwright test`. The
+`AKB_FRONTEND_URL` for `cd frontend && pnpm run test:e2e:real`. The
 frontend flag is opt-in so the existing backend/MCP `gate` and `serve` paths
 keep their current process and dependency requirements.
 

@@ -247,7 +247,7 @@ uv run --locked --project backend python \
 
 The first stdout line containing the ready schema-v2 JSON is the public
 descriptor. Set `AKB_FRONTEND_URL` to its `services.web.origin` when running
-the existing browser smoke (`cd frontend && pnpm exec playwright test`). Stop
+the existing browser smoke (`cd frontend && pnpm run test:e2e:real`). Stop
 the foreground command with SIGINT/SIGTERM; the supervisor then cleans the
 frontend, backend, embedding process, fixture control, and dependency Compose
 resources for that run only.

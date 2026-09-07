@@ -23,18 +23,27 @@ window.addEventListener("vite:preloadError", (event) => {
   window.location.reload();
 });
 
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: { staleTime: 30_000, retry: 1, refetchOnWindowFocus: false },
-  },
-});
+async function bootstrap() {
+  if (import.meta.env.VITE_AKB_TEST_MODE === "mock") {
+    const { startMockWorker } = await import("./mocks/browser");
+    await startMockWorker();
+  }
 
-createRoot(document.getElementById("root")!).render(
-  <StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
-        <AppRoutes />
-      </BrowserRouter>
-    </QueryClientProvider>
-  </StrictMode>
-);
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { staleTime: 30_000, retry: 1, refetchOnWindowFocus: false },
+    },
+  });
+
+  createRoot(document.getElementById("root")!).render(
+    <StrictMode>
+      <QueryClientProvider client={queryClient}>
+        <BrowserRouter>
+          <AppRoutes />
+        </BrowserRouter>
+      </QueryClientProvider>
+    </StrictMode>,
+  );
+}
+
+void bootstrap();

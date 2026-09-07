@@ -19,7 +19,9 @@
     "test:watch": "vitest",
     "lint": "eslint src",
     "typecheck": "tsc --noEmit",
-    "test:e2e": "playwright test"
+    "test:e2e": "AKB_FE_E2E_MODE=real playwright test",
+    "test:e2e:mock": "AKB_FE_E2E_MODE=mock playwright test",
+    "test:e2e:real": "AKB_FE_E2E_MODE=real playwright test"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

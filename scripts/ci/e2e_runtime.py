@@ -1495,6 +1495,7 @@ class E2ERuntime:
         log_path: Path,
         check: bool = True,
         stdin_data: bytes | None = None,
+        environment: dict[str, str] | None = None,
     ) -> int:
         log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with log_path.open("ab", buffering=0) as handle:
@@ -1502,7 +1503,7 @@ class E2ERuntime:
             process = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=str(self.config.runtime_root),
-                env=self._child_environment(),
+                env=self._child_environment(environment),
                 stdin=asyncio.subprocess.PIPE if stdin_data is not None else asyncio.subprocess.DEVNULL,
                 stdout=handle,
                 stderr=handle,
@@ -3645,11 +3646,35 @@ class E2ERuntime:
                 if raw_returncode is None:
                     raw_returncode = await wait_task
 
-                return shell_exit_code(raw_returncode)
+                suite_result = shell_exit_code(raw_returncode)
+                if suite_result != 0 or not self.config.frontend_enabled or self._stop_event.is_set():
+                    return suite_result
+
+                await self._run_frontend_smoke()
+                return suite_result
             finally:
                 stop_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await stop_task
+
+    async def _run_frontend_smoke(self) -> None:
+        try:
+            await self._run_logged_command(
+                [
+                    "pnpm",
+                    "--dir",
+                    str(self.config.frontend_dir),
+                    "run",
+                    "test:e2e:real",
+                ],
+                log_path=self.config.logs_dir / "frontend-e2e.log",
+                environment={
+                    "AKB_FRONTEND_URL": self.config.frontend_origin,
+                    "CI": "1",
+                },
+            )
+        except ProvisioningFailure as exc:
+            raise ProductAssertionFailure("frontend browser smoke failed") from exc
 
     async def _stop_fixture_control(self) -> None:
         if self._fixture_server is not None:

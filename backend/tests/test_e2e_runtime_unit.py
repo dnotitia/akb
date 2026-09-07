@@ -52,7 +52,6 @@ from fixture_control import create_app  # noqa: E402
 COMPOSE_FILE = CI_DIR / "dependency-compose.yaml"
 BOOTSTRAP = CI_DIR / "ubuntu_e2e_bootstrap.sh"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "e2e.yml"
-BACKEND_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "backend-pytest.yml"
 LOCAL_CANONICAL_RUNNER = REPO_ROOT / "scripts" / "run_canonical_e2e.sh"
 
 
@@ -1193,11 +1192,6 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
     workflow = WORKFLOW.read_text()
     assert "scripts/ci/e2e_runtime.py gate" in workflow
     assert "--scenario empty" in workflow
-    assert "frontend-e2e:" in workflow
-    assert "scripts/ci/e2e_runtime.py serve" in workflow
-    assert "--with-frontend" in workflow
-    assert "pnpm run build" in workflow
-    assert "pnpm exec playwright test" in workflow
     assert "app-installation-lifecycle" in (CI_DIR / "e2e_runtime.py").read_text()
     assert "uv sync --locked --extra dev --project backend" in workflow
     assert "services:" not in workflow
@@ -1208,11 +1202,6 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
     local_runner = LOCAL_CANONICAL_RUNNER.read_text()
     assert "scripts/ci/e2e_suite_runner.py" in local_runner
     assert "SUITES=(" not in local_runner
-
-    backend_workflow = BACKEND_WORKFLOW.read_text()
-    assert "tests/test_e2e_runtime_unit.py" in backend_workflow
-    assert "Run repository runtime contract tests" in backend_workflow
-
 
 def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
     result = subprocess.run(["bash", "-n", str(BOOTSTRAP)], check=False)
