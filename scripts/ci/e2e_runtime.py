@@ -1346,8 +1346,8 @@ class E2ERuntime:
         required: tuple[Path, ...] = (
             self.config.backend_dir / "uv.lock",
             self.config.backend_dir / "pyproject.toml",
-                self.config.runtime_scripts_dir / "embed_stub.py",
-                self.config.runtime_scripts_dir / "e2e_suite_runner.py",
+            self.config.runtime_scripts_dir / "embed_stub.py",
+            self.config.runtime_scripts_dir / "e2e_suite_runner.py",
         )
         if self.profile.needs_stdio:
             required += (
@@ -1359,7 +1359,6 @@ class E2ERuntime:
                 self.config.frontend_dir / "package.json",
                 self.config.frontend_dir / "index.html",
                 self.config.frontend_dir / "vite.config.ts",
-                self.config.frontend_dir / "node_modules" / ".bin" / "vite",
             )
         missing = [str(path) for path in required if not path.is_file()]
         if missing:
@@ -1383,8 +1382,13 @@ class E2ERuntime:
                 raise BlockedRuntimeConfig("stdio capability requires packages/akb-mcp-client")
         if self.profile.needs_oidc and self.oidc_fixture is None:
             raise BlockedRuntimeConfig("OIDC capability was selected without its fixture")
-        if self.config.frontend_enabled and shutil.which("node") is None:
-            raise BlockedRuntimeConfig("frontend runtime requires the installed Node.js toolchain")
+        if self.config.frontend_enabled:
+            missing = [name for name in ("node", "pnpm") if shutil.which(name) is None]
+            if missing:
+                raise BlockedRuntimeConfig(
+                    "frontend runtime requires the installed frontend toolchain: "
+                    + ", ".join(missing)
+                )
 
     def _write_config(self) -> None:
         import yaml
@@ -1700,16 +1704,19 @@ class E2ERuntime:
         )
 
     async def _start_frontend(self) -> None:
-        vite = self.config.frontend_dir / "node_modules" / ".bin" / "vite"
+        pnpm = shutil.which("pnpm")
+        if pnpm is None:
+            raise BlockedRuntimeConfig("frontend runtime requires pnpm")
         self.config.frontend_cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.config.frontend_cache_dir, 0o700)
         await self._spawn_host_process(
             "frontend",
             [
-                str(vite),
+                pnpm,
+                "--dir",
                 str(self.config.frontend_dir),
-                "--config",
-                str(self.config.frontend_dir / "vite.config.ts"),
+                "run",
+                "dev",
                 "--host",
                 self.config.frontend_host,
                 "--port",

@@ -118,8 +118,9 @@ The supervisor has two modes:
   processes and dependency resources.
 - `serve`: starts the same stack, prints the ready descriptor, and remains in
   the foreground until SIGINT/SIGTERM. Pass `--with-frontend` to also start
-  the existing Vite SPA on `--frontend-port` (default `3000`), with its `/api`
-  and `/mcp` proxy pointed at this run's backend origin. The fixture's
+  the existing frontend package's `pnpm run dev` contract on `--frontend-port`
+  (default `3000`), with its `/api` and `/mcp` proxy pointed at this run's
+  backend origin. The fixture's
   `POST /reset` performs a safe empty reset and waits for backend readiness
   again; the frontend process remains owned by the same serve lifecycle.
 

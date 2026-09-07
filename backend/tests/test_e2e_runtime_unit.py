@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import shutil
 import stat
 import subprocess
 import sys
@@ -180,6 +181,14 @@ def test_frontend_runtime_requires_explicit_flag_and_supports_isolated_port():
     assert configured.frontend_port == 3017
 
 
+def test_frontend_owns_package_script_and_toolchain_contract():
+    package = json.loads((REPO_ROOT / "frontend" / "package.json").read_text())
+
+    assert package["packageManager"] == "pnpm@11.21.0"
+    assert package["engines"]["node"] == "22.19.0"
+    assert package["scripts"]["dev"] == "vite"
+
+
 def test_runtime_assets_live_in_repository_common_layer():
     common_runtime = REPO_ROOT / "scripts" / "ci"
     backend_runtime = REPO_ROOT / "backend" / "scripts" / "ci"
@@ -231,10 +240,11 @@ async def test_frontend_start_uses_private_root_and_per_run_backend_target(tmp_p
     assert name == "frontend"
     assert log_name == "frontend.log"
     assert command == [
-        str(REPO_ROOT / "frontend" / "node_modules" / ".bin" / "vite"),
+        shutil.which("pnpm"),
+        "--dir",
         str(REPO_ROOT / "frontend"),
-        "--config",
-        str(REPO_ROOT / "frontend" / "vite.config.ts"),
+        "run",
+        "dev",
         "--host",
         "127.0.0.1",
         "--port",
@@ -1207,8 +1217,9 @@ def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
     assert "app-installation-lifecycle" in text
     assert "--with-frontend" in text
     assert "pnpm install --frozen-lockfile" in text
-    assert "node@22.19.0 pnpm@11.21.0" in text
-    assert '"${SUDO[@]}" npm install --global --prefix /usr/local node@22.19.0 pnpm@11.21.0' in text
+    assert "FRONTEND_PACKAGE_MANAGER" in text
+    assert "FRONTEND_NODE_VERSION" in text
+    assert '"node@$FRONTEND_NODE_VERSION" "pnpm@$FRONTEND_PNPM_VERSION"' in text
     assert "command -v pnpm" in text
     assert 'apt-get install -y nodejs npm' in text
     assert 'command -v node' in text

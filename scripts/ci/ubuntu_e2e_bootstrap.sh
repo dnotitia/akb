@@ -184,20 +184,41 @@ case "$PYTHON_VERSION" in
 esac
 
 if [ "$WITH_FRONTEND" -eq 1 ]; then
-  # Vite 8 requires a modern Node runtime. Keep the frontend path explicit
-  # and reproducible without changing the default backend/MCP bootstrap.
-  "${SUDO[@]}" npm install --global --prefix /usr/local node@22.19.0 pnpm@11.21.0 \
+  FRONTEND_PACKAGE_JSON="$CHECKOUT/frontend/package.json"
+  [ -f "$FRONTEND_PACKAGE_JSON" ] \
+    || die "frontend package.json is required for frontend toolchain discovery"
+  FRONTEND_NODE_VERSION=$(node -e \
+    'const fs=require("fs"); const p=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(p.engines?.node ?? "")' \
+    "$FRONTEND_PACKAGE_JSON") \
+    || die "frontend Node.js version could not be read from package.json"
+  FRONTEND_PACKAGE_MANAGER=$(node -e \
+    'const fs=require("fs"); const p=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(p.packageManager ?? "")' \
+    "$FRONTEND_PACKAGE_JSON") \
+    || die "frontend package manager could not be read from package.json"
+  case "$FRONTEND_PACKAGE_MANAGER" in
+    pnpm@*) FRONTEND_PNPM_VERSION="${FRONTEND_PACKAGE_MANAGER#pnpm@}" ;;
+    *) die "frontend packageManager must declare a pinned pnpm version" ;;
+  esac
+  [ -n "$FRONTEND_NODE_VERSION" ] \
+    || die "frontend engines.node must declare a pinned Node.js version"
+  [ -n "$FRONTEND_PNPM_VERSION" ] \
+    || die "frontend packageManager must declare a pinned pnpm version"
+
+  "${SUDO[@]}" npm install --global --prefix /usr/local \
+    "node@$FRONTEND_NODE_VERSION" "pnpm@$FRONTEND_PNPM_VERSION" \
     || die "Node.js/pnpm frontend toolchain installation failed"
   export PATH="/usr/local/bin:$PATH"
   NODE_VERSION=$(node --version) \
     || die "Node.js version check failed for the frontend runtime"
-  case "$NODE_VERSION" in
-    v22.19.*) ;;
-    *) die "Node.js 22.19.0 verification failed for the frontend runtime (found $NODE_VERSION)" ;;
-  esac
+  [ "$NODE_VERSION" = "v$FRONTEND_NODE_VERSION" ] \
+    || die "frontend Node.js version verification failed (expected $FRONTEND_NODE_VERSION, found $NODE_VERSION)"
 
   command -v pnpm >/dev/null 2>&1 \
     || die "pnpm is unavailable after frontend toolchain installation"
+  PNPM_VERSION=$(pnpm --version) \
+    || die "pnpm version check failed for the frontend runtime"
+  [ "$PNPM_VERSION" = "$FRONTEND_PNPM_VERSION" ] \
+    || die "frontend pnpm version verification failed (expected $FRONTEND_PNPM_VERSION, found $PNPM_VERSION)"
   (cd -- "$CHECKOUT/frontend" && pnpm install --frozen-lockfile) \
     || die "frontend pnpm install --frozen-lockfile failed"
 fi
