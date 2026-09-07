@@ -88,7 +88,8 @@ Playwright e2e specs live in `e2e/`. Choose `mock` or `real` explicitly:
   the Vite run's reset generation; the browser worker reads that generation
   before the next auth request and resets its in-memory fixture state, so an
   external HTTP client can reset the active browser run without reaching into
-  the page.
+  the page. Once the mock listener is ready, Vite also prints the same
+  schema-v2 descriptor as one JSON line on stdout for runtime helpers.
 - `AKB_FRONTEND_URL=<services.web.origin> pnpm run test:e2e:real` consumes the
   common schema-v2 descriptor. The backend, fixture reset, and process shutdown
   remain owned by the repository runtime.
