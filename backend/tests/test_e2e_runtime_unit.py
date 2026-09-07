@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
-import shutil
 import stat
 import subprocess
 import sys
@@ -31,6 +30,7 @@ from e2e_runtime import (  # noqa: E402
     select_capability_profile,
     terminate_process,
 )
+import e2e_runtime  # noqa: E402
 from e2e_gate_observability import (  # noqa: E402
     EVENT_PREFIX,
     emit_gate_event,
@@ -206,7 +206,13 @@ def test_runtime_assets_live_in_repository_common_layer():
 
 
 @pytest.mark.asyncio
-async def test_frontend_start_uses_private_root_and_per_run_backend_target(tmp_path):
+async def test_frontend_start_uses_private_root_and_per_run_backend_target(tmp_path, monkeypatch):
+    pnpm_path = "/fake/toolchain/pnpm"
+    monkeypatch.setattr(
+        e2e_runtime.shutil,
+        "which",
+        lambda name: pnpm_path if name == "pnpm" else None,
+    )
     runtime = E2ERuntime(
         dataclasses.replace(
             make_config(tmp_path),
@@ -240,7 +246,7 @@ async def test_frontend_start_uses_private_root_and_per_run_backend_target(tmp_p
     assert name == "frontend"
     assert log_name == "frontend.log"
     assert command == [
-        shutil.which("pnpm"),
+        pnpm_path,
         "--dir",
         str(REPO_ROOT / "frontend"),
         "run",
