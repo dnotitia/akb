@@ -28,15 +28,30 @@ const handlers = [
   ),
   http.get("/__akb_mock__/discover", () =>
     HttpResponse.json({
+      schema_version: 2,
       mode: "mock",
       status: "ready",
-      worker: { url: "/mockServiceWorker.js", unhandled_api: "error" },
-      reset: { method: "POST", path: "/__akb_mock__/reset" },
+      scenario: "empty",
+      services: {
+        web: {
+          origin: window.location.origin,
+          health: { method: "GET", url: "/__akb_mock__/health" },
+          discovery: { method: "GET", url: "/__akb_mock__/discover" },
+          reset: {
+            method: "POST",
+            url: "/__akb_mock__/reset",
+            body: { scenario: "empty" },
+          },
+        },
+      },
+      credentials: { required: false, mode: "mock" },
+      access: { login: { method: "browser", path: "/auth" } },
+      mock: { worker_url: "/mockServiceWorker.js", unhandled_api: "error" },
     }),
   ),
   http.post("/__akb_mock__/reset", () => {
     resetState();
-    return HttpResponse.json({ status: "ready", mode: "mock" });
+    return HttpResponse.json({ status: "ready", mode: "mock", scenario: "empty" });
   }),
   http.get(`${API}/auth/config`, () => HttpResponse.json(localAuthConfig)),
   http.get(`${API}/auth/me`, () => HttpResponse.json(user)),

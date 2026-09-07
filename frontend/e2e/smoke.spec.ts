@@ -50,7 +50,17 @@ test("signup → land in shell → profile edit round-trip", async ({ page }) =>
     timeout: 5_000,
   });
 
-  if (process.env.AKB_FE_E2E_MODE === "real") {
+  if (process.env.AKB_FE_E2E_MODE === "mock") {
+    const resetStatus = await page.evaluate(async () => {
+      const response = await fetch("/__akb_mock__/reset", { method: "POST" });
+      return response.status;
+    });
+    expect(resetStatus).toBe(200);
+    await page.reload();
+    await expect(page.getByLabel("DISPLAY NAME")).toHaveValue("JY Kim", {
+      timeout: 5_000,
+    });
+  } else {
     await page.reload();
     await expect(page.getByLabel("DISPLAY NAME")).toHaveValue(`${USER} Renamed`, {
       timeout: 5_000,
