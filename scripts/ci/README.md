@@ -276,12 +276,15 @@ to the descriptor, logs, argv, or committed files.
 contain runtime lifecycle logic. On a clean Ubuntu 24.04 host it:
 
 1. verifies the base image and installs `curl`/CA certificates as needed;
-2. installs the Ubuntu archive's `nodejs`/`npm` packages and verifies both
+2. persists and immediately applies `net.ipv4.tcp_mtu_probing=1` through
+   `/etc/sysctl.d/99-akb-e2e-tcp-mtu-probing.conf` before any network download;
+   failure is a provisioning failure and the bootstrap stops;
+3. installs the Ubuntu archive's `nodejs`/`npm` packages and verifies both
    executables before any selected stdio profile is validated;
-3. installs and starts Docker Engine plus Compose v2 idempotently;
-4. installs/verifies `uv` and Python 3.14 under the private runtime root;
-5. runs `uv sync --locked --extra dev --project backend`; and
-6. `exec`s the same Python supervisor in `gate` or `serve` mode.
+4. installs and starts Docker Engine plus Compose v2 idempotently;
+5. installs/verifies `uv` and Python 3.14 under the private runtime root;
+6. runs `uv sync --locked --extra dev --project backend`; and
+7. `exec`s the same Python supervisor in `gate` or `serve` mode.
 
 Package, network, Docker, uv, and Python failures are provisioning failures
 and stop immediately with an actionable stderr message. The bootstrap does
@@ -350,6 +353,10 @@ When no `--runtime-root` is supplied, the bootstrap creates a private
 `/tmp/akb-e2e-bootstrap.XXXXXX` root. Child processes and dependency resources
 are cleaned on exit, while that root and its logs remain caller-owned for
 inspection and cleanup.
+
+The bootstrap does not set a fixed interface MTU. TCP MTU probing is the only
+network adjustment it owns, and it is applied before `apt`, `curl`, or `uv`
+network activity so VPN paths can recover from black-holed packet sizes.
 
 ## Runtime change checklist
 
