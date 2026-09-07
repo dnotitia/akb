@@ -19,7 +19,7 @@ import yaml
 
 
 _BACKEND = Path(__file__).resolve().parents[1]
-_CI = _BACKEND / "scripts" / "ci"
+_CI = _BACKEND.parent / "scripts" / "ci"
 sys.path.insert(0, str(_CI))
 
 from e2e_runtime import CredentialNames, E2ERuntime, RuntimeConfig  # noqa: E402

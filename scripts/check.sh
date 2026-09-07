@@ -176,7 +176,7 @@ echo "  node deps present in frontend + packages/akb-client"
 # Fails fast when a new shell E2E suite is neither run by the hosted gate nor
 # deliberately deferred with a reviewed reason.
 step "E2E suite manifest"
-python backend/scripts/ci/e2e_suite_runner.py --check-manifest --repo-root "${REPO_ROOT}"
+python scripts/ci/e2e_suite_runner.py --check-manifest --repo-root "${REPO_ROOT}"
 
 # ─── backend: ruff (lint) ──────────────────────────────────────────
 step "ruff (backend)"
@@ -284,7 +284,7 @@ if command -v detect-secrets-hook >/dev/null 2>&1; then
   # The generated MSW worker also carries an integrity checksum.
   # Both pnpm-lock.yaml files are excluded because package integrity hashes
   # (sha512-… base64) are expected high-entropy data, not secrets.
-  git ls-files -z -- . ':!frontend/pnpm-lock.yaml' ':!packages/akb-client/pnpm-lock.yaml' ':!frontend/.storybook/public/mockServiceWorker.js' |
+  git ls-files -z -- . ':!frontend/pnpm-lock.yaml' ':!packages/akb-client/pnpm-lock.yaml' ':!frontend/public/mockServiceWorker.js' |
     xargs -0 detect-secrets-hook --baseline .secrets.baseline
 else
   echo "  ! detect-secrets not installed — pipx install detect-secrets" >&2

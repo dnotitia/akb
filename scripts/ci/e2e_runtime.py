@@ -62,6 +62,7 @@ SCENARIO: Scenario = "empty"
 DEFAULT_USERNAME_ENV = "AKB_E2E_USERNAME"
 DEFAULT_PASSWORD_ENV = "AKB_E2E_PASSWORD"
 DEFAULT_APP_PORT = 8000
+DEFAULT_FRONTEND_PORT = 3000
 DEFAULT_EMBED_PORT = 8888
 DEFAULT_FIXTURE_PORT = 8889
 DEFAULT_POSTGRES_PORT = 15432
@@ -399,6 +400,8 @@ class RuntimeConfig:
     compose_project: str
     app_host: str = "127.0.0.1"
     app_port: int = DEFAULT_APP_PORT
+    frontend_host: str = "127.0.0.1"
+    frontend_port: int = DEFAULT_FRONTEND_PORT
     embed_host: str = "127.0.0.1"
     embed_port: int = DEFAULT_EMBED_PORT
     fixture_host: str = "127.0.0.1"
@@ -410,6 +413,7 @@ class RuntimeConfig:
     scenario: Scenario = SCENARIO
     profile: str = DEFAULT_PROFILE
     capabilities: tuple[str, ...] = ()
+    frontend_enabled: bool = False
 
     @property
     def capability_profile(self) -> CapabilityProfile:
@@ -420,8 +424,24 @@ class RuntimeConfig:
         return self.checkout / "backend"
 
     @property
+    def runtime_scripts_dir(self) -> Path:
+        return self.checkout / "scripts" / "ci"
+
+    @property
     def app_origin(self) -> str:
         return f"http://{self.app_host}:{self.app_port}"
+
+    @property
+    def frontend_dir(self) -> Path:
+        return self.checkout / "frontend"
+
+    @property
+    def frontend_origin(self) -> str:
+        return f"http://{self.frontend_host}:{self.frontend_port}"
+
+    @property
+    def frontend_cache_dir(self) -> Path:
+        return self.runtime_root / "frontend-cache"
 
     @property
     def fixture_origin(self) -> str:
@@ -710,6 +730,20 @@ class E2ERuntime:
             "fixture": fixture,
             "failure_stages": ["provisioning", "product_assertion"],
         }
+        if self.config.frontend_enabled:
+            origins = evidence["origin"]
+            assert isinstance(origins, dict)
+            origins["frontend"] = self.config.frontend_origin
+            evidence["frontend"] = {
+                "service": "web",
+                "origin": self.config.frontend_origin,
+                "health": {
+                    "method": "GET",
+                    "url": self.config.frontend_origin,
+                },
+                "backend_proxy_target": self.config.app_origin,
+                "browser_input": "AKB_FRONTEND_URL",
+            }
         if self.profile.needs_stdio:
             if self._proxy_version is None:
                 self._proxy_version = self._artifact_version(self.config.proxy_package_dir)
@@ -741,10 +775,31 @@ class E2ERuntime:
         return evidence
 
     def fixture_health(self) -> dict[str, object]:
-        return {
-            "status": "ready" if self.app_ready else "starting",
+        frontend_ready = self.frontend_ready
+        ready = self.app_ready and (not self.config.frontend_enabled or frontend_ready)
+        health: dict[str, object] = {
+            "status": "ready" if ready else "starting",
             "scenario": self.config.scenario,
             "app_ready": self.app_ready,
+        }
+        if self.config.frontend_enabled:
+            health["frontend_ready"] = frontend_ready
+        return health
+
+    @property
+    def frontend_ready(self) -> bool:
+        process = self._children.get("frontend")
+        return process is not None and process.process.returncode is None
+
+    def _frontend_discovery(self) -> dict[str, object]:
+        return {
+            "service": "web",
+            "origin": self.config.frontend_origin,
+            "health": {
+                "method": "GET",
+                "path": "/",
+            },
+            "backend_proxy_target": self.config.app_origin,
         }
 
     def fixture_discovery(self) -> dict[str, object]:
@@ -783,6 +838,8 @@ class E2ERuntime:
             }
         }
         catalog["runtime"] = self.runtime_evidence()
+        if self.config.frontend_enabled:
+            catalog["web"] = self._frontend_discovery()
         if self.oidc_fixture is not None:
             catalog["oidc"] = self.oidc_fixture.discovery()
         if self.config.scenario in {"app-release-rollout", "app-control-plane"}:
@@ -1224,10 +1281,18 @@ class E2ERuntime:
                 "login_path": "/api/v1/auth/login",
             },
         }
+        if self.config.frontend_enabled:
+            descriptor["services"]["web"] = {
+                "origin": self.config.frontend_origin,
+                "health": {
+                    "method": "GET",
+                    "url": self.config.frontend_origin,
+                },
+            }
         # Keep the legacy default descriptor byte-for-byte compatible.  A
         # selected non-default profile advertises its added capabilities using
         # the same schema-v2 service map rather than a parallel MCP descriptor.
-        if self.profile.name != DEFAULT_PROFILE or self.config.capabilities:
+        if self.profile.name != DEFAULT_PROFILE or self.config.capabilities or self.config.frontend_enabled:
             descriptor["profile"] = self.profile.name
             descriptor["capabilities"] = list(self.selected_capabilities)
             descriptor["evidence"] = self.runtime_evidence()
@@ -1281,13 +1346,19 @@ class E2ERuntime:
         required: tuple[Path, ...] = (
             self.config.backend_dir / "uv.lock",
             self.config.backend_dir / "pyproject.toml",
-            self.config.backend_dir / "scripts" / "ci" / "embed_stub.py",
-            self.config.backend_dir / "scripts" / "ci" / "e2e_suite_runner.py",
+            self.config.runtime_scripts_dir / "embed_stub.py",
+            self.config.runtime_scripts_dir / "e2e_suite_runner.py",
         )
         if self.profile.needs_stdio:
             required += (
                 self.config.proxy_package_dir / "package.json",
                 self.config.proxy_package_dir / "bin" / "akb-mcp.mjs",
+            )
+        if self.config.frontend_enabled:
+            required += (
+                self.config.frontend_dir / "package.json",
+                self.config.frontend_dir / "index.html",
+                self.config.frontend_dir / "vite.config.ts",
             )
         missing = [str(path) for path in required if not path.is_file()]
         if missing:
@@ -1311,6 +1382,13 @@ class E2ERuntime:
                 raise BlockedRuntimeConfig("stdio capability requires packages/akb-mcp-client")
         if self.profile.needs_oidc and self.oidc_fixture is None:
             raise BlockedRuntimeConfig("OIDC capability was selected without its fixture")
+        if self.config.frontend_enabled:
+            missing = [name for name in ("node", "pnpm") if shutil.which(name) is None]
+            if missing:
+                raise BlockedRuntimeConfig(
+                    "frontend runtime requires the installed frontend toolchain: "
+                    + ", ".join(missing)
+                )
 
     def _write_config(self) -> None:
         import yaml
@@ -1417,6 +1495,7 @@ class E2ERuntime:
         log_path: Path,
         check: bool = True,
         stdin_data: bytes | None = None,
+        environment: dict[str, str] | None = None,
     ) -> int:
         log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with log_path.open("ab", buffering=0) as handle:
@@ -1424,7 +1503,7 @@ class E2ERuntime:
             process = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=str(self.config.runtime_root),
-                env=self._child_environment(),
+                env=self._child_environment(environment),
                 stdin=asyncio.subprocess.PIPE if stdin_data is not None else asyncio.subprocess.DEVNULL,
                 stdout=handle,
                 stderr=handle,
@@ -1488,6 +1567,8 @@ class E2ERuntime:
         name: str,
         command: list[str],
         log_name: str,
+        *,
+        environment: dict[str, str] | None = None,
     ) -> None:
         if name in self._children:
             raise ProvisioningFailure(f"process already running: {name}")
@@ -1497,7 +1578,7 @@ class E2ERuntime:
             process = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=str(self.config.runtime_root),
-                env=self._child_environment(),
+                env=self._child_environment(environment),
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=handle,
                 stderr=handle,
@@ -1584,9 +1665,9 @@ class E2ERuntime:
                 sys.executable,
                 "-m",
                 "uvicorn",
-                "scripts.ci.embed_stub:app",
+                "embed_stub:app",
                 "--app-dir",
-                str(self.config.backend_dir),
+                str(self.config.runtime_scripts_dir),
                 "--host",
                 self.config.embed_host,
                 "--port",
@@ -1621,6 +1702,38 @@ class E2ERuntime:
             "backend",
             f"{self.config.app_origin}/readyz",
             self._ready_response,
+        )
+
+    async def _start_frontend(self) -> None:
+        pnpm = shutil.which("pnpm")
+        if pnpm is None:
+            raise BlockedRuntimeConfig("frontend runtime requires pnpm")
+        self.config.frontend_cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.config.frontend_cache_dir, 0o700)
+        await self._spawn_host_process(
+            "frontend",
+            [
+                pnpm,
+                "--dir",
+                str(self.config.frontend_dir),
+                "run",
+                "dev",
+                "--host",
+                self.config.frontend_host,
+                "--port",
+                str(self.config.frontend_port),
+                "--strictPort",
+            ],
+            "frontend.log",
+            environment={
+                "AKB_FRONTEND_BACKEND_URL": self.config.app_origin,
+                "AKB_FRONTEND_CACHE_DIR": str(self.config.frontend_cache_dir),
+            },
+        )
+        await self._wait_http(
+            "frontend",
+            self.config.frontend_origin,
+            lambda status, _body: status == 200,
         )
 
     async def _mint_runtime_pat(self) -> None:
@@ -3310,6 +3423,8 @@ class E2ERuntime:
         await self._bootstrap_backend_and_seed()
         if self.profile.needs_stdio:
             await self._start_stdio_proxy()
+        if self.config.frontend_enabled:
+            await self._start_frontend()
         self._prepared = True
 
     async def reset_scenario(self) -> None:
@@ -3388,7 +3503,7 @@ class E2ERuntime:
         return 0
 
     async def _run_gate(self) -> int:
-        suite_path = self.config.backend_dir / "scripts" / "ci" / "e2e_suite_runner.py"
+        suite_path = self.config.runtime_scripts_dir / "e2e_suite_runner.py"
         mcp_pytest_path = self.config.checkout / "backend" / "tests" / "mcp_e2e"
         log_path = self.config.logs_dir / "gate.log"
         emit_gate_event(
@@ -3531,11 +3646,35 @@ class E2ERuntime:
                 if raw_returncode is None:
                     raw_returncode = await wait_task
 
-                return shell_exit_code(raw_returncode)
+                suite_result = shell_exit_code(raw_returncode)
+                if suite_result != 0 or not self.config.frontend_enabled or self._stop_event.is_set():
+                    return suite_result
+
+                await self._run_frontend_smoke()
+                return suite_result
             finally:
                 stop_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await stop_task
+
+    async def _run_frontend_smoke(self) -> None:
+        try:
+            await self._run_logged_command(
+                [
+                    "pnpm",
+                    "--dir",
+                    str(self.config.frontend_dir),
+                    "run",
+                    "test:e2e:real",
+                ],
+                log_path=self.config.logs_dir / "frontend-e2e.log",
+                environment={
+                    "AKB_FRONTEND_URL": self.config.frontend_origin,
+                    "CI": "1",
+                },
+            )
+        except ProvisioningFailure as exc:
+            raise ProductAssertionFailure("frontend browser smoke failed") from exc
 
     async def _stop_fixture_control(self) -> None:
         if self._fixture_server is not None:
@@ -3566,6 +3705,7 @@ class E2ERuntime:
             self._suite_process = None
         await self._stop_fixture_control()
         await self._stop_named_process("stdio")
+        await self._stop_named_process("frontend")
         await self._stop_named_process("backend")
         await self._stop_named_process("embed")
         with contextlib.suppress(Exception):
@@ -3627,7 +3767,7 @@ def _configure_logging() -> None:
 
 
 def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
-    default_checkout = Path(__file__).resolve().parents[3]
+    default_checkout = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("gate", "serve"))
     parser.add_argument("--checkout", type=Path, default=default_checkout)
@@ -3639,6 +3779,7 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
     )
     parser.add_argument("--compose-project", default="")
     parser.add_argument("--app-port", type=int, default=DEFAULT_APP_PORT)
+    parser.add_argument("--frontend-port", type=int, default=DEFAULT_FRONTEND_PORT)
     parser.add_argument("--embed-port", type=int, default=DEFAULT_EMBED_PORT)
     parser.add_argument("--fixture-port", type=int, default=DEFAULT_FIXTURE_PORT)
     parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS)
@@ -3658,6 +3799,11 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
         action="append",
         default=[],
         help="optional capability addition (stdio, oidc, or keycloak); repeatable",
+    )
+    parser.add_argument(
+        "--with-frontend",
+        action="store_true",
+        help="start the existing Vite frontend and expose it as the web service",
     )
     parser.add_argument(
         "--scenario",
@@ -3691,6 +3837,7 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
         compose_file=compose_file,
         compose_project=project,
         app_port=args.app_port,
+        frontend_port=args.frontend_port,
         embed_port=args.embed_port,
         fixture_port=args.fixture_port,
         timeout_seconds=args.timeout_seconds,
@@ -3698,6 +3845,7 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
         scenario=args.scenario,
         profile=args.profile,
         capabilities=tuple(args.capability),
+        frontend_enabled=args.with_frontend,
     )
 
 

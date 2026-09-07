@@ -13,7 +13,8 @@ pnpm lint             # eslint src
 pnpm test             # vitest run
 pnpm build            # tsc && vite build
 pnpm preview          # serve dist locally
-pnpm test:e2e         # playwright (requires backend reachable at AKB_URL)
+pnpm run test:e2e:mock # Playwright + MSW, no backend required
+pnpm run test:e2e:real # Playwright against AKB_FRONTEND_URL from the runtime descriptor
 ```
 
 ## Editing documents
@@ -78,8 +79,26 @@ Unit tests live under `src/**/__tests__/`. Vitest runs against jsdom +
 and interactive components (`TagInput`) have explicit coverage. Add a
 test alongside any change to those code paths.
 
-Playwright e2e specs live in `e2e/`. `pnpm test:e2e` expects the AKB
-backend reachable at `AKB_URL` (defaults to `http://localhost:8000`).
+Playwright e2e specs live in `e2e/`. Choose `mock` or `real` explicitly:
+
+- `pnpm run test:e2e:mock` starts Vite with the browser MSW worker, exposes
+  mock readiness/discovery/reset at `/__akb_mock__/health`,
+  `/__akb_mock__/discover`, and `POST /__akb_mock__/reset`, and fails
+  unhandled `/api` requests with a 501 response. The public reset increments
+  the Vite run's reset generation; the browser worker reads that generation
+  before the next auth request and resets its in-memory fixture state, so an
+  external HTTP client can reset the active browser run without reaching into
+  the page. Once the mock listener is ready, Vite also prints the same
+  schema-v2 descriptor as one JSON line on stdout for runtime helpers.
+- `AKB_FRONTEND_URL=<services.web.origin> pnpm run test:e2e:real` consumes the
+  common schema-v2 descriptor. The backend, fixture reset, and process shutdown
+  remain owned by the repository runtime.
+
+For a manual mock session, run `VITE_AKB_TEST_MODE=mock pnpm run dev --host
+127.0.0.1 --port 4173 --strictPort`. The browser worker exposes readiness and
+discovery at `/__akb_mock__/health` and `/__akb_mock__/discover`, and reset at
+`POST /__akb_mock__/reset`; stop the Vite process with Ctrl-C. Mock mode is
+never enabled by the default application or production build.
 
 ## Adding routes
 

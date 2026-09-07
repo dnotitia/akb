@@ -14,7 +14,8 @@ import httpx
 import pytest
 import yaml
 
-CI_DIR = Path(__file__).resolve().parent.parent / "scripts" / "ci"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CI_DIR = REPO_ROOT / "scripts" / "ci"
 sys.path.insert(0, str(CI_DIR))
 
 from e2e_runtime import (  # noqa: E402
@@ -29,6 +30,7 @@ from e2e_runtime import (  # noqa: E402
     select_capability_profile,
     terminate_process,
 )
+import e2e_runtime  # noqa: E402
 from e2e_gate_observability import (  # noqa: E402
     EVENT_PREFIX,
     emit_gate_event,
@@ -47,7 +49,6 @@ from e2e_suite_runner import (  # noqa: E402
 from fixture_control import create_app  # noqa: E402
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = CI_DIR / "dependency-compose.yaml"
 BOOTSTRAP = CI_DIR / "ubuntu_e2e_bootstrap.sh"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "e2e.yml"
@@ -126,6 +127,163 @@ def test_descriptor_is_schema_v2_and_never_contains_credential_values(tmp_path, 
     serialized = str(descriptor)
     assert "external-user-value" not in serialized
     assert "external-password-value" not in serialized
+
+
+def test_frontend_descriptor_exposes_web_origin_and_backend_proxy_target(tmp_path):
+    runtime = E2ERuntime(
+        dataclasses.replace(
+            make_config(tmp_path),
+            frontend_enabled=True,
+            frontend_port=3017,
+        )
+    )
+
+    descriptor = runtime.descriptor()
+    assert descriptor["services"]["web"] == {
+        "origin": "http://127.0.0.1:3017",
+        "health": {
+            "method": "GET",
+            "url": "http://127.0.0.1:3017",
+        },
+    }
+    evidence = descriptor["evidence"]
+    assert evidence["origin"]["frontend"] == "http://127.0.0.1:3017"
+    assert evidence["frontend"] == {
+        "service": "web",
+        "origin": "http://127.0.0.1:3017",
+        "health": {
+            "method": "GET",
+            "url": "http://127.0.0.1:3017",
+        },
+        "backend_proxy_target": "http://127.0.0.1:8000",
+        "browser_input": "AKB_FRONTEND_URL",
+    }
+
+    discovery = runtime.fixture_discovery()
+    assert discovery["web"] == {
+        "service": "web",
+        "origin": "http://127.0.0.1:3017",
+        "health": {"method": "GET", "path": "/"},
+        "backend_proxy_target": "http://127.0.0.1:8000",
+    }
+
+
+def test_frontend_runtime_requires_explicit_flag_and_supports_isolated_port():
+    default = _parse_args(["serve"])
+    assert default.frontend_enabled is False
+    assert default.frontend_port == 3000
+
+    configured = _parse_args(
+        ["serve", "--with-frontend", "--frontend-port", "3017"]
+    )
+    assert configured.frontend_enabled is True
+    assert configured.frontend_port == 3017
+
+
+def test_frontend_owns_package_script_and_toolchain_contract():
+    package = json.loads((REPO_ROOT / "frontend" / "package.json").read_text())
+
+    assert package["packageManager"] == "pnpm@11.21.0"
+    assert package["engines"]["node"] == "22.19.0"
+    assert package["scripts"]["dev"] == "vite"
+
+
+def test_runtime_assets_live_in_repository_common_layer():
+    common_runtime = REPO_ROOT / "scripts" / "ci"
+    backend_runtime = REPO_ROOT / "backend" / "scripts" / "ci"
+
+    for name in (
+        "e2e_runtime.py",
+        "e2e_suite_runner.py",
+        "fixture_control.py",
+        "oidc_fixture.py",
+        "embed_stub.py",
+        "ubuntu_e2e_bootstrap.sh",
+    ):
+        assert (common_runtime / name).is_file()
+        assert not (backend_runtime / name).exists()
+
+
+@pytest.mark.asyncio
+async def test_frontend_start_uses_private_root_and_per_run_backend_target(tmp_path, monkeypatch):
+    pnpm_path = "/fake/toolchain/pnpm"
+    monkeypatch.setattr(
+        e2e_runtime.shutil,
+        "which",
+        lambda name: pnpm_path if name == "pnpm" else None,
+    )
+    runtime = E2ERuntime(
+        dataclasses.replace(
+            make_config(tmp_path),
+            frontend_enabled=True,
+            frontend_port=3017,
+        )
+    )
+    started: list[tuple[str, list[str], str, dict[str, str] | None]] = []
+    waited: list[tuple[str, str]] = []
+
+    async def fake_spawn(
+        name: str,
+        command: list[str],
+        log_name: str,
+        *,
+        environment: dict[str, str] | None = None,
+    ) -> None:
+        started.append((name, command, log_name, environment))
+
+    async def fake_wait(label: str, url: str, _predicate) -> bytes:
+        waited.append((label, url))
+        return b""
+
+    runtime._spawn_host_process = fake_spawn  # type: ignore[method-assign]
+    runtime._wait_http = fake_wait  # type: ignore[method-assign]
+
+    await runtime._start_frontend()
+
+    assert len(started) == 1
+    name, command, log_name, environment = started[0]
+    assert name == "frontend"
+    assert log_name == "frontend.log"
+    assert command == [
+        pnpm_path,
+        "--dir",
+        str(REPO_ROOT / "frontend"),
+        "run",
+        "dev",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "3017",
+        "--strictPort",
+    ]
+    assert environment == {
+        "AKB_FRONTEND_BACKEND_URL": "http://127.0.0.1:8000",
+        "AKB_FRONTEND_CACHE_DIR": str(tmp_path / "runtime" / "frontend-cache"),
+    }
+    assert waited == [("frontend", "http://127.0.0.1:3017")]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_stops_frontend_with_the_owned_runtime_processes(tmp_path):
+    runtime = E2ERuntime(
+        dataclasses.replace(make_config(tmp_path), frontend_enabled=True)
+    )
+    runtime._children["frontend"] = ManagedProcess(_LifecycleProcess())
+    stopped: list[str] = []
+
+    async def record_stop(name: str) -> None:
+        stopped.append(name)
+
+    async def record_compose(*_arguments: str, **_kwargs: object) -> int:
+        return 0
+
+    runtime._stop_fixture_control = lambda: asyncio.sleep(0)  # type: ignore[method-assign]
+    runtime._stop_named_process = record_stop  # type: ignore[method-assign]
+    runtime._compose = record_compose  # type: ignore[method-assign]
+
+    await runtime.cleanup()
+
+    assert stopped == ["stdio", "frontend", "backend", "embed"]
 
 
 def test_fixture_discovery_declares_auth_and_observability_without_secrets(
@@ -370,7 +528,7 @@ def test_suite_summary_uses_last_complete_line_and_fails_closed():
     assert SuiteResult("suite.sh", 0, 0, 0, None, "").gate_failed
     assert SuiteResult("suite.sh", 0, 2, 0, "Results: 2 passed, 0 failed", "").gate_failed is False
     assert SuiteResult("suite.sh", -4, 0, 0, None, "").signal == 4
-    assert len(CURATED_SUITES) == 26
+    assert len(CURATED_SUITES) == 27
 
 
 def test_shell_e2e_manifest_classifies_every_suite_exactly_once():
@@ -479,7 +637,7 @@ def test_suite_runner_emits_suite_and_gate_events(monkeypatch, capsys):
 @pytest.mark.asyncio
 async def test_gate_child_stdout_is_private_and_stderr_is_inherited(tmp_path, capfd):
     checkout = tmp_path / "checkout"
-    suite_path = checkout / "backend" / "scripts" / "ci" / "e2e_suite_runner.py"
+    suite_path = checkout / "scripts" / "ci" / "e2e_suite_runner.py"
     suite_path.parent.mkdir(parents=True)
     suite_path.write_text(
         "import sys\n"
@@ -561,6 +719,7 @@ class FakeFixtureRuntime:
     def __init__(self, scenario="empty"):
         self.reset_count = 0
         self.scenario = scenario
+        self.oidc_fixture = None
 
     def fixture_health(self):
         return {"status": "ready", "scenario": self.scenario, "app_ready": True}
@@ -595,7 +754,7 @@ class FakeFixtureRuntime:
             "redaction_scan": {"private_value_hits": 0, "raw_log_exposed": False},
         }
 
-    def fixture_control(self, action, target, enabled, kind=None):
+    async def fixture_control(self, action, target, enabled, kind=None):
         return {
             "status": "accepted",
             "scenario": self.scenario,
@@ -1031,7 +1190,7 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
     ]
 
     workflow = WORKFLOW.read_text()
-    assert "backend/scripts/ci/e2e_runtime.py gate" in workflow
+    assert "scripts/ci/e2e_runtime.py gate" in workflow
     assert "--scenario empty" in workflow
     assert "app-installation-lifecycle" in (CI_DIR / "e2e_runtime.py").read_text()
     assert "uv sync --locked --extra dev --project backend" in workflow
@@ -1041,9 +1200,8 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
     assert "akb-e2e-runtime-logs" in workflow
 
     local_runner = LOCAL_CANONICAL_RUNNER.read_text()
-    assert "backend/scripts/ci/e2e_suite_runner.py" in local_runner
+    assert "scripts/ci/e2e_suite_runner.py" in local_runner
     assert "SUITES=(" not in local_runner
-
 
 def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
     result = subprocess.run(["bash", "-n", str(BOOTSTRAP)], check=False)
@@ -1052,6 +1210,12 @@ def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
     assert "exec 3>&1 1>&2" in text
     assert "--scenario empty" in text
     assert "app-installation-lifecycle" in text
+    assert "--with-frontend" in text
+    assert "pnpm install --frozen-lockfile" in text
+    assert "FRONTEND_PACKAGE_MANAGER" in text
+    assert "FRONTEND_NODE_VERSION" in text
+    assert '"node@$FRONTEND_NODE_VERSION" "pnpm@$FRONTEND_PNPM_VERSION"' in text
+    assert "command -v pnpm" in text
     assert 'apt-get install -y nodejs npm' in text
     assert 'command -v node' in text
     assert 'command -v npm' in text
@@ -1108,7 +1272,8 @@ async def test_oidc_profile_serves_jwks_metadata_and_deterministic_variants(tmp_
         transport=httpx.ASGITransport(app=app), base_url=runtime.config.fixture_origin
     ) as client:
         health = await client.get("/oidc/health")
-        metadata = await client.get("/.well-known/openid-configuration")
+        metadata_path = runtime.oidc_fixture.metadata_uri.removeprefix(runtime.config.fixture_origin)
+        metadata = await client.get(metadata_path)
         jwks = await client.get(jwks_path)
         token = await client.post("/oidc/token", json={"variant": "valid"})
         bad = await client.post("/oidc/token", json={"variant": "wrong_issuer"})

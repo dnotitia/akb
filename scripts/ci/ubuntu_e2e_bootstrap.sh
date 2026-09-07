@@ -13,14 +13,15 @@ die() {
 }
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-DEFAULT_CHECKOUT=$(cd -- "$SCRIPT_DIR/../../.." && pwd)
+DEFAULT_CHECKOUT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 MODE="${1:-}"
 [ "$MODE" = "gate" ] || [ "$MODE" = "serve" ] \
-  || die "usage: $0 {gate|serve} [--profile tool-only|transport-proxy|oidc-resource-server|transport-oidc] [--capability stdio|oidc] [--scenario empty|app-installation-lifecycle|app-release-rollout|app-control-plane] [--checkout PATH] [--runtime-root PATH] [supervisor options]"
+  || die "usage: $0 {gate|serve} [--with-frontend] [--profile tool-only|transport-proxy|oidc-resource-server|transport-oidc] [--capability stdio|oidc] [--scenario empty|app-installation-lifecycle|app-release-rollout|app-control-plane] [--checkout PATH] [--runtime-root PATH] [supervisor options]"
 shift
 
 CHECKOUT="${AKB_CHECKOUT:-$DEFAULT_CHECKOUT}"
 RUNTIME_ROOT="${AKB_RUNTIME_ROOT:-}"
+WITH_FRONTEND=0
 FORWARD_ARGS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -33,6 +34,11 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || die "--runtime-root requires a path"
       RUNTIME_ROOT=$2
       shift 2
+      ;;
+    --with-frontend)
+      WITH_FRONTEND=1
+      FORWARD_ARGS+=("$1")
+      shift
       ;;
     *)
       FORWARD_ARGS+=("$1")
@@ -177,9 +183,49 @@ case "$PYTHON_VERSION" in
   *) die "uv-managed Python 3.14 verification failed (found $PYTHON_VERSION)" ;;
 esac
 
+if [ "$WITH_FRONTEND" -eq 1 ]; then
+  FRONTEND_PACKAGE_JSON="$CHECKOUT/frontend/package.json"
+  [ -f "$FRONTEND_PACKAGE_JSON" ] \
+    || die "frontend package.json is required for frontend toolchain discovery"
+  FRONTEND_NODE_VERSION=$(node -e \
+    'const fs=require("fs"); const p=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(p.engines?.node ?? "")' \
+    "$FRONTEND_PACKAGE_JSON") \
+    || die "frontend Node.js version could not be read from package.json"
+  FRONTEND_PACKAGE_MANAGER=$(node -e \
+    'const fs=require("fs"); const p=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(p.packageManager ?? "")' \
+    "$FRONTEND_PACKAGE_JSON") \
+    || die "frontend package manager could not be read from package.json"
+  case "$FRONTEND_PACKAGE_MANAGER" in
+    pnpm@*) FRONTEND_PNPM_VERSION="${FRONTEND_PACKAGE_MANAGER#pnpm@}" ;;
+    *) die "frontend packageManager must declare a pinned pnpm version" ;;
+  esac
+  [ -n "$FRONTEND_NODE_VERSION" ] \
+    || die "frontend engines.node must declare a pinned Node.js version"
+  [ -n "$FRONTEND_PNPM_VERSION" ] \
+    || die "frontend packageManager must declare a pinned pnpm version"
+
+  "${SUDO[@]}" npm install --global --prefix /usr/local \
+    "node@$FRONTEND_NODE_VERSION" "pnpm@$FRONTEND_PNPM_VERSION" \
+    || die "Node.js/pnpm frontend toolchain installation failed"
+  export PATH="/usr/local/bin:$PATH"
+  NODE_VERSION=$(node --version) \
+    || die "Node.js version check failed for the frontend runtime"
+  [ "$NODE_VERSION" = "v$FRONTEND_NODE_VERSION" ] \
+    || die "frontend Node.js version verification failed (expected $FRONTEND_NODE_VERSION, found $NODE_VERSION)"
+
+  command -v pnpm >/dev/null 2>&1 \
+    || die "pnpm is unavailable after frontend toolchain installation"
+  PNPM_VERSION=$(pnpm --version) \
+    || die "pnpm version check failed for the frontend runtime"
+  [ "$PNPM_VERSION" = "$FRONTEND_PNPM_VERSION" ] \
+    || die "frontend pnpm version verification failed (expected $FRONTEND_PNPM_VERSION, found $PNPM_VERSION)"
+  (cd -- "$CHECKOUT/frontend" && pnpm install --frozen-lockfile) \
+    || die "frontend pnpm install --frozen-lockfile failed"
+fi
+
 SUPERVISOR_COMMAND=(
   "$UV_BIN" run --locked --project "$CHECKOUT/backend" python
-  "$CHECKOUT/backend/scripts/ci/e2e_runtime.py" "$MODE"
+  "$CHECKOUT/scripts/ci/e2e_runtime.py" "$MODE"
   --checkout "$CHECKOUT"
   --runtime-root "$RUNTIME_ROOT"
   "${FORWARD_ARGS[@]}"

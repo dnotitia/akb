@@ -29,11 +29,23 @@ jobs:
 
       - uses: astral-sh/setup-uv@v6
 
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: frontend/package.json
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22.19.0"
           cache: npm
           cache-dependency-path: packages/akb-mcp-client/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium for the real frontend smoke
+        working-directory: frontend
+        run: pnpm exec playwright install --with-deps chromium
 
       - name: Install stdio proxy and Inspector deps
         working-directory: packages/akb-mcp-client
@@ -63,7 +75,8 @@ jobs:
         run: |
           export AKB_E2E_PASSWORD="$(uv run --locked --project backend python -c 'import secrets; print(secrets.token_urlsafe(24))')"
           uv run --locked --project backend python \
-            backend/scripts/ci/e2e_runtime.py gate \
+            scripts/ci/e2e_runtime.py gate \
+            --with-frontend \
             --profile transport-proxy \
             --scenario empty \
             --checkout "$GITHUB_WORKSPACE" \
@@ -76,3 +89,39 @@ jobs:
           name: akb-e2e-runtime-logs
           path: ${{ runner.temp }}/akb-e2e-runtime/logs
           if-no-files-found: ignore
+
+  frontend-e2e:
+    name: frontend e2e (mock)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: frontend/package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.19.0"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend production bundle
+        working-directory: frontend
+        run: pnpm run build
+
+      - name: Install Chromium for frontend E2E
+        working-directory: frontend
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run frontend E2E in explicit mock mode
+        working-directory: frontend
+        env:
+          CI: "1"
+        run: pnpm run test:e2e:mock

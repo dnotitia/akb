@@ -41,6 +41,13 @@ jobs:
         # Shell e2e suites under tests/*.sh aren't picked up by pytest.
         run: pytest tests/ -k 'not _e2e' -v --tb=short
 
+      - name: Run repository runtime contract tests
+        working-directory: backend
+        # The filename contains `_e2e`, so the broad unit selector above
+        # intentionally excludes it. Keep this explicit so the runtime
+        # contract is collected and executed in every PR.
+        run: pytest tests/test_e2e_runtime_unit.py -v --tb=short
+
   pgvector-e2e:
     # DB-backed bootstrap tests that the unit job skips (`-k 'not
     # _e2e'`). They need a real Postgres with pgvector *available but

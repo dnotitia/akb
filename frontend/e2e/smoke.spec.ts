@@ -16,7 +16,7 @@
 //
 // Run locally:
 //   docker compose up -d
-//   cd frontend && pnpm exec playwright test
+//   cd frontend && pnpm run test:e2e:real
 import { test, expect } from "@playwright/test";
 
 const RUN = Date.now();
@@ -25,7 +25,7 @@ const PASS = "test-pass-1234";
 
 test.describe.configure({ mode: "serial" });
 
-test("signup → land in shell → profile edit round-trip", async ({ page }) => {
+test("signup → land in shell → profile edit round-trip", async ({ page, request }) => {
   // ── 1. Register ────────────────────────────────────────────
   await page.goto("/auth");
   await page.getByRole("tab", { name: /^register$/i }).click();
@@ -36,7 +36,7 @@ test("signup → land in shell → profile edit round-trip", async ({ page }) =>
 
   // The authenticated shell sets up nav links — "Home" is the
   // first NavLink in components/layout.tsx.
-  await expect(page.getByRole("link", { name: "Home" })).toBeVisible({
+  await expect(page.getByRole("link", { name: "Home", exact: true })).toBeVisible({
     timeout: 10_000,
   });
 
@@ -49,6 +49,24 @@ test("signup → land in shell → profile edit round-trip", async ({ page }) =>
   await expect(page.getByText("Saved", { exact: true })).toBeVisible({
     timeout: 5_000,
   });
+
+  if (process.env.AKB_FE_E2E_MODE === "mock") {
+    const resetResponse = await request.post("/__akb_mock__/reset", {
+      data: { scenario: "empty" },
+    });
+    expect(resetResponse.status()).toBe(200);
+    const resetBody = await resetResponse.json();
+    expect(resetBody.reset_generation).toBeGreaterThan(0);
+    await page.reload();
+    await expect(page.getByLabel("DISPLAY NAME")).toHaveValue("JY Kim", {
+      timeout: 5_000,
+    });
+  } else {
+    await page.reload();
+    await expect(page.getByLabel("DISPLAY NAME")).toHaveValue(`${USER} Renamed`, {
+      timeout: 5_000,
+    });
+  }
 });
 
 test("logged-out user redirects to /auth (layout auth gate)", async ({
