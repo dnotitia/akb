@@ -469,6 +469,7 @@ export function VaultShell() {
           open={createVaultOpen}
           onOpenChange={setCreateVaultOpen}
           onCreated={handleVaultCreated}
+          onOpenExisting={handleVaultCreated}
           returnFocusRef={createVaultTriggerRef}
         />
         {name && (

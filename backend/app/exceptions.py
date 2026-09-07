@@ -71,6 +71,25 @@ class ConflictError(AKBError):
         )
 
 
+VAULT_NAME_UNAVAILABLE = "vault_name_unavailable"
+
+
+class VaultNameUnavailableError(ConflictError):
+    """A globally reserved Vault name cannot be assigned to the caller.
+
+    The message deliberately carries no Vault, owner, visibility, or lifecycle
+    data.  Callers that cannot see an existing private Vault must receive the
+    same response as callers colliding with one they can see, including when
+    the database UNIQUE constraint resolves a concurrent create race.
+    """
+
+    def __init__(self):
+        super().__init__(
+            "Vault name is unavailable. Choose a different name.",
+            code=VAULT_NAME_UNAVAILABLE,
+        )
+
+
 DOCUMENT_TITLE_CONFLICT = "document_title_conflict"
 
 

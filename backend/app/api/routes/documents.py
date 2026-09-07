@@ -43,6 +43,12 @@ doc_service = get_document_service()
 
 @router.post("/vaults", summary="Create a new vault")
 async def create_vault(name: str, description: str = "", template: str | None = None, public_access: str = "none", user: AuthenticatedUser = Depends(get_current_user)):
+    """Create a Vault whose name is unique across this AKB installation.
+
+    Any unavailable name returns HTTP 409 with the stable
+    ``vault_name_unavailable`` code.  The response intentionally does not say
+    whether the conflicting Vault is visible to the caller.
+    """
     if template is not None and template not in template_registry.list_names():
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
