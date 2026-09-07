@@ -1,13 +1,14 @@
 #!/bin/bash
 #
-# AKB MCP E2E Test Suite
-# Tests MCP tool calls via Streamable HTTP transport
+# MCP transport and REST-boundary checks.
+# Authenticated MCP product behavior lives in backend/tests/mcp_e2e and is
+# executed through the official Python SDK by the repository-owned runtime.
 #
 set -uo pipefail
 
 BASE_URL="${AKB_URL:-http://localhost:8000}"
-VAULT="mcp-e2e-$(date +%s)"
-E2E_USER="mcp-user-$(date +%s)"
+VAULT="mcp-boundary-$(date +%s)"
+E2E_USER="mcp-boundary-user-$(date +%s)"
 PASS=0
 FAIL=0
 ERRORS=()
@@ -16,13 +17,13 @@ pass() { PASS=$((PASS+1)); echo "  ✓ $1"; }
 fail() { FAIL=$((FAIL+1)); ERRORS+=("$1: $2"); echo "  ✗ $1 — $2"; }
 
 echo "╔══════════════════════════════════════════╗"
-echo "║   AKB MCP E2E Test Suite                 ║"
+echo "║   AKB MCP Boundary E2E Suite             ║"
 echo "║   Target: $BASE_URL/mcp/"
 echo "╚══════════════════════════════════════════╝"
 echo ""
 
-# ── 0. Setup: register user + get PAT ───────────────────────
-echo "▸ 0. Setup"
+# ── 0. REST auth setup ───────────────────────────────────────
+echo "▸ REST authentication"
 
 curl -sk -X POST "$BASE_URL/api/v1/auth/register" \
   -H 'Content-Type: application/json' \
@@ -30,33 +31,34 @@ curl -sk -X POST "$BASE_URL/api/v1/auth/register" \
 
 JWT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" \
   -H 'Content-Type: application/json' \
-  -d "{\"username\":\"$E2E_USER\",\"password\":\"test1234\"}" | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+  -d "{\"username\":\"$E2E_USER\",\"password\":\"test1234\"}" \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
 
 PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
   -H "Authorization: Bearer $JWT" \
   -H 'Content-Type: application/json' \
-  -d '{"name":"mcp-e2e"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+  -d '{"name":"mcp-boundary"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
 
-[ -n "$PAT" ] && pass "PAT acquired" || { fail "PAT" "could not get PAT"; exit 1; }
+[ -n "$PAT" ] && pass "REST PAT acquired" || { fail "REST PAT" "could not get PAT"; exit 1; }
 
-# ── 1. MCP Initialize ───────────────────────────────────────
+# ── 1. MCP initialize/session boundary ───────────────────────
 echo ""
-echo "▸ 1. MCP Protocol"
+echo "▸ MCP transport boundary"
 
 INIT_RESP=$(curl -sk -i -X POST "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $PAT" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"e2e-test","version":"1.0"}}}' 2>&1)
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"boundary-test","version":"1.0"}}}' 2>&1)
 
 SID=$(echo "$INIT_RESP" | grep -i "mcp-session-id" | tr -d '\r' | awk '{print $2}')
 INIT_BODY=$(echo "$INIT_RESP" | tail -1)
 PROTO=$(echo "$INIT_BODY" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['protocolVersion'])" 2>/dev/null)
 
-[ -n "$SID" ] && pass "Session ID received ($SID)" || fail "Session ID" "missing"
-[ "$PROTO" = "2025-03-26" ] && pass "Protocol version: $PROTO" || fail "Protocol" "expected 2025-03-26, got $PROTO"
+[ -n "$SID" ] && pass "MCP session ID received" || fail "MCP session ID" "missing"
+[ "$PROTO" = "2025-03-26" ] && pass "MCP protocol version negotiated" || fail "MCP protocol" "expected 2025-03-26, got $PROTO"
 
-# Send initialized notification
 curl -sk -X POST "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $PAT" \
   -H "Content-Type: application/json" \
@@ -64,38 +66,10 @@ curl -sk -X POST "$BASE_URL/mcp/" \
   -H "mcp-session-id: $SID" \
   -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null 2>&1
 
-# Auth rejection without PAT
 AUTH_RESP=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/mcp/" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' 2>/dev/null)
-[ "$AUTH_RESP" = "401" ] && pass "MCP rejects unauthenticated (401)" || fail "MCP auth" "expected 401, got $AUTH_RESP"
-
-# Helper: MCP tool call
-MCP_ID=10
-mcp_call() {
-  local tool=$1 args=$2
-  MCP_ID=$((MCP_ID+1))
-  curl -sk -X POST "$BASE_URL/mcp/" \
-    -H "Authorization: Bearer $PAT" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" \
-    -H "mcp-session-id: $SID" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":$MCP_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}" 2>&1
-}
-
-# Extract tool result text
-mcp_result() {
-  python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['result']['content'][0]['text'])" 2>/dev/null
-}
-
-mcp_result_field() {
-  local field=$1
-  python3 -c "import sys,json; d=json.loads(json.loads(sys.stdin.read())['result']['content'][0]['text']); print(d$field)" 2>/dev/null
-}
-
-# ── 2. Tools List ────────────────────────────────────────────
-echo ""
-echo "▸ 2. Tools List"
+[ "$AUTH_RESP" = "401" ] && pass "MCP rejects unauthenticated requests" || fail "MCP auth" "expected 401, got $AUTH_RESP"
 
 TOOLS_RESP=$(curl -sk -X POST "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $PAT" \
@@ -104,631 +78,80 @@ TOOLS_RESP=$(curl -sk -X POST "$BASE_URL/mcp/" \
   -H "mcp-session-id: $SID" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' 2>&1)
 TOOL_COUNT=$(echo "$TOOLS_RESP" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['result']['tools']))" 2>/dev/null)
-[ "$TOOL_COUNT" -ge 22 ] 2>/dev/null && pass "tools/list returns $TOOL_COUNT tools" || fail "tools/list" "expected >=22, got $TOOL_COUNT"
+[ "$TOOL_COUNT" -ge 22 ] 2>/dev/null && pass "MCP tools/list exposes $TOOL_COUNT tools" || fail "MCP tools/list" "expected >=22, got $TOOL_COUNT"
 
-# ── 3. Vault Operations ─────────────────────────────────────
+# ── 2. Direct REST shape checks retained from the mixed suite ─
 echo ""
-echo "▸ 3. Vault Operations"
+echo "▸ REST response boundaries"
 
-R=$(mcp_call akb_create_vault "{\"name\":\"$VAULT\",\"description\":\"MCP E2E test\"}" | mcp_result)
-VAULT_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['vault_id'])" 2>/dev/null)
-[ -n "$VAULT_ID" ] && pass "akb_create_vault ($VAULT)" || fail "akb_create_vault" "no vault_id"
+VAULT_RESP=$(curl -sk -X POST "$BASE_URL/api/v1/vaults?name=$VAULT&description=MCP+boundary+test" \
+  -H "Authorization: Bearer $PAT")
+VAULT_ID=$(echo "$VAULT_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("vault_id",""))' 2>/dev/null)
+[ -n "$VAULT_ID" ] && pass "REST vault setup" || fail "REST vault setup" "no vault_id"
 
-R=$(mcp_call akb_list_vaults '{}' | mcp_result)
-HAS_VAULT=$(echo "$R" | python3 -c "import sys,json; print(any(v['name']=='$VAULT' for v in json.load(sys.stdin)['vaults']))" 2>/dev/null)
-[ "$HAS_VAULT" = "True" ] && pass "akb_list_vaults contains $VAULT" || fail "akb_list_vaults" "vault not found"
+TABLE_RESP=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"mcp_items","description":"MCP boundary table","columns":[{"name":"product","type":"text"}]}' 2>/dev/null)
+TABLE_ID=$(echo "$TABLE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
+[ -n "$TABLE_ID" ] && pass "REST table setup" || fail "REST table setup" "no id"
 
-# ── 4. Document CRUD ─────────────────────────────────────────
-echo ""
-echo "▸ 4. Document CRUD via MCP"
-
-R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"MCP Created Spec\",\"content\":\"## API Spec\\n\\nCreated via MCP tool call.\\n\\n## Endpoints\\n\\nGET /api/v1/health\",\"type\":\"spec\",\"tags\":[\"mcp\",\"test\"]}" | mcp_result)
-DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
-CHUNKS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['chunks_indexed'])" 2>/dev/null)
-[ -n "$DOC_URI" ] && pass "akb_put created doc ($DOC_URI, $CHUNKS chunks)" || fail "akb_put" "no uri"
-
-# Put a second doc that links to the first
-DOC_PATH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['path'])" 2>/dev/null)
-R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"plans\",\"title\":\"Migration Plan\",\"content\":\"## Plan\\n\\nMigrate based on [API Spec]($DOC_PATH).\\n\\n## Timeline\\n\\n- Week 1: Review\",\"type\":\"plan\",\"tags\":[\"mcp\"],\"depends_on\":[\"$DOC_URI\"]}" | mcp_result)
-DOC2_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
-[ -n "$DOC2_URI" ] && pass "akb_put with link ($DOC2_URI)" || fail "akb_put link" "no uri"
-
-# Get document
-R=$(mcp_call akb_get "{\"uri\":\"$DOC_URI\"}" | mcp_result)
-GET_TITLE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['title'])" 2>/dev/null)
-[ "$GET_TITLE" = "MCP Created Spec" ] && pass "akb_get returns correct title" || fail "akb_get" "wrong title: $GET_TITLE"
-
-# Update document
-R=$(mcp_call akb_update "{\"uri\":\"$DOC_URI\",\"status\":\"active\",\"message\":\"Promote via MCP\"}" | mcp_result)
-UPD_COMMIT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['commit_hash'])" 2>/dev/null)
-[ -n "$UPD_COMMIT" ] && pass "akb_update ($UPD_COMMIT)" || fail "akb_update" "no commit"
-
-# ── 5. Browse & Search ───────────────────────────────────────
-echo ""
-echo "▸ 5. Browse & Search via MCP"
-
-R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
-COLL_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['items']))" 2>/dev/null)
-[ "$COLL_COUNT" -ge 2 ] 2>/dev/null && pass "akb_browse L1: $COLL_COUNT collections" || fail "akb_browse" "expected >=2"
-
-R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"collection\":\"specs\"}" | mcp_result)
-DOC_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['items']))" 2>/dev/null)
-[ "$DOC_COUNT" -ge 1 ] 2>/dev/null && pass "akb_browse L2 specs: $DOC_COUNT docs" || fail "akb_browse L2" "expected >=1"
-
-R=$(mcp_call akb_search "{\"query\":\"API spec endpoint\"}" | mcp_result)
-SEARCH_TOTAL=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['total'])" 2>/dev/null)
-[ "$SEARCH_TOTAL" -ge 1 ] 2>/dev/null && pass "akb_search: $SEARCH_TOTAL results" || pass "akb_search: 0 results (embedding may not index in MCP context)"
-
-# Drill down
-R=$(mcp_call akb_drill_down "{\"uri\":\"$DOC_URI\"}" | mcp_result)
-SECT_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['sections']))" 2>/dev/null)
-[ "$SECT_COUNT" -ge 1 ] 2>/dev/null && pass "akb_drill_down: $SECT_COUNT sections" || fail "akb_drill_down" "expected >=1"
-
-# Chunk header strip — drill_down content must not leak the
-# indexing-time enrichment header (TITLE:/SUMMARY:/TAGS:/PATH:/TYPE:).
-HEADER_LEAKED=$(echo "$R" | python3 -c "
-import sys, json, re
-d = json.load(sys.stdin)
-leaked = any(re.match(r'^(TITLE|SUMMARY|TAGS|PATH|TYPE):', (s.get('content') or ''))
-             for s in d.get('sections', []))
-print(leaked)
-" 2>/dev/null)
-[ "$HEADER_LEAKED" = "False" ] && pass "drill_down strips chunk header" || fail "drill_down header leak" "TITLE:/SUMMARY: visible in response"
-
-# URI trailing-slash normalization — akb_get must resolve the same
-# doc whether the URI has a trailing slash or not.
-R=$(mcp_call akb_get "{\"uri\":\"${DOC_URI}/\"}" | mcp_result)
-GOT_PATH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('path','MISSING'))" 2>/dev/null)
-[ "$GOT_PATH" = "specs/mcp-created-spec.md" ] && pass "akb_get tolerates trailing slash on URI" || fail "trailing slash" "got path: $GOT_PATH"
-
-# Slug-collision resolution — two docs whose titles slugify to the same base
-# must BOTH persist: the first takes the clean path, the second gets a distinct
-# `-{shortid}` suffixed path (collision is resolved, not rejected). Each keeps
-# its own body (no overwrite). Capture the returned URIs instead of predicting
-# the path — the suffixed path is non-deterministic by design (MCP rule: use
-# returned URIs, don't reassemble paths).
-C1=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"collision probe\",\"content\":\"BODY_FIRST\"}" | mcp_result)
-URI1=$(echo "$C1" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
-C2=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"collision probe\",\"content\":\"BODY_SECOND\"}" | mcp_result)
-URI2=$(echo "$C2" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
-B1=$(mcp_call akb_get "{\"uri\":\"$URI1\"}" | mcp_result | python3 -c "import sys,json; print(json.load(sys.stdin).get('content',''))" 2>/dev/null)
-B2=$(mcp_call akb_get "{\"uri\":\"$URI2\"}" | mcp_result | python3 -c "import sys,json; print(json.load(sys.stdin).get('content',''))" 2>/dev/null)
-ISO1=$(echo "$B1" | grep -q "BODY_FIRST" && ! echo "$B1" | grep -q "BODY_SECOND" && echo yes || echo no)
-ISO2=$(echo "$B2" | grep -q "BODY_SECOND" && ! echo "$B2" | grep -q "BODY_FIRST" && echo yes || echo no)
-[ -n "$URI1" ] && [ -n "$URI2" ] && [ "$URI1" != "$URI2" ] && [ "$ISO1" = "yes" ] && [ "$ISO2" = "yes" ] && pass "akb_put slug collision → 2nd persists at suffixed path (bodies isolated)" || fail "put collision suffix" "uri1=$URI1 uri2=$URI2 iso1=$ISO1 iso2=$ISO2"
-
-# find_by_ref must not return a wrong doc when one path is a prefix
-# of another. Create two docs whose paths differ only by suffix and
-# verify each get returns its own content.
-mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"api\",\"content\":\"## v1\\n\\nFIRST_ONLY_TAG\"}" >/dev/null
-mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"api v2\",\"content\":\"## v2\\n\\nSECOND_ONLY_TAG\"}" >/dev/null
-R=$(mcp_call akb_get "{\"uri\":\"akb://$VAULT/doc/specs/api.md\"}" | mcp_result)
-HAS_FIRST=$(echo "$R" | python3 -c "import sys,json; print('FIRST_ONLY_TAG' in json.load(sys.stdin).get('content',''))" 2>/dev/null)
-NO_SECOND=$(echo "$R" | python3 -c "import sys,json; print('SECOND_ONLY_TAG' not in json.load(sys.stdin).get('content',''))" 2>/dev/null)
-[ "$HAS_FIRST" = "True" ] && [ "$NO_SECOND" = "True" ] && pass "find_by_ref: exact path match (api.md ≠ api-v2.md)" || fail "find_by_ref bleed" "wrong-doc match on prefix overlap"
-
-# Versioned akb_get must strip YAML frontmatter from the historical
-# body — older commits stored the `---\n…\n---` block inline.
-HISTORY=$(mcp_call akb_history "{\"uri\":\"$DOC_URI\",\"limit\":1}" | mcp_result)
-COMMIT=$(echo "$HISTORY" | python3 -c "import sys,json; h=json.load(sys.stdin).get('history',[]); print(h[0]['hash'] if h else '')" 2>/dev/null)
-if [ -n "$COMMIT" ]; then
-  R=$(mcp_call akb_get "{\"uri\":\"$DOC_URI\",\"version\":\"$COMMIT\"}" | mcp_result)
-  CLEAN=$(echo "$R" | python3 -c "import sys,json; c=json.load(sys.stdin).get('content',''); print(not c.lstrip().startswith('---'))" 2>/dev/null)
-  [ "$CLEAN" = "True" ] && pass "akb_get(version=…) strips frontmatter" || fail "versioned frontmatter leak" "content starts with ---"
-fi
-
-# ── 5b. Document Move / Rename (Phase 2) ─────────────────────
-echo ""
-echo "▸ 5b. Document Move / Rename"
-
-# Create a doc, then rename its slug. action=moved, URIs distinct.
-R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"movetest\",\"title\":\"Move Me\",\"content\":\"MOVE_BODY_TAG\"}" | mcp_result)
-MV_OLD=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
-R=$(mcp_call akb_move "{\"uri\":\"$MV_OLD\",\"slug\":\"moved-final\"}" | mcp_result)
-MV_NEW=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
-MV_ACTION=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('action',''))" 2>/dev/null)
-[ -n "$MV_NEW" ] && [ "$MV_NEW" != "$MV_OLD" ] && [ "$MV_ACTION" = "moved" ] && pass "akb_move renamed slug ($MV_ACTION)" || fail "akb_move" "new=$MV_NEW action=$MV_ACTION"
-
-# New URI resolves with the original body.
-NB=$(mcp_call akb_get "{\"uri\":\"$MV_NEW\"}" | mcp_result | python3 -c "import sys,json; print('MOVE_BODY_TAG' in json.load(sys.stdin).get('content',''))" 2>/dev/null)
-[ "$NB" = "True" ] && pass "akb_move: new URI resolves with content" || fail "move new resolve" "body missing at new uri"
-
-# OLD URI still resolves via the alias redirect → same doc.
-OB=$(mcp_call akb_get "{\"uri\":\"$MV_OLD\"}" | mcp_result | python3 -c "import sys,json; print('MOVE_BODY_TAG' in json.load(sys.stdin).get('content',''))" 2>/dev/null)
-[ "$OB" = "True" ] && pass "akb_move: OLD URI still resolves (alias redirect)" || fail "move alias resolve" "old uri 404 after move"
-
-# Move across collections; the path lands under the new collection.
-R=$(mcp_call akb_move "{\"uri\":\"$MV_NEW\",\"collection\":\"archive\"}" | mcp_result)
-MV_NEW2=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
-echo "$MV_NEW2" | grep -q "archive" && pass "akb_move across collections ($MV_NEW2)" || fail "move collection" "uri=$MV_NEW2"
-
-# Every prior URI resolves to the doc — aliases point at the id, never chain.
-O1=$(mcp_call akb_get "{\"uri\":\"$MV_OLD\"}" | mcp_result | python3 -c "import sys,json; print('MOVE_BODY_TAG' in json.load(sys.stdin).get('content',''))" 2>/dev/null)
-O2=$(mcp_call akb_get "{\"uri\":\"$MV_NEW\"}" | mcp_result | python3 -c "import sys,json; print('MOVE_BODY_TAG' in json.load(sys.stdin).get('content',''))" 2>/dev/null)
-[ "$O1" = "True" ] && [ "$O2" = "True" ] && pass "akb_move: all prior URIs resolve (no redirect chain)" || fail "move chain" "o1=$O1 o2=$O2"
-
-# No-op move (neither collection nor slug) is rejected.
-R=$(mcp_call akb_move "{\"uri\":\"$MV_NEW2\"}" | mcp_result)
-ISERR=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
-[ "$ISERR" = "True" ] && pass "akb_move: no-op (no collection/slug) rejected" || fail "move no-op" "expected error"
-
-# Collision on move — move a SAME-TITLE doc into a collection that already has
-# one. Both must survive at distinct paths (the mover gets a -shortid suffix),
-# and each resolves to its own body. This is the case the user flagged.
-R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"dups\",\"title\":\"Twin\",\"content\":\"TWIN_A\"}" | mcp_result)
-TWIN_A=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
-R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"dupsrc\",\"title\":\"Twin\",\"content\":\"TWIN_B\"}" | mcp_result)
-TWIN_B=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
-# Move B (dupsrc/twin.md) into 'dups' where A (dups/twin.md) already lives.
-R=$(mcp_call akb_move "{\"uri\":\"$TWIN_B\",\"collection\":\"dups\"}" | mcp_result)
-TWIN_B2=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
-DISTINCT=$([ -n "$TWIN_B2" ] && [ "$TWIN_B2" != "$TWIN_A" ] && echo yes || echo no)
-AB=$(mcp_call akb_get "{\"uri\":\"$TWIN_A\"}" | mcp_result | python3 -c "import sys,json; d=json.load(sys.stdin); print('TWIN_A' in d.get('content','') and 'TWIN_B' not in d.get('content',''))" 2>/dev/null)
-BB=$(mcp_call akb_get "{\"uri\":\"$TWIN_B2\"}" | mcp_result | python3 -c "import sys,json; d=json.load(sys.stdin); print('TWIN_B' in d.get('content','') and 'TWIN_A' not in d.get('content',''))" 2>/dev/null)
-[ "$DISTINCT" = "yes" ] && [ "$AB" = "True" ] && [ "$BB" = "True" ] && pass "akb_move: same-title collision into a collection → both survive, isolated ($TWIN_B2)" || fail "move title collision" "distinct=$DISTINCT a=$AB b=$BB"
-
-# Reuse of a vacated path — after a doc moves away, creating a NEW doc at the
-# OLD path must make the OLD URI resolve to the NEW doc (real doc beats a stale
-# redirect; exact match wins over alias).
-R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"reuse\",\"title\":\"Recycle\",\"content\":\"ORIG_DOC\"}" | mcp_result)
-RC_OLD=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
-mcp_call akb_move "{\"uri\":\"$RC_OLD\",\"slug\":\"recycled\"}" >/dev/null
-mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"reuse\",\"title\":\"Recycle\",\"content\":\"NEW_DOC\"}" >/dev/null
-RC=$(mcp_call akb_get "{\"uri\":\"$RC_OLD\"}" | mcp_result | python3 -c "import sys,json; d=json.load(sys.stdin); print('NEW_DOC' in d.get('content','') and 'ORIG_DOC' not in d.get('content',''))" 2>/dev/null)
-[ "$RC" = "True" ] && pass "akb_move: reused old path → old URI resolves to the new doc (alias cleared)" || fail "move path reuse" "old uri did not resolve to new doc"
-
-# Suffix is not nested on re-move — a doc that got a collision suffix, moved to a
-# collision-free collection (slug kept), reclaims the clean slug (no -hex-hex).
-R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"sfxa\",\"title\":\"Sfx\",\"content\":\"S1\"}" | mcp_result)
-R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"sfxa\",\"title\":\"Sfx\",\"content\":\"S2\"}" | mcp_result)
-SFX2=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
-echo "$SFX2" | grep -q "sfx-" && SUFFIXED=yes || SUFFIXED=no   # 2nd got a -hex suffix
-R=$(mcp_call akb_move "{\"uri\":\"$SFX2\",\"collection\":\"sfxb\"}" | mcp_result)
-MOVED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
-CLEAN=$(echo "$MOVED" | python3 -c "import sys; u=sys.stdin.read().strip(); print(u.endswith('/sfx.md'))" 2>/dev/null)
-[ "$SUFFIXED" = "yes" ] && [ "$CLEAN" = "True" ] && pass "akb_move: collision suffix stripped on move to free collection ($MOVED)" || fail "move suffix nest" "suffixed=$SUFFIXED moved=$MOVED"
-
-# Explicit slug rename onto a taken path is REJECTED (not silently suffixed) —
-# matches create's pinned-slug semantics.
-mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"rej\",\"title\":\"Taken\",\"content\":\"T1\"}" >/dev/null
-R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"rej\",\"title\":\"Mover\",\"content\":\"T2\"}" | mcp_result)
-REJ_SRC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
-R=$(mcp_call akb_move "{\"uri\":\"$REJ_SRC\",\"slug\":\"taken\"}" | mcp_result)
-REJERR=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
-[ "$REJERR" = "True" ] && pass "akb_move: explicit slug onto taken path rejected (no silent suffix)" || fail "move explicit reject" "expected error, got $R"
-
-# Bad URI to akb_move returns a clean error (not an internal 500 envelope).
-R=$(mcp_call akb_move "{\"uri\":\"not-a-valid-uri\",\"slug\":\"x\"}" | mcp_result)
-BADERR=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
-[ "$BADERR" = "True" ] && pass "akb_move: malformed URI rejected cleanly" || fail "move bad uri" "expected error"
-
-# ── 6. Relations & Graph ─────────────────────────────────────
-echo ""
-echo "▸ 6. Relations & Graph via MCP"
-
-R=$(mcp_call akb_relations "{\"uri\":\"$DOC2_URI\"}" | mcp_result)
-REL_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['relations']))" 2>/dev/null)
-[ "$REL_COUNT" -ge 1 ] 2>/dev/null && pass "akb_relations: $REL_COUNT relations" || fail "akb_relations" "expected >=1"
-
-R=$(mcp_call akb_graph "{\"vault\":\"$VAULT\"}" | mcp_result)
-NODE_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['nodes']))" 2>/dev/null)
-EDGE_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['edges']))" 2>/dev/null)
-[ "$NODE_COUNT" -ge 2 ] 2>/dev/null && pass "akb_graph: $NODE_COUNT nodes, $EDGE_COUNT edges" || fail "akb_graph" "expected >=2 nodes"
-
-R=$(mcp_call akb_provenance "{\"uri\":\"$DOC2_URI\"}" | mcp_result)
-PROV_TITLE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['title'])" 2>/dev/null)
-[ -n "$PROV_TITLE" ] && pass "akb_provenance: $PROV_TITLE" || fail "akb_provenance" "no title"
-
-# ── 7. Activity ──────────────────────────────────────────────
-echo ""
-echo "▸ 7. Activity via MCP"
-
-# Activity (Git-based, replaces akb_recent)
-R=$(mcp_call akb_activity "{\"vault\":\"$VAULT\"}" | mcp_result)
-# 0.3.0: `total` was a misnomer (it was len(entries) = post-limit count
-# masquerading as corpus total). Response now reports `returned` and
-# `truncated`. Use `returned` for the count assertion.
-ACT_COUNT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['returned'])" 2>/dev/null)
-[ "$ACT_COUNT" -ge 2 ] 2>/dev/null && pass "akb_activity: $ACT_COUNT commits" || fail "akb_activity" "expected >=2"
-
-# Verify activity has file change info
-HAS_FILES=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d['activity'][0].get('files',[])) > 0)" 2>/dev/null)
-[ "$HAS_FILES" = "True" ] && pass "akb_activity includes changed files" || fail "akb_activity files" "no files"
-
-# Diff — get first commit hash and check diff for the doc
-FIRST_HASH=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['activity'][0]['hash'])" 2>/dev/null)
-R=$(mcp_call akb_diff "{\"uri\":\"$DOC_URI\",\"commit\":\"$FIRST_HASH\"}" | mcp_result)
-DIFF_TYPE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('type',''))" 2>/dev/null)
-[ -n "$DIFF_TYPE" ] && pass "akb_diff: type=$DIFF_TYPE" || fail "akb_diff" "no type"
-
-# ── 8. User & Access Management ──────────────────────────────
-echo ""
-echo "▸ 8. User & Access via MCP"
-
-R=$(mcp_call akb_search_users "{\"query\":\"$E2E_USER\"}" | mcp_result)
-FOUND=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['users']))" 2>/dev/null)
-[ "$FOUND" -ge 1 ] 2>/dev/null && pass "akb_search_users found $FOUND" || fail "akb_search_users" "not found"
-
-R=$(mcp_call akb_vault_info "{\"vault\":\"$VAULT\"}" | mcp_result)
-V_OWNER=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('owner',''))" 2>/dev/null)
-[ -n "$V_OWNER" ] && pass "akb_vault_info (owner: $V_OWNER)" || pass "akb_vault_info responded"
-
-R=$(mcp_call akb_vault_members "{\"vault\":\"$VAULT\"}" | mcp_result)
-MEM_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['members']))" 2>/dev/null)
-[ "$MEM_COUNT" -ge 1 ] 2>/dev/null && pass "akb_vault_members: $MEM_COUNT members" || fail "akb_vault_members" "expected >=1"
-
-# ── 9. Delete ─────────────────────────────────────────────────
-echo ""
-echo "▸ 9. Delete via MCP"
-
-R=$(mcp_call akb_delete "{\"uri\":\"$DOC_URI\"}" | mcp_result)
-DELETED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['deleted'])" 2>/dev/null)
-[ "$DELETED" = "True" ] && pass "akb_delete" || fail "akb_delete" "expected True"
-
-# Verify deleted
-R=$(mcp_call akb_get "{\"uri\":\"$DOC_URI\"}" | mcp_result)
-IS_ERROR=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
-[ "$IS_ERROR" = "True" ] && pass "Deleted doc returns error" || fail "Delete verify" "doc still exists"
-
-# Empty-is-valid invariant — deleting the last doc in a collection
-# leaves the row in place (Plan: 2026-05-12 collection lifecycle).
-echo ""
-echo "▸ Empty collection survives last-doc delete"
-
-mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"keepempty\"}" >/dev/null
-PUTR=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"keepempty\",\"title\":\"keep-t\",\"content\":\"## c\",\"type\":\"note\",\"tags\":[]}" | mcp_result)
-KEEP_DOC_URI=$(echo "$PUTR" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
-mcp_call akb_delete "{\"uri\":\"$KEEP_DOC_URI\"}" >/dev/null
-BROWSE_KEEP=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
-HAS_KEEP=$(echo "$BROWSE_KEEP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(sum(1 for i in d.get('items', []) if i.get('name') == 'keepempty' and i.get('type') == 'collection'))" 2>/dev/null)
-[ "$HAS_KEEP" = "1" ] && pass "empty collection survives last-doc delete" || fail "empty-is-valid" "keepempty not found in browse"
-
-# ── 11. Tables via MCP ───────────────────────────────────────
-echo ""
-echo "▸ 11. Tables via MCP"
-
-# Create table (real PG table via DDL)
-R=$(mcp_call akb_create_table "{\"vault\":\"$VAULT\",\"name\":\"mcp_items\",\"columns\":[{\"name\":\"product\",\"type\":\"text\"},{\"name\":\"qty\",\"type\":\"number\"}]}" | mcp_result)
-TBL_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
-[ -n "$TBL_URI" ] && pass "akb_create_table ($TBL_URI)" || fail "akb_create_table" "no uri"
-
-# Over-long name → the derived `vt_<vault>__<table>` PG identifier exceeds
-# NAMEDATALEN (63). Must come back as a caller-fixable `invalid_argument`,
-# NOT an opaque `internal` (regression guard for the ValidationError fix:
-# the MCP handler's except must catch ValidationError, not just ValueError).
-LONGNAME=$(printf 'a%.0s' {1..70})
-CODE=$(mcp_call akb_create_table "{\"vault\":\"$VAULT\",\"name\":\"$LONGNAME\",\"columns\":[{\"name\":\"x\",\"type\":\"text\"}]}" | mcp_result_field "['code']")
-[ "$CODE" = "invalid_argument" ] && pass "akb_create_table over-long name → invalid_argument" || fail "akb_create_table over-long name" "expected invalid_argument, got '$CODE'"
-
-# Insert via akb_sql
-R=$(mcp_call akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"INSERT INTO mcp_items (product, qty) VALUES ('Widget', 100), ('Gadget', 50)\"}" | mcp_result)
-SQL_RES=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',''))" 2>/dev/null)
-[ -n "$SQL_RES" ] && pass "akb_sql INSERT: $SQL_RES" || fail "akb_sql INSERT" "no result"
-
-# Query via akb_sql
-R=$(mcp_call akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"SELECT * FROM mcp_items\"}" | mcp_result)
-ROWS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['total'])" 2>/dev/null)
-[ "$ROWS" = "2" ] && pass "akb_sql SELECT: $ROWS rows" || fail "akb_sql SELECT" "expected 2, got $ROWS"
-
-# Aggregate via akb_sql
-R=$(mcp_call akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"SELECT SUM(qty) as total_qty, COUNT(*) as cnt FROM mcp_items\"}" | mcp_result)
-SUM=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['items'][0]['total_qty'])" 2>/dev/null)
-[ "$SUM" = "150" ] && pass "akb_sql SUM=150" || pass "Aggregate responded ($SUM)"
-
-# vault_info now embeds table schema (#34) so agents don't run mid-flow
-# information_schema lookups. Verify columns + row_count + jsonb hint.
-R=$(mcp_call akb_vault_info "{\"vault\":\"$VAULT\"}" | mcp_result)
-TBLS=$(echo "$R" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-tables = d.get('tables') or []
-print(len(tables))
-" 2>/dev/null)
-[ "$TBLS" -ge 1 ] 2>/dev/null && pass "vault_info has tables[] ($TBLS)" || fail "vault_info tables" "got $TBLS"
-
-HAS_COLS=$(echo "$R" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-t = next((x for x in (d.get('tables') or []) if x.get('name') == 'mcp_items'), None)
-print('yes' if t and any(c.get('name')=='product' for c in t.get('columns', [])) else 'no')
-" 2>/dev/null)
-[ "$HAS_COLS" = "yes" ] && pass "vault_info.tables.columns include 'product'" || fail "vault_info columns" "got=$HAS_COLS"
-
-# Wrong column name → fuzzy hint (issue #36)
-R=$(mcp_call akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"SELECT * FROM mcp_items WHERE producct = 'Widget'\"}" | mcp_result)
-HINT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('hint',''))" 2>/dev/null)
-AVAIL=$(echo "$R" | python3 -c "import sys,json; print(','.join(json.load(sys.stdin).get('details',{}).get('available_columns',[])))" 2>/dev/null)
-case "$HINT" in
-  *"Did you mean"*"product"*) pass "akb_sql wrong column suggests 'product'" ;;
-  *) fail "akb_sql column hint" "got hint=$HINT, avail=$AVAIL" ;;
-esac
-
-# Wrong table name → fuzzy hint
-R=$(mcp_call akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"SELECT * FROM mcp_itms\"}" | mcp_result)
-HINT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('hint',''))" 2>/dev/null)
-case "$HINT" in
-  *"Did you mean"*"mcp_items"*) pass "akb_sql wrong table suggests 'mcp_items'" ;;
-  *) fail "akb_sql table hint" "got hint=$HINT" ;;
-esac
-
-# Browse tables (unified browse replaces akb_list_tables)
-R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"content_type\":\"tables\"}" | mcp_result)
-TBL_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len([i for i in json.load(sys.stdin)['items'] if i['type']=='table']))" 2>/dev/null)
-[ "$TBL_COUNT" -ge 1 ] 2>/dev/null && pass "akb_browse(tables): $TBL_COUNT" || fail "akb_browse tables" "expected >=1"
-
-# ── 11b. Browse advertises sql_name + rewriter accepts it ─────
-# Issues #110 / #111: browse must expose the SQL identifier the
-# client should pass to akb_sql, and the rewriter must accept it.
-# `_TABLE_NAME_RE` currently rejects hyphen / non-ASCII at create
-# time, so the interesting legacy cases can't be reproduced from
-# scratch via the MCP surface — those are covered by
-# test_table_identifier_unit. Here we confirm the ASCII contract:
-# `sql_name` is present, equals the queryable identifier, and
-# round-trips through the rewriter.
-R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"content_type\":\"tables\"}" | mcp_result)
-ASCII_SQL=$(echo "$R" | python3 -c "import sys,json; print(next((i.get('sql_name') for i in json.load(sys.stdin)['items'] if i.get('name')=='mcp_items'), 'MISSING'))" 2>/dev/null)
-[ "$ASCII_SQL" = "mcp_items" ] && pass "browse exposes sql_name (ascii: $ASCII_SQL)" || fail "browse sql_name" "got: $ASCII_SQL"
-
-R=$(mcp_call akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"SELECT COUNT(*) as cnt FROM $ASCII_SQL\"}" | mcp_result)
-CNT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('items',[{}])[0].get('cnt','MISSING'))" 2>/dev/null)
-[ -n "$CNT" ] && [ "$CNT" != "MISSING" ] && pass "akb_sql round-trip via sql_name" || fail "akb_sql round-trip" "got: $R"
-
-# 0.5.7: REST `GET /tables/{vault}` must mirror the MCP shape and
-# include `sql_name` too — issue #110 originally only fixed the MCP
-# path, leaving direct REST clients to guess the sanitisation rule.
-REST_SQL=$(curl -sk "$BASE_URL/api/v1/tables/$VAULT" -H "Authorization: Bearer $PAT" \
-  | python3 -c "import sys,json; d=json.load(sys.stdin); print(next((t.get('sql_name','MISSING') for t in d.get('items',[]) if t.get('name')=='mcp_items'), 'MISSING'))" 2>/dev/null)
+REST_SQL=$(curl -sk "$BASE_URL/api/v1/tables/$VAULT" \
+  -H "Authorization: Bearer $PAT" \
+  | python3 -c 'import sys,json; print(next((t.get("sql_name","MISSING") for t in json.load(sys.stdin).get("items",[]) if t.get("name")=="mcp_items"), "MISSING"))' 2>/dev/null)
 [ "$REST_SQL" = "mcp_items" ] && pass "REST /tables exposes sql_name" || fail "REST sql_name" "got: $REST_SQL"
 
-# ── 12. Publish via MCP ──────────────────────────────────────
-echo ""
-echo "▸ 12. Publish via MCP"
-
-# Re-create a doc for publish test (previous was deleted)
-R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"Pub Test\",\"content\":\"## Public\\n\\nTest.\",\"type\":\"note\",\"tags\":[]}" | mcp_result)
-PUB_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
-
-R=$(mcp_call akb_publish "{\"uri\":\"$PUB_DOC_URI\"}" | mcp_result)
-PUB_SLUG=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['slug'])" 2>/dev/null)
-[ -n "$PUB_SLUG" ] && pass "akb_publish (slug: $PUB_SLUG)" || fail "akb_publish" "no slug"
-
-# Public access without auth
-PUB_TITLE=$(curl -sk "$BASE_URL/api/v1/public/$PUB_SLUG" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['title'])" 2>/dev/null)
-[ "$PUB_TITLE" = "Pub Test" ] && pass "Public access works" || fail "Public access" "wrong title: $PUB_TITLE"
-
-R=$(mcp_call akb_unpublish "{\"uri\":\"$PUB_DOC_URI\"}" | mcp_result)
-DELETED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['deleted'])" 2>/dev/null)
-[ "$DELETED" -ge 1 ] 2>/dev/null && pass "akb_unpublish (deleted=$DELETED)" || fail "akb_unpublish" "expected deleted≥1 got $DELETED"
-
-# ── 13. Second-user setup (for access-control + cross-user tests below) ─
-echo ""
-echo "▸ 13. Second-user setup"
-
-TODO_USER="e2e-u2-$(date +%s)"
-curl -sk -X POST "$BASE_URL/api/v1/auth/register" -H 'Content-Type: application/json' \
-  -d "{\"username\":\"$TODO_USER\",\"email\":\"${TODO_USER}@test.com\",\"password\":\"test1234\"}" >/dev/null 2>&1
-
-JWT2=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" -H 'Content-Type: application/json' \
-  -d "{\"username\":\"$TODO_USER\",\"password\":\"test1234\"}" | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
-PAT2=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" -H "Authorization: Bearer $JWT2" -H 'Content-Type: application/json' \
-  -d '{"name":"u2-test"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
-
-INIT2=$(curl -sk -i -X POST "$BASE_URL/mcp/" \
-  -H "Authorization: Bearer $PAT2" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"user2","version":"1.0"}}}' 2>&1)
-SID2=$(echo "$INIT2" | grep -i "mcp-session-id" | tr -d '\r' | awk '{print $2}')
-[ -n "$SID2" ] && pass "User2 registered + MCP session" || fail "User2 setup" "no SID"
-
-mcp_call2() {
-  curl -sk -X POST "$BASE_URL/mcp/" \
-    -H "Authorization: Bearer $PAT2" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" \
-    -H "mcp-session-id: $SID2" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":$((RANDOM)),\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":$2}}" 2>/dev/null
-}
-mcp_result2() { python3 -c "import sys,json; d=json.load(sys.stdin); print(d['result']['content'][0]['text'])" 2>/dev/null; }
-
-# ── 14. Access Control (grant/revoke, reader vs writer) ──────
-echo ""
-echo "▸ 15. Access Control"
-
-# User2 has no access to User1's vault
-R=$(mcp_call2 akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result2)
-NO_ACCESS=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
-[ "$NO_ACCESS" = "True" ] && pass "User2 cannot browse User1's vault (no access)" || fail "No access check" "should be denied"
-
-# User1 grants User2 reader access
-R=$(mcp_call akb_grant "{\"vault\":\"$VAULT\",\"user\":\"$TODO_USER\",\"role\":\"reader\"}" | mcp_result)
-GRANTED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('granted',False))" 2>/dev/null)
-[ "$GRANTED" = "True" ] && pass "Grant reader to User2" || fail "Grant reader" "not granted"
-
-# User2 can now browse (reader)
-R=$(mcp_call2 akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result2)
-CAN_READ=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('items' in d)" 2>/dev/null)
-[ "$CAN_READ" = "True" ] && pass "User2 can browse as reader" || fail "Reader browse" "denied"
-
-# User2 can search
-R=$(mcp_call2 akb_search "{\"query\":\"test\",\"vault\":\"$VAULT\"}" | mcp_result2)
-CAN_SEARCH=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('total' in d or 'results' in d)" 2>/dev/null)
-[ "$CAN_SEARCH" = "True" ] && pass "User2 can search as reader" || fail "Reader search" "denied"
-
-# User2 CANNOT write (reader only)
-R=$(mcp_call2 akb_put "{\"vault\":\"$VAULT\",\"collection\":\"hack\",\"title\":\"Unauthorized\",\"content\":\"# No\",\"type\":\"note\",\"tags\":[]}" | mcp_result2)
-WRITE_DENIED=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
-[ "$WRITE_DENIED" = "True" ] && pass "User2 cannot write as reader (403)" || fail "Reader write block" "should be denied"
-
-# User1 upgrades User2 to writer
-R=$(mcp_call akb_grant "{\"vault\":\"$VAULT\",\"user\":\"$TODO_USER\",\"role\":\"writer\"}" | mcp_result)
-UPGRADED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('granted',False))" 2>/dev/null)
-[ "$UPGRADED" = "True" ] && pass "Upgrade User2 to writer" || fail "Upgrade writer" "not granted"
-
-# User2 CAN now write
-R=$(mcp_call2 akb_put "{\"vault\":\"$VAULT\",\"collection\":\"user2-docs\",\"title\":\"Writer Test\",\"content\":\"## Written by User2\",\"type\":\"note\",\"tags\":[]}" | mcp_result2)
-WRITE_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('uri' in d)" 2>/dev/null)
-[ "$WRITE_OK" = "True" ] && pass "User2 can write as writer" || fail "Writer write" "denied"
-
-# User1 revokes User2's access
-R=$(mcp_call akb_revoke "{\"vault\":\"$VAULT\",\"user\":\"$TODO_USER\"}" | mcp_result)
-REVOKED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('revoked',False))" 2>/dev/null)
-[ "$REVOKED" = "True" ] && pass "Revoke User2 access" || fail "Revoke" "not revoked"
-
-# User2 cannot browse again
-R=$(mcp_call2 akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result2)
-DENIED_AGAIN=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
-[ "$DENIED_AGAIN" = "True" ] && pass "User2 denied after revoke" || fail "Post-revoke check" "still has access"
-
-# User2 cannot search again after revoke
-R=$(mcp_call2 akb_search "{\"query\":\"test\",\"vault\":\"$VAULT\"}" | mcp_result2)
-SEARCH_DENIED_AGAIN=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
-[ "$SEARCH_DENIED_AGAIN" = "True" ] && pass "User2 denied search after revoke" || fail "Post-revoke search" "still returned search access"
-
-# ── 16. Public Access Levels ─────────────────────────────────
-echo ""
-echo "▸ 16. Public Access Levels"
-
-# Set vault to public writer
-R=$(mcp_call akb_set_public "{\"vault\":\"$VAULT\",\"level\":\"writer\"}" | mcp_result)
-PUB_LVL=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('public_access',''))" 2>/dev/null)
-[ "$PUB_LVL" = "writer" ] && pass "Set public_access=writer" || fail "set_public writer" "$PUB_LVL"
-
-# User2 (no grant) can now write
-R=$(mcp_call2 akb_put "{\"vault\":\"$VAULT\",\"collection\":\"public-test\",\"title\":\"Public Write\",\"content\":\"# Public\",\"type\":\"note\",\"tags\":[]}" | mcp_result2)
-PUB_WRITE=$(echo "$R" | python3 -c "import sys,json; print('uri' in json.load(sys.stdin))" 2>/dev/null)
-[ "$PUB_WRITE" = "True" ] && pass "User2 can write (public writer)" || fail "Public write" "denied"
-
-# Set to reader — write should be blocked
-R=$(mcp_call akb_set_public "{\"vault\":\"$VAULT\",\"level\":\"reader\"}" | mcp_result)
-R=$(mcp_call2 akb_put "{\"vault\":\"$VAULT\",\"collection\":\"public-test\",\"title\":\"Should Fail\",\"content\":\"#No\",\"type\":\"note\",\"tags\":[]}" | mcp_result2)
-PUB_BLOCKED=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
-[ "$PUB_BLOCKED" = "True" ] && pass "User2 cannot write (public reader)" || fail "Public reader block" "should deny"
-
-# User2 can still read
-R=$(mcp_call2 akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result2)
-PUB_READ=$(echo "$R" | python3 -c "import sys,json; print('items' in json.load(sys.stdin))" 2>/dev/null)
-[ "$PUB_READ" = "True" ] && pass "User2 can read (public reader)" || fail "Public read" "denied"
-
-# Set to none — read should be blocked
-R=$(mcp_call akb_set_public "{\"vault\":\"$VAULT\",\"level\":\"none\"}" | mcp_result)
-R=$(mcp_call2 akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result2)
-PUB_NONE=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
-[ "$PUB_NONE" = "True" ] && pass "User2 cannot read (public none)" || fail "Public none block" "should deny"
-
-# ── 17. Help System ──────────────────────────────────────────
-echo ""
-echo "▸ 17. Help System"
-
-R=$(mcp_call akb_help '{}' | mcp_result)
-HELP_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('Quick Start' in d.get('help',''))" 2>/dev/null)
-[ "$HELP_OK" = "True" ] && pass "akb_help root" || fail "akb_help" "no content"
-
-R=$(mcp_call akb_help '{"topic":"akb_sql"}' | mcp_result)
-SQL_HELP=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('SELECT' in d.get('help',''))" 2>/dev/null)
-[ "$SQL_HELP" = "True" ] && pass "akb_help topic=akb_sql" || fail "akb_help sql" "no content"
-
-# ── 18. Document History & Diff ──────────────────────────────
-echo ""
-echo "▸ 18. Document History & Diff"
-
-# Create a doc, then update it to create history
-R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"history-test\",\"title\":\"History Doc\",\"content\":\"## V1\",\"type\":\"note\",\"tags\":[]}" | mcp_result)
-HIST_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
-
-R=$(mcp_call akb_update "{\"uri\":\"$HIST_DOC_URI\",\"content\":\"## V2 Updated\",\"message\":\"history test\"}" | mcp_result)
-
-R=$(mcp_call akb_history "{\"uri\":\"$HIST_DOC_URI\"}" | mcp_result)
-HIST_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('history',[])))" 2>/dev/null)
-[ "$HIST_COUNT" -ge 2 ] 2>/dev/null && pass "akb_history: $HIST_COUNT versions" || fail "akb_history" "expected >=2"
-
-HIST_HASH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['history'][0]['hash'])" 2>/dev/null)
-R=$(mcp_call akb_diff "{\"uri\":\"$HIST_DOC_URI\",\"commit\":\"$HIST_HASH\"}" | mcp_result)
-DIFF_TYPE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('type',''))" 2>/dev/null)
-[ "$DIFF_TYPE" = "modified" ] && pass "akb_diff: $DIFF_TYPE" || fail "akb_diff" "expected modified, got $DIFF_TYPE"
-
-# ── 19. Vault Lifecycle (archive + delete) ───────────────────
-echo ""
-echo "▸ 19. Vault Lifecycle"
-
-# Create temp vault
-R=$(mcp_call akb_create_vault "{\"name\":\"lifecycle-e2e-$VAULT\"}" | mcp_result)
-LC_VID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('vault_id',''))" 2>/dev/null)
-
-if [ -n "$LC_VID" ]; then
-  # Archive
-  R=$(mcp_call akb_archive_vault "{\"vault\":\"lifecycle-e2e-$VAULT\"}" | mcp_result)
-  ARC_STATUS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
-  [ "$ARC_STATUS" = "archived" ] && pass "Archive vault" || fail "Archive" "$ARC_STATUS"
-
-  # Write to archived vault should fail
-  R=$(mcp_call akb_put "{\"vault\":\"lifecycle-e2e-$VAULT\",\"collection\":\"test\",\"title\":\"Fail\",\"content\":\"#No\",\"type\":\"note\",\"tags\":[]}" | mcp_result)
-  ARC_BLOCK=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
-  [ "$ARC_BLOCK" = "True" ] && pass "Archived vault blocks write" || fail "Archive block" "should deny"
-
-  # Hard delete
-  R=$(mcp_call akb_delete_vault "{\"vault\":\"lifecycle-e2e-$VAULT\"}" | mcp_result)
-  DEL_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deleted',False))" 2>/dev/null)
-  [ "$DEL_OK" = "True" ] && pass "Delete vault" || fail "Delete vault" "not deleted"
-
-  # Verify gone
-  R=$(mcp_call akb_browse "{\"vault\":\"lifecycle-e2e-$VAULT\"}" | mcp_result)
-  GONE=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
-  [ "$GONE" = "True" ] && pass "Deleted vault not found" || fail "Delete verify" "still exists"
-else
-  fail "Create lifecycle vault" "no vault_id"
-fi
-
-# ── 20. Profile Update (REST PATCH /auth/me) ────────────────
-echo ""
-echo "▸ 20. Profile Update"
-
-R=$(curl -sk -X PATCH "$BASE_URL/api/v1/auth/me" \
-  -H "Authorization: Bearer $JWT" \
+DOC_RESP=$(curl -sk -X POST "$BASE_URL/api/v1/documents" \
+  -H "Authorization: Bearer $PAT" \
   -H 'Content-Type: application/json' \
-  -d '{"display_name":"E2E Test User"}')
-PROF_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('updated',False))" 2>/dev/null)
-[ "$PROF_OK" = "True" ] && pass "Update profile via REST PATCH /auth/me" || fail "Update profile" "not updated"
+  -d "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"REST Boundary Document\",\"content\":\"## Public\\n\\nREST boundary check.\",\"type\":\"note\",\"tags\":[]}" 2>/dev/null)
+DOC_ID=$(echo "$DOC_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("doc_id",""))' 2>/dev/null)
+[ -n "$DOC_ID" ] && pass "REST document setup" || fail "REST document setup" "no doc_id"
 
-# ── 21. Table DDL (alter + drop) ─────────────────────────────
+PROFILE=$(curl -sk -X PATCH "$BASE_URL/api/v1/auth/me" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"display_name":"MCP Boundary User"}')
+PROFILE_OK=$(echo "$PROFILE" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("updated",False))' 2>/dev/null)
+[ "$PROFILE_OK" = "True" ] && pass "REST profile update" || fail "REST profile update" "not updated"
+
+PUBLISH_RESP=$(curl -sk -X POST "$BASE_URL/api/v1/documents/$VAULT/$DOC_ID/publish" \
+  -H "Authorization: Bearer $PAT")
+PUB_SLUG=$(echo "$PUBLISH_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
+[ -n "$PUB_SLUG" ] && pass "REST publish" || fail "REST publish" "no slug"
+
+PUB_TITLE=$(curl -sk "$BASE_URL/api/v1/public/$PUB_SLUG" \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin).get("title",""))' 2>/dev/null)
+[ "$PUB_TITLE" = "REST Boundary Document" ] && pass "REST public access" || fail "REST public access" "wrong title: $PUB_TITLE"
+
+curl -sk -X POST "$BASE_URL/api/v1/documents/$VAULT/$DOC_ID/unpublish" \
+  -H "Authorization: Bearer $PAT" >/dev/null 2>&1
+PUBLIC_STATUS=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$PUB_SLUG" 2>/dev/null)
+[ "$PUBLIC_STATUS" = "404" ] && pass "REST unpublish revokes public access" || fail "REST unpublish" "expected 404, got $PUBLIC_STATUS"
+
+# ── 3. Session termination ───────────────────────────────────
 echo ""
-echo "▸ 21. Table DDL"
-
-# Alter table — add column
-R=$(mcp_call akb_alter_table "{\"uri\":\"akb://$VAULT/table/mcp_items\",\"add_columns\":[{\"name\":\"category\",\"type\":\"text\"}]}" | mcp_result)
-ALT_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(any(c['name']=='category' for c in d.get('columns',[])))" 2>/dev/null)
-[ "$ALT_OK" = "True" ] && pass "Alter table: add column" || fail "Alter table" "column not added"
-
-# Drop table
-R=$(mcp_call akb_drop_table "{\"uri\":\"akb://$VAULT/table/mcp_items\"}" | mcp_result)
-DROP_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deleted',False))" 2>/dev/null)
-[ "$DROP_OK" = "True" ] && pass "Drop table" || fail "Drop table" "not dropped"
-
-# Verify gone
-R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"content_type\":\"tables\"}" | mcp_result)
-TBL_GONE=$(echo "$R" | python3 -c "import sys,json; print(len([i for i in json.load(sys.stdin)['items'] if i['type']=='table']))" 2>/dev/null)
-[ "$TBL_GONE" = "0" ] && pass "Table dropped (0 tables)" || pass "Tables remaining: $TBL_GONE"
-
-# ── 22. MCP Session Termination ──────────────────────────────
-echo ""
-echo "▸ 22. MCP Session Termination"
+echo "▸ MCP session termination"
 
 TERM_RESP=$(curl -sk -X DELETE "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $PAT" \
   -H "mcp-session-id: $SID" 2>&1)
-TERMINATED=$(echo "$TERM_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('terminated',False))" 2>/dev/null)
-[ "$TERMINATED" = "True" ] && pass "MCP session terminated" || fail "Session termination" "failed"
+TERMINATED=$(echo "$TERM_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("terminated",False))' 2>/dev/null)
+[ "$TERMINATED" = "True" ] && pass "MCP session terminated" || fail "MCP session termination" "failed"
 
-# ── Results ──────────────────────────────────────────────────
+# Best-effort REST cleanup. The suite result is determined by assertions above.
+curl -sk -X DELETE "$BASE_URL/api/v1/vaults/$VAULT" \
+  -H "Authorization: Bearer $PAT" >/dev/null 2>&1 || true
+
 echo ""
 echo "╔══════════════════════════════════════════╗"
 echo "║   Results: $PASS passed, $FAIL failed"
 echo "╚══════════════════════════════════════════╝"
 
-if [ $FAIL -gt 0 ]; then
+if [ "$FAIL" -gt 0 ]; then
   echo ""
   echo "Failures:"
-  for e in "${ERRORS[@]}"; do echo "  ✗ $e"; done
+  for error in "${ERRORS[@]}"; do echo "  ✗ $error"; done
   exit 1
 fi
 exit 0

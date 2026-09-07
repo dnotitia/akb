@@ -95,10 +95,11 @@ unset AKB_E2E_USERNAME AKB_E2E_PASSWORD
 cd frontend && pnpm test
 ```
 
-The authenticated MCP pytest scenario is run by the repository-owned runtime
-gate and can also consume a ready schema-v2 descriptor directly. Local and
-hosted CI use the same pytest entrypoint and the same `akb_list_vaults({})`
-assertion:
+The authenticated MCP pytest behavior suite is run by the repository-owned
+runtime gate and can also consume a ready schema-v2 descriptor directly.
+Local and hosted CI use the same pytest entrypoint: the list-vaults canary and
+the migrated MCP product scenarios consume the same descriptor and fixture
+lifecycle. Transport/session and direct REST checks remain in the shell suite:
 
 ```bash
 uv run --locked --extra dev --project backend python -m pytest \

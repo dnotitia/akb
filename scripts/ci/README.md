@@ -45,10 +45,22 @@ runner, so there is no second suite array to keep synchronized.
 
 ### MCP pytest behavior suite
 
-The first MCP behavior scenario is an authenticated read-only
-`akb_list_vaults({})` call through the official MCP Python SDK. The fixture
-uses the SDK's public `Client` and Streamable HTTP transport in the pytest
-process; it does not invoke Inspector, Node, or a separate MCP driver.
+The authenticated MCP behavior suite runs through the official Python SDK.
+`test_list_vaults_e2e.py` remains the small typed `akb_list_vaults({})`
+canary, while `test_product_e2e.py` covers the migrated product scenarios:
+vault and document lifecycle, browse/search/drill-down, move and aliases,
+relations/activity/history/diff, access roles and public levels, tables/SQL/
+DDL, publication, help, and deletion. Each pytest test receives the existing
+fixture's reset/login/SDK lifecycle; the access-control scenario adds a
+second user through the same authenticated endpoint and client lifecycle.
+The fixture uses the SDK's public `Client` and Streamable HTTP transport in the
+pytest process; it does not invoke Inspector, Node, or a separate MCP driver.
+
+The mixed `backend/tests/test_mcp_e2e.sh` suite now retains only transport,
+protocol/session, and direct REST response checks. Its MCP product assertions
+and raw JSON-RPC helper were removed so the product behavior has one SDK-based
+execution path. REST-only checks, initialize/session checks, and the separate
+stdio/Inspector boundaries remain in their existing lanes.
 
 The repository runtime remains the owner of backend startup, readiness,
 fixture reset, credentials, and teardown. Give the same schema-v2 descriptor
@@ -95,7 +107,7 @@ The topology is deliberately small:
 | backend | Ubuntu host process | `127.0.0.1:8000` | AKB application under test |
 | frontend (`--with-frontend`) | Ubuntu host process | `127.0.0.1:3000` by default | existing Vite SPA and per-run backend proxy |
 | fixture control | supervisor-owned in-process app | `127.0.0.1:8889` | health, discovery, and empty reset |
-| MCP pytest behavior suite | Ubuntu host process | no public listener | authenticated `akb_list_vaults` scenario through the official Python SDK |
+| MCP pytest behavior suite | Ubuntu host process | no public listener | authenticated MCP product scenarios through the official Python SDK |
 | curated suite runner | Ubuntu host process | no public listener | exact 15-suite gate and count semantics |
 
 Only PostgreSQL and MinIO are managed by

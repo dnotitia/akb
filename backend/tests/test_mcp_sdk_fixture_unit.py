@@ -226,3 +226,57 @@ async def test_mcp_fixture_reports_connection_failure_and_redacts_it(
     assert "scenario=akb_list_vaults SDK connection" in str(captured.value)
     assert "sdk-secret" not in str(captured.value)
     assert http_client.closed
+
+
+def test_secondary_user_preparation_uses_descriptor_auth_coordinates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Response:
+        def __init__(self, status_code: int, payload: dict[str, Any]) -> None:
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self) -> dict[str, Any]:
+            return self._payload
+
+    class RecordingClient:
+        requests: list[tuple[str, str, dict[str, Any] | None, dict[str, str] | None]] = []
+
+        def __init__(self, **_kwargs: Any) -> None:
+            return None
+
+        def __enter__(self) -> RecordingClient:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, Any]) -> Response:
+            self.requests.append(("POST", url, json, None))
+            return Response(201, {"user_id": "secondary"})
+
+        def request(
+            self,
+            method: str,
+            url: str,
+            *,
+            json: dict[str, Any] | None = None,
+            headers: dict[str, str] | None = None,
+        ) -> Response:
+            self.requests.append((method, url, json, headers))
+            if url.endswith("/login"):
+                return Response(200, {"token": "jwt-secondary"})
+            return Response(200, {"token": "akb_secondary_pat"})
+
+    RecordingClient.requests = []
+    monkeypatch.setattr(mcp_conftest.httpx, "Client", RecordingClient)
+
+    username, pat, secret_values = mcp_conftest._prepare_secondary_user(_runtime_context())
+
+    assert username.startswith("mcp-pytest-u2-")
+    assert pat == "akb_secondary_pat"
+    assert username in secret_values
+    assert "jwt-secondary" in secret_values
+    assert any(url.endswith("/api/v1/auth/register") for _, url, _, _ in RecordingClient.requests)
+    assert any(url.endswith("/api/v1/auth/login") for _, url, _, _ in RecordingClient.requests)
+    assert any(url.endswith("/api/v1/auth/tokens") for _, url, _, _ in RecordingClient.requests)
