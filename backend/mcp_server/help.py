@@ -1050,7 +1050,7 @@ akb_list_vaults()
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| name | ✓ | Lowercase, hyphens allowed |
+| name | ✓ | Unique across this AKB installation; lowercase letters and digits with single hyphens between words. Becomes part of the canonical `akb://` URI |
 | description | | What this vault is for |
 | template | | Pre-populate with collections |
 
@@ -1060,7 +1060,11 @@ akb_list_vaults()
 ## Example
 ```
 akb_create_vault(name="project-x", description="Project X docs", template="engineering")
-```""",
+```
+
+If the name cannot be assigned, the tool returns the stable
+`vault_name_unavailable` conflict without revealing another Vault's owner,
+visibility, or state.""",
 
     "akb_create_collection": """# akb_create_collection — Create an Empty Collection
 

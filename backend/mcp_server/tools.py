@@ -74,13 +74,20 @@ TOOLS = [
         name="akb_create_vault",
         description=(
             "Create a new knowledge base vault (a separate, access-controlled repository for documents). "
+            "Its name is unique across the AKB installation and becomes part of the canonical akb:// URI. "
             "Pass `external_git` to instead create a read-only mirror of an upstream git repo — the vault "
             "tracks the remote on a polling schedule and rejects user writes."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Vault name (lowercase, hyphens allowed)"},
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "Globally unique Vault name: lowercase letters and digits, "
+                        "with single hyphens between words"
+                    ),
+                },
                 "description": {"type": "string", "description": "What this vault is for"},
                 "template": {
                     "type": "string",

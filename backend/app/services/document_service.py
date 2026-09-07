@@ -118,6 +118,7 @@ from app.exceptions import (
     DocumentTitleConflictError,
     NotFoundError,
     ValidationError,
+    VaultNameUnavailableError,
     WriteBusyError,
 )
 from app.models.document import (
@@ -2165,7 +2166,7 @@ class DocumentService:
         public_access = validate_public_access(public_access)
 
         if await vault_repo.get_by_name(name):
-            raise ConflictError(f"Vault already exists: {name}")
+            raise VaultNameUnavailableError()
 
         uid = uuid.UUID(owner_id) if owner_id else None
 
@@ -2263,8 +2264,20 @@ class DocumentService:
         existed_before = await asyncio.to_thread(self.git.vault_exists, name)
         git_path: str | None = None
         created_vault_id: uuid.UUID | None = None
+        collided_before_disk_create = False
         try:
-            git_path = await run_git_write(self.git.init_vault, name)
+            try:
+                git_path = await run_git_write(self.git.init_vault, name)
+            except FileExistsError as exc:
+                # Another process can win after the advisory DB pre-check but
+                # before this request obtains the storage-backed create lock.
+                # Keep that race on the same non-disclosing 409 contract as a
+                # database UNIQUE collision; the outer handler still performs
+                # ownership-aware compensation for failures that happen after
+                # this request creates storage.  This request created nothing,
+                # so its outer handler must not remove the winner's directory.
+                collided_before_disk_create = True
+                raise VaultNameUnavailableError() from exc
             vault_yaml = f"name: {name}\ndescription: {description}\n"
             if template:
                 vault_yaml += f"template: {template}\n"
@@ -2311,6 +2324,8 @@ class DocumentService:
                     skill_internal=True,
                 )
         except BaseException:
+            if collided_before_disk_create:
+                raise
             # run_compensation: the whole rollback runs to COMPLETION even
             # if the cancellation that may be unwinding us keeps firing;
             # the cancel is re-delivered afterwards. Any rollback-internal

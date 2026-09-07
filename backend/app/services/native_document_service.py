@@ -26,6 +26,7 @@ from app.exceptions import (
     DocumentTitleConflictError,
     NotFoundError,
     ValidationError,
+    VaultNameUnavailableError,
 )
 from app.models.document import (
     DOC_STATUSES,
@@ -1382,7 +1383,7 @@ class NativeDocumentService(DocumentService):
         pool = await self._pool()
         vault_repo = VaultRepository(pool)
         if await vault_repo.get_by_name(name):
-            raise ConflictError(f"Vault already exists: {name}")
+            raise VaultNameUnavailableError()
         uid = uuid.UUID(owner_id) if owner_id else None
         vault_id: uuid.UUID | None = None
         # These strict same-connection hooks observe the uncommitted catalog
@@ -1412,7 +1413,7 @@ class NativeDocumentService(DocumentService):
                     )
         except asyncpg.UniqueViolationError as exc:
             if exc.constraint_name == "vaults_name_key":
-                raise ConflictError(f"Vault already exists: {name}") from exc
+                raise VaultNameUnavailableError() from exc
             raise
         assert vault_id is not None
         # POST-COMMIT (the transaction above has exited). Drops any negative

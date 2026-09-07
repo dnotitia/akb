@@ -38,6 +38,7 @@ from app.exceptions import (
     ForbiddenError,
     InvalidColumnTypeError,
     NotFoundError,
+    VAULT_NAME_UNAVAILABLE,
     ValidationError,
     WriteBusyError,
 )
@@ -173,6 +174,8 @@ def exception_envelope(e: Exception) -> dict:
     if isinstance(e, NotFoundError):
         return err(str(e), code=NOT_FOUND)
     if isinstance(e, ConflictError):
+        if e.code == VAULT_NAME_UNAVAILABLE:
+            return err(str(e), code=VAULT_NAME_UNAVAILABLE)
         if e.code == DOCUMENT_TITLE_CONFLICT:
             return err(
                 str(e),

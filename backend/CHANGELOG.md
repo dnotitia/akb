@@ -7,6 +7,16 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Made globally reserved Vault-name conflicts non-disclosing
+
+Vault creation now returns the same `vault_name_unavailable` conflict for an
+existing name and for concurrent database or Git creation races. The response
+does not expose the conflicting Vault's name, owner, visibility, or state, and
+the contract is shared by REST, MCP, standard, native-ledger, and external-git
+creation paths. The create UI documents installation-wide uniqueness and only
+offers to open an existing Vault when that Vault is already present in the
+caller's access-filtered list.
+
 ### Added the strict App Release Manifest v2 contract
 
 App release registration now requires a v2-only manifest with immutable app

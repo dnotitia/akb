@@ -165,9 +165,20 @@ class ExternalGitService:
         """
         host = _host_only(remote_url)
         if not self.git.vault_exists(vault_name):
-            logger.info("Bootstrap clone: vault=%s host=%s", vault_name, host)
-            sha = self.git.clone_mirror(vault_name, remote_url, branch, auth_token)
-            return ("cloned", sha)
+            # Join standard Vault creation's cross-process lock before
+            # materialising an absent bare path. Without this, a standard
+            # create that already observed "absent" can mistake this poller's
+            # mirror for its own failed-create artefact and remove it during
+            # compensation. Re-check after the wait because the standard
+            # winner may have created and then rolled back the same path.
+            creation_fd = self.git.acquire_vault_creation_lock(vault_name)
+            try:
+                if not self.git.vault_exists(vault_name):
+                    logger.info("Bootstrap clone: vault=%s host=%s", vault_name, host)
+                    sha = self.git.clone_mirror(vault_name, remote_url, branch, auth_token)
+                    return ("cloned", sha)
+            finally:
+                self.git.release_vault_creation_lock(creation_fd)
         # A normal marker is written only by a fresh clone or the
         # DB-authoritative startup backfill. Do NOT recreate it from this stale
         # poller snapshot: after a completed retirement the retained bare is a
