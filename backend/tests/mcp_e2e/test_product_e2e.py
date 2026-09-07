@@ -497,14 +497,14 @@ async def test_tables_sql_and_ddl(
         "akb_sql",
         {"vault": vault, "sql": "SELECT * FROM mcp_items"},
     )
-    assert rows.get("total") == 2
+    assert str(rows.get("total")) == "2"
     aggregate = await _call_json(
         mcp_client,
         runtime_session,
         "akb_sql",
         {"vault": vault, "sql": "SELECT SUM(qty) as total_qty, COUNT(*) as cnt FROM mcp_items"},
     )
-    assert aggregate.get("items", [{}])[0].get("total_qty") == 150
+    assert str(aggregate.get("items", [{}])[0].get("total_qty")) == "150"
 
     info = await _call_json(mcp_client, runtime_session, "akb_vault_info", {"vault": vault})
     tables = info.get("tables") or []
@@ -546,7 +546,7 @@ async def test_tables_sql_and_ddl(
         "akb_sql",
         {"vault": vault, "sql": f"SELECT COUNT(*) as cnt FROM {sql_name}"},
     )
-    assert round_trip.get("items", [{}])[0].get("cnt") == 2
+    assert str(round_trip.get("items", [{}])[0].get("cnt")) == "2"
 
     altered = await _call_json(
         mcp_client,
