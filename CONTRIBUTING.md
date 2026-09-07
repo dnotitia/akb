@@ -55,7 +55,7 @@ the frontend in `frontend/`. The stdio MCP proxy that ships on npm lives
 under `packages/akb-mcp-client/`.
 
 The local Compose path and the repository-owned E2E runtime are separate
-development paths. See [`backend/scripts/ci/README.md`](backend/scripts/ci/README.md)
+development paths. See [`scripts/ci/README.md`](scripts/ci/README.md)
 for the suite, runtime, and clean-host bootstrap contracts.
 
 ## Configuration
@@ -87,7 +87,7 @@ export AKB_E2E_USERNAME="$(uv run --locked --project backend python -c \
 export AKB_E2E_PASSWORD="$(uv run --locked --project backend python -c \
   'import secrets; print(secrets.token_urlsafe(24))')"
 uv run --locked --project backend python \
-  backend/scripts/ci/e2e_runtime.py gate \
+  scripts/ci/e2e_runtime.py gate \
   --scenario empty --checkout "$PWD" --runtime-root "$RUNTIME_ROOT"
 unset AKB_E2E_USERNAME AKB_E2E_PASSWORD
 
@@ -115,7 +115,7 @@ uv run --locked --extra dev --project backend python -m pytest \
   --runtime-descriptor /path/to/descriptor.json
 ```
 
-The descriptor must come from `backend/scripts/ci/e2e_runtime.py serve` or the
+The descriptor must come from `scripts/ci/e2e_runtime.py serve` or the
 Ubuntu bootstrap. This pytest command consumes the existing runtime; it does
 not start or tear down a backend, database, or fixture service.
 
@@ -125,7 +125,7 @@ frontend and point its `/api` and `/mcp` proxy at the run's backend:
 ```bash
 (cd frontend && pnpm install --frozen-lockfile)
 uv run --locked --project backend python \
-  backend/scripts/ci/e2e_runtime.py serve \
+  scripts/ci/e2e_runtime.py serve \
   --with-frontend --frontend-port 3000 \
   --scenario empty --checkout "$PWD" --runtime-root "$RUNTIME_ROOT"
 ```
@@ -197,7 +197,7 @@ bash scripts/check.sh
 - [ ] `bash scripts/check.sh` passes (see Static Analysis Gate above).
 - [ ] All E2E suites pass against your local stack.
 - [ ] Changes to the E2E runtime/bootstrap also pass the isolated full gate;
-      see [`backend/scripts/ci/README.md`](backend/scripts/ci/README.md).
+      see [`scripts/ci/README.md`](scripts/ci/README.md).
 - [ ] No secrets, internal hostnames/IPs, or personal info in commits or
       diffs (check `git diff` carefully).
 - [ ] New configuration is reflected in `config/*.yaml.example`.

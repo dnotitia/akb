@@ -49,6 +49,11 @@ test("signup → land in shell → profile edit round-trip", async ({ page }) =>
   await expect(page.getByText("Saved", { exact: true })).toBeVisible({
     timeout: 5_000,
   });
+
+  await page.reload();
+  await expect(page.getByLabel("DISPLAY NAME")).toHaveValue(`${USER} Renamed`, {
+    timeout: 5_000,
+  });
 });
 
 test("logged-out user redirects to /auth (layout auth gate)", async ({

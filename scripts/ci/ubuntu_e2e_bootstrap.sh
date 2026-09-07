@@ -13,7 +13,7 @@ die() {
 }
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-DEFAULT_CHECKOUT=$(cd -- "$SCRIPT_DIR/../../.." && pwd)
+DEFAULT_CHECKOUT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 MODE="${1:-}"
 [ "$MODE" = "gate" ] || [ "$MODE" = "serve" ] \
   || die "usage: $0 {gate|serve} [--with-frontend] [--profile tool-only|transport-proxy|oidc-resource-server|transport-oidc] [--capability stdio|oidc] [--scenario empty|app-installation-lifecycle|app-release-rollout|app-control-plane] [--checkout PATH] [--runtime-root PATH] [supervisor options]"
@@ -204,7 +204,7 @@ fi
 
 SUPERVISOR_COMMAND=(
   "$UV_BIN" run --locked --project "$CHECKOUT/backend" python
-  "$CHECKOUT/backend/scripts/ci/e2e_runtime.py" "$MODE"
+  "$CHECKOUT/scripts/ci/e2e_runtime.py" "$MODE"
   --checkout "$CHECKOUT"
   --runtime-root "$RUNTIME_ROOT"
   "${FORWARD_ARGS[@]}"

@@ -424,6 +424,10 @@ class RuntimeConfig:
         return self.checkout / "backend"
 
     @property
+    def runtime_scripts_dir(self) -> Path:
+        return self.checkout / "scripts" / "ci"
+
+    @property
     def app_origin(self) -> str:
         return f"http://{self.app_host}:{self.app_port}"
 
@@ -1342,8 +1346,8 @@ class E2ERuntime:
         required: tuple[Path, ...] = (
             self.config.backend_dir / "uv.lock",
             self.config.backend_dir / "pyproject.toml",
-            self.config.backend_dir / "scripts" / "ci" / "embed_stub.py",
-            self.config.backend_dir / "scripts" / "ci" / "e2e_suite_runner.py",
+                self.config.runtime_scripts_dir / "embed_stub.py",
+                self.config.runtime_scripts_dir / "e2e_suite_runner.py",
         )
         if self.profile.needs_stdio:
             required += (
@@ -1656,9 +1660,9 @@ class E2ERuntime:
                 sys.executable,
                 "-m",
                 "uvicorn",
-                "scripts.ci.embed_stub:app",
+                "embed_stub:app",
                 "--app-dir",
-                str(self.config.backend_dir),
+                str(self.config.runtime_scripts_dir),
                 "--host",
                 self.config.embed_host,
                 "--port",
@@ -3491,7 +3495,7 @@ class E2ERuntime:
         return 0
 
     async def _run_gate(self) -> int:
-        suite_path = self.config.backend_dir / "scripts" / "ci" / "e2e_suite_runner.py"
+        suite_path = self.config.runtime_scripts_dir / "e2e_suite_runner.py"
         mcp_pytest_path = self.config.checkout / "backend" / "tests" / "mcp_e2e"
         log_path = self.config.logs_dir / "gate.log"
         emit_gate_event(
@@ -3731,7 +3735,7 @@ def _configure_logging() -> None:
 
 
 def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
-    default_checkout = Path(__file__).resolve().parents[3]
+    default_checkout = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("gate", "serve"))
     parser.add_argument("--checkout", type=Path, default=default_checkout)

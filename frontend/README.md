@@ -13,7 +13,7 @@ pnpm lint             # eslint src
 pnpm test             # vitest run
 pnpm build            # tsc && vite build
 pnpm preview          # serve dist locally
-pnpm test:e2e         # playwright (requires backend reachable at AKB_URL)
+pnpm test:e2e         # playwright (set AKB_FRONTEND_URL to the runtime web origin)
 ```
 
 ## Editing documents
@@ -78,8 +78,10 @@ Unit tests live under `src/**/__tests__/`. Vitest runs against jsdom +
 and interactive components (`TagInput`) have explicit coverage. Add a
 test alongside any change to those code paths.
 
-Playwright e2e specs live in `e2e/`. `pnpm test:e2e` expects the AKB
-backend reachable at `AKB_URL` (defaults to `http://localhost:8000`).
+Playwright e2e specs live in `e2e/`. `pnpm test:e2e` expects
+`AKB_FRONTEND_URL` to point at the frontend origin from the common runtime's
+schema-v2 descriptor (`services.web.origin`), or defaults to
+`http://localhost:3000` for the local Compose stack.
 
 ## Adding routes
 

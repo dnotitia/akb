@@ -24,7 +24,7 @@ AKB_URL=http://localhost:8000 bash backend/tests/test_publications_e2e.sh
 ```
 
 The shared curated gate is implemented by
-`backend/scripts/ci/e2e_suite_runner.py`. `CURATED_SUITES` is the executable
+`scripts/ci/e2e_suite_runner.py`. `CURATED_SUITES` is the executable
 list, while `DEFERRED_SUITE_GROUPS` is the explicit opt-out list with reviewed
 reasons. Every `backend/tests/*_e2e.sh` file must appear in exactly one side of
 that manifest. The static check and the live gate both fail when a suite is
@@ -33,7 +33,7 @@ unclassified, duplicated, overlaps both sides, or no longer exists.
 Validate the manifest without starting any services:
 
 ```bash
-python backend/scripts/ci/e2e_suite_runner.py --check-manifest
+python scripts/ci/e2e_suite_runner.py --check-manifest
 ```
 
 The runner is fail-closed. Each suite must finish successfully and provide a
@@ -69,7 +69,7 @@ uv run --locked --extra dev --project backend python -m pytest \
   --runtime-descriptor /path/to/descriptor.json
 ```
 
-The descriptor must come from `backend/scripts/ci/e2e_runtime.py serve` or the
+The descriptor must come from `scripts/ci/e2e_runtime.py serve` or the
 Ubuntu bootstrap. The fixture consumes the descriptor's app/fixture origins,
 health and reset operations, discovery-declared credential environment names,
 and the existing `empty` reset contract. It does not create another backend,
@@ -99,7 +99,7 @@ The topology is deliberately small:
 | curated suite runner | Ubuntu host process | no public listener | exact 15-suite gate and count semantics |
 
 Only PostgreSQL and MinIO are managed by
-`backend/scripts/ci/dependency-compose.yaml`. The root `docker-compose.yaml`
+`scripts/ci/dependency-compose.yaml`. The root `docker-compose.yaml`
 is the normal development stack and is the default path for contributors;
 the dependency Compose file is an internal implementation detail of this
 runtime and should not be started directly.
@@ -223,7 +223,7 @@ export AKB_E2E_USERNAME="$(uv run --locked --project backend python -c \
 export AKB_E2E_PASSWORD="$(uv run --locked --project backend python -c \
   'import secrets; print(secrets.token_urlsafe(24))')"
 uv run --locked --project backend python \
-  backend/scripts/ci/e2e_runtime.py gate \
+  scripts/ci/e2e_runtime.py gate \
   --scenario empty --checkout "$PWD" --runtime-root "$RUNTIME_ROOT"
 unset AKB_E2E_USERNAME AKB_E2E_PASSWORD
 ```
@@ -239,7 +239,7 @@ export AKB_E2E_USERNAME="$(uv run --locked --project backend python -c \
 export AKB_E2E_PASSWORD="$(uv run --locked --project backend python -c \
   'import secrets; print(secrets.token_urlsafe(24))')"
 uv run --locked --project backend python \
-  backend/scripts/ci/e2e_runtime.py serve \
+  scripts/ci/e2e_runtime.py serve \
   --with-frontend --frontend-port 3000 \
   --scenario empty --checkout "$PWD" --runtime-root "$RUNTIME_ROOT"
 ```
@@ -298,7 +298,7 @@ directly:
 ```bash
 uv sync --locked --extra dev --project backend
 uv run --locked --project backend python \
-  backend/scripts/ci/e2e_runtime.py gate \
+  scripts/ci/e2e_runtime.py gate \
   --scenario empty \
   --checkout "$GITHUB_WORKSPACE" \
   --runtime-root "${RUNNER_TEMP}/akb-e2e-runtime"
@@ -321,12 +321,12 @@ following guards make that requirement explicit without assuming a system
 ```bash
 : "${AKB_E2E_USERNAME:?inject a private per-run username before bootstrap}"
 : "${AKB_E2E_PASSWORD:?inject a private per-run password before bootstrap}"
-bash backend/scripts/ci/ubuntu_e2e_bootstrap.sh gate \
+bash scripts/ci/ubuntu_e2e_bootstrap.sh gate \
   --scenario empty --checkout "$PWD"
 
 : "${AKB_E2E_USERNAME:?inject a private per-run username before bootstrap}"
 : "${AKB_E2E_PASSWORD:?inject a private per-run password before bootstrap}"
-bash backend/scripts/ci/ubuntu_e2e_bootstrap.sh serve \
+bash scripts/ci/ubuntu_e2e_bootstrap.sh serve \
   --scenario empty --checkout "$PWD"
 ```
 

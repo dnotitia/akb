@@ -14,7 +14,8 @@ import httpx
 import pytest
 import yaml
 
-CI_DIR = Path(__file__).resolve().parent.parent / "scripts" / "ci"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CI_DIR = REPO_ROOT / "scripts" / "ci"
 sys.path.insert(0, str(CI_DIR))
 
 from e2e_runtime import (  # noqa: E402
@@ -47,10 +48,10 @@ from e2e_suite_runner import (  # noqa: E402
 from fixture_control import create_app  # noqa: E402
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = CI_DIR / "dependency-compose.yaml"
 BOOTSTRAP = CI_DIR / "ubuntu_e2e_bootstrap.sh"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "e2e.yml"
+BACKEND_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "backend-pytest.yml"
 LOCAL_CANONICAL_RUNNER = REPO_ROOT / "scripts" / "run_canonical_e2e.sh"
 
 
@@ -177,6 +178,22 @@ def test_frontend_runtime_requires_explicit_flag_and_supports_isolated_port():
     )
     assert configured.frontend_enabled is True
     assert configured.frontend_port == 3017
+
+
+def test_runtime_assets_live_in_repository_common_layer():
+    common_runtime = REPO_ROOT / "scripts" / "ci"
+    backend_runtime = REPO_ROOT / "backend" / "scripts" / "ci"
+
+    for name in (
+        "e2e_runtime.py",
+        "e2e_suite_runner.py",
+        "fixture_control.py",
+        "oidc_fixture.py",
+        "embed_stub.py",
+        "ubuntu_e2e_bootstrap.sh",
+    ):
+        assert (common_runtime / name).is_file()
+        assert not (backend_runtime / name).exists()
 
 
 @pytest.mark.asyncio
@@ -605,7 +622,7 @@ def test_suite_runner_emits_suite_and_gate_events(monkeypatch, capsys):
 @pytest.mark.asyncio
 async def test_gate_child_stdout_is_private_and_stderr_is_inherited(tmp_path, capfd):
     checkout = tmp_path / "checkout"
-    suite_path = checkout / "backend" / "scripts" / "ci" / "e2e_suite_runner.py"
+    suite_path = checkout / "scripts" / "ci" / "e2e_suite_runner.py"
     suite_path.parent.mkdir(parents=True)
     suite_path.write_text(
         "import sys\n"
@@ -1157,8 +1174,13 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
     ]
 
     workflow = WORKFLOW.read_text()
-    assert "backend/scripts/ci/e2e_runtime.py gate" in workflow
+    assert "scripts/ci/e2e_runtime.py gate" in workflow
     assert "--scenario empty" in workflow
+    assert "frontend-runtime:" in workflow
+    assert "scripts/ci/e2e_runtime.py serve" in workflow
+    assert "--with-frontend" in workflow
+    assert "pnpm run build" in workflow
+    assert "pnpm exec playwright test" in workflow
     assert "app-installation-lifecycle" in (CI_DIR / "e2e_runtime.py").read_text()
     assert "uv sync --locked --extra dev --project backend" in workflow
     assert "services:" not in workflow
@@ -1167,8 +1189,12 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
     assert "akb-e2e-runtime-logs" in workflow
 
     local_runner = LOCAL_CANONICAL_RUNNER.read_text()
-    assert "backend/scripts/ci/e2e_suite_runner.py" in local_runner
+    assert "scripts/ci/e2e_suite_runner.py" in local_runner
     assert "SUITES=(" not in local_runner
+
+    backend_workflow = BACKEND_WORKFLOW.read_text()
+    assert "tests/test_e2e_runtime_unit.py" in backend_workflow
+    assert "Run repository runtime contract tests" in backend_workflow
 
 
 def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
