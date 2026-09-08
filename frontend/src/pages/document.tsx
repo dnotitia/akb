@@ -1760,6 +1760,7 @@ export default function DocumentPage({
                             type="button"
                             variant="outline"
                             size="sm"
+                            className="shrink-0 focus-ring-instant"
                             onClick={() => void copyDraftText(draftRecovery.draft.body, "Expired draft Markdown copied")}
                           >
                             Copy expired Markdown
@@ -1775,6 +1776,7 @@ export default function DocumentPage({
                             type="button"
                             variant="outline"
                             size="sm"
+                            className="shrink-0 focus-ring-instant"
                             onClick={() => void copyDraftText(draftRecovery.draft.copyBody, "Incompatible draft Markdown copied")}
                           >
                             Copy preserved Markdown

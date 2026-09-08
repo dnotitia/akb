@@ -1,4 +1,4 @@
-import { expect, test, type APIRequestContext } from "@playwright/test";
+import { expect, test, type APIRequestContext, type Locator } from "@playwright/test";
 
 type MockOperation = {
   method: "GET" | "POST";
@@ -34,6 +34,31 @@ test.describe("document edit recovery mock contract", () => {
     return recovery!;
   }
 
+  async function expectInstantKeyboardFocus(button: Locator) {
+    await button.evaluate((element) => {
+      const sentinel = document.createElement("span");
+      sentinel.tabIndex = 0;
+      sentinel.dataset.focusTestSentinel = "true";
+      sentinel.style.cssText = "position:fixed;width:1px;height:1px;opacity:0;";
+      element.before(sentinel);
+    });
+    await button.page().locator("[data-focus-test-sentinel]").last().focus();
+    await button.page().keyboard.press("Tab");
+    await expect(button).toBeFocused();
+    await expect(button).toHaveClass(/focus-ring-instant/);
+    const focusStyle = await button.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return {
+        focusVisible: element.matches(":focus-visible"),
+        transitionDuration: style.transitionDuration,
+        transitionProperty: style.transitionProperty,
+      };
+    });
+    expect(focusStyle.focusVisible).toBe(true);
+    expect(focusStyle.transitionDuration).toBe("0s");
+    expect(focusStyle.transitionProperty).toBe("none");
+  }
+
   async function reset(request: APIRequestContext) {
     const response = await request.post("/__akb_mock__/reset", {
       data: { scenario: "document-edit-recovery" },
@@ -63,6 +88,11 @@ test.describe("document edit recovery mock contract", () => {
     page,
     request,
   }) => {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.addInitScript(() => {
+      localStorage.setItem("akb.vaultRailWidth.v2", "320");
+      localStorage.setItem("akb.treeWidth.v2", "270");
+    });
     const recovery = await fixture(request);
     await page.goto(recovery.identity!.start_url!);
     const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
@@ -78,10 +108,50 @@ test.describe("document edit recovery mock contract", () => {
     await expect(editor).toContainText("Local draft before another editor saves");
 
     await page.getByRole("button", { name: "Save" }).click();
-    await expect(page.getByText("This document changed on the server")).toBeVisible();
-    await expect(page.getByText("Original base", { exact: true })).toBeVisible();
-    await expect(page.getByText("Your draft", { exact: true })).toBeVisible();
-    await expect(page.getByText("Latest server version", { exact: true })).toBeVisible();
+    const conflict = page
+      .getByRole("alert")
+      .filter({ hasText: "This document changed on the server" });
+    await expect(conflict).toBeVisible();
+    const snapshots = conflict.locator("[data-conflict-snapshot]");
+    await expect(snapshots).toHaveCount(3);
+    const snapshotWidths = await snapshots.evaluateAll((elements) =>
+      elements.map((element) => Math.round(element.getBoundingClientRect().width)),
+    );
+    expect(Math.min(...snapshotWidths)).toBeGreaterThanOrEqual(240);
+    const metadata = await conflict.locator("[data-conflict-metadata]").evaluateAll((elements) =>
+      elements.map((element) => {
+        const style = getComputedStyle(element);
+        return {
+          textOverflow: style.textOverflow,
+          whiteSpace: style.whiteSpace,
+        };
+      }),
+    );
+    expect(metadata).toHaveLength(9);
+    expect(
+      metadata.every(
+        ({ textOverflow, whiteSpace }) =>
+          textOverflow !== "ellipsis" && whiteSpace !== "nowrap",
+      ),
+    ).toBe(true);
+    const actionStyles = await conflict.getByRole("button").evaluateAll((buttons) =>
+      buttons.map((button) => getComputedStyle(button).whiteSpace),
+    );
+    expect(actionStyles.every((whiteSpace) => whiteSpace === "nowrap")).toBe(true);
+    for (const width of [320, 634, 1920]) {
+      await page.setViewportSize({ width, height: 900 });
+      await expect
+        .poll(async () =>
+          page.evaluate(
+            () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+          ),
+        )
+        .toBe(true);
+    }
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await expectInstantKeyboardFocus(
+      conflict.getByRole("button", { name: "Apply draft to latest" }),
+    );
 
     await page.getByRole("button", { name: "Apply draft to latest" }).click();
     await page.getByRole("button", { name: "Save" }).click();
@@ -143,7 +213,9 @@ test.describe("document edit recovery mock contract", () => {
     await operate(request, recovery.operations!.expire_draft);
     await page.reload();
     await expect(page.getByText("This draft has expired")).toBeVisible();
-    await expect(page.getByRole("button", { name: "Copy expired Markdown" })).toBeVisible();
+    const expiredCopy = page.getByRole("button", { name: "Copy expired Markdown" });
+    await expect(expiredCopy).toBeVisible();
+    await expectInstantKeyboardFocus(expiredCopy);
 
     await page.getByRole("button", { name: "Cancel" }).click();
     await page.getByRole("button", { name: "Discard changes" }).click();

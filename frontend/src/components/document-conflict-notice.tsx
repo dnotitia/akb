@@ -35,22 +35,32 @@ function Snapshot({ snapshot }: { snapshot: DocumentConflictSnapshot }) {
   }
 
   return (
-    <div className="min-w-0 rounded-[var(--radius-md)] border border-border bg-surface p-3">
+    <div
+      data-conflict-snapshot
+      className="min-w-0 rounded-[var(--radius-md)] border border-border bg-surface p-3"
+    >
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
-          <p className="truncate text-xs font-semibold text-foreground">{snapshot.label}</p>
-          <p className="mt-0.5 truncate text-xs text-foreground-muted">
+          <p
+            data-conflict-metadata="label"
+            className="text-xs font-semibold text-foreground"
+          >
+            {snapshot.label}
+          </p>
+          <p data-conflict-metadata="title" className="mt-0.5 text-xs text-foreground-muted">
             Title: <span className="text-foreground">{snapshot.title || "(untitled)"}</span>
           </p>
-          <p className="truncate text-xs text-foreground-muted">
-            Revision: <code className="font-mono text-foreground">{snapshot.commit || "unavailable"}</code>
+          <p data-conflict-metadata="revision" className="text-xs text-foreground-muted">
+            Revision: <code className="break-all font-mono text-foreground">
+              {snapshot.commit || "unavailable"}
+            </code>
           </p>
         </div>
         <Button
           type="button"
           variant="ghost"
           size="sm"
-          className="shrink-0"
+          className="shrink-0 focus-ring-instant"
           onClick={() => void copySnapshot()}
           aria-label={`Copy ${snapshot.label} markdown`}
         >
@@ -79,28 +89,37 @@ export function DocumentConflictNotice({
       <p>
         Your draft is still protected. Review the original base, your local draft, and the latest server version before choosing a new base.
       </p>
-      <div className="mt-3 grid gap-3 xl:grid-cols-3">
-        <Snapshot snapshot={base} />
-        <Snapshot snapshot={local} />
-        {latest ? (
-          <Snapshot snapshot={latest} />
-        ) : (
-          <div className="min-w-0 rounded-[var(--radius-md)] border border-border bg-surface p-3">
-            <p className="flex items-center gap-2 text-xs font-semibold text-foreground">
-              <GitCompareArrows className="h-3.5 w-3.5 text-warning" aria-hidden />
-              Latest server version
-            </p>
-            <p className="mt-2 text-xs text-foreground-muted">
-              {latestError || "The latest version could not be loaded. Your draft remains available."}
-            </p>
-          </div>
-        )}
+      <div className="mt-3 @container">
+        <div className="grid gap-3 @lg:grid-cols-2 @2xl:grid-cols-3">
+          <Snapshot snapshot={base} />
+          <Snapshot snapshot={local} />
+          {latest ? (
+            <Snapshot snapshot={latest} />
+          ) : (
+            <div
+              data-conflict-snapshot
+              className="min-w-0 rounded-[var(--radius-md)] border border-border bg-surface p-3"
+            >
+              <p
+                data-conflict-metadata="label"
+                className="flex items-center gap-2 text-xs font-semibold text-foreground"
+              >
+                <GitCompareArrows className="h-3.5 w-3.5 text-warning" aria-hidden />
+                Latest server version
+              </p>
+              <p className="mt-2 text-xs text-foreground-muted">
+                {latestError || "The latest version could not be loaded. Your draft remains available."}
+              </p>
+            </div>
+          )}
+        </div>
       </div>
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <Button
           type="button"
           variant="default"
           size="sm"
+          className="shrink-0 focus-ring-instant"
           onClick={onRebase}
           disabled={!latest?.commit || rebasing}
           loading={rebasing}
@@ -108,7 +127,14 @@ export function DocumentConflictNotice({
           Apply draft to latest
         </Button>
         {!latest && (
-          <Button type="button" variant="outline" size="sm" onClick={onRetryLatest} disabled={rebasing}>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="shrink-0 focus-ring-instant"
+            onClick={onRetryLatest}
+            disabled={rebasing}
+          >
             Try loading latest
           </Button>
         )}
