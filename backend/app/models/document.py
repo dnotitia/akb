@@ -268,6 +268,14 @@ class SearchResult(BaseModel):
     tags: list[str] = Field(default_factory=list)
     score: float
     matched_section: str | None = None                # the chunk that matched
+    # Where the matched chunk sits in the document. Additive, and never a
+    # substitute for `matched_section`: that is the chunk body, these say
+    # which section it came from and which chunk of the document it was, so
+    # a caller can follow up with `akb_drill_down(section=...)` instead of
+    # re-searching. Null when the chunk row is gone (a delete racing the
+    # vector index) or the driver could not name it.
+    section_path: str | None = None                   # heading path of that chunk
+    chunk_index: int | None = None                    # its ordinal in the document
 
 
 class SearchResponse(BaseModel):

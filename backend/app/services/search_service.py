@@ -963,6 +963,7 @@ class SearchService:
 
         pool = await get_pool()
         meta: dict[tuple[str, str], dict] = {}
+        chunk_indexes: dict[str, int] = {}
         async with pool.acquire() as conn:
             if by_type["document"]:
                 rows = await conn.fetch(
@@ -1252,6 +1253,33 @@ class SearchService:
                         else None
                     )
 
+            # Chunk-level identity for the row that matched. `VectorHit`
+            # carries `section_path` but no ordinal, and the drivers differ in
+            # what they store, so read it from `chunks` — PG is the source of
+            # truth for chunk rows, and this is one keyed lookup for the whole
+            # result page. A hit whose chunk row has since been deleted simply
+            # gets no ordinal; the hit itself is unaffected.
+            chunk_uuids: list[uuid.UUID] = []
+            for h in hits:
+                try:
+                    chunk_uuids.append(uuid.UUID(str(h.chunk_id)))
+                except (TypeError, ValueError):
+                    continue
+            if chunk_uuids:
+                rows = await conn.fetch(
+                    """
+                    SELECT c.id::text AS chunk_id, c.chunk_index
+                      FROM chunks c
+                     WHERE c.id = ANY($1::uuid[])
+                    """,
+                    chunk_uuids,
+                )
+                for r in rows:
+                    chunk_id = _row_value(r, "chunk_id")
+                    chunk_index = _row_value(r, "chunk_index")
+                    if chunk_id is not None and isinstance(chunk_index, int):
+                        chunk_indexes[str(chunk_id)] = chunk_index
+
         from app.services.uri_service import doc_uri, table_uri, file_uri
 
         results: list[SearchResult] = []
@@ -1289,6 +1317,8 @@ class SearchService:
                     status=m.get("status"),
                     tags=m["tags"], score=h.score,
                     matched_section=(strip_chunk_metadata_header(h.content) or "")[:500] or None,
+                    section_path=(h.section_path or None),
+                    chunk_index=chunk_indexes.get(str(h.chunk_id)),
                 )
             )
         return results
