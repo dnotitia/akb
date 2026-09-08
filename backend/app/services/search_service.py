@@ -1326,7 +1326,16 @@ class SearchService:
                     doc_type=m["doc_type"], summary=m["summary"],
                     status=m.get("status"),
                     tags=m["tags"], score=h.score,
-                    matched_section=(strip_chunk_metadata_header(h.content) or "")[:500] or None,
+                    # Cleaned before the clip, not after: the heading-context
+                    # line duplicates `section_path` on this very row, so
+                    # leaving it in would spend the first ~40 characters of
+                    # the excerpt restating the field beside it.
+                    matched_section=(
+                        strip_chunk_context_line(
+                            strip_chunk_metadata_header(h.content),
+                            h.section_path,
+                        ) or ""
+                    )[:500] or None,
                     section_path=(h.section_path or None),
                     chunk_index=chunk_indexes.get(str(h.chunk_id)),
                 )

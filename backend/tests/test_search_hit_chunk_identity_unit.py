@@ -151,6 +151,44 @@ async def test_a_driver_chunk_id_that_is_not_a_uuid_is_skipped(monkeypatch):
     assert not any("FROM chunks c" in q for q in connection.queries)
 
 
+async def test_the_excerpt_drops_the_heading_context_line(monkeypatch):
+    # The chunk body opens with `[<section_path>]`, which is the value the
+    # hit already carries in `section_path`. Removing it before the 500-char
+    # clip also means the excerpt is 500 characters of body.
+    doc_id = uuid.uuid4()
+    chunk_id = str(uuid.uuid4())
+    connection = _Connection(doc_id, [{"chunk_id": chunk_id, "chunk_index": 4}])
+    service = _configure(monkeypatch, connection)
+
+    hit = _hit(chunk_id, doc_id)
+    body = "Requests carry an Idempotency-Key. " + "x" * 600
+    hit.content = (
+        "TITLE: Collector module\n"
+        "PATH: project-akb/product/pipeline/modules/collector.md\n"
+        "\n"
+        f"[{hit.section_path}]\n{body}"
+    )
+
+    (result,) = await service._hydrate_hits([hit])
+
+    assert result.matched_section == body[:500]
+    assert result.section_path == "# Collector > ## Product-API seam"
+
+
+async def test_a_bracketed_body_line_survives_in_the_excerpt(monkeypatch):
+    doc_id = uuid.uuid4()
+    chunk_id = str(uuid.uuid4())
+    connection = _Connection(doc_id, [{"chunk_id": chunk_id, "chunk_index": 4}])
+    service = _configure(monkeypatch, connection)
+
+    hit = _hit(chunk_id, doc_id)
+    hit.content = "[# Some other heading]\nBody text."
+
+    (result,) = await service._hydrate_hits([hit])
+
+    assert result.matched_section == "[# Some other heading]\nBody text."
+
+
 async def test_an_empty_section_path_is_reported_as_null(monkeypatch):
     doc_id = uuid.uuid4()
     chunk_id = str(uuid.uuid4())
