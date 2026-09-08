@@ -35,7 +35,7 @@ test(`archived search result restores inside the reader at ${width}px (${dark ? 
         writes.push(body);
         status = body.status;
       }
-      return route.fulfill({ json: { path: "example.md", title: "Archive recovery example", content: "# Recovery\n\nOriginal document body.", status, current_commit: "abcdef1234567", tags: [] } });
+      return route.fulfill({ json: { path: "example.md", title: "Archive recovery example", content: "# Recovery\n\nOriginal document body.", status, current_commit: "aaaaaaaaaaaaa", tags: [] } });
     }
     return route.fulfill({ json: { items: [], history: [], relations: [], vaults: [] } });
   });
@@ -49,7 +49,7 @@ test(`archived search result restores inside the reader at ${width}px (${dark ? 
   const confirm = page.getByRole("dialog", { name: "Restore this document?" });
   await confirm.getByRole("button", { name: "Restore document" }).click();
   await expect(page.getByText("Restored to Vault root.")).toBeVisible();
-  expect(writes).toEqual([{ status: "active", expected_commit: "abcdef1234567" }]);
+  expect(writes).toEqual([{ status: "active", expected_commit: "aaaaaaaaaaaaa" }]);
   await page.keyboard.press("Escape");
   await expect(page).toHaveURL(/\/search\?q=example&archive_scope=archived/);
   await expect(page.getByRole("link", { name: /Archive recovery example/ })).toHaveCount(0);
