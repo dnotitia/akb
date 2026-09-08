@@ -207,19 +207,64 @@ test.describe("document edit recovery mock contract", () => {
     page,
     request,
   }) => {
+    const draftTitle = "AC7-TITLE-248";
+    const markerOne = "AC7-ORIGINAL-ONE-248";
+    const markerTwo = "AC7-ORIGINAL-TWO-248";
+    const draftBody = `${markerOne}\n\n${markerTwo}\n`;
     const recovery = await fixture(request);
     await page.goto(recovery.identity!.start_url!);
-    await page.getByRole("textbox", { name: "Document body (markdown)" }).fill("Draft that will expire");
+    await page.getByRole("textbox", { name: "Document title" }).fill(draftTitle);
+    const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
+    await editor.fill(draftBody);
+    await expect(page.getByText("Draft saved locally")).toBeVisible();
     await operate(request, recovery.operations!.expire_draft);
+    await page.waitForTimeout(500);
+    let beforeUnloadAccepted = false;
+    page.once("dialog", async (dialog) => {
+      expect(dialog.type()).toBe("beforeunload");
+      beforeUnloadAccepted = true;
+      await dialog.accept();
+    });
     await page.reload();
+    expect(beforeUnloadAccepted).toBe(true);
+    await page.waitForTimeout(3_000);
+    await expect(page.getByRole("textbox", { name: "Document title" })).toHaveValue(draftTitle);
+    await expect(editor).toContainText(markerOne);
+    await expect(editor).toContainText(markerTwo);
+    await expect(page.getByText("Local draft restored")).toHaveCount(0);
     await expect(page.getByText("This draft has expired")).toBeVisible();
+    await expect(page.getByText(/attached images are not guaranteed/)).toBeVisible();
     const expiredCopy = page.getByRole("button", { name: "Copy expired Markdown" });
     await expect(expiredCopy).toBeVisible();
     await expectInstantKeyboardFocus(expiredCopy);
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {
+      origin: new URL(page.url()).origin,
+    });
+    await expiredCopy.click();
+    await expect
+      .poll(async () => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(draftBody);
+    await page.evaluate(() => {
+      const target = document.createElement("textarea");
+      target.dataset.clipboardPasteTarget = "true";
+      target.style.cssText = "position:fixed;left:0;top:0;width:240px;height:40px;";
+      document.body.append(target);
+    });
+    const pasteTarget = page.locator("[data-clipboard-paste-target]");
+    await pasteTarget.focus();
+    await pasteTarget.press(process.platform === "darwin" ? "Meta+V" : "Control+V");
+    await expect(pasteTarget).toHaveValue(draftBody);
 
     await page.getByRole("button", { name: "Cancel" }).click();
     await page.getByRole("button", { name: "Discard changes" }).click();
     await expect(page.locator("#doc-title")).toHaveText("Recovery document");
+    await page.getByRole("button", { name: "Edit" }).click();
+    await expect(page.getByRole("textbox", { name: "Document title" })).toHaveValue("Recovery document");
+    const reopenedEditor = page.getByRole("textbox", { name: "Document body (markdown)" });
+    await expect(reopenedEditor).toContainText("The original body is safe to edit.");
+    await expect(reopenedEditor).not.toContainText(markerOne);
+    await expect(reopenedEditor).not.toContainText(markerTwo);
+    await expect(page.getByText("This draft has expired")).toHaveCount(0);
     const state = await operate(request, recovery.operations!.state);
     expect(state.scenario).toBe("document-edit-recovery");
   });

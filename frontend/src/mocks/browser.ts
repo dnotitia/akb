@@ -6,11 +6,9 @@ import {
   vaultHealth,
 } from "@/stories/page-story-fixtures";
 import {
-  DOCUMENT_EDIT_DRAFT_EDITOR_VERSION,
-  DOCUMENT_EDIT_DRAFT_MARKDOWN_PROFILE,
-  createDocumentEditDraftId,
   documentEditDraftStorageKey,
   documentEditDraftTabId,
+  listDocumentEditDrafts,
 } from "@/lib/document-draft";
 
 const API = "/api/v1";
@@ -150,7 +148,7 @@ async function syncFixtureState(): Promise<FixtureState> {
       expireGeneration > appliedExpireDraftGeneration
     ) {
       appliedExpireDraftGeneration = expireGeneration;
-      seedExpiredDraft();
+      expireCurrentDraft();
     }
     return fixtureState;
   } catch {
@@ -158,37 +156,33 @@ async function syncFixtureState(): Promise<FixtureState> {
   }
 }
 
-function seedExpiredDraft() {
+function expireCurrentDraft() {
   if (!isDocumentScenario()) return;
-  const document = documentForState();
+  const drafts = listDocumentEditDrafts(
+    "u-jylkim",
+    "fixture",
+    documentIdentity(),
+  );
   const tabId = documentEditDraftTabId();
-  const draft = {
-    version: 1,
-    kind: "document-edit",
-    draftId: createDocumentEditDraftId(),
-    tabId,
-    userId: fixtureState.identity?.user_id || initialUser.user_id,
-    vault: "fixture",
-    document: documentIdentity(),
-    baseCommit: document.current_commit,
-    baseTitle: document.title,
-    baseBody: document.content,
-    title: document.title,
-    body: `${document.content}\n\nExpired draft recovery text.`,
-    assetIds: [],
-    editorVersion: DOCUMENT_EDIT_DRAFT_EDITOR_VERSION,
-    markdownProfile: DOCUMENT_EDIT_DRAFT_MARKDOWN_PROFILE,
-    updatedAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
-    expiresAt: new Date(Date.now() - 60_000).toISOString(),
-  };
+  const draft = drafts.find((candidate) => candidate.tabId === tabId) || drafts[0];
+  if (!draft) return;
   try {
     window.localStorage.setItem(
-      documentEditDraftStorageKey("u-jylkim", "fixture", documentIdentity(), tabId, draft.draftId),
-      JSON.stringify(draft),
+      documentEditDraftStorageKey(
+        draft.userId,
+        draft.vault,
+        draft.document,
+        draft.tabId,
+        draft.draftId,
+      ),
+      JSON.stringify({
+        ...draft,
+        expiresAt: new Date(Date.now() - 60_000).toISOString(),
+      }),
     );
   } catch {
     // The browser will surface the same local-storage-unavailable state as a
-    // real user when the test fixture cannot write a draft.
+    // real user when the test fixture cannot expire a draft.
   }
 }
 

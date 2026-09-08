@@ -2224,6 +2224,7 @@ export default function DocumentPage({
           const next = pendingView;
           await discardEditDraft();
           setEditingContent(originalContent);
+          setEditorInitialContent(originalContent);
           setEditingTitle(originalTitle);
           setEditingAssetIds([]);
           setEditorKey((k) => k + 1);
