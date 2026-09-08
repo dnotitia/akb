@@ -184,6 +184,12 @@ def _validate_required_settings() -> None:
 async def init_storage() -> None:
     """Initialize DB schema/migrations and eagerly construct vector-store driver."""
     _validate_required_settings()
+    if settings.model_api_governance_mode == "platform_hard":
+        from app.services.adapters import s3_adapter
+
+        # Provisioning is owned by the managed control plane. Never become
+        # ready with an absent/inaccessible bucket or unusable STS identity.
+        await asyncio.to_thread(s3_adapter.ensure_bucket, settings.s3_bucket)
     await pre_migration_revision_authority_guard()
     await init_db()
     logger.info("Database initialized")
@@ -374,7 +380,7 @@ def start_workers(*, include_api_local: bool = True) -> None:
     # s3_delete_worker drains s3_delete_outbox into S3 deletes. Only
     # makes sense when S3 is configured; otherwise file uploads are
     # disabled altogether and the outbox stays empty forever.
-    if settings.s3_endpoint_url:
+    if settings.object_storage_enabled:
         asset_gc_worker.start()
         s3_delete_worker.start()
         started.append("asset_gc_worker")
@@ -394,7 +400,9 @@ def start_workers(*, include_api_local: bool = True) -> None:
             "metadata_worker disabled (external_git_enabled=false; it only "
             "fills metadata on external_git mirror imports)"
         )
-    elif settings.llm_base_url and settings.llm_api_key:
+    elif settings.llm_base_url and (
+        settings.llm_api_key or settings.model_api_governance_mode == "platform_hard"
+    ):
         metadata_worker.start()
         started.append("metadata_worker")
     else:

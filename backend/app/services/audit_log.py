@@ -499,25 +499,28 @@ _s3 = None
 
 def _s3_client():
     """Dedicated audit-storage client. Uses the ``audit.*`` credentials when
-    set, otherwise falls back to the system S3 connection (see
+    set in standalone mode, otherwise shares the selected runtime session (see
     ``AuditSettings``). Built once and cached. We never need Delete on this
     client — only PutObject — so the bucket credential can be write-only.
 
     Note we don't reuse the `s3_adapter.put_bytes/get_bytes` primitives:
     those are bound to the single `settings.s3_bucket` on the shared
     file-store client, whereas audit must target a *different* bucket on a
-    *credential-isolated* client. We share only the boto-config via
-    `make_client` and issue `put_object` directly."""
+    client. Standalone can use a credential-isolated `make_client`; managed
+    uploads share the refreshable workload identity and its bucket policy."""
     global _s3
     if _s3 is None:
         from app.services.adapters import s3_adapter  # boto3 imported lazily
         a = settings.audit
-        _s3 = s3_adapter.make_client(
-            a.endpoint_url or settings.s3_endpoint_url,
-            a.access_key or settings.s3_access_key,
-            a.secret_key or settings.s3_secret_key,
-            a.region or settings.s3_region,
-        )
+        endpoint = a.endpoint_url or settings.s3_endpoint_url
+        region = a.region or settings.s3_region
+        if a.access_key or a.secret_key:
+            _s3 = s3_adapter.make_client(
+                endpoint, a.access_key or settings.s3_access_key,
+                a.secret_key or settings.s3_secret_key, region,
+            )
+        else:
+            _s3 = s3_adapter.session_client(endpoint, region)
     return _s3
 
 

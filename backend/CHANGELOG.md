@@ -212,6 +212,20 @@ untouched. Adopted or retained tables reject generic alter/drop and structured
 migrations, while the owning rollout worker retains its exact installation
 context.
 
+## 0.14.3 — 2026-09-08  *(fix — managed workload identity)*
+
+Managed `platform_hard` deployments now read rotating Gateway tokens for model
+calls and use refreshable RGW WebIdentity sessions for file and audit storage.
+Static model/S3/audit keys are rejected. Internal S3 operations and public
+presigns share the workload credentials; URL lifetime is bounded by the exact
+signing session, and API `expires_in` reports the actual lifetime. Managed
+startup requires an accessible pre-provisioned bucket and never creates one.
+
+Standalone static credentials and MinIO bucket creation remain available.
+Explicit `s3_auth_mode: default_chain` supports native cloud credentials,
+including AWS WebIdentity, with cleanup workers enabled even when no custom
+S3 endpoint is configured. See [workload identity configuration](../docs/managed-workload-identity.md).
+
 ## 0.14.2 — 2026-08-13  *(feat — exact PAT authority self-verification)*
 
 ### Added PAT authority self-verification

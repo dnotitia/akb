@@ -451,9 +451,9 @@ class FileService:
             "uri": file_uri(vault_name, str(file_id), collection=collection_path),
             "vault": vault_name,
             "collection": collection_path or None,
-            "upload_url": presigned_url,
+            "upload_url": presigned_url.url,
             "s3_key": s3_key,
-            "expires_in": _PRESIGN_UPLOAD_TTL,
+            "expires_in": presigned_url.expires_in,
             "deduplicated": deduplicated,
         }
 
@@ -542,8 +542,8 @@ class FileService:
             "name": row["name"],
             "mime_type": upload_mime_type,
             "replacement_id": str(replacement_id),
-            "upload_url": upload_url,
-            "expires_in": _PRESIGN_UPLOAD_TTL,
+            "upload_url": upload_url.url,
+            "expires_in": upload_url.expires_in,
             "current_content_hash": row.get("content_hash"),
             "current_version": current_version,
             "unchanged": False,
@@ -984,7 +984,7 @@ class FileService:
         return {
             "kind": "file",
             "name": row["name"],
-            "download_url": presigned_url,
+            "download_url": presigned_url.url,
             "mime_type": row["mime_type"],
             "size_bytes": row["size_bytes"],
             "content_hash": row["content_hash"],
@@ -992,7 +992,7 @@ class FileService:
             "etag": row["etag"],
             "storage_version": row["storage_version"],
             "version": _file_version(row),
-            "expires_in": _PRESIGN_DOWNLOAD_TTL,
+            "expires_in": presigned_url.expires_in,
         }
 
     async def list_files(

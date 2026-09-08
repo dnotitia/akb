@@ -398,7 +398,8 @@ async def test_inv7_delete_vault_no_orphan_chunks(pool, tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_inv7b_delete_vault_file_outbox_with_s3(pool, tmp_path, monkeypatch):
+@pytest.mark.parametrize("native_cloud", [False, True])
+async def test_inv7b_delete_vault_file_outbox_with_s3(pool, tmp_path, monkeypatch, native_cloud):
     """When S3 is configured, delete_vault records both durable outboxes.
 
     The file ids must reach the vector outbox before the metadata cascade, and
@@ -415,7 +416,8 @@ async def test_inv7b_delete_vault_file_outbox_with_s3(pool, tmp_path, monkeypatc
     from app.services import access_service
 
     monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
-    monkeypatch.setattr(settings, "s3_endpoint_url", "http://stub-s3:9000")
+    monkeypatch.setattr(settings, "s3_endpoint_url", "" if native_cloud else "http://stub-s3:9000")
+    monkeypatch.setattr(settings, "s3_auth_mode", "default_chain" if native_cloud else "static")
     try:
         get_role_sync()
     except RuntimeError:

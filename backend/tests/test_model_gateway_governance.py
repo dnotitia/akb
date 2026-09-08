@@ -6,7 +6,8 @@ import pytest
 from pydantic import ValidationError
 
 from app.config import Settings, settings
-from app.services import http_pool, index_service, llm_service, rerank_service
+from app.services import http_pool, index_service, llm_service, model_gateway, rerank_service
+from tests.test_workload_identity_config_unit import managed_values
 
 
 class _Response:
@@ -37,15 +38,18 @@ class _Client:
         return self.responses.pop(0)
 
 
-def _set_hard_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+def _set_hard_mode(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    token = tmp_path / "gateway-token"
+    token.write_text("projected-first\n")
+    monkeypatch.setattr(settings, "platform_gateway_token_file", str(token))
     monkeypatch.setattr(settings, "model_api_governance_mode", "platform_hard")
     monkeypatch.setattr(
         settings, "platform_gateway_base_url", "https://gateway.example/v1"
     )
     monkeypatch.setattr(settings, "embed_base_url", "https://gateway.example/v1")
-    monkeypatch.setattr(settings, "embed_api_key", "gw_test")  # pragma: allowlist secret
+    monkeypatch.setattr(settings, "embed_api_key", "")
     monkeypatch.setattr(settings, "llm_base_url", "https://gateway.example/v1")
-    monkeypatch.setattr(settings, "llm_api_key", "gw_test")  # pragma: allowlist secret
+    monkeypatch.setattr(settings, "llm_api_key", "")
     monkeypatch.setattr(settings, "rerank_enabled", True)
     monkeypatch.setattr(settings, "rerank_base_url", "")
     monkeypatch.setattr(settings, "rerank_api_key", "")
@@ -53,47 +57,28 @@ def _set_hard_mode(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _assert_managed_idempotency_key(call: dict) -> None:
     value = call["headers"].get("Idempotency-Key")
+    assert call["headers"]["Authorization"] == "Bearer projected-first"
     assert value
     assert str(uuid.UUID(value)) == value
 
 
 def test_platform_hard_config_rejects_direct_or_uncredentialed_model_routes():
     with pytest.raises(ValidationError, match="embed_base_url"):
-        Settings(
-            model_api_governance_mode="platform_hard",
-            platform_gateway_base_url="https://gateway.example/v1",
-            embed_base_url="https://api.openai.com/v1",
-            embed_api_key="gw_test",  # pragma: allowlist secret
-        )
-
-    with pytest.raises(ValidationError, match="embed_api_key"):
-        Settings(
-            model_api_governance_mode="platform_hard",
-            platform_gateway_base_url="https://gateway.example/v1",
-            embed_base_url="https://gateway.example/v1/",
-        )
-
-    configured = Settings(
-        model_api_governance_mode="platform_hard",
+        Settings(**managed_values(embed_base_url="https://api.openai.com/v1"))
+    with pytest.raises(ValidationError, match="platform_gateway_token_file"):
+        Settings(**managed_values(platform_gateway_token_file=""))
+    configured = Settings(**managed_values(
         platform_gateway_base_url="https://gateway.example/v1/",
-        embed_base_url="https://gateway.example/v1",
-        embed_api_key="gw_test",  # pragma: allowlist secret
-        llm_base_url="https://gateway.example/v1",
-        llm_api_key="gw_test",  # pragma: allowlist secret
-        rerank_enabled=True,
-    )
+        llm_base_url="https://gateway.example/v1", rerank_enabled=True,
+    ))
     assert configured.model_api_governance_mode == "platform_hard"
-
-    standalone = Settings(
-        model_api_governance_mode="external_metering",
-        embed_base_url="https://api.openai.com/v1",
-    )
+    standalone = Settings(embed_base_url="https://api.openai.com/v1")
     assert standalone.embed_base_url == "https://api.openai.com/v1"
 
 
 @pytest.mark.asyncio
-async def test_platform_hard_model_calls_send_one_caller_generated_identity(monkeypatch):
-    _set_hard_mode(monkeypatch)
+async def test_platform_hard_model_calls_send_one_caller_generated_identity(monkeypatch, tmp_path):
+    _set_hard_mode(monkeypatch, tmp_path)
 
     embed_client = _Client([_Response(200, {"data": [{"index": 0, "embedding": [1.0]}]})])
     status, embeddings, _ = await index_service._embed_call(embed_client, ["text"], 5.0)
@@ -144,9 +129,9 @@ async def test_external_metering_preserves_legacy_4xx_classification(monkeypatch
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status_code", [401, 402, 403, 404, 409, 422, 428])
 async def test_embedding_governance_rejection_does_not_fan_out_batch(
-    monkeypatch, status_code
+    monkeypatch, status_code, tmp_path
 ):
-    _set_hard_mode(monkeypatch)
+    _set_hard_mode(monkeypatch, tmp_path)
     client = _Client([_Response(status_code)])
     monkeypatch.setattr(http_pool, "get_client", lambda: client)
 
@@ -157,8 +142,8 @@ async def test_embedding_governance_rejection_does_not_fan_out_batch(
 
 
 @pytest.mark.asyncio
-async def test_chat_budget_denial_remains_deferred_instead_of_abandoned(monkeypatch):
-    _set_hard_mode(monkeypatch)
+async def test_chat_budget_denial_remains_deferred_instead_of_abandoned(monkeypatch, tmp_path):
+    _set_hard_mode(monkeypatch, tmp_path)
     client = _Client([_Response(402)])
     monkeypatch.setattr(http_pool, "get_client", lambda: client)
 
@@ -167,3 +152,46 @@ async def test_chat_budget_denial_remains_deferred_instead_of_abandoned(monkeypa
 
     assert not isinstance(caught.value, llm_service.LLMPermanentError)
     assert len(client.calls) == 1
+
+
+def test_gateway_reopens_rotated_projection_and_mints_distinct_request_ids(monkeypatch, tmp_path):
+    _set_hard_mode(monkeypatch, tmp_path)
+    first = model_gateway.request_headers("")
+    replacement = tmp_path / "replacement"
+    replacement.write_text("projected-second\n")
+    replacement.replace(tmp_path / "gateway-token")
+    second = model_gateway.request_headers("")
+    assert first["Authorization"] == "Bearer projected-first"
+    assert second["Authorization"] == "Bearer projected-second"
+    assert first["Idempotency-Key"] != second["Idempotency-Key"]
+
+
+@pytest.mark.parametrize("contents", ["", " \n", "injected\nheader", "x" * 65537])
+async def test_invalid_projected_token_never_sends_a_model_request(monkeypatch, tmp_path, contents):
+    _set_hard_mode(monkeypatch, tmp_path)
+    (tmp_path / "gateway-token").write_text(contents)
+    client = _Client([])
+    monkeypatch.setattr(http_pool, "get_client", lambda: client)
+    assert await index_service.generate_embeddings(["one", "two"]) == [[], []]
+    with pytest.raises(llm_service.LLMError, match="identity"):
+        await llm_service.chat_json(system="system", user="user")
+    with pytest.raises(rerank_service.RerankError, match="identity"):
+        await rerank_service.rerank("query", ["document"])
+    assert client.calls == []
+
+
+def test_gateway_missing_token_and_static_argument_fail_closed(monkeypatch, tmp_path):
+    from app.exceptions import AKBError
+
+    _set_hard_mode(monkeypatch, tmp_path)
+    with pytest.raises(AKBError, match="Static"):
+        model_gateway.request_headers("legacy-key")
+    (tmp_path / "gateway-token").unlink()
+    with pytest.raises(AKBError, match="identity"):
+        model_gateway.request_headers("")
+
+
+def test_standalone_headers_preserve_direct_provider_keys(monkeypatch):
+    monkeypatch.setattr(settings, "model_api_governance_mode", "external_metering")
+    assert model_gateway.request_headers("provider-fixture") == {"Authorization": "Bearer provider-fixture"}
+    assert model_gateway.request_headers("") == {}

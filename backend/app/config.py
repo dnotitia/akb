@@ -23,6 +23,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -592,6 +593,7 @@ class Settings(BaseModel):
     # route must use; startup rejects a direct-provider escape.
     model_api_governance_mode: Literal["external_metering", "platform_hard"] = "external_metering"
     platform_gateway_base_url: str = ""
+    platform_gateway_token_file: str = ""
 
     # LLM — optional. Only consumed by metadata_worker (auto-tagging
     # external_git imports). When unset, metadata_worker stays disabled
@@ -666,27 +668,28 @@ class Settings(BaseModel):
         gateway = self.platform_gateway_base_url.strip().rstrip("/")
         if not gateway:
             raise ValueError("platform_gateway_base_url is required in platform_hard mode")
+        if not Path(self.platform_gateway_token_file).is_absolute():
+            raise ValueError("platform_gateway_token_file must be an absolute token path in platform_hard mode")
+        for name in ("embed_api_key", "llm_api_key", "rerank_api_key"):
+            if getattr(self, name):
+                raise ValueError(f"{name} is forbidden in platform_hard mode")
 
-        routes = [
-            ("embed_base_url", self.embed_base_url, "embed_api_key", self.embed_api_key),
-        ]
+        routes = []
+        if self.embed_base_url:
+            routes.append(("embed_base_url", self.embed_base_url))
         if self.llm_base_url:
-            routes.append(("llm_base_url", self.llm_base_url, "llm_api_key", self.llm_api_key))
+            routes.append(("llm_base_url", self.llm_base_url))
         if self.rerank_enabled:
             routes.append(
                 (
                     "rerank_base_url",
                     self.rerank_base_url or self.llm_base_url,
-                    "rerank_api_key",
-                    self.rerank_api_key or self.llm_api_key,
                 )
             )
 
-        for url_name, url, key_name, key in routes:
+        for url_name, url in routes:
             if not url or url.strip().rstrip("/") != gateway:
                 raise ValueError(f"{url_name} must exactly match platform_gateway_base_url in platform_hard mode")
-            if not key.strip():
-                raise ValueError(f"{key_name} is required in platform_hard mode")
         return self
 
     @model_validator(mode="after")
@@ -760,6 +763,49 @@ class Settings(BaseModel):
     s3_secret_key: str = ""
     s3_bucket: str = "akb-files"
     s3_region: str = ""
+    # Static retains the existing standalone/MinIO configuration. The native
+    # chain supports cloud roles without requiring a custom S3 endpoint.
+    # platform_hard narrows default_chain to this explicit WebIdentity tuple;
+    # no environment or shared-profile credential can override that identity.
+    s3_auth_mode: Literal["static", "default_chain"] = "static"
+    s3_web_identity_token_file: str = ""
+    s3_role_arn: str = ""
+    s3_sts_endpoint_url: str = ""
+
+    @property
+    def object_storage_enabled(self) -> bool:
+        return bool(self.s3_endpoint_url) or self.s3_auth_mode == "default_chain"
+
+    @model_validator(mode="after")
+    def validate_storage_identity(self) -> "Settings":
+        managed = self.model_api_governance_mode == "platform_hard"
+        if managed and self.s3_auth_mode != "default_chain":
+            raise ValueError("s3_auth_mode must be default_chain in platform_hard mode")
+        if self.s3_auth_mode == "default_chain":
+            for name in ("s3_access_key", "s3_secret_key"):
+                if getattr(self, name):
+                    raise ValueError(f"{name} is forbidden with s3_auth_mode=default_chain")
+        if managed:
+            for name in ("access_key", "secret_key"):
+                if getattr(self.audit, name):
+                    raise ValueError(f"audit.{name} is forbidden in platform_hard mode")
+            if not self.s3_endpoint_url.strip():
+                raise ValueError("s3_endpoint_url is required in platform_hard mode")
+
+        fields = ("s3_web_identity_token_file", "s3_role_arn", "s3_sts_endpoint_url")
+        if managed or any(getattr(self, name) for name in fields):
+            if self.s3_auth_mode != "default_chain":
+                raise ValueError("s3_auth_mode must be default_chain for WebIdentity")
+            for name in fields:
+                if not getattr(self, name).strip():
+                    raise ValueError(f"{name} is required for explicit S3 WebIdentity")
+            if not Path(self.s3_web_identity_token_file).is_absolute():
+                raise ValueError("s3_web_identity_token_file must be an absolute token path")
+            endpoint = urlsplit(self.s3_sts_endpoint_url)
+            if (endpoint.scheme not in ("https", "http") or not endpoint.hostname
+                    or endpoint.username or endpoint.password or endpoint.query or endpoint.fragment):
+                raise ValueError("s3_sts_endpoint_url must be an HTTP(S) endpoint without credentials or query")
+        return self
     # boto3/botocore default to a 60 s connect AND 60 s read timeout with NO
     # retries. A stalled MinIO/S3 (network blip, cold bucket, dead endpoint)
     # then blocks the caller for up to 60 s — and several S3 primitives run on

@@ -435,7 +435,10 @@ async def _embed_call(
         caller must not fan the same denied batch out into per-item calls.
     `detail` is a short human-readable string suffix for logs/errors.
     """
-    headers = model_gateway.request_headers(settings.embed_api_key)
+    try:
+        headers = model_gateway.request_headers(settings.embed_api_key)
+    except model_gateway.WorkloadIdentityError:
+        return "transient", None, "Workload identity is unavailable"
     # Send `dimensions` so MRL-capable models (qwen3-embedding-8b native
     # 4096, text-embedding-3-* native 3072) truncate to the deployed
     # vector schema dim. Native-dim models (bge-m3@1024) accept it as a

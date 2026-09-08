@@ -377,7 +377,7 @@ async def test_file_initiation_serializes_with_a_concurrent_vault_delete(
     monkeypatch.setattr(
         fs.s3_adapter,
         "presign_put",
-        lambda key, **_kwargs: f"https://storage.invalid/{key}",
+        lambda key, **_kwargs: fs.s3_adapter.PresignedURL(f"https://storage.invalid/{key}", 3600),
     )
 
     upload = asyncio.create_task(fs.FileService().initiate_upload(
@@ -609,7 +609,7 @@ async def test_file_initiation_does_not_wait_for_same_key_cleanup(
     monkeypatch.setattr(
         fs.s3_adapter,
         "presign_put",
-        lambda key, **_kwargs: f"https://storage.invalid/{key}",
+        lambda key, **_kwargs: fs.s3_adapter.PresignedURL(f"https://storage.invalid/{key}", 3600),
     )
 
     async with pool.acquire() as cleanup_conn:
