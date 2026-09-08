@@ -13,19 +13,18 @@ import os
 import sys
 import time
 from dataclasses import asdict
-from pathlib import Path
 from typing import Any
 
 import yaml
 
 from .llm_client import LLM
 from .mcp_client import mcp_session
+from .paths import evalset_dir, runs_dir
 from .react_agent import ARM_TOOLS, run_agent_with_session
 
 
-ROOT = Path(__file__).resolve().parent.parent
-EVALSET = ROOT / "evalset"
-RUNS = Path(os.environ.get("RUNS_DIR", ROOT / "runs"))
+EVALSET = evalset_dir()
+RUNS = runs_dir("runs")
 
 
 def load_query(qid: str) -> dict[str, Any]:

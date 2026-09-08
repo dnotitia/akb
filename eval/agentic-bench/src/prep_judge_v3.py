@@ -13,14 +13,13 @@ from __future__ import annotations
 import json
 import re
 import sys
-from pathlib import Path
 
 import yaml
 
-import os
-ROOT = Path(__file__).resolve().parent.parent
-EVALSET = ROOT / "evalset"
-RUNS = Path(os.environ.get("RUNS_DIR", ROOT / "runs_v3"))
+from .paths import evalset_dir, runs_dir
+
+EVALSET = evalset_dir()
+RUNS = runs_dir("runs_v3")
 BATCHES = RUNS / "batches"
 VERDICTS = RUNS / "verdicts"
 _V4_STYLE = any(s in str(RUNS) for s in ("v4", "v5", "v6", "v7", "v8", "v9"))

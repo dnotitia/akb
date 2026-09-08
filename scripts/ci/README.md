@@ -59,6 +59,13 @@ second user through the same authenticated endpoint and client lifecycle.
 The fixture uses the SDK's public `Client` and Streamable HTTP transport in the
 pytest process; it does not invoke Inspector, Node, or a separate MCP driver.
 
+The detailed security suite also covers declarative table constraints and
+indexes, stable permission envelopes, private-document and graph boundaries,
+SQL failure-state integrity, and PAT write scopes. The PG-native ACL backstops
+remain in `test_pg_rbac_e2e.sh` and `test_vault_scope_sql_e2e.sh`; the retained
+shell security suite keeps only REST, health, and role-source checks plus the
+MCP setup calls needed to seed those REST assertions.
+
 The mixed shell suites retain only their non-migrated boundaries: transport and
 protocol/session checks, direct REST comparisons and ACLs, file byte hashes,
 and SQL/cross-vault checks. Their migrated MCP product assertions and unused
