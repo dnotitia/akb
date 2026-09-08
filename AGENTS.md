@@ -1,5 +1,28 @@
 # AKB Project Guide
 
+## Coding agent workflow
+
+- Start with Astra at the repository's configured `medium` effort. Increase to
+  `high`, `xhigh`, or `max` when the problem or observed result warrants it.
+  Architecture, consequential review, and uncertain cross-repository decisions
+  stay with Astra. These settings concern the coding agent, not product models.
+- Terra and Luna may be used only at `max`, for a bounded auxiliary task.
+  Choose Sol only when comparable work has demonstrated adequate quality and
+  better total efficiency than Astra; include latency, retries, and usage in
+  that judgment. Otherwise keep the task on Astra.
+- Carry out the requested outcome using reasonable assumptions. Existing user
+  authorization continues to apply; local skills do not create new approval
+  steps. If an actual instruction blocks progress, cite its file and wording.
+- Delegate independent work when it saves time while the owner makes useful
+  progress. Give each worker clear paths, scope, and a check; integrate once.
+  A review or implementation task does not require a fixed agent pipeline.
+- Read only the applicable product and directory guidance. Run checks that
+  exercise the changed behavior and required repository gates; documentation
+  or agent-configuration edits need parsing, links, and relevant policy checks.
+  Repeat a passing check only for a changed input or a specific unresolved risk.
+- Report the result, evidence, and remaining limitation in concise prose.
+  Preserve unrelated local work and keep credentials out of tracked files.
+
 ## Architecture
 
 - **Backend**: Python 3.14, FastAPI + Uvicorn, PostgreSQL 16 + pgvector, GitPython (bare repo)
@@ -155,10 +178,9 @@ only.
   → `bash deploy/k8s/internal/deploy-internal.sh` (image built from
   the bumped pyproject version).
 - **Proxy**: bump `packages/akb-mcp-client/package.json`, add
-  CHANGELOG entry, PR + merge → user runs
+  CHANGELOG entry, PR + merge → for an authorized release, run
   `cd packages/akb-mcp-client && npm publish --access public`
-  manually (deliberate human gate, see workspace memory
-  [[feedback_proxy_npm_publish]]) →
+  using the verified publishing account →
   `git tag -a akb-mcp-vX.Y.Z <bump-commit> -m "..."` → push →
   `gh release create akb-mcp-vX.Y.Z [--latest] --notes "..."`.
 
@@ -244,3 +266,12 @@ OpenAPI document.
   stored (migration 087).
 - No Prometheus dependency — plain JSON, deliberately not a metrics
   endpoint.
+
+## Product decisions
+
+Keep product intent under `docs/prd/{backlog,wip,applied,denied}/` and durable
+engineering decisions under `docs/design/{proposal,accepted,denied}/`. Each
+existing item owns its `README.md`, review rounds, and feedback; update its
+status/stage/date when promoting it. Ordinary implementation does not require
+a new planning document or a fixed critique sequence. Mirror notes to a live
+AKB vault only when that write is within the user's requested scope.
