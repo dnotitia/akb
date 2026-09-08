@@ -116,6 +116,28 @@ def test_search_hit_additions_are_the_only_change():
     assert added == {"section_path", "chunk_index"}
 
 
+def test_a_hit_serialises_every_baseline_key_even_when_the_new_ones_are_null():
+    # Declaring a field is not the same as emitting it. A hit whose chunk row
+    # is gone carries `section_path=None, chunk_index=None`, and those keys
+    # must still appear — a consumer reading `"chunk_index" in hit` should not
+    # get a different answer depending on whether the lookup succeeded.
+    dumped = SearchResult(
+        source_type="document",
+        uri="akb://v/doc/a.md",
+        vault="v",
+        path="a.md",
+        title="A",
+        score=0.5,
+        section_path=None,
+        chunk_index=None,
+    ).model_dump()
+
+    assert BASELINE_MODEL_FIELDS["SearchResult"] <= set(dumped)
+    assert dumped["section_path"] is None
+    assert dumped["chunk_index"] is None
+    assert set(dumped) == set(SearchResult.model_fields)
+
+
 # ── service payloads assembled in code, not by a model ──────────────
 
 BASELINE_DRILL_DOWN_SECTION = {"section_path", "content", "chunk_index"}
@@ -268,3 +290,31 @@ async def test_empty_match_envelope_keeps_its_baseline_keys(drill_down_handler):
 
     assert BASELINE_EMPTY_SECTIONS_RESPONSE <= set(response)
     assert response["sections"] == []
+
+
+async def test_the_outline_cap_still_lines_up_with_the_probe(drill_down_handler):
+    # The handler asks for OUTLINE_CAP + 1 headings to learn whether the
+    # outline was truncated without paying for a full count. Now that the
+    # service collapses duplicates before the limit, that probe has to keep
+    # meaning "more than 50 distinct headings exist".
+    headings = [f"# H{i:03d}" for i in range(51)]
+    handler = drill_down_handler(sections=[], headings=headings)
+
+    response = await handler({"uri": URI, "mode": "outline"}, "user-1", None)
+
+    assert len(response["outline"]) == 50
+    assert response["returned"] == 50
+    assert response["truncated"] is True
+    assert "total" not in response  # unknown once truncated
+    assert response["outline"] == headings[:50]
+
+
+async def test_exactly_the_cap_is_not_reported_as_truncated(drill_down_handler):
+    headings = [f"# H{i:03d}" for i in range(50)]
+    handler = drill_down_handler(sections=[], headings=headings)
+
+    response = await handler({"uri": URI, "mode": "outline"}, "user-1", None)
+
+    assert len(response["outline"]) == 50
+    assert response["total"] == 50
+    assert "truncated" not in response
