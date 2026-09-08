@@ -59,6 +59,7 @@ from app.services.admission_service import (
     list_pending_admissions,
 )
 from app.util.text import NFCModel
+from app.services import audit_log
 
 
 def _require_admin(user: AuthenticatedUser) -> None:
@@ -242,17 +243,36 @@ async def vault_members(vault: str, user: AuthenticatedUser = Depends(get_curren
 @router.post("/vaults/{vault}/grant", summary="Grant vault access to a user")
 async def grant(vault: str, req: GrantRequest, user: AuthenticatedUser = Depends(get_current_user)):
     kwargs = {} if req.source_key is None else {"source_key": req.source_key}
-    return await grant_access(
-        user.user_id, vault, req.user, req.role, revision=req.revision, **kwargs,
+    return await _audited_access(
+        "akb_grant", {"vault": vault, **req.model_dump(exclude_none=True)}, user,
+        grant_access(user.user_id, vault, req.user, req.role, revision=req.revision, **kwargs),
     )
 
 
 @router.post("/vaults/{vault}/revoke", summary="Revoke vault access from a user")
 async def revoke(vault: str, req: RevokeRequest, user: AuthenticatedUser = Depends(get_current_user)):
-    return await revoke_access(
-        user.user_id, vault, req.user,
-        source_key=req.source_key, revision=req.revision,
+    return await _audited_access(
+        "akb_revoke", {"vault": vault, **req.model_dump()}, user,
+        revoke_access(user.user_id, vault, req.user, source_key=req.source_key, revision=req.revision),
     )
+
+
+async def _audited_access(name, args, user, operation):
+    """Use the existing API audit producer for REST's two access operations.
+
+    The canonical action matches MCP; transport metadata identifies REST.
+    Domain events remain separate. Preserve the handler's result or exception,
+    and never copy exception messages (which may contain private details).
+    """
+    result = {"error": True, "code": "interrupted"}
+    try:
+        result = await operation
+        return result
+    except Exception as error:
+        result = {"error": True, "code": getattr(error, "code", None)}
+        raise
+    finally:
+        audit_log.record_tool(name, args, user, result, is_write=True, protocol={"transport": "rest"})
 
 
 @router.get(
