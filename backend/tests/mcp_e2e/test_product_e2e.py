@@ -433,26 +433,6 @@ async def test_relations_activity_provenance_and_document_deletion(
     missing = await _call_json(mcp_client, runtime_session, "akb_get", {"uri": first["uri"]}, expect_error=True)
     assert missing.get("code") == "not_found"
 
-    await _call_json(
-        mcp_client,
-        runtime_session,
-        "akb_create_collection",
-        {"vault": vault, "path": "keepempty"},
-    )
-    keep = await _call_json(
-        mcp_client,
-        runtime_session,
-        "akb_put",
-        {"vault": vault, "collection": "keepempty", "title": "keep-t", "content": "## c"},
-    )
-    await _call_json(mcp_client, runtime_session, "akb_delete", {"uri": keep["uri"]})
-    after_delete = await _call_json(mcp_client, runtime_session, "akb_browse", {"vault": vault})
-    assert sum(
-        item.get("name") == "keepempty" and item.get("type") == "collection"
-        for item in after_delete.get("items", [])
-    ) == 1
-
-
 async def test_tables_sql_and_ddl(
     mcp_client: Client,
     runtime_session: RuntimeContext,

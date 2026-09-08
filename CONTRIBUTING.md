@@ -74,7 +74,6 @@ variables are read by the backend.** When you need a new setting:
 ```bash
 # Individual endpoint-driven suites against the normal local Compose stack
 AKB_URL=http://localhost:8000 bash backend/tests/test_e2e.sh
-AKB_URL=http://localhost:8000 bash backend/tests/test_edit_e2e.sh
 AKB_URL=http://localhost:8000 bash backend/tests/test_security_edge_e2e.sh
 # … see backend/tests/ for the full list
 
