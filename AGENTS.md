@@ -2,33 +2,39 @@
 
 ## Coding agent workflow
 
-- Start with Astra at the repository's configured `medium` effort. Increase to
+Both coding agents run the same roles. They are defined once in
+`.agents/roles.toml`; `.codex/` and `.claude/` are rendered from it by
+`scripts/agent-roles.py`, and `scripts/check.sh` fails when a rendered file is
+hand-edited or stale. Model names live only in that source. `CLAUDE.md`
+imports this file, so this is the one contract.
+
+| role | effort | scope |
+| --- | --- | --- |
+| owner (the session default) | `medium`, raised per task | architecture, consequential review, uncertain cross-repository decisions |
+| `explorer` | `max` only | optional bounded read-only lookup: paths and evidence, not decisions |
+| `reviewer` | `high` | read-only review of a named diff with reproducible findings |
+| `efficiency_worker` | `medium` | opt-in implementation, only with evidence of better total efficiency |
+
+- Start on the owner model at the configured `medium` effort. Increase to
   `high`, `xhigh`, or `max` when the problem or observed result warrants it.
-  Architecture, consequential review, and uncertain cross-repository decisions
-  stay with Astra. These settings concern the coding agent, not product models.
-- Terra and Luna may be used only at `max`, for a bounded auxiliary task.
-  Choose Sol only when comparable work has demonstrated adequate quality and
-  better total efficiency than Astra; include latency, retries, and usage in
-  that judgment. Otherwise keep the task on Astra.
+  These settings concern the coding agent, not product models.
+- The explorer tier is allowed only at `max`, for a bounded auxiliary task.
+  Choose the worker tier only when comparable work has demonstrated adequate
+  quality and better total efficiency than the owner; include latency,
+  retries, and usage in that judgment. Otherwise keep the task on the owner.
 - Carry out the requested outcome using reasonable assumptions. Existing user
   authorization continues to apply; local skills do not create new approval
   steps. If an actual instruction blocks progress, cite its file and wording.
 - Delegate independent work when it saves time while the owner makes useful
-  progress. Give each worker clear paths, scope, and a check; integrate once.
-  A review or implementation task does not require a fixed agent pipeline.
+  progress: one level deep, at most three workers at a time, each with clear
+  paths, scope, and a check; integrate once. A review or implementation task
+  does not require a fixed agent pipeline.
 - Read only the applicable product and directory guidance. Run checks that
   exercise the changed behavior and required repository gates; documentation
   or agent-configuration edits need parsing, links, and relevant policy checks.
   Repeat a passing check only for a changed input or a specific unresolved risk.
 - Report the result, evidence, and remaining limitation in concise prose.
   Preserve unrelated local work and keep credentials out of tracked files.
-- The same roles exist for both agents. `.codex/config.toml` and
-  `.codex/agents/` carry the Codex side; `.claude/settings.json` and
-  `.claude/agents/` carry the Claude Code side, and `CLAUDE.md` only imports
-  this file so there is one contract. Tier for tier: Astra is Claude Fable 5.1,
-  Terra is Claude Opus 5, Sol is Claude Sonnet 5; effort levels are the same
-  words, and on both sides delegation is one level deep with at most three
-  workers at a time. Change a role in both places in the same commit.
 
 ## Architecture
 

@@ -1,6 +1,7 @@
 ---
+# Generated from .agents/roles.toml by scripts/agent-roles.py; edit the source.
 name: reviewer
-description: Fable review of consequential changes with concrete, reproducible findings. Use for a named diff or PR before merge; read-only.
+description: Owner-tier review of consequential changes with concrete, reproducible findings.
 model: fable
 effort: high
 permissionMode: plan
