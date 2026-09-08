@@ -122,6 +122,63 @@ def strip_chunk_metadata_header(text: str | None) -> str | None:
     return _CHUNK_HEADER_RE.sub("", text, count=1)
 
 
+def strip_chunk_context_line(text: str | None, section_path: str | None) -> str | None:
+    """Strip the `[# A > ## B]` heading-context line the indexer writes as
+    the first line of a section's first chunk.
+
+    `chunk_markdown` prepends `f"[{section_path}]\n"` to every section so
+    the retrieval legs see the heading path inside the embedded text. On
+    the way out it is pure duplication: `drill_down` already returns the
+    same value in the `section_path` field of the very same row, so the
+    line costs the caller tokens and tells it nothing new.
+
+    Removed only when the first line is *exactly* `[<section_path>]` for
+    this chunk's own `section_path` — a body that legitimately opens with
+    a bracketed line (a markdown link label, a citation key) never
+    matches, and the `section_path` field itself is untouched.
+    """
+    if not text or not section_path:
+        return text
+    prefix = f"[{section_path}]"
+    if not text.startswith(prefix):
+        return text
+    rest = text[len(prefix):]
+    if rest.startswith("\r\n"):
+        return rest[2:]
+    if rest.startswith("\n"):
+        return rest[1:]
+    if rest == "":
+        return rest
+    # `[section]` ran into other text on the same line — not the context
+    # line the indexer wrote.
+    return text
+
+
+def clean_section_rows(rows) -> list[dict]:
+    """Build the `drill_down` section payload from stored chunk rows.
+
+    Every transform here removes bytes the caller cannot use: index-side
+    metadata (`strip_chunk_metadata_header`) and the heading-context line
+    that duplicates the row's own `section_path`
+    (`strip_chunk_context_line`). Keys are never removed — `section_path`,
+    `content` and `chunk_index` are returned for every surviving row.
+
+    `rows` must be ordered by `chunk_index`, as both SQL paths in
+    `drill_down` are.
+    """
+    sections: list[dict] = []
+    for r in rows:
+        section_path = r["section_path"]
+        content = strip_chunk_metadata_header(r["content"])
+        content = strip_chunk_context_line(content, section_path)
+        sections.append({
+            "section_path": section_path,
+            "content": content,
+            "chunk_index": r["chunk_index"],
+        })
+    return sections
+
+
 def fuse_original_and_reranked_hits(
     hits: list[VectorHit],
     ranked: list[tuple[int, float]],
@@ -1676,14 +1733,7 @@ class SearchService:
                     vault, doc_id,
                 )
 
-            return [
-                {
-                    "section_path": r["section_path"],
-                    "content": strip_chunk_metadata_header(r["content"]),
-                    "chunk_index": r["chunk_index"],
-                }
-                for r in rows
-            ]
+            return clean_section_rows(rows)
 
     async def list_section_headings(self, vault: str, doc_id: str, limit: int | None = None) -> list[str]:
         """Return the document's section paths without their bodies.
