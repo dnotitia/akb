@@ -1,0 +1,18 @@
+# Seed question: a specific decision, with a specific client-visible
+# consequence. Tests whether an arm can find one ADR among many and read the
+# clause rather than the title.
+id: q002
+category: decision-lookup
+query: >-
+  What does ADR-016 decide about write admission in akb-oss, and what does a
+  client see when the write lane stays saturated?
+ground_truth:
+  must_mention:
+    - "coroutine waiting before any resource is acquired"
+    - "429"
+    - "Retry-After"
+  forbidden:
+    - "the write is rejected immediately without waiting"
+    - "the request holds a database connection while it waits"
+  source_docs:
+    - "akb://project-akb/coll/decisions/adr/doc/adr-016-write-admission-write-lane-429-backpressure.md"

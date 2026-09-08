@@ -51,9 +51,15 @@ src/
   react_agent.py       Per-arm ARM_TOOLS / ARM_HINTS + ReAct loop
   runner.py            Chunk runner: 1 session, sequential queries, auto-reconnect
   prep_judge_v3.py     Pre/post processing for the offline judge step
-  judge.py             Aggregator: per-arm pass%, provenance%, per-category breakdown
+  judge.py             Aggregator: per-arm pass%, provenance%, accuracy gate,
+                       tokens per correct answer, payload per call, tradeoff
 scripts/
   run_v4_multiproc.sh  Multi-process driver — N processes × M queries each
+evalset-project-akb/   Tracked seed questions over the `project-akb` vault —
+                       the only worked examples of the schema in this repo
+                       (`evalset/` itself stays private, see below)
+tests/                 Unit tests for the gate/tradeoff arithmetic and the
+                       seed evalset schema
 ```
 
 ## How to run
@@ -81,7 +87,49 @@ RUNS_DIR=runs_v1 python -m src.judge --aggregate
 ```
 
 `RUNS_DIR` is required for any version other than the default
-`runs/`. The aggregator emits `metrics.json` next to the raw runs.
+`runs/`. `EVALSET_DIR` selects the question set (default `evalset/`; the
+tracked seed set is `evalset-project-akb/`). The aggregator emits
+`metrics.json` next to the raw runs.
+
+## The accuracy gate and the cost tradeoff
+
+A change that makes responses cheaper is only worth having if the answers
+are still right, so the aggregator states the gate rather than leaving it
+to be read off the table:
+
+```bash
+RUNS_DIR=runs_v1 python -m src.judge --aggregate \
+  --accuracy-floor 0.95 \
+  --redirect-cost 8000 \
+  --saving-per-call 250
+```
+
+- `--accuracy-floor` (default **0.95**) — an arm below it is `FAIL`. The
+  readout repeats each arm at 0.90 and 0.80 so a near miss can be read
+  against the thresholds a reviewer asks about next.
+- `--redirect-cost` **D** — tokens it costs to redirect one wrong answer
+  (the re-prompt plus the retry it triggers). The expected cost per
+  question is `(1 − p) × D`.
+- `--saving-per-call` — tokens the change under test saves per tool call,
+  scaled by the measured calls per question to compare like with like.
+
+`net/q` is the saving less the expected redirect cost: positive means the
+change pays for the answers it is expected to break. `break-even p` is the
+accuracy at which the two are equal, `p* = 1 − saving / D` — the number
+the decision actually turns on. Both are levels, not deltas: the harness
+does not know how much accuracy a change cost, only what accuracy the run
+measured, so a before/after comparison is still two runs.
+
+The aggregate table also carries **tokens per correct answer** (spend
+divided by answers that survived the rubric, not by questions asked) and a
+**payload per call** section (mean response characters the agent had to
+read, per call and per question). Both are the units a payload change
+moves. The harness counts characters, not tokens: a tokenizer would pin a
+model the bench does not otherwise depend on.
+
+Neither cost input has a default. Without them the readout is pass/fail
+only — what a redirect costs is a property of the deployment, and the
+harness will not invent it.
 
 ## Required tools
 
@@ -152,6 +200,17 @@ live in a sister repo. They aren't checked in here because:
 
 If you fork this for your own domain, you'll write your own
 `evalset/`. The schema is intentionally tiny.
+
+`evalset-project-akb/` is the exception that is checked in: three seed
+questions over the `project-akb` vault (the AKB family's own
+design/decision record), written so this repository carries at least one
+worked example of the schema. Point the harness at them with
+`EVALSET_DIR=evalset-project-akb`. They cover a cross-repository seam
+(the Product-API contract in `product/pipeline/modules/collector.md`), a
+single decision with a client-visible consequence (`ADR-016`, write-lane
+admission), and a two-sided module contract (`product/akb-oss/modules/backend.md`).
+Each answer lives in one section of one document, so an arm that retrieves
+the right document and stops has not answered the question.
 
 ## License
 

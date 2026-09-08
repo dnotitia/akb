@@ -1,0 +1,19 @@
+# Seed question: a two-sided contract. A complete answer carries both the
+# MUST clauses and the NEVER clauses; an arm that summarises the module
+# document's opening paragraphs gets half of it.
+id: q003
+category: module-contract
+query: >-
+  What does the akb-oss backend module's Agent contract require, and what does
+  it forbid outright?
+ground_truth:
+  must_mention:
+    - "MUST route every write through the write-lane admission gate"
+    - "MUST keep local-filesystem behaviour in the stdio proxy, not the backend"
+    - "NEVER add a pgvector or embedding column to the main DB schema"
+    - "NEVER read an environment variable from backend/app/config.py"
+  forbidden:
+    - "the backend implements the local file tools"
+    - "configuration is read from environment variables in app/config.py"
+  source_docs:
+    - "akb://project-akb/coll/product/akb-oss/modules/doc/backend.md"
