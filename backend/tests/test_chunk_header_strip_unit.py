@@ -15,6 +15,8 @@ that merely looks like a header never does.
 
 from __future__ import annotations
 
+import pytest
+
 from app.services.index_service import (
     build_doc_metadata_header,
     build_file_metadata_header,
@@ -123,6 +125,50 @@ def test_a_block_without_a_path_line_is_not_a_header():
         "TAGS: notes\n"
         "\n"
         "It must survive verbatim."
+    )
+    assert strip_chunk_metadata_header(body) == body
+
+
+def test_a_summary_with_a_blank_line_inside_it_still_strips():
+    header = build_doc_metadata_header(
+        vault_name="project-akb",
+        path="meta/agent-onboarding.md",
+        title="Agent onboarding",
+        summary=(
+            "First paragraph of the summary.\n"
+            "\n"
+            "A second paragraph, after a blank line."
+        ),
+        tags=["topic:onboarding"],
+        doc_type="guide",
+    )
+    assert strip_chunk_metadata_header(header + BODY) == BODY
+
+
+@pytest.mark.parametrize("tags", [None, ["topic:meta"]])
+@pytest.mark.parametrize("doc_type", [None, "guide"])
+def test_every_combination_of_the_optional_keys_strips(tags, doc_type):
+    header = build_doc_metadata_header(
+        vault_name="project-akb",
+        path="meta/welcome.md",
+        title="Welcome",
+        summary="A summary.\nSpanning two lines.",
+        tags=tags,
+        doc_type=doc_type,
+    )
+    assert strip_chunk_metadata_header(header + BODY) == BODY
+
+
+def test_keys_out_of_builder_order_are_not_a_header():
+    # The builders emit one order. A block that merely uses the same words
+    # in another order was not written by them.
+    body = (
+        "TITLE: x\n"
+        "PATH: v/p.md\n"
+        "SUMMARY: this came after PATH, which no builder does\n"
+        "TAGS: a\n"
+        "\n"
+        "Body that must survive."
     )
     assert strip_chunk_metadata_header(body) == body
 

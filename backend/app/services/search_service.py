@@ -25,7 +25,6 @@ from app.models.document import SearchResponse, SearchResult
 from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.services import sparse_encoder
 from app.services.index_service import (
-    CHUNK_HEADER_KEYS,
     OVERLAP,
     SOURCE_NATIVE_FILE,
     generate_embeddings,
@@ -84,41 +83,49 @@ def _configured_document_source_type() -> str:
     )
 
 # Strips the indexing-time enrichment block emitted by
-# `build_doc_metadata_header`. The block is `TITLE: ...\n`, more `KEY:`
-# lines, then a `\n\n` separator before the body. It rides along with
-# every doc chunk so the BM25 and dense legs see doc-level signals during
-# retrieval — but it is noise when the chunk content is shown to humans
-# or agents.
+# `build_doc_metadata_header` / `build_file_metadata_header`. It rides along
+# with every body chunk so the BM25 and dense legs see resource-level signals
+# during retrieval — but it is noise once the chunk content is shown to a
+# human or an agent.
 #
-# The pattern mirrors the builders line for line rather than accepting any
-# run of lines, because the difference is whether a user paragraph can be
-# eaten. `build_doc_metadata_header` emits TITLE → (SUMMARY) → (TAGS) →
-# PATH → (TYPE); `build_file_metadata_header` emits TITLE → TYPE → VAULT →
-# PATH → URI → (SIZE). So:
+# The two patterns below TRANSCRIBE those two builders, key by key and in
+# order, rather than accepting any run of key-shaped lines. The looser form
+# is what lets a user paragraph be eaten: a document whose body opens
+# `TITLE: …` and reaches something key-shaped before its first blank line
+# would have that prose removed. Pinning the structure costs nothing —
+# these are the only two shapes the indexer can write — and both require the
+# `PATH:` line that every such header carries.
 #
-#   * `SUMMARY:` is the only value interpolated verbatim
-#     (`f"SUMMARY: {summary}"`), so it is the only line whose value can
-#     carry newlines of its own. Continuation lines are therefore allowed
-#     ONLY directly after a `SUMMARY:` line — lazy, bounded at 40, and
-#     unable to cross a blank line (`[^\n]+`). Without them the whole
-#     header failed to match on a multi-line summary and every byte of it
-#     leaked into `drill_down` / `search` output.
-#   * `PATH:` is emitted by every builder that produces a body separator,
-#     so the block is required to contain one. That costs no coverage and
-#     is what keeps `TITLE: …` prose followed by an unrelated `KEY:`-ish
-#     line and a blank line from being mistaken for a header.
+# `SUMMARY:` is the one value interpolated verbatim (`f"SUMMARY: {summary}"`),
+# so it is the only line whose value can carry newlines of its own. Its group
+# is therefore lazy and DOTALL: it runs to the first point where the rest of
+# the header matches, which is the next `TAGS:` or `PATH:` line, and a blank
+# line inside the summary does not end it.
 #
-# Table/file catalogue chunks are pure metadata with no `\n\n` separator
-# and still do not match. Keys imported from index_service so adding a new
-# builder field can't silently drift.
-_CHUNK_HEADER_KEY_LINE = rf"(?:{'|'.join(CHUNK_HEADER_KEYS)}):[^\n]*\n"
+# Table/file *catalogue* chunks (`build_table_chunk` / `build_file_chunk`) are
+# pure metadata with no `\n\n` body separator and still do not match — there
+# would be nothing left of them.
+#
+# Keep in step with index_service: a new key in either builder needs a new
+# line here, or it starts leaking into drill_down / search / grep output.
+_DOC_METADATA_HEADER = (
+    r"TITLE:[^\n]*\n"
+    r"(?:SUMMARY:.*?\n)?"
+    r"(?:TAGS:[^\n]*\n)?"
+    r"PATH:[^\n]*\n"
+    r"(?:TYPE:[^\n]*\n)?"
+)
+_FILE_METADATA_HEADER = (
+    r"TITLE:[^\n]*\n"
+    r"TYPE:[^\n]*\n"
+    r"VAULT:[^\n]*\n"
+    r"PATH:[^\n]*\n"
+    r"URI:[^\n]*\n"
+    r"(?:SIZE:[^\n]*\n)?"
+)
 _CHUNK_HEADER_RE = re.compile(
-    rf"\ATITLE:[^\n]*\n"
-    rf"(?:SUMMARY:[^\n]*\n(?:[^\n]+\n){{0,40}}?)?"
-    rf"(?:{_CHUNK_HEADER_KEY_LINE}){{0,8}}?"
-    rf"PATH:[^\n]*\n"
-    rf"(?:{_CHUNK_HEADER_KEY_LINE}){{0,8}}"
-    rf"\n"
+    rf"\A(?:{_DOC_METADATA_HEADER}|{_FILE_METADATA_HEADER})\n",
+    re.DOTALL,
 )
 
 
