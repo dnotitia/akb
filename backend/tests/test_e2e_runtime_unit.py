@@ -1207,7 +1207,16 @@ def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
     result = subprocess.run(["bash", "-n", str(BOOTSTRAP)], check=False)
     assert result.returncode == 0
     text = BOOTSTRAP.read_text()
+    lines = text.splitlines()
+    ubuntu_check = next(index for index, line in enumerate(lines) if "Ubuntu 24.04 is required" in line)
+    sysctl_persist = next(index for index, line in enumerate(lines) if "99-akb-e2e-tcp-mtu-probing.conf" in line)
+    apt_update = next(index for index, line in enumerate(lines) if '"${SUDO[@]}" apt-get update' in line)
     assert "exec 3>&1 1>&2" in text
+    assert ubuntu_check < sysctl_persist < apt_update
+    assert "net.ipv4.tcp_mtu_probing = 2" in text
+    assert 'sysctl --load "$SYSCTL_CONF"' in text
+    assert '[ "$SYSCTL_VALUE" = "2" ]' in text
+    assert "TCP MTU probing configuration" in text
     assert "--scenario empty" in text
     assert "app-installation-lifecycle" in text
     assert "--with-frontend" in text

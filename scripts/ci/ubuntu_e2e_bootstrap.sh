@@ -82,6 +82,23 @@ source /etc/os-release 2>/dev/null || die "cannot inspect /etc/os-release"
 [ "${ID:-}" = "ubuntu" ] && [ "${VERSION_ID:-}" = "24.04" ] \
   || die "Ubuntu 24.04 is required (found ${ID:-unknown} ${VERSION_ID:-unknown})"
 
+# VPN-backed Ubuntu runners may start with a path MTU below the host default.
+# Persist and apply PLPMTUD mode 2 before the first network provisioning
+# operation so uv/apt downloads proactively use the kernel's black-hole
+# recovery instead of a fixed MTU.
+command -v sysctl >/dev/null 2>&1 \
+  || die "sysctl is required to enable TCP MTU probing"
+SYSCTL_CONF=/etc/sysctl.d/99-akb-e2e-tcp-mtu-probing.conf
+printf '%s\n' 'net.ipv4.tcp_mtu_probing = 2' \
+  | "${SUDO[@]}" tee "$SYSCTL_CONF" >/dev/null \
+  || die "could not persist TCP MTU probing configuration"
+"${SUDO[@]}" sysctl --load "$SYSCTL_CONF" >/dev/null \
+  || die "could not apply TCP MTU probing configuration"
+SYSCTL_VALUE=$("${SUDO[@]}" sysctl -n net.ipv4.tcp_mtu_probing) \
+  || die "could not verify TCP MTU probing configuration"
+[ "$SYSCTL_VALUE" = "2" ] \
+  || die "TCP MTU probing verification failed (found $SYSCTL_VALUE)"
+
 "${SUDO[@]}" apt-get update \
   || die "apt package index update failed; check VM networking/DNS"
 "${SUDO[@]}" apt-get install -y curl ca-certificates \

@@ -3523,7 +3523,7 @@ class E2ERuntime:
             {
                 "event": "mcp_pytest_start",
                 "process": "mcp_pytest",
-                "scenario": "akb_list_vaults",
+                "scenario": "mcp_product_e2e",
                 "suite": str(mcp_pytest_path),
                 "stage": "product_assertion",
                 "profile": self.profile.name,
@@ -3554,7 +3554,7 @@ class E2ERuntime:
             {
                 "event": "mcp_pytest_complete",
                 "process": "mcp_pytest",
-                "scenario": "akb_list_vaults",
+                "scenario": "mcp_product_e2e",
                 "suite": str(mcp_pytest_path),
                 "stage": "product_assertion",
                 "profile": self.profile.name,

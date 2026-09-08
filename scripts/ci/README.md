@@ -45,10 +45,22 @@ runner, so there is no second suite array to keep synchronized.
 
 ### MCP pytest behavior suite
 
-The first MCP behavior scenario is an authenticated read-only
-`akb_list_vaults({})` call through the official MCP Python SDK. The fixture
-uses the SDK's public `Client` and Streamable HTTP transport in the pytest
-process; it does not invoke Inspector, Node, or a separate MCP driver.
+The authenticated MCP behavior suite runs through the official Python SDK.
+`test_list_vaults_e2e.py` remains the small typed `akb_list_vaults({})`
+canary, while `test_product_e2e.py` covers the migrated product scenarios:
+vault and document lifecycle, browse/search/drill-down, move and aliases,
+relations/activity/history/diff, access roles and public levels, tables/SQL/
+DDL, publication, help, and deletion. Each pytest test receives the existing
+fixture's reset/login/SDK lifecycle; the access-control scenario adds a
+second user through the same authenticated endpoint and client lifecycle.
+The fixture uses the SDK's public `Client` and Streamable HTTP transport in the
+pytest process; it does not invoke Inspector, Node, or a separate MCP driver.
+
+The mixed `backend/tests/test_mcp_e2e.sh` suite now retains only transport,
+protocol/session, and direct REST response checks. Its MCP product assertions
+and raw JSON-RPC helper were removed so the product behavior has one SDK-based
+execution path. REST-only checks, initialize/session checks, and the separate
+stdio/Inspector boundaries remain in their existing lanes.
 
 The repository runtime remains the owner of backend startup, readiness,
 fixture reset, credentials, and teardown. Give the same schema-v2 descriptor
@@ -95,7 +107,7 @@ The topology is deliberately small:
 | backend | Ubuntu host process | `127.0.0.1:8000` | AKB application under test |
 | frontend (`--with-frontend`) | Ubuntu host process | `127.0.0.1:3000` by default | existing Vite SPA and per-run backend proxy |
 | fixture control | supervisor-owned in-process app | `127.0.0.1:8889` | health, discovery, and empty reset |
-| MCP pytest behavior suite | Ubuntu host process | no public listener | authenticated `akb_list_vaults` scenario through the official Python SDK |
+| MCP pytest behavior suite | Ubuntu host process | no public listener | authenticated MCP product scenarios through the official Python SDK |
 | curated suite runner | Ubuntu host process | no public listener | exact 15-suite gate and count semantics |
 
 Only PostgreSQL and MinIO are managed by
@@ -264,12 +276,16 @@ to the descriptor, logs, argv, or committed files.
 contain runtime lifecycle logic. On a clean Ubuntu 24.04 host it:
 
 1. verifies the base image and installs `curl`/CA certificates as needed;
-2. installs the Ubuntu archive's `nodejs`/`npm` packages and verifies both
+2. persists and immediately applies `net.ipv4.tcp_mtu_probing=2` through
+   `/etc/sysctl.d/99-akb-e2e-tcp-mtu-probing.conf` before any network download;
+   mode 2 keeps probing proactively enabled for VPN/Docker Hub black-hole
+   paths, and failure is a provisioning failure that stops the bootstrap;
+3. installs the Ubuntu archive's `nodejs`/`npm` packages and verifies both
    executables before any selected stdio profile is validated;
-3. installs and starts Docker Engine plus Compose v2 idempotently;
-4. installs/verifies `uv` and Python 3.14 under the private runtime root;
-5. runs `uv sync --locked --extra dev --project backend`; and
-6. `exec`s the same Python supervisor in `gate` or `serve` mode.
+4. installs and starts Docker Engine plus Compose v2 idempotently;
+5. installs/verifies `uv` and Python 3.14 under the private runtime root;
+6. runs `uv sync --locked --extra dev --project backend`; and
+7. `exec`s the same Python supervisor in `gate` or `serve` mode.
 
 Package, network, Docker, uv, and Python failures are provisioning failures
 and stop immediately with an actionable stderr message. The bootstrap does
@@ -338,6 +354,10 @@ When no `--runtime-root` is supplied, the bootstrap creates a private
 `/tmp/akb-e2e-bootstrap.XXXXXX` root. Child processes and dependency resources
 are cleaned on exit, while that root and its logs remain caller-owned for
 inspection and cleanup.
+
+The bootstrap does not set a fixed interface MTU. TCP MTU probing is the only
+network adjustment it owns, and it is applied before `apt`, `curl`, or `uv`
+network activity so VPN paths can recover from black-holed packet sizes.
 
 ## Runtime change checklist
 

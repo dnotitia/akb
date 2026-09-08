@@ -13,9 +13,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from mcp import types as mcp_types
 
 import tests.mcp_e2e.conftest as mcp_conftest
 from tests.mcp_e2e.conftest import mcp_client as mcp_client_fixture
+from tests.mcp_e2e.test_product_e2e import _call_json as product_call_json
 from tests.mcp_e2e.runtime import RuntimeContext, RuntimeDescriptor
 
 
@@ -76,6 +78,60 @@ def test_descriptor_stdin_read_is_compatible_with_pytest_capture(tmp_path: Path)
     assert result.returncode == 0, result.stderr
 
 
+def test_runtime_descriptor_stdin_is_reused_across_function_scoped_sessions(
+    tmp_path: Path,
+) -> None:
+    probe = tmp_path / "test_descriptor_reuse.py"
+    probe.write_text(
+        "import pytest\n"
+        "import tests.mcp_e2e.conftest as mcp_conftest\n"
+        "from tests.mcp_e2e.runtime import RuntimeContext\n"
+        "\n"
+        "pytest_plugins = ('tests.mcp_e2e.conftest',)\n"
+        "\n"
+        "def _fake_prepare(descriptor, client):\n"
+        "    return RuntimeContext(descriptor=descriptor, pat='akb_test_pat', secrets=('fixture-user', 'fixture-pass', 'akb_test_pat'))\n"
+        "\n"
+        "@pytest.fixture(autouse=True)\n"
+        "def patch_prepare(monkeypatch):\n"
+        "    monkeypatch.setattr(mcp_conftest, '_prepare_runtime', _fake_prepare)\n"
+        "\n"
+        "def test_first(runtime_session):\n"
+        "    assert runtime_session.descriptor.scenario == 'empty'\n"
+        "\n"
+        "def test_second(runtime_session):\n"
+        "    assert runtime_session.descriptor.scenario == 'empty'\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    tests_root = Path(__file__).resolve().parent
+    env["PYTHONPATH"] = f"{tests_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "tests.mcp_e2e.conftest",
+            str(probe),
+            "--runtime-descriptor",
+            "-",
+            "-q",
+            "--tb=short",
+        ],
+        cwd=tmp_path,
+        env=env,
+        input=json.dumps(_descriptor()),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2 passed" in result.stdout
+
+
 def test_preparation_failure_is_an_actual_pytest_failure(tmp_path: Path) -> None:
     descriptor = copy.deepcopy(_descriptor())
     descriptor["services"]["app"]["origin"] = "http://127.0.0.1:1"
@@ -121,6 +177,28 @@ def _runtime_context() -> RuntimeContext:
         pat="akb_test_pat",
         secrets=("fixture-user", "fixture-pass", "akb_test_pat"),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sdk_is_error", [False, True])
+async def test_product_error_envelope_does_not_require_sdk_is_error(
+    sdk_is_error: bool,
+) -> None:
+    class RecordingClient:
+        async def call_tool(self, _name: str, _arguments: dict[str, Any]) -> mcp_types.CallToolResult:
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(text='{"error":"denied","code":"forbidden"}')],
+                isError=sdk_is_error,
+            )
+
+    result = await product_call_json(
+        RecordingClient(),  # type: ignore[arg-type]
+        _runtime_context(),
+        "akb_browse",
+        {"vault": "missing"},
+        expect_error=True,
+    )
+    assert result == {"error": "denied", "code": "forbidden"}
 
 
 class _RecordingHttpClient:
@@ -226,3 +304,57 @@ async def test_mcp_fixture_reports_connection_failure_and_redacts_it(
     assert "scenario=akb_list_vaults SDK connection" in str(captured.value)
     assert "sdk-secret" not in str(captured.value)
     assert http_client.closed
+
+
+def test_secondary_user_preparation_uses_descriptor_auth_coordinates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Response:
+        def __init__(self, status_code: int, payload: dict[str, Any]) -> None:
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self) -> dict[str, Any]:
+            return self._payload
+
+    class RecordingClient:
+        requests: list[tuple[str, str, dict[str, Any] | None, dict[str, str] | None]] = []
+
+        def __init__(self, **_kwargs: Any) -> None:
+            return None
+
+        def __enter__(self) -> RecordingClient:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, Any]) -> Response:
+            self.requests.append(("POST", url, json, None))
+            return Response(201, {"user_id": "secondary"})
+
+        def request(
+            self,
+            method: str,
+            url: str,
+            *,
+            json: dict[str, Any] | None = None,
+            headers: dict[str, str] | None = None,
+        ) -> Response:
+            self.requests.append((method, url, json, headers))
+            if url.endswith("/login"):
+                return Response(200, {"token": "jwt-secondary"})
+            return Response(200, {"token": "akb_secondary_pat"})
+
+    RecordingClient.requests = []
+    monkeypatch.setattr(mcp_conftest.httpx, "Client", RecordingClient)
+
+    username, pat, secret_values = mcp_conftest._prepare_secondary_user(_runtime_context())
+
+    assert username.startswith("mcp-pytest-u2-")
+    assert pat == "akb_secondary_pat"
+    assert username in secret_values
+    assert "jwt-secondary" in secret_values
+    assert any(url.endswith("/api/v1/auth/register") for _, url, _, _ in RecordingClient.requests)
+    assert any(url.endswith("/api/v1/auth/login") for _, url, _, _ in RecordingClient.requests)
+    assert any(url.endswith("/api/v1/auth/tokens") for _, url, _, _ in RecordingClient.requests)

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets as secrets_module
 from collections.abc import AsyncIterator, Iterator, Mapping
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
@@ -155,21 +158,24 @@ def _prepare_runtime(descriptor: RuntimeDescriptor, client: httpx.Client) -> Run
     return RuntimeContext(descriptor=descriptor, pat=pat, secrets=(*secrets, pat))
 
 
-@pytest.fixture
-def runtime_session(request: pytest.FixtureRequest) -> Iterator[RuntimeContext]:
+@pytest.fixture(scope="session")
+def runtime_descriptor(request: pytest.FixtureRequest) -> RuntimeDescriptor:
     source = request.config.getoption("--runtime-descriptor")
     if not source:
         pytest.fail("scenario=akb_list_vaults preparation: --runtime-descriptor is required")
     try:
         capture_manager = request.config.pluginmanager.getplugin("capturemanager")
-        descriptor = RuntimeDescriptor.from_json(_read_descriptor(source, capture_manager))
+        return RuntimeDescriptor.from_json(_read_descriptor(source, capture_manager))
     except Exception as exc:
         pytest.fail(f"scenario=akb_list_vaults preparation: {redact_error(exc)}")
 
+
+@pytest.fixture
+def runtime_session(runtime_descriptor: RuntimeDescriptor) -> Iterator[RuntimeContext]:
     client = httpx.Client(timeout=30.0)
     try:
         try:
-            context = _prepare_runtime(descriptor, client)
+            context = _prepare_runtime(runtime_descriptor, client)
         except Exception as exc:
             pytest.fail(f"scenario=akb_list_vaults preparation: {redact_error(exc)}")
         yield context
@@ -177,10 +183,26 @@ def runtime_session(request: pytest.FixtureRequest) -> Iterator[RuntimeContext]:
         client.close()
 
 
-@pytest.fixture
-async def mcp_client(runtime_session: RuntimeContext) -> AsyncIterator[Client]:
+@dataclass(frozen=True, slots=True)
+class SecondaryMcpSession:
+    """A second authenticated SDK client used for role-boundary scenarios."""
+
+    client: Client
+    username: str
+
+
+@asynccontextmanager
+async def _open_mcp_client(
+    runtime_session: RuntimeContext,
+    *,
+    pat: str,
+    secrets: tuple[str, ...],
+    scenario: str,
+) -> AsyncIterator[Client]:
+    """Own one SDK client's complete enter/exit lifecycle in one task."""
+
     http_client = httpx2.AsyncClient(
-        headers={"Authorization": f"Bearer {runtime_session.pat}"},
+        headers={"Authorization": f"Bearer {pat}"},
         timeout=httpx2.Timeout(30.0, read=300.0),
         follow_redirects=True,
         trust_env=False,
@@ -229,15 +251,15 @@ async def mcp_client(runtime_session: RuntimeContext) -> AsyncIterator[Client]:
         if cancelled:
             raise asyncio.CancelledError
 
-    task = asyncio.create_task(run_client(), name="mcp-sdk-client")
+    task = asyncio.create_task(run_client(), name=f"mcp-sdk-client-{scenario}")
     reported_startup_error = False
     try:
         await ready.wait()
         if lifecycle_error is not None:
             reported_startup_error = True
             pytest.fail(
-                "scenario=akb_list_vaults SDK connection: "
-                + redact_error(lifecycle_error, runtime_session.secrets)
+                f"scenario={scenario} SDK connection: "
+                + redact_error(lifecycle_error, secrets)
             )
         yield client
     finally:
@@ -246,3 +268,87 @@ async def mcp_client(runtime_session: RuntimeContext) -> AsyncIterator[Client]:
         if lifecycle_error is not None and not reported_startup_error:
             raise lifecycle_error
         await task
+
+
+@pytest.fixture
+async def mcp_client(runtime_session: RuntimeContext) -> AsyncIterator[Client]:
+    async with _open_mcp_client(
+        runtime_session,
+        pat=runtime_session.pat,
+        secrets=runtime_session.secrets,
+        scenario="akb_list_vaults",
+    ) as client:
+        yield client
+
+
+def _prepare_secondary_user(runtime_session: RuntimeContext) -> tuple[str, str, tuple[str, ...]]:
+    username = f"mcp-pytest-u2-{secrets_module.token_hex(8)}"
+    password = secrets_module.token_urlsafe(24)
+    login_url = urljoin(
+        f"{runtime_session.descriptor.app_origin}/",
+        runtime_session.descriptor.login_path.lstrip("/"),
+    )
+    register_url = urljoin(f"{runtime_session.descriptor.app_origin}/", "api/v1/auth/register")
+    token_url = urljoin(f"{runtime_session.descriptor.app_origin}/", "api/v1/auth/tokens")
+
+    with httpx.Client(timeout=30.0, trust_env=False) as client:
+        try:
+            registration = client.post(
+                register_url,
+                json={
+                    "username": username,
+                    "email": f"{username}@example.test",
+                    "password": password,
+                },
+            )
+        except httpx.HTTPError:
+            raise RuntimeSetupError("secondary user registration request failed") from None
+        if registration.status_code not in {200, 201}:
+            raise RuntimeSetupError(
+                f"secondary user registration returned HTTP {registration.status_code}"
+            )
+
+        login = _request_json(
+            client,
+            "POST",
+            login_url,
+            stage="secondary user login",
+            body={"username": username, "password": password},
+        )
+        jwt = login.get("token")
+        if not isinstance(jwt, str) or not jwt:
+            raise RuntimeSetupError("secondary user login returned no session token")
+
+        minted = _request_json(
+            client,
+            "POST",
+            token_url,
+            stage="secondary user credential mint",
+            authorization=f"Bearer {jwt}",
+            body={"name": "mcp-pytest-secondary"},
+        )
+        pat = minted.get("token")
+        if not isinstance(pat, str) or not pat.startswith("akb_"):
+            raise RuntimeSetupError("secondary user credential mint returned an invalid PAT")
+
+    return username, pat, (username, password, jwt, pat)
+
+
+@pytest.fixture
+async def secondary_mcp_client(
+    runtime_session: RuntimeContext,
+) -> AsyncIterator[SecondaryMcpSession]:
+    try:
+        username, pat, secrets = _prepare_secondary_user(runtime_session)
+    except Exception as exc:
+        pytest.fail(
+            "scenario=mcp_product_e2e secondary user preparation: "
+            + redact_error(exc, runtime_session.secrets)
+        )
+    async with _open_mcp_client(
+        runtime_session,
+        pat=pat,
+        secrets=(*runtime_session.secrets, *secrets),
+        scenario="mcp_product_e2e-secondary",
+    ) as client:
+        yield SecondaryMcpSession(client=client, username=username)
