@@ -229,15 +229,32 @@ def clean_section_rows(rows) -> list[dict]:
     landed leaves the same body sitting at the same position more than once
     and every `drill_down` — the `pattern` filter especially, which matches on
     body text — hands the agent the same paragraph several times over. Rows
-    are collapsed on `(document, chunk_index, stored content)`: an identical
-    row is a duplicate and goes, while two rows that genuinely disagree at the
-    same position are both kept. Dropping one of *those* would pick a winner
-    the query has no tiebreaker for, so the response would stop being
-    deterministic in exactly the case where the difference matters.
+    are collapsed on `(document, chunk_index, section_path, stored content)`:
+    an identical row is a duplicate and goes, while two rows that differ in
+    any part of that identity are both kept. Dropping one of *those* would
+    pick a winner the query has no tiebreaker for, so the response would stop
+    being deterministic in exactly the case where the difference matters.
+
+    A position that does carry two different bodies also suspends the overlap
+    strip across it. Two generations of the same chunk mean the neighbouring
+    row's text may belong to the other generation, and an exact match against
+    the wrong generation is still the wrong cut. Where the index is in that
+    state the bodies are returned whole.
 
     `rows` must be ordered by `chunk_index`, as both SQL paths in
     `drill_down` are.
     """
+    rows = list(rows)
+    # Positions this call sees more than one distinct body for. Computed up
+    # front because the decision for chunk n depends on a row that has not
+    # been reached yet.
+    bodies_at: dict[tuple, set] = {}
+    for r in rows:
+        bodies_at.setdefault(
+            (_row_value(r, "doc_id"), r["chunk_index"]), set()
+        ).add(r["content"])
+    contested = {key for key, bodies in bodies_at.items() if len(bodies) > 1}
+
     sections: list[dict] = []
     seen: set[tuple] = set()
     # doc id -> (chunk_index, cleaned content, section_path) of the row this
@@ -250,7 +267,7 @@ def clean_section_rows(rows) -> list[dict]:
         doc_key = _row_value(r, "doc_id")
         stored = r["content"]
 
-        identity = (doc_key, chunk_index, stored)
+        identity = (doc_key, chunk_index, section_path, stored)
         if identity in seen:
             continue
         seen.add(identity)
@@ -266,6 +283,8 @@ def clean_section_rows(rows) -> list[dict]:
             and isinstance(chunk_index, int)
             and prior[0] + 1 == chunk_index
             and prior[2] == section_path
+            and (doc_key, prior[0]) not in contested
+            and (doc_key, chunk_index) not in contested
         ):
             content = strip_chunk_overlap_prefix(prior[1], content)
 

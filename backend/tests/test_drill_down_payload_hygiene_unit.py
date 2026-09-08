@@ -253,3 +253,44 @@ def test_the_same_index_in_two_documents_is_not_a_duplicate():
     sections = clean_section_rows(rows)
 
     assert len(sections) == 2
+
+
+def test_the_same_position_with_different_headings_keeps_both_rows():
+    # Identical body, same position, different `section_path`: the rows are
+    # not the same chunk, so neither is a duplicate of the other.
+    rows = [
+        _row("# A", "Shared body.", 0),
+        _row("# B", "Shared body.", 0),
+    ]
+    sections = clean_section_rows(rows)
+
+    assert [s["section_path"] for s in sections] == ["# A", "# B"]
+
+
+def test_a_contested_position_suspends_the_overlap_strip():
+    # Two generations of chunk 0 are present, so the text chunk 1 overlaps
+    # with is ambiguous — an exact match against the wrong generation is
+    # still the wrong cut. Chunk 1 comes back whole.
+    tail = "the last sentence of the previous chunk."
+    rows = [
+        _row("# A", "Generation one. " + tail, 0),
+        _row("# A", "Generation two. " + tail, 0),
+        _row("# A", tail + " And the continuation.", 1),
+    ]
+    sections = clean_section_rows(rows)
+
+    assert len(sections) == 3
+    assert sections[2]["content"] == tail + " And the continuation."
+
+
+def test_a_contested_position_does_not_suspend_unrelated_boundaries():
+    tail = "shared trailing text"
+    rows = [
+        _row("# A", "one", 0),
+        _row("# A", "two", 0),          # contested position
+        _row("# A", "body " + tail, 1),
+        _row("# A", tail + " more", 2),  # 1→2 is untouched by the contest
+    ]
+    sections = clean_section_rows(rows)
+
+    assert sections[-1]["content"] == " more"
