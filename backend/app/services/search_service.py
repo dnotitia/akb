@@ -1802,25 +1802,45 @@ class SearchService:
             return clean_section_rows(rows)
 
     async def list_section_headings(self, vault: str, doc_id: str, limit: int | None = None) -> list[str]:
-        """Return the document's section paths without their bodies.
+        """Return the document's distinct section paths, without their bodies,
+        in first-occurrence order.
 
         Used by `akb_drill_down`'s empty-match fallback to surface the
         available headings cheaply — pulling full content for a 1000-
         section doc just to extract heading strings is wasteful.
+
+        One heading, one row. A section longer than `MAX_CHUNK_SIZE` is stored
+        as several chunks that all carry the same `section_path`, so the
+        row-per-chunk form repeated a heading once per chunk and the caller's
+        outline cap was spent on duplicates instead of on headings it had not
+        seen yet. `limit` therefore bounds *headings*: the grouping happens in
+        SQL, before the LIMIT, and the Python pass keeps the contract true
+        regardless of how the rows arrive.
         """
         from app.repositories.document_repo import DocumentRepository
         pool = await get_pool()
         async with pool.acquire() as conn:
             doc_match = DocumentRepository.match_clause(2)
             sql = f"""
-                SELECT c.section_path
+                SELECT c.section_path, MIN(c.chunk_index) AS first_chunk_index
                 FROM chunks c
                 JOIN documents d ON c.source_id = d.id AND c.source_type = 'document'
                 JOIN vaults v ON d.vault_id = v.id
                 WHERE v.name = $1 AND {doc_match}
-                ORDER BY c.chunk_index
+                  AND c.section_path IS NOT NULL
+                  AND c.section_path <> ''
+                GROUP BY c.section_path
+                ORDER BY first_chunk_index
             """
             if isinstance(limit, int) and limit > 0:
                 sql += f" LIMIT {int(limit)}"
             rows = await conn.fetch(sql, vault, doc_id)
-            return [r["section_path"] for r in rows if r["section_path"]]
+            headings: list[str] = []
+            seen: set[str] = set()
+            for r in rows:
+                section_path = r["section_path"]
+                if not section_path or section_path in seen:
+                    continue
+                seen.add(section_path)
+                headings.append(section_path)
+            return headings
