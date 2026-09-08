@@ -22,6 +22,13 @@
   Repeat a passing check only for a changed input or a specific unresolved risk.
 - Report the result, evidence, and remaining limitation in concise prose.
   Preserve unrelated local work and keep credentials out of tracked files.
+- The same roles exist for both agents. `.codex/config.toml` and
+  `.codex/agents/` carry the Codex side; `.claude/settings.json` and
+  `.claude/agents/` carry the Claude Code side, and `CLAUDE.md` only imports
+  this file so there is one contract. Tier for tier: Astra is Claude Fable 5.1,
+  Terra is Claude Opus 5, Sol is Claude Sonnet 5; effort levels are the same
+  words, and on both sides delegation is one level deep with at most three
+  workers at a time. Change a role in both places in the same commit.
 
 ## Architecture
 

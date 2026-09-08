@@ -1,0 +1,29 @@
+{
+  "model": "fable",
+  "effortLevel": "medium",
+  "permissions": {
+    "allow": [
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(rg *)",
+      "Bash(find *)",
+      "Bash(sed -n *)",
+      "Bash(nl *)",
+      "Bash(bash scripts/check.sh)",
+      "Bash(cd backend && pytest *)",
+      "Bash(cd frontend && npx --no-install *)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./config/secret.yaml)",
+      "Read(./**/secret.yaml)",
+      "Bash(rm -rf *)",
+      "Bash(git reset --hard *)",
+      "Bash(git checkout -- *)",
+      "Bash(git clean -*)",
+      "Bash(git push --force *)"
+    ]
+  }
+}
