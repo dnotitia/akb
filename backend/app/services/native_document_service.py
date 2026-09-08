@@ -1272,8 +1272,13 @@ class NativeDocumentService(DocumentService):
         content_type: str = "all",
         include_hashes: bool = False,
         include_archived: bool = False,
+        archive_scope: str | None = None,
     ) -> BrowseResponse:
         """Return the legacy browse envelope with Native document Heads."""
+        from app.services.search_filters import resolve_archive_scope, status_matches
+
+        scope = resolve_archive_scope(archive_scope, include_archived)
+        include_archived = scope != "unarchived"
         prefix = normalize_collection_path(collection) if collection is not None else ""
         pool = await self._pool()
         vault_row = await VaultRepository(pool).get_by_name(vault)
@@ -1299,8 +1304,8 @@ class NativeDocumentService(DocumentService):
                 description=vault_row.get("description"),
             )
         show_docs = content_type in ("all", "documents")
-        show_tables = content_type in ("all", "tables")
-        show_files = content_type in ("all", "files")
+        show_tables = scope != "archived" and content_type in ("all", "tables")
+        show_files = scope != "archived" and content_type in ("all", "files")
 
         items: list[BrowseItem] = []
         if show_docs:
@@ -1346,9 +1351,11 @@ class NativeDocumentService(DocumentService):
             )
 
         browse_path = prefix
+        items = [item for item in items if item.type != "document" or status_matches(item.status, scope)]
         hint = self._browse_hint(vault, prefix or None, items)
         return BrowseResponse(
             vault=vault,
+            archive_scope=scope,
             path=browse_path,
             context=context,
             items=items,

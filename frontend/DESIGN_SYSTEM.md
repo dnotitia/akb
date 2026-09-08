@@ -341,7 +341,12 @@ an `sr-only` summary, never the only signal.
   Collection vocabulary, with the target Collection preselected in each modal.
   Collection rows keep the human name and one overflow trigger only—never a
   second line of icon counts or sibling action icons that squeeze the name.
-  Document rows also remain title-first. When two documents in the same
+  Document rows also remain title-first. For archive recovery, the rail's compact document-state selector
+  exposes Current (draft and active), Archived, and All. Archived rows pair a
+  quiet archive glyph with an accessible label. The reader owns Archive/Restore
+  in its overflow and a compact archived-state restore notice; archive never
+  implies deletion or revoked access. Unsupported server filters show a recovery
+  notice rather than a false empty inventory. When two documents in the same
   Collection have the same title, and only then, both rows add one quiet
   monospace filename discriminator; generated UUID suffixes collapse to four
   characters. This is ambiguity recovery, not permanent technical metadata.

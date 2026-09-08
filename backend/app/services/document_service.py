@@ -1829,6 +1829,7 @@ class DocumentService:
         content_type: str = "all",
         include_hashes: bool = False,
         include_archived: bool = False,
+        archive_scope: str | None = None,
     ) -> BrowseResponse:
         """Unified vault browse.
 
@@ -1852,13 +1853,17 @@ class DocumentService:
         ``collection`` is provided. ``doc`` / ``table`` / ``file`` rows
         are the ones gated by depth.
         """
+        from app.services.search_filters import resolve_archive_scope, status_matches
+
+        scope = resolve_archive_scope(archive_scope, include_archived)
+        include_archived = scope != "unarchived"
         vault_repo, doc_repo, coll_repo = await self._repos()
 
         browse_path = collection or ""
         vault_row = await vault_repo.get_by_name(vault)
 
         if not vault_row:
-            return BrowseResponse(vault=vault, path=browse_path, items=[])
+            return BrowseResponse(vault=vault, path=browse_path, items=[], archive_scope=scope)
         vault_id = vault_row["id"]
 
         if collection:
@@ -1880,8 +1885,8 @@ class DocumentService:
             )
 
         show_docs = content_type in ("all", "documents")
-        show_tables = content_type in ("all", "tables")
-        show_files = content_type in ("all", "files")
+        show_tables = scope != "archived" and content_type in ("all", "tables")
+        show_files = scope != "archived" and content_type in ("all", "files")
 
         items: list[BrowseItem] = []
         prefix = collection or ""
@@ -1908,9 +1913,11 @@ class DocumentService:
                 include_hashes=include_hashes,
             ))
 
+        items = [item for item in items if item.type != "document" or status_matches(item.status, scope)]
         hint = self._browse_hint(vault, collection, items)
         return BrowseResponse(
             vault=vault,
+            archive_scope=scope,
             path=browse_path,
             context=context,
             items=items,

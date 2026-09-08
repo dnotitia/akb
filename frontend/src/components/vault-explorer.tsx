@@ -3,6 +3,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
   ChevronDown,
+  Archive,
   ChevronRight,
   FilePlus,
   FileText,
@@ -45,6 +46,7 @@ import {
   deleteVaultFile,
   deleteVaultTable,
   getVaultInfo,
+  type ArchiveScope,
 } from "@/lib/api";
 import { recentTone } from "@/lib/recent";
 import { isReservedCollection } from "@/lib/skill";
@@ -107,7 +109,9 @@ export function VaultExplorer({
   onRefetchReady,
   onCollapse,
 }: VaultExplorerProps) {
-  const { tree, loading, refreshing, error, refetch } = useVaultTree(vault);
+  const [scopeSelection, setScopeSelection] = useState<{ vault: string; scope: ArchiveScope }>({ vault, scope: "unarchived" });
+  const archiveScope = scopeSelection.vault === vault ? scopeSelection.scope : "unarchived";
+  const { tree, loading, refreshing, showingPreviousScope, unsupported, error, refetch } = useVaultTree(vault, archiveScope);
   const openCreateDocument = useOpenDocumentCreateDialog();
   const refreshCtx = useVaultRefresh();
   // Prefer the explicit prop; otherwise fall back to context. This lets
@@ -127,6 +131,11 @@ export function VaultExplorer({
   const navigate = useNavigate();
   const [filter, setFilter] = useState("");
   const [kindFilter, setKindFilter] = useState<ResourceKind | "all">("all");
+  function changeArchiveScope(value: string) {
+    setScopeSelection({ vault, scope: value as ArchiveScope });
+    setKindFilter("all");
+    setFilter("");
+  }
   const [collapsedKindGroups, setCollapsedKindGroups] = useState<Set<string>>(
     () => new Set(),
   );
@@ -232,8 +241,8 @@ export function VaultExplorer({
 
   const kindFiltered = useMemo(() => {
     if (!tree) return tree;
-    return filterTreeByKind(tree, kindFilter);
-  }, [tree, kindFilter]);
+    return filterTreeByKind(tree, archiveScope === "archived" ? "document" : kindFilter);
+  }, [tree, kindFilter, archiveScope]);
 
   const filtered = useMemo(() => {
     if (!kindFiltered) return kindFiltered;
@@ -452,7 +461,21 @@ export function VaultExplorer({
         </div>
       </div>
 
-      {total > 0 && (
+      <div className="shrink-0 border-b border-border px-2 py-1.5">
+        <SelectMenu
+          value={archiveScope}
+          onValueChange={changeArchiveScope}
+          aria-label="Collection document state"
+          className="h-8 bg-background px-2 text-xs"
+          options={[
+            { value: "unarchived", label: "Current documents", hint: "Includes drafts; files and tables remain visible" },
+            { value: "archived", label: "Archived documents", hint: "Documents only, in their original Collections" },
+            { value: "all", label: "All documents", hint: "Includes archived documents, files, and tables" },
+          ]}
+        />
+      </div>
+
+      {total > 0 && !unsupported && (
         <div className="shrink-0 border-b border-border px-2 py-1.5">
           <div className="grid grid-cols-[minmax(0,1fr)_6.5rem] gap-1.5">
             <div className="relative min-w-0">
@@ -470,12 +493,13 @@ export function VaultExplorer({
               />
             </div>
             <SelectMenu
-              value={kindFilter}
+              value={archiveScope === "archived" ? "document" : kindFilter}
               onValueChange={(value) =>
                 setKindFilter(value as ResourceKind | "all")
               }
               options={kindOptions}
               aria-label="Resource type"
+              disabled={archiveScope === "archived"}
               className="h-8 bg-background px-2 text-xs"
             />
           </div>
@@ -491,19 +515,28 @@ export function VaultExplorer({
         className="flex-1 overflow-y-auto"
       >
         {loading && <VaultExplorerLoading />}
+        {showingPreviousScope && (
+          <p role="status" className="px-3 py-2 text-xs text-foreground-muted">Previous document state view shown{refreshing ? " while updating…" : ". Refresh to try again."}</p>
+        )}
         {error && <Alert variant="destructive" className="m-2">{error}</Alert>}
-        {!loading && total === 0 && (
+        {unsupported && (
+          <Alert variant="warning" className="m-2">
+            This server does not support this document state view yet. Update the server or{" "}
+            <button type="button" onClick={() => changeArchiveScope("unarchived")} className="underline focus-visible:ring-2 focus-visible:ring-ring">show current documents</button>.
+          </Alert>
+        )}
+        {!loading && !refreshing && !error && !unsupported && (total === 0 || (archiveScope === "archived" && resourceCounts.document === 0)) && (
           <div className="px-3 py-4 text-xs leading-relaxed text-foreground-muted" role="status">
-            No collections yet — the tree fills in with your first document.
+            {archiveScope === "archived" ? "No archived documents in this Vault." : "No collections yet — the tree fills in with your first document."}
           </div>
         )}
-        {!loading && total > 0 && visibleRows.length === 0 && (
+        {!loading && !refreshing && !unsupported && total > 0 && visibleRows.length === 0 && !(archiveScope === "archived" && resourceCounts.document === 0) && (
           <div className="coord px-3 py-2" role="status">
             No resources match these filters.
           </div>
         )}
 
-        {!loading &&
+        {!loading && !unsupported &&
           visibleRows.map((row) => {
             if (row.type === "kind-group") {
               return (
@@ -551,7 +584,7 @@ export function VaultExplorer({
                     editable: canWrite && !isReservedCollection(node.path),
                   });
                 }}
-                onDeleteCollection={(node) => {
+                onDeleteCollection={archiveScope === "archived" || showingPreviousScope ? undefined : (node) => {
                   const counts = countCollectionResources(node);
                   setDeleteTarget({
                     path: node.path,
@@ -906,6 +939,12 @@ const TreeRow = memo(function TreeRow({
           )}
         </span>
         {isSkill && <SkillBadge defined className="ml-auto shrink-0" />}
+        {node.kind === "document" && node.raw?.status === "archived" && (
+          <span title="Archived" className="shrink-0 text-foreground-muted">
+            <Archive className="h-3 w-3" aria-hidden />
+            <span className="sr-only">Archived</span>
+          </span>
+        )}
       </Link>
       {canDeleteResource && (
         <ResourceActionsMenu

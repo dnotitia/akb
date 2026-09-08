@@ -17,6 +17,68 @@ from app.services.search_filters import collection_predicate, escape_like, metad
 from app.services.m1_native_grep_service import HeadBody, M1NativeGrepService
 
 
+@pytest.mark.parametrize("scope,expected", [("unarchived", ["draft", "active"]), ("archived", ["archived"]), ("all", ["draft", "active", "archived"])])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_archive_scope_overrides_legacy_flag(scope, expected, legacy):
+    assert [status for status in ["draft", "active", "archived"]
+            if metadata_matches({"status": status}, None, None, legacy, scope)] == expected
+
+
+async def test_rest_archive_scope_echo_even_with_no_results(monkeypatch):
+    app = FastAPI()
+    app.include_router(routes.router)
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(user_id="user")
+    search = AsyncMock(return_value=SearchResponse(query="x", total=0, results=[]))
+    grep = AsyncMock(return_value={"pattern": "x", "results": []})
+    monkeypatch.setattr(routes.search_service, "search", search)
+    monkeypatch.setattr(routes.search_service, "grep", grep)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        for endpoint, handler in [("search", search), ("grep", grep)]:
+            response = await client.get(f"/{endpoint}?q=x&archive_scope=archived&include_archived=false")
+            assert response.status_code == 200
+            assert response.json()["archive_scope"] == "archived"
+            assert handler.call_args.kwargs["archive_scope"] == "archived"
+            assert (await client.get(f"/{endpoint}?q=x&archive_scope=deleted")).status_code == 422
+
+
+async def test_archived_search_filters_before_top_k_and_excludes_other_resources(monkeypatch):
+    conn = CandidateConnection()
+    monkeypatch.setattr(ss, "get_pool", AsyncMock(return_value=Pool(conn)))
+    monkeypatch.setattr(ss, "generate_embeddings", AsyncMock(return_value=[[0.1]]))
+    monkeypatch.setattr(ss, "_configured_document_source_type", lambda: ss.LEGACY_DOCUMENT_SOURCE)
+    service = ss.SearchService()
+    vector = AsyncMock(return_value=([], None))
+    monkeypatch.setattr(service, "_run_vector_search", vector)
+    result = await service.search("x", vault="mine", archive_scope="archived", include_archived=False, limit=1)
+    assert result.archive_scope == "archived"
+    assert len(conn.queries) == 1
+    assert "d.status = 'archived'" in conn.queries[0][0]
+    assert vector.call_args.kwargs["candidate_source_ids"] == [str(uuid.UUID(int=30))]
+
+
+@pytest.mark.parametrize("mode", [{}, {"count_only": True}, {"files_with_matches": True}])
+async def test_native_archived_only_precedes_limit_and_counts(monkeypatch, mode):
+    bodies = [HeadBody(namespace_id=uuid.UUID(int=1), vault="mine", resource_id=uuid.UUID(int=i + 1),
+                       surface="document", path=f"{i}.md", revision_id="r", digest="d", byte_size=100,
+                       canonical_bytes=(f"---\nstatus: {'archived' if i >= 28 else 'draft'}\n---\nneedle\n").encode())
+              for i in range(30)]
+    bodies.append(HeadBody(namespace_id=uuid.UUID(int=1), vault="mine", resource_id=uuid.UUID(int=99),
+                           surface="file", path="sample.txt", revision_id="r", digest="d", byte_size=7,
+                           canonical_bytes=b"needle\n"))
+    service = M1NativeGrepService(None)
+    monkeypatch.setattr(service, "_head_bodies", AsyncMock(return_value=bodies))
+    response = await service.grep_public("needle", user_id=uuid.UUID(int=1), archive_scope="archived",
+                                         include_archived=False, include_text_files=True, limit=1, **mode)
+    if mode.get("files_with_matches"):
+        assert response["n_files"] == 2
+    else:
+        assert response["total_docs"] == 2
+    if not mode:
+        assert response["returned_docs"] == 1
+        assert response["results"][0]["status"] == "archived"
+        assert response["results"][0]["path"] == "28.md"
+
+
 def test_collection_boundary_and_literal_metacharacters():
     params = ["existing"]
     sql = collection_predicate("c.path", "/guide_%/", params)

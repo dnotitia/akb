@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { browseVault } from "@/lib/api";
+import { browseVault, type ArchiveScope } from "@/lib/api";
 import { isReservedCollection } from "@/lib/skill";
 import { parseFileUri } from "@/lib/uri";
 
@@ -46,9 +46,16 @@ interface BrowseItem {
  * kind disclosures and progressive pages. True network/memory scaling will
  * require a future browse contract with collection + kind + cursor inputs.
  */
-export function useVaultTree(vault: string | undefined) {
-  const [snapshot, setSnapshot] = useState<{ vault: string; items: BrowseItem[] } | null>(null);
-  const snapshotRef = useRef<{ vault: string; items: BrowseItem[] } | null>(null);
+interface TreeSnapshot {
+  vault: string;
+  scope: ArchiveScope;
+  items: BrowseItem[];
+  unsupported: boolean;
+}
+
+export function useVaultTree(vault: string | undefined, archiveScope: ArchiveScope = "unarchived") {
+  const [snapshot, setSnapshot] = useState<TreeSnapshot | null>(null);
+  const snapshotRef = useRef<TreeSnapshot | null>(null);
   const [error, setError] = useState<string>("");
   const [refreshing, setRefreshing] = useState(false);
   // Counter bumped on every refetch invocation so the underlying
@@ -59,6 +66,14 @@ export function useVaultTree(vault: string | undefined) {
   const refetch = useCallback(() => {
     setRefetchTick((n) => n + 1);
   }, []);
+
+  useEffect(() => {
+    const refresh = (event: Event) => {
+      if ((event as CustomEvent<{ vault?: string }>).detail?.vault === vault) refetch();
+    };
+    window.addEventListener("akb:document-status-changed", refresh);
+    return () => window.removeEventListener("akb:document-status-changed", refresh);
+  }, [vault, refetch]);
 
   // `alive` guard still matters: if `vault` changes mid-flight (or the
   // user fires refetch twice before the first resolves), we don't want
@@ -75,10 +90,14 @@ export function useVaultTree(vault: string | undefined) {
     const hasCurrentSnapshot = snapshotRef.current?.vault === vault;
     setRefreshing(hasCurrentSnapshot);
     setError("");
-    browseVault(vault, undefined, -1)
+    const request = archiveScope === "unarchived"
+      ? browseVault(vault, undefined, -1)
+      : browseVault(vault, undefined, -1, { archive_scope: archiveScope });
+    request
       .then((d) => {
         if (!alive) return;
-        const next = { vault, items: d.items as BrowseItem[] };
+        const unsupported = archiveScope !== "unarchived" && d.archive_scope !== archiveScope;
+        const next = { vault, scope: archiveScope, unsupported, items: unsupported ? [] : d.items as BrowseItem[] };
         snapshotRef.current = next;
         setSnapshot(next);
       })
@@ -89,16 +108,19 @@ export function useVaultTree(vault: string | undefined) {
         if (alive) setRefreshing(false);
       });
     return () => { alive = false; };
-  }, [vault, refetchTick]);
+  }, [vault, archiveScope, refetchTick]);
 
   const items = snapshot && snapshot.vault === vault ? snapshot.items : null;
+  const scopePending = Boolean(snapshot && snapshot.vault === vault && snapshot.scope !== archiveScope && !error);
+  const unsupported = Boolean(snapshot && snapshot.vault === vault && snapshot.scope === archiveScope && snapshot.unsupported);
+  const showingPreviousScope = Boolean(snapshot && snapshot.vault === vault && snapshot.scope !== archiveScope);
 
   const tree = useMemo<TreeNode[] | null>(() => {
     if (!items) return null;
     return buildTree(items);
   }, [items]);
 
-  return { tree, loading: items === null && !error, refreshing, error, refetch };
+  return { tree, loading: items === null && !error, refreshing: refreshing || scopePending, showingPreviousScope, unsupported, error, refetch };
 }
 
 export function buildTree(items: BrowseItem[]): TreeNode[] {

@@ -1,5 +1,5 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import { FolderInput, MoreHorizontal, Share2, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, FolderInput, MoreHorizontal, Share2, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -12,6 +12,9 @@ interface ResourceActionsMenuProps {
   publishLabel?: string;
   onPublish?: () => void;
   moveDisabledReason?: string;
+  archiveAction?: "archive" | "restore";
+  onArchiveAction?: () => void;
+  archiveDisabledReason?: string;
   className?: string;
   side?: "top" | "right" | "bottom" | "left";
   align?: "start" | "center" | "end";
@@ -32,6 +35,9 @@ export function ResourceActionsMenu({
   publishLabel,
   onPublish,
   moveDisabledReason,
+  archiveAction,
+  onArchiveAction,
+  archiveDisabledReason,
   className,
   side = "bottom",
   align = "end",
@@ -39,7 +45,7 @@ export function ResourceActionsMenu({
   const showMoveAction = Boolean(moveLabel && (onMove || moveDisabledReason));
   const showPublishAction = Boolean(publishLabel && onPublish);
   const showDeleteAction = Boolean(deleteLabel && onDelete);
-  if (!showMoveAction && !showPublishAction && !showDeleteAction) return null;
+  if (!showMoveAction && !showPublishAction && !showDeleteAction && !archiveAction) return null;
 
   return (
     <DropdownMenu.Root>
@@ -88,6 +94,22 @@ export function ResourceActionsMenu({
               </span>
             </DropdownMenu.Item>
           )}
+          {archiveAction && (
+            <DropdownMenu.Item
+              aria-disabled={archiveDisabledReason ? true : undefined}
+              onSelect={(event) => {
+                if (archiveDisabledReason || !onArchiveAction) event.preventDefault();
+                else onArchiveAction();
+              }}
+              className={cn("flex cursor-pointer select-none items-start gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-hover", archiveDisabledReason && "cursor-not-allowed opacity-50")}
+            >
+              {archiveAction === "restore" ? <ArchiveRestore className="mt-0.5 h-4 w-4 shrink-0 text-link" aria-hidden /> : <Archive className="mt-0.5 h-4 w-4 shrink-0 text-foreground-muted" aria-hidden />}
+              <span>
+                <span className="block font-medium">{archiveAction === "restore" ? "Restore document" : "Archive document"}</span>
+                {archiveDisabledReason && <span className="mt-0.5 block max-w-64 text-xs leading-snug text-foreground-muted">{archiveDisabledReason}</span>}
+              </span>
+            </DropdownMenu.Item>
+          )}
           {showPublishAction && (
             <DropdownMenu.Item
               onSelect={onPublish}
@@ -97,7 +119,7 @@ export function ResourceActionsMenu({
               {publishLabel}
             </DropdownMenu.Item>
           )}
-          {(showMoveAction || showPublishAction) && showDeleteAction && (
+          {(showMoveAction || showPublishAction || archiveAction) && showDeleteAction && (
             <DropdownMenu.Separator className="my-1 h-px bg-border" />
           )}
           {showDeleteAction && (

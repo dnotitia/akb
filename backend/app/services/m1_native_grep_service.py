@@ -652,7 +652,11 @@ class M1NativeGrepService:
         doc_types: list[str] | None = None,
         tags: list[str] | None = None,
         include_archived: bool = True,
+        archive_scope: str | None = None,
     ) -> dict[str, Any]:
+        from app.services.search_filters import metadata_matches, resolve_archive_scope
+
+        scope = resolve_archive_scope(archive_scope, include_archived)
         if pattern == "":
             raise ValidationError("grep pattern must not be empty")
         if count_only and files_with_matches:
@@ -693,13 +697,11 @@ class M1NativeGrepService:
             resource_id=resource_id,
             surfaces=self._selected_surfaces(include_text_files=include_text_files),
         )
-        if doc_types or tags or not include_archived:
-            from app.services.search_filters import metadata_matches
-
+        if doc_types or tags or scope != "all":
             bodies = [body for body in bodies if (
                 body.surface == "document"
-                and metadata_matches(_parse_markdown(body.text)[0], doc_types, tags, include_archived)
-            ) or (body.surface != "document" and not (doc_types or tags))]
+                and metadata_matches(_parse_markdown(body.text)[0], doc_types, tags, include_archived, scope)
+            ) or (body.surface != "document" and scope != "archived" and not (doc_types or tags))]
         searched_bytes = sum(body.byte_size for body in bodies)
         if searched_bytes > NATIVE_GREP_MAX_SEARCH_BYTES:
             raise ValidationError(
@@ -743,6 +745,8 @@ class M1NativeGrepService:
         matched = scanned["items"]
         for item in matched:
             item["_body"] = bodies[item.pop("_body_index")]
+            if item["_body"].surface == "document":
+                item["status"] = _parse_markdown(item["_body"].text)[0].get("status") or "draft"
 
         base = {
             "pattern": pattern,
@@ -921,6 +925,7 @@ class M1NativeGrepService:
                 "vault": row["vault"],
                 "path": row["path"],
                 "title": row["title"],
+                **({"status": row["status"]} if row.get("status") is not None else {}),
                 "matches": [
                     {"section": None, "text": match["text"]}
                     for match in row["matches"]

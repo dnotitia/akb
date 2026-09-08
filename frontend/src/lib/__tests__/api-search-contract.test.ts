@@ -84,7 +84,7 @@ describe("grep response contract — total_matches + total_docs", () => {
       return HttpResponse.json({ results: [] });
     }));
     const options = { collection: "guide_%", doc_types: ["report", "note"], tags: ["ops", "한글"],
-      source_type: "document" as const, include_archived: false, regex: true, case_sensitive: true };
+      source_type: "document" as const, include_archived: false, archive_scope: "archived" as const, regex: true, case_sensitive: true };
     await searchDocs("x", ["a", "b"], 25, options);
     await grepDocs("A.*B", ["a", "b"], 20, options);
     for (const url of requests) {
@@ -93,6 +93,7 @@ describe("grep response contract — total_matches + total_docs", () => {
       expect(url.searchParams.getAll("doc_types")).toEqual(["report", "note"]);
       expect(url.searchParams.getAll("tags")).toEqual(["ops", "한글"]);
       expect(url.searchParams.get("include_archived")).toBe("false");
+      expect(url.searchParams.get("archive_scope")).toBe("archived");
     }
     expect(requests[0].searchParams.has("regex")).toBe(false);
     expect(requests[0].searchParams.get("source_type")).toBe("document");
