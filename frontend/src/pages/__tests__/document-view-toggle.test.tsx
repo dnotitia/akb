@@ -969,6 +969,31 @@ describe("DocumentPage view toggle", () => {
     );
   });
 
+  it("does not resurrect a draft after explicit discard and a later reopen", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "owner" });
+    const first = renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await user.click(await screen.findByRole("button", { name: "Edit" }));
+    await user.type(
+      await screen.findByRole("textbox", { name: "Document body (markdown)" }),
+      "discard me",
+    );
+    await screen.findByText("Draft saved locally");
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await user.click(screen.getByRole("button", { name: "Discard changes" }));
+    await screen.findByRole("heading", { level: 2, name: "BodyHeading" });
+
+    first.unmount();
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+    await user.click(await screen.findByRole("button", { name: "Edit" }));
+
+    expect(screen.queryByText("Local draft restored")).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Document body (markdown)" })).toHaveValue(
+      SAMPLE_CONTENT,
+    );
+  });
+
   it("exposes document deletion in the header for writers and leaves the stale route", async () => {
     const user = userEvent.setup();
     getVaultInfoMock.mockResolvedValue({ role: "writer" });

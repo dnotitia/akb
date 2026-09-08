@@ -93,6 +93,7 @@ import {
   listDocumentEditDrafts,
   saveDocumentEditDraft,
   type DocumentEditDraftLoadResult,
+  type DocumentEditDraftInput,
   type StoredDocumentEditDraft,
 } from "@/lib/document-draft";
 import {
@@ -253,6 +254,7 @@ export default function DocumentPage({
   const latestServerDocumentRef = useRef<any>(null);
   const latestServerErrorRef = useRef("");
   const storageSaveTimerRef = useRef<number | null>(null);
+  const latestDraftInputRef = useRef<DocumentEditDraftInput | null>(null);
   const editingSnapshotRef = useRef({
     title: "",
     content: "",
@@ -343,6 +345,7 @@ export default function DocumentPage({
   function persistEditDraft(overrides: Parameters<typeof currentDraftInput>[0] = {}): boolean {
     const input = currentDraftInput(overrides);
     if (!input) return false;
+    latestDraftInputRef.current = input;
     const saved = saveDocumentEditDraft(input);
     setDraftStatus(saved ? "saved" : "error");
     setDraftNotice(saved ? "Draft saved locally" : "Could not save this draft locally; it remains only in this tab.");
@@ -834,19 +837,24 @@ export default function DocumentPage({
     view,
   ]);
 
-  // Persist the latest snapshot synchronously before a route unmount. The
-  // normal 300ms write above gives localStorage a quiet path; this cleanup is
-  // the guard for a fast tab close, Back navigation, or preview dismissal.
   useEffect(() => {
-    return () => {
-      if (view !== "edit" || !isDirty) return;
-      const input = currentDraftInput();
-      if (input) saveDocumentEditDraft(input);
-    };
+    if (
+      view !== "edit" ||
+      !isDirty ||
+      draftStatus === "expired" ||
+      draftStatus === "incompatible" ||
+      (draftStatus === "restored" &&
+        draftRevisionRef.current === restoredDraftRevisionRef.current)
+    ) {
+      latestDraftInputRef.current = null;
+      return;
+    }
+    latestDraftInputRef.current = currentDraftInput();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     currentUserId,
     doc?.path,
+    draftStatus,
     editingAssetIds,
     editingContent,
     editingTitle,
@@ -856,6 +864,17 @@ export default function DocumentPage({
     originalTitle,
     view,
   ]);
+
+  // Persist the latest snapshot synchronously before a fast tab close, Back
+  // navigation, or preview dismissal. This effect intentionally has no state
+  // dependencies: its cleanup is an actual component-unmount boundary.
+  useEffect(
+    () => () => {
+      const input = latestDraftInputRef.current;
+      if (input) saveDocumentEditDraft(input);
+    },
+    [],
+  );
 
   // Warn before page navigation (close tab, browser back) when dirty.
   useEffect(() => {
@@ -1045,6 +1064,7 @@ export default function DocumentPage({
       } else if (draftSessionRef.current) {
         clearDocumentEditDraft(draftSessionRef.current);
         draftSessionRef.current = null;
+        latestDraftInputRef.current = null;
         setDraftStatus("idle");
         setDraftNotice("");
       }
@@ -1173,6 +1193,7 @@ export default function DocumentPage({
   async function discardEditDraft() {
     const draft = draftSessionRef.current;
     const protectedAssets = protectedDraftAssetIds(draft?.draftId);
+    latestDraftInputRef.current = null;
     const assets = new Set<string>([
       ...(draft?.assetIds || []),
       ...editingAssetIds,
