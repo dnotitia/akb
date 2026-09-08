@@ -241,7 +241,8 @@ def test_standalone_static_presign_keeps_existing_keys(monkeypatch):
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "ambient-key")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "ambient-secret")
     monkeypatch.setattr(s3_adapter, "settings", Settings(
-        s3_endpoint_url="http://minio:9000", s3_access_key="local-key", s3_secret_key="local-fixture",
+        s3_endpoint_url="http://minio:9000", s3_access_key="local-key",
+        s3_secret_key="local-fixture",  # pragma: allowlist secret -- offline test fixture
     ))
     for name in ("_internal_client", "_presign_client", "_session"):
         monkeypatch.setattr(s3_adapter, name, None, raising=False)
@@ -287,8 +288,9 @@ def test_failed_mandatory_refresh_does_not_use_expired_session(storage):
 
 def test_standalone_audit_credentials_remain_isolated(monkeypatch, tmp_path):
     configured = Settings(
-        s3_endpoint_url="http://minio:9000", s3_access_key="file-key", s3_secret_key="file-fixture",
-        audit={"access_key": "audit-key", "secret_key": "audit-fixture"},
+        s3_endpoint_url="http://minio:9000", s3_access_key="file-key",
+        s3_secret_key="file-fixture",  # pragma: allowlist secret -- offline test fixture
+        audit={"access_key": "audit-key", "secret_key": "audit-fixture"},  # pragma: allowlist secret -- offline fixture
     )
     monkeypatch.delenv("AWS_PROFILE", raising=False)
     monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "missing-config"))
