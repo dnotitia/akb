@@ -92,8 +92,22 @@ def _configured_document_source_type() -> str:
 # to start with `TITLE: foo`. Table/file chunks are pure-metadata (no
 # body separator) and intentionally do not match. Keys imported from
 # index_service so adding a new builder field can't silently drift.
+#
+# The middle `(?:[^\n]+\n){0,40}?` run exists because `SUMMARY:` is
+# interpolated verbatim (`f"SUMMARY: {summary}"`) and a summary that
+# carries its own newlines therefore emits continuation lines that are
+# not `KEY:`-prefixed. Without the run, the whole header failed to match
+# and every byte of it leaked into `drill_down` / `search` output — the
+# multi-line-summary case this pattern now covers. The run is lazy,
+# bounded, and cannot cross a blank line (`[^\n]+`), so the block still
+# has to terminate in the same way: one or more recognised `KEY:` lines
+# (`PATH:` is always emitted last-but-one) followed by the `\n\n` body
+# separator.
 _CHUNK_HEADER_RE = re.compile(
-    rf"\ATITLE:[^\n]*\n(?:(?:{'|'.join(CHUNK_HEADER_KEYS)}):[^\n]*\n)+\n"
+    rf"\ATITLE:[^\n]*\n"
+    rf"(?:[^\n]+\n){{0,40}}?"
+    rf"(?:(?:{'|'.join(CHUNK_HEADER_KEYS)}):[^\n]*\n)+"
+    rf"\n"
 )
 
 
