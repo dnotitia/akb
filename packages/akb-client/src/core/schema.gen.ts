@@ -164,6 +164,8 @@ export interface AkbSearchResult {
   tags: string[];
   score: number;
   matched_section?: string | null;
+  section_path?: string | null;
+  chunk_index?: number | null;
   [key: string]: unknown;
 }
 
