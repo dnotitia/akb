@@ -50,6 +50,7 @@ import { parseUri } from "@/lib/uri";
 import { cn } from "@/lib/utils";
 import { documentPreviewState } from "@/lib/document-preview-navigation";
 import { Input } from "@/components/ui/input";
+import { SelectMenu } from "@/components/ui/select-menu";
 import { TagInput } from "@/components/ui/tag-input";
 import { InlineLoadingState } from "@/components/ui/loading-state";
 import {
@@ -82,6 +83,7 @@ const SUGGESTED_QUERIES = [
 ] as const;
 
 interface DenseResult {
+  status?: string;
   source_type?: SourceType;
   uri: string;
   vault: string;
@@ -167,6 +169,9 @@ export default function SearchPage() {
   const [returnedMatches, setReturnedMatches] = useState(0);
   const [truncated, setTruncated] = useState(false);
   const [degraded, setDegraded] = useState(false);
+  const [archiveUnsupported, setArchiveUnsupported] = useState(false);
+  const archiveScope =
+    options.archive_scope ?? (options.include_archived ? "all" : "unarchived");
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -205,6 +210,7 @@ export default function SearchPage() {
             options,
           );
           if (id !== reqId.current) return;
+          setArchiveUnsupported(Boolean(options.archive_scope && response.archive_scope !== options.archive_scope));
           setDenseResults(response.results);
           setLiteralResults([]);
           setTotal(response.total ?? response.results.length);
@@ -222,6 +228,7 @@ export default function SearchPage() {
             options,
           );
           if (id !== reqId.current) return;
+          setArchiveUnsupported(Boolean(options.archive_scope && response.archive_scope !== options.archive_scope));
           setLiteralResults(response.results);
           setDenseResults([]);
           setTotal(response.total_docs ?? response.results.length);
@@ -271,6 +278,14 @@ export default function SearchPage() {
   }, [currentUserId]);
 
   useEffect(() => {
+    const refresh = () => {
+      if (q.trim()) void doSearch(q, mode, scopeVaults);
+    };
+    window.addEventListener("akb:document-status-changed", refresh);
+    return () => window.removeEventListener("akb:document-status-changed", refresh);
+  }, [q, mode, scopeVaults, doSearch]);
+
+  useEffect(() => {
     setDraft(q);
   }, [q]);
 
@@ -294,6 +309,7 @@ export default function SearchPage() {
       void doSearch(q, mode, scopeVaults);
     } else {
       reqId.current += 1;
+      setArchiveUnsupported(false);
       setDenseResults([]);
       setLiteralResults([]);
       setTotal(0);
@@ -350,11 +366,16 @@ export default function SearchPage() {
 
   function setFilter(key: string, values: string[]) {
     const next = setSearchValues(searchParams, key, values);
+    if (key === "archive_scope") {
+      next.delete("include_archived");
+      if (values[0] === "archived") next.set("source", "document");
+    }
     if ((key === "doc_type" || key === "tag") && values.length)
       next.set("source", "document");
     if (key === "source" && values[0] !== "document") {
       next.delete("doc_type");
       next.delete("tag");
+      if (archiveScope === "archived") next.delete("archive_scope");
     }
     setSearchParams(next);
   }
@@ -434,7 +455,7 @@ export default function SearchPage() {
     (allTypesActive ? 0 : 1) +
     (activeTags.size === 0 ? 0 : 1) +
     Number(Boolean(options.collection)) +
-    Number(options.include_archived) +
+    Number(archiveScope !== "unarchived") +
     Number(options.regex) +
     Number(options.case_sensitive);
   const accessibleVaultNames = new Set(
@@ -450,6 +471,8 @@ export default function SearchPage() {
     ? "Searching…"
     : error
       ? "Search unavailable"
+      : archiveUnsupported
+        ? "Document state filter unavailable"
       : !searched
         ? "Ready to search"
         : degraded
@@ -788,20 +811,30 @@ export default function SearchPage() {
                   </p>
                 </form>
                 <div className="flex flex-col gap-3 text-sm">
-                  <label className="flex min-h-9 items-center gap-2">
-                    <input
-                      type="checkbox"
-                      className="accent-primary focus-visible:outline-ring"
-                      checked={Boolean(options.include_archived)}
-                      onChange={(event) =>
-                        setFilter(
-                          "include_archived",
-                          event.target.checked ? ["true"] : [],
-                        )
+                  <div>
+                    <label
+                      htmlFor="search-document-state"
+                      className="mb-2 block text-xs font-semibold"
+                    >
+                      Document state
+                    </label>
+                    <SelectMenu
+                      id="search-document-state"
+                      aria-label="Document state"
+                      value={archiveScope}
+                      onValueChange={(value) =>
+                        setFilter("archive_scope", [value])
                       }
+                      options={[
+                        { value: "unarchived", label: "Current documents" },
+                        { value: "archived", label: "Archived documents" },
+                        { value: "all", label: "All documents" },
+                      ]}
                     />
-                    Include archived documents
-                  </label>
+                    <p className="mt-1 text-xs text-foreground-muted">
+                      Current includes drafts. Archived searches documents only.
+                    </p>
+                  </div>
                   {mode === "literal" && (
                     <>
                       <label className="flex min-h-9 items-center gap-2">
@@ -931,6 +964,13 @@ export default function SearchPage() {
             </Alert>
           )}
 
+          {archiveUnsupported && !loading && !error && (
+            <Alert variant="warning" title="Document state filter unavailable" className="rounded-none border-x-0 border-t-0">
+              This server could not confirm the selected document state filter. Results are hidden to avoid showing the wrong scope. Update the server or{" "}
+              <button type="button" className={inlineActionClass} onClick={() => setFilter("archive_scope", [])}>search current documents</button>.
+            </Alert>
+          )}
+
           {!searched && (
             <SearchStartState
               mode={mode}
@@ -942,7 +982,7 @@ export default function SearchPage() {
             />
           )}
 
-          {searched && !loading && !error && !degraded && !hasResults && (
+          {searched && !loading && !error && !degraded && !archiveUnsupported && !hasResults && (
             <section aria-labelledby="no-search-results-heading">
               <div className="border-b border-border bg-surface-2/60 px-4 py-3 sm:px-5">
                 <h2
@@ -980,7 +1020,7 @@ export default function SearchPage() {
             </section>
           )}
 
-          {truncated && !loading && !error && (
+          {truncated && !loading && !error && !archiveUnsupported && (
             <Alert
               variant="info"
               title={
@@ -996,7 +1036,7 @@ export default function SearchPage() {
             </Alert>
           )}
 
-          {hasResults && (
+          {hasResults && !archiveUnsupported && (
             <section aria-labelledby="search-results-heading">
               <h2 id="search-results-heading" className="sr-only">
                 Results for {q}
@@ -1296,6 +1336,7 @@ function DenseResultList({ items }: { items: DenseResult[] }) {
                   {result.doc_type && (
                     <Badge variant="outline">{result.doc_type}</Badge>
                   )}
+                  {result.status === "archived" && <Badge variant="outline">Archived</Badge>}
                   {tags.slice(0, 2).map((tag) => (
                     <Badge key={tag} variant="secondary">
                       {tag}
@@ -1372,6 +1413,7 @@ function LiteralResultList({ items }: { items: GrepDoc[] }) {
                 <span className="text-sm font-semibold text-foreground transition-colors group-hover:text-link">
                   {result.title}
                 </span>
+                {result.status === "archived" && <Badge variant="outline">Archived</Badge>}
                 <span className="ml-auto text-xs font-semibold tabular-nums text-foreground sm:hidden">
                   {result.matches.length}
                 </span>

@@ -63,6 +63,48 @@ const openFilters = async (user: ReturnType<typeof userEvent.setup>) =>
   user.click(screen.getByRole("button", { name: "Filter by document type" }));
 
 describe("server search filters", () => {
+  it("requests archived documents on the server, displays status, and preserves scope across modes and Back", async () => {
+    search.mockImplementation(async (_q, _v, _l, options) => ({
+      ...response(options?.archive_scope === "archived" ? [{ ...hit("Old guide"), status: "archived" }] : []),
+      archive_scope: options?.archive_scope ?? "unarchived",
+    }));
+    grep.mockResolvedValue({ pattern: "x", regex: false, total_docs: 1, total_matches: 1, archive_scope: "archived", results: [{ ...hit("Old literal guide"), status: "archived", matches: [{ section: null, text: "x" }] }] });
+    renderAt();
+    const user = userEvent.setup();
+    await openFilters(user);
+    await user.click(screen.getByLabelText("Document state"));
+    await user.click(screen.getByRole("menuitemradio", { name: "Archived documents" }));
+    await screen.findByText("Old guide");
+    expect(screen.getByText("Archived")).toBeInTheDocument();
+    expect(search).toHaveBeenLastCalledWith("x", [], 25, expect.objectContaining({ archive_scope: "archived", source_type: "document" }));
+    expect(screen.getByTestId("url")).toHaveTextContent("archive_scope=archived");
+    await user.click(screen.getByRole("button", { name: "Literal", pressed: false }));
+    await screen.findByText("Old literal guide");
+    expect(screen.getByText("Archived")).toBeInTheDocument();
+    expect(grep).toHaveBeenLastCalledWith("x", [], 20, expect.objectContaining({ archive_scope: "archived" }));
+    await user.click(screen.getByRole("button", { name: "Back" }));
+    await screen.findByText("Old guide");
+    expect(screen.getByLabelText("Document state")).toHaveTextContent("Archived documents");
+  });
+
+  it("does not claim no archives when an older server ignores the scope and offers recovery", async () => {
+    renderAt("/search?q=x&archive_scope=archived");
+    await screen.findByText(/This server could not confirm/);
+    expect(screen.queryByRole("heading", { name: /No results/ })).not.toBeInTheDocument();
+    expect(screen.queryByText("0 top results loaded")).not.toBeInTheDocument();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "search current documents" }));
+    await screen.findByRole("heading", { name: /No results/ });
+    expect(screen.getByTestId("url")).not.toHaveTextContent("archive_scope");
+  });
+
+  it("hides wrong-scope hits from an older server instead of client-filtering them", async () => {
+    search.mockResolvedValue(response([hit("Current guide")]));
+    renderAt("/search?q=x&archive_scope=archived");
+    await screen.findByText(/This server could not confirm/);
+    expect(screen.queryByText("Current guide")).not.toBeInTheDocument();
+  });
+
   it("keeps filters available before results and after a zero-match response", async () => {
     renderAt();
     const user = userEvent.setup();
@@ -127,7 +169,8 @@ describe("server search filters", () => {
       screen.getByLabelText("Tags (match any)"),
       "rare-tag{Enter}",
     );
-    await user.click(screen.getByLabelText("Include archived documents"));
+    await user.click(screen.getByLabelText("Document state"));
+    await user.click(screen.getByRole("menuitemradio", { name: "All documents" }));
     await waitFor(() =>
       expect(search).toHaveBeenLastCalledWith(
         "x",
@@ -137,7 +180,7 @@ describe("server search filters", () => {
           collection: "guides/api",
           tags: ["rare-tag"],
           source_type: "document",
-          include_archived: true,
+          archive_scope: "all",
         }),
       ),
     );

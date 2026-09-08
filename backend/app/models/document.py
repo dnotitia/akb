@@ -239,6 +239,7 @@ class BrowseResponse(BaseModel):
 
     kind: Literal["document"] = "document"
     vault: str
+    archive_scope: Literal["unarchived", "archived", "all"] | None = None
     path: str
     context: BrowseContext | None = None
     items: list[BrowseItem]
@@ -258,6 +259,7 @@ class SearchResult(BaseModel):
     vault: str
     path: str
     title: str
+    status: str | None = None
     collection: str | None = None                     # containing collection (null at vault root)
     collection_summary: str | None = None             # parent collection intent; not part of search scoring
     vault_description: str | None = None              # containing vault intent; not part of search scoring
@@ -292,6 +294,7 @@ class SearchResponse(BaseModel):
     """
 
     kind: Literal["search"] = "search"
+    archive_scope: Literal["unarchived", "archived", "all"] | None = None
     query: str
     total: int
     returned: int = 0
@@ -337,6 +340,7 @@ class GrepResult(BaseModel):
     vault: str
     path: str
     title: str
+    status: str | None = None
     # Additive native measurement identity. Legacy Document grep leaves these
     # unset, preserving its frozen response; W3b needs them to distinguish an
     # admitted searchable text File and bind the result to its current Head.
@@ -389,6 +393,7 @@ class GrepResponse(BaseModel):
     """
 
     kind: Literal["grep"] = "grep"
+    archive_scope: Literal["unarchived", "archived", "all"] | None = None
     pattern: str
     regex: bool
     error: str | None = None

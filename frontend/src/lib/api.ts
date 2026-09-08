@@ -1788,10 +1788,14 @@ export const deleteVaultTable = (vault: string, tableName: string) =>
   );
 
 // ── Browse ──
-export const browseVault = (vault: string, collection?: string, depth = 1) => {
+export type ArchiveScope = "unarchived" | "archived" | "all";
+
+export const browseVault = (vault: string, collection?: string, depth = 1, options: { archive_scope?: ArchiveScope } = {}) => {
   const p = new URLSearchParams({ depth: String(depth) });
   if (collection) p.set("collection", collection);
+  if (options.archive_scope) p.set("archive_scope", options.archive_scope);
   return api<{
+    archive_scope?: ArchiveScope;
     vault: string;
     path: string;
     context?: {
@@ -1843,6 +1847,7 @@ export async function importKnowledgeBundle(
 //   - truncated / hint: set when the prefetch pool filled, meaning the
 //     corpus may contain more hits than the response surfaces (#77 / 0.2.5).
 export interface SearchResponse {
+  archive_scope?: ArchiveScope;
   query: string;
   total: number;
   returned: number;
@@ -1862,6 +1867,7 @@ const vaultScopeParams = (vaults?: string[] | string): string[] =>
   (Array.isArray(vaults) ? vaults : vaults ? [vaults] : []).filter(Boolean);
 
 export interface SearchOptions {
+  archive_scope?: ArchiveScope;
   collection?: string;
   source_type?: "document" | "file" | "table";
   doc_types?: string[];
@@ -1872,6 +1878,7 @@ export interface SearchOptions {
 }
 
 function appendSearchOptions(p: URLSearchParams, options: SearchOptions, literal: boolean) {
+  if (options.archive_scope) p.set("archive_scope", options.archive_scope);
   if (options.collection) p.set("collection", options.collection);
   for (const type of options.doc_types || []) p.append("doc_types", type);
   for (const tag of options.tags || []) p.append("tags", tag);
@@ -1894,6 +1901,7 @@ export interface GrepMatch {
   text: string;
 }
 export interface GrepDoc {
+  status?: string | null;
   uri: string;
   vault: string;
   path: string;
@@ -1906,6 +1914,7 @@ export interface GrepDoc {
 // matches than the response surfaces — switch to count_only or
 // files_with_matches at the agent / caller level (backend #76 / 0.2.4).
 export interface GrepResponse {
+  archive_scope?: ArchiveScope;
   pattern: string;
   regex: boolean;
   returned_docs?: number;

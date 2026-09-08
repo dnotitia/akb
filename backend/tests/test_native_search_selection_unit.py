@@ -266,6 +266,21 @@ async def test_native_search_collection_is_exact_descendant_boundary_and_escaped
 
 
 @pytest.mark.asyncio
+async def test_native_archived_candidates_use_current_metadata_before_ranking(monkeypatch):
+    from app.services import search_service as module
+
+    conn = _CandidateConn()
+    conn.rows = [{"resource_id": uuid.UUID(int=i + 1), "status": status}
+                 for i, status in enumerate(["draft", "active", "archived"])]
+    monkeypatch.setattr(module, "_verified_native_metadata", lambda row: {"status": row["status"]})
+    candidates = await SearchService()._native_document_candidates(
+        conn, user_uuid=None, is_admin=True, vaults=["mine"], collection=None,
+        doc_type=None, tags=None, include_archived=False, archive_scope="archived", source_uris=None,
+    )
+    assert candidates == [str(uuid.UUID(int=3))]
+
+
+@pytest.mark.asyncio
 async def test_native_search_pushes_source_uri_into_bounded_sql_scope():
     conn = _CandidateConn()
     await SearchService()._native_document_candidates(

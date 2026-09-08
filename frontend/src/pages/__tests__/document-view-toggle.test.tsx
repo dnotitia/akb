@@ -101,6 +101,71 @@ function makeDoc(overrides: Record<string, unknown> = {}) {
   };
 }
 
+describe("document archive and restore", () => {
+  it("offers read-only recovery after an accepted restore cannot be verified", async () => {
+    const user = userEvent.setup();
+    let current = { ...makeDoc(), status: "archived" };
+    let failNextRead = false;
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    getDocumentMock.mockImplementation(async () => {
+      if (failNextRead) { failNextRead = false; throw new Error("503 temporary read failure"); }
+      return current;
+    });
+    updateDocumentMock.mockImplementation(async () => {
+      current = { ...current, status: "active", current_commit: UPDATED_COMMIT };
+      failNextRead = true;
+      return { current_commit: UPDATED_COMMIT };
+    });
+    renderPreviewAt("/vault/v/doc/notes%2Fhello.md");
+    await screen.findByRole("button", { name: "Edit" });
+    await user.click(screen.getByRole("button", { name: "Restore document" }));
+    await user.click(within(await screen.findByRole("dialog", { name: "Restore this document?" })).getByRole("button", { name: "Restore document" }));
+    const recovery = await screen.findByRole("dialog", { name: "Check document state" });
+    expect(within(recovery).getByRole("alert")).toHaveTextContent("change was accepted");
+    await user.click(within(recovery).getByRole("button", { name: "Cancel" }));
+    await user.click(screen.getByRole("button", { name: "Restore document" }));
+    await user.click(within(await screen.findByRole("dialog", { name: "Check document state" })).getByRole("button", { name: "Check current state" }));
+    await screen.findByText("Restored to notes.");
+    expect(updateDocumentMock).toHaveBeenCalledOnce();
+    expect(screen.getByTestId("location-state")).toHaveTextContent('"documentPreview":true');
+  });
+
+  it("archives through overflow and restores in the preview without moving the document", async () => {
+    const user = userEvent.setup();
+    let current = makeDoc({ status: "active" });
+    getDocumentMock.mockImplementation(async () => current);
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    updateDocumentMock.mockImplementation(async (_vault, _ref, patch) => {
+      current = { ...current, status: patch.status, current_commit: UPDATED_COMMIT };
+      return { current_commit: UPDATED_COMMIT };
+    });
+    renderPreviewAt("/vault/v/doc/notes%2Fhello.md");
+    await screen.findByRole("button", { name: "Edit" });
+    await user.click(screen.getByRole("button", { name: "Actions for DocTitle" }));
+    await user.click(screen.getByRole("menuitem", { name: "Archive document" }));
+    const archiveDialog = await screen.findByRole("dialog", { name: "Archive this document?" });
+    expect(within(archiveDialog).getByText(/does not delete it, revoke access/)).toBeInTheDocument();
+    await user.click(within(archiveDialog).getByRole("button", { name: "Archive document" }));
+    await screen.findByText(/Archived · Hidden from current documents/);
+    expect(updateDocumentMock).toHaveBeenCalledWith("v", "notes/hello.md", { status: "archived", expected_commit: "abcdef1234567" });
+    await user.click(screen.getByRole("button", { name: "Restore document" }));
+    const restoreDialog = await screen.findByRole("dialog", { name: "Restore this document?" });
+    await user.click(within(restoreDialog).getByRole("button", { name: "Restore document" }));
+    await screen.findByText("Restored to notes.");
+    expect(updateDocumentMock).toHaveBeenLastCalledWith("v", "notes/hello.md", { status: "active", expected_commit: UPDATED_COMMIT });
+    expect(screen.getByTestId("location-pathname")).toHaveTextContent("/vault/v/doc/notes%2Fhello.md");
+    expect(screen.getByTestId("location-state")).toHaveTextContent('"documentPreview":true');
+  });
+
+  it("keeps reader restore visible with an explicit permission reason", async () => {
+    getDocumentMock.mockResolvedValue(makeDoc({ status: "archived" }));
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+    expect(await screen.findByRole("button", { name: "Restore document" })).toBeDisabled();
+    await screen.findByText("Writer access or higher is required.");
+    expect(updateDocumentMock).not.toHaveBeenCalled();
+  });
+});
+
 function LocationProbe() {
   const loc = useLocation();
   return (

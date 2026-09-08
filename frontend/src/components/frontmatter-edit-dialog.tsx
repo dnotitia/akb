@@ -24,6 +24,7 @@ interface DocLike {
   title?: string;
   type?: string;
   status?: string;
+  current_commit?: string;
   domain?: string;
   summary?: string;
   tags?: string[];
@@ -127,6 +128,7 @@ export function FrontmatterEditDialog({
         tags,
       };
       if (contentChanged) payload.content = content;
+      if (doc.current_commit) payload.expected_commit = doc.current_commit;
       const result = await updateDocument(vault, docId, payload);
       onSaved({
         ...doc,
@@ -137,6 +139,7 @@ export function FrontmatterEditDialog({
         tags,
         content: contentChanged ? content : doc.content,
         path: result?.path || doc.path,
+        current_commit: result?.current_commit ?? result?.commit_hash ?? doc.current_commit,
       });
       onOpenChange(false);
     } catch (e: any) {

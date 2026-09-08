@@ -75,6 +75,7 @@ import { recordRecentDocumentView } from "@/lib/recent-document-views";
 import { ResourceActionsMenu } from "@/components/resource-actions-menu";
 import { ResourceDeleteDialog } from "@/components/resource-delete-dialog";
 import { DocumentMoveDialog } from "@/components/document-move-dialog";
+import { ArchiveVerificationError, changeDocumentArchiveState, checkDocumentArchiveState, documentArchiveDisabledReason } from "@/lib/document-archive";
 import { DocumentTitleConflictNotice } from "@/components/document-title-conflict-notice";
 import {
   documentCollection,
@@ -154,6 +155,9 @@ export default function DocumentPage({
   const [editOpen, setEditOpen] = useState(false);
   const [moveOpen, setMoveOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [archiveOpen, setArchiveOpen] = useState(false);
+  const [archiveNotice, setArchiveNotice] = useState("");
+  const [archivePending, setArchivePending] = useState<{ vault: string; ref: string; status: "active" | "archived" } | null>(null);
   const [publishOpen, setPublishOpen] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [detailsTab, setDetailsTab] = useState<"info" | "outline" | "relations" | "history">("info");
@@ -405,6 +409,8 @@ export default function DocumentPage({
   // is still loading — so a real older version is never briefly editable.
   const isHistorical = !!commitHash && !sameCommitRef(commitHash, headCommit);
   const canEdit =
+    !vaultReadOnly &&
+    (doc?.path !== VAULT_SKILL_PATH || vaultRole === "owner") &&
     !isHistorical &&
     !isDiffMode &&
     (vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner");
@@ -753,6 +759,12 @@ export default function DocumentPage({
     !isHistorical &&
     !isDiffMode &&
     doc.path !== VAULT_SKILL_PATH;
+  const archiveDisabledReason = documentArchiveDisabledReason({
+    role: vaultRole, readOnly: vaultReadOnly,
+    historical: isHistorical || isDiffMode,
+    guide: doc.path === VAULT_SKILL_PATH,
+  });
+  const pendingArchiveCheck = archivePending && archivePending.vault === name && archivePending.ref === docId ? archivePending : null;
 
   const openVersion = (hash?: string, options: { replace?: boolean } = {}) => {
     const params = new URLSearchParams(searchParams);
@@ -887,6 +899,9 @@ export default function DocumentPage({
                 )}
                 <ResourceActionsMenu
                   resourceName={doc.title || fileName}
+                  archiveAction={doc.status === "archived" ? "restore" : "archive"}
+                  archiveDisabledReason={archiveDisabledReason}
+                  onArchiveAction={() => setArchiveOpen(true)}
                   moveLabel="Move document"
                   onMove={moveDisabledReason ? undefined : () => setMoveOpen(true)}
                   moveDisabledReason={moveDisabledReason || undefined}
@@ -897,6 +912,15 @@ export default function DocumentPage({
             )}
           </div>
         </header>
+
+        {archiveNotice && <Alert variant="success" className="shrink-0">{archiveNotice}<Button variant="ghost" size="sm" onClick={() => setArchiveNotice("")}>Dismiss</Button></Alert>}
+        {doc.status === "archived" && !isHistorical && !isDiffMode && view !== "edit" && (
+          <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-border bg-surface-2 px-4 py-2 text-xs text-foreground-muted">
+            <span>Archived · Hidden from current documents. Existing links and access remain unchanged.</span>
+            <Button variant="outline" size="sm" disabled={!!archiveDisabledReason} title={archiveDisabledReason} onClick={() => setArchiveOpen(true)}>Restore document</Button>
+            {archiveDisabledReason && <span>{archiveDisabledReason}</span>}
+          </div>
+        )}
 
         {isDiffMode ? (
           <div
@@ -1239,7 +1263,7 @@ export default function DocumentPage({
                     <Info className="h-4 w-4 text-link" aria-hidden />
                     Properties
                   </h3>
-                  {canWrite && !isHistorical && (
+                  {canEdit && (
                     <Button type="button" variant="ghost" size="sm" onClick={() => setEditOpen(true)}>
                       <Pencil className="h-3.5 w-3.5" aria-hidden />
                       Edit
@@ -1420,6 +1444,8 @@ export default function DocumentPage({
         doc={doc}
         onSaved={(next) => {
           setDocOverride({ ...doc, ...next });
+          void queryClient.invalidateQueries({ queryKey: ["document", name] });
+          if (next.status !== doc.status) window.dispatchEvent(new CustomEvent("akb:document-status-changed", { detail: { vault: name, path: next.path, status: next.status } }));
           refetchTree();
         }}
       />
@@ -1489,6 +1515,38 @@ export default function DocumentPage({
           await deleteDocument(name!, docId);
           refetchTree();
           navigate(`/vault/${name}`);
+        }}
+      />
+
+      <ConfirmDialog
+        open={archiveOpen}
+        onOpenChange={setArchiveOpen}
+        title={pendingArchiveCheck ? "Check document state" : doc.status === "archived" ? "Restore this document?" : "Archive this document?"}
+        description={pendingArchiveCheck ? "The change was accepted. Only the current document will be fetched; the change will not be sent again." : doc.status === "archived"
+          ? `Restore as an active document in ${collectionPath || "Vault root"}. Its identity, links, and history stay unchanged. Search may take a moment to catch up.`
+          : "Hide this document from current documents and default search. You can find it with the Archived documents filter and restore it later. This does not delete it, revoke access, or disable public links."}
+        confirmLabel={pendingArchiveCheck ? "Check current state" : doc.status === "archived" ? "Restore document" : "Archive document"}
+        onConfirm={async () => {
+          if (!pendingArchiveCheck && archiveDisabledReason) throw new Error(archiveDisabledReason);
+          const status = pendingArchiveCheck?.status ?? (doc.status === "archived" ? "active" : "archived");
+          let next;
+          try {
+            next = pendingArchiveCheck
+              ? await checkDocumentArchiveState(name!, docId)
+              : await changeDocumentArchiveState(name!, docId, status, doc.current_commit);
+          } catch (error) {
+            if (error instanceof ArchiveVerificationError) setArchivePending({ vault: name!, ref: docId, status });
+            throw error;
+          }
+          setArchivePending(null);
+          setDocOverride(next);
+          await queryClient.invalidateQueries({ queryKey: ["document", name] });
+          void queryClient.invalidateQueries({ queryKey: ["document-history", name] });
+          refetchTree();
+          setArchiveNotice(next.status !== status
+            ? "Current state loaded. The requested state is not present; review the document before making another change."
+            : status === "active" ? `Restored to ${collectionPath || "Vault root"}.` : "Document archived. Find it using the Archived documents filter.");
+          if (commitHash) openVersion(undefined, { replace: true });
         }}
       />
 

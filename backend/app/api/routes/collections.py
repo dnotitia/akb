@@ -17,6 +17,7 @@ from app.services.collection_service import (
     InvalidPathError,
 )
 from app.services.revision_backend import get_document_service
+from app.services.search_filters import ArchiveScope
 
 router = APIRouter()
 doc_service = get_document_service()
@@ -72,12 +73,14 @@ async def browse_vault(
     ),
     include_hashes: bool = Query(False, description="Include content hash/version metadata for documents and files."),
     include_archived: bool = Query(False, description="Include archived documents (hidden from browse by default)."),
+    archive_scope: ArchiveScope | None = Query(None, description="Document archive scope; overrides include_archived."),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     await check_vault_access(user.user_id, vault, required_role="reader")
     return await doc_service.browse(
         vault, collection=collection, depth=depth, include_hashes=include_hashes,
         include_archived=include_archived,
+        archive_scope=archive_scope,
     )
 
 

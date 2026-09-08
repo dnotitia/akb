@@ -74,7 +74,8 @@ test("real login, search filters, reload and exact-search options", async ({
       page.getByText("Live active report", { exact: true }),
     ).toBeVisible();
     await expect(page.getByText("Live note", { exact: true })).toHaveCount(0);
-    await page.getByLabel("Include archived documents").click();
+    await page.getByRole("button", { name: "Document state", exact: true }).click();
+    await page.getByRole("menuitemradio", { name: "All documents", exact: true }).click();
     await expect(
       page.getByText("Live archived report", { exact: true }),
     ).toBeVisible();

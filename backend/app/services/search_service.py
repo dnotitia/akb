@@ -20,7 +20,7 @@ from typing import Literal
 from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import ValidationError
-from app.services.search_filters import collection_predicate, escape_like, metadata_matches
+from app.services.search_filters import ArchiveScope, collection_predicate, escape_like, metadata_matches, resolve_archive_scope
 from app.models.document import SearchResponse, SearchResult
 from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.services import sparse_encoder
@@ -237,6 +237,7 @@ class SearchService:
         doc_type: str | None,
         tags: list[str] | None,
         include_archived: bool,
+        archive_scope: ArchiveScope | None = None,
         source_uris: list[str] | None,
         doc_types: list[str] | None = None,
     ) -> list[str]:
@@ -326,7 +327,7 @@ class SearchService:
             metadata = await asyncio.to_thread(_verified_native_metadata, row)
             if doc_type and (metadata.get("type") or "note") != doc_type:
                 continue
-            if not metadata_matches(metadata, doc_types, tags, include_archived):
+            if not metadata_matches(metadata, doc_types, tags, include_archived, archive_scope):
                 continue
             candidates.append(str(row["resource_id"]))
         return candidates
@@ -343,6 +344,7 @@ class SearchService:
         limit: int = 10,
         user_id: str | None = None,
         include_archived: bool = False,
+        archive_scope: ArchiveScope | None = None,
         source_uris: list[str] | None = None,
         doc_types: list[str] | None = None,
         source_type: Literal["document", "file", "table"] | None = None,
@@ -354,6 +356,8 @@ class SearchService:
         intersected with the other filters, so retrieval runs only inside that
         set. An empty/omitted list means no restriction (default behaviour).
         """
+        scope = resolve_archive_scope(archive_scope, include_archived)
+        include_archived = scope != "unarchived"
         if mode != "hybrid":
             raise ValidationError("unsupported search mode")
         if source_uris and len(source_uris) > NATIVE_SEARCH_MAX_SOURCE_URIS:
@@ -418,7 +422,7 @@ class SearchService:
         # pre-upgrade pgvector point carries its vault_id, fall back to the
         # source-id path so a user can't miss their own un-backfilled docs.
         from app.services import vault_backfill
-        use_vault_path = not (doc_types or source_type or not include_archived) and vault_path_eligible(
+        use_vault_path = not (doc_types or source_type or scope != "all") and vault_path_eligible(
             collection=collection, doc_type=doc_type, tags=tags, source_uris=source_uris,
         ) and vault_backfill.is_ready()
 
@@ -437,7 +441,7 @@ class SearchService:
             # []    → the named vaults are all unreadable → no results.
             if candidate_vault_ids is not None and not candidate_vault_ids:
                 return SearchResponse(
-                    query=query, total=0, returned=0, total_matches=0, results=[],
+                    query=query, total=0, returned=0, total_matches=0, results=[], archive_scope=scope,
                 )
         elif has_filters:
             async with pool.acquire() as conn:
@@ -509,6 +513,8 @@ class SearchService:
                 # only the document candidate query carries doc status.)
                 if not include_archived:
                     conditions.append("d.status != 'archived'")
+                elif scope == "archived":
+                    conditions.append("d.status = 'archived'")
 
                 where_sql = " AND ".join(conditions) if conditions else "TRUE"
                 if source_type in {"file", "table"}:
@@ -523,6 +529,7 @@ class SearchService:
                         doc_type=doc_type,
                         tags=tags,
                         include_archived=include_archived,
+                        archive_scope=scope,
                         source_uris=source_uris,
                         doc_types=doc_types,
                     )
@@ -538,7 +545,7 @@ class SearchService:
                     candidate_source_ids = [str(r["id"]) for r in rows]
 
                 # Document metadata filters never admit unrelated files/tables.
-                if (not doc_type or doc_type == "table") and not (doc_types or tags) and source_type in {None, "table"}:
+                if scope != "archived" and (not doc_type or doc_type == "table") and not (doc_types or tags) and source_type in {None, "table"}:
                     t_params: list = []
                     t_conds: list[str] = []
                     if vaults:
@@ -559,7 +566,7 @@ class SearchService:
                     trows = await conn.fetch(q, *t_params)
                     candidate_source_ids.extend(str(r["id"]) for r in trows)
 
-                if (not doc_type or doc_type == "file") and not (doc_types or tags) and source_type in {None, "file"}:
+                if scope != "archived" and (not doc_type or doc_type == "file") and not (doc_types or tags) and source_type in {None, "file"}:
                     f_params: list = []
                     # Editor attachments are storage implementation details,
                     # never standalone searchable File resources.
@@ -591,7 +598,7 @@ class SearchService:
                     candidate_source_ids.extend(str(r["id"]) for r in frows)
 
                 if not candidate_source_ids:
-                    return SearchResponse(query=query, total=0, returned=0, total_matches=0, results=[])
+                    return SearchResponse(query=query, total=0, returned=0, total_matches=0, results=[], archive_scope=scope)
 
         target_unique = resolve_first_stage_unique_limit(
             limit=limit,
@@ -612,6 +619,7 @@ class SearchService:
 
         if not hits:
             return SearchResponse(
+                archive_scope=scope,
                 query=query, total=0, returned=0, total_matches=0, results=[],
                 degraded=degraded_reason is not None,
                 degradation_reason=degraded_reason,
@@ -663,6 +671,7 @@ class SearchService:
             "exhaustively enumerated."
         ) if prefetch_capped else None
         return SearchResponse(
+            archive_scope=scope,
             query=query,
             total=returned,  # deprecated alias of `returned`
             returned=returned,
@@ -805,7 +814,7 @@ class SearchService:
                     """
                     SELECT d.id, v.name AS vault_name, d.path, d.title,
                            c.path AS collection,
-                           d.doc_type, d.summary, d.tags
+                           d.doc_type, d.summary, d.tags, d.status
                       FROM documents d
                       JOIN vaults v ON d.vault_id = v.id
                       LEFT JOIN collections c ON c.id = d.collection_id
@@ -817,6 +826,7 @@ class SearchService:
                     meta[("document", str(r["id"]))] = {
                         "vault": r["vault_name"], "path": r["path"],
                         "title": r["title"], "doc_type": r["doc_type"],
+                        "status": r.get("status") or "draft",
                         "summary": r["summary"],
                         "tags": list(r["tags"]) if r["tags"] else [],
                         "collection": r["collection"],
@@ -892,6 +902,7 @@ class SearchService:
                         "vault": r["vault_name"],
                         "path": path,
                         "title": metadata.get("title") or path.rsplit("/", 1)[-1],
+                        "status": metadata.get("status") or "draft",
                         "doc_type": metadata.get("type") or "note",
                         "summary": metadata.get("summary"),
                         "tags": list(metadata.get("tags") or []),
@@ -1120,6 +1131,7 @@ class SearchService:
                     collection_summary=m.get("collection_summary"),
                     vault_description=m.get("vault_description"),
                     doc_type=m["doc_type"], summary=m["summary"],
+                    status=m.get("status"),
                     tags=m["tags"], score=h.score,
                     matched_section=(strip_chunk_metadata_header(h.content) or "")[:500] or None,
                 )
@@ -1248,6 +1260,7 @@ class SearchService:
         doc_types: list[str] | None = None,
         tags: list[str] | None = None,
         include_archived: bool = True,
+        archive_scope: ArchiveScope | None = None,
     ) -> dict:
         """Exact text / regex search across document content.
 
@@ -1264,6 +1277,9 @@ class SearchService:
         valid with the default response shape).
         """
         import re as _re
+
+        scope = resolve_archive_scope(archive_scope, include_archived)
+        include_archived = scope != "unarchived"
 
         if pattern == "":
             raise ValidationError("grep pattern must not be empty")
@@ -1329,6 +1345,7 @@ class SearchService:
                 files_with_matches=files_with_matches,
                 include_text_files=measurement_include_text_files,
                 doc_types=doc_types, tags=tags, include_archived=include_archived,
+                archive_scope=scope,
             )
 
         if replace is not None and doc_service is None:
@@ -1383,6 +1400,8 @@ class SearchService:
                 params.append(tags)
             if not include_archived:
                 conditions.append("d.status != 'archived'")
+            elif scope == "archived":
+                conditions.append("d.status = 'archived'")
 
             where_sql = " AND ".join(conditions)
             # No prefetch cap. The old `LIMIT (limit * 5)` cap was inherited
@@ -1405,7 +1424,7 @@ class SearchService:
             rows = await conn.fetch(
                 f"""
                 SELECT d.id::text as doc_id, v.name as vault, d.path, d.title,
-                       d.metadata,
+                       d.metadata, d.status,
                        c.section_path, c.content, c.chunk_index
                 FROM chunks c
                 JOIN documents d ON c.source_id = d.id AND c.source_type = 'document'
@@ -1431,6 +1450,7 @@ class SearchService:
                     "path": r["path"],
                     "title": r["title"],
                     "metadata": r["metadata"],
+                    **({"status": r["status"]} if r.get("status") is not None else {}),
                     "matches": [],
                 }
 

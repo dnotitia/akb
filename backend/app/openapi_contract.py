@@ -956,6 +956,7 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
         "AkbDocumentEnvelope": _kind_schema(
             "document",
             {
+                "archive_scope": {"type": "string", "enum": ["unarchived", "archived", "all"]},
                 "uri": {"type": "string"},
                 "vault": {"type": "string"},
                 "path": {"type": "string"},
@@ -1007,6 +1008,7 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
         "AkbSearchEnvelope": _kind_schema(
             "search",
             {
+                "archive_scope": {"type": "string", "enum": ["unarchived", "archived", "all"]},
                 "query": {"type": "string"},
                 "total": {"type": "integer"},
                 "returned": {"type": "integer"},
@@ -1047,6 +1049,7 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
         "AkbGrepEnvelope": _kind_schema(
             "grep",
             {
+                "archive_scope": {"type": "string", "enum": ["unarchived", "archived", "all"]},
                 "pattern": {"type": "string"},
                 "regex": {"type": "boolean"},
                 "error": _nullable_string(),

@@ -51,6 +51,7 @@ for (const viewport of [
             return route.fulfill({
               json: {
                 query: "deployment",
+                archive_scope: url.searchParams.get("archive_scope") || "unarchived",
                 total: 1,
                 returned: 1,
                 total_matches: 30,
@@ -74,6 +75,7 @@ for (const viewport of [
             return route.fulfill({
               json: {
                 pattern: "deployment",
+                archive_scope: url.searchParams.get("archive_scope") || "unarchived",
                 regex: url.searchParams.get("regex") === "true",
                 total_docs: 0,
                 total_matches: 0,
@@ -117,14 +119,16 @@ for (const viewport of [
       for (const label of [
         "Regular expression",
         "Case sensitive",
-        "Include archived documents",
       ]) {
         await page.getByLabel(label).click();
         await expect(page.getByLabel(label)).toBeChecked();
       }
+      await page.getByRole("button", { name: "Document state", exact: true }).click();
+      await page.getByRole("menuitemradio", { name: "All documents", exact: true }).click();
+      await expect(page.getByRole("button", { name: "Document state", exact: true })).toHaveText("All documents");
       await expect
-        .poll(() => requests.at(-1)?.searchParams.get("include_archived"))
-        .toBe("true");
+        .poll(() => requests.at(-1)?.searchParams.get("archive_scope"))
+        .toBe("all");
       expect(requests.at(-1)?.searchParams.get("regex")).toBe("true");
       expect(requests.at(-1)?.searchParams.get("case_sensitive")).toBe("true");
       expect(requests.at(-1)?.searchParams.getAll("doc_types")).toEqual([
@@ -132,8 +136,8 @@ for (const viewport of [
       ]);
       await page.goBack();
       await expect(
-        page.getByLabel("Include archived documents"),
-      ).not.toBeChecked();
+        page.getByRole("button", { name: "Document state", exact: true }),
+      ).toHaveText("Current documents");
       expect(
         await page.evaluate(
           () => document.documentElement.scrollWidth <= innerWidth,

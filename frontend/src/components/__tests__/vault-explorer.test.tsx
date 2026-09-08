@@ -88,6 +88,38 @@ beforeEach(() => {
 
 afterEach(() => cleanup());
 
+describe("archive document navigation", () => {
+  it("keeps the scope selector available in an empty Vault and gives compatibility recovery", async () => {
+    browseMock.mockResolvedValue({ vault: "v", path: "", items: [] });
+    renderAt("/vault/v");
+    const user = userEvent.setup();
+    await screen.findByText(/No collections yet/);
+    await user.click(screen.getByRole("button", { name: "Collection document state" }));
+    await user.click(screen.getByRole("menuitemradio", { name: /Archived documents/ }));
+    await screen.findByText(/This server does not support/);
+    expect(screen.queryByText("No archived documents in this Vault.")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "show current documents" }));
+    await screen.findByText(/No collections yet/);
+  });
+
+  it("shows confirmed archives at their Collection path with a readable state marker", async () => {
+    vaultInfoMock.mockResolvedValue({ role: "owner" });
+    browseMock.mockImplementation(async (_v: string, _c: unknown, _d: number, options: { archive_scope?: string } = {}) => ({
+      vault: "v", path: "", archive_scope: options.archive_scope ?? "unarchived",
+      items: options.archive_scope === "archived" ? [{ type: "document", name: "Old guide", path: "guides/old.md", status: "archived" }] : [],
+    }));
+    renderAt("/vault/v");
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Collection document state" }));
+    await user.click(screen.getByRole("menuitemradio", { name: /Archived documents/ }));
+    await user.click(await screen.findByRole("button", { name: "guides" }));
+    expect(screen.getByRole("treeitem", { name: /Document:\s*Old guide\s*Archived/ })).toHaveAttribute("href", "/vault/v/doc/guides%2Fold.md");
+    expect(screen.getByRole("button", { name: "Resource type" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "Collection actions for guides" }));
+    expect(screen.queryByRole("menuitem", { name: /Delete collection/ })).not.toBeInTheDocument();
+  });
+});
+
 describe("VaultExplorer — rendering", () => {
   it("renders collections from browse response", async () => {
     renderAt("/vault/v");
