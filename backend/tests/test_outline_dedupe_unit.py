@@ -113,6 +113,16 @@ async def test_the_limit_bounds_headings_not_chunks(outline):
     assert "c.section_path <> ''" in sql
 
 
+async def test_headings_that_first_appear_together_have_a_stable_order(outline):
+    service, connection = outline([{"section_path": "# Guide"}])
+
+    await service.list_section_headings("v", "d-1")
+
+    # `MIN(chunk_index)` can tie when a document's chunks were re-indexed;
+    # without a second key the outline would reorder between identical calls.
+    assert "ORDER BY first_chunk_index, c.section_path" in (connection.sql or "")
+
+
 async def test_no_limit_emits_no_limit_clause(outline):
     service, connection = outline([{"section_path": "# Guide"}])
 

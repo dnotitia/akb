@@ -196,6 +196,32 @@ def strip_chunk_overlap_prefix(previous: str | None, current: str | None) -> str
     return current
 
 
+def canonical_chunk_id(value) -> str | None:
+    """A chunk id in one canonical spelling, or None if it is not a uuid.
+
+    Drivers return the same id in different shapes — lower-case, upper-case,
+    brace- or urn-wrapped — because each store round-trips it through its own
+    type. Matching a hit against a `chunks` row on the raw string therefore
+    misses for anything but the spelling PostgreSQL happens to emit. Both
+    sides of that lookup go through here instead.
+    """
+    if value is None:
+        return None
+    try:
+        return str(uuid.UUID(str(value)))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _chunk_index_of(hit, chunk_indexes: dict[str, int]) -> int | None:
+    """The ordinal of the chunk a hit matched, or None when it is unknown —
+    an id the driver did not spell as a uuid, or a chunk row that is gone."""
+    canonical = canonical_chunk_id(hit.chunk_id)
+    if canonical is None:
+        return None
+    return chunk_indexes.get(canonical)
+
+
 def _row_value(row, key, default=None):
     """`row[key]` for asyncpg Records and plain dicts alike, tolerating a
     projection that did not select `key`."""
@@ -1295,12 +1321,13 @@ class SearchService:
             # truth for chunk rows, and this is one keyed lookup for the whole
             # result page. A hit whose chunk row has since been deleted simply
             # gets no ordinal; the hit itself is unaffected.
-            chunk_uuids: list[uuid.UUID] = []
-            for h in hits:
-                try:
-                    chunk_uuids.append(uuid.UUID(str(h.chunk_id)))
-                except (TypeError, ValueError):
-                    continue
+            chunk_uuids = sorted(
+                {
+                    canonical
+                    for canonical in (canonical_chunk_id(h.chunk_id) for h in hits)
+                    if canonical is not None
+                }
+            )
             if chunk_uuids:
                 rows = await conn.fetch(
                     """
@@ -1308,13 +1335,13 @@ class SearchService:
                       FROM chunks c
                      WHERE c.id = ANY($1::uuid[])
                     """,
-                    chunk_uuids,
+                    [uuid.UUID(x) for x in chunk_uuids],
                 )
                 for r in rows:
-                    chunk_id = _row_value(r, "chunk_id")
+                    chunk_id = canonical_chunk_id(_row_value(r, "chunk_id"))
                     chunk_index = _row_value(r, "chunk_index")
                     if chunk_id is not None and isinstance(chunk_index, int):
-                        chunk_indexes[str(chunk_id)] = chunk_index
+                        chunk_indexes[chunk_id] = chunk_index
 
         from app.services.uri_service import doc_uri, table_uri, file_uri
 
@@ -1363,7 +1390,7 @@ class SearchService:
                         ) or ""
                     )[:500] or None,
                     section_path=(h.section_path or None),
-                    chunk_index=chunk_indexes.get(str(h.chunk_id)),
+                    chunk_index=_chunk_index_of(h, chunk_indexes),
                 )
             )
         return results
@@ -1923,7 +1950,7 @@ class SearchService:
                   AND c.section_path IS NOT NULL
                   AND c.section_path <> ''
                 GROUP BY c.section_path
-                ORDER BY first_chunk_index
+                ORDER BY first_chunk_index, c.section_path
             """
             if isinstance(limit, int) and limit > 0:
                 sql += f" LIMIT {int(limit)}"

@@ -189,6 +189,31 @@ async def test_a_bracketed_body_line_survives_in_the_excerpt(monkeypatch):
     assert result.matched_section == "[# Some other heading]\nBody text."
 
 
+async def test_an_uppercase_driver_chunk_id_still_matches(monkeypatch):
+    # Drivers round-trip the id through their own type, so the same chunk can
+    # come back upper-cased, brace-wrapped or as a urn. The lookup must not
+    # miss just because PostgreSQL spells it in lower case.
+    doc_id = uuid.uuid4()
+    chunk_id = uuid.uuid4()
+    connection = _Connection(doc_id, [{"chunk_id": str(chunk_id), "chunk_index": 7}])
+    service = _configure(monkeypatch, connection)
+
+    (result,) = await service._hydrate_hits([_hit(str(chunk_id).upper(), doc_id)])
+
+    assert result.chunk_index == 7
+
+
+async def test_a_brace_wrapped_driver_chunk_id_still_matches(monkeypatch):
+    doc_id = uuid.uuid4()
+    chunk_id = uuid.uuid4()
+    connection = _Connection(doc_id, [{"chunk_id": str(chunk_id), "chunk_index": 2}])
+    service = _configure(monkeypatch, connection)
+
+    (result,) = await service._hydrate_hits([_hit("{" + str(chunk_id) + "}", doc_id)])
+
+    assert result.chunk_index == 2
+
+
 async def test_an_empty_section_path_is_reported_as_null(monkeypatch):
     doc_id = uuid.uuid4()
     chunk_id = str(uuid.uuid4())
