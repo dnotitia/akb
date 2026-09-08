@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.3.2 — opt-in per-call usage record
+
+Setting `AKB_MCP_USAGE_LOG=<path>` makes the proxy append one JSON line per
+`tools/call` — `{ts, tool, result_bytes, text_chars, latency_ms}`. Unset, which
+is the default, nothing is opened, formatted or written, and the proxy behaves
+exactly as it did in 2.3.1.
+
+It exists because response size is what a tool call actually costs the agent
+reading it, and until now that number could only be recovered by instrumenting
+the client. The record is taken where every `tools/call` result passes, so the
+proxy-local file tools — which never reach the backend — are measured on the
+same footing as forwarded calls.
+
+Characters, not tokens: a tokenizer in the proxy would pin a model the proxy
+does not otherwise depend on. A call that raised is not recorded, and a path
+that cannot be written warns once and then stays quiet rather than failing
+calls.
+
 ## 2.3.1 — negotiate the legacy protocol version instead of hard-rejecting
 
 The legacy `initialize` path no longer returns `-32602 "Unsupported protocol
