@@ -1,0 +1,18 @@
+# Seed question: the seam between two repositories. The answer lives in one
+# module document, but only in its "Agent contract" section — an arm that
+# retrieves the document and stops has not answered it.
+id: q001
+category: cross-repo-seam
+query: >-
+  How is akb-platform allowed to call Seahorse Pipeline? Name the constraints
+  the Product-API seam puts on every mutating call.
+ground_truth:
+  must_mention:
+    - "Idempotency-Key"
+    - "Product API allowlist"
+    - "credential references"
+  forbidden:
+    - "akb-platform may call any Pipeline endpoint it needs"
+    - "raw secrets are sent in the request payload"
+  source_docs:
+    - "akb://project-akb/coll/product/pipeline/modules/doc/collector.md"
