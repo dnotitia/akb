@@ -200,3 +200,56 @@ def test_cleaned_chunks_of_a_real_split_section_rebuild_the_source_text():
     stored_chars = sum(len(c.content) for c in chunks)
     returned_chars = sum(len(s["content"]) for s in sections)
     assert returned_chars < stored_chars
+
+
+# ── duplicate chunk rows ────────────────────────────────────────────
+
+
+def test_the_same_chunk_is_returned_once():
+    body = "[# A]\nThe paragraph an agent asked for."
+    rows = [
+        _row("# A", body, 0),
+        _row("# A", body, 0),
+        _row("# A", body, 0),
+    ]
+    sections = clean_section_rows(rows)
+
+    assert len(sections) == 1
+    assert sections[0]["section_path"] == "# A"
+    assert sections[0]["chunk_index"] == 0
+    assert sections[0]["content"] == "The paragraph an agent asked for."
+
+
+def test_duplicate_rows_do_not_hide_the_rest_of_the_section():
+    rows = [
+        _row("# A", "[# A]\nFirst.", 0),
+        _row("# A", "[# A]\nFirst.", 0),
+        _row("# B", "[# B]\nSecond.", 1),
+    ]
+    sections = clean_section_rows(rows)
+
+    assert [s["chunk_index"] for s in sections] == [0, 1]
+    assert [s["content"] for s in sections] == ["First.", "Second."]
+
+
+def test_the_same_position_with_different_bodies_keeps_both_rows():
+    # Two disagreeing rows at one position mean the index is in a bad
+    # state; the query has no tiebreaker, so silently picking one would
+    # make the response nondeterministic. Both are returned.
+    rows = [
+        _row("# A", "[# A]\nGeneration one.", 0),
+        _row("# A", "[# A]\nGeneration two.", 0),
+    ]
+    sections = clean_section_rows(rows)
+
+    assert [s["content"] for s in sections] == ["Generation one.", "Generation two."]
+
+
+def test_the_same_index_in_two_documents_is_not_a_duplicate():
+    rows = [
+        _row("# A", "[# A]\nShared body.", 0, doc_id="doc-1"),
+        _row("# A", "[# A]\nShared body.", 0, doc_id="doc-2"),
+    ]
+    sections = clean_section_rows(rows)
+
+    assert len(sections) == 2

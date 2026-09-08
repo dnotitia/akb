@@ -207,10 +207,22 @@ def clean_section_rows(rows) -> list[dict]:
     keeps it from nibbling a character off the start of a new section just
     because the previous section happened to end with the same one.
 
+    A chunk is also emitted once. `chunks` carries no uniqueness constraint on
+    `(source_id, chunk_index)`, so a re-index that inserted before its delete
+    landed leaves the same body sitting at the same position more than once
+    and every `drill_down` — the `pattern` filter especially, which matches on
+    body text — hands the agent the same paragraph several times over. Rows
+    are collapsed on `(document, chunk_index, stored content)`: an identical
+    row is a duplicate and goes, while two rows that genuinely disagree at the
+    same position are both kept. Dropping one of *those* would pick a winner
+    the query has no tiebreaker for, so the response would stop being
+    deterministic in exactly the case where the difference matters.
+
     `rows` must be ordered by `chunk_index`, as both SQL paths in
     `drill_down` are.
     """
     sections: list[dict] = []
+    seen: set[tuple] = set()
     # doc id -> (chunk_index, cleaned content, section_path) of the row this
     # document last contributed. Keyed by document because the same call can
     # (in principle) surface chunks from more than one row of `documents`.
@@ -220,6 +232,12 @@ def clean_section_rows(rows) -> list[dict]:
         chunk_index = r["chunk_index"]
         doc_key = _row_value(r, "doc_id")
         stored = r["content"]
+
+        identity = (doc_key, chunk_index, stored)
+        if identity in seen:
+            continue
+        seen.add(identity)
+
         content = strip_chunk_metadata_header(stored)
         content = strip_chunk_context_line(content, section_path)
         section_first_chunk = content != stored
