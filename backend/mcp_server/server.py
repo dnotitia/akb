@@ -82,6 +82,10 @@ from mcp_server.vault_contract import project_accessible_vault
 from app.services import audit_log, tool_usage
 
 logger = logging.getLogger("akb.mcp")
+# Separate channel so per-call response sizes can be routed (or muted)
+# without touching the rest of the MCP server's logging.
+RESPONSE_SIZE_LOGGER = "akb.mcp.response"
+logger_response = logging.getLogger(RESPONSE_SIZE_LOGGER)
 
 # A non-mutating write preflight changes the result shape and requires the
 # client to retry the original operation.  Keep it behind MCP's experimental
@@ -1677,6 +1681,38 @@ async def list_tools():
     return decorated
 
 
+def _log_response_size(tool: str, encoded: str, *, duration_ms: int) -> None:
+    """One line per `tools/call` carrying what the call actually cost the
+    caller: the serialised response size and how long it took.
+
+    Response size is the number an agent pays for and the one nothing
+    currently reports — `tool_calls` records the call but not its payload, and
+    adding a column there is a schema change the tenant release model wants
+    kept out of a hygiene batch. A log line needs no migration and is enough
+    to size the problem per tool before/after a payload change.
+
+    Measured on the encoded string, after `json.dumps`, so it is the wire
+    length rather than an estimate; `len(...encode())` because a byte count of
+    Korean or Japanese content is roughly three times its character count.
+    Emitted for the error envelope too — a failing tool has a payload cost as
+    well. Never raises: a logging failure must not fail a tool call.
+    """
+    try:
+        logger_response.info(
+            "tools/call tool=%s result_bytes=%d duration_ms=%d",
+            tool,
+            len(encoded.encode("utf-8")),
+            duration_ms,
+            extra={
+                "tool": tool,
+                "result_bytes": len(encoded.encode("utf-8")),
+                "duration_ms": duration_ms,
+            },
+        )
+    except Exception:  # noqa: BLE001 — measurement must never break a call
+        pass
+
+
 async def call_tool(name: str, arguments: dict) -> CallToolResult:
     # Capability-v2 acknowledgement is transport metadata expressed as a
     # reserved tool argument so generic MCP clients can send it through their
@@ -1812,8 +1848,14 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
         # deliberately do NOT switch this MCP encode to `to_json`: it would shift
         # datetime/enum output for ~6 tools (put/get/update/move/edit/search) and
         # raise on the odd non-UTF8 bytes that `default=str` degrades to a string.
+        encoded = json.dumps(result, ensure_ascii=False, default=str)
+        _log_response_size(
+            name,
+            encoded,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
         return CallToolResult(
-            content=[TextContent(type="text", text=json.dumps(result, ensure_ascii=False, default=str))]
+            content=[TextContent(type="text", text=encoded)]
         )
     except Exception as e:
         # Last-resort envelope so the canonical {error, code, ...} shape
@@ -1843,11 +1885,17 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
                 duration_ms=int((time.perf_counter() - started) * 1000),
                 is_write=is_write,
             )
+        encoded = json.dumps(envelope, ensure_ascii=False, default=str)
+        _log_response_size(
+            name,
+            encoded,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
         return CallToolResult(
             content=[
                 TextContent(
                     type="text",
-                    text=json.dumps(envelope, ensure_ascii=False, default=str),
+                    text=encoded,
                 )
             ]
         )
