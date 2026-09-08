@@ -1,8 +1,8 @@
 #!/bin/bash
 #
-# AKB Collection Lifecycle E2E Tests
-# Covers akb_create_collection / akb_delete_collection MCP tools and the
-# matching REST endpoints.
+# AKB Collection REST Boundary E2E Tests
+# Detailed MCP collection behavior lives in the authenticated SDK pytest suite;
+# this shell lane retains the REST lifecycle and permission contracts.
 #
 set -uo pipefail
 
@@ -157,161 +157,14 @@ REST_HTTP=$(curl -sk -o "$REST_BODY" -w "%{http_code}" \
 [ "$REST_HTTP" = "404" ] && pass "REST missing collection → 404" \
   || fail "REST missing collection 404" "http=$REST_HTTP; body=$(cat "$REST_BODY")"
 
-# ── 3. Create empty collection ──────────────────────────────
+# The REST ACL checks below need a live collection to target. Keep this MCP
+# setup call as preparation; the lifecycle assertions themselves run through
+# the REST surface or the SDK pytest suite.
+mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"keepempty\"}" | mcp_result >/dev/null
+
+# ── 1. REST ACL — reader cannot create or delete ─────────────
 echo ""
-echo "▸ 3. Create empty collection"
-
-R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"specs\"}" | mcp_result)
-OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok'))" 2>/dev/null)
-CREATED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('created'))" 2>/dev/null)
-COLL_PATH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['collection']['path'])" 2>/dev/null)
-COLL_DC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['collection']['doc_count'])" 2>/dev/null)
-[ "$OK" = "True" ] && [ "$CREATED" = "True" ] && [ "$COLL_PATH" = "specs" ] && [ "$COLL_DC" = "0" ] \
-  && pass "akb_create_collection(specs) → ok, created=true, doc_count=0" \
-  || fail "akb_create_collection specs" "ok=$OK created=$CREATED path=$COLL_PATH doc_count=$COLL_DC; raw=$R"
-
-# Browse verifies the new empty collection appears at top level
-R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
-HAS_SPECS=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(next((i for i in d.get('items',[]) if i.get('name')=='specs' and i.get('type')=='collection'), {}).get('doc_count', -1))" 2>/dev/null)
-[ "$HAS_SPECS" = "0" ] && pass "browse shows 'specs' at top level with doc_count=0" \
-  || fail "browse empty specs" "doc_count=$HAS_SPECS"
-
-# ── 4. Idempotent create ────────────────────────────────────
-echo ""
-echo "▸ 4. Idempotent create"
-
-R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"specs\"}" | mcp_result)
-CREATED2=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('created'))" 2>/dev/null)
-[ "$CREATED2" = "False" ] && pass "second create returns created=false" \
-  || fail "idempotent create" "expected created=false, got created=$CREATED2; raw=$R"
-
-# ── 5. Path normalization ───────────────────────────────────
-echo ""
-echo "▸ 5. Path normalization"
-
-R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"  /api-specs/  \"}" | mcp_result)
-NORM_PATH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['collection']['path'])" 2>/dev/null)
-[ "$NORM_PATH" = "api-specs" ] && pass "input '  /api-specs/  ' normalized to 'api-specs'" \
-  || fail "normalization (return)" "expected 'api-specs', got '$NORM_PATH'; raw=$R"
-
-# Browse: confirm normalized path is the one stored
-R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
-HAS_NORM=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(any(i.get('name')=='api-specs' and i.get('type')=='collection' for i in d.get('items',[])))" 2>/dev/null)
-[ "$HAS_NORM" = "True" ] && pass "browse shows normalized 'api-specs'" \
-  || fail "normalization (browse)" "api-specs not found in browse"
-
-# ── 6. Invalid paths rejected ───────────────────────────────
-echo ""
-echo "▸ 6. Invalid paths rejected"
-
-INVALID_PATHS=("" "/" "../etc" "a/../b")
-for p in "${INVALID_PATHS[@]}"; do
-  # JSON-escape the path
-  esc_p=$(python3 -c "import sys,json; print(json.dumps(sys.argv[1]))" "$p")
-  R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":$esc_p}" | mcp_result)
-  CODE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('code',''))" 2>/dev/null)
-  [ "$CODE" = "invalid_path" ] && pass "rejected invalid path: $(printf %q "$p")" \
-    || fail "invalid path '$p'" "expected code=invalid_path, got code='$CODE'; raw=$R"
-done
-
-# ── 7. Delete empty collection ──────────────────────────────
-echo ""
-echo "▸ 7. Delete empty collection"
-
-R=$(mcp_call akb_delete_collection "{\"vault\":\"$VAULT\",\"path\":\"specs\"}" | mcp_result)
-DOK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok'))" 2>/dev/null)
-DDOCS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deleted_docs'))" 2>/dev/null)
-DFILES=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deleted_files'))" 2>/dev/null)
-[ "$DOK" = "True" ] && [ "$DDOCS" = "0" ] && [ "$DFILES" = "0" ] \
-  && pass "delete empty 'specs' → ok, deleted_docs=0, deleted_files=0" \
-  || fail "delete empty specs" "ok=$DOK deleted_docs=$DDOCS deleted_files=$DFILES; raw=$R"
-
-# Browse: specs should be gone
-R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
-GONE_SPECS=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(any(i.get('name')=='specs' and i.get('type')=='collection' for i in d.get('items',[])))" 2>/dev/null)
-[ "$GONE_SPECS" = "False" ] && pass "browse no longer lists 'specs'" \
-  || fail "browse after delete empty" "specs still present"
-
-# ── 8. Delete non-empty without recursive → rejected ────────
-echo ""
-echo "▸ 8. Delete non-empty without recursive → rejected"
-
-# Create 'docs' and put a doc inside
-R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"docs\"}" | mcp_result)
-NE_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok'))" 2>/dev/null)
-[ "$NE_OK" = "True" ] && pass "create 'docs' for non-empty test" \
-  || fail "create docs" "ok=$NE_OK; raw=$R"
-
-R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"docs\",\"title\":\"DocsDoc\",\"content\":\"## body\",\"type\":\"note\",\"tags\":[]}" | mcp_result)
-NE_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
-[ -n "$NE_DOC_URI" ] && pass "put doc into 'docs' ($NE_DOC_URI)" \
-  || fail "put docs doc" "no uri; raw=$R"
-
-# Delete without recursive
-R=$(mcp_call akb_delete_collection "{\"vault\":\"$VAULT\",\"path\":\"docs\"}" | mcp_result)
-NE_CODE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('code',''))" 2>/dev/null)
-NE_DC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('details',{}).get('doc_count', -1))" 2>/dev/null)
-[ "$NE_CODE" = "conflict" ] && [ "$NE_DC" -ge 1 ] 2>/dev/null \
-  && pass "non-empty delete rejected with code=conflict, doc_count=$NE_DC" \
-  || fail "non-empty no-recursive" "code=$NE_CODE doc_count=$NE_DC; raw=$R"
-
-# Doc must still exist
-R=$(mcp_call akb_get "{\"uri\":\"$NE_DOC_URI\"}" | mcp_result)
-STILL_EXISTS=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' not in d and d.get('title','')!='')" 2>/dev/null)
-[ "$STILL_EXISTS" = "True" ] && pass "doc still exists after rejected delete" \
-  || fail "doc after rejected delete" "doc missing or errored; raw=$R"
-
-# ── 9. Delete recursive cascade ─────────────────────────────
-echo ""
-echo "▸ 9. Delete recursive cascade"
-
-R=$(mcp_call akb_delete_collection "{\"vault\":\"$VAULT\",\"path\":\"docs\",\"recursive\":true}" | mcp_result)
-CASC_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok'))" 2>/dev/null)
-CASC_DOCS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deleted_docs', -1))" 2>/dev/null)
-[ "$CASC_OK" = "True" ] && [ "$CASC_DOCS" -ge 1 ] 2>/dev/null \
-  && pass "recursive delete: ok, deleted_docs=$CASC_DOCS" \
-  || fail "recursive delete" "ok=$CASC_OK deleted_docs=$CASC_DOCS; raw=$R"
-
-# Doc is gone
-R=$(mcp_call akb_get "{\"uri\":\"$NE_DOC_URI\"}" | mcp_result)
-DOC_GONE=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
-[ "$DOC_GONE" = "True" ] && pass "doc gone after recursive delete" \
-  || fail "doc after recursive" "doc still retrievable; raw=$R"
-
-# Collection is gone
-R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
-COLL_GONE=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(any(i.get('name')=='docs' and i.get('type')=='collection' for i in d.get('items',[])))" 2>/dev/null)
-[ "$COLL_GONE" = "False" ] && pass "collection 'docs' gone after recursive delete" \
-  || fail "collection after recursive" "'docs' still present in browse"
-
-# ── 10. Empty-is-valid invariant ────────────────────────────
-echo ""
-echo "▸ 10. Empty-is-valid invariant"
-
-R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"keepempty\"}" | mcp_result)
-KE_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok'))" 2>/dev/null)
-[ "$KE_OK" = "True" ] && pass "created 'keepempty'" \
-  || fail "create keepempty" "ok=$KE_OK; raw=$R"
-
-R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"keepempty\",\"title\":\"OnlyDoc\",\"content\":\"## c\",\"type\":\"note\",\"tags\":[]}" | mcp_result)
-KE_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
-[ -n "$KE_DOC_URI" ] && pass "put OnlyDoc ($KE_DOC_URI) into 'keepempty'" \
-  || fail "put OnlyDoc" "no uri; raw=$R"
-
-R=$(mcp_call akb_delete "{\"uri\":\"$KE_DOC_URI\"}" | mcp_result)
-KE_DEL=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deleted'))" 2>/dev/null)
-[ "$KE_DEL" = "True" ] && pass "deleted OnlyDoc" \
-  || fail "delete OnlyDoc" "deleted=$KE_DEL; raw=$R"
-
-# Browse: keepempty should still show, doc_count=0
-R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
-KE_DC=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(next((i for i in d.get('items',[]) if i.get('name')=='keepempty' and i.get('type')=='collection'), {}).get('doc_count', -1))" 2>/dev/null)
-[ "$KE_DC" = "0" ] && pass "'keepempty' survives last-doc delete with doc_count=0" \
-  || fail "empty-is-valid invariant" "doc_count=$KE_DC (expected 0)"
-
-# ── 11. REST ACL — reader cannot create or delete ───────────
-echo ""
-echo "▸ 11. REST ACL"
+echo "▸ 1. REST ACL"
 
 # Reader has NO access at all (no grant) — expect 403 on create
 HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
@@ -343,9 +196,9 @@ HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
 [ "$HTTP_CODE" = "403" ] && pass "reader role REST DELETE → 403" \
   || fail "reader DELETE 403" "got HTTP $HTTP_CODE (expected 403)"
 
-# ── 11b. Writer cannot bypass admin-only table deletion ─────
+# ── 1b. Writer cannot bypass admin-only table deletion ───────
 echo ""
-echo "▸ 11b. Table deletion permission boundary"
+echo "▸ 1b. Table deletion permission boundary"
 
 # Promote the second account to Writer, then create a table inside a
 # collection as the owner. Writer must be denied both by the dedicated table
@@ -386,9 +239,9 @@ ADMIN_DELETE=$(python3 -c 'import sys,json; print(json.load(sys.stdin).get("dele
   && pass "owner recursive collection delete removes one table" \
   || fail "owner collection table delete" "http=$HTTP_CODE deleted_tables=$ADMIN_DELETE; body=$(cat "$REST_BODY")"
 
-# ── 12. Nested parent delete (prefix semantics) ─────────────
+# ── 2. Nested parent delete (prefix semantics) ───────────────
 echo ""
-echo "▸ 12. Nested parent delete"
+echo "▸ 2. Nested parent delete"
 
 # Create only "nested/inner" — no row at "nested" itself. This is the
 # bug reproducer: the client tree synthesizes a parent that has no
@@ -416,27 +269,12 @@ NP_DSUB=$(python3 -c 'import sys,json; print(json.load(sys.stdin).get("deleted_s
   && pass "REST DELETE 'nested' recursive → 200 deleted_sub_collections=$NP_DSUB" \
   || fail "nested recursive 200" "http=$NP_HTTP deleted_sub_collections=$NP_DSUB; body=$(cat /tmp/np_body.json)"
 
-# Browse: neither 'nested' nor 'nested/inner' should be present
-R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
-HAS_NESTED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(any(i.get('name')=='nested' and i.get('type')=='collection' for i in d.get('items',[])))" 2>/dev/null)
-[ "$HAS_NESTED" = "False" ] && pass "browse no longer shows 'nested'" \
-  || fail "browse after nested recursive delete" "'nested' still present"
-
 # Bonus: truly-missing path still returns 404 (NotFoundError invariant)
 NP_HTTP=$(curl -sk -o /dev/null -w "%{http_code}" \
   -X DELETE "$BASE_URL/api/v1/collections/$VAULT/totally-absent" \
   -H "Authorization: Bearer $PAT" 2>/dev/null)
 [ "$NP_HTTP" = "404" ] && pass "REST DELETE truly-missing path → 404" \
   || fail "truly-missing 404" "got HTTP $NP_HTTP (expected 404)"
-
-# Bonus: same via MCP — sub_collection_count surfaces on `not_empty`
-R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"nested2/inner\"}" | mcp_result)
-R=$(mcp_call akb_delete_collection "{\"vault\":\"$VAULT\",\"path\":\"nested2\"}" | mcp_result)
-NP_MCP_CODE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('code',''))" 2>/dev/null)
-NP_MCP_SUB=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('details',{}).get('sub_collection_count', -1))" 2>/dev/null)
-[ "$NP_MCP_CODE" = "conflict" ] && [ "$NP_MCP_SUB" -ge 1 ] 2>/dev/null \
-  && pass "MCP delete_collection on nested parent → conflict sub_collection_count=$NP_MCP_SUB" \
-  || fail "MCP nested not_empty" "code=$NP_MCP_CODE sub_collection_count=$NP_MCP_SUB; raw=$R"
 
 # Clean up the ephemeral Vault even when an earlier assertion failed. The
 # generated test users are intentionally left to the auth lifecycle suites.
