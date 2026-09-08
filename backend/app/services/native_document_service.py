@@ -16,6 +16,7 @@ import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import NoReturn
+from app.services.search_filters import ArchiveScope
 
 import asyncpg
 
@@ -1272,7 +1273,7 @@ class NativeDocumentService(DocumentService):
         content_type: str = "all",
         include_hashes: bool = False,
         include_archived: bool = False,
-        archive_scope: str | None = None,
+        archive_scope: ArchiveScope | None = None,
     ) -> BrowseResponse:
         """Return the legacy browse envelope with Native document Heads."""
         from app.services.search_filters import resolve_archive_scope, status_matches

@@ -19,6 +19,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Literal
+from app.services.search_filters import ArchiveScope
 
 import asyncpg
 
@@ -652,7 +653,7 @@ class M1NativeGrepService:
         doc_types: list[str] | None = None,
         tags: list[str] | None = None,
         include_archived: bool = True,
-        archive_scope: str | None = None,
+        archive_scope: ArchiveScope | None = None,
     ) -> dict[str, Any]:
         from app.services.search_filters import metadata_matches, resolve_archive_scope
 

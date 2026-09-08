@@ -49,8 +49,12 @@ invent a remembered prior state.
   requires Owner. Historical/diff views and read-only Vaults cannot mutate state.
   Unavailable actions show the reason instead of disappearing.
 - A PATCH alone is not considered proof of state change: the reader reloads the
-  current document and verifies its status before notifying other views. Errors
-  remain in the confirmation dialog without closing it or claiming success.
+  current document, refreshes other views with the observed state, and verifies
+  its status before claiming success. If that verification fails after an
+  accepted write, the dialog offers **Check current state**. This retries only
+  the read, including after closing and reopening the dialog, rather than
+  repeating the mutation with an outdated concurrency token. A different
+  observed state is reported without overwriting it or claiming success.
 - Unsupported explicit filters suppress untrusted results and offer a return to
   current documents. No misleading zero-archive count is shown.
 - The archived-only tree does not expose recursive Collection deletion, because

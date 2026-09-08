@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { changeDocumentArchiveState, documentArchiveDisabledReason } from "@/lib/document-archive";
+import { ArchiveVerificationError, changeDocumentArchiveState, checkDocumentArchiveState, documentArchiveDisabledReason } from "@/lib/document-archive";
 import { getDocument, updateDocument } from "@/lib/api";
 
 vi.mock("@/lib/api", () => ({ getDocument: vi.fn(), updateDocument: vi.fn() }));
@@ -24,6 +24,14 @@ describe("document archive permissions", () => {
 });
 
 describe("verified archive mutations", () => {
+  it("recovers an accepted mutation by reading, never repeating the PATCH", async () => {
+    vi.mocked(updateDocument).mockResolvedValue({ current_commit: "new" } as never);
+    vi.mocked(getDocument).mockRejectedValueOnce(new Error("503"))
+      .mockResolvedValueOnce({ status: "active", path: "a.md", current_commit: "new" } as never);
+    await expect(changeDocumentArchiveState("team", "a.md", "active", "old")).rejects.toBeInstanceOf(ArchiveVerificationError);
+    expect(await checkDocumentArchiveState("team", "a.md")).toMatchObject({ status: "active", current_commit: "new" });
+    expect(updateDocument).toHaveBeenCalledOnce();
+  });
   it.each(["active", "archived"] as const)("patches only status and concurrency token for %s", async (status) => {
     vi.mocked(updateDocument).mockResolvedValue({} as never);
     vi.mocked(getDocument).mockResolvedValue({ status, path: "research/a.md", title: "A" } as never);

@@ -75,7 +75,7 @@ import { recordRecentDocumentView } from "@/lib/recent-document-views";
 import { ResourceActionsMenu } from "@/components/resource-actions-menu";
 import { ResourceDeleteDialog } from "@/components/resource-delete-dialog";
 import { DocumentMoveDialog } from "@/components/document-move-dialog";
-import { changeDocumentArchiveState, documentArchiveDisabledReason } from "@/lib/document-archive";
+import { ArchiveVerificationError, changeDocumentArchiveState, checkDocumentArchiveState, documentArchiveDisabledReason } from "@/lib/document-archive";
 import { DocumentTitleConflictNotice } from "@/components/document-title-conflict-notice";
 import {
   documentCollection,
@@ -157,6 +157,7 @@ export default function DocumentPage({
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [archiveOpen, setArchiveOpen] = useState(false);
   const [archiveNotice, setArchiveNotice] = useState("");
+  const [archivePending, setArchivePending] = useState<{ vault: string; ref: string; status: "active" | "archived" } | null>(null);
   const [publishOpen, setPublishOpen] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [detailsTab, setDetailsTab] = useState<"info" | "outline" | "relations" | "history">("info");
@@ -763,6 +764,7 @@ export default function DocumentPage({
     historical: isHistorical || isDiffMode,
     guide: doc.path === VAULT_SKILL_PATH,
   });
+  const pendingArchiveCheck = archivePending && archivePending.vault === name && archivePending.ref === docId ? archivePending : null;
 
   const openVersion = (hash?: string, options: { replace?: boolean } = {}) => {
     const params = new URLSearchParams(searchParams);
@@ -1519,20 +1521,31 @@ export default function DocumentPage({
       <ConfirmDialog
         open={archiveOpen}
         onOpenChange={setArchiveOpen}
-        title={doc.status === "archived" ? "Restore this document?" : "Archive this document?"}
-        description={doc.status === "archived"
+        title={pendingArchiveCheck ? "Check document state" : doc.status === "archived" ? "Restore this document?" : "Archive this document?"}
+        description={pendingArchiveCheck ? "The change was accepted. Only the current document will be fetched; the change will not be sent again." : doc.status === "archived"
           ? `Restore as an active document in ${collectionPath || "Vault root"}. Its identity, links, and history stay unchanged. Search may take a moment to catch up.`
           : "Hide this document from current documents and default search. You can find it with the Archived documents filter and restore it later. This does not delete it, revoke access, or disable public links."}
-        confirmLabel={doc.status === "archived" ? "Restore document" : "Archive document"}
+        confirmLabel={pendingArchiveCheck ? "Check current state" : doc.status === "archived" ? "Restore document" : "Archive document"}
         onConfirm={async () => {
-          if (archiveDisabledReason) throw new Error(archiveDisabledReason);
-          const status = doc.status === "archived" ? "active" : "archived";
-          const next = await changeDocumentArchiveState(name!, docId, status, doc.current_commit);
+          if (!pendingArchiveCheck && archiveDisabledReason) throw new Error(archiveDisabledReason);
+          const status = pendingArchiveCheck?.status ?? (doc.status === "archived" ? "active" : "archived");
+          let next;
+          try {
+            next = pendingArchiveCheck
+              ? await checkDocumentArchiveState(name!, docId)
+              : await changeDocumentArchiveState(name!, docId, status, doc.current_commit);
+          } catch (error) {
+            if (error instanceof ArchiveVerificationError) setArchivePending({ vault: name!, ref: docId, status });
+            throw error;
+          }
+          setArchivePending(null);
           setDocOverride(next);
           await queryClient.invalidateQueries({ queryKey: ["document", name] });
           void queryClient.invalidateQueries({ queryKey: ["document-history", name] });
           refetchTree();
-          setArchiveNotice(status === "active" ? `Restored to ${collectionPath || "Vault root"}.` : "Document archived. Find it using the Archived documents filter.");
+          setArchiveNotice(next.status !== status
+            ? "Current state loaded. The requested state is not present; review the document before making another change."
+            : status === "active" ? `Restored to ${collectionPath || "Vault root"}.` : "Document archived. Find it using the Archived documents filter.");
           if (commitHash) openVersion(undefined, { replace: true });
         }}
       />

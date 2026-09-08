@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
+from app.services.search_filters import ArchiveScope
 
 if TYPE_CHECKING:
     from app.services.external_git_validation import ValidatedRemote
@@ -1829,7 +1830,7 @@ class DocumentService:
         content_type: str = "all",
         include_hashes: bool = False,
         include_archived: bool = False,
-        archive_scope: str | None = None,
+        archive_scope: ArchiveScope | None = None,
     ) -> BrowseResponse:
         """Unified vault browse.
 

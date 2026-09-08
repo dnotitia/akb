@@ -90,6 +90,7 @@ const handlers = [
       : "Initial result";
     return HttpResponse.json({
       query: "deployment",
+      archive_scope: url.searchParams.get("archive_scope") || "unarchived",
       total: 1,
       returned: 1,
       total_matches: 30,
@@ -111,6 +112,7 @@ const handlers = [
     const url = new URL(request.url);
     return HttpResponse.json({
       pattern: "deployment",
+      archive_scope: url.searchParams.get("archive_scope") || "unarchived",
       regex: url.searchParams.get("regex") === "true",
       total_docs: 0,
       total_matches: 0,
