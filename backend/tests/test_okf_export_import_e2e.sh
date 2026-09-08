@@ -55,7 +55,7 @@ echo "$D1" | grep -q '"uri"' && pass "Doc 1 created (specs/)" || fail "Doc1" "$D
 
 D2=$(acurl -X POST "$BASE_URL/api/v1/documents" \
   -H 'Content-Type: application/json' \
-  -d "{\"vault\":\"$SRC_VAULT\",\"slug\":\"readme\",\"title\":\"Readme\",\"content\":\"# Readme\\n\\nRoot doc.\",\"type\":\"note\"}")
+  -d "{\"vault\":\"$SRC_VAULT\",\"collection\":\"\",\"slug\":\"readme\",\"title\":\"Readme\",\"content\":\"# Readme\\n\\nRoot doc.\",\"type\":\"note\"}")
 echo "$D2" | grep -q '"uri"' && pass "Doc 2 created (root)" || fail "Doc2" "$D2"
 
 # Table column types are AKB's set: text | number | boolean | date | json.
