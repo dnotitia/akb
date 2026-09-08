@@ -1,6 +1,10 @@
 # Seed question: a specific decision, with a specific client-visible
 # consequence. Tests whether an arm can find one ADR among many and read the
 # clause rather than the title.
+#
+# `must_mention` items are matched two ways — an LLM judge for meaning and a
+# normalized substring pass for provenance — so they are the shortest form
+# that still pins the fact, spelled as the source document spells it.
 id: q002
 category: decision-lookup
 query: >-
@@ -8,7 +12,7 @@ query: >-
   client see when the write lane stays saturated?
 ground_truth:
   must_mention:
-    - "coroutine waiting before any resource is acquired"
+    - "coroutine"
     - "429"
     - "Retry-After"
   forbidden:

@@ -13,20 +13,21 @@ import os
 import re
 import statistics
 import sys
-from pathlib import Path
 from typing import Any
 
 import yaml
 
 from .llm_client import LLM, LLMError
+from .paths import evalset_dir, runs_dir
 
 
-ROOT = Path(__file__).resolve().parent.parent
 # `evalset/` is the private Korean-law set the harness shipped against;
 # `EVALSET_DIR` points the same code at another one — e.g. the tracked
-# `evalset-project-akb/` seed questions.
-EVALSET = Path(os.environ.get("EVALSET_DIR", ROOT / "evalset"))
-RUNS = Path(os.environ.get("RUNS_DIR", ROOT / "runs"))
+# `evalset-project-akb/` seed questions. Resolved in `paths` so the runner,
+# the judge prep and this aggregator cannot disagree about which questions
+# a run is about.
+EVALSET = evalset_dir()
+RUNS = runs_dir("runs")
 
 # The accuracy the batch is gated on. A payload change that makes answers
 # cheaper is only worth having if the answers are still right, so the gate
@@ -239,12 +240,21 @@ def tokens_per_correct_answer(total_tokens: float, passes: int) -> float:
     return total_tokens / passes
 
 
-def payload_per_call(result_chars: list[int], questions: int) -> dict[str, float]:
+def payload_per_call(
+    result_chars: list[int] | None, questions: int
+) -> dict[str, float] | None:
     """Aggregate the per-tool-call response sizes an agent had to read.
+
+    `None` in means the runs carried no measurable size at all, and `None`
+    comes back out — reporting that as `0` would read as "this arm sent
+    nothing", which is the opposite of "nobody wrote it down". An empty list
+    is different: the arm ran and made no tool calls, and zero is the answer.
 
     Characters, not tokens: the runner stores what the tool returned, and the
     token count depends on a tokenizer the harness deliberately does not pin.
     """
+    if result_chars is None:
+        return None
     calls = len(result_chars)
     total = float(sum(result_chars))
     return {
@@ -300,15 +310,22 @@ def tradeoff_row(
     }
 
 
-def arm_result_chars(arm: str, qids: list[str]) -> list[int]:
+def arm_result_chars(arm: str, qids: list[str]) -> list[int] | None:
     """Per-call response sizes for one arm, read from the run summaries.
 
     The judge file carries the *count* of tool calls; the sizes live in the
     run summary's `tool_calls_clean`, which is where the runner already wrote
     `result_chars`. Reading them here means `--aggregate` reports payload for
-    runs that were judged before this readout existed.
+    runs that were judged before this readout existed — those summaries carry
+    `result_text` instead, and its length is used.
+
+    Returns `None` when nothing could be measured: no readable summary, or
+    calls that carry neither field. An arm that genuinely made no tool calls
+    returns `[]`, which is a measured zero and not the same thing.
     """
     chars: list[int] = []
+    calls_seen = 0
+    summaries_read = 0
     for qid in qids:
         summary_path = RUNS / arm / f"{qid}.summary.json"
         if not summary_path.exists():
@@ -317,13 +334,19 @@ def arm_result_chars(arm: str, qids: list[str]) -> list[int]:
             summary = json.loads(summary_path.read_text())
         except (OSError, json.JSONDecodeError):
             continue
+        summaries_read += 1
         for call in summary.get("tool_calls_clean") or []:
+            calls_seen += 1
             size = call.get("result_chars")
             if isinstance(size, int):
                 chars.append(size)
             elif isinstance(call.get("result_text"), str):
                 chars.append(len(call["result_text"]))
-    return chars
+    if chars:
+        return chars
+    if summaries_read and not calls_seen:
+        return []
+    return None
 
 
 def _infer_verdict(d: dict[str, Any]) -> str:
@@ -351,9 +374,15 @@ def _infer_verdict(d: dict[str, Any]) -> str:
 def aggregate(
     *,
     accuracy_floor: float = DEFAULT_ACCURACY_FLOOR,
-    redirect_cost: float = 0.0,
-    saving_per_call: float = 0.0,
+    redirect_cost: float | None = None,
+    saving_per_call: float | None = None,
 ) -> dict[str, Any]:
+    """Print the run's readout and return the per-arm metrics.
+
+    The tradeoff needs both cost inputs. With neither, the readout is the
+    accuracy gate alone — which is the honest output, because the harness
+    does not know what a redirect costs in a given deployment.
+    """
     print("\n=== AGGREGATE ===\n")
     rows = []
     for arm in ARMS:
@@ -415,36 +444,49 @@ def aggregate(
     # A payload change is worth having when what it saves per question is
     # more than what the answers it breaks cost to redirect. `D` and the
     # per-call saving are operator inputs — the harness does not know what a
-    # re-prompt costs in this deployment, and refuses to invent it.
-    print(
-        f"\n--- accuracy floor {accuracy_floor:.2f} "
-        f"(D={redirect_cost:.0f} tok/redirect, saving={saving_per_call:.0f} tok/call) ---"
-    )
-    if redirect_cost <= 0 and saving_per_call <= 0:
-        print("  no cost inputs given — pass/fail only "
-              "(pass --redirect-cost and --saving-per-call for the tradeoff)")
-    print(f"  {'arm':<18}{'floor':<8}{'p':<8}{'verdict':<9}{'(1-p)xD':<12}{'saving/q':<12}{'net/q':<12}{'break-even p':<13}")
+    # re-prompt costs in this deployment, and refuses to invent it, so
+    # without both the readout stops at the gate.
+    have_costs = redirect_cost is not None and saving_per_call is not None
     floors = [accuracy_floor, *TRADEOFF_FLOORS]
-    for arm, _ in rows:
-        m = metrics[arm]
-        arm_rows = []
-        for floor in floors:
-            row = tradeoff_row(
-                pass_rate=m["pass_rate"],
-                floor=floor,
-                redirect_cost=redirect_cost,
-                saving_per_call=saving_per_call,
-                calls_per_question=m["mean_tools"],
-            )
-            arm_rows.append(row)
-            break_even = row["break_even_accuracy"]
-            break_even_text = "-" if break_even is None else f"{break_even:.3f}"
-            print(
-                f"  {arm:<18}{floor:<8.2f}{row['pass_rate']:<8.3f}{row['verdict']:<9}"
-                f"{row['expected_redirect_tokens']:<12.0f}{row['saving_tokens']:<12.0f}"
-                f"{row['net_tokens']:<12.0f}{break_even_text:<13}"
-            )
-        metrics[arm]["tradeoff"] = arm_rows
+    if have_costs:
+        print(
+            f"\n--- accuracy floor {accuracy_floor:.2f} "
+            f"(D={redirect_cost:.0f} tok/redirect, saving={saving_per_call:.0f} tok/call) ---"
+        )
+        print(f"  {'arm':<18}{'floor':<8}{'p':<8}{'verdict':<9}{'(1-p)xD':<12}{'saving/q':<12}{'net/q':<12}{'break-even p':<13}")
+        for arm, _ in rows:
+            m = metrics[arm]
+            arm_rows = []
+            for floor in floors:
+                row = tradeoff_row(
+                    pass_rate=m["pass_rate"],
+                    floor=floor,
+                    redirect_cost=redirect_cost,
+                    saving_per_call=saving_per_call,
+                    calls_per_question=m["mean_tools"],
+                )
+                arm_rows.append(row)
+                break_even = row["break_even_accuracy"]
+                break_even_text = "-" if break_even is None else f"{break_even:.3f}"
+                print(
+                    f"  {arm:<18}{floor:<8.2f}{row['pass_rate']:<8.3f}{row['verdict']:<9}"
+                    f"{row['expected_redirect_tokens']:<12.0f}{row['saving_tokens']:<12.0f}"
+                    f"{row['net_tokens']:<12.0f}{break_even_text:<13}"
+                )
+            metrics[arm]["tradeoff"] = arm_rows
+    else:
+        print(f"\n--- accuracy floor {accuracy_floor:.2f} ---")
+        print("  pass/fail only — give both --redirect-cost and "
+              "--saving-per-call for the cost tradeoff")
+        print(f"  {'arm':<18}{'floor':<8}{'p':<8}{'verdict':<9}")
+        for arm, _ in rows:
+            m = metrics[arm]
+            for floor in floors:
+                print(
+                    f"  {arm:<18}{floor:<8.2f}{m['pass_rate']:<8.3f}"
+                    f"{gate_verdict(m['pass_rate'], floor):<9}"
+                )
+            metrics[arm]["tradeoff"] = None
 
     # Per-category breakdown.
     print("\n--- per category ---")
@@ -460,11 +502,16 @@ def aggregate(
             if v:
                 print(f"    {arm}: {sum(v)}/{len(v)} PASS")
 
-    # Payload per call — what the agent had to read to get there.
+    # Payload per call — what the agent had to read to get there. A run whose
+    # summaries carry neither `result_chars` nor `result_text` is reported as
+    # unknown, never as zero.
     print("\n--- payload per call ---")
     print(f"  {'arm':<18}{'calls':<8}{'chars/call':<13}{'chars/q':<12}")
     for arm, _ in rows:
         pay = metrics[arm]["payload"]
+        if pay is None:
+            print(f"  {arm:<18}{'unknown':<8}{'unknown':<13}{'unknown':<12}")
+            continue
         print(
             f"  {arm:<18}{pay['calls']:<8}{pay['chars_per_call']:<13.0f}"
             f"{pay['chars_per_question']:<12.0f}"
@@ -495,31 +542,57 @@ def main():
     p.add_argument(
         "--redirect-cost",
         type=float,
-        default=0.0,
+        default=None,
         help=(
             "D: tokens it costs to redirect one wrong answer (re-prompt plus "
-            "the retry it triggers). Used for the (1-p)xD readout."
+            "the retry it triggers). Required together with "
+            "--saving-per-call; without both, the readout is the gate only."
         ),
     )
     p.add_argument(
         "--saving-per-call",
         type=float,
-        default=0.0,
+        default=None,
         help=(
             "Tokens saved per tool call by the change under test. Scaled by "
-            "the measured calls per question to compare against (1-p)xD."
+            "the measured calls per question to compare against (1-p)xD. "
+            "Required together with --redirect-cost."
+        ),
+    )
+    p.add_argument(
+        "--fail-on-gate",
+        action="store_true",
+        help=(
+            "Exit 1 when any arm's accuracy is below --accuracy-floor. Off by "
+            "default so reading a run never fails a shell; turn it on to use "
+            "the bench as a gate."
         ),
     )
     args = p.parse_args()
     if not (0.0 <= args.accuracy_floor <= 1.0):
         p.error("--accuracy-floor is a fraction in [0, 1]")
+    # Half the tradeoff is not a cheaper tradeoff, it is a wrong one: with
+    # only one of the two the readout would silently treat the other as zero
+    # and report a net that always favours the change.
+    if (args.redirect_cost is None) != (args.saving_per_call is None):
+        p.error(
+            "--redirect-cost and --saving-per-call go together; give both for "
+            "the cost tradeoff, or neither for the accuracy gate alone"
+        )
     if not args.aggregate:
         asyncio.run(judge_all_async(args))
-    aggregate(
+    metrics = aggregate(
         accuracy_floor=args.accuracy_floor,
         redirect_cost=args.redirect_cost,
         saving_per_call=args.saving_per_call,
     )
+    below = sorted(arm for arm, m in metrics.items() if m["gate"] == "FAIL")
+    if args.fail_on_gate and below:
+        print(
+            f"\ngate FAILED at {args.accuracy_floor:.2f}: {', '.join(below)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":

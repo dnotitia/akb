@@ -53,6 +53,7 @@ src/
   prep_judge_v3.py     Pre/post processing for the offline judge step
   judge.py             Aggregator: per-arm pass%, provenance%, accuracy gate,
                        tokens per correct answer, payload per call, tradeoff
+  paths.py             EVALSET_DIR / RUNS_DIR — one resolution for all stages
 scripts/
   run_v4_multiproc.sh  Multi-process driver — N processes × M queries each
 evalset-project-akb/   Tracked seed questions over the `project-akb` vault —
@@ -88,8 +89,10 @@ RUNS_DIR=runs_v1 python -m src.judge --aggregate
 
 `RUNS_DIR` is required for any version other than the default
 `runs/`. `EVALSET_DIR` selects the question set (default `evalset/`; the
-tracked seed set is `evalset-project-akb/`). The aggregator emits
-`metrics.json` next to the raw runs.
+tracked seed set is `evalset-project-akb/`) and is read by the runner, the
+judge prep and the aggregator through one helper (`src/paths.py`), so a
+run cannot be produced against one question set and scored against
+another. The aggregator emits `metrics.json` next to the raw runs.
 
 ## The accuracy gate and the cost tradeoff
 
@@ -112,6 +115,13 @@ RUNS_DIR=runs_v1 python -m src.judge --aggregate \
   question is `(1 − p) × D`.
 - `--saving-per-call` — tokens the change under test saves per tool call,
   scaled by the measured calls per question to compare like with like.
+- `--fail-on-gate` — exit 1 when any arm is below the floor. Off by
+  default, so reading a run never fails a shell; turn it on to use the
+  bench as a gate.
+
+The two cost options go together. Given one alone the aggregator refuses
+the run rather than treating the other as zero, which would report a net
+that always favours the change.
 
 `net/q` is the saving less the expected redirect cost: positive means the
 change pays for the answers it is expected to break. `break-even p` is the
@@ -125,7 +135,10 @@ divided by answers that survived the rubric, not by questions asked) and a
 **payload per call** section (mean response characters the agent had to
 read, per call and per question). Both are the units a payload change
 moves. The harness counts characters, not tokens: a tokenizer would pin a
-model the bench does not otherwise depend on.
+model the bench does not otherwise depend on. Payload is read from the run
+summaries, so `--aggregate` reports it for runs judged before this readout
+existed; a run whose summaries carry no size at all is reported as
+`unknown`, never as zero.
 
 Neither cost input has a default. Without them the readout is pass/fail
 only — what a redirect costs is a property of the deployment, and the

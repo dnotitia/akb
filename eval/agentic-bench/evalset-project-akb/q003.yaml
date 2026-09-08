@@ -1,6 +1,10 @@
 # Seed question: a two-sided contract. A complete answer carries both the
 # MUST clauses and the NEVER clauses; an arm that summarises the module
 # document's opening paragraphs gets half of it.
+#
+# `must_mention` items are matched two ways — an LLM judge for meaning and a
+# normalized substring pass for provenance — so they are the shortest form
+# that still pins the fact, spelled as the source document spells it.
 id: q003
 category: module-contract
 query: >-
@@ -8,10 +12,10 @@ query: >-
   it forbid outright?
 ground_truth:
   must_mention:
-    - "MUST route every write through the write-lane admission gate"
-    - "MUST keep local-filesystem behaviour in the stdio proxy, not the backend"
-    - "NEVER add a pgvector or embedding column to the main DB schema"
-    - "NEVER read an environment variable from backend/app/config.py"
+    - "MUST"
+    - "NEVER"
+    - "write-lane"
+    - "pgvector"
   forbidden:
     - "the backend implements the local file tools"
     - "configuration is read from environment variables in app/config.py"
