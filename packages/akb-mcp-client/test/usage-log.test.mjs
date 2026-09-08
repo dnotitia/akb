@@ -184,7 +184,7 @@ itAsync("marks an isError result as an error without losing its size", async () 
 
 itAsync("never writes the call arguments", async () => {
   await withLogPath(async (path) => {
-    const secret = "canary-8f3a1c-not-for-the-log";
+    const secret = "canary-8f3a1c-not-for-the-log"; // pragma: allowlist secret
     const proxy = backedBy(JSON.stringify({ kind: "search", results: [] }));
 
     await proxy._handle({
