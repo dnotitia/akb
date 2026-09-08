@@ -10,7 +10,8 @@ in `backend/CHANGELOG.md` 0.8.1.
 
 Capture model — **best-effort post-operation append.** Every MCP tool call
 passes through `record_tool()` from the dispatch chokepoint *after* the
-handler runs, so reads and writes are captured uniformly (the Kubernetes
+handler runs. REST grant/revoke use the same producer and canonical action,
+with `transport=rest` metadata. MCP reads and writes are captured uniformly (the Kubernetes
 audit-backend model: log at the API layer, not per-service). There is no
 transactional outbox: an AKB domain write already spans PG + git + vector
 store + S3 and is not globally atomic, so binding the audit line to the PG
@@ -406,8 +407,8 @@ def record_tool(
     is_write: bool = False,
     protocol: dict[str, str] | None = None,
 ) -> None:
-    """Audit one MCP tool call from the dispatch chokepoint. ``user`` is the
-    resolved _MCPUser; ``result`` is the handler's return envelope (or the
+    """Audit a canonical API operation from MCP dispatch or REST access routes.
+    ``user`` is the resolved principal; ``result`` is the handler's return envelope (or the
     final error envelope) — outcome is derived from it.
 
     Schema note — this is deliberately NOT the `events` outbox schema
@@ -434,7 +435,27 @@ def record_tool(
         code = result.get("code")
     if name == "akb_grep" and is_write:
         _record_grep_replace_receipts(args, user, result, protocol)
-    audit_meta = dict(protocol or {})
+    audit_meta: dict[str, Any] = dict(protocol or {})
+    if name in {"akb_grant", "akb_revoke"}:
+        # Bounded metadata identifies the recipient and basis, including a
+        # failed attempt. A revoke with no key means all bases; a grant with no
+        # key means direct. Never serialize the request or exception wholesale.
+        source_key = args.get("source_key")
+        if name == "akb_grant" and source_key is None:
+            source_key = "direct"
+        access_meta: dict[str, Any] = {
+            "user": str(args.get("user", ""))[:_TARGET_MAX],
+            "source_key": str(source_key)[:_TARGET_MAX] if source_key is not None else None,
+            "revision": args.get("revision") if type(args.get("revision")) is int else None,
+        }
+        if name == "akb_grant":
+            access_meta["role"] = str(args.get("role", ""))[:_TARGET_MAX]
+        if outcome == "ok" and isinstance(result, dict):
+            access_meta.update({
+                "effective_role": result.get("effective_role"),
+                "applied": result.get("applied"),
+            })
+        audit_meta["access"] = access_meta
     if name == "akb_grep" and is_write:
         audit_meta.update(_grep_replace_meta(args, result) or {})
     record(
