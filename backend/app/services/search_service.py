@@ -84,30 +84,40 @@ def _configured_document_source_type() -> str:
     )
 
 # Strips the indexing-time enrichment block emitted by
-# `build_doc_metadata_header`. The block is `TITLE: ...\n` followed by
-# at least one more KEY: line and a `\n\n` separator before the body.
-# It rides along with every doc chunk so the BM25 and dense legs see
-# doc-level signals during retrieval — but it is noise when the chunk
-# content is shown to humans or agents. Requiring TWO header lines + a
-# `\n\n` body separator avoids stripping a user paragraph that happens
-# to start with `TITLE: foo`. Table/file chunks are pure-metadata (no
-# body separator) and intentionally do not match. Keys imported from
-# index_service so adding a new builder field can't silently drift.
+# `build_doc_metadata_header`. The block is `TITLE: ...\n`, more `KEY:`
+# lines, then a `\n\n` separator before the body. It rides along with
+# every doc chunk so the BM25 and dense legs see doc-level signals during
+# retrieval — but it is noise when the chunk content is shown to humans
+# or agents.
 #
-# The middle `(?:[^\n]+\n){0,40}?` run exists because `SUMMARY:` is
-# interpolated verbatim (`f"SUMMARY: {summary}"`) and a summary that
-# carries its own newlines therefore emits continuation lines that are
-# not `KEY:`-prefixed. Without the run, the whole header failed to match
-# and every byte of it leaked into `drill_down` / `search` output — the
-# multi-line-summary case this pattern now covers. The run is lazy,
-# bounded, and cannot cross a blank line (`[^\n]+`), so the block still
-# has to terminate in the same way: one or more recognised `KEY:` lines
-# (`PATH:` is always emitted last-but-one) followed by the `\n\n` body
-# separator.
+# The pattern mirrors the builders line for line rather than accepting any
+# run of lines, because the difference is whether a user paragraph can be
+# eaten. `build_doc_metadata_header` emits TITLE → (SUMMARY) → (TAGS) →
+# PATH → (TYPE); `build_file_metadata_header` emits TITLE → TYPE → VAULT →
+# PATH → URI → (SIZE). So:
+#
+#   * `SUMMARY:` is the only value interpolated verbatim
+#     (`f"SUMMARY: {summary}"`), so it is the only line whose value can
+#     carry newlines of its own. Continuation lines are therefore allowed
+#     ONLY directly after a `SUMMARY:` line — lazy, bounded at 40, and
+#     unable to cross a blank line (`[^\n]+`). Without them the whole
+#     header failed to match on a multi-line summary and every byte of it
+#     leaked into `drill_down` / `search` output.
+#   * `PATH:` is emitted by every builder that produces a body separator,
+#     so the block is required to contain one. That costs no coverage and
+#     is what keeps `TITLE: …` prose followed by an unrelated `KEY:`-ish
+#     line and a blank line from being mistaken for a header.
+#
+# Table/file catalogue chunks are pure metadata with no `\n\n` separator
+# and still do not match. Keys imported from index_service so adding a new
+# builder field can't silently drift.
+_CHUNK_HEADER_KEY_LINE = rf"(?:{'|'.join(CHUNK_HEADER_KEYS)}):[^\n]*\n"
 _CHUNK_HEADER_RE = re.compile(
     rf"\ATITLE:[^\n]*\n"
-    rf"(?:[^\n]+\n){{0,40}}?"
-    rf"(?:(?:{'|'.join(CHUNK_HEADER_KEYS)}):[^\n]*\n)+"
+    rf"(?:SUMMARY:[^\n]*\n(?:[^\n]+\n){{0,40}}?)?"
+    rf"(?:{_CHUNK_HEADER_KEY_LINE}){{0,8}}?"
+    rf"PATH:[^\n]*\n"
+    rf"(?:{_CHUNK_HEADER_KEY_LINE}){{0,8}}"
     rf"\n"
 )
 

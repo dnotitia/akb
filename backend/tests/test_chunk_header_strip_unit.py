@@ -113,6 +113,59 @@ def test_prose_run_never_swallows_a_body_without_a_key_line():
     assert strip_chunk_metadata_header(body) == body
 
 
+def test_a_block_without_a_path_line_is_not_a_header():
+    # Every builder that emits a body separator also emits `PATH:`, so a
+    # `TITLE:`-looking opening followed by other key-shaped lines and a blank
+    # line is prose, not a header — and prose is never removed.
+    body = (
+        "TITLE: how the indexer enriches a chunk\n"
+        "SUMMARY: the block is written at index time\n"
+        "TAGS: notes\n"
+        "\n"
+        "It must survive verbatim."
+    )
+    assert strip_chunk_metadata_header(body) == body
+
+
+def test_a_multiline_summary_run_still_needs_the_path_line():
+    body = (
+        "TITLE: x\n"
+        "SUMMARY: first line of a long summary\n"
+        "a continuation line\n"
+        "another continuation line\n"
+        "TYPE: guide\n"
+        "\n"
+        "Body that must survive."
+    )
+    assert strip_chunk_metadata_header(body) == body
+
+
+def test_continuation_lines_are_only_allowed_after_summary():
+    # Without a SUMMARY line there is no interpolated value that can carry
+    # newlines, so free-form lines between TITLE and PATH are prose.
+    body = (
+        "TITLE: x\n"
+        "a line that is not a key\n"
+        "PATH: v/p.md\n"
+        "\n"
+        "Body that must survive."
+    )
+    assert strip_chunk_metadata_header(body) == body
+
+
+def test_stripping_is_idempotent():
+    header = build_doc_metadata_header(
+        vault_name="project-akb",
+        path="meta/agent-onboarding.md",
+        title="Agent onboarding",
+        summary="Line one of the summary.\nLine two of the summary.",
+        tags=["topic:onboarding"],
+        doc_type="guide",
+    )
+    once = strip_chunk_metadata_header(header + BODY)
+    assert strip_chunk_metadata_header(once) == once == BODY
+
+
 def test_empty_and_none_pass_through():
     assert strip_chunk_metadata_header(None) is None
     assert strip_chunk_metadata_header("") == ""
