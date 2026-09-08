@@ -478,6 +478,17 @@ export default function DocumentPage({
     retry: false,
   });
 
+  useEffect(() => {
+    if (import.meta.env.VITE_AKB_TEST_MODE !== "mock" || !name || !docId) return;
+    const onMockRefetch = (event: Event) => {
+      const detail = (event as CustomEvent<{ vault?: unknown; document?: unknown }>).detail;
+      if (detail?.vault !== name || detail.document !== docId) return;
+      void queryClient.refetchQueries({ queryKey: ["document", name, docId] });
+    };
+    window.addEventListener("akb:mock-document-refetch", onMockRefetch);
+    return () => window.removeEventListener("akb:mock-document-refetch", onMockRefetch);
+  }, [docId, name, queryClient]);
+
   const doc = docOverride ?? docQuery.data ?? null;
   const historyQuery = useQuery({
     queryKey: ["document-history", name, doc?.path],
