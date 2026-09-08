@@ -222,7 +222,10 @@ async def test_initiate_replace_schedules_abandoned_staging_cleanup(monkeypatch)
 
     monkeypatch.setattr(fs.vault_files_repo, "find_by_id", _find)
     monkeypatch.setattr(fs.s3_adapter, "ensure_bucket", lambda _bucket: None)
-    monkeypatch.setattr(fs.s3_adapter, "presign_put", lambda *_args, **_kwargs: "https://upload.test")
+    monkeypatch.setattr(
+        fs.s3_adapter, "presign_put",
+        lambda *_args, **_kwargs: fs.s3_adapter.PresignedURL("https://upload.test", 123),
+    )
     monkeypatch.setattr(fs, "_enqueue_s3_delete", _enqueue)
 
     result = await service.initiate_replace(
@@ -234,6 +237,7 @@ async def test_initiate_replace_schedules_abandoned_staging_cleanup(monkeypatch)
 
     assert result["unchanged"] is False
     assert result["upload_url"] == "https://upload.test"
+    assert result["expires_in"] == 123
     assert scheduled == [
         (
             fs._replacement_staging_key(
@@ -244,6 +248,46 @@ async def test_initiate_replace_schedules_abandoned_staging_cleanup(monkeypatch)
             fs._REPLACEMENT_STAGING_DELETE_DELAY,
         )
     ]
+
+
+async def test_upload_response_reports_actual_signing_lifetime(monkeypatch):
+    service, _pool = await _service(monkeypatch)
+
+    async def allowed(*_args, **_kwargs):
+        return True
+
+    async def inserted(_conn, **kwargs):
+        return kwargs["file_id"]
+
+    monkeypatch.setattr(fs, "lock_vault_for_child_write", allowed)
+    monkeypatch.setattr(fs.vault_files_repo, "s3_key_available_for_registration", allowed)
+    monkeypatch.setattr(fs.vault_files_repo, "insert_or_adopt", inserted)
+    monkeypatch.setattr(fs.s3_adapter, "ensure_bucket", lambda _bucket: None)
+    monkeypatch.setattr(
+        fs.s3_adapter, "presign_put",
+        lambda *_args, **_kwargs: fs.s3_adapter.PresignedURL("https://upload.test", 234),
+    )
+    result = await service.initiate_upload(
+        "team", _row()["vault_id"], "", "test.bin", actor_id="tester",
+    )
+    assert result["upload_url"] == "https://upload.test"
+    assert result["expires_in"] == 234
+
+
+async def test_download_response_reports_actual_signing_lifetime(monkeypatch):
+    service, _pool = await _service(monkeypatch)
+
+    async def find(*_args):
+        return {**_row(), "upload_state": "confirmed", "hash_algorithm": "sha256"}
+
+    monkeypatch.setattr(fs.vault_files_repo, "find_by_id", find)
+    monkeypatch.setattr(
+        fs.s3_adapter, "presign_get",
+        lambda *_args, **_kwargs: fs.s3_adapter.PresignedURL("https://download.test", 345),
+    )
+    result = await service.get_download_url(_row()["vault_id"], str(_row()["id"]))
+    assert result["download_url"] == "https://download.test"
+    assert result["expires_in"] == 345
 
 
 async def test_confirm_replace_switches_metadata_only_after_locked_recheck(monkeypatch):

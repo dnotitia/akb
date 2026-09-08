@@ -77,9 +77,12 @@ embed_dimensions: 1536
 
 # Standalone default keeps direct-provider routing. A managed akb-platform
 # deployment sets platform_hard plus the exact gateway URL; startup then rejects
-# any active embed/LLM/rerank route that points elsewhere or lacks a credential.
+# any active embed/LLM/rerank route that points elsewhere. Managed requests read
+# the projected token for every call; all model API-key fields must be blank.
+# See docs/managed-workload-identity.md for token projection and S3 configuration.
 model_api_governance_mode: external_metering  # external_metering | platform_hard
 platform_gateway_base_url: ""
+platform_gateway_token_file: ""
 
 # === LLM (optional) ===
 # Only used by metadata_worker to auto-tag external_git imports.
@@ -137,11 +140,19 @@ search_limit_max: 50
 vault_filter_enabled: false
 
 # === S3-compatible object storage (for vault file uploads) ===
-# Leave endpoints blank to disable file storage features.
+# static + blank endpoint disables object storage. default_chain enables native
+# cloud storage even without an endpoint; never set static key fields with it.
+s3_auth_mode: static # static | default_chain
 s3_endpoint_url: "http://minio:9000" # local Compose; blank disables object storage
 s3_public_url: "http://localhost:9000" # browser endpoint; change for remote access
 s3_bucket: akb-files
 s3_region: ""
+# Explicit WebIdentity (required in platform_hard): configured token → STS only,
+# without AWS environment/profile credential fallback. The bucket must exist.
+# Standalone default_chain can leave all three blank for the native AWS chain.
+s3_web_identity_token_file: ""
+s3_role_arn: ""
+s3_sts_endpoint_url: ""
 
 # Hidden document images follow live Markdown references. Removed/deleted
 # images remain available only to matching Git revisions for this window;
@@ -396,6 +407,8 @@ redis_stream_maxlen: 100000
 #   # duties point these at a SEPARATE account with a WRITE-ONLY key
 #   # (PutObject, no Delete) — AKB never deletes bucket objects, so a
 #   # compromise of the primary S3 key can't erase the audit trail.
+#   # In platform_hard, access_key/secret_key must stay blank. The uploader uses
+#   # the workload session; its role must authorize PutObject on the audit bucket.
 #   endpoint_url: ""
 #   access_key: ""
 #   secret_key: ""

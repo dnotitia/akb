@@ -1858,7 +1858,7 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
                 "SELECT id, s3_key, upload_state FROM vault_files WHERE vault_id = $1",
                 vault_id,
             )
-            if file_rows and settings.s3_endpoint_url:
+            if file_rows and settings.object_storage_enabled:
                 from app.services.s3_delete_worker import (
                     enqueue_delete,
                     enqueue_pending_upload_delete,
@@ -1875,7 +1875,7 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
                 " WHERE vault_id = $1 AND snapshot_s3_key IS NOT NULL",
                 vault_id,
             )
-            if snap_rows and settings.s3_endpoint_url:
+            if snap_rows and settings.object_storage_enabled:
                 from app.services.s3_delete_worker import enqueue_delete
                 for sr in snap_rows:
                     await enqueue_delete(conn, sr["snapshot_s3_key"])
@@ -1891,7 +1891,7 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
             for fr in file_rows:
                 await _drop_source_chunks_with_outbox(conn, "file", str(fr["id"]))
 
-            if file_rows and settings.s3_endpoint_url:
+            if file_rows and settings.object_storage_enabled:
                 await conn.execute("DELETE FROM vault_files WHERE vault_id = $1", vault_id)
 
             await conn.execute("DELETE FROM edges WHERE vault_id = $1", vault_id)

@@ -36,8 +36,11 @@ app:
     model: cohere/rerank-v3.5
     prefetch: 30
   objectStorage:
+    authMode: static # static | default_chain; default_chain must omit static keys
     endpointUrl: ""
+    publicUrl: ""
     bucket: akb-files
+    region: ""
   vectorStore:
     driver: pgvector
     dsn: ""

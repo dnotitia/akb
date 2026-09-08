@@ -72,6 +72,8 @@ def _settings(
         tokenizer_processes=2,
         bm25_recompute_interval_secs=3600,
         s3_endpoint_url=None,
+        object_storage_enabled=False,
+        model_api_governance_mode="external_metering",
         llm_base_url="http://llm.local/v1" if llm_configured else None,
         llm_api_key="sk-test" if llm_configured else None,  # pragma: allowlist secret
         redis_url=None,
@@ -79,6 +81,35 @@ def _settings(
         tool_usage=types.SimpleNamespace(enabled=False),
         role_sync_reconcile_interval_secs=0,
     )
+
+
+def test_managed_keyless_metadata_worker_starts(monkeypatch, tmp_path):
+    lifecycle = _import_lifecycle(monkeypatch, tmp_path)
+    started = []
+    _stub_workers(monkeypatch, lifecycle, started)
+    configured = _settings(external_git_enabled=True, llm_configured=True)
+    configured.llm_api_key = ""
+    configured.model_api_governance_mode = "platform_hard"
+    monkeypatch.setattr(lifecycle, "settings", configured)
+    lifecycle.start_workers()
+    assert "metadata_worker" in started
+
+
+def test_native_cloud_storage_starts_cleanup_without_custom_endpoint(monkeypatch, tmp_path):
+    from app.config import Settings
+
+    lifecycle = _import_lifecycle(monkeypatch, tmp_path)
+    started = []
+    _stub_workers(monkeypatch, lifecycle, started)
+    configured = _settings(external_git_enabled=False)
+    cloud = Settings(s3_auth_mode="default_chain")
+    configured.object_storage_enabled = cloud.object_storage_enabled
+    monkeypatch.setattr(lifecycle, "settings", configured)
+    monkeypatch.setattr(lifecycle.s3_delete_worker, "start", lambda: started.append("s3_delete"))
+    monkeypatch.setattr(lifecycle.asset_gc_worker, "start", lambda: started.append("asset_gc"))
+    lifecycle.start_workers()
+    assert "s3_delete" in started
+    assert "asset_gc" in started
 
 
 def test_start_workers_starts_poller_when_enabled(monkeypatch, tmp_path):

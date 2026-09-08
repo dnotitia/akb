@@ -66,7 +66,10 @@ async def chat_json(
     }
     if disable_reasoning:
         payload["reasoning"] = {"enabled": False}
-    headers = model_gateway.request_headers(settings.llm_api_key)
+    try:
+        headers = model_gateway.request_headers(settings.llm_api_key)
+    except model_gateway.WorkloadIdentityError:
+        raise LLMError("Workload identity is unavailable") from None
 
     client = http_pool.get_client()
     resp = await client.post(
