@@ -178,6 +178,13 @@ echo "  node deps present in frontend + packages/akb-client"
 step "E2E suite manifest"
 python scripts/ci/e2e_suite_runner.py --check-manifest --repo-root "${REPO_ROOT}"
 
+# ─── coding-agent roles ────────────────────────────────────────────
+# .codex/ and .claude/ are rendered from .agents/roles.toml so both agents
+# read one contract. A hand edit to a rendered file, or a source edit without
+# a re-render, is a second contract nobody reads; fail on it here.
+step "agent roles (.codex + .claude rendered from .agents/roles.toml)"
+python scripts/agent-roles.py --check
+
 # ─── backend: ruff (lint) ──────────────────────────────────────────
 step "ruff (backend)"
 ruff check backend/

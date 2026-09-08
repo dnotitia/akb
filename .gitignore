@@ -70,13 +70,13 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 
-# Claude Code
+# Claude Code — track only the shared role/permission configuration, the
+# counterpart of .codex/. Per-user state (settings.local.json, session data)
+# stays local.
 .claude/*
 !.claude/settings.json
-!.claude/hooks/
-!.claude/hooks/akb_pm_hook.py
-!.claude/commands/
-!.claude/commands/*.md
+!.claude/agents/
+!.claude/agents/*.md
 .claude/*.local.*
 
 # AI-assistant scratch — superpowers skill writes plans/specs here by default.

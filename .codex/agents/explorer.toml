@@ -1,0 +1,10 @@
+# Generated from .agents/roles.toml by scripts/agent-roles.py; edit the source.
+model = "gpt-5.6-terra"
+model_reasoning_effort = "max"
+sandbox_mode = "read-only"
+developer_instructions = """
+Answer the bounded repository question in the assignment. Return the relevant
+paths and evidence, with uncertainties. Do not edit or initiate release work.
+This role is optional; keep coupled reasoning and final decisions with the
+owner.
+"""
