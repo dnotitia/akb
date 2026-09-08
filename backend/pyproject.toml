@@ -1,6 +1,6 @@
 [project]
 name = "akb"
-version = "0.14.2"
+version = "0.14.3"
 description = "Agent Knowledge Base - Organizational Memory for Agents"
 requires-python = ">=3.14"
 license = "BUSL-1.1"
@@ -28,6 +28,9 @@ dependencies = [
     "cryptography==48.0.0",
     "bcrypt==5.0.0",
     "boto3==1.43.23",
+    # Atomic refresh snapshots and request-scoped signing use botocore's
+    # credential hooks; pin the already-locked runtime for pip installs too.
+    "botocore==1.43.27",
     "qdrant-client==1.18.0",
     "kiwipiepy==0.23.1",
     "redis==8.0.0",

@@ -57,11 +57,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gosu \
     && rm -rf /var/lib/apt/lists/*
 
-# MinIO server + mc client (bucket bootstrap)
-RUN curl -fsSL https://dl.min.io/server/minio/release/linux-${TARGETARCH}/minio \
-        -o /usr/local/bin/minio && chmod +x /usr/local/bin/minio && \
-    curl -fsSL https://dl.min.io/client/mc/release/linux-${TARGETARCH}/mc \
-        -o /usr/local/bin/mc && chmod +x /usr/local/bin/mc
+# MinIO server + mc client (bucket bootstrap), pinned to dated archive releases.
+# minio sha256: 7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f
+# mc sha256: 01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891
+ARG MINIO_RELEASE=RELEASE.2025-09-07T16-13-09Z
+ARG MC_RELEASE=RELEASE.2025-08-13T08-35-41Z
+RUN curl -fsSL https://dl.min.io/server/minio/release/linux-${TARGETARCH}/archive/minio.${MINIO_RELEASE} \
+        -o /usr/local/bin/minio && \
+    echo "7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f  /usr/local/bin/minio" | sha256sum -c - && \
+    chmod +x /usr/local/bin/minio && \
+    curl -fsSL https://dl.min.io/client/mc/release/linux-${TARGETARCH}/archive/mc.${MC_RELEASE} \
+        -o /usr/local/bin/mc && \
+    echo "01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891  /usr/local/bin/mc" | sha256sum -c - && \
+    chmod +x /usr/local/bin/mc
 
 # Backend requires Python >=3.14 (backend/pyproject.toml). The pgvector
 # base image (debian bookworm) only ships system python 3.11 — kept
