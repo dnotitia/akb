@@ -24,7 +24,11 @@ async def _search_until_found(
     """Allow the derived search index to catch up without weakening the result."""
 
     result: dict[str, Any] = {}
-    for _ in range(20):
+    # akb_put commits PG before the repository-owned embed/index worker catches
+    # up. The shell E2E contract allows a 180-second indexing window; keep the
+    # same bound here so the fixed embedding stub's dense leg does not turn a
+    # valid BM25 match into a timing race.
+    for _ in range(90):
         result = await _call_json(
             client,
             runtime_session,
@@ -33,7 +37,7 @@ async def _search_until_found(
         )
         if int(result.get("total", 0)) >= 1 or result.get("results"):
             return result
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(2)
     return result
 
 
