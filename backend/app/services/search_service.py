@@ -26,6 +26,7 @@ from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.services import sparse_encoder
 from app.services.index_service import (
     CHUNK_HEADER_KEYS,
+    OVERLAP,
     SOURCE_NATIVE_FILE,
     generate_embeddings,
 )
@@ -154,27 +155,92 @@ def strip_chunk_context_line(text: str | None, section_path: str | None) -> str 
     return text
 
 
+def strip_chunk_overlap_prefix(previous: str | None, current: str | None) -> str | None:
+    """Remove the leading run of `current` that is an exact duplicate of the
+    tail of `previous`.
+
+    `_split_large_chunk` carries `OVERLAP` characters of each chunk into the
+    head of the next one so a sentence cut by the size cap is still embedded
+    intact on both sides. Reading a long section back therefore pays for that
+    window once per chunk boundary.
+
+    Only an exact character-for-character match is removed, and never more
+    than `OVERLAP` characters, so `previous + returned` reproduces
+    `previous + current` byte for byte — nothing a caller reading the whole
+    section can no longer see. When no prefix of `current` equals a suffix of
+    `previous`, `current` is returned untouched.
+    """
+    if not previous or not current:
+        return current
+    limit = min(OVERLAP, len(previous), len(current))
+    for size in range(limit, 0, -1):
+        if current[:size] == previous[-size:]:
+            return current[size:]
+    return current
+
+
+def _row_value(row, key, default=None):
+    """`row[key]` for asyncpg Records and plain dicts alike, tolerating a
+    projection that did not select `key`."""
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return default
+
+
 def clean_section_rows(rows) -> list[dict]:
     """Build the `drill_down` section payload from stored chunk rows.
 
     Every transform here removes bytes the caller cannot use: index-side
-    metadata (`strip_chunk_metadata_header`) and the heading-context line
-    that duplicates the row's own `section_path`
-    (`strip_chunk_context_line`). Keys are never removed — `section_path`,
-    `content` and `chunk_index` are returned for every surviving row.
+    metadata (`strip_chunk_metadata_header`), the heading-context line that
+    duplicates the row's own `section_path` (`strip_chunk_context_line`), and
+    the indexing overlap window a continuation chunk repeats from its
+    predecessor (`strip_chunk_overlap_prefix`). Keys are never removed —
+    `section_path`, `content` and `chunk_index` are returned for every
+    surviving row.
+
+    The overlap strip is deliberately narrow. It fires only between rows the
+    writer could actually have overlapped: same document, consecutive
+    `chunk_index`, same `section_path`, and a `content` that carried neither a
+    metadata header nor a context line (both mark the *first* chunk of a
+    section, which `_split_large_chunk` never prefixes with an overlap). That
+    keeps it from nibbling a character off the start of a new section just
+    because the previous section happened to end with the same one.
 
     `rows` must be ordered by `chunk_index`, as both SQL paths in
     `drill_down` are.
     """
     sections: list[dict] = []
+    # doc id -> (chunk_index, cleaned content, section_path) of the row this
+    # document last contributed. Keyed by document because the same call can
+    # (in principle) surface chunks from more than one row of `documents`.
+    previous: dict[object, tuple[int, str, object]] = {}
     for r in rows:
         section_path = r["section_path"]
-        content = strip_chunk_metadata_header(r["content"])
+        chunk_index = r["chunk_index"]
+        doc_key = _row_value(r, "doc_id")
+        stored = r["content"]
+        content = strip_chunk_metadata_header(stored)
         content = strip_chunk_context_line(content, section_path)
+        section_first_chunk = content != stored
+
+        prior = previous.get(doc_key)
+        if (
+            prior is not None
+            and not section_first_chunk
+            and isinstance(chunk_index, int)
+            and prior[0] + 1 == chunk_index
+            and prior[2] == section_path
+        ):
+            content = strip_chunk_overlap_prefix(prior[1], content)
+
+        if isinstance(chunk_index, int) and content is not None:
+            previous[doc_key] = (chunk_index, content, section_path)
+
         sections.append({
             "section_path": section_path,
             "content": content,
-            "chunk_index": r["chunk_index"],
+            "chunk_index": chunk_index,
         })
     return sections
 
@@ -1709,7 +1775,7 @@ class SearchService:
             if section:
                 rows = await conn.fetch(
                     f"""
-                    SELECT c.section_path, c.content, c.chunk_index
+                    SELECT c.section_path, c.content, c.chunk_index, d.id AS doc_id
                     FROM chunks c
                     JOIN documents d ON c.source_id = d.id AND c.source_type = 'document'
                     JOIN vaults v ON d.vault_id = v.id
@@ -1723,7 +1789,7 @@ class SearchService:
             else:
                 rows = await conn.fetch(
                     f"""
-                    SELECT c.section_path, c.content, c.chunk_index
+                    SELECT c.section_path, c.content, c.chunk_index, d.id AS doc_id
                     FROM chunks c
                     JOIN documents d ON c.source_id = d.id AND c.source_type = 'document'
                     JOIN vaults v ON d.vault_id = v.id
