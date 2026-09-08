@@ -102,9 +102,10 @@ echo "  mypy + bandit parse Python ${REQUIRED_PYTHON}"
 
 # 2. Node deps must be installed in every node project this gate runs in.
 #
-# There are three, they do not share a package manager, and each has its own
-# lockfile and its own node_modules: frontend/ and packages/akb-client/ are
-# pnpm, packages/akb-mcp-client/ is npm. Installing only some of them dies
+# There are four, they do not share a package manager, and each has its own
+# lockfile and its own node_modules: frontend/, packages/akb-client/, and
+# packages/markdown-editor/ are pnpm; packages/akb-mcp-client/ is npm.
+# Installing only some of them dies
 # several steps later, inside one of the others, as something that names
 # neither the package nor the missing install:
 #
@@ -170,7 +171,7 @@ if [ "${#missing_installs[@]}" -ne 0 ]; then
   echo "    naming their package or silently resolve to a global toolchain." >&2
   exit 1
 fi
-echo "  node deps present in frontend + packages/akb-client"
+echo "  node deps present in ${#node_projects[@]} lockfile-backed projects"
 
 # ─── E2E suite manifest ───────────────────────────────────────────
 # Fails fast when a new shell E2E suite is neither run by the hosted gate nor
@@ -263,6 +264,20 @@ step "generated type drift (@akb/client)"
 step "packed SDK consumer proof (@akb/client)"
 (cd packages/akb-client && pnpm run proof:packed)
 
+# ─── shared Markdown editor package ───────────────────────────────
+# The package owns the exact Tiptap versions and its minimum static/unit proof.
+step "build (@akb/markdown-editor)"
+(cd packages/markdown-editor && pnpm run build)
+
+step "typecheck (@akb/markdown-editor)"
+(cd packages/markdown-editor && pnpm run typecheck)
+
+step "lint (@akb/markdown-editor)"
+(cd packages/markdown-editor && pnpm run lint)
+
+step "vitest (@akb/markdown-editor)"
+(cd packages/markdown-editor && pnpm run test)
+
 # ─── stdio proxy + MCP Inspector developer contract ──────────────
 # The package owns its exact Inspector devDependency, command, and focused
 # redaction/cleanup regression. The live HTTP+stdio smoke is invoked by the
@@ -289,9 +304,9 @@ if command -v detect-secrets-hook >/dev/null 2>&1; then
   # Scope: git-tracked files only — skips node_modules, .venv, dist, etc.
   # for free, and prevents the scan from drowning in third-party noise.
   # The generated MSW worker also carries an integrity checksum.
-  # Both pnpm-lock.yaml files are excluded because package integrity hashes
+  # All pnpm-lock.yaml files are excluded because package integrity hashes
   # (sha512-… base64) are expected high-entropy data, not secrets.
-  git ls-files -z -- . ':!frontend/pnpm-lock.yaml' ':!packages/akb-client/pnpm-lock.yaml' ':!frontend/public/mockServiceWorker.js' |
+  git ls-files -z -- . ':!frontend/pnpm-lock.yaml' ':!packages/akb-client/pnpm-lock.yaml' ':!packages/markdown-editor/pnpm-lock.yaml' ':!frontend/public/mockServiceWorker.js' |
     xargs -0 detect-secrets-hook --baseline .secrets.baseline
 else
   echo "  ! detect-secrets not installed — pipx install detect-secrets" >&2
