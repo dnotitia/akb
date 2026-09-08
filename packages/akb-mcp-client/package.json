@@ -8,7 +8,7 @@
   },
   "scripts": {
     "inspect": "node scripts/mcp-inspector-smoke.mjs",
-    "test": "node test/contract.test.mjs && node test/reconnect.test.mjs && node test/protocol.test.mjs && node --test test/mcp-inspector-smoke.test.mjs"
+    "test": "node test/contract.test.mjs && node test/reconnect.test.mjs && node test/protocol.test.mjs && node test/usage-log.test.mjs && node --test test/mcp-inspector-smoke.test.mjs"
   },
   "type": "module",
   "devDependencies": {
