@@ -1246,6 +1246,9 @@ class DocumentService:
                 "content_hash": content_hash,
                 "hash_algorithm": HASH_ALGORITHM,
                 "content_changed": req.content is not None,
+                "resource_id": str(pg_doc_id),
+                "previous_status": row["status"],
+                "status": req.status if req.status is not None else row["status"],
             },
         )
 
@@ -1505,6 +1508,7 @@ class DocumentService:
                 payload={
                     "vault": vault, "path": new_path, "old_path": old_path,
                     "old_uri": old_uri, "commit_hash": commit_hash,
+                    "resource_id": str(pg_doc_id),
                 },
             )
 
@@ -1716,6 +1720,7 @@ class DocumentService:
                 "hash_algorithm": HASH_ALGORITHM,
                 "content_changed": True,
                 "source": "edit",
+                "resource_id": str(pg_doc_id),
             },
         )
 
@@ -1796,6 +1801,7 @@ class DocumentService:
             payload={
                 "vault": vault,
                 "path": file_path,
+                "resource_id": str(pg_doc_id),
             },
         )
         # The row delete and the publication cascade are ONE call. That

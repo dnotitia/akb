@@ -27,6 +27,7 @@ from app.services.m1_reference_payload_store import (
     ReferencePayloadIntegrityError,
 )
 from app.services.native_payload_verification import payload_store_for_placement
+from app.services.notification_producer import enqueue_document_change
 
 
 Failpoint = Callable[[str], Awaitable[None] | None]
@@ -653,6 +654,8 @@ class NativeRevisionService:
         summary: str | None = None,
         expected_digest: str | None = None,
         expected_size: int | None = None,
+        notification_previous_status: str | None = None,
+        notification_status: str | None = None,
     ) -> NativeMutationResult:
         self._validate_common(surface=surface, path=path, actor=actor, mutation_id=mutation_id)
         self._validate_expected_revision(expected_revision_id)
@@ -691,6 +694,8 @@ class NativeRevisionService:
             summary=summary,
             prepared=prepared,
             fingerprint=fingerprint,
+            notification_previous_status=notification_previous_status,
+            notification_status=notification_status,
         )
         await self._hit("authority.after_commit_before_response")
         return result
@@ -710,6 +715,8 @@ class NativeRevisionService:
         summary: str | None,
         prepared: PreparedReferencePayload,
         fingerprint: str,
+        notification_previous_status: str | None = None,
+        notification_status: str | None = None,
     ) -> NativeMutationResult:
         revision_id = await self._allocate_revision_id()
         manifest_id = uuid.uuid4()
@@ -796,6 +803,12 @@ class NativeRevisionService:
                     path_to=None,
                     occurred_at=occurred_at,
                 )
+                if surface == "document":
+                    await enqueue_document_change(
+                        conn, "document.update", source_key=f"native:{activity_id}",
+                        vault_id=namespace_id, resource_id=resource_id, actor_username=actor,
+                        previous_status=notification_previous_status, status=notification_status,
+                    )
                 await self._hit("authority.after_activity")
                 await self.repository.insert_invalidation_intent(
                     conn,
@@ -1017,6 +1030,11 @@ class NativeRevisionService:
                         path_to=None,
                         occurred_at=occurred_at,
                     )
+                    if surface == "document":
+                        await enqueue_document_change(
+                            conn, "document.restore", source_key=f"native:{activity_id}",
+                            vault_id=namespace_id, resource_id=expected_resource_id, actor_username=actor,
+                        )
                     await self._hit("authority.after_activity")
                     await self.repository.insert_invalidation_intent(
                         conn,
@@ -1244,6 +1262,11 @@ class NativeRevisionService:
                         path_to=path_to,
                         occurred_at=occurred_at,
                     )
+                    if surface == "document":
+                        await enqueue_document_change(
+                            conn, "document.move", source_key=f"native:{activity_id}",
+                            vault_id=namespace_id, resource_id=resource_id, actor_username=actor,
+                        )
                     await self._hit("authority.after_activity")
                     await self.repository.insert_invalidation_intent(
                         conn,
@@ -1421,6 +1444,11 @@ class NativeRevisionService:
                     path_to=None,
                     occurred_at=occurred_at,
                 )
+                if surface == "document":
+                    await enqueue_document_change(
+                        conn, "document.delete", source_key=f"native:{activity_id}",
+                        vault_id=namespace_id, resource_id=resource_id, actor_username=actor,
+                    )
                 await self._hit("authority.after_activity")
                 await self.repository.insert_invalidation_intent(
                     conn,

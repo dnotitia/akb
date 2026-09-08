@@ -54,7 +54,7 @@ async def emit_event(
     """
     vault_uuid = _to_uuid_or_none(vault_id)
     payload_json = json.dumps(payload or {})
-    return await conn.fetchval(
+    event_id = await conn.fetchval(
         """
         INSERT INTO events (vault_id, kind, resource_uri, actor_id, payload)
         VALUES ($1, $2, $3, $4, $5::jsonb)
@@ -62,6 +62,12 @@ async def emit_event(
         """,
         vault_uuid, kind, resource_uri, actor_id, payload_json,
     )
+    from app.services.notification_producer import enqueue_domain_event
+    await enqueue_domain_event(
+        conn, event_id, kind, vault_id=vault_uuid, actor_id=actor_id,
+        payload=payload or {},
+    )
+    return event_id
 
 
 async def get_vault_event_bounds(

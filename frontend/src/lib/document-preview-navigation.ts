@@ -7,8 +7,8 @@ export interface DocumentPreviewNavigationState {
 }
 
 /**
- * Preserve the page that launched a search result so a document can open as a
- * route-backed preview without losing the query, filters, or result scroll.
+ * Preserve the launching page so a document can open as a route-backed preview
+ * without losing search or inbox filters, scroll, or the initiating control.
  */
 export function documentPreviewState(
   backgroundLocation: Location,

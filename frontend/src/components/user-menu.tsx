@@ -87,7 +87,7 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
     >
       <DropdownMenu.Trigger
         aria-label={`Account menu — ${label}`}
-        className="group inline-flex h-9 min-w-9 max-w-28 cursor-pointer items-center gap-2 rounded-[var(--radius-md)] border border-border-strong bg-surface py-1 pl-1 pr-2.5 shadow-xs transition-token hover:border-primary hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background data-[state=open]:border-primary data-[state=open]:bg-surface-selected data-[state=open]:ring-2 data-[state=open]:ring-ring/30 sm:max-w-48"
+        className="group inline-flex h-9 min-w-9 shrink-0 cursor-pointer items-center gap-2 rounded-[var(--radius-md)] border border-border-strong bg-surface p-1 shadow-xs transition-token hover:border-primary hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background data-[state=open]:border-primary data-[state=open]:bg-surface-selected data-[state=open]:ring-2 data-[state=open]:ring-ring/30 sm:max-w-48 sm:pr-2.5"
       >
         <span
           className="inline-grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-sm)] bg-surface-selected font-display text-xs font-bold uppercase text-surface-selected-foreground group-hover:bg-surface-active"
@@ -95,7 +95,7 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
         >
           {initials}
         </span>
-        <span className="min-w-0 truncate text-sm font-medium normal-case text-foreground">
+        <span className="hidden min-w-0 truncate text-sm font-medium normal-case text-foreground sm:block">
           {label}
         </span>
       </DropdownMenu.Trigger>

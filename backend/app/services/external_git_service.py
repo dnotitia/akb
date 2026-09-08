@@ -680,6 +680,7 @@ class ExternalGitService:
                         "title": title,
                         "doc_type": doc_type,
                         "external_blob": blob_sha,
+                        "resource_id": str(pg_doc_id),
                         "commit": last_commit,
                         "content_hash": compute_text_content_hash(body),
                         "hash_algorithm": HASH_ALGORITHM,
@@ -798,7 +799,7 @@ class ExternalGitService:
                     vault_id=vault_id,
                     resource_uri=doc_uri(vault_name, path),
                     actor_id=row["created_by"],
-                    payload={"path": path, "source": "external_git"},
+                    payload={"path": path, "source": "external_git", "resource_id": str(row["id"])},
                 )
         return "deleted"
 

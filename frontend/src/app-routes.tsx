@@ -24,6 +24,7 @@ import FilePage from "@/pages/file";
 import GraphPage from "@/pages/graph";
 import SearchPage from "@/pages/search";
 import SettingsPage from "@/pages/settings";
+import NotificationsPage from "@/pages/notifications";
 import PublicationsPage from "@/pages/publications";
 import PublicationPage from "@/pages/public-publication";
 import VaultMembersPage from "@/pages/vault-members";
@@ -67,6 +68,7 @@ const routeComponents = {
   SearchPage,
   SkillRedirect,
   SettingsPage,
+  NotificationsPage,
   NotFoundPage,
 } satisfies Record<AppRouteComponentName, ComponentType>;
 

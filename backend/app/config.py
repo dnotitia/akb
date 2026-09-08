@@ -439,6 +439,8 @@ class ExternalGitHostRule(BaseModel):
 
 
 class Settings(BaseModel):
+    notifications_enabled: bool = True
+    notification_retention_days: int = Field(default=90, ge=1, le=3650)
     # Forbid unknown keys so a typo in app.yaml / secret.yaml fails loudly
     # instead of being silently dropped (pydantic default is 'ignore').
     # Never include the merged config input in validation errors: it can contain

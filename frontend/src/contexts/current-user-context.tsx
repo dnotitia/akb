@@ -7,7 +7,7 @@ export function CurrentUserProvider({
   user,
   children,
 }: {
-  user: CurrentUser;
+  user: CurrentUser | null;
   children: ReactNode;
 }) {
   return (

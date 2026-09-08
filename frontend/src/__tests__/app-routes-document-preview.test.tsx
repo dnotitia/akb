@@ -2,6 +2,7 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Outlet, useLocation } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 vi.mock("@/components/layout", () => ({
   Layout: () => (
@@ -71,6 +72,7 @@ describe("AppRoutes document preview", () => {
         <AppRoutes />
         <LocationProbe />
       </MemoryRouter>,
+      { wrapper: ({ children }) => <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>{children}</QueryClientProvider> },
     );
 
     expect(screen.getByText("Preserved search results")).toBeInTheDocument();
@@ -122,6 +124,7 @@ describe("AppRoutes document preview", () => {
         <AppRoutes />
         <LocationProbe />
       </MemoryRouter>,
+      { wrapper: ({ children }) => <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>{children}</QueryClientProvider> },
     );
 
     const overlay = document.querySelector<HTMLElement>(

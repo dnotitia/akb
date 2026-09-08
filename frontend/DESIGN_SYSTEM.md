@@ -796,6 +796,37 @@ _Roadmap primitives_ (high-drift inline patterns being extracted): `IndexRow`
 `MetaList`/`MetaItem` (rail `dl`), `InlineCode` (single-token mono chip). Until shipped, match the
 existing inline pattern and flag for extraction.
 
+### Personal notification ledger
+
+Personal notifications use one shared ledger in the header panel and full inbox.
+Use two header bands: title and overflow actions, then text-only category
+underline tabs (All / Documents / Access) with an independent Unread only
+checkbox. Allow the filter band to wrap on narrow screens. Do not mix read state
+and event categories in one tab list.
+Category filters are server predicates applied before pagination, not a filter
+over the first loaded page. The full inbox URL and the panel's View all action
+retain both filters. The header overflow groups Mark all notifications read
+(explicitly global) and Notification settings. Unknown server category support
+shows a recovery notice, never a misleading filtered-empty result. Rows stay
+title-first with a short event label and non-repeated Vault context; unread
+weight and a narrow indicator complement accessible state text. Times and
+always-accessible read actions sit side by side at the trailing edge. Group rows
+under Today / Yesterday / Earlier using local calendar boundaries, preserving
+server order. Avoid repeated row dividers and icon boxes. Category color stays
+on compact glyphs; do not tint entire rows or add invented counters.
+Navigable titles use link color and an always-visible arrow, with destination
+purpose in the accessible description. Notice-only rows retain neutral titles,
+say Notice only beside the event label, and have no row hover treatment or fake
+disabled navigation button. Read/unread controls remain available independently.
+Use 8px vertical row padding, 14px/20px titles and 12px/16px metadata separated
+by 2px: a normal two-line notification is approximately 54px tall. Keep long
+titles readable rather than fixing the row height. Header bands use 48px and
+36px minimum heights; read controls remain 36px.
+The app-header notification and account controls use content-sized, non-shrinking
+slots, never share a fixed account-width box. Account names stay visible from
+`sm` (bounded only for unusually long names); smaller screens use the avatar
+with the full identity available in its labelled account menu.
+
 ### Loading-state contract
 
 - Initial page and panel discovery keeps the final outer shell, masthead, rails,

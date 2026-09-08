@@ -47,6 +47,7 @@ import {
 } from "@/lib/api";
 import { cn, timeAgo } from "@/lib/utils";
 import { docUri } from "@/lib/uri";
+import { DocumentWatch } from "@/components/document-watch";
 import { parseHeadings } from "@/lib/markdown";
 import { sameCommitRef } from "@/lib/commit";
 import { VAULT_SKILL_PATH } from "@/lib/skill";
@@ -1023,6 +1024,7 @@ export default function DocumentPage({
                       {timeAgo(doc.updated_at)}
                     </span>
                   )}
+                  {!isHistorical && <DocumentWatch key={docUri(name!, doc.path)} uri={docUri(name!, doc.path)} />}
                   <button
                     type="button"
                     onClick={() => {
