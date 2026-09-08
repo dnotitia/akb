@@ -1326,8 +1326,34 @@ export function getDocumentDiff(
   );
 }
 
-export const updateDocument = (vault: string, id: string, data: any) =>
-  api<any>(`/documents/${vault}/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(data) });
+export interface DocumentUpdateInput {
+  content?: string;
+  title?: string;
+  type?: string;
+  status?: "draft" | "active" | "archived";
+  tags?: string[];
+  domain?: string | null;
+  summary?: string | null;
+  depends_on?: string[];
+  related_to?: string[];
+  message?: string;
+  expected_commit?: string;
+  expected_content_hash?: string;
+  title_conflict_policy?: "allow" | "reject";
+}
+
+export interface DocumentUpdateResult {
+  path?: string;
+  current_commit?: string | null;
+  commit_hash?: string | null;
+  [key: string]: unknown;
+}
+
+export const updateDocument = (vault: string, id: string, data: DocumentUpdateInput) =>
+  api<DocumentUpdateResult>(
+    `/documents/${vault}/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: JSON.stringify(data) },
+  );
 
 export interface DocumentMoveInput {
   collection?: string;
