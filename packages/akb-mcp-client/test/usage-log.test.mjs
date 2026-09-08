@@ -88,16 +88,119 @@ itAsync("appends one record per tools/call with the documented fields", async ()
 
     assert.deepEqual(
       Object.keys(record).sort(),
-      ["latency_ms", "result_bytes", "text_chars", "tool", "ts"],
+      ["error", "latency_ms", "result_bytes", "text_chars", "tool", "ts"],
     );
     assert.equal(record.tool, "akb_search");
     assert.equal(record.text_chars, body.length);
+    assert.equal(record.error, false);
     assert.equal(
       record.result_bytes,
       Buffer.byteLength(JSON.stringify(response.result), "utf8"),
     );
     assert.ok(record.latency_ms >= 0);
     assert.ok(!Number.isNaN(Date.parse(record.ts)), "ts must be a timestamp");
+  });
+});
+
+itAsync("sums text_chars across every text block, in characters", async () => {
+  await withLogPath(async (path) => {
+    const parts = ["첫 번째 블록입니다.", "second block", "세 번째 블록"];
+    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    proxy._ensureBackend = async () => true;
+    proxy._rpc = async () => ({
+      content: [
+        { type: "text", text: parts[0] },
+        { type: "image", data: "ignored-non-text-block" },
+        { type: "text", text: parts[1] },
+        { type: "text", text: parts[2] },
+      ],
+    });
+
+    await proxy._handle(searchCall(1));
+
+    const [record] = await readLines(path);
+    assert.equal(record.text_chars, parts.join("").length);
+    // Bytes and characters part company on Korean text, which is the point
+    // of carrying both.
+    assert.ok(record.result_bytes > record.text_chars);
+  });
+});
+
+itAsync("records concurrent calls as whole lines, one per call", async () => {
+  await withLogPath(async (path) => {
+    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    proxy._ensureBackend = async () => true;
+    proxy._rpc = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      return { content: [{ type: "text", text: "x".repeat(500) }] };
+    };
+
+    await Promise.all(
+      Array.from({ length: 12 }, (_, i) => proxy._handle(searchCall(i + 1))),
+    );
+
+    const records = await readLines(path);
+    assert.equal(records.length, 12, "one line per call, none interleaved");
+    assert.ok(records.every((r) => r.tool === "akb_search" && r.text_chars === 500));
+  });
+});
+
+// ── failures are measured too ────────────────────────────────────
+
+itAsync("records a call that threw, with error true and no payload", async () => {
+  await withLogPath(async (path) => {
+    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    proxy._forward = async () => {
+      throw new Error("backend unreachable");
+    };
+
+    await assert.rejects(() => proxy._handle(searchCall(1)), /backend unreachable/);
+
+    const [record] = await readLines(path);
+    assert.equal(record.tool, "akb_search");
+    assert.equal(record.error, true);
+    assert.equal(record.result_bytes, 0);
+    assert.ok(record.latency_ms >= 0);
+  });
+});
+
+itAsync("marks an isError result as an error without losing its size", async () => {
+  await withLogPath(async (path) => {
+    const body = JSON.stringify({ error: "vault not found", code: "not_found" });
+    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    proxy._ensureBackend = async () => true;
+    proxy._rpc = async () => ({ content: [{ type: "text", text: body }], isError: true });
+
+    await proxy._handle(searchCall(1));
+
+    const [record] = await readLines(path);
+    assert.equal(record.error, true);
+    assert.equal(record.text_chars, body.length);
+    assert.ok(record.result_bytes > 0);
+  });
+});
+
+// ── what the record must not contain ─────────────────────────────
+
+itAsync("never writes the call arguments", async () => {
+  await withLogPath(async (path) => {
+    const secret = "canary-8f3a1c-not-for-the-log";
+    const proxy = backedBy(JSON.stringify({ kind: "search", results: [] }));
+
+    await proxy._handle({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: {
+        name: "akb_search",
+        arguments: { query: secret, vault: secret, file_path: `/tmp/${secret}` },
+      },
+    });
+
+    const raw = await readFile(path, "utf8");
+    assert.ok(!raw.includes(secret), "arguments must never reach the usage log");
+    const [record] = await readLines(path);
+    assert.equal(record.tool, "akb_search");
   });
 });
 

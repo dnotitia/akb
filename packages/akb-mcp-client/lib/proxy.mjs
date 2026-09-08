@@ -466,9 +466,11 @@ export class AKBProxy {
     // Local file/image tools bypass backend call_tool. Keep their vault-level
     // challenge pending until an exact retry carries its opaque token.
     this._localVaultSkillPending = new Map();
-    // Set once if AKB_MCP_USAGE_LOG cannot be written, so a bad path costs
-    // one warning rather than one failed write per tool call.
-    this._usageLogBroken = false;
+    // Opt-in usage record. Read once, here, so the disabled path costs
+    // nothing per call — not even a clock read. Set to null when the
+    // variable is unset or the sink turns out to be unwritable, so a bad
+    // path costs one warning rather than one failed write per tool call.
+    this._usageLogPath = process.env.AKB_MCP_USAGE_LOG || null;
   }
 
   _sleep(ms) {
@@ -599,57 +601,80 @@ export class AKBProxy {
     const callKey = method === "tools/call" ? this._vaultSkillCallKey(msg.params) : null;
     if (callKey) msg = this._withVaultSkillAcknowledgement(msg, callKey);
 
-    const startedAt = Date.now();
-    const response =
-      method === "tools/call" && FILE_TOOL_NAMES.has(msg.params?.name)
-        ? await this._handleFileTool(id, msg.params)
-        : await this._forward(msg);
-    if (callKey) this._recordVaultSkillOutcome(callKey, msg, response);
-    if (method === "tools/call") {
-      this._recordUsage(msg.params?.name, response, Date.now() - startedAt);
+    // Only measured calls read the clock.
+    const measuring = method === "tools/call" && this._usageLogPath !== null;
+    const startedAt = measuring ? Date.now() : 0;
+    let response;
+    let threw = false;
+    try {
+      response =
+        method === "tools/call" && FILE_TOOL_NAMES.has(msg.params?.name)
+          ? await this._handleFileTool(id, msg.params)
+          : await this._forward(msg);
+      if (callKey) this._recordVaultSkillOutcome(callKey, msg, response);
+      return response;
+    } catch (err) {
+      threw = true;
+      throw err;
+    } finally {
+      if (measuring) {
+        this._recordUsage(msg.params?.name, response, Date.now() - startedAt, threw);
+      }
     }
-    return response;
   }
 
   // ── Opt-in usage record ────────────────────────────────────
   //
   // With `AKB_MCP_USAGE_LOG=<path>` set, append one JSON line per
-  // `tools/call` — `{ts, tool, result_bytes, text_chars, latency_ms}`.
+  // `tools/call` — `{ts, tool, result_bytes, text_chars, latency_ms, error}`.
   // Unset (the default) this does nothing at all: no file handle, no
-  // formatting, no behaviour change.
+  // formatting, not even a clock read.
   //
-  // It sits here rather than in `_forward` so the proxy-local file tools,
-  // which never reach the backend, are measured on the same footing as
-  // forwarded calls — this is the only place that sees every tools/call
-  // result. A call that threw is not recorded: there is no payload to
-  // size, and the error already surfaces to the client.
+  // It sits on the dispatch rather than in `_forward` so the proxy-local
+  // file tools, which never reach the backend, are measured on the same
+  // footing as forwarded calls — this is the only place that sees every
+  // tools/call result. Failures are measured too, and marked `error: true`:
+  // a call that fails still consumed a round trip, and a run where the
+  // failures are invisible reads as cheaper than it was. A call that threw
+  // before producing a response records `result_bytes: 0`.
+  //
+  // ARGUMENTS ARE NEVER WRITTEN. The record is about size and timing; a
+  // tool call's arguments carry vault content, paths and, on the file
+  // tools, local filesystem paths, none of which belong in a file the user
+  // enabled to count bytes.
   //
   // Characters, not tokens. A tokenizer would be a dependency, a model
   // choice and a version to keep in step with whatever model the agent
   // actually runs; `result_bytes` and `text_chars` are exact, and the
   // token estimate belongs wherever the model is known.
-  _recordUsage(tool, response, latencyMs) {
-    const path = process.env.AKB_MCP_USAGE_LOG;
-    if (!path || this._usageLogBroken) return;
+  _recordUsage(tool, response, latencyMs, threw = false) {
+    const path = this._usageLogPath;
+    if (!path) return;
     try {
-      const result = response?.result;
+      const payload = response?.result ?? response?.error;
       let textChars = 0;
-      const content = Array.isArray(result?.content) ? result.content : [];
+      const content = Array.isArray(response?.result?.content)
+        ? response.result.content
+        : [];
       for (const part of content) {
         if (typeof part?.text === "string") textChars += part.text.length;
       }
       const record = {
         ts: new Date().toISOString(),
         tool: typeof tool === "string" ? tool : null,
-        result_bytes: Buffer.byteLength(JSON.stringify(result ?? null), "utf8"),
+        result_bytes:
+          payload === undefined
+            ? 0
+            : Buffer.byteLength(JSON.stringify(payload ?? null), "utf8"),
         text_chars: textChars,
         latency_ms: latencyMs,
+        error: threw || response?.error !== undefined || response?.result?.isError === true,
       };
       // Synchronous on purpose: one short line per call, and an interleaved
       // partial write would corrupt the JSONL this is meant to produce.
       appendFileSync(path, `${JSON.stringify(record)}\n`);
     } catch (err) {
-      this._usageLogBroken = true;
+      this._usageLogPath = null;
       process.stderr.write(
         `[akb-mcp] AKB_MCP_USAGE_LOG write failed (${err.message}); ` +
           `usage records disabled for this session\n`,
