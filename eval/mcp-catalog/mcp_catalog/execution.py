@@ -27,7 +27,7 @@ from pydantic_evals.reporting import EvaluationReport, ReportCaseFailure, Scalar
 
 from .catalog import ConnectionSpec, create_client, create_toolset
 from .contracts import OPENROUTER_BASE_URL, BenchmarkRunManifest, ModelSpec, TaskManifest
-from .evidence import canonical_json, redact_text, safe_json
+from .evidence import canonical_json, redact_exception, redact_text, safe_json
 from .runtime import RuntimeContractError, RuntimeFixture, StateObservation
 from .state import StateCheckResult, evaluate_state_contract
 
@@ -197,7 +197,7 @@ class ToolCallRecorder:
         try:
             result = await call(name, server_args)
         except Exception as exc:
-            observed.error = redact_text(exc, self.secrets)
+            observed.error = redact_exception(exc, self.secrets)
             raise
         observed.succeeded = True
         result_text = canonical_json(safe_json(result, self.secrets))
@@ -293,7 +293,7 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
                     self._record_cleanup(exc)
                     result.error_message = (
                         f"{result.error_message}; cleanup failed: "
-                        f"{redact_text(exc, self._secrets_for_case())}"
+                        f"{redact_exception(exc, self._secrets_for_case())}"
                     )
                 else:
                     self._record_failure(exc)
@@ -463,7 +463,7 @@ class TrialExecutor:
                         infer_name=False,
                     )
             except Exception as exc:
-                error = redact_text(exc, secrets)
+                error = redact_exception(exc, secrets)
             latency = time.perf_counter() - started
             outcome = outcome_from_run(
                 task=task,
@@ -538,7 +538,13 @@ def build_model(spec: ModelSpec) -> OpenRouterChatModel:
     return OpenRouterChatModel(
         spec.model_id,
         provider=OpenAIProvider(base_url=base_url, api_key=api_key),
-        profile=cast(Any, {"openai_chat_supports_max_completion_tokens": False}),
+        profile=cast(
+            Any,
+            {
+                "openai_chat_supports_max_completion_tokens": False,
+                "openai_supports_strict_tool_definition": False,
+            },
+        ),
         settings=cast(Any, settings),
     )
 
