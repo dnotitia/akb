@@ -17,6 +17,7 @@ test("channel is vault-scoped and exposes the same auth boundary from main and l
 
   assert.throws(() => root.channel(), /Select a vault/);
   assert.throws(() => lite.channel(), /Select a vault/);
+  assert.throws(() => root.vault("vault/one").channel().on("message", () => undefined), TypeError);
   assert.equal(fetchCalls, 0);
   assert.equal(typeof root.vault("vault/one").channel, "function");
   assert.equal(typeof lite.vault("vault/one").channel, "function");

@@ -247,7 +247,7 @@ function makeChannel(
         return makeChannel(vault, openStream, [...registrations, registration]);
       }
 
-      if (typeof optionsOrListener !== "function") {
+      if (event !== "checkpoint" || typeof optionsOrListener !== "function") {
         throw new TypeError('"checkpoint" listeners must be functions.');
       }
       const registration: CheckpointRegistration = {
