@@ -70,6 +70,7 @@ DEFAULT_MINIO_PORT = 9000
 DEFAULT_COMPOSE_PROJECT = "akb-e2e"
 DEFAULT_TIMEOUT_SECONDS = 180.0
 DEFAULT_PROFILE = "tool-only"
+SOURCE_REVISION_ENV = "AKB_E2E_SOURCE_REVISION"
 BENCHMARK_PROFILE = "transport-proxy"
 BENCHMARK_SCENARIO: Scenario = "app-control-plane"
 OPENROUTER_BASE_URL_ENV = "MCP_BENCH_OPENROUTER_BASE_URL"
@@ -657,6 +658,14 @@ class E2ERuntime:
         return tuple(sorted(self.profile.capabilities))
 
     def _source_revision(self) -> str:
+        explicit = os.environ.get(SOURCE_REVISION_ENV)
+        if explicit is not None:
+            if re.fullmatch(r"[0-9a-f]{40}", explicit) is None:
+                raise BlockedRuntimeConfig(
+                    f"{SOURCE_REVISION_ENV} must be a full 40-hex Git SHA"
+                )
+            self._candidate_revision = explicit
+            return explicit
         if self._candidate_revision is not None:
             return self._candidate_revision
         try:
@@ -669,7 +678,11 @@ class E2ERuntime:
             )
         except OSError:
             completed = None
-        revision = completed.stdout.strip() if completed and completed.returncode == 0 else "unknown"
+        revision = completed.stdout.strip() if completed and completed.returncode == 0 else ""
+        if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+            raise BlockedRuntimeConfig(
+                f"exact source revision requires {SOURCE_REVISION_ENV} in a raw checkout"
+            )
         self._candidate_revision = revision
         return revision
 
@@ -3433,6 +3446,7 @@ class E2ERuntime:
 
     async def prepare(self) -> None:
         self._validate_checkout()
+        self._source_revision()
         self._validate_profile()
         prepare_private_runtime_root(self.config.runtime_root)
         self._write_config()

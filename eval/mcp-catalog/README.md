@@ -85,6 +85,16 @@ uv run --locked --project eval/mcp-catalog \
   mcp-catalog-bench validate --descriptor -
 ```
 
+### Source revision handoff
+
+runtime source identity는 명시된 `AKB_E2E_SOURCE_REVISION`이 있으면 그것을
+우선 사용한다. 값은 lowercase 40-hex Git SHA여야 하며, 값이 없을 때만 실제
+checkout의 `git rev-parse HEAD`를 사용한다. raw sync처럼 `.git`이 없는
+checkout에서 값이 없거나 형식이 틀리면 runtime은 resource를 만들기 전에
+`blocked_runtime_config`로 종료하며 `unknown`을 descriptor/discovery에
+기록하지 않는다. 이 변수는 credential이 아니므로 provider/PAT handoff와
+분리된 runtime identity input이다.
+
 ## Baseline과 candidate 실행
 
 먼저 동일 corpus와 manifest로 baseline을 한 번 실행하고, candidate runtime을
