@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "name": "akb-mcp-tool-catalog",
+  "protocol_revision": "2026-07-28",
+  "source_revision": "runtime_descriptor",
+  "arms": ["baseline", "candidate"],
+  "transports": ["http", "stdio"],
+  "models": [
+    {
+      "class_name": "primary",
+      "provider": "openai-compatible",
+      "model_id": "gpt-4o-2024-08-06",
+      "version": "gpt-4o-2024-08-06",
+      "base_url_env": "MCP_BENCH_OPENAI_BASE_URL",
+      "provider_key_env": "MCP_BENCH_OPENAI_API_KEY",
+      "settings": {"temperature": 0.0, "max_tokens": 1600},
+      "input_cost_per_million_usd": 5.0,
+      "output_cost_per_million_usd": 15.0
+    },
+    {
+      "class_name": "lightweight",
+      "provider": "openai-compatible",
+      "model_id": "gpt-4o-mini-2024-07-18",
+      "version": "gpt-4o-mini-2024-07-18",
+      "base_url_env": "MCP_BENCH_OPENAI_BASE_URL",
+      "provider_key_env": "MCP_BENCH_OPENAI_API_KEY",
+      "settings": {"temperature": 0.0, "max_tokens": 1200},
+      "input_cost_per_million_usd": 0.15,
+      "output_cost_per_million_usd": 0.6
+    }
+  ],
+  "repeats": 3,
+  "max_concurrency": 1,
+  "category_minimums": {
+    "single_operation": 2,
+    "ambiguous_action": 2,
+    "multi_step": 2,
+    "destructive_confirmation": 2,
+    "authorization": 2,
+    "invalid_input_recovery": 2,
+    "stdio_local": 2
+  },
+  "statistical_procedure": {
+    "method": "paired_task_mean_normal_approximation",
+    "confidence": 0.95,
+    "noninferiority_margin": 0.03,
+    "repeated_trials_are_averaged_per_task": true,
+    "z_value": 1.644854
+  },
+  "budget": {
+    "max_model_requests": 3000,
+    "max_input_tokens": 6000000,
+    "max_output_tokens": 1000000,
+    "max_total_tokens": 7000000,
+    "max_total_cost_usd": 100.0,
+    "max_wall_seconds": 10800,
+    "max_requests_per_trial": 8,
+    "max_tokens_per_trial": 24000,
+    "max_cost_per_trial_usd": 1.0
+  },
+  "operation_map": {
+    "list": ["akb_list_vaults", "akb_browse"],
+    "read": ["akb_get", "akb_drill_down", "akb_vault_info"],
+    "search": ["akb_search", "akb_grep"],
+    "create": ["akb_put", "akb_create_vault", "akb_create_collection", "akb_create_table"],
+    "update": ["akb_update", "akb_edit", "akb_update_file"],
+    "delete": ["akb_delete", "akb_delete_vault", "akb_delete_collection", "akb_delete_file"],
+    "grant": ["akb_grant", "akb_revoke"],
+    "file_upload": ["akb_put_file"],
+    "image_upload": ["akb_put_image"]
+  },
+  "credential_profiles": {
+    "default": null,
+    "read_only": "MCP_BENCH_READ_ONLY_PAT"
+  },
+  "fixture_scenario": "app-control-plane"
+}
