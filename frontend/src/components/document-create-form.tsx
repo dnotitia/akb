@@ -59,6 +59,8 @@ export interface DocumentCreateFormProps {
   onCreatingChange?: (creating: boolean) => void;
   onUploadingChange?: (uploading: boolean) => void;
   onAssetIdsChange?: (assetIds: readonly string[]) => void;
+  onAssetExpirationsChange?: (expirations: Readonly<Record<string, string>>) => void;
+  onUnclaimedAssetIdsChange?: (assetIds: readonly string[]) => void;
 }
 
 /** Depth-first collection paths for the location suggestions. */
@@ -98,8 +100,13 @@ export function DocumentCreateForm({
   onCreatingChange,
   onUploadingChange,
   onAssetIdsChange,
+  onAssetExpirationsChange,
+  onUnclaimedAssetIdsChange,
 }: DocumentCreateFormProps) {
   const restoredDraft = useMemo(() => loadDocumentDraft(vault), [vault]);
+  const restoredDraftExpired = Boolean(
+    restoredDraft?.expiresAt && Date.parse(restoredDraft.expiresAt) <= Date.now(),
+  );
   const { tree } = useVaultTree(vault);
   const { refetchTree, refetchVaults } = useVaultRefresh();
   const collectionOptions = useMemo(
@@ -122,6 +129,12 @@ export function DocumentCreateForm({
   const [bodyAssetIds, setBodyAssetIds] = useState<readonly string[]>(
     restoredDraft?.assetIds ?? [],
   );
+  const [bodyAssetExpirations, setBodyAssetExpirations] = useState<Readonly<Record<string, string>>>(
+    restoredDraft?.assetExpiresAt ?? {},
+  );
+  const [unclaimedAssetIds, setUnclaimedAssetIds] = useState<readonly string[]>(
+    restoredDraft?.assetIds ?? [],
+  );
   const [claimedAssetIds, setClaimedAssetIds] = useState<readonly string[] | null>(null);
   const [error, setError] = useState("");
   const [serverConflict, setServerConflict] = useState<DocumentTitleConflict | null>(null);
@@ -129,8 +142,8 @@ export function DocumentCreateForm({
   const [creating, setCreating] = useState(false);
   const [uploadingImage, setUploadingImage] = useState(false);
   const [draftStatus, setDraftStatus] = useState<
-    "idle" | "restored" | "saving" | "saved" | "error"
-  >(restoredDraft ? "restored" : "idle");
+    "idle" | "restored" | "saving" | "saved" | "error" | "expired"
+  >(restoredDraftExpired ? "expired" : restoredDraft ? "restored" : "idle");
   const skipInitialDraftSaveRef = useRef(Boolean(restoredDraft));
   const [detailsOpen, setDetailsOpen] = useState(() =>
     typeof window === "undefined"
@@ -169,12 +182,16 @@ export function DocumentCreateForm({
     summary.trim() !== "" ||
     tags.length > 0 ||
     hasMeaningfulMarkdown(body);
-  const hasUnsavedWork = isDirty || uploadingImage;
+  const hasUnsavedWork = isDirty || uploadingImage || unclaimedAssetIds.length > 0;
 
   useEffect(() => onDirtyChange?.(hasUnsavedWork), [hasUnsavedWork, onDirtyChange]);
   useEffect(() => onCreatingChange?.(creating), [creating, onCreatingChange]);
   useEffect(() => onUploadingChange?.(uploadingImage), [uploadingImage, onUploadingChange]);
   useEffect(() => onAssetIdsChange?.(bodyAssetIds), [bodyAssetIds, onAssetIdsChange]);
+  useEffect(
+    () => onUnclaimedAssetIdsChange?.(unclaimedAssetIds),
+    [onUnclaimedAssetIdsChange, unclaimedAssetIds],
+  );
 
   useEffect(() => {
     if (creating) return;
@@ -199,11 +216,12 @@ export function DocumentCreateForm({
         tags,
         body,
         assetIds: [...bodyAssetIds],
+        assetExpiresAt: bodyAssetExpirations,
       });
       setDraftStatus(saved ? "saved" : "error");
     }, 300);
     return () => window.clearTimeout(timer);
-  }, [body, bodyAssetIds, collection, creating, domain, isDirty, summary, tags, title, type, vault]);
+  }, [body, bodyAssetExpirations, bodyAssetIds, collection, creating, domain, isDirty, summary, tags, title, type, vault]);
 
   useEffect(() => {
     const media = window.matchMedia("(min-width: 1024px)");
@@ -408,6 +426,8 @@ export function DocumentCreateForm({
                 ? "Uploading image…"
                 : draftStatus === "restored"
                   ? "Local draft restored"
+                  : draftStatus === "expired"
+                    ? "Draft expired — review attachments"
                   : draftStatus === "saving"
                     ? "Saving draft…"
                     : draftStatus === "saved"
@@ -559,6 +579,13 @@ export function DocumentCreateForm({
                       setServerConflict(null);
                       if (invalidField === "body") setInvalidField(null);
                     }}
+                    onAssetExpirationsChange={(expirations) => {
+                      setBodyAssetExpirations(expirations);
+                      onAssetExpirationsChange?.(expirations);
+                    }}
+                    onUnclaimedAssetIdsChange={(assetIds) => {
+                      setUnclaimedAssetIds(assetIds);
+                    }}
                     placeholder="Start with the idea, decision, or context worth keeping…"
                     ariaLabelledby="doc-body-label"
                     required
@@ -570,6 +597,7 @@ export function DocumentCreateForm({
                       if (uploading) setClaimedAssetIds(null);
                     }}
                     initialUnclaimedAssetIds={restoredDraft?.assetIds}
+                    initialUnclaimedAssetExpirations={restoredDraft?.assetExpiresAt}
                     preserveUploadsOnUnmount
                     claimedAssetIds={claimedAssetIds}
                   />

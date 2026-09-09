@@ -212,6 +212,8 @@ export default function DocumentPage({
   const [editingContent, setEditingContent] = useState("");
   const [editingTitle, setEditingTitle] = useState("");
   const [editingAssetIds, setEditingAssetIds] = useState<readonly string[]>([]);
+  const [editingAssetExpirations, setEditingAssetExpirations] = useState<Readonly<Record<string, string>>>({});
+  const [unclaimedAssetIds, setUnclaimedAssetIds] = useState<readonly string[]>([]);
   const [originalContent, setOriginalContent] = useState("");
   const [originalTitle, setOriginalTitle] = useState("");
   const [titleTouched, setTitleTouched] = useState(false);
@@ -259,20 +261,22 @@ export default function DocumentPage({
     title: "",
     content: "",
     assetIds: [] as readonly string[],
+    assetExpirations: {} as Readonly<Record<string, string>>,
   });
   const contentChanged = editingContent !== originalContent;
   const normalizedEditingTitle = documentTitleKey(editingTitle);
   const titleChanged = normalizedEditingTitle !== documentTitleKey(originalTitle);
   const isDirty = contentChanged || titleChanged;
-  const hasUnsavedWork = isDirty || uploadingImage;
+  const hasUnsavedWork = isDirty || uploadingImage || unclaimedAssetIds.length > 0;
 
   useEffect(() => {
     editingSnapshotRef.current = {
       title: editingTitle,
       content: editingContent,
       assetIds: editingAssetIds,
+      assetExpirations: editingAssetExpirations,
     };
-  }, [editingAssetIds, editingContent, editingTitle]);
+  }, [editingAssetExpirations, editingAssetIds, editingContent, editingTitle]);
 
   useEffect(() => {
     // A real editor can emit one canonicalization event while mounting. The
@@ -302,12 +306,13 @@ export default function DocumentPage({
       title: string;
       body: string;
       assetIds: readonly string[];
+      assetExpiresAt: Readonly<Record<string, string>>;
     }> = {},
   ) {
     if (!currentUserId || !name || !doc?.path || !editBaseCommitRef.current) return null;
     if (!draftSessionRef.current) {
       draftSessionRef.current = {
-        version: 1,
+        version: 2,
         kind: "document-edit",
         draftId: createDocumentEditDraftId(),
         tabId: draftTabIdRef.current || documentEditDraftTabId(),
@@ -320,6 +325,7 @@ export default function DocumentPage({
         title: editingTitle,
         body: editingContent,
         assetIds: [...editingAssetIds],
+        assetExpiresAt: { ...editingAssetExpirations },
         editorVersion: DOCUMENT_EDIT_DRAFT_EDITOR_VERSION,
         markdownProfile: DOCUMENT_EDIT_DRAFT_MARKDOWN_PROFILE,
         updatedAt: new Date().toISOString(),
@@ -338,6 +344,9 @@ export default function DocumentPage({
       title: overrides.title ?? editingTitle,
       body: overrides.body ?? editingContent,
       assetIds: [...(overrides.assetIds ?? editingAssetIds)],
+      assetExpiresAt: {
+        ...(overrides.assetExpiresAt ?? editingAssetExpirations),
+      },
       tabId: draftTabIdRef.current || session.tabId,
     };
   }
@@ -643,6 +652,7 @@ export default function DocumentPage({
         draftStatus === "saving" ||
         draftStatus === "saved" ||
         draftStatus === "error" ||
+        draftStatus === "expired" ||
         saveConflict !== null);
 
     if (identityChanged) {
@@ -667,6 +677,8 @@ export default function DocumentPage({
       setOriginalTitle(d.title || "");
       setEditingTitle(d.title || "");
       setEditingAssetIds([]);
+      setEditingAssetExpirations({});
+      setUnclaimedAssetIds([]);
       setEditorInitialContent(d.content || "");
       editorHydrationModeRef.current = "server";
       hydratedKey.current = null;
@@ -687,6 +699,9 @@ export default function DocumentPage({
       setEditingContent(d.content || "");
       setOriginalTitle(d.title || "");
       setEditingTitle(d.title || "");
+      setEditingAssetIds([]);
+      setEditingAssetExpirations({});
+      setUnclaimedAssetIds([]);
       setEditorInitialContent(d.content || "");
       editorHydrationModeRef.current = "server";
       hydratedKey.current = null;
@@ -744,6 +759,8 @@ export default function DocumentPage({
       setEditingContent(stored.body);
       setEditingTitle(stored.title);
       setEditingAssetIds(stored.assetIds);
+      setEditingAssetExpirations(stored.assetExpiresAt ?? {});
+      setUnclaimedAssetIds(stored.assetIds);
       setEditorInitialContent(stored.body);
       editorHydrationModeRef.current = "draft";
       hydratedKey.current = null;
@@ -838,6 +855,7 @@ export default function DocumentPage({
   }, [
     currentUserId,
     doc?.path,
+    editingAssetExpirations,
     editingAssetIds,
     editingContent,
     editingTitle,
@@ -865,6 +883,7 @@ export default function DocumentPage({
   }, [
     currentUserId,
     doc?.path,
+    editingAssetExpirations,
     draftStatus,
     editingAssetIds,
     editingContent,
@@ -974,6 +993,7 @@ export default function DocumentPage({
         title: editingTitle,
         body: editingContent,
         assetIds: editingAssetIds,
+        assetExpiresAt: editingAssetExpirations,
       });
     } finally {
       setRebasing(false);
@@ -1071,6 +1091,7 @@ export default function DocumentPage({
           title: followup.title,
           body: followup.content,
           assetIds: followup.assetIds,
+          assetExpiresAt: followup.assetExpirations,
         });
       } else if (draftSessionRef.current) {
         clearDocumentEditDraft(draftSessionRef.current);
@@ -1078,6 +1099,7 @@ export default function DocumentPage({
         latestDraftInputRef.current = null;
         setDraftStatus("idle");
         setDraftNotice("");
+        setEditingAssetExpirations({});
       }
       // Sidebar refresh is best-effort — its failure must not leave the
       // user looking at a "still dirty" editor after a successful save.
@@ -1208,6 +1230,7 @@ export default function DocumentPage({
     const assets = new Set<string>([
       ...(draft?.assetIds || []),
       ...editingAssetIds,
+      ...unclaimedAssetIds,
     ]);
     if (draft) clearDocumentEditDraft(draft);
     if (draftRecovery?.status === "expired") {
@@ -1219,6 +1242,7 @@ export default function DocumentPage({
         .map((assetId) => discardAsset(name!, assetId)),
     );
     draftSessionRef.current = null;
+    setEditingAssetExpirations({});
     setDraftRecovery(null);
     setDraftStatus("idle");
     setDraftNotice("");
@@ -1710,6 +1734,7 @@ export default function DocumentPage({
                             title: editingTitle,
                             content: markdown,
                             assetIds: nextAssetIds,
+                            assetExpirations: editingAssetExpirations,
                           };
                           setEditingAssetIds(nextAssetIds);
                           setServerTitleConflict((current) =>
@@ -1725,6 +1750,10 @@ export default function DocumentPage({
                           }
                           setEditingContent(markdown);
                         }}
+                        onAssetExpirationsChange={(expirations) => {
+                          setEditingAssetExpirations(expirations);
+                        }}
+                        onUnclaimedAssetIdsChange={setUnclaimedAssetIds}
                         ariaLabel="Document body (markdown)"
                         autoFocus
                         readOnly={savingBody}
@@ -1745,6 +1774,7 @@ export default function DocumentPage({
                         }
                         claimedAssetIds={claimedAssetIds}
                         initialUnclaimedAssetIds={editingAssetIds}
+                        initialUnclaimedAssetExpirations={editingAssetExpirations}
                       />
                     </Suspense>
                     {draftNotice && (draftStatus === "restored" || draftStatus === "saved" || draftStatus === "error" || draftStatus === "unavailable") && (
@@ -2202,6 +2232,7 @@ export default function DocumentPage({
           setEditingContent(originalContent);
           setEditingTitle(originalTitle);
           setEditingAssetIds([]);
+          setUnclaimedAssetIds([]);
           setTitleTouched(false);
           setServerTitleConflict(null);
           if (existingPath) openExistingDocument(existingPath);
@@ -2227,6 +2258,7 @@ export default function DocumentPage({
           setEditorInitialContent(originalContent);
           setEditingTitle(originalTitle);
           setEditingAssetIds([]);
+          setUnclaimedAssetIds([]);
           setEditorKey((k) => k + 1);
           setBodyError("");
           setTitleTouched(false);

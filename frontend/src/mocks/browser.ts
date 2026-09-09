@@ -52,7 +52,7 @@ type FixtureState = {
   refetch_generation?: number;
   expire_draft_generation?: number;
   faults?: { save?: number; upload?: number };
-  assets?: Array<{ id: string; filename: string; status: string }>;
+  assets?: Array<{ id: string; filename: string; status: string; expires_at?: string }>;
 };
 
 let fixtureState: FixtureState = {};
@@ -81,19 +81,42 @@ const baseDocument = {
   metadata_is_current: true,
 };
 
+const referenceDocument = {
+  ...baseDocument,
+  uri: "akb://fixture/coll/notes/doc/references.md",
+  path: "notes/references.md",
+  title: "Reference adapter fixture",
+  content: [
+    "# Reference adapter fixture",
+    "",
+    "[Available document](akb://fixture/doc/available.md)",
+    "",
+    "[Available file](akb://fixture/file/123e4567-e89b-42d3-a456-426614174001)",
+    "",
+    "[Unavailable file](akb://fixture/file/123e4567-e89b-42d3-a456-426614174099)",
+    "",
+    "![Fixture attachment](/api/assets/123e4567-e89b-42d3-a456-426614174000)",
+  ].join("\n"),
+};
+
 function documentForState(): typeof baseDocument {
   const remote = fixtureState.document;
+  const template = isReferenceScenario() ? referenceDocument : baseDocument;
   return remote
-    ? { ...baseDocument, ...remote }
-    : { ...baseDocument };
+    ? { ...template, ...remote }
+    : { ...template };
 }
 
 function isDocumentScenario(): boolean {
-  return activeScenario === "document-edit-recovery";
+  return activeScenario === "document-edit-recovery" || activeScenario === "markdown-reference-adapters";
+}
+
+function isReferenceScenario(): boolean {
+  return activeScenario === "markdown-reference-adapters";
 }
 
 function documentIdentity(): string {
-  return fixtureState.identity?.document_uri || baseDocument.uri;
+  return fixtureState.identity?.document_uri || documentForState().uri;
 }
 
 async function consumeFixtureFault(operation: "save" | "upload"): Promise<boolean> {
@@ -137,7 +160,10 @@ async function syncFixtureState(): Promise<FixtureState> {
       appliedRefetchGeneration = refetchGeneration;
       window.dispatchEvent(
         new CustomEvent("akb:mock-document-refetch", {
-          detail: { vault: "fixture", document: "notes/recovery.md" },
+          detail: {
+            vault: "fixture",
+            document: fixtureState.identity?.document_path || "notes/recovery.md",
+          },
         }),
       );
     }
@@ -243,7 +269,7 @@ const handlers = [
     await syncPublicReset();
     return HttpResponse.json({
       vaults: isDocumentScenario()
-        ? [{ name: "fixture", role: "owner", description: "Document recovery fixture" }]
+        ? [{ name: "fixture", role: "owner", description: isReferenceScenario() ? "Reference adapter fixture" : "Document recovery fixture" }]
         : [],
     });
   }),
@@ -251,7 +277,7 @@ const handlers = [
     await syncPublicReset();
     return HttpResponse.json({
       name: "fixture",
-      description: "Document recovery fixture",
+      description: isReferenceScenario() ? "Reference adapter fixture" : "Document recovery fixture",
       role: "owner",
       member_count: 1,
       owner_display_name: "JY Kim",
@@ -272,12 +298,25 @@ const handlers = [
       path: "",
       items: [
         { type: "collection", name: "notes", path: "notes", doc_count: 1 },
-        { type: "document", name: documentForState().title, path: "notes/recovery.md" },
+        { type: "document", name: documentForState().title, path: documentForState().path },
       ],
     });
   }),
-  http.get(/\/api\/v1\/documents\/fixture\/.+$/, async () => {
+  http.get(/\/api\/v1\/documents\/fixture\/.+$/, async ({ request }) => {
     await syncPublicReset();
+    if (isReferenceScenario()) {
+      const path = decodeURIComponent(new URL(request.url).pathname.split("/documents/fixture/")[1] || "");
+      if (path === "missing.md") return new HttpResponse(null, { status: 404 });
+      if (path === "available.md") {
+        return HttpResponse.json({
+          ...referenceDocument,
+          uri: "akb://fixture/doc/available.md",
+          path,
+          title: "Available document",
+          content: "Available reference",
+        });
+      }
+    }
     return HttpResponse.json(documentForState());
   }),
   http.patch(/\/api\/v1\/documents\/fixture\/.+$/, async ({ request }) => {
@@ -342,7 +381,7 @@ const handlers = [
   }),
   http.get(`${API}/relations`, async () => {
     await syncPublicReset();
-    return HttpResponse.json({ uri: baseDocument.uri, relations: [] });
+    return HttpResponse.json({ uri: documentForState().uri, relations: [] });
   }),
   http.post(`${API}/assets/fixture`, async ({ request }) => {
     await syncPublicReset();
@@ -355,21 +394,89 @@ const handlers = [
     const url = new URL(request.url);
     const filename = url.searchParams.get("filename") || "fixture.png";
     const id = `00000000-0000-4000-8000-${String(Date.now() % 1_000_000_000_000).padStart(12, "0")}`;
+    let uploadedState: { expires_at?: string };
     try {
-      await fetch("/__akb_mock__/fixture/upload", {
+      const uploaded = await fetch("/__akb_mock__/fixture/upload", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id, filename }),
       });
+      uploadedState = await uploaded.json().catch(() => ({})) as { expires_at?: string };
     } catch {
       return HttpResponse.json({ error: "fixture_upload_failed" }, { status: 503 });
     }
     return HttpResponse.json({
+      kind: "attachment",
       id,
+      target: `/api/assets/${id}`,
       url: `/api/assets/${id}`,
       name: filename,
       mime_type: request.headers.get("content-type") || "image/png",
       size_bytes: Number(request.headers.get("content-length") || 0),
+      unclaimed_expires_at: uploadedState.expires_at ?? null,
+    });
+  }),
+  http.post(/\/api\/v1\/assets\/fixture\/from-file\/[^/]+$/, async ({ request }) => {
+    await syncPublicReset();
+    const sourceId = new URL(request.url).pathname.split("/").at(-1) || "";
+    if (sourceId !== "123e4567-e89b-42d3-a456-426614174001") {
+      return new HttpResponse(null, { status: 404 });
+    }
+    const id = `00000000-0000-4000-8000-${String(Date.now() % 1_000_000_000_000).padStart(12, "0")}`;
+    const uploaded = await fetch("/__akb_mock__/fixture/upload", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, filename: "available.png" }),
+    });
+    const uploadedState = await uploaded.json().catch(() => ({})) as { expires_at?: string };
+    return HttpResponse.json({
+      kind: "attachment",
+      id,
+      target: `/api/assets/${id}`,
+      url: `/api/assets/${id}`,
+      name: "available.png",
+      mime_type: "image/png",
+      size_bytes: 10,
+      source_file_uri: `akb://fixture/file/${sourceId}`,
+      unclaimed_expires_at: uploadedState.expires_at ?? null,
+    }, { status: 201 });
+  }),
+  http.get(`${API}/assets/fixture/policy`, async () => {
+    await syncPublicReset();
+    return HttpResponse.json({
+      kind: "attachment_policy",
+      vault: "fixture",
+      server_time: new Date().toISOString(),
+      unclaimed_ttl_hours: 24,
+      revision_retention_days: 30,
+    });
+  }),
+  http.get(/\/api\/v1\/assets\/fixture\/[^/]+\/metadata$/, async ({ request }) => {
+    await syncPublicReset();
+    const id = new URL(request.url).pathname.split("/").at(-2) || "";
+    const asset = fixtureState.assets?.find((candidate) => candidate.id === id);
+    if (!asset || asset.status === "discarded") return new HttpResponse(null, { status: 404 });
+    return HttpResponse.json({
+      kind: "attachment",
+      target: `/api/assets/${asset.id}`,
+      status: asset.status,
+      unclaimed_expires_at: asset.expires_at ?? null,
+    });
+  }),
+  http.get(`${API}/files/fixture/123e4567-e89b-42d3-a456-426614174001/download`, async () => {
+    await syncPublicReset();
+    return HttpResponse.json({
+      kind: "file",
+      name: "available.png",
+      download_url: "/__akb_mock__/fixture/available-file.png",
+      mime_type: "image/png",
+      size_bytes: 5,
+    });
+  }),
+  http.get("/__akb_mock__/fixture/available-file.png", async () => {
+    await syncPublicReset();
+    return new HttpResponse(new Blob(["file-image"], { type: "image/png" }), {
+      headers: { "Content-Type": "image/png" },
     });
   }),
   http.delete(/\/api\/v1\/assets\/fixture\/.+$/, async ({ request }) => {

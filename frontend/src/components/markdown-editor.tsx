@@ -96,8 +96,14 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { discardAsset, uploadAsset } from "@/lib/api";
-import { normalizeEditorLinkUrl } from "@/lib/editor-link";
+import { discardAsset } from "@/lib/api";
+import { isAkbResourceTarget, normalizeEditorLinkUrl } from "@/lib/editor-link";
+import {
+  canonicalAkbMarkdownTarget,
+  createAkbMarkdownAdapters,
+  extractAkbMarkdownLinkTargets,
+  type AkbMarkdownTargetResolution,
+} from "@/lib/markdown-adapters";
 import {
   assetIdFromUrl,
   classifyEditorImageUploadFailure,
@@ -161,14 +167,35 @@ function CodeLineElement(props: PlateElementProps) {
 
 function LinkElement(props: PlateElementProps) {
   const url = (props.element as { url?: string }).url;
-  const safe = sanitizeLinkUrl(url);
+  const targetUrl = url ?? "";
+  const canonicalTarget = canonicalAkbMarkdownTarget(targetUrl) ?? targetUrl;
+  const assetLifecycle = React.useContext(EditorAssetLifecycleContext);
+  const resolution = isAkbResourceTarget(canonicalTarget)
+    ? assetLifecycle?.targetResolutions.get(canonicalTarget)
+    : undefined;
+  const safe = isAkbResourceTarget(canonicalTarget)
+    ? resolution?.status === "available" && resolution.runtimeUrl
+      ? resolution.runtimeUrl
+      : "#"
+    : sanitizeLinkUrl(targetUrl);
   return (
     <PlateElement
       {...props}
       as="a"
       // href is read-only in the editor; opening links is handled outside the
       // editing surface (cmd-click). We still set href for serialization round-trip.
-      attributes={{ ...props.attributes, href: safe, rel: "noopener noreferrer" }}
+      attributes={{
+        ...props.attributes,
+        href: safe,
+        rel: "noopener noreferrer",
+        ...(isAkbResourceTarget(canonicalTarget)
+          ? {
+              "data-markdown-target": canonicalTarget,
+              "data-markdown-resolution": resolution?.status ?? "pending",
+              "aria-disabled": resolution?.status === "available" ? undefined : "true",
+            }
+          : {}),
+      }}
       className="text-link underline underline-offset-2 hover:no-underline"
     />
   );
@@ -401,9 +428,11 @@ interface EditorAssetLifecycle {
   readOnly?: boolean;
   focusEditor: () => void;
   requestImageReplacement: (path: number[]) => void;
+  targetResolutions: ReadonlyMap<string, AkbMarkdownTargetResolution>;
 }
 
 const EditorAssetLifecycleContext = React.createContext<EditorAssetLifecycle | null>(null);
+const EMPTY_TARGET_RESOLUTIONS: ReadonlyMap<string, AkbMarkdownTargetResolution> = new Map();
 
 function ImageElement(props: PlateElementProps) {
   const editor = useEditorRef();
@@ -459,6 +488,7 @@ function ImageElement(props: PlateElementProps) {
         <div className="relative mx-auto w-fit max-w-full">
           <AssetImage
             src={element.url}
+            canonicalTarget={element.url}
             alt={alt}
             assetContext={
               assetLifecycle
@@ -1199,6 +1229,12 @@ export interface MarkdownEditorProps {
   claimedAssetIds?: readonly string[] | null;
   /** Temporary image ids recovered with a locally saved new-document draft. */
   initialUnclaimedAssetIds?: readonly string[];
+  /** Server expiry metadata for recovered unclaimed attachments. */
+  initialUnclaimedAssetExpirations?: Readonly<Record<string, string>>;
+  /** Reports server-provided expiry metadata for current unclaimed uploads. */
+  onAssetExpirationsChange?: (expirations: Readonly<Record<string, string>>) => void;
+  /** Reports all unclaimed uploads, including nodes removed before unmount. */
+  onUnclaimedAssetIdsChange?: (assetIds: readonly string[]) => void;
 }
 
 export function MarkdownEditor({
@@ -1219,6 +1255,9 @@ export function MarkdownEditor({
   preserveUploadsOnUnmount = false,
   claimedAssetIds = null,
   initialUnclaimedAssetIds = [],
+  initialUnclaimedAssetExpirations = {},
+  onAssetExpirationsChange,
+  onUnclaimedAssetIdsChange,
 }: MarkdownEditorProps) {
   const [uploadingImage, setUploadingImage] = React.useState(false);
   const [uploadingName, setUploadingName] = React.useState("");
@@ -1236,10 +1275,32 @@ export function MarkdownEditor({
   const uploadInFlightRef = React.useRef(false);
   const deferredImageFilesRef = React.useRef<File[]>([]);
   const unclaimedAssetIdsRef = React.useRef(new Set(initialUnclaimedAssetIds));
+  const unclaimedAssetExpirationsRef = React.useRef(
+    new Map(Object.entries(initialUnclaimedAssetExpirations)),
+  );
   const discardingAssetIdsRef = React.useRef(new Set<string>());
   const mountedRef = React.useRef(true);
   const onUploadingChangeRef = React.useRef(onUploadingChange);
   const preserveUploadsOnUnmountRef = React.useRef(preserveUploadsOnUnmount);
+
+  const reportAssetExpirations = React.useCallback(() => {
+    onAssetExpirationsChange?.(
+      Object.fromEntries(unclaimedAssetExpirationsRef.current.entries()),
+    );
+  }, [onAssetExpirationsChange]);
+
+  const reportUnclaimedAssetIds = React.useCallback(() => {
+    onUnclaimedAssetIdsChange?.([...unclaimedAssetIdsRef.current]);
+  }, [onUnclaimedAssetIdsChange]);
+
+  const markdownAdapters = React.useMemo(
+    () => createAkbMarkdownAdapters({ vault, document, commit }),
+    [commit, document, vault],
+  );
+
+  React.useEffect(() => {
+    reportUnclaimedAssetIds();
+  }, [reportUnclaimedAssetIds]);
 
   const discardUnclaimedAsset = React.useCallback(
     (assetId: string) => {
@@ -1249,14 +1310,19 @@ export function MarkdownEditor({
       ) return;
       discardingAssetIdsRef.current.add(assetId);
       void discardAsset(vault, assetId)
-        .then(() => unclaimedAssetIdsRef.current.delete(assetId))
+        .then(() => {
+          unclaimedAssetIdsRef.current.delete(assetId);
+          unclaimedAssetExpirationsRef.current.delete(assetId);
+          reportAssetExpirations();
+          reportUnclaimedAssetIds();
+        })
         .catch(() => {
           // Retain the id for a later unmount retry. Server-side TTL cleanup is
           // the final backstop for an abrupt browser termination.
         })
         .finally(() => discardingAssetIdsRef.current.delete(assetId));
     },
-    [vault],
+    [reportAssetExpirations, reportUnclaimedAssetIds, vault],
   );
 
   const discardIfUnclaimed = React.useCallback(
@@ -1327,11 +1393,14 @@ export function MarkdownEditor({
     for (const assetId of unclaimedAssetIdsRef.current) {
       if (accepted.has(assetId)) {
         unclaimedAssetIdsRef.current.delete(assetId);
+        unclaimedAssetExpirationsRef.current.delete(assetId);
       } else {
         discardUnclaimedAsset(assetId);
       }
     }
-  }, [claimedAssetIds, discardUnclaimedAsset]);
+    reportAssetExpirations();
+    reportUnclaimedAssetIds();
+  }, [claimedAssetIds, discardUnclaimedAsset, reportAssetExpirations, reportUnclaimedAssetIds]);
 
   const uploadImages = React.useCallback(
     async (
@@ -1341,28 +1410,15 @@ export function MarkdownEditor({
     ) => {
       if (readOnly || uploadInFlightRef.current || files.length === 0) return;
 
-      for (const file of files) {
-        const validationMessage = validateEditorImage(file);
-        if (validationMessage) {
-          setUploadFailure({
-            // Validation is a preflight over the entire batch, so no earlier
-            // file has uploaded yet. Reject the batch explicitly instead of
-            // presenting a partial retry that silently omits valid files.
-            files: [],
-            message: `${file.name}: ${validationMessage} No images were uploaded.`,
-            retryable: false,
-            kind: "error",
-            replacementPath,
-          });
-          return;
-        }
-      }
-
       const controller = new AbortController();
       const insertionRef = insertionRange ? editor.api.rangeRef(insertionRange) : null;
       let currentFileIndex = 0;
       let restoredInsertion = false;
+      let insertedImageCount = 0;
       let failed = false;
+      const batchFailures: Array<{ file: File; message: string; retryable: boolean }> = [];
+      const cancelledFiles: File[] = [];
+      const retryableFiles: File[] = [];
       uploadControllerRef.current = controller;
       uploadInFlightRef.current = true;
       setUploadFailure(null);
@@ -1372,54 +1428,105 @@ export function MarkdownEditor({
       try {
         for (const [index, file] of files.entries()) {
           currentFileIndex = index;
-          setUploadingName(`Checking ${file.name}`);
-          const prepared = await prepareEditorImage(file);
-          setUploadingName(
-            prepared.optimized ? `Uploading optimized ${file.name}` : file.name,
-          );
-          const asset = await uploadAsset(vault, prepared.file, controller.signal);
-          const assetId = assetIdFromUrl(asset.url);
-          if (!assetId || assetId !== asset.id) {
-            throw new Error("The image upload returned an invalid asset URL.");
-          }
-          unclaimedAssetIdsRef.current.add(assetId);
-
-          if (controller.signal.aborted || !mountedRef.current) {
-            discardIfUnclaimed(asset.url);
-            throw new DOMException("Upload cancelled", "AbortError");
-          }
-
-          if (!restoredInsertion && insertionRef?.current) {
-            editor.tf.select(insertionRef.current);
-          }
-          restoredInsertion = true;
-          const alt = file.name.replace(/\.[^.]+$/, "") || "Image";
-          if (replacementPath && index === 0) {
-            const target = editor.api.node(replacementPath)?.[0] as {
-              type?: string;
-              url?: string;
-            } | undefined;
-            if (target?.type !== ImagePlugin.key) {
-              throw new Error("The image to replace is no longer available.");
+          try {
+            setUploadingName(`Checking ${file.name}`);
+            const validationMessage = validateEditorImage(file);
+            if (validationMessage) {
+              throw Object.assign(new Error(validationMessage), {
+                status: 415,
+                code: "invalid",
+              });
             }
-            const replacedUrl = target.url;
-            editor.tf.setNodes(
-              { url: asset.url, caption: [{ text: alt }] },
-              { at: replacementPath },
+            const prepared = await prepareEditorImage(file);
+            setUploadingName(
+              prepared.optimized ? `Uploading optimized ${file.name}` : file.name,
             );
-            editor.tf.select(replacementPath);
-            discardIfUnclaimed(replacedUrl);
-          } else {
-            editor.tf.insertNodes(
-              {
-                type: ImagePlugin.key,
-                url: asset.url,
-                caption: [{ text: alt }],
-                children: [{ text: "" }],
-              },
-              { select: true },
-            );
+            const asset = await markdownAdapters.upload.upload(prepared.file, {
+              vault,
+              document,
+              commit,
+              signal: controller.signal,
+            });
+            const target = asset.target;
+            const assetId = assetIdFromUrl(target);
+            if (!assetId || (asset.id && assetId !== asset.id)) {
+              throw new Error("The image upload returned an invalid asset URL.");
+            }
+            unclaimedAssetIdsRef.current.add(assetId);
+            if (asset.expiresAt) {
+              unclaimedAssetExpirationsRef.current.set(assetId, asset.expiresAt);
+              reportAssetExpirations();
+            }
+            reportUnclaimedAssetIds();
+
+            if (controller.signal.aborted || !mountedRef.current) {
+              discardIfUnclaimed(target);
+              throw new DOMException("Upload cancelled", "AbortError");
+            }
+
+            if (!restoredInsertion && insertionRef?.current) {
+              editor.tf.select(insertionRef.current);
+            }
+            restoredInsertion = true;
+            const alt = file.name.replace(/\.[^.]+$/, "") || "Image";
+            if (replacementPath && insertedImageCount === 0) {
+              const replacementTarget = editor.api.node(replacementPath)?.[0] as {
+                type?: string;
+                url?: string;
+              } | undefined;
+              if (replacementTarget?.type !== ImagePlugin.key) {
+                throw new Error("The image to replace is no longer available.");
+              }
+              const replacedUrl = replacementTarget.url;
+              editor.tf.setNodes(
+                { url: target, caption: [{ text: alt }] },
+                { at: replacementPath },
+              );
+              editor.tf.select(replacementPath);
+              discardIfUnclaimed(replacedUrl);
+            } else {
+              editor.tf.insertNodes(
+                {
+                  type: ImagePlugin.key,
+                  url: target,
+                  caption: [{ text: alt }],
+                  children: [{ text: "" }],
+                },
+                { select: true },
+              );
+            }
+            insertedImageCount += 1;
+          } catch (error) {
+            failed = true;
+            const aborted =
+              controller.signal.aborted ||
+              (error instanceof DOMException && error.name === "AbortError");
+            if (aborted) {
+              cancelledFiles.push(file, ...files.slice(index + 1));
+              break;
+            }
+
+            const failure = classifyEditorImageUploadFailure(error, file);
+            batchFailures.push({ file, message: failure.message, retryable: failure.retryable });
+            if (failure.retryable) retryableFiles.push(file);
           }
+        }
+        if (mountedRef.current && (batchFailures.length > 0 || cancelledFiles.length > 0)) {
+          const deferred = deferredImageFilesRef.current.splice(0);
+          const cancelledMessage = cancelledFiles.length > 0
+            ? `${cancelledFiles.length} image${cancelledFiles.length === 1 ? "" : "s"} cancelled.`
+            : "";
+          setUploadFailure({
+            files: [...retryableFiles, ...deferred],
+            message: [
+              ...batchFailures.map((failure) => failure.message),
+              cancelledMessage,
+              "Successful images remain in the draft.",
+            ].filter(Boolean).join(" "),
+            retryable: retryableFiles.length > 0 || deferred.length > 0,
+            kind: "error",
+            replacementPath,
+          });
         }
       } catch (error) {
         const aborted =
@@ -1471,7 +1578,52 @@ export function MarkdownEditor({
         }
       }
     },
-    [discardIfUnclaimed, editor, readOnly, vault],
+    [commit, discardIfUnclaimed, document, editor, markdownAdapters, readOnly, reportAssetExpirations, reportUnclaimedAssetIds, vault],
+  );
+
+  const targetResolver = React.useMemo(
+    () => markdownAdapters.targetResolver,
+    [markdownAdapters],
+  );
+  const targetStrings = React.useMemo(
+    () => extractAkbMarkdownLinkTargets(value),
+    [value],
+  );
+  const targetResolutionKey = React.useMemo(
+    () => [vault, document ?? "", commit ?? "", ...targetStrings].join("\u0000"),
+    [commit, document, targetStrings, vault],
+  );
+  const [targetResolutionState, setTargetResolutionState] = React.useState<{
+    key: string;
+    values: ReadonlyMap<string, AkbMarkdownTargetResolution>;
+  }>({ key: "", values: new Map() });
+
+  React.useEffect(() => {
+    if (targetStrings.length === 0) return;
+    const controller = new AbortController();
+    void Promise.all(
+      targetStrings.map(async (target) => [
+        target,
+        await targetResolver.resolve(target, {
+          vault,
+          document,
+          commit,
+          signal: controller.signal,
+        }),
+      ] as const),
+    ).then((entries) => {
+      if (!controller.signal.aborted) {
+        setTargetResolutionState({ key: targetResolutionKey, values: new Map(entries) });
+      }
+    });
+    return () => controller.abort();
+  }, [commit, document, targetResolutionKey, targetResolver, targetStrings, vault]);
+  const targetResolutions = React.useMemo(
+    () =>
+      targetResolutionState.key === targetResolutionKey
+        ? targetResolutionState.values
+        : EMPTY_TARGET_RESOLUTIONS,
+    [targetResolutionKey, targetResolutionState],
   );
 
   const assetLifecycle = React.useMemo(
@@ -1485,8 +1637,9 @@ export function MarkdownEditor({
         replacementPathRef.current = path;
         imageInputRef.current?.click();
       },
+      targetResolutions,
     }),
-    [commit, document, readOnly, vault],
+    [commit, document, readOnly, targetResolutions, vault],
   );
 
   const handleImageDragOver = React.useCallback(
@@ -1613,8 +1766,8 @@ export function MarkdownEditor({
           <div className="flex flex-wrap items-center justify-between gap-3">
             <span className="min-w-0 flex-1">
               {uploadFailure.message}
-              {uploadFailure.files.length > 1
-                ? ` ${uploadFailure.files.length} images remain in this batch.`
+              {uploadFailure.files.length > 0
+                ? ` ${uploadFailure.files.length} image${uploadFailure.files.length === 1 ? "" : "s"} remain in this batch.`
                 : ""}
             </span>
             <div className="flex flex-wrap items-center gap-1.5">

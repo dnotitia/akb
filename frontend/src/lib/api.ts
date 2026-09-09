@@ -1394,11 +1394,17 @@ export const deleteDocument = (vault: string, id: string) =>
 
 // ── Editor image assets ──
 export interface AssetUploadResponse {
+  kind?: "attachment";
   id: string;
-  url: string;
+  /** Stable target persisted in document Markdown. */
+  target: string;
+  /** Same stable target for the existing editor wire shape; never a runtime URL. */
+  url?: string;
   name: string;
   mime_type: string;
   size_bytes: number;
+  unclaimed_expires_at?: string | null;
+  source_file_uri?: string;
 }
 
 /**
@@ -1423,6 +1429,51 @@ export async function uploadAsset(
   }
   return res.json();
 }
+
+export interface AttachmentRetentionPolicy {
+  kind: "attachment_policy";
+  vault: string;
+  server_time: string;
+  unclaimed_ttl_hours: number;
+  revision_retention_days: number;
+}
+
+/** Read the active server policy used to bound recoverable attachment drafts. */
+export const getAttachmentRetentionPolicy = (vault: string) =>
+  api<AttachmentRetentionPolicy>(
+    `/assets/${encodeURIComponent(vault)}/policy`,
+  );
+
+export interface AttachmentMetadata {
+  kind: "attachment";
+  target: string;
+  status: "unclaimed" | "claimed" | "expired";
+  unclaimed_expires_at?: string | null;
+}
+
+/** Resolve an attachment through the same document/user reachability boundary as its bytes. */
+export async function getAttachmentMetadata(
+  vault: string,
+  fileId: string,
+  source?: { document?: string; commit?: string },
+): Promise<AttachmentMetadata> {
+  const params = new URLSearchParams();
+  if (source?.document) params.set("document", source.document);
+  if (source?.commit) params.set("commit", source.commit);
+  const query = params.toString();
+  const response = await authenticatedFetch(
+    `${API_BASE}/assets/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}/metadata${query ? `?${query}` : ""}`,
+  );
+  if (!response.ok) await throwJsonApiError(response);
+  return response.json() as Promise<AttachmentMetadata>;
+}
+
+/** Copy a confirmed standalone image File into an independent Attachment. */
+export const copyFileToAttachment = (vault: string, fileId: string) =>
+  api<AssetUploadResponse>(
+    `/assets/${encodeURIComponent(vault)}/from-file/${encodeURIComponent(fileId)}`,
+    { method: "POST" },
+  );
 
 /** Fetch a private asset with the app's Bearer credential for blob rendering. */
 export async function getAssetBlob(
@@ -1602,6 +1653,29 @@ export async function uploadVaultFile(
     }
     throw error;
   }
+}
+
+export interface VaultFileDownloadResult {
+  kind: "file";
+  name?: string;
+  download_url: string;
+  mime_type?: string;
+  size_bytes?: number;
+  content_hash?: string;
+  version?: string | null;
+  expires_in?: number;
+}
+
+/** Resolve a standalone File to a short-lived download URL for viewing. */
+export async function getVaultFileDownloadUrl(
+  vault: string,
+  fileId: string,
+): Promise<VaultFileDownloadResult> {
+  const response = await authenticatedFetch(
+    `${API_BASE}/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}/download`,
+  );
+  if (!response.ok) await throwJsonApiError(response);
+  return response.json() as Promise<VaultFileDownloadResult>;
 }
 
 export const deleteVaultFile = (vault: string, fileId: string) =>

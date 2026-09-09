@@ -3,9 +3,11 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   canonicalizeMarkdown,
   createMarkdownEditor,
+  extractMarkdownTargets,
   markdownCommands,
   parseMarkdown,
   serializeMarkdown,
+  uploadMarkdownBatch,
 } from '../src/index.js'
 import type { MarkdownAdapters } from '../src/index.js'
 
@@ -79,16 +81,83 @@ describe('Markdown conformance core', () => {
     expect(canonicalizeMarkdown(canonical)).toBe(canonical)
   })
 
+  it('keeps document, file, and attachment targets through image/link editing', () => {
+    const attachment = '/api/assets/00000000-0000-4000-8000-000000000001'
+    const document = 'akb://vault/coll/notes/doc/guide.md'
+    const file = 'akb://vault/file/00000000-0000-4000-8000-000000000002'
+    const markdown = [
+      `[Guide](${document})`,
+      `[Download](${file})`,
+      `![Diagram](${attachment})`,
+      '![Remote](https://example.com/remote.png)',
+      '`[ignored](akb://vault/doc/ignored.md)`',
+    ].join('\n\n')
+
+    expect(canonicalizeMarkdown(markdown)).toContain(`![Diagram](${attachment})`)
+    expect(extractMarkdownTargets(markdown)).toEqual([
+      { kind: 'document', target: document },
+      { kind: 'file', target: file },
+      { kind: 'attachment', target: attachment },
+    ])
+  })
+
+  it('retains every per-file upload outcome for a partial batch', async () => {
+    const files = [new Blob(['one']), new Blob(['two']), new Blob(['three'])]
+    const adapter = {
+      upload: async (file: Blob) => {
+        if (file === files[1]) throw Object.assign(new Error('busy'), { retryable: true })
+        return { kind: 'attachment' as const, target: `/api/assets/${file.size}` }
+      },
+    }
+
+    const result = await uploadMarkdownBatch(adapter, files)
+
+    expect(result).toMatchObject({ succeeded: 2, failed: 1, cancelled: 0, partial: true })
+    expect(result.items.map(item => item.status)).toEqual(['success', 'failed', 'success'])
+    expect(result.items[1]).toMatchObject({
+      status: 'failed',
+      error: { code: 'unknown', message: 'busy', retryable: true },
+    })
+  })
+
+  it('marks the remaining files cancelled once the batch signal is aborted', async () => {
+    const controller = new AbortController()
+    const files = [new Blob(['one']), new Blob(['two'])]
+    const adapter = {
+      upload: async (file: Blob) => {
+        if (file === files[0]) controller.abort()
+        return { kind: 'attachment' as const, target: `/api/assets/${file.size}` }
+      },
+    }
+
+    const result = await uploadMarkdownBatch(adapter, files, { signal: controller.signal })
+
+    expect(result.succeeded).toBe(1)
+    expect(result.cancelled).toBe(1)
+    expect(result.items.map(item => item.status)).toEqual(['success', 'cancelled'])
+  })
+
   it('exposes product-neutral adapter contracts without implementing product behavior', () => {
     const adapters: MarkdownAdapters = {
       upload: {
-        upload: async file => ({ url: `https://cdn.example/${file.size}` }),
+        upload: async file => ({
+          kind: 'attachment',
+          target: `/api/assets/${file.size}`,
+        }),
       },
       search: {
-        search: async query => [{ id: query, title: query }],
+        search: async query => [{
+          id: query,
+          title: query,
+          target: `akb://vault/doc/${query}.md`,
+        }],
       },
       targetResolver: {
-        resolve: async target => target,
+        resolve: async target => ({
+          target,
+          status: 'available',
+          runtimeUrl: `/runtime/${encodeURIComponent(target)}`,
+        }),
       },
     }
 
