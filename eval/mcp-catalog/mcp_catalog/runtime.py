@@ -19,6 +19,9 @@ import httpx
 from .contracts import StateProbe
 
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+DEFAULT_HTTP_TIMEOUT_SECONDS = 30.0
+# Matches scripts/ci/e2e_runtime.py::DEFAULT_TIMEOUT_SECONDS for reset/recovery.
+RESET_TIMEOUT_SECONDS = 180.0
 
 
 class RuntimeContractError(RuntimeError):
@@ -239,14 +242,17 @@ class RuntimeFixture:
         self,
         descriptor: RuntimeDescriptor,
         *,
-        timeout: float = 30.0,
-        readiness_timeout: float = 30.0,
+        timeout: float = DEFAULT_HTTP_TIMEOUT_SECONDS,
+        reset_timeout: float = RESET_TIMEOUT_SECONDS,
+        readiness_timeout: float = RESET_TIMEOUT_SECONDS,
         readiness_poll_interval: float = 0.25,
     ) -> None:
-        if readiness_timeout < 0 or readiness_poll_interval < 0:
-            raise ValueError("runtime readiness timing values must be non-negative")
+        if timeout < 0 or reset_timeout < 0 or readiness_timeout < 0 or readiness_poll_interval < 0:
+            raise ValueError("runtime timing values must be non-negative")
         self.descriptor = descriptor
         self.client = httpx.AsyncClient(timeout=timeout)
+        self.timeout = timeout
+        self.reset_timeout = reset_timeout
         self.readiness_timeout = readiness_timeout
         self.readiness_poll_interval = readiness_poll_interval
         self._reset_lock = asyncio.Lock()
@@ -271,8 +277,10 @@ class RuntimeFixture:
         deadline = time.monotonic() + self.readiness_timeout
         while True:
             try:
-                app_health = await self.client.get(self.descriptor.app_health_url)
-                fixture_health = await self.client.get(self.descriptor.fixture_health_url)
+                remaining = max(0.0, deadline - time.monotonic())
+                probe_timeout = min(self.timeout, remaining)
+                app_health = await self.client.get(self.descriptor.app_health_url, timeout=probe_timeout)
+                fixture_health = await self.client.get(self.descriptor.fixture_health_url, timeout=probe_timeout)
                 app_payload = _json_object(app_health, "app readiness")
                 fixture_payload = _json_object(fixture_health, "fixture readiness")
                 if (
@@ -301,9 +309,14 @@ class RuntimeFixture:
     async def reset(self) -> None:
         async with self._reset_lock:
             try:
-                response = await self.client.post(self.descriptor.reset_url, json=self.descriptor.reset_body)
+                response = await self.client.post(
+                    self.descriptor.reset_url,
+                    json=self.descriptor.reset_body,
+                    timeout=self.reset_timeout,
+                )
             except httpx.HTTPError as exc:
-                raise RuntimeContractError("fixture reset request failed", stage="fixture_reset") from exc
+                message = "fixture reset request timed out" if isinstance(exc, httpx.TimeoutException) else "fixture reset request failed"
+                raise RuntimeContractError(message, stage="fixture_reset") from exc
             if response.status_code != 200:
                 raise RuntimeContractError(
                     f"fixture reset returned HTTP {response.status_code}",

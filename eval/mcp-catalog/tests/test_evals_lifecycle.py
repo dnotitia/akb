@@ -9,7 +9,7 @@ from mcp_catalog.contracts import load_run_manifest, load_task_corpus
 from mcp_catalog.evidence import serialize_report
 from mcp_catalog.execution import TrialOutcome, evaluate_dataset
 from mcp_catalog.runtime import RuntimeContractError, RuntimeFixture, StateObservation
-from test_runtime_contract import descriptor_dict
+from test_runtime_contract import _TimedResetClient, descriptor_dict
 
 ROOT = Path(__file__).parents[1]
 
@@ -33,14 +33,15 @@ class _ReadinessClient:
         self.health_reads = 0
         self.ready = False
 
-    async def post(self, _url: str, *, json: dict) -> object:
+    async def post(self, _url: str, *, json: dict, **_kwargs: object) -> object:
         assert json == self.descriptor.reset_body
         self.health_reads = 0
         self.ready = False
         return type("Response", (), {"status_code": 200, "json": lambda _self: {"status": "ready", "scenario": self.descriptor.scenario}})()
 
-    async def get(self, url: str, **_kwargs: object) -> object:
+    async def get(self, url: str, *, timeout: float | None = None, **_kwargs: object) -> object:
         assert url in {self.descriptor.app_health_url, self.descriptor.fixture_health_url}
+        assert timeout is not None
         self.health_reads += 1
         ready = self.health_reads > 2
         if ready:
@@ -218,3 +219,39 @@ async def test_teardown_reset_blocks_the_next_trial() -> None:
     assert raised.value.stage == "fixture_readiness"
     assert failures and failures[0] is raised.value
     assert executor.provider_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_reset_timeout_blocks_provider_execution() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "destructive-confirm-a")
+    from mcp_catalog.runtime import RuntimeDescriptor
+
+    runtime_descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
+    fixture = RuntimeFixture(
+        runtime_descriptor,
+        timeout=0.01,
+        reset_timeout=0.05,
+        readiness_timeout=0.05,
+        readiness_poll_interval=0,
+    )
+    client = _TimedResetClient(runtime_descriptor, response_delay=0.1)
+    fixture.client = client  # type: ignore[assignment]
+    failures: list[Exception] = []
+    executor = _ReadinessGuardExecutor(manifest, _NotReadyMarker())
+
+    try:
+        report = await evaluate_dataset(
+            [task],
+            manifest=manifest,
+            executor=executor,
+            fixture=fixture,
+            failure_sink=failures,
+        )
+    finally:
+        await fixture.close()
+
+    assert report.failures
+    assert failures and isinstance(failures[0], RuntimeContractError)
+    assert failures[0].stage == "fixture_reset"
+    assert executor.provider_calls == 0
