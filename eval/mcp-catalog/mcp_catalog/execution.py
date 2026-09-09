@@ -10,7 +10,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Callable, cast
+from typing import Any, Callable, Literal, cast
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -25,7 +25,7 @@ from pydantic_evals.lifecycle import CaseLifecycle
 from pydantic_evals.reporting import EvaluationReport, ScalarResult
 
 from .catalog import ConnectionSpec, create_client, create_toolset
-from .contracts import BenchmarkRunManifest, ModelSpec, TaskManifest
+from .contracts import OPENROUTER_BASE_URL, BenchmarkRunManifest, ModelSpec, TaskManifest
 from .evidence import canonical_json, redact_text, safe_json
 from .runtime import RuntimeContractError, RuntimeFixture, StateObservation
 from .state import StateCheckResult, evaluate_state_contract
@@ -39,12 +39,31 @@ SYSTEM_PROMPT = (
 CURRENT_TRIAL: contextvars.ContextVar[TrialContext | None] = contextvars.ContextVar("mcp_catalog_trial", default=None)
 
 
-class ModelConfigurationError(RuntimeError):
+class ModelConfigurationError(ValueError):
     """Raised before a provider call when the model contract is incomplete."""
 
 
 class BudgetExceeded(RuntimeError):
     """Raised when a run would exceed its pre-registered finite cap."""
+
+
+class OpenRouterChatModel(OpenAIChatModel):
+    """PydanticAI's OpenAI-compatible model with OpenRouter response evidence."""
+
+    def _process_provider_details(self, response: Any) -> dict[str, Any] | None:
+        details = super()._process_provider_details(response) or {}
+        response_extra = getattr(response, "model_extra", None)
+        if isinstance(response_extra, dict):
+            metadata = response_extra.get("openrouter_metadata")
+            if metadata is not None:
+                details["openrouter_metadata"] = safe_json(metadata)
+        service_tier = getattr(response, "service_tier", None)
+        if service_tier is not None:
+            details["openrouter_service_tier"] = service_tier
+        usage = getattr(response, "usage", None)
+        if usage is not None and hasattr(usage, "model_dump"):
+            details["openrouter_usage"] = safe_json(usage.model_dump(mode="json", exclude_none=True))
+        return details or None
 
 
 class ToolCallRecord(BaseModel):
@@ -97,6 +116,11 @@ class TrialOutcome(BaseModel):
     model_requests: int = Field(default=0, ge=0)
     latency_seconds: float = Field(default=0.0, ge=0)
     cost_usd: float = Field(default=0.0, ge=0)
+    provider_evidence: list[dict[str, Any]] = Field(default_factory=list)
+    provider_cost_usd: float | None = Field(default=None, ge=0)
+    cost_source: Literal["provider_response", "registered_price_snapshot"] = "registered_price_snapshot"
+    routing_observed: bool = False
+    routing_valid: bool = False
 
     @property
     def tool_call_count(self) -> int:
@@ -246,9 +270,23 @@ class BudgetLedger:
     output_tokens: int = 0
     cost_usd: float = 0.0
     wall_seconds: float = 0.0
+    reserved_cost_usd: float = 0.0
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    async def charge(self, outcome: TrialOutcome) -> None:
+    async def reserve_trial(self, worst_case_cost_usd: float) -> None:
+        async with self._lock:
+            budget = self.manifest.budget
+            if worst_case_cost_usd < 0 or self.cost_usd + self.reserved_cost_usd + worst_case_cost_usd > budget.max_total_cost_usd:
+                raise BudgetExceeded("preregistered worst-case trial cost would exceed max_total_cost_usd")
+            self.reserved_cost_usd += worst_case_cost_usd
+
+    async def release_trial(self, reserved_cost_usd: float) -> None:
+        async with self._lock:
+            if reserved_cost_usd > self.reserved_cost_usd:
+                raise BudgetExceeded("trial cost reservation accounting is inconsistent")
+            self.reserved_cost_usd -= reserved_cost_usd
+
+    async def charge(self, outcome: TrialOutcome, *, reserved_cost_usd: float = 0.0) -> None:
         async with self._lock:
             next_requests = self.requests + outcome.model_requests
             next_input = self.input_tokens + outcome.input_tokens
@@ -270,7 +308,8 @@ class BudgetLedger:
                 raise BudgetExceeded("max_output_tokens exceeded")
             if next_input + next_output > budget.max_total_tokens:
                 raise BudgetExceeded("max_total_tokens exceeded")
-            if next_cost > budget.max_total_cost_usd:
+            remaining_reserved = self.reserved_cost_usd - reserved_cost_usd
+            if remaining_reserved < 0 or next_cost + remaining_reserved > budget.max_total_cost_usd:
                 raise BudgetExceeded("max_total_cost_usd exceeded")
             if next_wall > budget.max_wall_seconds:
                 raise BudgetExceeded("max_wall_seconds exceeded")
@@ -279,6 +318,7 @@ class BudgetLedger:
             self.output_tokens = next_output
             self.cost_usd = next_cost
             self.wall_seconds = next_wall
+            self.reserved_cost_usd = remaining_reserved
 
 
 class TrialExecutor:
@@ -311,64 +351,87 @@ class TrialExecutor:
             raise RuntimeContractError("task executed outside its fixture lifecycle")
         token = context.token
         secrets = context.secrets
-        if self.transport == "stdio":
-            command, args, environment = self.fixture.stdio_command(token)
-            spec = ConnectionSpec(
-                transport="stdio",
-                token=token,
-                app_origin=self.fixture.descriptor.app_origin,
-                command=command,
-                args=tuple(args),
-                environment=environment,
-            )
-        else:
-            spec = ConnectionSpec(
-                transport="http",
-                token=token,
-                app_origin=self.fixture.descriptor.app_origin,
-            )
-        client = create_client(spec)
         recorder = ToolCallRecorder(operation_map=self.manifest.operation_map, secrets=secrets)
-        toolset = create_toolset(client, recorder)
         started = time.perf_counter()
         result: Any = None
         error: str | None = None
+        reservation = worst_case_cost(self.model_spec, self.manifest.budget)
         try:
-            async with toolset:
-                agent = Agent(model=self.model, system_prompt=SYSTEM_PROMPT, retries=0)
-                result = await agent.run(
-                    task.prompt,
-                    toolsets=cast(Any, [toolset]),
-                    model_settings=cast(Any, self.model_spec.settings),
-                    usage_limits=UsageLimits(
-                        request_limit=self.manifest.budget.max_requests_per_trial,
-                        total_tokens_limit=self.manifest.budget.max_tokens_per_trial,
-                        cost_limit=Decimal(str(self.manifest.budget.max_cost_per_trial_usd)),
-                    ),
-                    infer_name=False,
-                )
-        except Exception as exc:
-            error = redact_text(exc, secrets)
-        latency = time.perf_counter() - started
-        outcome = outcome_from_run(
-            task=task,
-            arm=self.arm,
-            model_spec=self.model_spec,
-            transport=self.transport,
-            result=result,
-            recorder=recorder,
-            operation_map=self.manifest.operation_map,
-            error=error,
-            latency=latency,
-            secrets=secrets,
-        )
-        await self.ledger.charge(outcome)
-        return outcome
+            await self.ledger.reserve_trial(reservation)
+        except BudgetExceeded as exc:
+            return TrialOutcome(
+                task_id=task.id,
+                category=task.category,
+                arm=self.arm,
+                model_class=self.model_spec.class_name,
+                model_id=self.model_spec.model_id,
+                transport=self.transport,
+                error=f"benchmark incomplete: {exc}",
+            )
+        settled = False
+        try:
+            try:
+                if self.transport == "stdio":
+                    command, args, environment = self.fixture.stdio_command(token)
+                    spec = ConnectionSpec(
+                        transport="stdio",
+                        token=token,
+                        app_origin=self.fixture.descriptor.app_origin,
+                        command=command,
+                        args=tuple(args),
+                        environment=environment,
+                    )
+                else:
+                    spec = ConnectionSpec(
+                        transport="http",
+                        token=token,
+                        app_origin=self.fixture.descriptor.app_origin,
+                    )
+                client = create_client(spec)
+                toolset = create_toolset(client, recorder)
+                async with toolset:
+                    agent = Agent(model=self.model, system_prompt=SYSTEM_PROMPT, retries=0)
+                    result = await agent.run(
+                        task.prompt,
+                        toolsets=cast(Any, [toolset]),
+                        model_settings=cast(Any, self.model.settings),
+                        usage_limits=UsageLimits(
+                            request_limit=self.manifest.budget.max_requests_per_trial,
+                            total_tokens_limit=self.manifest.budget.max_tokens_per_trial,
+                            cost_limit=Decimal(str(self.manifest.budget.max_cost_per_trial_usd)),
+                        ),
+                        infer_name=False,
+                    )
+            except Exception as exc:
+                error = redact_text(exc, secrets)
+            latency = time.perf_counter() - started
+            outcome = outcome_from_run(
+                task=task,
+                arm=self.arm,
+                model_spec=self.model_spec,
+                transport=self.transport,
+                result=result,
+                recorder=recorder,
+                operation_map=self.manifest.operation_map,
+                error=error,
+                latency=latency,
+                secrets=secrets,
+            )
+            try:
+                await self.ledger.charge(outcome, reserved_cost_usd=reservation)
+            except BudgetExceeded as exc:
+                outcome.error = f"benchmark incomplete: {exc}"
+                return outcome
+            settled = True
+            return outcome
+        finally:
+            if not settled:
+                await self.ledger.release_trial(reservation)
 
 
-def build_model(spec: ModelSpec) -> OpenAIChatModel:
-    if spec.provider not in {"openai", "openai-compatible"}:
-        raise ModelConfigurationError(f"unsupported provider: {spec.provider}")
+def validate_model_configuration(spec: ModelSpec) -> tuple[str, str]:
+    if spec.provider != "openrouter":
+        raise ModelConfigurationError(f"unsupported benchmark provider: {spec.provider}")
     base_url = os.environ.get(spec.base_url_env, "")
     api_key = os.environ.get(spec.provider_key_env, "")
     if not base_url or not api_key:
@@ -389,10 +452,25 @@ def build_model(spec: ModelSpec) -> OpenAIChatModel:
         or parsed.fragment
     ):
         raise ModelConfigurationError(f"model {spec.class_name} base URL must be HTTP(S)")
-    return OpenAIChatModel(
+    if base_url.rstrip("/") != OPENROUTER_BASE_URL:
+        raise ModelConfigurationError("OpenRouter base URL must be the registered endpoint")
+    return base_url.rstrip("/"), api_key
+
+
+def build_model(spec: ModelSpec) -> OpenRouterChatModel:
+    base_url, api_key = validate_model_configuration(spec)
+    request_body = spec.routing.request_body(
+        input_price=spec.input_cost_per_million_usd,
+        output_price=spec.output_cost_per_million_usd,
+    )
+    settings = dict(spec.settings)
+    settings["extra_body"] = request_body
+    settings["extra_headers"] = {"X-OpenRouter-Metadata": "enabled"}
+    return OpenRouterChatModel(
         spec.model_id,
         provider=OpenAIProvider(base_url=base_url, api_key=api_key),
-        settings=cast(Any, spec.settings),
+        profile=cast(Any, {"openai_chat_supports_max_completion_tokens": False}),
+        settings=cast(Any, settings),
     )
 
 
@@ -410,17 +488,40 @@ def outcome_from_run(
     secrets: tuple[str, ...],
 ) -> TrialOutcome:
     raw_calls: list[tuple[str, Any]] = []
+    provider_evidence: list[dict[str, Any]] = []
     final_answer = ""
     input_tokens = output_tokens = requests = 0
     cost = 0.0
+    provider_cost: float | None = None
+    cost_source: Literal["provider_response", "registered_price_snapshot"] = "registered_price_snapshot"
+    routing_observed = False
+    routing_valid = False
     if result is not None:
         final_answer = redact_text(result.output, secrets)
-        raw_calls = extract_tool_calls(result.all_messages(), secrets)
+        messages = result.all_messages()
+        raw_calls = extract_tool_calls(messages, secrets)
+        provider_evidence = extract_provider_evidence(messages, secrets)
         usage = result.usage
         input_tokens = usage.input_tokens
         output_tokens = usage.output_tokens
         requests = usage.requests
-        cost = float(usage.cost) if usage.cost is not None else estimate_cost(model_spec, input_tokens, output_tokens)
+        raw_input, raw_output = provider_token_totals(provider_evidence)
+        if raw_input or raw_output:
+            input_tokens = raw_input
+            output_tokens = raw_output
+        if not requests:
+            requests = len(provider_evidence)
+        provider_cost = provider_response_cost(provider_evidence)
+        cost = provider_cost if provider_cost is not None else estimate_cost(model_spec, input_tokens, output_tokens)
+        cost_source = "provider_response" if provider_cost is not None else "registered_price_snapshot"
+        routing_observed, routing_valid = validate_routing_evidence(provider_evidence, model_spec)
+        if error is None and not routing_observed:
+            error = "OpenRouter routing evidence was not returned"
+        elif error is None and not routing_valid:
+            error = "OpenRouter response did not match the registered model/provider route"
+        registered_cost = estimate_cost(model_spec, input_tokens, output_tokens)
+        if provider_cost is not None and provider_cost > registered_cost + 1e-9:
+            error = error or "OpenRouter response cost exceeded the registered price ceiling"
     tool_calls = bind_tool_calls(raw_calls, recorder.calls, operation_map, secrets)
     first_operation = tool_calls[0].logical_operation if tool_calls else "none"
     return TrialOutcome(
@@ -440,6 +541,11 @@ def outcome_from_run(
         model_requests=requests,
         latency_seconds=latency,
         cost_usd=cost,
+        provider_evidence=provider_evidence,
+        provider_cost_usd=provider_cost,
+        cost_source=cost_source,
+        routing_observed=routing_observed,
+        routing_valid=routing_valid,
     )
 
 
@@ -452,6 +558,81 @@ def extract_tool_calls(messages: list[Any], secrets: tuple[str, ...]) -> list[tu
             if isinstance(part, ToolCallPart):
                 calls.append((part.tool_name, safe_json(part.args, secrets)))
     return calls
+
+
+def extract_provider_evidence(messages: list[Any], secrets: tuple[str, ...]) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, ModelResponse):
+            continue
+        details = safe_json(getattr(message, "provider_details", None), secrets)
+        if not isinstance(details, dict):
+            details = {}
+        evidence.append(
+            {
+                "model": getattr(message, "model_name", None),
+                "provider_name": getattr(message, "provider_name", None),
+                "provider_url": getattr(message, "provider_url", None),
+                "routing": details.get("openrouter_metadata"),
+                "service_tier": details.get("openrouter_service_tier"),
+                "usage": details.get("openrouter_usage"),
+            }
+        )
+    return safe_json(evidence, secrets)
+
+
+def provider_token_totals(evidence: list[dict[str, Any]]) -> tuple[int, int]:
+    input_tokens = 0
+    output_tokens = 0
+    for item in evidence:
+        usage = item.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        input_tokens += _int_value(usage.get("prompt_tokens", usage.get("input_tokens")))
+        output_tokens += _int_value(usage.get("completion_tokens", usage.get("output_tokens")))
+    return input_tokens, output_tokens
+
+
+def provider_response_cost(evidence: list[dict[str, Any]]) -> float | None:
+    costs: list[float] = []
+    for item in evidence:
+        usage = item.get("usage")
+        if not isinstance(usage, dict) or usage.get("cost") is None:
+            return None
+        try:
+            costs.append(float(usage["cost"]))
+        except (TypeError, ValueError):
+            return None
+    return sum(costs) if costs else None
+
+
+def validate_routing_evidence(evidence: list[dict[str, Any]], model_spec: ModelSpec) -> tuple[bool, bool]:
+    if not evidence:
+        return False, False
+    observed = False
+    for item in evidence:
+        if item.get("model") != model_spec.model_id:
+            return observed, False
+        routing = item.get("routing")
+        if not isinstance(routing, dict):
+            return observed, False
+        endpoints = routing.get("endpoints")
+        available = endpoints.get("available") if isinstance(endpoints, dict) else None
+        selected = [
+            endpoint.get("provider")
+            for endpoint in available
+            if isinstance(endpoint, dict) and endpoint.get("selected") is True
+        ] if isinstance(available, list) else []
+        if not selected:
+            return observed, False
+        observed = True
+        if any(str(provider).casefold().split("/", 1)[0] != "parasail" for provider in selected):
+            return observed, False
+    return observed, True
+
+
+def _int_value(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 def bind_tool_calls(
@@ -533,6 +714,16 @@ def estimate_cost(spec: ModelSpec, input_tokens: int, output_tokens: int) -> flo
     return (
         input_tokens * spec.input_cost_per_million_usd / 1_000_000
         + output_tokens * spec.output_cost_per_million_usd / 1_000_000
+    )
+
+
+def worst_case_cost(spec: ModelSpec, budget: Any) -> float:
+    """Use the preregistered token caps and endpoint prices before each trial."""
+
+    return estimate_cost(
+        spec,
+        budget.max_input_tokens_per_trial,
+        budget.max_output_tokens_per_trial,
     )
 
 

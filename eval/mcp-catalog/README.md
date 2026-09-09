@@ -20,10 +20,19 @@ task corpus와 resettable fixture로 비교하는 독립 실행 환경이다. �
 - `fixture`의 state probe는 최종 상태와 destructive 보호를 결정적으로
   검사한다. before/after 관찰이 없으면 안전성·성공을 통과시키지 않는다.
 
-모델·provider 설정, category별 독립 task 수 2개, 3회 반복, paired task-mean
-95% 신뢰구간, request/token/time/총비용 상한은 `config/run.json`에 사전
-등록되어 있다. 반복 결과는 독립 task로 세지 않는다. 모델 API key, PAT와
+OpenRouter provider 설정, DeepSeek primary와 Qwen lightweight model, category별
+독립 task 수 2개, 3회 반복, paired task-mean 95% 신뢰구간,
+request/token/time/총비용 상한은 `config/run.json`에 사전 등록되어 있다.
+반복 결과는 독립 task로 세지 않는다. OpenRouter API key, PAT와
 password 값은 환경에서만 읽고 evidence에 쓰지 않는다.
+
+모델은 `deepseek/deepseek-v4-flash-0731`와 `qwen/qwen3.8-27b`로 고정하고,
+두 요청 모두 OpenRouter `parasail` upstream만 사용한다. 요청 body에는
+`allow_fallbacks=false`, `require_parameters=true`, model별 `max_price`가
+강제로 들어가며 model fallback을 의미하는 `models` 배열은 보내지 않는다.
+등록 가격은 각각 입력/출력 `$0.14/$0.28` 및 `$0.24/$2.20` per million이고,
+전체 hard cap은 `$50`이다. 각 trial은 시작 전에 등록 token cap과 가격으로
+worst-case 비용을 예약하며 cap을 넘으면 다음 provider 요청을 시작하지 않는다.
 
 ## 독립 환경 설치와 계약 확인
 
@@ -46,6 +55,28 @@ stdout에 제공한 ready JSON이어야 한다. benchmark가 runtime을 시작�
 warm하지 않는다. runtime supervisor와 같은 stdin handoff를 사용할 때는
 `--descriptor -`를 쓴다.
 
+### Runtime credential handoff
+
+orchestrator는 기존 `mcp-stdio-runtime`의 ready descriptor를 stdin으로
+전달하고, benchmark process에 다음 두 environment name만 secure handoff로
+주입해야 한다. 값은 descriptor, argv, 로그, 파일과 evidence를 통과하지
+않는다.
+
+runtime는 benchmark manifest와 같은 `app-control-plane` scenario로
+기동한다(`CRABBOX_RUNTIME_SCENARIO=app-control-plane`). runtime process에는
+OpenRouter 값을 전달하지 않고, tunnel/host-side benchmark process에만
+전달한다.
+
+```text
+MCP_BENCH_OPENROUTER_BASE_URL
+MCP_BENCH_OPENROUTER_API_KEY
+```
+
+`MCP_BENCH_OPENROUTER_BASE_URL`은 반드시
+`https://openrouter.ai/api/v1`이어야 한다. runtime의 AKB PAT 환경은 MCP
+server 연결용으로만 사용하며 OpenRouter credential과 섞지 않는다. 아래
+명령은 descriptor를 받은 host/tunnel-side benchmark process에서 실행한다.
+
 ```bash
 cat /private/run/descriptor.json | \
   uv run --locked --project eval/mcp-catalog \
@@ -60,9 +91,11 @@ candidate-bound runtime에서 올 수 있지만, run artifact의 corpus hash,
 protocol, repeat, model/settings, fixture reset 계약은 동일해야 한다.
 
 ```bash
-export MCP_BENCH_OPENAI_BASE_URL=https://api.openai.com/v1
-export MCP_BENCH_OPENAI_API_KEY='(secret supplied by the operator)'
-export MCP_BENCH_READ_ONLY_PAT='(scoped secret supplied by the operator)'
+# The orchestrator injects the two OpenRouter values and the scoped PAT into
+# the process environment; no credential value belongs in this command.
+export MCP_BENCH_OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+: "${MCP_BENCH_OPENROUTER_API_KEY:?securely injected by orchestrator}"
+: "${MCP_BENCH_READ_ONLY_PAT:?securely injected by orchestrator}"
 
 cat /private/run/baseline-descriptor.json | \
   uv run --locked --project eval/mcp-catalog \
