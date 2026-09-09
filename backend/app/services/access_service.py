@@ -533,7 +533,7 @@ async def grant_access(
     async with pool.acquire() as conn:
         async with conn.transaction():
             vault = await conn.fetchrow(
-                "SELECT id, owner_id, status FROM vaults WHERE name = $1 FOR UPDATE",
+                "SELECT id, owner_id, status, public_access FROM vaults WHERE name = $1 FOR UPDATE",
                 vault_name,
             )
             if not vault:
@@ -556,7 +556,7 @@ async def grant_access(
                             f"Requires 'admin' role on vault '{vault_name}'"
                         )
             target = await conn.fetchrow(
-                "SELECT id, username FROM users WHERE username = $1", target_username,
+                "SELECT id, username, is_admin FROM users WHERE username = $1", target_username,
             )
             if not target:
                 raise NotFoundError("User", target_username)
@@ -577,6 +577,10 @@ async def grant_access(
                     "vault": vault_name,
                     "user": target_username,
                     "role": role,
+                    "target_user_id": str(target["id"]),
+                    "target_is_owner": vault["owner_id"] == target["id"],
+                    "target_is_admin": bool(target.get("is_admin")),
+                    "public_access": vault.get("public_access"),
                     "source_key": source_key,
                     "effective_role": outcome.effective_role,
                     "previous_effective_role": outcome.previous_effective_role,
@@ -637,7 +641,7 @@ async def revoke_access(
     async with pool.acquire() as conn:
         async with conn.transaction():
             vault = await conn.fetchrow(
-                "SELECT id, owner_id, status FROM vaults WHERE name = $1 FOR UPDATE",
+                "SELECT id, owner_id, status, public_access FROM vaults WHERE name = $1 FOR UPDATE",
                 vault_name,
             )
             if not vault:
@@ -659,7 +663,7 @@ async def revoke_access(
                             f"Requires 'admin' role on vault '{vault_name}'"
                         )
             target = await conn.fetchrow(
-                "SELECT id FROM users WHERE username = $1", target_username,
+                "SELECT id, is_admin FROM users WHERE username = $1", target_username,
             )
             if not target:
                 raise NotFoundError("User", target_username)
@@ -667,6 +671,11 @@ async def revoke_access(
                 raise ForbiddenError(
                     "Cannot revoke owner's access. Use transfer_ownership instead."
                 )
+            had_direct = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM vault_access_contributions "
+                "WHERE vault_id = $1 AND user_id = $2 AND source_key = 'direct')",
+                vault["id"], target["id"],
+            )
             if source_key is None:
                 outcome = await remove_all_contributions(
                     conn, vault["id"], target["id"],
@@ -687,6 +696,10 @@ async def revoke_access(
                     "vault": vault_name,
                     "user": target_username,
                     "source_key": source_key,
+                    "target_user_id": str(target["id"]),
+                    "target_is_admin": bool(target.get("is_admin")),
+                    "public_access": vault.get("public_access"),
+                    "direct_removed": bool(had_direct and source_key in (None, DIRECT_SOURCE_KEY) and outcome.applied),
                     "effective_role": outcome.effective_role,
                     "previous_effective_role": outcome.previous_effective_role,
                     "applied": outcome.applied,
@@ -1157,6 +1170,7 @@ async def transfer_ownership(owner_id: str, vault_name: str, new_owner_username:
                     "vault": vault_name,
                     "from_user_id": str(vault["owner_id"]),
                     "to_username": new_owner_username,
+                    "to_user_id": str(new_owner["id"]),
                 },
             )
 

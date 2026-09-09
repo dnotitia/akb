@@ -2,8 +2,14 @@
 
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
+import base64
+import json
 
 import pytest
+from fastapi import Response
+
+from app.exceptions import AKBError
+from app.services.recent_cursor import decode_cursor, encode_cursor
 
 from app.models.activity import (
     AkbActivityEnvelope,
@@ -74,6 +80,73 @@ async def test_recent_adds_kind_and_preserves_explicit_nulls(monkeypatch, routes
     dumped = AkbRecentChangesEnvelope.model_validate(out).model_dump(exclude_unset=True)
     assert dumped["changes"][0]["commit"] is None
     assert dumped["changes"][0]["changed_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_watching_pages_emit_scope_and_private_cache_header(monkeypatch, routes):
+    from app.api.routes import notifications
+    monkeypatch.setattr(notifications, "human_user", AsyncMock())
+    changes = [{"resource_id": f"00000000-0000-0000-0000-{i:012d}",
+                "changed_at": "2026-09-01T00:00:00+00:00"} for i in [2, 1]]
+    backend = AsyncMock(return_value=changes)
+    monkeypatch.setattr(routes.revision_backend, "recent_changes", backend)
+    response = Response()
+    page = await routes.recent_changes(vault=None, limit=1, user=MagicMock(user_id="u"),
+                                      scope="watching", response=response)
+    assert page["changes"] == changes[:1]
+    assert page["scope"] == "watching"
+    assert str(decode_cursor(page["next_cursor"], "watching", None)[1]) == changes[0]["resource_id"]
+    assert response.headers["Cache-Control"] == "private, no-store"
+    backend.assert_awaited_once_with("u", vault=None, limit=2, watching=True, before=None)
+
+
+@pytest.mark.asyncio
+async def test_watching_preserves_notification_session_and_feature_guards(monkeypatch, routes):
+    from app.config import settings
+    from app.services.auth_service import AuthenticatedUser
+    user = AuthenticatedUser(user_id="u", username="u", email="u@example.invalid",
+                             display_name=None, is_admin=False, auth_method="jwt")
+    backend = AsyncMock()
+    monkeypatch.setattr(routes.revision_backend, "recent_changes", backend)
+    monkeypatch.setattr(settings, "notifications_enabled", False)
+    with pytest.raises(AKBError) as disabled:
+        await routes.recent_changes(vault=None, limit=20, user=user, scope="watching")
+    assert disabled.value.code == "notifications_disabled"
+    monkeypatch.setattr(settings, "notifications_enabled", True)
+    user.auth_method = "pat"
+    with pytest.raises(AKBError) as session:
+        await routes.recent_changes(vault=None, limit=20, user=user, scope="watching")
+    assert session.value.code == "notifications_session_required"
+    backend.assert_not_awaited()
+
+
+@pytest.mark.parametrize("value", ["bad", "", "a" * 1025, *[
+    base64.urlsafe_b64encode(json.dumps(v).encode()).decode() for v in [None, [], {},
+        {"at": "2026-09-01", "id": "00000000-0000-0000-0000-000000000001", "scope": "watching", "vault": None}]
+]])
+def test_invalid_recent_cursor_is_client_error(value):
+    with pytest.raises(AKBError) as error:
+        decode_cursor(value, "watching", None)
+    assert error.value.status_code == 400
+
+
+def test_recent_cursor_cannot_cross_scope_or_vault():
+    cursor = encode_cursor({"changed_at": "2026-09-01T00:00:00Z",
+                            "resource_id": "00000000-0000-0000-0000-000000000001"}, "watching", "v")
+    for scope, vault in [("all", "v"), ("watching", None)]:
+        with pytest.raises(AKBError):
+            decode_cursor(cursor, scope, vault)
+
+
+@pytest.mark.parametrize("identifier", [123, {}, [], None])
+def test_recent_cursor_rejects_non_string_identifier(identifier):
+    cursor = base64.urlsafe_b64encode(json.dumps({
+        "at": "2026-09-01T00:00:00Z", "id": identifier,
+        "scope": "watching", "vault": None,
+    }).encode()).decode()
+    with pytest.raises(AKBError) as error:
+        decode_cursor(cursor, "watching", None)
+    assert error.value.status_code == 400
 
 
 @pytest.mark.asyncio

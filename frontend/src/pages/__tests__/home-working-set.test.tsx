@@ -140,7 +140,7 @@ describe("Home working set", () => {
 
     expect(screen.getByRole("heading", { name: "Your vaults" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Recent updates" })).toBeInTheDocument();
-    expect(screen.getByText("Mina Park")).toBeInTheDocument();
+    expect(screen.getByText(/Mina Park/)).toBeInTheDocument();
     expect(screen.getByText(/Deployment checks, rollback signals/)).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Connect an agent" })).toBeInTheDocument();
     expect(screen.getByText("2 of 3 complete")).toBeInTheDocument();

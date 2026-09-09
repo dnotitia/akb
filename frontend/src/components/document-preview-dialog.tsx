@@ -1,5 +1,8 @@
 import { useRef, useState, type CSSProperties } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
+import { getMe } from "@/lib/api";
+import { CurrentUserProvider } from "@/contexts/current-user-context";
 import DocumentPage from "@/pages/document";
 import {
   Dialog,
@@ -7,7 +10,7 @@ import {
   DialogDescription,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { documentPreviewReturnFocusId } from "@/lib/document-preview-navigation";
+import { documentPreviewReturnFocusId, documentPreviewReturnFocusFallbackId } from "@/lib/document-preview-navigation";
 
 function readWorkspaceLeftOffset() {
   if (typeof document === "undefined" || typeof window === "undefined") return 32;
@@ -19,17 +22,19 @@ function readWorkspaceLeftOffset() {
 }
 
 /**
- * Route-backed reading surface launched by search results. The background
+ * Route-backed reading surface launched by search results or notifications. The background
  * route remains mounted, so closing the dialog restores its exact query,
  * filters, scroll position, and focused result.
  */
 export function DocumentPreviewDialog() {
   const navigate = useNavigate();
   const location = useLocation();
+  const user = useQuery({ queryKey: ["document-preview-user", location.key], queryFn: () => getMe(), retry: false });
   const contentRef = useRef<HTMLDivElement | null>(null);
   const closingRef = useRef(false);
   const [desktopLeftOffset] = useState(readWorkspaceLeftOffset);
   const returnFocusId = documentPreviewReturnFocusId(location);
+  const returnFocusFallbackId = documentPreviewReturnFocusFallbackId(location);
 
   function closePreview() {
     // Radix can report the same outside interaction through both the overlay
@@ -40,7 +45,8 @@ export function DocumentPreviewDialog() {
     if (!returnFocusId) return;
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
-        document.getElementById(returnFocusId)?.focus();
+        (document.getElementById(returnFocusId) ??
+          (returnFocusFallbackId ? document.getElementById(returnFocusFallbackId) : null))?.focus();
       });
     });
   }
@@ -76,9 +82,9 @@ export function DocumentPreviewDialog() {
       >
         <DialogTitle className="sr-only">Document preview</DialogTitle>
         <DialogDescription className="sr-only">
-          Read this document without leaving the current search results.
+          Read this document without leaving the page you opened it from.
         </DialogDescription>
-        <DocumentPage presentation="preview" />
+        <CurrentUserProvider user={user.data ?? null}><DocumentPage presentation="preview" /></CurrentUserProvider>
       </DialogContent>
     </Dialog>
   );

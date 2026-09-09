@@ -7,6 +7,25 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Added a personal notification inbox and document watches
+
+Human browser sessions can view effective Vault-access changes and explicitly
+watch documents for updates, moves, archive/restore transitions, and deletion.
+The web inbox supports server-side category and unread filters, pagination,
+version-aware read acknowledgement, and snapshot-based mark-all-read. Watches
+survive document moves through stable resource identity. Current access is
+checked during delivery and reads; inaccessible targets are redacted or omitted.
+
+Migration 099 adds PostgreSQL-backed subscriptions, inbox entries, and durable
+delivery work for both legacy and Native document mutations. Delivery runs in
+the existing worker, without Redis or an external messaging service. Ordinary
+updates coalesce into fixed five-minute buckets and retention defaults to 90
+days. Operators can disable the feature with `notifications_enabled` or adjust
+`notification_retention_days`. PATs and service credentials cannot read a
+personal inbox. Email, push delivery, and historical-event replay are not included.
+
+See the [personal notifications guide](../docs/guides/personal-notifications.md).
+
 ### drill_down and search payload hygiene
 
 `akb_drill_down` returns section bodies, not the scaffolding the indexer wrote

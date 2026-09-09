@@ -338,9 +338,15 @@ class CollectionService:
                     # snapshot was taken without a document row lock
                     # (`list_docs_under`), so a concurrent move could have
                     # changed the path since. See the method's docstring.
-                    await doc_repo.delete_with_publications(
+                    deleted = await doc_repo.delete_with_publications(
                         conn, doc_id=d["id"], vault_id=vault_id,
                     )
+                    if deleted:
+                        from app.services.notification_producer import enqueue_document_change
+                        await enqueue_document_change(
+                            conn, "document.delete", source_key=f"collection-delete:{uuid.uuid4()}",
+                            vault_id=vault_id, resource_id=d["id"], actor_username=agent_id,
+                        )
 
                 # Per-file cost: edges + chunk outbox + s3 outbox +
                 # vault_files row delete = ~4 round-trips. Acceptable

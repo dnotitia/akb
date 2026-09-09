@@ -387,6 +387,10 @@ redis_url: ""              # e.g. redis://redis:6379/0
 redis_event_stream: akb:events
 redis_stream_maxlen: 100000
 
+# === Personal inbox (PostgreSQL; no Redis required) ===
+notifications_enabled: true
+notification_retention_days: 90
+
 # === Audit log (compliance-grade, producer-only) ===
 # AKB does NOT store/query/retain audit data — it emits an append-only,
 # hash-chained JSON-lines stream and (optionally) hands the daily rolled

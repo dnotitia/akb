@@ -30,6 +30,7 @@ from app.api.routes import (
     collections,
     documents,
     events,
+    notifications,
     files,
     help as help_routes,
     knowledge,
@@ -53,6 +54,7 @@ from app.services import (
     external_git_poller,
     external_git_service,
     metadata_worker,
+    notification_worker,
     tool_usage,
 )
 from app.services.access_service import check_vault_access
@@ -343,6 +345,7 @@ app.include_router(app_rollouts.router, prefix="/api/v1", tags=["app-rollouts"])
 app.include_router(access.router, prefix="/api/v1", tags=["access"])
 app.include_router(documents.router, prefix="/api/v1", tags=["documents"])
 app.include_router(events.router, prefix="/api/v1", tags=["events"])
+app.include_router(notifications.router, prefix="/api/v1", tags=["notifications"])
 app.include_router(search.router, prefix="/api/v1", tags=["search"])
 app.include_router(collections.router, prefix="/api/v1")
 app.include_router(knowledge.router, prefix="/api/v1")
@@ -505,6 +508,7 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
         "asset_gc": await _safe(asset_gc_worker.pending_stats),
         "metadata_backfill": await _safe(metadata_worker.pending_stats),
         "events": await _safe(events_publisher.pending_stats),
+        "notifications": await _safe(notification_worker.pending_stats),
         "native_file_projection": await _safe(native_file_projection.pending_stats),
         "vector_store": vs_info,
     }

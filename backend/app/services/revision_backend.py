@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
+from uuid import UUID
 from collections.abc import Callable
 from threading import Lock
 from typing import Any, Protocol, cast
@@ -36,6 +38,7 @@ class RevisionBackend(Protocol):
 
     async def recent_changes(
         self, user_id: str, *, vault: str | None, limit: int,
+        watching: bool = False, before: tuple[datetime, UUID] | None = None,
     ) -> list[dict[str, Any]]: ...
 
     async def document_diff(
@@ -67,38 +70,35 @@ class LegacyRevisionBackend:
 
     async def recent_changes(
         self, user_id: str, *, vault: str | None, limit: int,
+        watching: bool = False, before: tuple[datetime, UUID] | None = None,
     ) -> list[dict[str, Any]]:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            if vault:
-                rows = await conn.fetch(
-                    """
-                    SELECT d.id, d.title, d.path, d.doc_type, d.current_commit,
-                           d.updated_at, v.name AS vault_name, d.metadata
-                    FROM documents d
-                    JOIN vaults v ON d.vault_id = v.id
-                    WHERE v.name = $1
-                    ORDER BY d.updated_at DESC
-                    LIMIT $2
-                    """,
-                    vault, limit,
-                )
-            else:
-                rows = await conn.fetch(
-                    """
+            watch_filter = """AND EXISTS (
+                SELECT 1 FROM notification_subscriptions ns
+                WHERE ns.user_id = $1 AND ns.resource_id = d.id AND ns.vault_id = v.id
+            )""" if watching else ""
+            rows = await conn.fetch(
+                    f"""
                     SELECT d.id, d.title, d.path, d.doc_type, d.current_commit,
                            d.updated_at, v.name AS vault_name, d.metadata
                     FROM documents d
                     JOIN vaults v ON d.vault_id = v.id
                     LEFT JOIN vault_access va
                         ON va.vault_id = v.id AND va.user_id = $1
-                    WHERE v.owner_id = $1
+                    WHERE (($3::text IS NOT NULL AND NOT $6::boolean)
+                       OR v.owner_id = $1
                        OR va.user_id = $1
-                       OR v.public_access IN ('reader', 'writer')
-                    ORDER BY d.updated_at DESC
+                       OR v.public_access IN ('reader', 'writer'))
+                    AND ($3::text IS NULL OR v.name = $3)
+                    AND ($4::timestamptz IS NULL OR (d.updated_at, d.id) < ($4, $5::uuid))
+                    {watch_filter}
+                    ORDER BY d.updated_at DESC, d.id DESC
                     LIMIT $2
                     """,
-                    user_id, limit,
+                    user_id, limit, vault, before[0] if before else None,
+                    before[1] if before else None,
+                    watching,
                 )
 
         changes = []
@@ -111,6 +111,7 @@ class LegacyRevisionBackend:
                     metadata = {}
             changes.append({
                 "doc_id": metadata.get("id") or str(row["id"]),
+                "resource_id": str(row["id"]),
                 "vault": row["vault_name"],
                 "path": row["path"],
                 "title": row["title"],

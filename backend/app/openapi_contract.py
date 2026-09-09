@@ -481,6 +481,7 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
             "required": ["doc_id", "vault", "path", "title", "type", "commit", "changed_at"],
             "properties": {
                 "doc_id": {"type": "string"},
+                "resource_id": _nullable_string(),
                 "vault": {"type": "string"},
                 "path": {"type": "string"},
                 "title": {"type": "string"},
@@ -523,6 +524,8 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
         "AkbRecentChangesEnvelope": _kind_schema(
             "recent_changes",
             {
+                "scope": {"type": "string", "enum": ["all", "watching"], "default": "all"},
+                "next_cursor": _nullable_string(),
                 "changes": {
                     "type": "array",
                     "items": {"$ref": "#/components/schemas/RecentDocumentChange"},

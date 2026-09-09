@@ -27,6 +27,7 @@ from app.services import (
     http_pool,
     m1_file_transfer_reaper,
     metadata_worker,
+    notification_worker,
     queue_rescuer,
     s3_delete_worker,
     sparse_encoder,
@@ -325,6 +326,7 @@ def start_workers(*, include_api_local: bool = True) -> None:
     start_runtime_pools()
     embed_worker.start()
     delete_worker.start()
+    notification_worker.start()
     # ``start_workers`` is normally called from the FastAPI lifespan loop.
     # Keep direct, loop-free lifecycle probes (and import-time diagnostics)
     # side-effect free; the rollout runner owns asyncio tasks and cannot be
@@ -452,6 +454,7 @@ async def stop_workers(*, include_api_local: bool = True) -> None:
         ("role_sync", lambda: get_role_sync().stop_reconcile_timer()),
         ("m1_file_transfer_reaper", m1_file_transfer_reaper.stop),
         ("events_publisher", events_publisher.stop),
+        ("notification_worker", notification_worker.stop),
         ("metadata_worker", metadata_worker.stop),
         ("external_git_poller", external_git_poller.stop),
         ("asset_gc_worker", asset_gc_worker.stop),

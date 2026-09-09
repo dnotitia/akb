@@ -719,6 +719,7 @@ class NativeDocumentService(DocumentService):
                     f"current_commit moved: expected {req.expected_commit}, actual {current.revision_id}"
                 )
             frontmatter, current_body = await self._document_frontmatter(vault_id, current)
+            previous_status = frontmatter.get("status") or "draft"
             previous_hash = _body_content_hash(current_body)
             if req.expected_content_hash and req.expected_content_hash != previous_hash:
                 raise ConflictError(f"content_hash moved: expected {req.expected_content_hash}, actual {previous_hash}")
@@ -772,6 +773,8 @@ class NativeDocumentService(DocumentService):
                     message=message,
                     subject=f"[update] {current.path}",
                     summary=summary,
+                    notification_previous_status=previous_status,
+                    notification_status=frontmatter.get("status") or "draft",
                 )
             except ConflictError as exc:
                 if exact_head_pinned or not str(exc).startswith(

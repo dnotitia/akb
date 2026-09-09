@@ -2,6 +2,7 @@ import { useEffect, useState, type ComponentType } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
   KeyRound,
+  Bell,
   Palette,
   ShieldCheck,
   UserRound,
@@ -31,8 +32,9 @@ import { ProfileSection, type User } from "./profile-section";
 import { TokensSection, type PAT } from "./tokens-section";
 import { PreferencesSection } from "./preferences-section";
 import { AdminSection } from "./admin-section";
+import { NotificationsSection } from "./notifications-section";
 
-type TabId = "profile" | "tokens" | "preferences" | "admin";
+type TabId = "profile" | "tokens" | "preferences" | "notifications" | "admin";
 
 const SETTINGS_SECTIONS: Array<{
   id: Exclude<TabId, "admin">;
@@ -40,6 +42,7 @@ const SETTINGS_SECTIONS: Array<{
   description: string;
   icon: ComponentType<LucideProps>;
 }> = [
+  { id: "notifications", label: "Notifications", description: "Watched documents", icon: Bell },
   {
     id: "profile",
     label: "Profile",
@@ -154,7 +157,7 @@ export default function SettingsPage() {
   // Active tab synced to `?tab=` so Profile/Tokens/etc. are deep-linkable.
   // `admin` is only a valid value when the viewer is an admin — otherwise
   // it falls back to the default so non-admins can't land on a blank pane.
-  const allowedTabs: TabId[] = ["profile", "tokens", "preferences"];
+  const allowedTabs: TabId[] = ["profile", "tokens", "preferences", "notifications"];
   if (user.is_admin) allowedTabs.push("admin");
   const rawTab = searchParams.get("tab");
   const activeTab: TabId =
@@ -235,6 +238,7 @@ export default function SettingsPage() {
         </aside>
 
         <div className="min-w-0">
+          <TabsContent value="notifications" className="space-y-6 pt-0"><NotificationsSection /></TabsContent>
           <TabsContent value="profile" className="space-y-6 pt-0">
             <ProfileSection
               user={user}

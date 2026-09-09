@@ -863,10 +863,17 @@ class NativeRevisionRepository:
         user_id: uuid.UUID | None,
         vault: str | None,
         limit: int,
+        watching: bool = False,
+        before: tuple | None = None,
     ) -> list[dict]:
         async with self.pool.acquire() as conn:
+            watch_filter = """AND EXISTS (
+                SELECT 1 FROM notification_subscriptions ns
+                WHERE ns.user_id = $1 AND ns.resource_id = rs.resource_id
+                  AND ns.vault_id = v.id
+            )""" if watching else ""
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT rs.resource_id, rs.current_path AS path,
                        rs.head_revision_id AS revision_id, rs.updated_at,
                        v.name AS vault_name,
@@ -888,17 +895,22 @@ class NativeRevisionRepository:
                    AND rs.lifecycle = 'live'
                    AND ($2::text IS NULL OR v.name = $2)
                    AND (
-                        $2::text IS NOT NULL
+                        ($2::text IS NOT NULL AND NOT $6::boolean)
                         OR v.owner_id = $1
                         OR va.user_id = $1
                         OR v.public_access IN ('reader', 'writer')
                    )
+                   AND ($4::timestamptz IS NULL OR (rs.updated_at, rs.resource_id) < ($4, $5::uuid))
+                   {watch_filter}
                  ORDER BY rs.updated_at DESC, rs.resource_id DESC
                  LIMIT $3
                 """,
                 user_id,
                 vault,
                 limit,
+                before[0] if before else None,
+                before[1] if before else None,
+                watching,
             )
         return [dict(row) for row in rows]
 

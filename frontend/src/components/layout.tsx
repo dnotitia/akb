@@ -14,6 +14,7 @@ import { Logo } from "@/components/logo";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { GlobalSearchDialog } from "@/components/global-search-dialog";
 import { HeaderIndexingStatus } from "@/components/header-indexing-status";
+import { NotificationBell } from "@/components/notification-bell";
 import { AppSidebar } from "@/components/app-sidebar";
 import { appRouteBoundaryForPath } from "@/app-route-contract";
 import { CurrentUserProvider } from "@/contexts/current-user-context";
@@ -246,7 +247,10 @@ export function Layout() {
               />
             </nav>
 
-            <div className="ml-3 flex shrink-0 items-center justify-end border-l border-border pl-3 lg:w-28">
+            <div className="ml-2 flex shrink-0 items-center justify-end gap-2 border-l border-border pl-2 lg:min-w-28">
+              <CurrentUserProvider user={session.user}>
+                <NotificationBell key={session.user.user_id} />
+              </CurrentUserProvider>
               <UserMenu initialUser={session.user} />
             </div>
           </div>
