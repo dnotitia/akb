@@ -7,11 +7,11 @@ import os
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from .catalog import capture_catalog
 from .contracts import BenchmarkRunManifest, TaskManifest, hash_json, load_run_manifest, load_task_corpus
-from .evidence import serialize_report, write_json, safe_json
+from .evidence import redact_text, serialize_report, write_json, safe_json
 from .execution import (
     BudgetLedger,
     TrialExecutor,
@@ -26,6 +26,55 @@ from .runtime import RuntimeContractError, RuntimeDescriptor, RuntimeFixture
 
 class NeedsUserInput(RuntimeError):
     """The run needs a user-provided provider, credential, or cost decision."""
+
+
+class BenchmarkRunFailure(RuntimeError):
+    """A post-preflight run failure with a safe partial artifact."""
+
+    def __init__(
+        self,
+        primary_error: Exception,
+        artifact: dict[str, Any],
+        secrets: tuple[str, ...],
+        cleanup_errors: tuple[Exception, ...],
+    ) -> None:
+        self.primary_error = primary_error
+        self.artifact = artifact
+        self.secrets = secrets
+        self.cleanup_errors = cleanup_errors
+        message = redact_text(_exception_text(primary_error), secrets)
+        if cleanup_errors:
+            cleanup = ", ".join(redact_text(_exception_text(error), secrets) for error in cleanup_errors)
+            message = f"{message}; cleanup failed: {cleanup}"
+        super().__init__(message)
+
+
+def _exception_text(error: BaseException) -> str:
+    return f"{type(error).__name__}: {error}"
+
+
+def _exception_stage(error: BaseException, fallback: str) -> str:
+    stage = getattr(error, "stage", None)
+    return stage if isinstance(stage, str) and stage else fallback
+
+
+def _attach_cleanup_errors(
+    primary: Exception,
+    cleanup_errors: list[Exception],
+    secrets: tuple[str, ...],
+) -> None:
+    for error in cleanup_errors:
+        primary.add_note(f"cleanup failed: {redact_text(_exception_text(error), secrets)}")
+
+
+async def _collect_cleanup_errors(*actions: Callable[[], Awaitable[None]]) -> list[Exception]:
+    errors: list[Exception] = []
+    for action in actions:
+        try:
+            await action()
+        except Exception as exc:
+            errors.append(exc)
+    return errors
 
 
 @dataclass(slots=True)
@@ -103,6 +152,21 @@ class CredentialResolver:
         if self.minted_default is not None:
             await fixture.revoke_pat(*self.minted_default)
 
+    def secret_values(self) -> tuple[str, ...]:
+        values = list(self.model_secrets)
+        if self.tokens is not None:
+            values.extend(self.tokens.values())
+        for env_name in (
+            self.descriptor.username_env,
+            self.descriptor.password_env,
+            self.descriptor.pat_env,
+        ):
+            if env_name:
+                value = os.environ.get(env_name)
+                if value:
+                    values.append(value)
+        return tuple(dict.fromkeys(value for value in values if value))
+
 
 class BenchmarkRunner:
     def __init__(
@@ -118,6 +182,90 @@ class BenchmarkRunner:
         self.descriptor = descriptor
         self.arm = arm
         self.secrets: tuple[str, ...] = ()
+        self._completed_trials: dict[str, list[TrialOutcome]] = defaultdict(list)
+
+    def _refresh_secrets(self, resolver: CredentialResolver) -> None:
+        self.secrets = resolver.secret_values()
+
+    def _record_trial(self, key: str, outcome: TrialOutcome) -> None:
+        self._completed_trials[key].append(outcome)
+
+    def _build_artifact(
+        self,
+        *,
+        runtime: dict[str, Any],
+        artifact_versions: dict[str, str],
+        ledger: BudgetLedger,
+        catalogs: dict[str, Any],
+        reports: dict[str, Any],
+        incomplete_reasons: set[str],
+        failure: Exception | None = None,
+        failure_stage: str | None = None,
+        cleanup_errors: list[Exception] | None = None,
+    ) -> dict[str, Any]:
+        all_reports = dict(reports)
+        for key, outcomes in self._completed_trials.items():
+            if key in all_reports or not outcomes:
+                continue
+            all_reports[key] = {
+                "catalog_keys": [],
+                "report": None,
+                "trials": [safe_json(outcome.model_dump(mode="json"), self.secrets) for outcome in outcomes],
+                "summary": summarize_outcomes(outcomes),
+                "partial": True,
+            }
+        completed_trials = sum(len(outcomes) for outcomes in self._completed_trials.values())
+        for key, report in all_reports.items():
+            if key in self._completed_trials or not isinstance(report, dict):
+                continue
+            trials = report.get("trials")
+            if isinstance(trials, list):
+                completed_trials += len(trials)
+        artifact: dict[str, Any] = {
+            "schema_version": 1,
+            "status": "incomplete" if failure is not None or incomplete_reasons else "complete",
+            "incomplete_reasons": sorted(incomplete_reasons),
+            "completed_trials": completed_trials,
+            "arm": self.arm,
+            "run_manifest_hash": hash_json(self.manifest.model_dump(mode="json")),
+            "task_corpus_hash": hash_json([task.model_dump(mode="json") for task in self.tasks]),
+            "task_ids": [task.id for task in self.tasks],
+            "category_counts": dict(sorted(Counter(task.category for task in self.tasks).items())),
+            "source_revision": runtime["source_revision"],
+            "protocol_revision": self.manifest.protocol_revision,
+            "artifact_versions": artifact_versions,
+            "fixture": {
+                "scenario": self.descriptor.scenario,
+                "reset": {
+                    "method": "POST",
+                    "url": self.descriptor.reset_url,
+                    "body": self.descriptor.reset_body,
+                },
+            },
+            "runtime": safe_json(runtime["discovery"], self.secrets),
+            "manifest": self.manifest.model_dump(mode="json"),
+            "catalogs": {key: safe_json(value.model_dump(mode="json"), self.secrets) for key, value in sorted(catalogs.items())},
+            "runs": all_reports,
+            "budget_used": {
+                "model_requests": ledger.requests,
+                "input_tokens": ledger.input_tokens,
+                "output_tokens": ledger.output_tokens,
+                "total_tokens": ledger.input_tokens + ledger.output_tokens,
+                "cost_usd": ledger.cost_usd,
+                "wall_seconds": ledger.wall_seconds,
+                "reserved_cost_usd": ledger.reserved_cost_usd,
+            },
+        }
+        if failure is not None:
+            cleanup = cleanup_errors or []
+            stage = failure_stage or _exception_stage(failure, "run")
+            artifact["failure_stage"] = stage
+            artifact["failure"] = {
+                "stage": stage,
+                "error": redact_text(_exception_text(failure), self.secrets),
+                "cleanup_errors": [redact_text(_exception_text(error), self.secrets) for error in cleanup],
+            }
+        return safe_json(artifact, self.secrets)
 
     async def preflight(self) -> dict[str, Any]:
         self.manifest.validate_tasks(self.tasks)
@@ -142,10 +290,21 @@ class BenchmarkRunner:
         profiles = resolver.required_profiles(self.tasks)
         resolver.validate_inputs(profiles)
         fixture = RuntimeFixture(self.descriptor)
+        runtime: dict[str, Any] | None = None
+        primary_error: Exception | None = None
         try:
             runtime = await fixture.preflight()
+        except Exception as exc:
+            primary_error = exc
         finally:
-            await fixture.close()
+            cleanup_errors = await _collect_cleanup_errors(fixture.close)
+        if primary_error is not None:
+            _attach_cleanup_errors(primary_error, cleanup_errors, tuple(model_secrets))
+            raise primary_error
+        if cleanup_errors:
+            _attach_cleanup_errors(cleanup_errors[0], cleanup_errors[1:], tuple(model_secrets))
+            raise cleanup_errors[0]
+        assert runtime is not None
         return {
             "runtime": runtime,
             "resolver": resolver,
@@ -162,17 +321,24 @@ class BenchmarkRunner:
         catalogs: dict[str, Any] = {}
         reports: dict[str, Any] = {}
         incomplete_reasons: set[str] = set()
+        lifecycle_failures: list[Exception] = []
+        lifecycle_cleanup_errors: list[Exception] = []
+        current_stage = "run_initialization"
+        self._refresh_secrets(resolver)
+        primary_error: Exception | None = None
         try:
+            current_stage = "runtime_readiness"
+            await fixture.wait_until_ready(stage="runtime_readiness")
+            current_stage = "credential_preparation"
             profiles = resolver.required_profiles(self.tasks)
             await resolver.prepare(fixture, profiles)
-            self.secrets = tuple(resolver.model_secrets)
-            for profile in profiles:
-                self.secrets = tuple(dict.fromkeys((*self.secrets, resolver.token_for(profile))))
+            self._refresh_secrets(resolver)
             for transport in self.manifest.transports:
                 for profile in profiles:
                     selected_tasks = [task for task in self.tasks if transport in task.fixture.transports and task.fixture.credential_profile == profile]
                     if not selected_tasks:
                         continue
+                    current_stage = f"catalog_capture:{transport}:{profile}"
                     token = resolver.token_for(profile)
                     artifact_version = (
                         artifact_versions["backend_artifact_version"]
@@ -189,11 +355,18 @@ class BenchmarkRunner:
                     )
 
             for model_spec in self.manifest.models:
+                current_stage = f"model_build:{model_spec.class_name}"
                 model = build_model(model_spec)
                 for transport in self.manifest.transports:
                     selected_tasks = [task for task in self.tasks if transport in task.fixture.transports]
                     if not selected_tasks:
                         continue
+                    key = f"{model_spec.class_name}:{transport}"
+                    current_stage = f"evaluation:{key}"
+
+                    def record_outcome(outcome: TrialOutcome, key: str = key) -> None:
+                        self._record_trial(key, outcome)
+
                     executor = TrialExecutor(
                         self.manifest,
                         arm=self.arm,
@@ -204,14 +377,18 @@ class BenchmarkRunner:
                         token_for=resolver.token_for,
                         secrets_for=resolver.secrets_for,
                         ledger=ledger,
+                        outcome_sink=record_outcome,
                     )
                     report = await evaluate_dataset(
                         selected_tasks,
                         manifest=self.manifest,
                         executor=executor,
                         fixture=fixture,
+                        failure_sink=lifecycle_failures,
+                        cleanup_sink=lifecycle_cleanup_errors,
                     )
-                    key = f"{model_spec.class_name}:{transport}"
+                    if lifecycle_failures:
+                        raise lifecycle_failures[0]
                     outcomes = outcomes_from_report(report, self.manifest.repeats)
                     incomplete_reasons.update(
                         outcome.error for outcome in outcomes if outcome.error and outcome.error.startswith("benchmark incomplete:")
@@ -229,42 +406,46 @@ class BenchmarkRunner:
                         "trials": [outcome.model_dump(mode="json") for outcome in outcomes],
                         "summary": summarize_outcomes(outcomes),
                     }
+        except Exception as exc:
+            primary_error = exc
         finally:
-            await resolver.cleanup(fixture)
-            await fixture.close()
-        return {
-            "schema_version": 1,
-            "status": "incomplete" if incomplete_reasons else "complete",
-            "incomplete_reasons": sorted(incomplete_reasons),
-            "arm": self.arm,
-            "run_manifest_hash": hash_json(self.manifest.model_dump(mode="json")),
-            "task_corpus_hash": hash_json([task.model_dump(mode="json") for task in self.tasks]),
-            "task_ids": [task.id for task in self.tasks],
-            "category_counts": dict(sorted(Counter(task.category for task in self.tasks).items())),
-            "source_revision": source_revision,
-            "protocol_revision": self.manifest.protocol_revision,
-            "artifact_versions": artifact_versions,
-            "fixture": {
-                "scenario": self.descriptor.scenario,
-                "reset": {
-                    "method": "POST",
-                    "url": self.descriptor.reset_url,
-                    "body": self.descriptor.reset_body,
-                },
-            },
-            "runtime": safe_json(runtime["discovery"], self.secrets),
-            "manifest": self.manifest.model_dump(mode="json"),
-            "catalogs": {key: value.model_dump(mode="json") for key, value in sorted(catalogs.items())},
-            "runs": reports,
-            "budget_used": {
-                "model_requests": ledger.requests,
-                "input_tokens": ledger.input_tokens,
-                "output_tokens": ledger.output_tokens,
-                "total_tokens": ledger.input_tokens + ledger.output_tokens,
-                "cost_usd": ledger.cost_usd,
-                "wall_seconds": ledger.wall_seconds,
-            },
-        }
+            cleanup_errors = await _collect_cleanup_errors(
+                lambda: resolver.cleanup(fixture),
+                fixture.close,
+            )
+        self._refresh_secrets(resolver)
+        cleanup_errors = [*lifecycle_cleanup_errors, *cleanup_errors]
+        if primary_error is None and cleanup_errors:
+            primary_error = cleanup_errors[0]
+        if primary_error is not None:
+            notes = cleanup_errors if primary_error not in cleanup_errors else cleanup_errors[1:]
+            _attach_cleanup_errors(primary_error, notes, self.secrets)
+            incomplete_reasons.add(f"benchmark incomplete: {_exception_text(primary_error)}")
+            artifact = self._build_artifact(
+                runtime=runtime,
+                artifact_versions=artifact_versions,
+                ledger=ledger,
+                catalogs=catalogs,
+                reports=reports,
+                incomplete_reasons=incomplete_reasons,
+                failure=primary_error,
+                failure_stage=_exception_stage(primary_error, current_stage),
+                cleanup_errors=cleanup_errors,
+            )
+            raise BenchmarkRunFailure(
+                primary_error,
+                artifact,
+                self.secrets,
+                tuple(cleanup_errors),
+            ) from primary_error
+        return self._build_artifact(
+            runtime=runtime,
+            artifact_versions=artifact_versions,
+            ledger=ledger,
+            catalogs=catalogs,
+            reports=reports,
+            incomplete_reasons=incomplete_reasons,
+        )
 
 def outcomes_from_report(report: Any, repeat_count: int) -> list[TrialOutcome]:
     if report.failures:
@@ -481,6 +662,8 @@ def _validate_artifact_pair(baseline: dict[str, Any], candidate: dict[str, Any])
     for artifact, expected_arm in ((baseline, "baseline"), (candidate, "candidate")):
         if artifact.get("schema_version") != 1 or artifact.get("arm") != expected_arm:
             raise ValueError(f"invalid {expected_arm} run artifact")
+        if artifact.get("status", "complete") != "complete":
+            raise ValueError(f"cannot compare incomplete {expected_arm} run artifact")
     for key in ("run_manifest_hash", "task_corpus_hash", "protocol_revision", "task_ids"):
         if baseline.get(key) != candidate.get(key):
             raise ValueError(f"paired artifacts differ in {key}")

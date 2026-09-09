@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from mcp_catalog.contracts import load_run_manifest
 from mcp_catalog.execution import TrialOutcome
 from mcp_catalog.runner import compare_artifacts
@@ -70,3 +72,13 @@ def test_paired_comparison_averages_repeats_per_task_and_applies_all_gates() -> 
     assert result["paired"]["primary:http"]["metrics"]["success"]["independent_tasks"] == 2
     assert result["gate"]["status"] == "pass"
     assert result["gate"]["catalog_reduction"]["http:default"] == 0.5
+
+
+def test_incomplete_arm_artifact_cannot_be_paired() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json").model_dump(mode="json")
+    baseline = _artifact(manifest, candidate=False)
+    candidate = _artifact(manifest, candidate=True)
+    baseline["status"] = "incomplete"
+
+    with pytest.raises(ValueError, match="incomplete baseline"):
+        compare_artifacts(baseline, candidate)

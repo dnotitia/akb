@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,10 @@ ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 class RuntimeContractError(RuntimeError):
     """Raised when a runtime descriptor or fixture response is not safe to use."""
+
+    def __init__(self, message: str, *, stage: str | None = None) -> None:
+        super().__init__(message)
+        self.stage = stage
 
 
 def _object(value: Any, label: str) -> dict[str, Any]:
@@ -230,23 +235,27 @@ class StateObservation:
 class RuntimeFixture:
     """Reset and state-observe the existing runtime without owning its lifecycle."""
 
-    def __init__(self, descriptor: RuntimeDescriptor, *, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        descriptor: RuntimeDescriptor,
+        *,
+        timeout: float = 30.0,
+        readiness_timeout: float = 30.0,
+        readiness_poll_interval: float = 0.25,
+    ) -> None:
+        if readiness_timeout < 0 or readiness_poll_interval < 0:
+            raise ValueError("runtime readiness timing values must be non-negative")
         self.descriptor = descriptor
         self.client = httpx.AsyncClient(timeout=timeout)
+        self.readiness_timeout = readiness_timeout
+        self.readiness_poll_interval = readiness_poll_interval
         self._reset_lock = asyncio.Lock()
 
     async def close(self) -> None:
         await self.client.aclose()
 
     async def preflight(self) -> dict[str, Any]:
-        app_health = await self.client.get(self.descriptor.app_health_url)
-        fixture_health = await self.client.get(self.descriptor.fixture_health_url)
-        if app_health.status_code != 200 or fixture_health.status_code != 200:
-            raise RuntimeContractError("runtime readiness probe failed")
-        app_payload = _json_object(app_health, "app readiness")
-        fixture_payload = _json_object(fixture_health, "fixture readiness")
-        if app_payload.get("status") != "ready" or fixture_payload.get("status") != "ready":
-            raise RuntimeContractError("runtime is not ready")
+        await self.wait_until_ready(stage="runtime_readiness")
         discovery = await self.discover()
         source_revision = self.descriptor.source_revision_from(discovery)
         artifact_versions = self.descriptor.artifact_versions_from(discovery)
@@ -255,6 +264,34 @@ class RuntimeFixture:
             "artifact_versions": artifact_versions,
             "discovery": discovery,
         }
+
+    async def wait_until_ready(self, *, stage: str = "fixture_readiness") -> None:
+        """Wait for the descriptor's app and fixture health conditions."""
+
+        deadline = time.monotonic() + self.readiness_timeout
+        while True:
+            try:
+                app_health = await self.client.get(self.descriptor.app_health_url)
+                fixture_health = await self.client.get(self.descriptor.fixture_health_url)
+                app_payload = _json_object(app_health, "app readiness")
+                fixture_payload = _json_object(fixture_health, "fixture readiness")
+                if (
+                    app_health.status_code == 200
+                    and fixture_health.status_code == 200
+                    and app_payload.get("status") == "ready"
+                    and fixture_payload.get("status") == "ready"
+                    and fixture_payload.get("scenario") == self.descriptor.scenario
+                ):
+                    return
+            except (httpx.HTTPError, RuntimeContractError):
+                pass
+
+            if time.monotonic() >= deadline:
+                raise RuntimeContractError(
+                    f"{stage} did not recover before timeout",
+                    stage=stage,
+                )
+            await asyncio.sleep(self.readiness_poll_interval)
 
     async def discover(self) -> dict[str, Any]:
         response = await self.client.get(self.descriptor.discovery_url)
@@ -266,12 +303,22 @@ class RuntimeFixture:
             try:
                 response = await self.client.post(self.descriptor.reset_url, json=self.descriptor.reset_body)
             except httpx.HTTPError as exc:
-                raise RuntimeContractError("fixture reset request failed") from exc
+                raise RuntimeContractError("fixture reset request failed", stage="fixture_reset") from exc
             if response.status_code != 200:
-                raise RuntimeContractError(f"fixture reset returned HTTP {response.status_code}")
-            payload = _json_object(response, "fixture reset")
+                raise RuntimeContractError(
+                    f"fixture reset returned HTTP {response.status_code}",
+                    stage="fixture_reset",
+                )
+            try:
+                payload = _json_object(response, "fixture reset")
+            except RuntimeContractError as exc:
+                raise RuntimeContractError(str(exc), stage="fixture_reset") from exc
             if payload.get("status") != "ready" or payload.get("scenario") != self.descriptor.scenario:
-                raise RuntimeContractError("fixture reset response is not ready for the declared scenario")
+                raise RuntimeContractError(
+                    "fixture reset response is not ready for the declared scenario",
+                    stage="fixture_reset",
+                )
+            await self.wait_until_ready(stage="fixture_readiness")
 
     async def mint_pat(self, username: str, password: str) -> tuple[str, str]:
         """Mint a short-lived benchmark PAT when the runtime keeps its PAT private."""
@@ -282,7 +329,7 @@ class RuntimeFixture:
                 json={"username": username, "password": password},
             )
             if login.status_code != 200:
-                raise RuntimeContractError("runtime benchmark login failed")
+                raise RuntimeContractError("runtime benchmark login failed", stage="credential_login")
             login_payload = _json_object(login, "runtime benchmark login")
             session_token = login_payload.get("token")
             if not isinstance(session_token, str) or not session_token:
@@ -293,14 +340,14 @@ class RuntimeFixture:
                 json={"name": "mcp-catalog-benchmark"},
             )
             if response.status_code != 200:
-                raise RuntimeContractError("runtime benchmark PAT mint failed")
+                raise RuntimeContractError("runtime benchmark PAT mint failed", stage="pat_mint")
             payload = _json_object(response, "runtime benchmark PAT mint")
             token = payload.get("token")
             token_id = payload.get("token_id")
         except httpx.HTTPError as exc:
-            raise RuntimeContractError("runtime benchmark credential request failed") from exc
+            raise RuntimeContractError("runtime benchmark credential request failed", stage="credential_request") from exc
         if not isinstance(token, str) or not token or not isinstance(token_id, str) or not token_id:
-            raise RuntimeContractError("runtime benchmark PAT response is invalid")
+            raise RuntimeContractError("runtime benchmark PAT response is invalid", stage="pat_mint")
         return token, token_id
 
     async def revoke_pat(self, token: str, token_id: str) -> None:
@@ -310,9 +357,9 @@ class RuntimeFixture:
                 headers={"Authorization": f"Bearer {token}"},
             )
         except httpx.HTTPError as exc:
-            raise RuntimeContractError("runtime benchmark PAT cleanup request failed") from exc
+            raise RuntimeContractError("runtime benchmark PAT cleanup request failed", stage="pat_cleanup") from exc
         if response.status_code not in {200, 204}:
-            raise RuntimeContractError("runtime benchmark PAT cleanup failed")
+            raise RuntimeContractError("runtime benchmark PAT cleanup failed", stage="pat_cleanup")
 
     async def observe(self, probe: StateProbe, *, token: str | None) -> StateObservation:
         origin = self.descriptor.app_origin if probe.service == "app" else self.descriptor.fixture_origin
