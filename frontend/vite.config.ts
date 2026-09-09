@@ -13,6 +13,10 @@ const requestedMockScenario = process.env.CRABBOX_RUNTIME_SCENARIO || "empty";
 const mockScenario = ["document-edit-recovery", "markdown-reference-adapters"].includes(requestedMockScenario)
   ? requestedMockScenario
   : "empty";
+const FIXTURE_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  "base64",
+);
 let mockResetGeneration = 0;
 
 type MockFixtureDocument = {
@@ -285,6 +289,11 @@ function mockControlPlugin(): Plugin {
 
         const origin = `http://${request.headers.host || "127.0.0.1:4173"}`;
         response.setHeader("Content-Type", "application/json");
+        if (pathname === "/__akb_mock__/fixture/available-file.png" && request.method === "GET") {
+          response.setHeader("Content-Type", "image/png");
+          response.end(FIXTURE_PNG);
+          return;
+        }
         if (pathname === "/__akb_mock__/health" && request.method === "GET") {
           response.end(
             JSON.stringify({

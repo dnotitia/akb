@@ -13,6 +13,17 @@ import {
 
 const API = "/api/v1";
 const MOCK_TOKEN = "akb-mock-browser-token";
+const FIXTURE_PNG_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+function fixturePngBlob(): Blob {
+  const binary = atob(FIXTURE_PNG_BASE64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new Blob([bytes], { type: "image/png" });
+}
 
 type MockUser = typeof fixtureUser & { auth_method: "local" };
 
@@ -475,7 +486,7 @@ const handlers = [
   }),
   http.get("/__akb_mock__/fixture/available-file.png", async () => {
     await syncPublicReset();
-    return new HttpResponse(new Blob(["file-image"], { type: "image/png" }), {
+    return new HttpResponse(fixturePngBlob(), {
       headers: { "Content-Type": "image/png" },
     });
   }),
@@ -496,7 +507,7 @@ const handlers = [
     if (!asset || asset.status === "discarded") {
       return new HttpResponse(null, { status: 404 });
     }
-    return new HttpResponse(new Blob(["fixture-image"], { type: "image/png" }), {
+    return new HttpResponse(fixturePngBlob(), {
       headers: { "Content-Type": "image/png" },
     });
   }),

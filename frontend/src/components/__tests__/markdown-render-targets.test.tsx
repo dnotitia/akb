@@ -1,5 +1,5 @@
 import { render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const apiMocks = vi.hoisted(() => ({
   getAssetBlob: vi.fn(),
@@ -16,6 +16,19 @@ import { MarkdownRender } from "@/components/markdown-render";
 
 const DOCUMENT = "akb://team/coll/notes/doc/guide.md";
 const FILE = "akb://team/file/123e4567-e89b-42d3-a456-426614174001";
+const ATTACHMENT = "/api/assets/123e4567-e89b-42d3-a456-426614174000";
+
+beforeEach(() => {
+  Object.values(apiMocks).forEach((mock) => mock.mockReset());
+  Object.defineProperty(URL, "createObjectURL", {
+    configurable: true,
+    value: vi.fn(() => "blob:claimed-attachment"),
+  });
+  Object.defineProperty(URL, "revokeObjectURL", {
+    configurable: true,
+    value: vi.fn(),
+  });
+});
 
 describe("MarkdownRender resource targets", () => {
   it("uses a runtime route for an available document while retaining the canonical target", async () => {
@@ -53,5 +66,20 @@ describe("MarkdownRender resource targets", () => {
       expect(link).toHaveAttribute("title", "Reference unavailable");
       expect(link).toHaveAttribute("data-markdown-target", FILE);
     });
+  });
+
+  it("renders a claimed attachment from the authenticated byte path", async () => {
+    apiMocks.getAssetBlob.mockResolvedValue(new Blob(["valid fixture bytes"], { type: "image/png" }));
+
+    render(
+      <MarkdownRender
+        markdown={`![Fixture attachment](${ATTACHMENT})`}
+        assetContext={{ mode: "authenticated", vault: "team" }}
+      />,
+    );
+
+    const image = await screen.findByRole("img", { name: "Fixture attachment" });
+    expect(image).toHaveAttribute("src", "blob:claimed-attachment");
+    expect(image).toHaveAttribute("data-markdown-target", ATTACHMENT);
   });
 });
