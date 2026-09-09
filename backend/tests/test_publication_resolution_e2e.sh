@@ -15,11 +15,13 @@
 #
 # Covered here:
 #   T1 — recursive collection delete
-#   T2 — move onto a path a publication still claims
 #   T3 — file publications under a recursively deleted collection
 #   T4 — publications when confirm_upload discards a file, both paths
 #   T5 — external-git delete: covered as a pytest test instead; see the
 #        note in section 5 below.
+#
+# The MCP-only T2 move and its REST resolution oracle run in the authenticated
+# SDK pytest suite; the REST delete/file regressions below remain here.
 #
 set -uo pipefail
 
@@ -57,15 +59,6 @@ TOKEN=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" \
 [ -n "$TOKEN" ] && pass "Login as $USER" || { fail "Login" "no token"; exit 1; }
 
 acurl() { curl -sk -H "Authorization: Bearer $TOKEN" "$@"; }
-
-# MCP is an automation surface: a local browser/session JWT must not cross
-# that capability boundary. Mint a dedicated PAT for the one MCP-only move
-# below and keep TOKEN exclusively on the REST user-session path.
-MCP_PAT=$(acurl -X POST "$BASE_URL/api/v1/auth/tokens" \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"publication-resolution-e2e-mcp"}' \
-  | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])" 2>/dev/null)
-[ -n "$MCP_PAT" ] && pass "MCP PAT acquired" || { fail "MCP PAT" "no token"; exit 1; }
 
 R=$(acurl -X POST "$BASE_URL/api/v1/vaults?name=$VAULT&description=resolution%20regression")
 [ "$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("name",""))' 2>/dev/null)" = "$VAULT" ] \
@@ -162,97 +155,9 @@ fi
 
 echo ""
 
-# ══════════════════════════════════════════════════════════
-# 2. Move onto a path a publication still claims
-# ══════════════════════════════════════════════════════════
-# A move rewrites publications at the source path but must not let an
-# unrelated document arrive at a destination path that a publication still
-# claims. This reaches the same resolution question as T1 without creating
-# anything new — the corrected code refuses the move at the destination.
-echo "▸ 2. Move onto a path a publication still claims"
-
-T2_COLL="t2-board"
-T2_OPEN="T2-FIRST-BODY"
-T2_PRIVATE="T2-SECOND-BODY"
-
-OUT=$(mkdoc "$T2_COLL" "minutes" "T2 first document" "$T2_OPEN")
-T2_URI="${OUT%%|*}"; T2_PATH="${OUT##*|}"
-[ -n "$T2_URI" ] && pass "T2 setup: original doc created ($T2_PATH)" || fail "T2 setup" "no uri"
-
-T2_SLUG=$(pubdoc "$T2_URI")
-[ -n "$T2_SLUG" ] && pass "T2 setup: published (slug=$T2_SLUG)" || fail "T2 setup" "no slug"
-
-curl -sk "$BASE_URL/api/v1/public/$T2_SLUG" | grep -q "$T2_OPEN" \
-  && pass "T2 sanity: slug serves the original document" \
-  || fail "T2 sanity" "slug does not serve the original"
-
-D=$(delcoll "$T2_COLL")
-del_ok "$D" \
-  && pass "T2: collection deleted recursively (publication now orphaned)" \
-  || fail "T2 collection delete" "$D"
-
-# The document that gets moved onto the claimed path. It lives somewhere
-# else entirely and carries different content.
-OUT=$(mkdoc "t2-other" "second" "T2 second document" "$T2_PRIVATE")
-T2_MOVER_URI="${OUT%%|*}"; T2_MOVER_PATH="${OUT##*|}"
-[ -n "$T2_MOVER_URI" ] && pass "T2 setup: unpublished doc created ($T2_MOVER_PATH)" || fail "T2 setup" "no mover uri"
-
-# There is no REST move endpoint — move is MCP-only (akb_move).
-SESS=$(curl -sk -X POST "$BASE_URL/mcp/" \
-  -H "Authorization: Bearer $MCP_PAT" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"pubres-e2e","version":"0.1"}}}' \
-  -i 2>&1 | grep -i "mcp-session-id:" | tr -d '\r' | awk '{print $2}')
-[ -n "$SESS" ] && pass "T2: MCP session initialized" || fail "T2 MCP init" "no session id"
-
-curl -sk -X POST "$BASE_URL/mcp/" \
-  -H "Authorization: Bearer $MCP_PAT" -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" -H "Mcp-Session-Id: $SESS" \
-  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null
-
-mcp() {
-  local id=$1; shift
-  local name=$1; shift
-  curl -sk -X POST "$BASE_URL/mcp/" \
-    -H "Authorization: Bearer $MCP_PAT" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" \
-    -H "Mcp-Session-Id: $SESS" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"tools/call\",\"params\":{\"name\":\"$name\",\"arguments\":$1}}" 2>&1
-}
-mcp_text() {
-  python3 -c "
-import json, sys, re
-text = sys.stdin.read()
-m = re.search(r'(\{.*\})', text, re.DOTALL)
-if m:
-    data = json.loads(m.group(1))
-    if 'result' in data and 'content' in data['result']:
-        print(data['result']['content'][0]['text'])
-"
-}
-
-MV=$(mcp 20 akb_move "{\"uri\":\"$T2_MOVER_URI\",\"collection\":\"$T2_COLL\",\"slug\":\"minutes\"}" | mcp_text)
-T2_MOVED_PATH=$(echo "$MV" | jfield path)
-[ "$T2_MOVED_PATH" = "$T2_PATH" ] \
-  && pass "T2: unpublished doc moved onto the orphaned path ($T2_MOVED_PATH)" \
-  || fail "T2 move" "moved to '$T2_MOVED_PATH', expected '$T2_PATH' — response: $(echo "$MV" | head -c 240)"
-
-# ── THE ASSERTION ────────────────────────────────────────
-AFTER=$(curl -sk "$BASE_URL/api/v1/public/$T2_SLUG")
-AFTER_CODE=$(code_of "$T2_SLUG")
-if echo "$AFTER" | grep -q "$T2_PRIVATE"; then
-  fail "T2 resolution" "slug $T2_SLUG resolved to the moved document, not the one it was published for (HTTP $AFTER_CODE)"
-else
-  pass "T2: old slug does NOT serve the moved document"
-fi
-[ "$AFTER_CODE" != "200" ] \
-  && pass "T2: old slug no longer resolves (HTTP $AFTER_CODE)" \
-  || fail "T2 resolves" "publication for a deleted document still returns HTTP 200"
-
-echo ""
-
+# The MCP-only move case and its REST resolution oracle are covered by the
+# authenticated SDK pytest scenario. This shell lane retains the independent
+# delete/file regressions below.
 # ══════════════════════════════════════════════════════════
 # 3. File publications under a recursively deleted collection
 # ══════════════════════════════════════════════════════════
@@ -483,9 +388,8 @@ echo ""
 
 # ── 99. Cleanup ───────────────────────────────────────────
 echo "▸ 99. Cleanup"
-mcp 99 akb_delete_vault "{\"vault\":\"$VAULT\"}" >/dev/null 2>&1
+acurl -X DELETE "$BASE_URL/api/v1/vaults/$VAULT" >/dev/null 2>&1
 pass "Cleanup done"
-curl -sk -X DELETE "$BASE_URL/mcp/" -H "Authorization: Bearer $MCP_PAT" -H "Mcp-Session-Id: ${SESS:-}" >/dev/null 2>&1
 
 echo ""
 echo "╔══════════════════════════════════════════╗"

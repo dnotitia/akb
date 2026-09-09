@@ -50,12 +50,15 @@ The authenticated MCP behavior suite runs through the official Python SDK.
 canary, while `test_product_e2e.py` covers the baseline product scenarios and
 `test_detail_e2e.py` covers the migrated detailed regressions: exact-text edit,
 body hash/OCC, collection boundaries, Unicode search, graph link/unlink, grep
-replacement, and ownership transfer. The baseline suite covers vault and
-document lifecycle, browse/search/drill-down, move and aliases,
-relations/activity/history/diff, access roles and public levels, tables/SQL/
-DDL, publication, help, and deletion. Each pytest test receives the existing
-fixture's reset/login/SDK lifecycle; scenarios that need role boundaries add a
-second user through the same authenticated endpoint and client lifecycle.
+replacement, and ownership transfer. `test_publication_okf_e2e.py` covers
+detailed publication lifecycle and public-resolution oracles, the MCP-only
+move regression, and OKF export/import round-trips with their writer boundary.
+The baseline suite covers vault and document lifecycle, browse/search/
+drill-down, move and aliases, relations/activity/history/diff, access roles
+and public levels, tables/SQL/DDL, basic publication, help, and deletion.
+Each pytest test receives the existing fixture's reset/login/SDK lifecycle;
+scenarios that need role boundaries add a second user through the same
+authenticated endpoint and client lifecycle.
 The fixture uses the SDK's public `Client` and Streamable HTTP transport in the
 pytest process; it does not invoke Inspector, Node, or a separate MCP driver.
 
