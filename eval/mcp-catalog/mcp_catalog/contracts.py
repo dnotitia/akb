@@ -13,6 +13,17 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 PROTOCOL_REVISION = "2026-07-28"
 CONTRACT_SCHEMA_VERSION = 1
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_BASE_URL_ENV = "MCP_BENCH_OPENROUTER_BASE_URL"
+OPENROUTER_PROVIDER_KEY_ENV = "MCP_BENCH_OPENROUTER_API_KEY"
+OPENROUTER_PRICES = {
+    "deepseek/deepseek-v4-flash-0731": (0.14, 0.28),
+    "qwen/qwen3.8-27b": (0.24, 2.20),
+}
+OPENROUTER_CLASSES = {
+    "primary": "deepseek/deepseek-v4-flash-0731",
+    "lightweight": "qwen/qwen3.8-27b",
+}
 TASK_ID_RE = re.compile(r"^[a-z][a-z0-9-]{2,63}$")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 TOOL_NAME_RE = re.compile(r"\bakb_[a-z0-9_]+\b", re.IGNORECASE)
@@ -112,6 +123,29 @@ class ResponseRubric(ContractModel):
         return values
 
 
+class ProviderRouting(ContractModel):
+    order: list[Literal["parasail"]] = Field(min_length=1, max_length=1)
+    allow_fallbacks: Literal[False] = False
+    require_parameters: Literal[True] = True
+
+    @field_validator("order")
+    @classmethod
+    def pin_parasail(cls, values: list[Literal["parasail"]]) -> list[Literal["parasail"]]:
+        if values != ["parasail"]:
+            raise ValueError("OpenRouter routing must pin the parasail upstream")
+        return values
+
+    def request_body(self, *, input_price: float, output_price: float) -> dict[str, JsonValue]:
+        return {
+            "provider": {
+                "order": ["parasail"],
+                "allow_fallbacks": False,
+                "require_parameters": True,
+                "max_price": {"prompt": input_price, "completion": output_price},
+            }
+        }
+
+
 class TaskManifest(ContractModel):
     schema_version: Literal[1] = 1
     id: str
@@ -150,11 +184,12 @@ class TaskManifest(ContractModel):
 
 class ModelSpec(ContractModel):
     class_name: Literal["primary", "lightweight"]
-    provider: str = Field(min_length=1, max_length=100)
+    provider: Literal["openrouter"]
     model_id: str = Field(min_length=1, max_length=200)
     version: str = Field(min_length=1, max_length=200)
     base_url_env: str = Field(min_length=1, max_length=100)
     provider_key_env: str = Field(min_length=1, max_length=100)
+    routing: ProviderRouting
     settings: dict[str, JsonValue] = Field(default_factory=dict)
     input_cost_per_million_usd: float = Field(gt=0)
     output_cost_per_million_usd: float = Field(gt=0)
@@ -166,6 +201,25 @@ class ModelSpec(ContractModel):
             raise ValueError(f"invalid environment name: {value}")
         return value
 
+    @model_validator(mode="after")
+    def validate_openrouter_model(self) -> ModelSpec:
+        expected_model = OPENROUTER_CLASSES[self.class_name]
+        if self.model_id != expected_model or self.version != expected_model:
+            raise ValueError(f"{self.class_name} model/version must be pinned to {expected_model}")
+        if self.base_url_env != OPENROUTER_BASE_URL_ENV or self.provider_key_env != OPENROUTER_PROVIDER_KEY_ENV:
+            raise ValueError("OpenRouter model credentials must use the declared environment names")
+        expected_prices = OPENROUTER_PRICES[self.model_id]
+        if (self.input_cost_per_million_usd, self.output_cost_per_million_usd) != expected_prices:
+            raise ValueError(f"pricing snapshot for {self.model_id} does not match the pinned Parasail prices")
+        if set(self.settings) != {"temperature", "max_tokens"}:
+            raise ValueError("model settings must contain only temperature and max_tokens")
+        max_tokens = self.settings.get("max_tokens")
+        if self.settings.get("temperature") != 0.0 or not isinstance(max_tokens, int):
+            raise ValueError("model settings must pin temperature=0 and an integer max_tokens")
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+        return self
+
 
 class Budget(ContractModel):
     max_model_requests: int = Field(gt=0)
@@ -175,6 +229,8 @@ class Budget(ContractModel):
     max_total_cost_usd: float = Field(gt=0)
     max_wall_seconds: int = Field(gt=0)
     max_requests_per_trial: int = Field(gt=0)
+    max_input_tokens_per_trial: int = Field(gt=0)
+    max_output_tokens_per_trial: int = Field(gt=0)
     max_tokens_per_trial: int = Field(gt=0)
     max_cost_per_trial_usd: float = Field(gt=0)
 
@@ -184,6 +240,8 @@ class Budget(ContractModel):
             raise ValueError("max_total_tokens must equal input plus output token caps")
         if self.max_requests_per_trial > self.max_model_requests:
             raise ValueError("per-trial request cap cannot exceed global request cap")
+        if self.max_input_tokens_per_trial + self.max_output_tokens_per_trial != self.max_tokens_per_trial:
+            raise ValueError("per-trial input and output caps must equal the total token cap")
         return self
 
 
@@ -249,6 +307,8 @@ class BenchmarkRunManifest(ContractModel):
             raise ValueError("paired benchmark requires exactly baseline and candidate arms")
         if set(self.transports) != {"http", "stdio"}:
             raise ValueError("benchmark must register both HTTP and stdio transports")
+        if self.budget.max_total_cost_usd != 50.0:
+            raise ValueError("the benchmark hard total cost cap must be $50")
         classes = {model.class_name for model in self.models}
         if classes != {"primary", "lightweight"}:
             raise ValueError("models must include one primary and one lightweight class")
@@ -303,6 +363,18 @@ class BenchmarkRunManifest(ContractModel):
         required_trials = len(tasks) * len(self.models) * len(self.transports) * self.repeats * len(self.arms)
         if self.budget.max_model_requests < required_trials:
             raise ValueError("max_model_requests is below the registered trial count")
+        worst_case_per_trial = max(
+            (
+                self.budget.max_input_tokens_per_trial * model.input_cost_per_million_usd
+                + self.budget.max_output_tokens_per_trial * model.output_cost_per_million_usd
+            )
+            / 1_000_000
+            for model in self.models
+        )
+        if worst_case_per_trial > self.budget.max_cost_per_trial_usd:
+            raise ValueError("a preregistered worst-case trial cost exceeds max_cost_per_trial_usd")
+        if worst_case_per_trial * required_trials > self.budget.max_total_cost_usd:
+            raise ValueError("the preregistered worst-case trial set exceeds max_total_cost_usd")
 
 
 class CatalogSnapshot(ContractModel):

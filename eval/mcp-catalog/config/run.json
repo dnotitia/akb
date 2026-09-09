@@ -8,25 +8,27 @@
   "models": [
     {
       "class_name": "primary",
-      "provider": "openai-compatible",
-      "model_id": "gpt-4o-2024-08-06",
-      "version": "gpt-4o-2024-08-06",
-      "base_url_env": "MCP_BENCH_OPENAI_BASE_URL",
-      "provider_key_env": "MCP_BENCH_OPENAI_API_KEY",
+      "provider": "openrouter",
+      "model_id": "deepseek/deepseek-v4-flash-0731",
+      "version": "deepseek/deepseek-v4-flash-0731",
+      "base_url_env": "MCP_BENCH_OPENROUTER_BASE_URL",
+      "provider_key_env": "MCP_BENCH_OPENROUTER_API_KEY",
+      "routing": {"order": ["parasail"], "allow_fallbacks": false, "require_parameters": true},
       "settings": {"temperature": 0.0, "max_tokens": 1600},
-      "input_cost_per_million_usd": 5.0,
-      "output_cost_per_million_usd": 15.0
+      "input_cost_per_million_usd": 0.14,
+      "output_cost_per_million_usd": 0.28
     },
     {
       "class_name": "lightweight",
-      "provider": "openai-compatible",
-      "model_id": "gpt-4o-mini-2024-07-18",
-      "version": "gpt-4o-mini-2024-07-18",
-      "base_url_env": "MCP_BENCH_OPENAI_BASE_URL",
-      "provider_key_env": "MCP_BENCH_OPENAI_API_KEY",
+      "provider": "openrouter",
+      "model_id": "qwen/qwen3.8-27b",
+      "version": "qwen/qwen3.8-27b",
+      "base_url_env": "MCP_BENCH_OPENROUTER_BASE_URL",
+      "provider_key_env": "MCP_BENCH_OPENROUTER_API_KEY",
+      "routing": {"order": ["parasail"], "allow_fallbacks": false, "require_parameters": true},
       "settings": {"temperature": 0.0, "max_tokens": 1200},
-      "input_cost_per_million_usd": 0.15,
-      "output_cost_per_million_usd": 0.6
+      "input_cost_per_million_usd": 0.24,
+      "output_cost_per_million_usd": 2.2
     }
   ],
   "repeats": 3,
@@ -52,9 +54,11 @@
     "max_input_tokens": 6000000,
     "max_output_tokens": 1000000,
     "max_total_tokens": 7000000,
-    "max_total_cost_usd": 100.0,
+    "max_total_cost_usd": 50.0,
     "max_wall_seconds": 10800,
     "max_requests_per_trial": 8,
+    "max_input_tokens_per_trial": 22400,
+    "max_output_tokens_per_trial": 1600,
     "max_tokens_per_trial": 24000,
     "max_cost_per_trial_usd": 1.0
   },

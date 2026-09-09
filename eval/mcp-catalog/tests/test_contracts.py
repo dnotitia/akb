@@ -5,7 +5,10 @@ from pathlib import Path
 import pytest
 
 from mcp_catalog.contracts import (
+    BenchmarkRunManifest,
     CatalogSnapshot,
+    OPENROUTER_BASE_URL_ENV,
+    OPENROUTER_PROVIDER_KEY_ENV,
     hash_json,
     load_run_manifest,
     load_task_corpus,
@@ -25,6 +28,37 @@ def test_registered_manifest_and_corpus_cover_every_category() -> None:
     assert {model.class_name for model in manifest.models} == {"primary", "lightweight"}
     assert {task.category for task in tasks} == set(manifest.category_minimums)
     assert source_blind_violations_for(tasks, manifest.operation_map) == []
+    assert manifest.budget.max_total_cost_usd == 50.0
+    assert manifest.models[0].model_id == "deepseek/deepseek-v4-flash-0731"
+    assert manifest.models[1].model_id == "qwen/qwen3.8-27b"
+    assert all(model.provider == "openrouter" for model in manifest.models)
+    assert all(model.base_url_env == OPENROUTER_BASE_URL_ENV for model in manifest.models)
+    assert all(model.provider_key_env == OPENROUTER_PROVIDER_KEY_ENV for model in manifest.models)
+    for model in manifest.models:
+        provider = model.routing.request_body(
+            input_price=model.input_cost_per_million_usd,
+            output_price=model.output_cost_per_million_usd,
+        )["provider"]
+        assert provider["order"] == ["parasail"]
+        assert provider["allow_fallbacks"] is False
+        assert provider["require_parameters"] is True
+        assert "models" not in provider
+    assert (manifest.models[0].input_cost_per_million_usd, manifest.models[0].output_cost_per_million_usd) == (0.14, 0.28)
+    assert (manifest.models[1].input_cost_per_million_usd, manifest.models[1].output_cost_per_million_usd) == (0.24, 2.2)
+    assert manifest.budget.max_input_tokens_per_trial + manifest.budget.max_output_tokens_per_trial == manifest.budget.max_tokens_per_trial
+
+
+def test_manifest_rejects_provider_or_price_drift() -> None:
+    raw = load_run_manifest(ROOT / "config" / "run.json").model_dump(mode="json")
+    raw["models"][0]["input_cost_per_million_usd"] = 0.15
+
+    with pytest.raises(ValueError, match="pricing snapshot"):
+        BenchmarkRunManifest.model_validate(raw)
+
+    raw["models"][0]["input_cost_per_million_usd"] = 0.14
+    raw["models"][0]["routing"]["allow_fallbacks"] = True
+    with pytest.raises(ValueError):
+        BenchmarkRunManifest.model_validate(raw)
 
 
 def test_source_blind_check_rejects_tool_names_but_allows_logical_operations() -> None:

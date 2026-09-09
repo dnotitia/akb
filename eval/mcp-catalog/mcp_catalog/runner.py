@@ -19,6 +19,7 @@ from .execution import (
     build_model,
     evaluate_dataset,
     summarize_outcomes,
+    validate_model_configuration,
 )
 from .runtime import RuntimeContractError, RuntimeDescriptor, RuntimeFixture
 
@@ -135,6 +136,7 @@ class BenchmarkRunner:
                     f"model {model_spec.class_name} requires configured provider credentials "
                     f"({model_spec.base_url_env}, {model_spec.provider_key_env})"
                 )
+            validate_model_configuration(model_spec)
             model_secrets.append(api_key)
         resolver = CredentialResolver(self.manifest, self.descriptor, tuple(model_secrets))
         profiles = resolver.required_profiles(self.tasks)
@@ -159,6 +161,7 @@ class BenchmarkRunner:
         ledger = BudgetLedger(self.manifest)
         catalogs: dict[str, Any] = {}
         reports: dict[str, Any] = {}
+        incomplete_reasons: set[str] = set()
         try:
             profiles = resolver.required_profiles(self.tasks)
             await resolver.prepare(fixture, profiles)
@@ -210,6 +213,9 @@ class BenchmarkRunner:
                     )
                     key = f"{model_spec.class_name}:{transport}"
                     outcomes = outcomes_from_report(report, self.manifest.repeats)
+                    incomplete_reasons.update(
+                        outcome.error for outcome in outcomes if outcome.error and outcome.error.startswith("benchmark incomplete:")
+                    )
                     reports[key] = {
                         "catalog_keys": sorted(
                             f"{transport}:{profile}"
@@ -228,6 +234,8 @@ class BenchmarkRunner:
             await fixture.close()
         return {
             "schema_version": 1,
+            "status": "incomplete" if incomplete_reasons else "complete",
+            "incomplete_reasons": sorted(incomplete_reasons),
             "arm": self.arm,
             "run_manifest_hash": hash_json(self.manifest.model_dump(mode="json")),
             "task_corpus_hash": hash_json([task.model_dump(mode="json") for task in self.tasks]),
