@@ -61,8 +61,8 @@ class CredentialResolver:
     async def prepare(self, fixture: RuntimeFixture, profiles: list[str]) -> None:
         self.tokens = {}
         for profile in profiles:
-            env_name = self.manifest.credential_profiles.get(profile)
-            value = os.environ.get(env_name, "") if env_name else ""
+            env_name = self.env_name_for(profile)
+            value = os.environ.get(env_name, "")
             if value:
                 self.tokens[profile] = value
                 continue
