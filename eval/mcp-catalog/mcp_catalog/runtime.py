@@ -7,6 +7,7 @@ import asyncio
 import os
 import re
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -104,7 +105,10 @@ class RuntimeDescriptor:
     @classmethod
     def from_file(cls, path: Path) -> RuntimeDescriptor:
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            if str(path) == "-":
+                raw = json.loads(sys.stdin.read())
+            else:
+                raw = json.loads(path.read_text(encoding="utf-8"))
         except OSError as exc:
             raise RuntimeContractError(f"cannot read runtime descriptor: {exc}") from exc
         except json.JSONDecodeError as exc:
