@@ -72,7 +72,7 @@ def write_json(path: Path, value: Any, secrets: Iterable[str] = ()) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     safe = safe_json(value, secrets)
     encoded = json.dumps(safe, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n"
-    path.write_text(encoded, encoding="utf-8")
     for secret in secrets:
         if secret and secret in encoded:
             raise RuntimeError("evidence redaction failed")
+    path.write_text(encoded, encoding="utf-8")

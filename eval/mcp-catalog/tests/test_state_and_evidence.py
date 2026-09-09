@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+import mcp_catalog.evidence as evidence
 from mcp_catalog.contracts import StateContract, StateExpectation, StateProbe
 from mcp_catalog.evidence import safe_json, write_json
 from mcp_catalog.runtime import StateObservation
@@ -65,3 +68,14 @@ def test_evidence_drops_secret_fields_and_redacts_values(tmp_path: Path) -> None
     assert safe_json({"api" + "_key_env": "MCP_BENCH_API_KEY"}, (marker,))["api" + "_key_env"] == "MCP_BENCH_API_KEY"
     assert marker not in path.read_text(encoding="utf-8")
     assert json.loads(path.read_text(encoding="utf-8"))["message"] == "Bearer [redacted]"
+
+
+def test_evidence_redaction_failure_does_not_persist_the_unredacted_file(tmp_path: Path, monkeypatch) -> None:
+    marker = "fixture-marker"
+    path = tmp_path / "failed-evidence.json"
+    monkeypatch.setattr(evidence, "safe_json", lambda value, _secrets=(): value)
+
+    with pytest.raises(RuntimeError, match="redaction failed"):
+        evidence.write_json(path, {"value": marker}, (marker,))
+
+    assert not path.exists()
