@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -83,7 +83,9 @@ class CredentialResolver:
     descriptor: RuntimeDescriptor
     model_secrets: tuple[str, ...]
     tokens: dict[str, str] | None = None
-    minted_default: tuple[str, str] | None = None
+    minted_tokens: list[tuple[str, str]] = field(default_factory=list)
+    stale_minted_tokens: set[str] = field(default_factory=set)
+    issued_tokens: set[str] = field(default_factory=set)
 
     def env_name_for(self, profile: str) -> str:
         configured = self.manifest.credential_profiles.get(profile)
@@ -110,52 +112,103 @@ class CredentialResolver:
 
     async def prepare(self, fixture: RuntimeFixture, profiles: list[str]) -> None:
         self.tokens = {}
+        self.minted_tokens.clear()
+        self.stale_minted_tokens.clear()
+        self.issued_tokens.clear()
         for profile in profiles:
             env_name = self.env_name_for(profile)
             value = os.environ.get(env_name, "")
             if value:
                 self.tokens[profile] = value
                 continue
-            if profile != "default":
-                self.token_for(profile)
-            if not self.descriptor.username_env or not self.descriptor.password_env:
-                raise NeedsUserInput(f"credential value for profile {profile!r} is not available")
-            username = os.environ.get(self.descriptor.username_env, "")
-            password = os.environ.get(self.descriptor.password_env, "")
-            if not username or not password:
-                raise NeedsUserInput(
-                    f"credential profile {profile!r} needs either its PAT environment or "
-                    f"runtime login environments {self.descriptor.username_env}/{self.descriptor.password_env}"
-                )
-            token, token_id = await fixture.mint_pat(username, password)
-            self.tokens[profile] = token
-            self.minted_default = (token, token_id)
+            await self._mint(fixture, profile)
 
     def validate_inputs(self, profiles: list[str]) -> None:
         for profile in profiles:
             env_name = self.manifest.credential_profiles.get(profile)
             if env_name and os.environ.get(env_name):
                 continue
-            if profile != "default":
-                self.token_for(profile)
-            if not self.descriptor.pat_env:
-                raise NeedsUserInput(f"credential profile {profile!r} has no runtime PAT environment")
-            if os.environ.get(self.descriptor.pat_env):
+            if profile == "default" and self.descriptor.pat_env and os.environ.get(self.descriptor.pat_env):
                 continue
-            if not os.environ.get(self.descriptor.username_env) or not os.environ.get(self.descriptor.password_env):
+            if self._login_credentials_available():
+                continue
+            if env_name:
                 raise NeedsUserInput(
-                    f"credential profile {profile!r} needs either its PAT environment or "
+                    f"credential profile {profile!r} needs either its PAT environment {env_name} or "
                     f"runtime login environments {self.descriptor.username_env}/{self.descriptor.password_env}"
                 )
+            raise NeedsUserInput(f"credential profile {profile!r} has no runtime PAT environment")
 
     async def cleanup(self, fixture: RuntimeFixture) -> None:
-        if self.minted_default is not None:
-            await fixture.revoke_pat(*self.minted_default)
+        errors: list[Exception] = []
+        remaining: list[tuple[str, str]] = []
+        for token, token_id in self.minted_tokens:
+            try:
+                await fixture.revoke_pat(
+                    token,
+                    token_id,
+                    allow_absent=token in self.stale_minted_tokens,
+                )
+            except Exception as exc:
+                errors.append(exc)
+                remaining.append((token, token_id))
+        self.minted_tokens = remaining
+        if errors:
+            primary = errors[0]
+            for error in errors[1:]:
+                primary.add_note(
+                    "additional PAT cleanup failure: "
+                    f"{redact_text(_exception_text(error), self.secret_values())}"
+                )
+            raise primary
+
+    def mark_reset_complete(self) -> None:
+        self.stale_minted_tokens.update(token for token, _token_id in self.minted_tokens)
+
+    async def refresh_after_reset(self, fixture: RuntimeFixture, profile: str) -> str:
+        self.mark_reset_complete()
+        if not self._login_credentials_available():
+            raise NeedsUserInput(
+                f"credential profile {profile!r} cannot refresh after fixture reset; "
+                f"runtime login environments {self.descriptor.username_env}/{self.descriptor.password_env} are required"
+            )
+        await self._mint(fixture, profile)
+        return self.token_for(profile)
+
+    async def _mint(self, fixture: RuntimeFixture, profile: str) -> None:
+        username, password = self._login_credentials(profile)
+        scopes = ["read"] if profile == "read_only" else None
+        token, token_id = await fixture.mint_pat(username, password, scopes=scopes)
+        assert self.tokens is not None
+        self.tokens[profile] = token
+        self.minted_tokens.append((token, token_id))
+        self.issued_tokens.add(token)
+
+    def _login_credentials_available(self) -> bool:
+        return bool(
+            self.descriptor.username_env
+            and self.descriptor.password_env
+            and os.environ.get(self.descriptor.username_env)
+            and os.environ.get(self.descriptor.password_env)
+        )
+
+    def _login_credentials(self, profile: str) -> tuple[str, str]:
+        if not self._login_credentials_available():
+            raise NeedsUserInput(
+                f"credential profile {profile!r} needs either its PAT environment or "
+                f"runtime login environments {self.descriptor.username_env}/{self.descriptor.password_env}"
+            )
+        assert self.descriptor.username_env is not None
+        assert self.descriptor.password_env is not None
+        username = os.environ[self.descriptor.username_env]
+        password = os.environ[self.descriptor.password_env]
+        return username, password
 
     def secret_values(self) -> tuple[str, ...]:
         values = list(self.model_secrets)
         if self.tokens is not None:
             values.extend(self.tokens.values())
+        values.extend(self.issued_tokens)
         for env_name in (
             self.descriptor.username_env,
             self.descriptor.password_env,
@@ -386,10 +439,13 @@ class BenchmarkRunner:
                         fixture=fixture,
                         failure_sink=lifecycle_failures,
                         cleanup_sink=lifecycle_cleanup_errors,
+                        refresh_token=resolver.refresh_after_reset,
+                        mark_reset_complete=resolver.mark_reset_complete,
                     )
                     if lifecycle_failures:
                         raise lifecycle_failures[0]
                     outcomes = outcomes_from_report(report, self.manifest.repeats)
+                    self._refresh_secrets(resolver)
                     incomplete_reasons.update(
                         outcome.error for outcome in outcomes if outcome.error and outcome.error.startswith("benchmark incomplete:")
                     )

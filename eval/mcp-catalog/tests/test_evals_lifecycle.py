@@ -7,7 +7,7 @@ import pytest
 
 from mcp_catalog.contracts import load_run_manifest, load_task_corpus
 from mcp_catalog.evidence import serialize_report
-from mcp_catalog.execution import TrialOutcome, evaluate_dataset
+from mcp_catalog.execution import CURRENT_TRIAL, TrialOutcome, evaluate_dataset
 from mcp_catalog.runtime import RuntimeContractError, RuntimeFixture, StateObservation
 from test_runtime_contract import _TimedResetClient, descriptor_dict
 
@@ -72,6 +72,38 @@ class _ReadinessGuardExecutor:
     async def execute(self, task):
         assert self.fixture_client.ready, "provider execution must wait for runtime readiness"
         self.provider_calls += 1
+        return TrialOutcome(
+            task_id=task.id,
+            category=task.category,
+            arm=self.arm,
+            model_class=self.model_spec.class_name,
+            model_id=self.model_spec.model_id,
+            transport=self.transport,
+            final_answer_text="확인 전에는 변경하지 않습니다.",
+            first_logical_operation="none",
+        )
+
+
+@dataclass
+class _TokenRecordingExecutor:
+    manifest: object
+    arm: str = "baseline"
+    transport: str = "http"
+
+    def __post_init__(self) -> None:
+        self.model_spec = self.manifest.models[0]
+        self.tokens: list[str] = []
+
+    def token_for(self, _profile: str) -> str:
+        return "stale-token"
+
+    def secrets_for(self, _profile: str) -> tuple[str, ...]:
+        return ("stale-token",)
+
+    async def execute(self, task):
+        context = CURRENT_TRIAL.get()
+        assert context is not None
+        self.tokens.append(context.token)
         return TrialOutcome(
             task_id=task.id,
             category=task.category,
@@ -255,3 +287,37 @@ async def test_reset_timeout_blocks_provider_execution() -> None:
     assert failures and isinstance(failures[0], RuntimeContractError)
     assert failures[0].stage == "fixture_reset"
     assert executor.provider_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_passes_a_fresh_http_token_after_each_reset() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "read-vaults-a")
+    fixture = FakeFixture()
+    executor = _TokenRecordingExecutor(manifest)
+    refreshed = 0
+    marked = 0
+
+    async def refresh(_fixture, profile: str) -> str:
+        nonlocal refreshed
+        assert profile == "default"
+        refreshed += 1
+        return f"fresh-token-{refreshed}"
+
+    def mark_reset() -> None:
+        nonlocal marked
+        marked += 1
+
+    report = await evaluate_dataset(
+        [task],
+        manifest=manifest,
+        executor=executor,
+        fixture=fixture,
+        refresh_token=refresh,
+        mark_reset_complete=mark_reset,
+    )
+
+    assert not report.failures
+    assert executor.tokens == [f"fresh-token-{index}" for index in range(1, manifest.repeats + 1)]
+    assert refreshed == manifest.repeats
+    assert marked == manifest.repeats

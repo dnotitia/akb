@@ -333,7 +333,13 @@ class RuntimeFixture:
                 )
             await self.wait_until_ready(stage="fixture_readiness")
 
-    async def mint_pat(self, username: str, password: str) -> tuple[str, str]:
+    async def mint_pat(
+        self,
+        username: str,
+        password: str,
+        *,
+        scopes: list[str] | None = None,
+    ) -> tuple[str, str]:
         """Mint a short-lived benchmark PAT when the runtime keeps its PAT private."""
 
         try:
@@ -347,10 +353,13 @@ class RuntimeFixture:
             session_token = login_payload.get("token")
             if not isinstance(session_token, str) or not session_token:
                 raise RuntimeContractError("runtime benchmark login returned no session token")
+            mint_body: dict[str, Any] = {"name": "mcp-catalog-benchmark"}
+            if scopes is not None:
+                mint_body["scopes"] = scopes
             response = await self.client.post(
                 f"{self.descriptor.app_origin}/api/v1/auth/tokens",
                 headers={"Authorization": f"Bearer {session_token}"},
-                json={"name": "mcp-catalog-benchmark"},
+                json=mint_body,
             )
             if response.status_code != 200:
                 raise RuntimeContractError("runtime benchmark PAT mint failed", stage="pat_mint")
@@ -363,7 +372,7 @@ class RuntimeFixture:
             raise RuntimeContractError("runtime benchmark PAT response is invalid", stage="pat_mint")
         return token, token_id
 
-    async def revoke_pat(self, token: str, token_id: str) -> None:
+    async def revoke_pat(self, token: str, token_id: str, *, allow_absent: bool = False) -> None:
         try:
             response = await self.client.delete(
                 f"{self.descriptor.app_origin}/api/v1/auth/tokens/{token_id}",
@@ -371,6 +380,10 @@ class RuntimeFixture:
             )
         except httpx.HTTPError as exc:
             raise RuntimeContractError("runtime benchmark PAT cleanup request failed", stage="pat_cleanup") from exc
+        if response.status_code in {200, 204}:
+            return
+        if allow_absent and response.status_code in {401, 404}:
+            return
         if response.status_code not in {200, 204}:
             raise RuntimeContractError("runtime benchmark PAT cleanup failed", stage="pat_cleanup")
 

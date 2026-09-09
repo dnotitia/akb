@@ -106,6 +106,29 @@ class _TimedResetClient:
         return None
 
 
+class _RevokeResponseClient:
+    async def delete(self, _url: str, **_kwargs: object) -> _Response:
+        return _Response(401, {})
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _MintClient:
+    def __init__(self, descriptor: RuntimeDescriptor) -> None:
+        self.descriptor = descriptor
+        self.posts: list[tuple[str, dict]] = []
+
+    async def post(self, url: str, *, json: dict, **_kwargs: object) -> _Response:
+        self.posts.append((url, json))
+        if url.endswith("/auth/login"):
+            return _Response(200, {"token": "session-marker"})
+        return _Response(200, {"token": "fresh-marker", "token_id": "token-id"})
+
+    async def aclose(self) -> None:
+        return None
+
+
 def test_schema_v2_descriptor_resolves_exact_source_and_artifacts() -> None:
     descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
     discovery = {
@@ -223,4 +246,30 @@ async def test_reset_timeout_over_budget_is_fixture_reset_failure() -> None:
     assert raised.value.stage == "fixture_reset"
     assert "timed out" in str(raised.value)
     assert not client.get_calls
+    await fixture.close()
+
+
+@pytest.mark.asyncio
+async def test_revoke_accepts_an_already_removed_token_only_when_marked_absent() -> None:
+    descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
+    fixture = RuntimeFixture(descriptor)
+    fixture.client = _RevokeResponseClient()  # type: ignore[assignment]
+
+    await fixture.revoke_pat("stale-token", "stale-id", allow_absent=True)
+    with pytest.raises(RuntimeContractError, match="cleanup failed"):
+        await fixture.revoke_pat("stale-token", "stale-id")
+    await fixture.close()
+
+
+@pytest.mark.asyncio
+async def test_mint_pat_forwards_the_declared_read_scope() -> None:
+    descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
+    fixture = RuntimeFixture(descriptor)
+    client = _MintClient(descriptor)
+    fixture.client = client  # type: ignore[assignment]
+
+    token, token_id = await fixture.mint_pat("fixture-user", "fixture-password", scopes=["read"])
+
+    assert (token, token_id) == ("fresh-marker", "token-id")
+    assert client.posts[1][1] == {"name": "mcp-catalog-benchmark", "scopes": ["read"]}
     await fixture.close()
