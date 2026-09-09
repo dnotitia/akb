@@ -75,6 +75,7 @@ vector_store_driver: pgvector
 vector_store_dsn: ""
 vector_store_schema: vector_index
 vector_store_sparse_shape: posting
+vector_store_startup_prewarm: "off"
 
 # === Indexing worker tuning ===
 # Bench-specific: concurrency activated to shorten ablation cycles. The
@@ -85,6 +86,7 @@ indexing_concurrency: 8
 # === BM25 ===
 bm25_k1: 1.5
 bm25_b: 0.75
+bm25_hybrid_max_df_ratio: 0
 
 # === Events (no redis in this stack) ===
 redis_url: ""

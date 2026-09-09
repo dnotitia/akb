@@ -46,8 +46,13 @@ app:
     dsn: ""
     schema: vector_index
     sparseShape: posting
+    startupPrewarm: "off"
     url: ""
     collection: chunks
+  bm25:
+    # 0 preserves exact BM25. Large hybrid deployments may opt in to a
+    # common-term cutoff; sparse-only queries are never pruned.
+    hybridMaxDfRatio: 0
   redis:
     url: ""
     eventStream: akb:events
@@ -78,6 +83,17 @@ postgres:
     size: 20Gi
     storageClass: ""
   sharedMemorySize: 4Gi
+  parameters:
+    sharedBuffers: 2GB
+    effectiveCacheSize: 6GB
+    workMem: 32MB
+    maintenanceWorkMem: 512MB
+    randomPageCost: "1.1"
+    maxConnections: 200
+    trackIoTiming: false
+    # Restores the previous shared-buffer working set after PostgreSQL restarts.
+    # Enable only with a pre-sized pgvector cache and startupPrewarm above.
+    autoPrewarm: false
   resources:
     requests: {cpu: "1", memory: 4Gi}
     limits: {cpu: "4", memory: 8Gi}

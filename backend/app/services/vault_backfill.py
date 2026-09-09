@@ -27,6 +27,7 @@ vault and source paths, so they do NOT block readiness.
 from __future__ import annotations
 
 import logging
+import time
 
 from app.config import settings
 from app.db.postgres import get_pool
@@ -37,15 +38,27 @@ from app.services.vector_store.base import supports_vault_filter
 logger = logging.getLogger("akb.vault_backfill")
 
 _BATCH = 5000
+_READY_REFRESH_INTERVAL_SECS = 15.0
 # Set once all live-source points carry vault_id. Increment A guarantees no NEW
 # nulls appear, so once True it stays True for the life of the process.
 _ready = False
+_last_ready_refresh = 0.0
 
 
 def is_ready() -> bool:
     """True when the vault filter is safe to use (all live-source points have
     vault_id). Read on the search hot path — must stay a cheap memory read."""
     return _ready
+
+
+def _mark_ready() -> None:
+    global _ready
+    if not _ready:
+        _ready = True
+        logger.info(
+            "vault_id backfill complete (%s) — vault filter path is now active",
+            settings.vector_store_driver,
+        )
 
 
 def _is_pgvector() -> bool:
@@ -69,49 +82,19 @@ def _applicable() -> bool:
     return _is_pgvector() and _same_instance()
 
 
-async def _process_once() -> int:
-    """One backfill step for the BackfillRunner. Returns rows updated; 0 makes
-    the runner idle. Flips `_ready` when the vault path is safe to use."""
-    global _ready
-    if _ready:
-        return 0
-
-    store = get_vector_store()
-
-    # A driver without the vault filter never takes the vault path
-    # (`vault_path_eligible` is False for it), so readiness is moot. Latch ready
-    # so the worker stops looping instead of spinning forever.
+async def _readiness_satisfied(store) -> bool:
+    """Read the durable readiness signal shared by API and worker processes."""
     if not supports_vault_filter(store):
-        _ready = True
-        return 0
+        return True
 
-    # Capable driver this worker CANNOT auto-backfill — qdrant, seahorse, or a
-    # SEPARATE-instance pgvector: none is reachable by the same-DB server-side
-    # join below. We DON'T auto-fill; the operator backfills (qdrant: the script;
-    # seahorse: recreate + reindex; separate pgvector: scripts/backfill_vault_id).
-    # We still gate: readiness = the driver reports 0 NULL vault_id (the manual
-    # script's "0 before flip" contract). Until then search keeps the source-id
-    # path — no under-fetch. A capable driver MUST expose vault_backfill_pending();
-    # if one somehow doesn't, stay gated forever rather than activate blind.
     if not _applicable():
         fn = getattr(store, "vault_backfill_pending", None)
-        if fn is None:
-            return 0
-        if await fn() == 0:
-            _ready = True
-            logger.info(
-                "vault_id backfill complete (%s) — vault filter path is now active",
-                settings.vector_store_driver,
-            )
-        return 0
+        return fn is not None and await fn() == 0
 
     schema = settings.vector_store_schema
     pool = await get_pool()
     async with pool.acquire() as c:
-        # Cheap EXISTS (stops at the first hit): is any LIVE-source point still
-        # missing vault_id? Orphans (no live source) are ignored — they never
-        # match and are excluded by both search paths anyway.
-        more = await c.fetchval(
+        missing = await c.fetchval(
             f"""
             SELECT EXISTS(
               SELECT 1 FROM "{schema}".chunks vi
@@ -121,11 +104,57 @@ async def _process_once() -> int:
                 OR EXISTS(SELECT 1 FROM vault_files  f WHERE f.id = vi.source_id)))
             """
         )
-        if not more:
-            _ready = True
-            logger.info("vault_id backfill complete — vault filter path is now active")
-            return 0
+    return not bool(missing)
 
+
+async def refresh_ready(*, min_interval_secs: float = _READY_REFRESH_INTERVAL_SECS) -> bool:
+    """Refresh readiness from durable storage without putting DB I/O on every search.
+
+    The backfill worker and API normally run in separate processes. The worker's
+    in-memory latch therefore cannot activate the API's vault-filter path by
+    itself. While gated, each API process rechecks the shared store at most once
+    per interval; after readiness is observed the hot path is a memory read.
+    """
+    global _last_ready_refresh
+    if _ready:
+        return True
+
+    now = time.monotonic()
+    if now - _last_ready_refresh < min_interval_secs:
+        return False
+    # Set before awaiting so concurrent first requests do not stampede the DB.
+    _last_ready_refresh = now
+    try:
+        store = get_vector_store()
+        if await _readiness_satisfied(store):
+            _mark_ready()
+    except Exception as exc:  # noqa: BLE001
+        # Fail closed: source-id filtering remains correct while the next
+        # throttled refresh gets another chance to observe worker completion.
+        logger.warning("vault_id readiness refresh failed; using source filter: %s", exc)
+    return _ready
+
+
+async def _process_once() -> int:
+    """One backfill step for the BackfillRunner. Returns rows updated; 0 makes
+    the runner idle. Flips `_ready` when the vault path is safe to use."""
+    if _ready:
+        return 0
+
+    store = get_vector_store()
+
+    # A non-capable driver is ready by definition. A capable non-applicable
+    # driver is gate-only and becomes ready after its external backfill reaches
+    # zero. Same-instance pgvector continues below only while live rows remain.
+    if await _readiness_satisfied(store):
+        _mark_ready()
+        return 0
+    if not _applicable():
+        return 0
+
+    schema = settings.vector_store_schema
+    pool = await get_pool()
+    async with pool.acquire() as c:
         async with c.transaction():
             res = await c.execute(
                 f"""

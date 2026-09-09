@@ -97,3 +97,43 @@ async def test_synthetic_hybrid_acl_empty_scope_and_timing(local_store, caplog):
     dense = await store.hybrid_search(**(args | {"query_sparse_indices": [], "query_sparse_values": []}), source_ids=[sources[3]])
     assert [str(hit.source_id) for hit in sparse] == [sources[3]]
     assert [str(hit.source_id) for hit in dense] == [sources[3]]
+
+
+async def test_startup_search_prewarm_is_sized_reported_and_shared(local_store):
+    store = local_store
+    await store.upsert_one(
+        chunk_id=str(uuid.uuid4()),
+        source_id=str(uuid.uuid4()),
+        vault_id=str(uuid.uuid4()),
+        source_type="document",
+        content="small prewarm contract fixture",
+        section_path=None,
+        chunk_index=0,
+        dense=[1.0, *([0.0] * 31)],
+        sparse_indices=[1],
+        sparse_values=[1.0],
+    )
+    store._startup_prewarm = "search"
+
+    await store.startup_prewarm()
+
+    status = store.startup_prewarm_status()
+    assert status["state"] == "ready"
+    assert status["source"] == "local"
+    assert status["relation_bytes"] > 0
+    assert status["loaded_blocks"] > 0
+
+    peer = PgvectorStore(
+        dsn=store._dsn,
+        schema="vector_index",
+        dense_dim=32,
+        sparse_shape="posting",
+        startup_prewarm="search",
+    )
+    try:
+        await peer.ensure_collection()
+        await peer.startup_prewarm()
+        assert peer.startup_prewarm_status()["source"] == "peer"
+    finally:
+        if peer._own_pool:
+            await peer._own_pool.close()

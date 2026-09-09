@@ -2,6 +2,7 @@
 
 import logging
 import time
+import uuid
 from unittest.mock import AsyncMock
 
 import pytest
@@ -29,3 +30,37 @@ def test_search_timing_reports_stage_milliseconds(caplog):
     assert "retrieval_ms=250.00" in caplog.text
     assert "rerank_ms=0.00" in caplog.text
     assert "returned=3" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("filter_col", "expects_materialized"),
+    [("source_id", True), ("vault_id", False)],
+)
+async def test_sparse_posting_plan_materializes_only_source_candidates(
+    filter_col, expects_materialized
+):
+    class _Connection:
+        sql = ""
+
+        async def fetch(self, sql, *_args):
+            self.sql = sql
+            return []
+
+    store = PgvectorStore(
+        dsn=None,
+        schema="vector_index",
+        dense_dim=4,
+        sparse_shape="posting",
+    )
+    conn = _Connection()
+
+    await store._search_sparse(
+        conn,
+        terms=[1, 2],
+        weights=[1.0, 1.0],
+        filter_uuids=[uuid.uuid4()],
+        filter_col=filter_col,
+        limit=20,
+    )
+
+    assert ("candidate_chunks AS MATERIALIZED" in conn.sql) is expects_materialized

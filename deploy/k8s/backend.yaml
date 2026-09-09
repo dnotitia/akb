@@ -52,6 +52,10 @@ data:
     vector_store_dsn: ""
     vector_store_schema: vector_index
     vector_store_sparse_shape: posting
+    # Opt-in only after sizing the selected pgvector relations below 90% of
+    # shared_buffers. See docs/designs/search-performance.md.
+    vector_store_startup_prewarm: "off"
+    bm25_hybrid_max_df_ratio: 0
     vector_url: ""
     vector_collection: chunks
 

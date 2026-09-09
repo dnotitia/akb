@@ -29,6 +29,43 @@
         "name": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"}
       }
     },
+    "app": {
+      "type": "object",
+      "properties": {
+        "vectorStore": {
+          "type": "object",
+          "properties": {
+            "startupPrewarm": {
+              "type": "string",
+              "enum": ["off", "index", "search"]
+            }
+          }
+        },
+        "bm25": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["hybridMaxDfRatio"],
+          "properties": {
+            "hybridMaxDfRatio": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          }
+        }
+      }
+    },
+    "postgres": {
+      "type": "object",
+      "properties": {
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "autoPrewarm": {"type": "boolean"}
+          }
+        }
+      }
+    },
     "sso": {
       "type": "object",
       "required": ["enabled", "keycloakPublicUrl", "productAdmin"],

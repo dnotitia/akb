@@ -2,9 +2,11 @@
 
 ## Scope and evidence
 
-This change improves PostgreSQL/pgvector posting retrieval without changing
-BM25 weights, dense embeddings, RRF, reranking, candidate limits, or application
-authorization. It does not replace the search engine or deploy a new model.
+This change improves PostgreSQL/pgvector retrieval while preserving the default
+BM25 weights, dense embeddings, RRF, reranking, candidate limits, and application
+authorization. An optional large-corpus profile can omit very common BM25 query
+terms when a dense leg is available; that explicit latency/relevance tradeoff is
+disabled by default. It does not replace the search engine or deploy a new model.
 
 A read-only investigation of an older deployed backend found:
 
@@ -359,8 +361,94 @@ both repeated BM25 cost and the observed cache competition. Treat startup
 warming as a separate follow-up, for example evaluating bounded hot-block
 restoration through `pg_prewarm`/autoprewarm in this isolated environment.
 Do not preload an entire 7.8 GiB index into a 2 GiB cache or raise all memory
-limits indiscriminately. No warming configuration has been enabled by this
-change. A true host/VM cold-disk experiment, concurrent writes, production
+limits indiscriminately. At that experiment stage no warming configuration was
+enabled; the opt-in target profile below is the separately validated follow-up.
+A true host/VM cold-disk experiment, concurrent writes, production
 query diversity and whole-request embedding/reranker latency remain untested.
 
 No production deployment, restart, index change or setting change was made.
+
+## Million-vector target profile
+
+The follow-up implementation adds an opt-in Helm overlay for a pgvector corpus
+around one million 1,024-dimensional embeddings:
+`deploy/helm/akb/tuning/pgvector-million-1024d.yaml`. It composes with both
+`standalone` and `standalone-sso`; it is not a third application profile.
+
+```bash
+helm upgrade --install akb deploy/helm/akb \
+  --namespace akb \
+  --values deploy/helm/akb/profiles/standalone.yaml \
+  --values deploy/helm/akb/tuning/pgvector-million-1024d.yaml
+```
+
+The overlay is a measured reference, not automatic capacity detection. It sets
+`shared_buffers=16GB`, enables PostgreSQL autoprewarm, requests 16 GiB and limits
+the database container to 36 GiB. The application loads the HNSW index plus the
+vector heap/TOAST search working set before becoming ready. It refuses startup
+when the selected relations exceed 90% of `shared_buffers`, so an undersized
+deployment cannot report a misleading healthy warmup. `/health` publishes only
+safe status, byte, block, source and duration metadata.
+
+The database records autoprewarm state so PostgreSQL can restore the buffer set
+after restart. The application also stores one completion record keyed by the
+PostgreSQL postmaster start time, selected mode and relation signature. This
+prevents duplicate loads across API replicas while ensuring a new database
+process or changed relation is warmed again. Worker-only processes skip the
+application prewarm.
+
+Two query-path changes complement cache restoration:
+
+- Source-filtered posting search materializes the already authorized chunk IDs
+  before joining a common posting list. This changes join order, not BM25 scores;
+  the regression fixture preserved ordered IDs and scores in all tested cases.
+- `bm25_hybrid_max_df_ratio` optionally omits terms above a document-frequency
+  ratio only when dense retrieval succeeded. The default `0` keeps exact BM25.
+  The scale overlay uses `0.8`. A sparse-only deployment or embedding outage
+  retains every term, and a failed cutoff-stat lookup falls back to exact BM25.
+
+The vault-filter activation gate was also corrected for split deployments. The
+background worker and API are separate processes, so the worker's memory-only
+“backfill complete” flag could never activate the API. While gated, each API
+process now checks the durable store at most once per 15 seconds and latches the
+result locally. It fails closed to the correct source-ID path on any check error.
+
+### Isolated Kubernetes result
+
+The target was validated in namespace `akb-search-perf-20260908`; no production
+resource was modified. The fixture contained 997,935 vectors, 71,536,566 posting
+rows and 100 vaults. It exercised local login, 10% and 90% vault access, archive,
+type, tag and explicit-vault filters, five concurrent requests, and cross-vault
+result assertions.
+
+After a PostgreSQL and backend restart, application prewarm loaded
+14,509,932,544 bytes (1,771,232 blocks) in 10.20 seconds before readiness.
+PostgreSQL autoprewarm restored 1,907,704 previously loaded blocks. The database
+cgroup used about 32.4 GB of a 36 GiB limit and reported zero OOM events. A 24 GiB
+limit tested earlier reached its hard ceiling and was rejected; `kubectl top`
+alone understated the page-cache pressure.
+
+Steady HTTP measurements (105 requests) were:
+
+| Scenario | p95 | Maximum |
+| --- | ---: | ---: |
+| All tested requests | 985 ms | 1,009 ms |
+| 90% access, default archive filter | 1,009 ms | 1,009 ms |
+| 90% access, type filter | 616 ms | 616 ms |
+| 90% access, tag filter | 467 ms | 467 ms |
+| 10% access, default archive filter | 327 ms | 327 ms |
+| Five concurrent requests | 763 ms | 763 ms |
+
+The first request after process restart took 2.66 seconds because Kiwi initialized
+its tokenizer process on first use; subsequent identical requests were about
+0.19 seconds. This satisfies the chosen exceptional restart ceiling of 5 seconds,
+but it is not counted as steady-state p95. A synthetic rare term below the 0.8
+cutoff exercised both dense and BM25 legs in 360 ms, confirming that the profile
+does not turn all searches into dense-only retrieval.
+
+These numbers are specific to the synthetic distribution and test storage. Before
+using the overlay elsewhere, measure relation size, cgroup memory including page
+cache, real query document-frequency distribution, relevance, write load and the
+actual embedding/reranker network stages. The common-term cutoff is intentionally
+opt-in because some corpora may value exact lexical contribution over this
+latency bound.

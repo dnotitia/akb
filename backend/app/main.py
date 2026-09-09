@@ -476,6 +476,9 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
 
     store = get_vector_store()
     vs_info: dict = {"reachable": await store.health()}
+    startup_prewarm_status = getattr(store, "startup_prewarm_status", None)
+    if callable(startup_prewarm_status):
+        vs_info["startup_prewarm"] = startup_prewarm_status()
     try:
         vs_info["backfill"] = await embed_worker.pending_stats()
     except Exception as e:  # noqa: BLE001

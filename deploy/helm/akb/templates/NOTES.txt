@@ -9,3 +9,14 @@ Application URL: {{ .Values.global.publicUrl }}
 {{- if .Values.sso.enabled }}
 Keycloak URL: {{ .Values.sso.keycloakPublicUrl }}
 {{- end }}
+{{- if ne .Values.app.vectorStore.startupPrewarm "off" }}
+
+Pgvector startup prewarm: {{ .Values.app.vectorStore.startupPrewarm }}
+The backend waits for the sized search working set before becoming Ready.
+Check /health -> vector_store.startup_prewarm for loaded bytes and duration.
+{{- end }}
+{{- if gt (.Values.app.bm25.hybridMaxDfRatio | float64) 0.0 }}
+
+Hybrid BM25 common-term pruning: document-frequency ratio
+{{ .Values.app.bm25.hybridMaxDfRatio }}. Sparse-only queries remain exact.
+{{- end }}

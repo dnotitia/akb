@@ -1,0 +1,23 @@
+# Optional overlay for a pgvector corpus around one million 1024-dimensional
+# embeddings. Apply after either public profile; it is tuning, not a third
+# application shape. Validate relation sizes and latency on your own data.
+app:
+  vectorStore:
+    startupPrewarm: search
+  bm25:
+    # Common terms above this ratio contribute little discrimination and make
+    # exact posting scans dominate latency. Dense-only fallback is intentional.
+    hybridMaxDfRatio: 0.8
+
+postgres:
+  parameters:
+    sharedBuffers: 16GB
+    effectiveCacheSize: 20GB
+    trackIoTiming: true
+    autoPrewarm: true
+  resources:
+    requests: {cpu: "2", memory: 16Gi}
+    # pg_prewarm transiently holds PostgreSQL buffers and filesystem cache.
+    # The 36Gi limit retained ~6Gi cgroup headroom in the reference fixture;
+    # 24Gi reached its hard limit despite a much lower `kubectl top` reading.
+    limits: {cpu: "4", memory: 36Gi}

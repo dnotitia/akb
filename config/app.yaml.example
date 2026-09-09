@@ -334,6 +334,14 @@ vector_store_schema: vector_index
 #   arrays   — sparse_terms BIGINT[] + sparse_weights REAL[] columns
 #              on the chunks row. Compact; slower at >100k rows.
 vector_store_sparse_shape: posting
+# Optional cold-start contract for pgvector:
+#   off    — lightweight default; the first search may load index pages.
+#   index  — load the dense HNSW index before API readiness.
+#   search — also load the chunks heap/TOAST used by filtered HNSW scans.
+# Enabled modes require the selected relations to fit below 90% of PostgreSQL
+# shared_buffers or startup fails with a sizing diagnostic. For PostgreSQL
+# restart recovery, pair this with pg_prewarm autoprewarm at the database layer.
+vector_store_startup_prewarm: "off"
 
 # Qdrant-driver settings (ignored when driver is pgvector).
 # Set vector_url to your Qdrant endpoint (e.g. http://qdrant:6333)
@@ -375,6 +383,10 @@ indexing_batch_size: 16
 # === BM25 sparse retrieval tuning (driver-neutral) ===
 bm25_k1: 1.5
 bm25_b: 0.75
+# Optional dense+sparse latency guard. 0 keeps exact BM25. For example, 0.8
+# drops terms present in more than 80% of the corpus only when dense search is
+# available; sparse-only searches always retain every term.
+bm25_hybrid_max_df_ratio: 0
 
 # === Event stream (optional Redis Streams fanout) ===
 # PG `events` outbox is always written. When redis_url is set the

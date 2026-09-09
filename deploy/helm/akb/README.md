@@ -67,6 +67,26 @@ helm upgrade --install akb deploy/helm/akb \
 Public origins and the initial product-administrator identity are installation
 inputs. Configure DNS first and replace every example value.
 
+## Optional million-vector pgvector tuning
+
+`tuning/pgvector-million-1024d.yaml` is a measured reference overlay for roughly
+one million 1,024-dimensional embeddings. It composes with either profile:
+
+```bash
+helm upgrade --install akb deploy/helm/akb \
+  --namespace akb \
+  --values deploy/helm/akb/profiles/standalone.yaml \
+  --values deploy/helm/akb/tuning/pgvector-million-1024d.yaml \
+  --wait
+```
+
+It enables bounded startup/autoprewarm and an opt-in hybrid BM25 common-term
+cutoff. The database limit is 36 GiB because the reference fixture used about
+32.4 GB including page cache; a 24 GiB trial reached its cgroup ceiling. Do not
+apply this overlay by corpus row count alone. First validate relation sizes,
+available node memory, search relevance, write load and latency on your own
+data. See the [search performance design](../../../docs/designs/search-performance.md#million-vector-target-profile).
+
 ## Render and inspect
 
 ```bash

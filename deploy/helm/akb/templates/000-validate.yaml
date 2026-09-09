@@ -14,6 +14,16 @@
 {{- if and .Values.sso.enabled (or (not .Values.sso.keycloakPublicUrl) (not .Values.sso.productAdmin.username) (not .Values.sso.productAdmin.email)) -}}
 {{- fail "SSO profiles require keycloakPublicUrl and product-admin identity" -}}
 {{- end -}}
+{{- $prewarm := .Values.app.vectorStore.startupPrewarm -}}
+{{- if and (ne $prewarm "off") (ne .Values.app.vectorStore.driver "pgvector") -}}
+{{- fail "vectorStore.startupPrewarm is supported only by the pgvector driver" -}}
+{{- end -}}
+{{- if and .Values.postgres.parameters.autoPrewarm (or (ne .Values.app.vectorStore.driver "pgvector") (ne .Values.app.vectorStore.dsn "")) -}}
+{{- fail "postgres.parameters.autoPrewarm applies only to the bundled same-instance pgvector store" -}}
+{{- end -}}
+{{- if and (ne $prewarm "off") (eq .Values.app.vectorStore.dsn "") (not .Values.postgres.parameters.autoPrewarm) -}}
+{{- fail "bundled pgvector startupPrewarm requires postgres.parameters.autoPrewarm so PostgreSQL restarts preserve the contract" -}}
+{{- end -}}
 {{- $secretNames := list .Values.secretContract.name "redis-credentials" -}}
 {{- if .Values.sso.enabled -}}
   {{- $secretNames = concat $secretNames (list "akb-keycloak-db-credentials" "akb-keycloak-bootstrap" "akb-product-admin-bootstrap") -}} # pragma: allowlist secret

@@ -87,6 +87,9 @@ def _stub_init_storage_dependencies(monkeypatch, lifecycle, settings, events: li
         async def ensure_collection(self) -> None:
             events.append("vector_store.ensure_collection")
 
+        async def startup_prewarm(self) -> None:
+            events.append("vector_store.startup_prewarm")
+
     monkeypatch.setattr(lifecycle, "get_vector_store", lambda: _VectorStore())
 
     class _Pool:
@@ -147,6 +150,7 @@ async def test_init_storage_default_and_explicit_bare_git_clean_stale_locks(
     assert _TrackingGit.constructed == 1
     assert _TrackingGit.cleanups == 1
     assert "reconcile_sso_session_epoch" in events
+    assert "vector_store.startup_prewarm" in events
     assert "RoleSync.reconcile_from_catalog" in events
 
 
@@ -174,3 +178,18 @@ async def test_init_storage_postgres_native_never_constructs_git(monkeypatch, tm
 
     assert constructed == []
     assert "RoleSync.reconcile_from_catalog" in events
+
+
+async def test_worker_process_does_not_duplicate_vector_prewarm(monkeypatch, tmp_path):
+    from app.services import lifecycle
+
+    configured = _settings(tmp_path, "postgres_native")
+    events: list[str] = []
+    _stub_init_storage_dependencies(monkeypatch, lifecycle, configured, events)
+    monkeypatch.setattr(lifecycle, "selected_document_revision_backend", lambda: "postgres_native")
+    monkeypatch.setenv("AKB_PROCESS_ROLE", "worker")
+
+    await lifecycle.init_storage()
+
+    assert "vector_store.ensure_collection" in events
+    assert "vector_store.startup_prewarm" not in events

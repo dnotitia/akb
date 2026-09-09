@@ -243,6 +243,14 @@ async def init_storage() -> None:
         logger.info("Vector store schema ensured (eager init)")
     except Exception as e:  # noqa: BLE001 — fall through so degraded probes can surface it
         logger.warning("Vector store eager init failed (will retry per-worker): %s", e)
+    # Only serving processes own the user-visible cold-start budget. Dedicated
+    # workers still ensure the schema, but never duplicate a potentially large
+    # pgvector prewarm. An enabled prewarm is an explicit latency contract, so
+    # failures stop startup instead of publishing a falsely-ready API pod.
+    if runtime_process_role() in {"all", "api"}:
+        startup_prewarm = getattr(store, "startup_prewarm", None)
+        if callable(startup_prewarm):
+            await startup_prewarm()
     # PG-native RBAC: reconcile role + GRANT state with the catalog
     # (users + vaults + vault_access + vault_tables). Idempotent —
     # creates missing roles, drops orphans, applies table-level GRANTs.
