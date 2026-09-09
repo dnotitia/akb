@@ -631,6 +631,11 @@ body::before {
     box-shadow var(--duration-fast) var(--ease-in-out);
 }
 
+/* Opt into an immediate keyboard focus ring for recovery actions. The ring
+   itself uses the Button primitive's box-shadow, so it must not wait on the
+   shared color/shadow transition. */
+.focus-ring-instant:focus-visible { transition: none; }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 1ms !important;

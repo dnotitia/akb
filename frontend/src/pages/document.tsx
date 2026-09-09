@@ -35,11 +35,13 @@ import {
 import {
   ApiError,
   browseVault,
+  discardAsset,
   deleteDocument,
   getDocument,
   getDocumentHistoryWithFallback,
   getRelations,
   getVaultInfo,
+  type DocumentUpdateInput,
   type DocumentHistoryEntry,
   type RelationRow,
   unpublishDoc,
@@ -78,6 +80,23 @@ import { DocumentMoveDialog } from "@/components/document-move-dialog";
 import { ArchiveVerificationError, changeDocumentArchiveState, checkDocumentArchiveState, documentArchiveDisabledReason } from "@/lib/document-archive";
 import { DocumentTitleConflictNotice } from "@/components/document-title-conflict-notice";
 import {
+  DocumentConflictNotice,
+  type DocumentConflictSnapshot,
+} from "@/components/document-conflict-notice";
+import {
+  clearDocumentEditDraft,
+  createDocumentEditDraftId,
+  DOCUMENT_EDIT_DRAFT_EDITOR_VERSION,
+  DOCUMENT_EDIT_DRAFT_MARKDOWN_PROFILE,
+  documentEditDraftTabId,
+  loadDocumentEditDraft,
+  listDocumentEditDrafts,
+  saveDocumentEditDraft,
+  type DocumentEditDraftLoadResult,
+  type DocumentEditDraftInput,
+  type StoredDocumentEditDraft,
+} from "@/lib/document-draft";
+import {
   documentCollection,
   documentTitleConflictFromError,
   documentTitleKey,
@@ -106,6 +125,24 @@ function isBrowsedDocumentTitle(item: unknown): item is BrowsedDocumentTitle {
     candidate.type === "document" &&
     typeof candidate.name === "string" &&
     typeof candidate.path === "string"
+  );
+}
+
+function documentIdentity(vault: string, document: Record<string, any>): string {
+  return typeof document.uri === "string" && document.uri
+    ? document.uri
+    : `${vault}:${String(document.path || "")}`;
+}
+
+function validRevision(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isRevisionConflict(error: unknown): error is ApiError {
+  return (
+    error instanceof ApiError &&
+    error.status === 409 &&
+    (error.detail as { code?: unknown } | null)?.code === "conflict"
   );
 }
 
@@ -186,15 +223,134 @@ export default function DocumentPage({
   const [bodyError, setBodyError] = useState("");
   const [savedAt, setSavedAt] = useState<number | null>(null);
   const [moveNotice, setMoveNotice] = useState<{ collection: string } | null>(null);
+  const [editBaseCommit, setEditBaseCommit] = useState<string | null>(null);
+  const [latestServerDocument, setLatestServerDocument] = useState<any>(null);
+  const [saveConflict, setSaveConflict] = useState<{
+    base: DocumentConflictSnapshot;
+    local: DocumentConflictSnapshot;
+    latest: DocumentConflictSnapshot | null;
+    latestError?: string;
+  } | null>(null);
+  const [rebasing, setRebasing] = useState(false);
+  const [draftStatus, setDraftStatus] = useState<
+    "idle" | "restored" | "saving" | "saved" | "error" | "expired" | "incompatible" | "unavailable"
+  >("idle");
+  const [draftNotice, setDraftNotice] = useState("");
+  const [draftRecovery, setDraftRecovery] = useState<DocumentEditDraftLoadResult | null>(null);
+  const [editorInitialContent, setEditorInitialContent] = useState("");
   // Plate's markdown roundtrip is not byte-identity: adopt the first
   // post-hydration emission as the new `originalContent` baseline so the
   // editor doesn't flash "UNSAVED" the moment it mounts.
   const hydratedKey = useRef<number | null>(null);
+  const editorHydrationModeRef = useRef<"server" | "draft">("server");
+  const documentIdentityRef = useRef<string | null>(null);
+  const editBaseCommitRef = useRef<string | null>(null);
+  const draftHydratedForRef = useRef<string | null>(null);
+  const draftSessionRef = useRef<StoredDocumentEditDraft | null>(null);
+  const draftTabIdRef = useRef<string | null>(null);
+  const skipNextDraftSaveRef = useRef(false);
+  const restoredDraftRevisionRef = useRef<number | null>(null);
+  const draftRevisionRef = useRef(0);
+  const latestServerDocumentRef = useRef<any>(null);
+  const latestServerErrorRef = useRef("");
+  const storageSaveTimerRef = useRef<number | null>(null);
+  const latestDraftInputRef = useRef<DocumentEditDraftInput | null>(null);
+  const editingSnapshotRef = useRef({
+    title: "",
+    content: "",
+    assetIds: [] as readonly string[],
+  });
   const contentChanged = editingContent !== originalContent;
   const normalizedEditingTitle = documentTitleKey(editingTitle);
   const titleChanged = normalizedEditingTitle !== documentTitleKey(originalTitle);
   const isDirty = contentChanged || titleChanged;
   const hasUnsavedWork = isDirty || uploadingImage;
+
+  useEffect(() => {
+    editingSnapshotRef.current = {
+      title: editingTitle,
+      content: editingContent,
+      assetIds: editingAssetIds,
+    };
+  }, [editingAssetIds, editingContent, editingTitle]);
+
+  useEffect(() => {
+    // A real editor can emit one canonicalization event while mounting. The
+    // page state already owns the server/draft baseline, so user input from
+    // the mounted editor must not be mistaken for that first emission (the
+    // mock editor has no mount event and otherwise makes clear() rewrite the
+    // OCC base to an empty string).
+    hydratedKey.current = editorKey;
+  }, [editorKey]);
+
+  function setBaseCommit(commit: string | null) {
+    editBaseCommitRef.current = commit;
+    setEditBaseCommit(commit);
+  }
+
+  function setLatestServer(document: any, error = "") {
+    latestServerDocumentRef.current = document;
+    latestServerErrorRef.current = error;
+    setLatestServerDocument(document);
+  }
+
+  function currentDraftInput(
+    overrides: Partial<{
+      baseCommit: string;
+      baseTitle: string;
+      baseBody: string;
+      title: string;
+      body: string;
+      assetIds: readonly string[];
+    }> = {},
+  ) {
+    if (!currentUserId || !name || !doc?.path || !editBaseCommitRef.current) return null;
+    if (!draftSessionRef.current) {
+      draftSessionRef.current = {
+        version: 1,
+        kind: "document-edit",
+        draftId: createDocumentEditDraftId(),
+        tabId: draftTabIdRef.current || documentEditDraftTabId(),
+        userId: currentUserId,
+        vault: name,
+        document: documentIdentity(name, doc),
+        baseCommit: editBaseCommitRef.current,
+        baseTitle: originalTitle,
+        baseBody: originalContent,
+        title: editingTitle,
+        body: editingContent,
+        assetIds: [...editingAssetIds],
+        editorVersion: DOCUMENT_EDIT_DRAFT_EDITOR_VERSION,
+        markdownProfile: DOCUMENT_EDIT_DRAFT_MARKDOWN_PROFILE,
+        updatedAt: new Date().toISOString(),
+        expiresAt: new Date().toISOString(),
+      };
+    }
+    const session = draftSessionRef.current;
+    return {
+      ...session,
+      userId: currentUserId,
+      vault: name,
+      document: documentIdentity(name, doc),
+      baseCommit: overrides.baseCommit ?? editBaseCommitRef.current,
+      baseTitle: overrides.baseTitle ?? originalTitle,
+      baseBody: overrides.baseBody ?? originalContent,
+      title: overrides.title ?? editingTitle,
+      body: overrides.body ?? editingContent,
+      assetIds: [...(overrides.assetIds ?? editingAssetIds)],
+      tabId: draftTabIdRef.current || session.tabId,
+    };
+  }
+
+  function persistEditDraft(overrides: Parameters<typeof currentDraftInput>[0] = {}): boolean {
+    const input = currentDraftInput(overrides);
+    if (!input) return false;
+    latestDraftInputRef.current = input;
+    const saved = saveDocumentEditDraft(input);
+    setDraftStatus(saved ? "saved" : "error");
+    setDraftNotice(saved ? "Draft saved locally" : "Could not save this draft locally; it remains only in this tab.");
+    return saved;
+  }
 
   useEffect(() => {
     if (!moveNotice) return;
@@ -321,6 +477,17 @@ export default function DocumentPage({
     enabled: !!name && !!docId,
     retry: false,
   });
+
+  useEffect(() => {
+    if (import.meta.env.VITE_AKB_TEST_MODE !== "mock" || !name || !docId) return;
+    const onMockRefetch = (event: Event) => {
+      const detail = (event as CustomEvent<{ vault?: unknown; document?: unknown }>).detail;
+      if (detail?.vault !== name || detail.document !== docId) return;
+      void queryClient.refetchQueries({ queryKey: ["document", name, docId] });
+    };
+    window.addEventListener("akb:mock-document-refetch", onMockRefetch);
+    return () => window.removeEventListener("akb:mock-document-refetch", onMockRefetch);
+  }, [docId, name, queryClient]);
 
   const doc = docOverride ?? docQuery.data ?? null;
   const historyQuery = useQuery({
@@ -465,41 +632,260 @@ export default function DocumentPage({
 
   useEffect(() => {
     const d = docQuery.data;
-    setDocOverride(null);
-    setRelations([]);
-    setRelationsError(false);
-    setBodyError("");
-    setTitleTouched(false);
-    setServerTitleConflict(null);
-    setClaimedAssetIds(null);
-    if (!d) return;
-    const body = d.content || "";
-    const title = d.title || "";
-    setOriginalContent(body);
-    setEditingContent(body);
-    setOriginalTitle(title);
-    setEditingTitle(title);
-    // Bump the key so the Plate editor remounts with the new value —
-    // it's uncontrolled internally and won't pick up `value` prop
-    // changes after mount.
-    setEditorKey((k) => k + 1);
+    if (!d?.path || !name) return;
+
+    const identity = documentIdentity(name, d);
+    const identityChanged = documentIdentityRef.current !== identity;
+    const preserveEditState =
+      view === "edit" &&
+      (isDirty ||
+        draftStatus === "restored" ||
+        draftStatus === "saving" ||
+        draftStatus === "saved" ||
+        draftStatus === "error" ||
+        saveConflict !== null);
+
+    if (identityChanged) {
+      documentIdentityRef.current = identity;
+      draftHydratedForRef.current = null;
+      draftSessionRef.current = null;
+      draftTabIdRef.current = currentUserId ? documentEditDraftTabId() : null;
+      setDocOverride(null);
+      setRelations([]);
+      setRelationsError(false);
+      setBodyError("");
+      setTitleTouched(false);
+      setServerTitleConflict(null);
+      setSaveConflict(null);
+      setLatestServer(null);
+      setDraftRecovery(null);
+      setDraftStatus("idle");
+      setDraftNotice("");
+      setClaimedAssetIds(null);
+      setOriginalContent(d.content || "");
+      setEditingContent(d.content || "");
+      setOriginalTitle(d.title || "");
+      setEditingTitle(d.title || "");
+      setEditingAssetIds([]);
+      setEditorInitialContent(d.content || "");
+      editorHydrationModeRef.current = "server";
+      hydratedKey.current = null;
+      setBaseCommit(validRevision(d.current_commit) ? d.current_commit : null);
+      setEditorKey((k) => k + 1);
+    } else if (preserveEditState) {
+      if (
+        validRevision(d.current_commit) &&
+        d.current_commit !== editBaseCommitRef.current
+      ) {
+        setLatestServer(d);
+      }
+    } else {
+      // A clean editor can follow an external refresh. Once the user has a
+      // dirty draft, this branch is never used, so the base revision remains
+      // pinned until the user explicitly reapplies it to the latest version.
+      setOriginalContent(d.content || "");
+      setEditingContent(d.content || "");
+      setOriginalTitle(d.title || "");
+      setEditingTitle(d.title || "");
+      setEditorInitialContent(d.content || "");
+      editorHydrationModeRef.current = "server";
+      hydratedKey.current = null;
+      setBaseCommit(validRevision(d.current_commit) ? d.current_commit : null);
+      setEditorKey((k) => k + 1);
+    }
+
     if (d.path && d.path !== docId) {
       navigate(`/vault/${name}/doc/${encodeURIComponent(d.path)}`, {
         replace: true,
         state: routeLocation.state,
       });
     }
-    if (d.path) {
-      // getRelations builds the canonical akb:// URI from the vault-relative
-      // *path* (docUri). The GET response exposes no internal `id` — `uri`/
-      // `path` is the sole identifier — so keying this off `d.id` (always
-      // undefined) meant relations never loaded on the document page.
-      getRelations(name!, d.path)
-        .then((r) => setRelations(r.relations || []))
-        .catch(() => setRelationsError(true));
-    }
+    // getRelations builds the canonical akb:// URI from the vault-relative
+    // path. The GET response exposes no internal `id`; `uri`/`path` is the
+    // sole document identifier.
+    getRelations(name, d.path)
+      .then((r) => setRelations(r.relations || []))
+      .catch(() => setRelationsError(true));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [docQuery.data]);
+
+  useEffect(() => {
+    const d = docQuery.data;
+    if (view !== "edit" || !d?.path || !name || !currentUserId) return;
+    const identity = documentIdentity(name, d);
+    const hydrationKey = `${currentUserId}\u0000${identity}`;
+    if (draftHydratedForRef.current === hydrationKey) return;
+    draftHydratedForRef.current = hydrationKey;
+    draftTabIdRef.current ||= documentEditDraftTabId();
+    const result = loadDocumentEditDraft(
+      currentUserId,
+      name,
+      identity,
+      draftTabIdRef.current,
+    );
+    setDraftRecovery(
+      result.status === "expired" || result.status === "incompatible" ? result : null,
+    );
+
+    if (result.status === "restored" || result.status === "expired") {
+      const stored = result.draft;
+      const sameTab = stored.tabId === draftTabIdRef.current;
+      draftSessionRef.current = sameTab
+        ? stored
+        : {
+            ...stored,
+            draftId: createDocumentEditDraftId(),
+            tabId: draftTabIdRef.current,
+          };
+      skipNextDraftSaveRef.current = true;
+      restoredDraftRevisionRef.current = draftRevisionRef.current;
+      setOriginalContent(stored.baseBody);
+      setOriginalTitle(stored.baseTitle);
+      setEditingContent(stored.body);
+      setEditingTitle(stored.title);
+      setEditingAssetIds(stored.assetIds);
+      setEditorInitialContent(stored.body);
+      editorHydrationModeRef.current = "draft";
+      hydratedKey.current = null;
+      setBaseCommit(validRevision(stored.baseCommit) ? stored.baseCommit : null);
+      setEditorKey((k) => k + 1);
+      setDraftStatus(result.status === "expired" ? "expired" : "restored");
+      setDraftNotice(
+        result.status === "expired"
+          ? "This draft has expired. Its text is kept for copying; attached images may no longer be available."
+          : "Local draft restored",
+      );
+      if (result.status === "expired") {
+        const protectedAssetIds = new Set(
+          listDocumentEditDrafts(currentUserId, name, identity)
+            .filter(
+              (draft) =>
+                draft.draftId !== stored.draftId &&
+                Date.parse(draft.expiresAt) > Date.now(),
+            )
+            .flatMap((draft) => draft.assetIds),
+        );
+        void Promise.allSettled(
+          stored.assetIds
+            .filter((assetId) => !protectedAssetIds.has(assetId))
+            .map((assetId) => discardAsset(name, assetId)),
+        );
+      }
+    } else if (result.status === "incompatible") {
+      setDraftStatus("incompatible");
+      setDraftNotice(
+        "This draft uses an incompatible editor profile. Its original text remains available to copy.",
+      );
+    } else if (result.status === "storage-unavailable") {
+      setDraftStatus("unavailable");
+      setDraftNotice("Local draft storage is unavailable; edits remain only in this tab.");
+    }
+  }, [currentUserId, docQuery.data, name, view]);
+
+  useEffect(() => {
+    if (view !== "edit" || !currentUserId || !name || !doc?.path) return;
+    if (draftStatus === "expired" || draftStatus === "incompatible" || draftStatus === "unavailable") {
+      return;
+    }
+    if (
+      skipNextDraftSaveRef.current ||
+      (draftStatus === "restored" &&
+        draftRevisionRef.current === restoredDraftRevisionRef.current)
+    ) {
+      skipNextDraftSaveRef.current = false;
+      return;
+    }
+    if (!isDirty) {
+      const existing = draftSessionRef.current;
+      if (existing) {
+        clearDocumentEditDraft(existing);
+        const currentAssets = new Set(editingAssetIds);
+        const protectedAssets = protectedDraftAssetIds(existing.draftId);
+        void Promise.allSettled(
+          existing.assetIds
+            .filter(
+              (assetId) =>
+                !currentAssets.has(assetId) && !protectedAssets.has(assetId),
+            )
+            .map((assetId) => discardAsset(name, assetId)),
+        );
+      }
+      draftSessionRef.current = null;
+      setDraftStatus("idle");
+      setDraftNotice("");
+      return;
+    }
+
+    if (storageSaveTimerRef.current !== null) {
+      window.clearTimeout(storageSaveTimerRef.current);
+    }
+    setDraftStatus("saving");
+    setDraftNotice("Saving draft locally…");
+    storageSaveTimerRef.current = window.setTimeout(() => {
+      storageSaveTimerRef.current = null;
+      persistEditDraft();
+    }, 300);
+    return () => {
+      if (storageSaveTimerRef.current !== null) {
+        window.clearTimeout(storageSaveTimerRef.current);
+        storageSaveTimerRef.current = null;
+      }
+    };
+    // `draftStatus` is intentionally read from the render that scheduled this
+    // write. Including it here would restart the debounce after every status
+    // update and could mark an expired draft active again.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    currentUserId,
+    doc?.path,
+    editingAssetIds,
+    editingContent,
+    editingTitle,
+    isDirty,
+    name,
+    originalContent,
+    originalTitle,
+    view,
+  ]);
+
+  useEffect(() => {
+    if (
+      view !== "edit" ||
+      !isDirty ||
+      draftStatus === "expired" ||
+      draftStatus === "incompatible" ||
+      (draftStatus === "restored" &&
+        draftRevisionRef.current === restoredDraftRevisionRef.current)
+    ) {
+      latestDraftInputRef.current = null;
+      return;
+    }
+    latestDraftInputRef.current = currentDraftInput();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    currentUserId,
+    doc?.path,
+    draftStatus,
+    editingAssetIds,
+    editingContent,
+    editingTitle,
+    isDirty,
+    name,
+    originalContent,
+    originalTitle,
+    view,
+  ]);
+
+  // Persist the latest snapshot synchronously before a fast tab close, Back
+  // navigation, or preview dismissal. This effect intentionally has no state
+  // dependencies: its cleanup is an actual component-unmount boundary.
+  useEffect(
+    () => () => {
+      const input = latestDraftInputRef.current;
+      if (input) saveDocumentEditDraft(input);
+    },
+    [],
+  );
 
   // Warn before page navigation (close tab, browser back) when dirty.
   useEffect(() => {
@@ -540,6 +926,69 @@ export default function DocumentPage({
     window.requestAnimationFrame(() => titleConflictRef.current?.focus());
   }
 
+  function makeConflictSnapshot(
+    label: string,
+    commit: string | null,
+    title: string,
+    body: string,
+  ): DocumentConflictSnapshot {
+    return { label, commit, title, body };
+  }
+
+  async function readLatestForConflict(): Promise<any | null> {
+    try {
+      const latest = await getDocument(name!, docId);
+      setLatestServer(latest);
+      return latest;
+    } catch {
+      setLatestServer(
+        null,
+        "The latest version could not be loaded. Your draft remains available.",
+      );
+      return null;
+    }
+  }
+
+  async function applyDraftToLatest() {
+    const latest = latestServerDocument || (await readLatestForConflict());
+    if (!latest || !validRevision(latest.current_commit)) return;
+    setRebasing(true);
+    try {
+      const baseBody = typeof latest.content === "string" ? latest.content : "";
+      const baseTitle = typeof latest.title === "string" ? latest.title : "";
+      setOriginalContent(baseBody);
+      setOriginalTitle(baseTitle);
+      setBaseCommit(latest.current_commit);
+      setDocOverride(latest);
+      queryClient.setQueryData(
+        ["document", name, docId, undefined],
+        latest,
+      );
+      setLatestServer(null);
+      setSaveConflict(null);
+      setBodyError("");
+      persistEditDraft({
+        baseCommit: latest.current_commit,
+        baseTitle,
+        baseBody,
+        title: editingTitle,
+        body: editingContent,
+        assetIds: editingAssetIds,
+      });
+    } finally {
+      setRebasing(false);
+    }
+  }
+
+  async function copyDraftText(text: string, message: string) {
+    try {
+      await navigator.clipboard?.writeText(text);
+      setDraftNotice(message);
+    } catch {
+      setDraftNotice("Clipboard access is unavailable; select the preserved text manually.");
+    }
+  }
+
   async function handleSaveDocument(
     titleConflictPolicy: "allow" | "reject" = "reject",
   ) {
@@ -557,7 +1006,7 @@ export default function DocumentPage({
 
     const contentToSave = editingContent;
     const assetIdsToClaim = editingAssetIds;
-    const payload: Record<string, unknown> = {};
+    const payload: DocumentUpdateInput = {};
     if (contentChanged) payload.content = contentToSave;
     if (titleChanged) {
       payload.title = normalizedEditingTitle;
@@ -565,11 +1014,26 @@ export default function DocumentPage({
     }
     if (Object.keys(payload).length === 0) return;
 
+    const baseCommit = editBaseCommitRef.current;
+    if (!validRevision(baseCommit)) {
+      setBodyError("This document has no valid revision. Reload it before saving.");
+      return;
+    }
+    payload.expected_commit = baseCommit;
+
+    const saveRevision = draftRevisionRef.current;
     setSavingBody(true);
     setBodyError("");
     try {
       const saved = await updateDocument(name, docId, payload);
+      const savedCommit = saved.current_commit ?? saved.commit_hash ?? null;
+      if (!validRevision(savedCommit)) {
+        throw new Error("The server did not return a document revision after saving.");
+      }
       const now = new Date().toISOString();
+      const titleToSave = titleChanged ? normalizedEditingTitle : originalTitle;
+      const hasFollowupEdits = draftRevisionRef.current !== saveRevision;
+      const followup = editingSnapshotRef.current;
       // Optimistically advance content + updated_at so the byline reads
       // "last changed just now" without waiting for a refetch. DocumentView
       // consumes the same query key independently, so update that cache too;
@@ -577,10 +1041,11 @@ export default function DocumentPage({
       const nextDoc = {
         ...(doc || {}),
         content: contentToSave,
-        title: titleChanged ? normalizedEditingTitle : doc?.title,
+        title: titleToSave,
         updated_at: now,
-        current_commit: saved.current_commit ?? saved.commit_hash ?? doc?.current_commit,
+        current_commit: savedCommit,
       };
+      setBaseCommit(savedCommit);
       setDocOverride(nextDoc);
       queryClient.setQueryData(
         ["document", name, docId, undefined],
@@ -590,10 +1055,30 @@ export default function DocumentPage({
         }),
       );
       setOriginalContent(contentToSave);
-      setOriginalTitle(titleChanged ? normalizedEditingTitle : originalTitle);
-      setEditingTitle(titleChanged ? normalizedEditingTitle : originalTitle);
+      setOriginalTitle(titleToSave);
+      if (!hasFollowupEdits) setEditingTitle(titleToSave);
       setTitleTouched(false);
       setServerTitleConflict(null);
+      setSaveConflict(null);
+      setLatestServer(null);
+      if (hasFollowupEdits) {
+        // Keep later edits in a new draft whose base is the commit that just
+        // succeeded. The accepted snapshot alone is the one being claimed.
+        persistEditDraft({
+          baseCommit: savedCommit,
+          baseTitle: titleToSave,
+          baseBody: contentToSave,
+          title: followup.title,
+          body: followup.content,
+          assetIds: followup.assetIds,
+        });
+      } else if (draftSessionRef.current) {
+        clearDocumentEditDraft(draftSessionRef.current);
+        draftSessionRef.current = null;
+        latestDraftInputRef.current = null;
+        setDraftStatus("idle");
+        setDraftNotice("");
+      }
       // Sidebar refresh is best-effort — its failure must not leave the
       // user looking at a "still dirty" editor after a successful save.
       try {
@@ -627,6 +1112,34 @@ export default function DocumentPage({
         await showTitleConflict(conflict);
         return;
       }
+      if (isRevisionConflict(e)) {
+        const latest = await readLatestForConflict();
+        setSaveConflict({
+          base: makeConflictSnapshot(
+            "Original base",
+            baseCommit,
+            originalTitle,
+            originalContent,
+          ),
+          local: makeConflictSnapshot(
+            "Your draft",
+            baseCommit,
+            normalizedEditingTitle,
+            contentToSave,
+          ),
+          latest: latest
+            ? makeConflictSnapshot(
+                "Latest server version",
+                validRevision(latest.current_commit) ? latest.current_commit : null,
+                latest.title || "",
+                latest.content || "",
+              )
+            : null,
+          latestError: latest ? undefined : latestServerErrorRef.current,
+        });
+        setDraftNotice("Your local draft is preserved after the conflict.");
+        return;
+      }
       const status = e instanceof ApiError ? e.status : 0;
       // 5xx responses can carry stack traces or SQL fragments — never
       // surface those verbatim. 4xx are intentional API errors so the
@@ -638,6 +1151,7 @@ export default function DocumentPage({
             ? e.message
             : "Save failed.";
       setBodyError(safe);
+      setDraftNotice("Your local draft is preserved. Retry when the server is available.");
     } finally {
       // Always clear the spinner — a post-await setState throwing must not
       // leave the editor stuck on "Saving…".
@@ -670,6 +1184,47 @@ export default function DocumentPage({
     setView("rendered");
   }
 
+  function protectedDraftAssetIds(excludeDraftId?: string): Set<string> {
+    if (!currentUserId || !name || !doc?.path) return new Set();
+    return new Set(
+      listDocumentEditDrafts(
+        currentUserId,
+        name,
+        documentIdentity(name, doc),
+      )
+        .filter(
+          (draft) =>
+            draft.draftId !== excludeDraftId &&
+            Date.parse(draft.expiresAt) > Date.now(),
+        )
+        .flatMap((draft) => draft.assetIds),
+    );
+  }
+
+  async function discardEditDraft() {
+    const draft = draftSessionRef.current;
+    const protectedAssets = protectedDraftAssetIds(draft?.draftId);
+    latestDraftInputRef.current = null;
+    const assets = new Set<string>([
+      ...(draft?.assetIds || []),
+      ...editingAssetIds,
+    ]);
+    if (draft) clearDocumentEditDraft(draft);
+    if (draftRecovery?.status === "expired") {
+      clearDocumentEditDraft(draftRecovery.draft);
+    }
+    await Promise.allSettled(
+      [...assets]
+        .filter((assetId) => !protectedAssets.has(assetId))
+        .map((assetId) => discardAsset(name!, assetId)),
+    );
+    draftSessionRef.current = null;
+    setDraftRecovery(null);
+    setDraftStatus("idle");
+    setDraftNotice("");
+    setSaveConflict(null);
+  }
+
   // The vault guide is system-managed: its only editing surface is the guide
   // section in vault settings, so the plain full-page viewer bounces there.
   // Search preview is exempt so every document result keeps the same modal
@@ -688,7 +1243,7 @@ export default function DocumentPage({
     return <Navigate to={`/vault/${name}/settings#skill`} replace />;
   }
 
-  if (docQuery.isError) {
+  if (docQuery.isError && !doc) {
     const errorMsg = (docQuery.error as Error)?.message ?? "Unknown error";
     return (
       <div className="py-8 fade-up">
@@ -973,6 +1528,15 @@ export default function DocumentPage({
             <Alert variant="destructive">{publishError}</Alert>
           </div>
         )}
+        {docQuery.isRefetchError && (
+          <div className="shrink-0 border-b border-border bg-surface px-4 py-3 sm:px-6">
+            <Alert variant="warning" title="Couldn’t refresh the document">
+              {isDirty
+                ? "Your local draft is still open. The latest server version will be loaded before any conflict resolution."
+                : "The current document remains visible. Try again when the server is available."}
+            </Alert>
+          </div>
+        )}
 
         <div className="relative min-h-0 flex-1 overflow-hidden">
           <main
@@ -1066,7 +1630,15 @@ export default function DocumentPage({
                       Editing document
                     </span>
                     <span role="status" aria-live="polite" className="ml-auto text-xs text-foreground-muted">
-                      {uploadingImage ? "Uploading image…" : isDirty ? "Unsaved changes" : "No changes"}
+                      {uploadingImage
+                        ? "Uploading image…"
+                        : isDirty
+                          ? "Unsaved changes"
+                          : draftStatus === "saving"
+                            ? "Saving draft locally…"
+                            : draftStatus === "saved"
+                              ? "Draft saved locally"
+                              : "No changes"}
                     </span>
                   </div>
                   <div
@@ -1080,6 +1652,7 @@ export default function DocumentPage({
                         value={editingTitle}
                         onChange={(event) => {
                           setEditingTitle(event.currentTarget.value);
+                          draftRevisionRef.current += 1;
                           setServerTitleConflict(null);
                           setBodyError("");
                         }}
@@ -1129,15 +1702,24 @@ export default function DocumentPage({
                     <Suspense fallback={<MarkdownEditorFallback />}>
                       <MarkdownEditor
                         key={editorKey}
-                        value={originalContent}
+                        value={editorInitialContent}
                         onChange={(markdown, assetIds) => {
-                          setEditingAssetIds(assetIds);
+                          const nextAssetIds = assetIds || [];
+                          draftRevisionRef.current += 1;
+                          editingSnapshotRef.current = {
+                            title: editingTitle,
+                            content: markdown,
+                            assetIds: nextAssetIds,
+                          };
+                          setEditingAssetIds(nextAssetIds);
                           setServerTitleConflict((current) =>
                             current ? { ...current, exactContent: false } : null,
                           );
                           if (hydratedKey.current !== editorKey) {
                             hydratedKey.current = editorKey;
-                            setOriginalContent(markdown);
+                            if (editorHydrationModeRef.current === "server") {
+                              setOriginalContent(markdown);
+                            }
                             setEditingContent(markdown);
                             return;
                           }
@@ -1148,16 +1730,71 @@ export default function DocumentPage({
                         readOnly={savingBody}
                         vault={name!}
                         document={doc?.path}
-                        commit={doc?.current_commit ?? undefined}
+                        commit={editBaseCommit ?? undefined}
                         appearance="workspace"
                         onUploadingChange={(uploading) => {
                           setUploadingImage(uploading);
                           if (uploading) setClaimedAssetIds(null);
                         }}
-                        preserveUploadsOnUnmount={savingBody}
+                        preserveUploadsOnUnmount={
+                          savingBody ||
+                          draftStatus === "saving" ||
+                          draftStatus === "saved" ||
+                          draftStatus === "restored" ||
+                          draftStatus === "expired"
+                        }
                         claimedAssetIds={claimedAssetIds}
+                        initialUnclaimedAssetIds={editingAssetIds}
                       />
                     </Suspense>
+                    {draftNotice && (draftStatus === "restored" || draftStatus === "saved" || draftStatus === "error" || draftStatus === "unavailable") && (
+                      <p className="mt-3 text-xs text-foreground-muted" role="status" aria-live="polite">
+                        {draftNotice}
+                      </p>
+                    )}
+                    {draftRecovery?.status === "expired" && (
+                      <Alert variant="warning" title="This draft has expired" className="mt-4">
+                        <p>{draftRecovery.draft.body ? "The preserved text can still be copied, but attached images are not guaranteed to be recoverable." : "The draft record is expired."}</p>
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="shrink-0 focus-ring-instant"
+                            onClick={() => void copyDraftText(draftRecovery.draft.body, "Expired draft Markdown copied")}
+                          >
+                            Copy expired Markdown
+                          </Button>
+                        </div>
+                      </Alert>
+                    )}
+                    {draftRecovery?.status === "incompatible" && (
+                      <Alert variant="warning" title="Draft editor profile is not supported here" className="mt-4">
+                        <p>The original draft was kept without conversion or deletion. Copy its text before choosing a new draft.</p>
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="shrink-0 focus-ring-instant"
+                            onClick={() => void copyDraftText(draftRecovery.draft.copyBody, "Incompatible draft Markdown copied")}
+                          >
+                            Copy preserved Markdown
+                          </Button>
+                        </div>
+                      </Alert>
+                    )}
+                    {saveConflict && (
+                      <DocumentConflictNotice
+                        base={saveConflict.base}
+                        local={saveConflict.local}
+                        latest={saveConflict.latest}
+                        latestError={saveConflict.latestError}
+                        rebasing={rebasing}
+                        onRebase={() => void applyDraftToLatest()}
+                        onRetryLatest={() => void readLatestForConflict()}
+                      />
+                    )}
                     {bodyError && <Alert variant="destructive" className="mt-4">{bodyError}</Alert>}
                   </div>
                 </section>
@@ -1559,8 +2196,9 @@ export default function DocumentPage({
         cancelLabel="Keep editing"
         variant="destructive"
         returnFocusRef={editTitleRef}
-        onConfirm={() => {
+        onConfirm={async () => {
           const existingPath = pendingExistingPath;
+          await discardEditDraft();
           setEditingContent(originalContent);
           setEditingTitle(originalTitle);
           setEditingAssetIds([]);
@@ -1582,9 +2220,11 @@ export default function DocumentPage({
         confirmLabel="Discard changes"
         variant="destructive"
         returnFocusRef={cancelEditButtonRef}
-        onConfirm={() => {
+        onConfirm={async () => {
           const next = pendingView;
+          await discardEditDraft();
           setEditingContent(originalContent);
+          setEditorInitialContent(originalContent);
           setEditingTitle(originalTitle);
           setEditingAssetIds([]);
           setEditorKey((k) => k + 1);
