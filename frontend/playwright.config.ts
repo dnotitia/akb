@@ -12,7 +12,8 @@ if (!mockMode && !process.env.AKB_FRONTEND_URL) {
 const baseURL = mockMode
   ? "http://127.0.0.1:4173"
   : process.env.AKB_FRONTEND_URL!;
-const recoveryScenario = process.env.CRABBOX_RUNTIME_SCENARIO === "document-edit-recovery";
+const selectedScenario = process.env.AKB_FE_E2E_SCENARIO || "empty";
+const recoveryScenario = selectedScenario === "document-edit-recovery";
 
 // Mock mode owns its Vite webServer and browser MSW worker. Real mode consumes
 // the already-ready frontend origin from the repository runtime descriptor.

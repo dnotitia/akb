@@ -9,7 +9,7 @@ import path from "path";
 const target = process.env.AKB_FRONTEND_BACKEND_URL || "http://localhost:8000";
 const cacheDir = process.env.AKB_FRONTEND_CACHE_DIR;
 const isHttps = false;
-const requestedMockScenario = process.env.CRABBOX_RUNTIME_SCENARIO || "empty";
+const requestedMockScenario = process.env.AKB_FE_E2E_SCENARIO || "empty";
 const mockScenario = ["document-edit-recovery", "markdown-reference-adapters"].includes(requestedMockScenario)
   ? requestedMockScenario
   : "empty";
