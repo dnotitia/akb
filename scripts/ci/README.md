@@ -180,6 +180,13 @@ a runtime command. Both `gate` and `serve` require
 `AKB_E2E_USERNAME` and `AKB_E2E_PASSWORD` to be present before the supervisor
 starts; the runtime does not generate or persist those values.
 
+The runtime source identity uses `AKB_E2E_SOURCE_REVISION` first when it is
+present. It must be a lowercase 40-hex Git SHA. When the variable is absent,
+the supervisor uses `git rev-parse HEAD` from a real checkout. A raw checkout
+without `.git` must receive the explicit variable; missing or invalid input
+fails preparation as `blocked_runtime_config`, and `unknown` is never emitted
+as the source revision.
+
 For a selected transport profile the supervisor mints one candidate-bound PAT
 in memory, passes it to the real proxy only as the `AKB_PAT` child environment
 value, and exposes only the configured PAT environment-name in descriptor and

@@ -26,6 +26,7 @@ from e2e_runtime import (  # noqa: E402
     ManagedProcess,
     OPENROUTER_BASE_URL_ENV,
     OPENROUTER_PROVIDER_KEY_ENV,
+    SOURCE_REVISION_ENV,
     RuntimeConfig,
     _parse_args,
     prepare_private_runtime_root,
@@ -429,6 +430,79 @@ def test_app_control_plane_descriptor_keeps_schema_v2_discovery_contract(tmp_pat
     assert discovery["coordinates"]["self_app"]["resume"]["path"] == "/api/v1/app/rollouts/{rollout_id}/resume"
 
 
+def test_raw_checkout_uses_explicit_source_revision_in_descriptor_and_discovery(tmp_path, monkeypatch):
+    raw_checkout = tmp_path / "raw-checkout"
+    raw_checkout.mkdir()
+    revision = "c" * 40
+    monkeypatch.setenv(SOURCE_REVISION_ENV, revision)
+    runtime = E2ERuntime(
+        dataclasses.replace(
+            make_config(tmp_path),
+            checkout=raw_checkout,
+            profile="transport-proxy",
+            scenario="app-control-plane",
+        )
+    )
+
+    descriptor = runtime.descriptor()
+    discovery = runtime.fixture_discovery()
+
+    assert descriptor["evidence"]["source_revision"] == revision
+    assert discovery["runtime"]["source_revision"] == revision
+    assert SOURCE_REVISION_ENV not in json.dumps(descriptor)
+    assert SOURCE_REVISION_ENV not in json.dumps(discovery)
+
+
+@pytest.mark.parametrize("value", ["", "not-a-sha", "a" * 39, "g" * 40, "a" * 41])
+def test_invalid_explicit_source_revision_fails_closed(value, tmp_path, monkeypatch):
+    monkeypatch.setenv(SOURCE_REVISION_ENV, value)
+    runtime = E2ERuntime(make_config(tmp_path))
+
+    with pytest.raises(BlockedRuntimeConfig, match="blocked_runtime_config"):
+        runtime._source_revision()
+
+
+def test_raw_checkout_without_explicit_source_revision_fails_closed(tmp_path, monkeypatch):
+    raw_checkout = tmp_path / "raw-checkout"
+    raw_checkout.mkdir()
+    monkeypatch.delenv(SOURCE_REVISION_ENV, raising=False)
+    runtime = E2ERuntime(dataclasses.replace(make_config(tmp_path), checkout=raw_checkout))
+
+    with pytest.raises(BlockedRuntimeConfig, match="blocked_runtime_config"):
+        runtime._source_revision()
+
+
+@pytest.mark.asyncio
+async def test_raw_checkout_preparation_blocks_before_creating_resources(tmp_path, monkeypatch):
+    raw_checkout = tmp_path / "raw-checkout"
+    raw_checkout.mkdir()
+    monkeypatch.delenv(SOURCE_REVISION_ENV, raising=False)
+    runtime = E2ERuntime(dataclasses.replace(make_config(tmp_path), checkout=raw_checkout))
+    monkeypatch.setattr(runtime, "_validate_checkout", lambda: None)
+    monkeypatch.setattr(runtime, "_validate_profile", lambda: None)
+    monkeypatch.setattr(
+        e2e_runtime,
+        "prepare_private_runtime_root",
+        lambda _path: pytest.fail("raw source revision must block before runtime setup"),
+    )
+
+    with pytest.raises(BlockedRuntimeConfig, match="blocked_runtime_config"):
+        await runtime.prepare()
+
+    assert runtime._children == {}
+    assert runtime._fixture_task is None
+
+
+def test_git_checkout_remains_the_fallback_source_revision_authority(tmp_path, monkeypatch):
+    monkeypatch.delenv(SOURCE_REVISION_ENV, raising=False)
+    runtime = E2ERuntime(make_config(tmp_path))
+
+    revision = runtime._source_revision()
+
+    assert len(revision) == 40
+    assert all(character in "0123456789abcdef" for character in revision)
+
+
 def test_app_control_plane_discovery_exposes_legacy_adoption_target_and_drift_control(tmp_path):
     runtime = E2ERuntime(
         dataclasses.replace(make_config(tmp_path), scenario="app-control-plane")
@@ -638,7 +712,8 @@ def test_suite_runner_emits_suite_and_gate_events(monkeypatch, capsys):
 
 
 @pytest.mark.asyncio
-async def test_gate_child_stdout_is_private_and_stderr_is_inherited(tmp_path, capfd):
+async def test_gate_child_stdout_is_private_and_stderr_is_inherited(tmp_path, capfd, monkeypatch):
+    monkeypatch.setenv(SOURCE_REVISION_ENV, "d" * 40)
     checkout = tmp_path / "checkout"
     suite_path = checkout / "scripts" / "ci" / "e2e_suite_runner.py"
     suite_path.parent.mkdir(parents=True)
