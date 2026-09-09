@@ -126,6 +126,8 @@ uv run --locked --project eval/mcp-catalog \
 PAT cleanup이 실패하면 primary failure stage를 유지하고, 이미 완료된 trial과
 `budget_used`를 포함한 redacted `status=incomplete` artifact를 먼저 기록한 뒤
 non-zero로 종료한다. 불완전 artifact는 `compare` 입력으로 허용하지 않는다.
+일반 HTTP 요청 timeout은 30초로 유지하고, repository runtime의
+`DEFAULT_TIMEOUT_SECONDS`와 맞춘 reset/readiness budget 180초를 별도로 적용한다.
 
 ## Evidence
 

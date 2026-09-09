@@ -3,9 +3,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import httpx
 import pytest
 
-from mcp_catalog.runtime import RuntimeContractError, RuntimeDescriptor, RuntimeFixture
+from mcp_catalog.runtime import RESET_TIMEOUT_SECONDS, RuntimeContractError, RuntimeDescriptor, RuntimeFixture
 
 
 def descriptor_dict() -> dict:
@@ -74,9 +75,31 @@ class _ResetReadinessClient:
             },
         )
 
-    async def post(self, url: str, *, json: dict) -> _Response:
+    async def post(self, url: str, *, json: dict, **_kwargs: object) -> _Response:
         self.post_calls.append((url, json))
         self._health_reads = 0
+        return _Response(200, {"status": "ready", "scenario": self.descriptor.scenario})
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _TimedResetClient:
+    def __init__(self, descriptor: RuntimeDescriptor, *, response_delay: float) -> None:
+        self.descriptor = descriptor
+        self.response_delay = response_delay
+        self.reset_timeout: float | None = None
+        self.get_calls: list[str] = []
+
+    async def post(self, _url: str, *, json: dict, timeout: float | None = None) -> _Response:
+        assert json == self.descriptor.reset_body
+        self.reset_timeout = timeout
+        if timeout is not None and self.response_delay > timeout:
+            raise httpx.ReadTimeout("reset response exceeded request budget")
+        return _Response(200, {"status": "ready", "scenario": self.descriptor.scenario})
+
+    async def get(self, url: str, **_kwargs: object) -> _Response:
+        self.get_calls.append(url)
         return _Response(200, {"status": "ready", "scenario": self.descriptor.scenario})
 
     async def aclose(self) -> None:
@@ -163,4 +186,41 @@ async def test_reset_reports_readiness_stage_when_runtime_does_not_recover() -> 
 
     assert raised.value.stage == "fixture_readiness"
     assert "readiness" in str(raised.value)
+    await fixture.close()
+
+
+@pytest.mark.asyncio
+async def test_reset_uses_repository_reset_budget_not_ordinary_http_timeout() -> None:
+    descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
+    client = _TimedResetClient(descriptor, response_delay=0.1)
+    fixture = RuntimeFixture(descriptor, timeout=0.01, readiness_timeout=0.2, readiness_poll_interval=0)
+    fixture.client = client  # type: ignore[assignment]
+
+    await fixture.reset()
+
+    assert client.reset_timeout == RESET_TIMEOUT_SECONDS
+    assert client.reset_timeout > 0.01
+    assert client.get_calls
+    await fixture.close()
+
+
+@pytest.mark.asyncio
+async def test_reset_timeout_over_budget_is_fixture_reset_failure() -> None:
+    descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
+    client = _TimedResetClient(descriptor, response_delay=0.1)
+    fixture = RuntimeFixture(
+        descriptor,
+        timeout=0.01,
+        reset_timeout=0.05,
+        readiness_timeout=0.05,
+        readiness_poll_interval=0,
+    )
+    fixture.client = client  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeContractError) as raised:
+        await fixture.reset()
+
+    assert raised.value.stage == "fixture_reset"
+    assert "timed out" in str(raised.value)
+    assert not client.get_calls
     await fixture.close()
