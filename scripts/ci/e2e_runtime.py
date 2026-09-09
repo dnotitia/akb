@@ -70,6 +70,10 @@ DEFAULT_MINIO_PORT = 9000
 DEFAULT_COMPOSE_PROJECT = "akb-e2e"
 DEFAULT_TIMEOUT_SECONDS = 180.0
 DEFAULT_PROFILE = "tool-only"
+BENCHMARK_PROFILE = "transport-proxy"
+BENCHMARK_SCENARIO: Scenario = "app-control-plane"
+OPENROUTER_BASE_URL_ENV = "MCP_BENCH_OPENROUTER_BASE_URL"
+OPENROUTER_PROVIDER_KEY_ENV = "MCP_BENCH_OPENROUTER_" + "API_KEY"
 
 
 def _canonical_fixture_json(value: object) -> bytes:
@@ -79,6 +83,17 @@ def _canonical_fixture_json(value: object) -> bytes:
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
+
+
+def benchmark_provider_credential_names(profile: CapabilityProfile, scenario: Scenario) -> dict[str, str]:
+    """Declare provider env names only for the catalog benchmark runtime."""
+
+    if profile.name != BENCHMARK_PROFILE or scenario != BENCHMARK_SCENARIO:
+        return {}
+    return {
+        "openrouter_base_url_env": OPENROUTER_BASE_URL_ENV,
+        "openrouter_provider_key_env": OPENROUTER_PROVIDER_KEY_ENV,
+    }
 
 
 def _fixture_table_descriptor(table: dict[str, object]) -> dict[str, object]:
@@ -1281,6 +1296,11 @@ class E2ERuntime:
                 "login_path": "/api/v1/auth/login",
             },
         }
+        credentials = descriptor["credentials"]
+        assert isinstance(credentials, dict)
+        credentials.update(
+            benchmark_provider_credential_names(self.profile, self.config.scenario)
+        )
         if self.config.frontend_enabled:
             descriptor["services"]["web"] = {
                 "origin": self.config.frontend_origin,

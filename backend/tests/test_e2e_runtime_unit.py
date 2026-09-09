@@ -24,10 +24,13 @@ from e2e_runtime import (  # noqa: E402
     CredentialNames,
     E2ERuntime,
     ManagedProcess,
+    OPENROUTER_BASE_URL_ENV,
+    OPENROUTER_PROVIDER_KEY_ENV,
     RuntimeConfig,
     _parse_args,
     prepare_private_runtime_root,
     select_capability_profile,
+    benchmark_provider_credential_names,
     terminate_process,
 )
 import e2e_runtime  # noqa: E402
@@ -1268,6 +1271,45 @@ def test_transport_profile_exposes_real_proxy_boundary_without_secret(tmp_path):
     assert "akb_runtime_secret" not in serialized
     assert "AKB_E2E_PAT" in serialized
     assert descriptor["evidence"]["transport"] == ["http", "stdio"]
+    assert OPENROUTER_BASE_URL_ENV not in json.dumps(descriptor)
+    assert OPENROUTER_PROVIDER_KEY_ENV not in json.dumps(descriptor)
+
+
+def test_benchmark_descriptor_declares_only_provider_environment_names(tmp_path, monkeypatch):
+    runtime = E2ERuntime(
+        dataclasses.replace(
+            make_config(tmp_path),
+            profile="transport-proxy",
+            scenario="app-control-plane",
+        )
+    )
+    monkeypatch.setenv(OPENROUTER_BASE_URL_ENV, "runtime-provider-url")
+    monkeypatch.setenv(OPENROUTER_PROVIDER_KEY_ENV, "runtime-provider-key")
+
+    descriptor = runtime.descriptor()
+
+    assert descriptor["credentials"]["openrouter_base_url_env"] == OPENROUTER_BASE_URL_ENV
+    assert descriptor["credentials"]["openrouter_provider_key_env"] == OPENROUTER_PROVIDER_KEY_ENV
+    serialized = json.dumps(descriptor)
+    assert "runtime-provider-url" not in serialized
+    assert "runtime-provider-key" not in serialized
+    assert OPENROUTER_BASE_URL_ENV in serialized
+    assert OPENROUTER_PROVIDER_KEY_ENV in serialized
+
+
+@pytest.mark.parametrize(
+    ("profile", "scenario"),
+    (
+        ("tool-only", "app-control-plane"),
+        ("transport-proxy", "empty"),
+        ("transport-oidc", "app-control-plane"),
+        ("oidc-resource-server", "app-control-plane"),
+    ),
+)
+def test_non_benchmark_profiles_do_not_advertise_provider_credentials(profile, scenario):
+    resolved = select_capability_profile(profile)
+
+    assert benchmark_provider_credential_names(resolved, scenario) == {}
 
 
 @pytest.mark.asyncio

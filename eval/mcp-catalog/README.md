@@ -57,15 +57,16 @@ warm하지 않는다. runtime supervisor와 같은 stdin handoff를 사용할 �
 
 ### Runtime credential handoff
 
-orchestrator는 기존 `mcp-stdio-runtime`의 ready descriptor를 stdin으로
-전달하고, benchmark process에 다음 두 environment name만 secure handoff로
-주입해야 한다. 값은 descriptor, argv, 로그, 파일과 evidence를 통과하지
-않는다.
+orchestrator는 기존 `mcp-stdio-runtime`의 ready descriptor를 benchmark
+command의 stdin으로 전달하고, benchmark process에 다음 두 environment name만
+secure handoff로 주입해야 한다. 값은 descriptor, argv, 로그, 파일과 evidence를
+통과하지 않는다.
 
 runtime는 benchmark manifest와 같은 `app-control-plane` scenario로
-기동한다(`CRABBOX_RUNTIME_SCENARIO=app-control-plane`). runtime process에는
-OpenRouter 값을 전달하지 않고, tunnel/host-side benchmark process에만
-전달한다.
+기동한다(`CRABBOX_RUNTIME_SCENARIO=app-control-plane`). orchestrator의
+기존 descriptor-derived `env_names` forwarding에 두 이름을 포함시키고,
+runtime 안의 benchmark process에서 실행한다. serving runtime 자체는
+OpenRouter 값을 사용하지 않는다.
 
 ```text
 MCP_BENCH_OPENROUTER_BASE_URL
@@ -75,11 +76,12 @@ MCP_BENCH_OPENROUTER_API_KEY
 `MCP_BENCH_OPENROUTER_BASE_URL`은 반드시
 `https://openrouter.ai/api/v1`이어야 한다. runtime의 AKB PAT 환경은 MCP
 server 연결용으로만 사용하며 OpenRouter credential과 섞지 않는다. 아래
-명령은 descriptor를 받은 host/tunnel-side benchmark process에서 실행한다.
+명령은 기존 runtime helper의 remote `exec`가 descriptor stdin과 두 env 값을
+주입한 뒤 runtime checkout에서 실행한다.
 
 ```bash
-cat /private/run/descriptor.json | \
-  uv run --locked --project eval/mcp-catalog \
+# The existing runtime exec supplies the descriptor JSON on stdin.
+uv run --locked --project eval/mcp-catalog \
   mcp-catalog-bench validate --descriptor -
 ```
 
@@ -97,14 +99,12 @@ export MCP_BENCH_OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 : "${MCP_BENCH_OPENROUTER_API_KEY:?securely injected by orchestrator}"
 : "${MCP_BENCH_READ_ONLY_PAT:?securely injected by orchestrator}"
 
-cat /private/run/baseline-descriptor.json | \
-  uv run --locked --project eval/mcp-catalog \
+uv run --locked --project eval/mcp-catalog \
   mcp-catalog-bench run --arm baseline \
   --descriptor - \
   --output /private/run/baseline.json
 
-cat /private/run/candidate-descriptor.json | \
-  uv run --locked --project eval/mcp-catalog \
+uv run --locked --project eval/mcp-catalog \
   mcp-catalog-bench run --arm candidate \
   --descriptor - \
   --output /private/run/candidate.json
