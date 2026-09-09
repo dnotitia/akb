@@ -109,6 +109,9 @@ export MCP_BENCH_OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 : "${MCP_BENCH_OPENROUTER_API_KEY:?securely injected by orchestrator}"
 : "${MCP_BENCH_READ_ONLY_PAT:?securely injected by orchestrator}"
 
+# The descriptor's AKB_E2E_USERNAME / AKB_E2E_PASSWORD are injected by the
+# runtime handoff and are used only to mint a fresh PAT after each reset.
+
 uv run --locked --project eval/mcp-catalog \
   mcp-catalog-bench run --arm baseline \
   --descriptor - \
@@ -129,6 +132,10 @@ uv run --locked --project eval/mcp-catalog \
 실제 provider key나 scoped PAT가 없으면 `run`은 catalog나 model 호출을
 시작하기 전에 `needs_user_input`으로 종료한다. descriptor의 credential
 환경변수 이름만 저장되며 값은 argv, log, report, trace에 남지 않는다.
+per-trial reset으로 PAT 저장소가 재생성되므로 descriptor의 username/password
+환경도 reset 후 fresh PAT 발급에 필요하다. default profile은 기존 full PAT
+scope로, `read_only` profile은 기존 `read` scope로 새 token을 발급하며,
+재발급 경로가 없으면 stale PAT를 재사용하지 않고 fail-closed로 종료한다.
 
 각 trial의 reset은 reset endpoint 응답만으로 완료 처리하지 않는다. repository가
 선언한 app/fixture health가 모두 `status=ready`이고 fixture scenario가 일치할

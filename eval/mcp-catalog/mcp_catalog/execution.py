@@ -11,7 +11,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Callable, Literal, cast
+from typing import Any, Awaitable, Callable, Literal, cast
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -226,6 +226,8 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
         secrets_for: Callable[[str], tuple[str, ...]],
         failure_sink: list[Exception] | None = None,
         cleanup_sink: list[Exception] | None = None,
+        refresh_token: Callable[[RuntimeFixture, str], Awaitable[str]] | None = None,
+        mark_reset_complete: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(case)
         self.fixture = fixture
@@ -233,6 +235,8 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
         self.secrets_for = secrets_for
         self.failure_sink = failure_sink
         self.cleanup_sink = cleanup_sink
+        self.refresh_token = refresh_token
+        self.mark_reset_complete = mark_reset_complete
         self.context: TrialContext | None = None
 
     async def setup(self) -> None:
@@ -240,8 +244,12 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
         try:
             if self.failure_sink:
                 raise self.failure_sink[0]
-            token = self.token_for(task.fixture.credential_profile)
             await self.fixture.reset()
+            token = (
+                await self.refresh_token(self.fixture, task.fixture.credential_profile)
+                if self.refresh_token is not None
+                else self.token_for(task.fixture.credential_profile)
+            )
             before = await self.fixture.observe(task.expected_final_state.probe, token=token)
             self.context = TrialContext(
                 task=task,
@@ -278,6 +286,8 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
             # A reset after the observation is the failure cleanup boundary.
             try:
                 await self.fixture.reset()
+                if self.mark_reset_complete is not None:
+                    self.mark_reset_complete()
             except Exception as exc:
                 if isinstance(result, ReportCaseFailure):
                     self._record_cleanup(exc)
@@ -852,6 +862,8 @@ async def evaluate_dataset(
     fixture: RuntimeFixture,
     failure_sink: list[Exception] | None = None,
     cleanup_sink: list[Exception] | None = None,
+    refresh_token: Callable[[RuntimeFixture, str], Awaitable[str]] | None = None,
+    mark_reset_complete: Callable[[], None] | None = None,
 ) -> EvaluationReport[TaskManifest, TrialOutcome, dict[str, Any]]:
     cases = [Case(name=task.id, inputs=task, metadata={"category": task.category}) for task in tasks]
     dataset = Dataset(
@@ -867,6 +879,8 @@ async def evaluate_dataset(
         secrets_for=executor.secrets_for,
         failure_sink=failure_sink,
         cleanup_sink=cleanup_sink,
+        refresh_token=refresh_token,
+        mark_reset_complete=mark_reset_complete,
     )
     try:
         return await dataset.evaluate(
