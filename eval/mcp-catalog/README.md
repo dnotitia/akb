@@ -30,6 +30,8 @@ password 값은 환경에서만 읽고 evidence에 쓰지 않는다.
 두 요청 모두 OpenRouter `parasail` upstream만 사용한다. 요청 body에는
 `allow_fallbacks=false`, `require_parameters=true`, model별 `max_price`가
 강제로 들어가며 model fallback을 의미하는 `models` 배열은 보내지 않는다.
+PydanticAI가 MCP schema에 추론해 붙이는 OpenAI strict tool flag는
+OpenRouter/Parasail 경로에서 끈다. 44개 전체 tool definition은 유지한다.
 등록 가격은 각각 입력/출력 `$0.14/$0.28` 및 `$0.24/$2.20` per million이고,
 전체 hard cap은 `$50`이다. 각 trial은 시작 전에 등록 token cap과 가격으로
 worst-case 비용을 예약하며 cap을 넘으면 다음 provider 요청을 시작하지 않는다.
@@ -145,6 +147,10 @@ PAT cleanup이 실패하면 primary failure stage를 유지하고, 이미 완료
 non-zero로 종료한다. 불완전 artifact는 `compare` 입력으로 허용하지 않는다.
 일반 HTTP 요청 timeout은 30초로 유지하고, repository runtime의
 `DEFAULT_TIMEOUT_SECONDS`와 맞춘 reset/readiness budget 180초를 별도로 적용한다.
+provider/toolset 단계에서 model request와 usage evidence를 얻지 못한 실패가
+trial의 과반이면 run은 `failure_stage=model_request`인 `status=incomplete`로
+남으며, zero-request arm을 성공 baseline으로 취급하지 않는다. 오류 evidence는
+redacted exception chain과 HTTP status를 보존한다.
 
 ## Evidence
 

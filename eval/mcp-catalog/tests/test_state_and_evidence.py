@@ -7,7 +7,7 @@ import pytest
 
 import mcp_catalog.evidence as evidence
 from mcp_catalog.contracts import StateContract, StateExpectation, StateProbe
-from mcp_catalog.evidence import safe_json, write_json
+from mcp_catalog.evidence import redact_exception, safe_json, write_json
 from mcp_catalog.runtime import StateObservation
 from mcp_catalog.state import evaluate_state_contract
 
@@ -79,3 +79,21 @@ def test_evidence_redaction_failure_does_not_persist_the_unredacted_file(tmp_pat
         evidence.write_json(path, {"value": marker}, (marker,))
 
     assert not path.exists()
+
+
+def test_exception_evidence_keeps_redacted_nested_cause_and_status() -> None:
+    marker = "fixture-marker"
+
+    class StatusError(RuntimeError):
+        status_code = 413
+
+    cause = StatusError(f"request body rejected: {marker}")
+    error = RuntimeError("Connection error.")
+    error.__cause__ = cause
+
+    detail = redact_exception(error, (marker,))
+
+    assert "RuntimeError: Connection error." in detail
+    assert "StatusError: request body rejected: [redacted]" in detail
+    assert "status=413" in detail
+    assert marker not in detail

@@ -11,7 +11,7 @@ from typing import Any, Awaitable, Callable
 
 from .catalog import capture_catalog
 from .contracts import BenchmarkRunManifest, TaskManifest, hash_json, load_run_manifest, load_task_corpus
-from .evidence import redact_text, serialize_report, write_json, safe_json
+from .evidence import redact_exception, redact_text, serialize_report, write_json, safe_json
 from .execution import (
     BudgetLedger,
     TrialExecutor,
@@ -42,15 +42,11 @@ class BenchmarkRunFailure(RuntimeError):
         self.artifact = artifact
         self.secrets = secrets
         self.cleanup_errors = cleanup_errors
-        message = redact_text(_exception_text(primary_error), secrets)
+        message = redact_exception(primary_error, secrets)
         if cleanup_errors:
-            cleanup = ", ".join(redact_text(_exception_text(error), secrets) for error in cleanup_errors)
+            cleanup = ", ".join(redact_exception(error, secrets) for error in cleanup_errors)
             message = f"{message}; cleanup failed: {cleanup}"
         super().__init__(message)
-
-
-def _exception_text(error: BaseException) -> str:
-    return f"{type(error).__name__}: {error}"
 
 
 def _exception_stage(error: BaseException, fallback: str) -> str:
@@ -64,7 +60,7 @@ def _attach_cleanup_errors(
     secrets: tuple[str, ...],
 ) -> None:
     for error in cleanup_errors:
-        primary.add_note(f"cleanup failed: {redact_text(_exception_text(error), secrets)}")
+        primary.add_note(f"cleanup failed: {redact_exception(error, secrets)}")
 
 
 async def _collect_cleanup_errors(*actions: Callable[[], Awaitable[None]]) -> list[Exception]:
@@ -75,6 +71,26 @@ async def _collect_cleanup_errors(*actions: Callable[[], Awaitable[None]]) -> li
         except Exception as exc:
             errors.append(exc)
     return errors
+
+
+def zero_evidence_failure_reason(outcomes: list[TrialOutcome]) -> str | None:
+    """Reject a run dominated by failures before any model usage evidence."""
+
+    if not outcomes:
+        return None
+    failures = [
+        outcome
+        for outcome in outcomes
+        if outcome.error and outcome.model_requests == 0 and not outcome.provider_evidence
+    ]
+    if len(failures) * 2 <= len(outcomes):
+        return None
+    dominant_error, dominant_count = Counter(outcome.error for outcome in failures).most_common(1)[0]
+    return (
+        "benchmark incomplete: "
+        f"{len(failures)}/{len(outcomes)} trials failed before model usage evidence; "
+        f"dominant failure {dominant_error!r} ({dominant_count} trials)"
+    )
 
 
 @dataclass(slots=True)
@@ -158,7 +174,7 @@ class CredentialResolver:
             for error in errors[1:]:
                 primary.add_note(
                     "additional PAT cleanup failure: "
-                    f"{redact_text(_exception_text(error), self.secret_values())}"
+                    f"{redact_exception(error, self.secret_values())}"
                 )
             raise primary
 
@@ -256,6 +272,11 @@ class BenchmarkRunner:
         failure_stage: str | None = None,
         cleanup_errors: list[Exception] | None = None,
     ) -> dict[str, Any]:
+        quality_reasons: list[str] = []
+        for outcomes in self._completed_trials.values():
+            if reason := zero_evidence_failure_reason(outcomes):
+                incomplete_reasons.add(reason)
+                quality_reasons.append(reason)
         all_reports = dict(reports)
         for key, outcomes in self._completed_trials.items():
             if key in all_reports or not outcomes:
@@ -315,8 +336,15 @@ class BenchmarkRunner:
             artifact["failure_stage"] = stage
             artifact["failure"] = {
                 "stage": stage,
-                "error": redact_text(_exception_text(failure), self.secrets),
-                "cleanup_errors": [redact_text(_exception_text(error), self.secrets) for error in cleanup],
+                "error": redact_exception(failure, self.secrets),
+                "cleanup_errors": [redact_exception(error, self.secrets) for error in cleanup],
+            }
+        elif quality_reasons:
+            artifact["failure_stage"] = "model_request"
+            artifact["failure"] = {
+                "stage": "model_request",
+                "error": redact_text(quality_reasons[0], self.secrets),
+                "cleanup_errors": [],
             }
         return safe_json(artifact, self.secrets)
 
@@ -476,7 +504,7 @@ class BenchmarkRunner:
         if primary_error is not None:
             notes = cleanup_errors if primary_error not in cleanup_errors else cleanup_errors[1:]
             _attach_cleanup_errors(primary_error, notes, self.secrets)
-            incomplete_reasons.add(f"benchmark incomplete: {_exception_text(primary_error)}")
+            incomplete_reasons.add(f"benchmark incomplete: {redact_exception(primary_error, self.secrets)}")
             artifact = self._build_artifact(
                 runtime=runtime,
                 artifact_versions=artifact_versions,

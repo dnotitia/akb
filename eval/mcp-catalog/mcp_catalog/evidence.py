@@ -27,6 +27,29 @@ def redact_text(value: Any, secrets: Iterable[str] = ()) -> str:
     return BEARER_RE.sub("Bearer [redacted]", message)
 
 
+def redact_exception(error: BaseException, secrets: Iterable[str] = ()) -> str:
+    """Keep exception-chain causes and HTTP status while redacting values."""
+
+    parts: list[str] = []
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        detail = redact_text(f"{type(current).__name__}: {current}", secrets)
+        status = getattr(current, "status_code", None)
+        response = getattr(current, "response", None)
+        if status is None and response is not None:
+            status = getattr(response, "status_code", None)
+        if isinstance(status, int) and f"status={status}" not in detail:
+            detail = f"{detail} (status={status})"
+        parts.append(detail)
+        cause = current.__cause__
+        if cause is None and not current.__suppress_context__:
+            cause = current.__context__
+        current = cause
+    return " <- ".join(parts)
+
+
 def safe_json(value: Any, secrets: Iterable[str] = ()) -> Any:
     """Convert arbitrary SDK values to JSON while dropping secret-bearing fields."""
 

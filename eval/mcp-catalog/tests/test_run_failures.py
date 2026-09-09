@@ -8,7 +8,7 @@ import pytest
 import mcp_catalog.cli as cli
 from mcp_catalog.contracts import load_run_manifest, load_task_corpus
 from mcp_catalog.execution import BudgetLedger, TrialOutcome
-from mcp_catalog.runner import BenchmarkRunFailure, BenchmarkRunner
+from mcp_catalog.runner import BenchmarkRunFailure, BenchmarkRunner, zero_evidence_failure_reason
 from mcp_catalog.runtime import RuntimeContractError, RuntimeDescriptor, RuntimeFixture
 from test_runtime_contract import descriptor_dict
 
@@ -185,3 +185,40 @@ async def test_incomplete_artifact_keeps_completed_trials_budget_and_redaction()
     assert artifact["runs"]["primary:http"]["partial"] is True
     assert "fixture-marker" not in encoded
     assert "fixture-token" not in encoded
+
+
+def test_zero_request_provider_failures_make_an_arm_incomplete() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
+    runner = BenchmarkRunner(manifest, tasks, descriptor, arm="baseline")
+    outcomes = [
+        TrialOutcome(
+            task_id=tasks[index].id,
+            category=tasks[index].category,
+            arm="baseline",
+            model_class="primary",
+            model_id=manifest.models[0].model_id,
+            transport="http",
+            error="Connection error.",
+        )
+        for index in range(3)
+    ]
+    runner._completed_trials["primary:http"].extend(outcomes)
+    ledger = BudgetLedger(manifest)
+
+    artifact = runner._build_artifact(
+        runtime={"source_revision": "a" * 40, "discovery": {"status": "ready"}},
+        artifact_versions={"backend_artifact_version": "0.0.0", "proxy_artifact_version": "0.0.0"},
+        ledger=ledger,
+        catalogs={},
+        reports={},
+        incomplete_reasons=set(),
+    )
+
+    assert zero_evidence_failure_reason(outcomes) is not None
+    assert artifact["status"] == "incomplete"
+    assert artifact["failure_stage"] == "model_request"
+    assert artifact["failure"]["stage"] == "model_request"
+    assert any("model usage evidence" in reason for reason in artifact["incomplete_reasons"])
+    assert artifact["completed_trials"] == 3

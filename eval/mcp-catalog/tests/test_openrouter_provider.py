@@ -9,6 +9,7 @@ from openai.types.chat import ChatCompletion
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import RequestUsage, RunUsage
 
 from mcp_catalog.contracts import OPENROUTER_BASE_URL, load_run_manifest, load_task_corpus
@@ -55,6 +56,47 @@ def test_build_model_uses_declared_openrouter_environment_and_forces_routing(mon
     }
     assert settings["extra_headers"] == {"X-OpenRouter-Metadata": "enabled"}
     assert "models" not in settings["extra_body"]
+
+
+@pytest.mark.asyncio
+async def test_full_catalog_wire_path_does_not_enable_strict_tool_definitions(monkeypatch: pytest.MonkeyPatch) -> None:
+    spec = _model_spec()
+    provider_key_env = "MCP_BENCH_OPENROUTER_" + "API_KEY"
+    monkeypatch.setenv(spec.base_url_env, OPENROUTER_BASE_URL)
+    monkeypatch.setenv(provider_key_env, "fixture-provider-key")
+    model = build_model(spec)
+    response = ChatCompletion.model_validate(
+        {
+            "id": "response-1",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
+            "created": 1,
+            "model": spec.model_id,
+            "object": "chat.completion",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+    )
+    request = AsyncMock(return_value=response)
+    monkeypatch.setattr(model.client.chat.completions, "create", request)
+    definitions = [
+        ToolDefinition(
+            name=f"catalog_tool_{index}",
+            parameters_json_schema={"type": "object", "properties": {"value": {"type": "string"}}},
+            strict=True,
+        )
+        for index in range(44)
+    ]
+
+    await model._completions_create(
+        [ModelRequest(parts=[UserPromptPart("hello")])],
+        False,
+        model.settings,
+        ModelRequestParameters(function_tools=definitions),
+    )
+
+    tools = request.await_args.kwargs["tools"]
+    assert model.profile["openai_supports_strict_tool_definition"] is False
+    assert len(tools) == 44
+    assert all("strict" not in tool["function"] for tool in tools)
 
 
 def test_model_preflight_rejects_a_nonregistered_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
