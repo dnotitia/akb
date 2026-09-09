@@ -4,9 +4,11 @@ import json
 import os
 import subprocess
 import sys
+import pytest
 from pathlib import Path
 
 from mcp_catalog.runtime import RuntimeDescriptor
+from mcp_catalog.runner import CredentialResolver
 from test_runtime_contract import descriptor_dict
 
 ROOT = Path(__file__).parents[1]
@@ -116,3 +118,22 @@ def test_run_stdin_stops_before_live_calls_when_provider_key_is_missing(tmp_path
     assert provider_key_env in completed.stderr
     assert "No such file" not in completed.stderr
     assert not output.exists()
+
+
+@pytest.mark.asyncio
+async def test_default_descriptor_pat_is_used_before_minting(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = descriptor_dict()
+    descriptor = RuntimeDescriptor.from_dict(raw)
+    from mcp_catalog.contracts import load_run_manifest
+
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    resolver = CredentialResolver(manifest, descriptor, ())
+    monkeypatch.setenv("AKB_E2E_PAT", "fixture-pat")
+
+    class NoMintFixture:
+        async def mint_pat(self, _username: str, _password: str) -> tuple[str, str]:
+            raise AssertionError("descriptor PAT should avoid minting")
+
+    await resolver.prepare(NoMintFixture(), ["default"])
+
+    assert resolver.token_for("default") == "fixture-pat"
