@@ -101,7 +101,7 @@ import { isAkbResourceTarget, normalizeEditorLinkUrl } from "@/lib/editor-link";
 import {
   canonicalAkbMarkdownTarget,
   createAkbMarkdownAdapters,
-  extractAkbMarkdownLinkTargets,
+  useAkbMarkdownTargetResolutions,
   type AkbMarkdownTargetResolution,
 } from "@/lib/markdown-adapters";
 import {
@@ -432,7 +432,6 @@ interface EditorAssetLifecycle {
 }
 
 const EditorAssetLifecycleContext = React.createContext<EditorAssetLifecycle | null>(null);
-const EMPTY_TARGET_RESOLUTIONS: ReadonlyMap<string, AkbMarkdownTargetResolution> = new Map();
 
 function ImageElement(props: PlateElementProps) {
   const editor = useEditorRef();
@@ -1281,22 +1280,29 @@ export function MarkdownEditor({
   const discardingAssetIdsRef = React.useRef(new Set<string>());
   const mountedRef = React.useRef(true);
   const onUploadingChangeRef = React.useRef(onUploadingChange);
+  const onAssetExpirationsChangeRef = React.useRef(onAssetExpirationsChange);
+  const onUnclaimedAssetIdsChangeRef = React.useRef(onUnclaimedAssetIdsChange);
   const preserveUploadsOnUnmountRef = React.useRef(preserveUploadsOnUnmount);
 
   const reportAssetExpirations = React.useCallback(() => {
-    onAssetExpirationsChange?.(
+    onAssetExpirationsChangeRef.current?.(
       Object.fromEntries(unclaimedAssetExpirationsRef.current.entries()),
     );
-  }, [onAssetExpirationsChange]);
+  }, []);
 
   const reportUnclaimedAssetIds = React.useCallback(() => {
-    onUnclaimedAssetIdsChange?.([...unclaimedAssetIdsRef.current]);
-  }, [onUnclaimedAssetIdsChange]);
+    onUnclaimedAssetIdsChangeRef.current?.([...unclaimedAssetIdsRef.current]);
+  }, []);
 
   const markdownAdapters = React.useMemo(
     () => createAkbMarkdownAdapters({ vault, document, commit }),
     [commit, document, vault],
   );
+
+  React.useEffect(() => {
+    onAssetExpirationsChangeRef.current = onAssetExpirationsChange;
+    onUnclaimedAssetIdsChangeRef.current = onUnclaimedAssetIdsChange;
+  }, [onAssetExpirationsChange, onUnclaimedAssetIdsChange]);
 
   React.useEffect(() => {
     reportUnclaimedAssetIds();
@@ -1428,6 +1434,10 @@ export function MarkdownEditor({
       try {
         for (const [index, file] of files.entries()) {
           currentFileIndex = index;
+          if (controller.signal.aborted) {
+            cancelledFiles.push(file, ...files.slice(index + 1));
+            break;
+          }
           try {
             setUploadingName(`Checking ${file.name}`);
             const validationMessage = validateEditorImage(file);
@@ -1459,7 +1469,7 @@ export function MarkdownEditor({
             }
             reportUnclaimedAssetIds();
 
-            if (controller.signal.aborted || !mountedRef.current) {
+            if (!mountedRef.current) {
               discardIfUnclaimed(target);
               throw new DOMException("Upload cancelled", "AbortError");
             }
@@ -1496,6 +1506,10 @@ export function MarkdownEditor({
               );
             }
             insertedImageCount += 1;
+            if (controller.signal.aborted) {
+              cancelledFiles.push(...files.slice(index + 1));
+              break;
+            }
           } catch (error) {
             failed = true;
             const aborted =
@@ -1552,9 +1566,9 @@ export function MarkdownEditor({
           setUploadFailure({
             files: deferredImageFilesRef.current.splice(0),
             message: "The current upload was cancelled before the next batch started.",
-              retryable: true,
-              kind: "error",
-              replacementPath,
+            retryable: true,
+            kind: "error",
+            replacementPath,
           });
         }
       } finally {
@@ -1581,50 +1595,7 @@ export function MarkdownEditor({
     [commit, discardIfUnclaimed, document, editor, markdownAdapters, readOnly, reportAssetExpirations, reportUnclaimedAssetIds, vault],
   );
 
-  const targetResolver = React.useMemo(
-    () => markdownAdapters.targetResolver,
-    [markdownAdapters],
-  );
-  const targetStrings = React.useMemo(
-    () => extractAkbMarkdownLinkTargets(value),
-    [value],
-  );
-  const targetResolutionKey = React.useMemo(
-    () => [vault, document ?? "", commit ?? "", ...targetStrings].join("\u0000"),
-    [commit, document, targetStrings, vault],
-  );
-  const [targetResolutionState, setTargetResolutionState] = React.useState<{
-    key: string;
-    values: ReadonlyMap<string, AkbMarkdownTargetResolution>;
-  }>({ key: "", values: new Map() });
-
-  React.useEffect(() => {
-    if (targetStrings.length === 0) return;
-    const controller = new AbortController();
-    void Promise.all(
-      targetStrings.map(async (target) => [
-        target,
-        await targetResolver.resolve(target, {
-          vault,
-          document,
-          commit,
-          signal: controller.signal,
-        }),
-      ] as const),
-    ).then((entries) => {
-      if (!controller.signal.aborted) {
-        setTargetResolutionState({ key: targetResolutionKey, values: new Map(entries) });
-      }
-    });
-    return () => controller.abort();
-  }, [commit, document, targetResolutionKey, targetResolver, targetStrings, vault]);
-  const targetResolutions = React.useMemo(
-    () =>
-      targetResolutionState.key === targetResolutionKey
-        ? targetResolutionState.values
-        : EMPTY_TARGET_RESOLUTIONS,
-    [targetResolutionKey, targetResolutionState],
-  );
+  const targetResolutions = useAkbMarkdownTargetResolutions(value, { vault, document, commit });
 
   const assetLifecycle = React.useMemo(
     () => ({

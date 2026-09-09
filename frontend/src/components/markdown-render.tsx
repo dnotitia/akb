@@ -28,7 +28,7 @@
  *     as a soft rounded card. `\[..\]` / `\(..\)` pre-normalized to
  *     `$$` / `$`.
  */
-import React, { useCallback, useEffect, useMemo, useState, type ComponentProps } from "react";
+import React, { useCallback, useMemo, useState, type ComponentProps } from "react";
 import Markdown, { defaultUrlTransform, type Components, type ExtraProps } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -51,8 +51,7 @@ import { parseHeadings, slugify, stripFrontmatter } from "@/lib/markdown";
 import {
   canonicalAkbMarkdownTarget,
   classifyAkbMarkdownTarget,
-  createAkbMarkdownTargetResolver,
-  extractAkbMarkdownLinkTargets,
+  useAkbMarkdownTargetResolutions,
   type AkbMarkdownTargetResolution,
 } from "@/lib/markdown-adapters";
 
@@ -781,51 +780,11 @@ export function MarkdownRender({ markdown, className, assetContext }: MarkdownRe
     }
     return undefined;
   }, [assetCommit, assetDocument, assetMode, assetVault, publicationSlug]);
-  const targetResolver = useMemo(
-    () =>
-      assetMode === "authenticated" && assetVault
-        ? createAkbMarkdownTargetResolver({
-            vault: assetVault,
-            document: assetDocument,
-            commit: assetCommit,
-          })
-        : undefined,
-    [assetCommit, assetDocument, assetMode, assetVault],
-  );
-  const targetStrings = useMemo(() => extractAkbMarkdownLinkTargets(body), [body]);
-  const targetResolutionKey = useMemo(
-    () => [assetVault ?? "", assetDocument ?? "", assetCommit ?? "", ...targetStrings].join("\u0000"),
-    [assetCommit, assetDocument, assetVault, targetStrings],
-  );
-  const [targetResolutionState, setTargetResolutionState] = useState<{
-    key: string;
-    values: ReadonlyMap<string, AkbMarkdownTargetResolution>;
-  }>({ key: "", values: new Map() });
-
-  useEffect(() => {
-    if (!targetResolver || targetStrings.length === 0) return;
-    const controller = new AbortController();
-    void Promise.all(
-      targetStrings.map(async (target) => [
-        target,
-        await targetResolver.resolve(target, {
-          vault: assetVault,
-          document: assetDocument,
-          commit: assetCommit,
-          signal: controller.signal,
-        }),
-      ] as const),
-    ).then((entries) => {
-      if (!controller.signal.aborted) {
-        setTargetResolutionState({ key: targetResolutionKey, values: new Map(entries) });
-      }
-    });
-    return () => controller.abort();
-  }, [assetCommit, assetDocument, assetVault, targetResolutionKey, targetResolver, targetStrings]);
-  const targetResolutions =
-    targetResolver && targetResolutionState.key === targetResolutionKey
-      ? targetResolutionState.values
-      : undefined;
+  const targetResolutions = useAkbMarkdownTargetResolutions(body, {
+    vault: assetVault,
+    document: assetDocument,
+    commit: assetCommit,
+  });
   const components = useMemo(
     () => buildComponents(body, stableAssetContext, targetResolutions),
     [body, stableAssetContext, targetResolutions],

@@ -1,11 +1,9 @@
 import type {
   MarkdownAdapterError,
-  MarkdownAsset,
   MarkdownTarget,
   MarkdownTargetResolution,
   MarkdownTargetResolver,
   MarkdownTargetResolverContext,
-  MarkdownUnavailableReason,
   MarkdownUploadAdapter,
   MarkdownUploadBatchResult,
   MarkdownUploadContext,
@@ -160,42 +158,4 @@ export async function resolveMarkdownTargets(
   )
 
   return new Map(entries)
-}
-
-export function targetResolution(
-  target: MarkdownTarget,
-  runtimeUrl: string,
-  label?: string,
-): MarkdownTargetResolution {
-  return {
-    target: target.target,
-    kind: target.kind,
-    status: 'available',
-    runtimeUrl,
-    label,
-  }
-}
-
-export function unavailableTargetResolution(
-  target: MarkdownTarget,
-  reason: MarkdownUnavailableReason = 'unknown',
-  label?: string,
-): MarkdownTargetResolution {
-  return {
-    target: target.target,
-    kind: target.kind,
-    status: 'unavailable',
-    reason,
-    label,
-  }
-}
-
-export function isMarkdownAsset(value: unknown): value is MarkdownAsset {
-  if (!value || typeof value !== 'object') return false
-  const candidate = value as Partial<MarkdownAsset>
-  return (
-    (candidate.kind === 'file' || candidate.kind === 'attachment') &&
-    typeof candidate.target === 'string' &&
-    candidate.target.trim().length > 0
-  )
 }

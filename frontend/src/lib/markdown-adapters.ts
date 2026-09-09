@@ -1,3 +1,4 @@
+import { useEffect, useMemo, useState } from "react";
 import {
   copyFileToAttachment,
   getAttachmentMetadata,
@@ -20,6 +21,7 @@ export type AkbMarkdownTargetResolution =
       status: "available";
       runtimeUrl: string;
       label?: string;
+      expiresAt?: string;
     }
   | {
       target: string;
@@ -150,7 +152,10 @@ export function createAkbMarkdownTargetResolver(
 
         if (kind === "file" && parsed?.kind === "file") {
           const access = await getVaultFileDownloadUrl(vault, parsed.id);
-          return { target, kind, status: "available", runtimeUrl: access.download_url };
+          const expiresAt = typeof access.expires_in === "number" && access.expires_in > 0
+            ? new Date(Date.now() + access.expires_in * 1000).toISOString()
+            : undefined;
+          return { target, kind, status: "available", runtimeUrl: access.download_url, expiresAt };
         }
 
         const attachmentId = assetIdFromUrl(target);
@@ -188,6 +193,77 @@ export function createAkbMarkdownTargetResolver(
       return unavailable(target, kind);
     },
   };
+}
+
+const EMPTY_TARGET_RESOLUTIONS: ReadonlyMap<string, AkbMarkdownTargetResolution> = new Map();
+
+/** Resolve editor/viewer links and refresh short-lived runtime URLs in place. */
+export function useAkbMarkdownTargetResolutions(
+  markdown: string,
+  defaults: Partial<AkbMarkdownUploadContext> = {},
+): ReadonlyMap<string, AkbMarkdownTargetResolution> {
+  const { commit, document, vault } = defaults;
+  const targetStrings = useMemo(
+    () => extractAkbMarkdownLinkTargets(markdown),
+    [markdown],
+  );
+  const targetResolver = useMemo(
+    () => (vault ? createAkbMarkdownTargetResolver({ vault, document, commit }) : undefined),
+    [commit, document, vault],
+  );
+  const targetResolutionKey = useMemo(
+    () => [vault ?? "", document ?? "", commit ?? "", ...targetStrings].join("\u0000"),
+    [commit, document, targetStrings, vault],
+  );
+  const [targetResolutionState, setTargetResolutionState] = useState<{
+    key: string;
+    values: ReadonlyMap<string, AkbMarkdownTargetResolution>;
+  }>({ key: "", values: EMPTY_TARGET_RESOLUTIONS });
+  const [refreshNonce, setRefreshNonce] = useState(0);
+
+  useEffect(() => {
+    if (!targetResolver || targetStrings.length === 0) return;
+    const controller = new AbortController();
+    void Promise.all(
+      targetStrings.map(async (target) => [
+        target,
+        await targetResolver.resolve(target, {
+          vault,
+          document,
+          commit,
+          signal: controller.signal,
+        }),
+      ] as const),
+    ).then((entries) => {
+      if (!controller.signal.aborted) {
+        setTargetResolutionState({ key: targetResolutionKey, values: new Map(entries) });
+      }
+    });
+    return () => controller.abort();
+  }, [commit, document, refreshNonce, targetResolutionKey, targetResolver, targetStrings, vault]);
+
+  const targetResolutions =
+    targetResolver && targetResolutionState.key === targetResolutionKey
+      ? targetResolutionState.values
+      : EMPTY_TARGET_RESOLUTIONS;
+  const nextRefreshAt = useMemo(() => {
+    let earliest = Number.POSITIVE_INFINITY;
+    for (const resolution of targetResolutions.values()) {
+      if (resolution.status !== "available" || !resolution.expiresAt) continue;
+      const timestamp = Date.parse(resolution.expiresAt);
+      if (Number.isFinite(timestamp)) earliest = Math.min(earliest, timestamp);
+    }
+    return Number.isFinite(earliest) ? earliest : null;
+  }, [targetResolutions]);
+
+  useEffect(() => {
+    if (nextRefreshAt === null) return;
+    const delay = Math.max(0, nextRefreshAt - Date.now() - 1_000);
+    const timer = window.setTimeout(() => setRefreshNonce((value) => value + 1), delay);
+    return () => window.clearTimeout(timer);
+  }, [nextRefreshAt]);
+
+  return targetResolutions;
 }
 
 export function createAkbMarkdownAdapters(defaults: AkbMarkdownUploadContext) {

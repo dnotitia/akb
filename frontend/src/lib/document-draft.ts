@@ -80,11 +80,6 @@ export type DocumentEditDraftInput = Omit<
   "version" | "kind" | "updatedAt" | "expiresAt"
 >;
 
-export interface DocumentDraftSaveOptions {
-  /** Active server expiry boundary for this draft's unclaimed attachments. */
-  expiresAt?: string;
-}
-
 let fallbackTabId: string | null = null;
 
 function encodeKeyPart(value: string): string {
@@ -294,16 +289,10 @@ export function listDocumentEditDrafts(
   }
 }
 
-export function saveDocumentEditDraft(
-  draft: DocumentEditDraftInput,
-  options: DocumentDraftSaveOptions = {},
-): boolean {
+export function saveDocumentEditDraft(draft: DocumentEditDraftInput): boolean {
   const updatedAt = new Date();
-  const configuredExpiry = options.expiresAt ? Date.parse(options.expiresAt) : Number.NaN;
   const expiresAt = new Date(
-    Number.isFinite(configuredExpiry) && configuredExpiry > 0
-      ? configuredExpiry
-      : updatedAt.getTime() + DOCUMENT_EDIT_DRAFT_RETENTION_MS,
+    updatedAt.getTime() + DOCUMENT_EDIT_DRAFT_RETENTION_MS,
   );
   const assetExpiresAt = Object.fromEntries(
     Object.entries(draft.assetExpiresAt ?? {}).filter(

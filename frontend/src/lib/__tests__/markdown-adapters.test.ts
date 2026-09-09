@@ -57,6 +57,7 @@ describe("AKB Markdown target adapter", () => {
     apiMocks.getVaultFileDownloadUrl.mockResolvedValue({
       kind: "file",
       download_url: "https://signed.example/file?expires=60",
+      expires_in: 60,
     });
     apiMocks.getAttachmentMetadata.mockResolvedValue({
       kind: "attachment",
@@ -71,12 +72,14 @@ describe("AKB Markdown target adapter", () => {
       status: "available",
       runtimeUrl: "/vault/team/doc/notes%2Fguide.md",
     });
-    await expect(resolver.resolve(FILE)).resolves.toMatchObject({
+    const fileResolution = await resolver.resolve(FILE);
+    expect(fileResolution).toMatchObject({
       target: FILE,
       kind: "file",
       status: "available",
       runtimeUrl: "https://signed.example/file?expires=60",
     });
+    expect(fileResolution.status === "available" && fileResolution.expiresAt).toBeTruthy();
     await expect(resolver.resolve(ATTACHMENT)).resolves.toMatchObject({
       target: ATTACHMENT,
       kind: "attachment",
