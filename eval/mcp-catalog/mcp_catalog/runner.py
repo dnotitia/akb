@@ -90,6 +90,8 @@ class CredentialResolver:
                 self.token_for(profile)
             if not self.descriptor.pat_env:
                 raise NeedsUserInput(f"credential profile {profile!r} has no runtime PAT environment")
+            if os.environ.get(self.descriptor.pat_env):
+                continue
             if not os.environ.get(self.descriptor.username_env) or not os.environ.get(self.descriptor.password_env):
                 raise NeedsUserInput(
                     f"credential profile {profile!r} needs either its PAT environment or "
@@ -134,14 +136,14 @@ class BenchmarkRunner:
                     f"({model_spec.base_url_env}, {model_spec.provider_key_env})"
                 )
             model_secrets.append(api_key)
+        resolver = CredentialResolver(self.manifest, self.descriptor, tuple(model_secrets))
+        profiles = resolver.required_profiles(self.tasks)
+        resolver.validate_inputs(profiles)
         fixture = RuntimeFixture(self.descriptor)
         try:
             runtime = await fixture.preflight()
         finally:
             await fixture.close()
-        resolver = CredentialResolver(self.manifest, self.descriptor, tuple(model_secrets))
-        profiles = resolver.required_profiles(self.tasks)
-        resolver.validate_inputs(profiles)
         return {
             "runtime": runtime,
             "resolver": resolver,

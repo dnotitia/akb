@@ -43,7 +43,14 @@ uv run --locked --project eval/mcp-catalog \
 
 descriptor는 repository-owned schema-v2 `serve --profile transport-proxy`가
 stdout에 제공한 ready JSON이어야 한다. benchmark가 runtime을 시작하거나
-warm하지 않는다.
+warm하지 않는다. runtime supervisor와 같은 stdin handoff를 사용할 때는
+`--descriptor -`를 쓴다.
+
+```bash
+cat /private/run/descriptor.json | \
+  uv run --locked --project eval/mcp-catalog \
+  mcp-catalog-bench validate --descriptor -
+```
 
 ## Baseline과 candidate 실행
 
@@ -57,14 +64,16 @@ export MCP_BENCH_OPENAI_BASE_URL=https://api.openai.com/v1
 export MCP_BENCH_OPENAI_API_KEY='(secret supplied by the operator)'
 export MCP_BENCH_READ_ONLY_PAT='(scoped secret supplied by the operator)'
 
-uv run --locked --project eval/mcp-catalog \
+cat /private/run/baseline-descriptor.json | \
+  uv run --locked --project eval/mcp-catalog \
   mcp-catalog-bench run --arm baseline \
-  --descriptor /private/run/baseline-descriptor.json \
+  --descriptor - \
   --output /private/run/baseline.json
 
-uv run --locked --project eval/mcp-catalog \
+cat /private/run/candidate-descriptor.json | \
+  uv run --locked --project eval/mcp-catalog \
   mcp-catalog-bench run --arm candidate \
-  --descriptor /private/run/candidate-descriptor.json \
+  --descriptor - \
   --output /private/run/candidate.json
 
 uv run --locked --project eval/mcp-catalog \
