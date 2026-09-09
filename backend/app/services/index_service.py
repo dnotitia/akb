@@ -63,11 +63,11 @@ _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
 
 
 # Keys emitted by build_doc_metadata_header / build_table_chunk /
-# build_file_chunk. `strip_chunk_metadata_header` (search_service.py)
-# regex-matches the same set on the way out so the enrichment doesn't
-# leak into client-facing chunk content. Keep both in sync — adding a
-# new key here without updating the strip regex causes that key to
-# show up in drill_down / search / grep output.
+# build_file_chunk. `_CHUNK_HEADER_RE` (search_service.py) transcribes the
+# two builders that emit a body separator — key by key, in order — so the
+# enrichment doesn't leak into client-facing chunk content. Keep both in
+# sync: adding a new key to a builder here without adding its line there
+# causes that key to show up in drill_down / search / grep output.
 CHUNK_HEADER_KEYS: tuple[str, ...] = (
     "TITLE",
     "SUMMARY",

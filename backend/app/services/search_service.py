@@ -25,7 +25,7 @@ from app.models.document import SearchResponse, SearchResult
 from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.services import sparse_encoder
 from app.services.index_service import (
-    CHUNK_HEADER_KEYS,
+    OVERLAP,
     SOURCE_NATIVE_FILE,
     generate_embeddings,
 )
@@ -83,17 +83,49 @@ def _configured_document_source_type() -> str:
     )
 
 # Strips the indexing-time enrichment block emitted by
-# `build_doc_metadata_header`. The block is `TITLE: ...\n` followed by
-# at least one more KEY: line and a `\n\n` separator before the body.
-# It rides along with every doc chunk so the BM25 and dense legs see
-# doc-level signals during retrieval — but it is noise when the chunk
-# content is shown to humans or agents. Requiring TWO header lines + a
-# `\n\n` body separator avoids stripping a user paragraph that happens
-# to start with `TITLE: foo`. Table/file chunks are pure-metadata (no
-# body separator) and intentionally do not match. Keys imported from
-# index_service so adding a new builder field can't silently drift.
+# `build_doc_metadata_header` / `build_file_metadata_header`. It rides along
+# with every body chunk so the BM25 and dense legs see resource-level signals
+# during retrieval — but it is noise once the chunk content is shown to a
+# human or an agent.
+#
+# The two patterns below TRANSCRIBE those two builders, key by key and in
+# order, rather than accepting any run of key-shaped lines. The looser form
+# is what lets a user paragraph be eaten: a document whose body opens
+# `TITLE: …` and reaches something key-shaped before its first blank line
+# would have that prose removed. Pinning the structure costs nothing —
+# these are the only two shapes the indexer can write — and both require the
+# `PATH:` line that every such header carries.
+#
+# `SUMMARY:` is the one value interpolated verbatim (`f"SUMMARY: {summary}"`),
+# so it is the only line whose value can carry newlines of its own. Its group
+# is therefore lazy and DOTALL: it runs to the first point where the rest of
+# the header matches, which is the next `TAGS:` or `PATH:` line, and a blank
+# line inside the summary does not end it.
+#
+# Table/file *catalogue* chunks (`build_table_chunk` / `build_file_chunk`) are
+# pure metadata with no `\n\n` body separator and still do not match — there
+# would be nothing left of them.
+#
+# Keep in step with index_service: a new key in either builder needs a new
+# line here, or it starts leaking into drill_down / search / grep output.
+_DOC_METADATA_HEADER = (
+    r"TITLE:[^\n]*\n"
+    r"(?:SUMMARY:.*?\n)?"
+    r"(?:TAGS:[^\n]*\n)?"
+    r"PATH:[^\n]*\n"
+    r"(?:TYPE:[^\n]*\n)?"
+)
+_FILE_METADATA_HEADER = (
+    r"TITLE:[^\n]*\n"
+    r"TYPE:[^\n]*\n"
+    r"VAULT:[^\n]*\n"
+    r"PATH:[^\n]*\n"
+    r"URI:[^\n]*\n"
+    r"(?:SIZE:[^\n]*\n)?"
+)
 _CHUNK_HEADER_RE = re.compile(
-    rf"\ATITLE:[^\n]*\n(?:(?:{'|'.join(CHUNK_HEADER_KEYS)}):[^\n]*\n)+\n"
+    rf"\A(?:{_DOC_METADATA_HEADER}|{_FILE_METADATA_HEADER})\n",
+    re.DOTALL,
 )
 
 
@@ -106,6 +138,191 @@ def strip_chunk_metadata_header(text: str | None) -> str | None:
     if not text:
         return text
     return _CHUNK_HEADER_RE.sub("", text, count=1)
+
+
+def strip_chunk_context_line(text: str | None, section_path: str | None) -> str | None:
+    """Strip the `[# A > ## B]` heading-context line the indexer writes as
+    the first line of a section's first chunk.
+
+    `chunk_markdown` prepends `f"[{section_path}]\n"` to every section so
+    the retrieval legs see the heading path inside the embedded text. On
+    the way out it is pure duplication: `drill_down` already returns the
+    same value in the `section_path` field of the very same row, so the
+    line costs the caller tokens and tells it nothing new.
+
+    Removed only when the first line is *exactly* `[<section_path>]` for
+    this chunk's own `section_path` — a body that legitimately opens with
+    a bracketed line (a markdown link label, a citation key) never
+    matches, and the `section_path` field itself is untouched.
+    """
+    if not text or not section_path:
+        return text
+    prefix = f"[{section_path}]"
+    if not text.startswith(prefix):
+        return text
+    rest = text[len(prefix):]
+    if rest.startswith("\r\n"):
+        return rest[2:]
+    if rest.startswith("\n"):
+        return rest[1:]
+    if rest == "":
+        return rest
+    # `[section]` ran into other text on the same line — not the context
+    # line the indexer wrote.
+    return text
+
+
+def strip_chunk_overlap_prefix(previous: str | None, current: str | None) -> str | None:
+    """Remove the leading run of `current` that is an exact duplicate of the
+    tail of `previous`.
+
+    `_split_large_chunk` carries `OVERLAP` characters of each chunk into the
+    head of the next one so a sentence cut by the size cap is still embedded
+    intact on both sides. Reading a long section back therefore pays for that
+    window once per chunk boundary.
+
+    Only an exact character-for-character match is removed, and never more
+    than `OVERLAP` characters, so `previous + returned` reproduces
+    `previous + current` byte for byte — nothing a caller reading the whole
+    section can no longer see. When no prefix of `current` equals a suffix of
+    `previous`, `current` is returned untouched.
+    """
+    if not previous or not current:
+        return current
+    limit = min(OVERLAP, len(previous), len(current))
+    for size in range(limit, 0, -1):
+        if current[:size] == previous[-size:]:
+            return current[size:]
+    return current
+
+
+def canonical_chunk_id(value) -> str | None:
+    """A chunk id in one canonical spelling, or None if it is not a uuid.
+
+    Drivers return the same id in different shapes — lower-case, upper-case,
+    brace- or urn-wrapped — because each store round-trips it through its own
+    type. Matching a hit against a `chunks` row on the raw string therefore
+    misses for anything but the spelling PostgreSQL happens to emit. Both
+    sides of that lookup go through here instead.
+    """
+    if value is None:
+        return None
+    try:
+        return str(uuid.UUID(str(value)))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _chunk_index_of(hit, chunk_indexes: dict[str, int]) -> int | None:
+    """The ordinal of the chunk a hit matched, or None when it is unknown —
+    an id the driver did not spell as a uuid, or a chunk row that is gone."""
+    canonical = canonical_chunk_id(hit.chunk_id)
+    if canonical is None:
+        return None
+    return chunk_indexes.get(canonical)
+
+
+def _row_value(row, key, default=None):
+    """`row[key]` for asyncpg Records and plain dicts alike, tolerating a
+    projection that did not select `key`."""
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return default
+
+
+def clean_section_rows(rows) -> list[dict]:
+    """Build the `drill_down` section payload from stored chunk rows.
+
+    Every transform here removes bytes the caller cannot use: index-side
+    metadata (`strip_chunk_metadata_header`), the heading-context line that
+    duplicates the row's own `section_path` (`strip_chunk_context_line`), and
+    the indexing overlap window a continuation chunk repeats from its
+    predecessor (`strip_chunk_overlap_prefix`). Keys are never removed —
+    `section_path`, `content` and `chunk_index` are returned for every
+    surviving row.
+
+    The overlap strip is deliberately narrow. It fires only between rows the
+    writer could actually have overlapped: same document, consecutive
+    `chunk_index`, same `section_path`, and a `content` that carried neither a
+    metadata header nor a context line (both mark the *first* chunk of a
+    section, which `_split_large_chunk` never prefixes with an overlap). That
+    keeps it from nibbling a character off the start of a new section just
+    because the previous section happened to end with the same one.
+
+    A chunk is also emitted once. `chunks` carries no uniqueness constraint on
+    `(source_id, chunk_index)`, so a re-index that inserted before its delete
+    landed leaves the same body sitting at the same position more than once
+    and every `drill_down` — the `pattern` filter especially, which matches on
+    body text — hands the agent the same paragraph several times over. Rows
+    are collapsed on `(document, chunk_index, section_path, stored content)`:
+    an identical row is a duplicate and goes, while two rows that differ in
+    any part of that identity are both kept. Dropping one of *those* would
+    pick a winner the query has no tiebreaker for, so the response would stop
+    being deterministic in exactly the case where the difference matters.
+
+    A position that does carry two different bodies also suspends the overlap
+    strip across it. Two generations of the same chunk mean the neighbouring
+    row's text may belong to the other generation, and an exact match against
+    the wrong generation is still the wrong cut. Where the index is in that
+    state the bodies are returned whole.
+
+    `rows` must be ordered by `chunk_index`, as both SQL paths in
+    `drill_down` are.
+    """
+    rows = list(rows)
+    # Positions this call sees more than one distinct body for. Computed up
+    # front because the decision for chunk n depends on a row that has not
+    # been reached yet.
+    bodies_at: dict[tuple, set] = {}
+    for r in rows:
+        bodies_at.setdefault(
+            (_row_value(r, "doc_id"), r["chunk_index"]), set()
+        ).add(r["content"])
+    contested = {key for key, bodies in bodies_at.items() if len(bodies) > 1}
+
+    sections: list[dict] = []
+    seen: set[tuple] = set()
+    # doc id -> (chunk_index, cleaned content, section_path) of the row this
+    # document last contributed. Keyed by document because the same call can
+    # (in principle) surface chunks from more than one row of `documents`.
+    previous: dict[object, tuple[int, str, object]] = {}
+    for r in rows:
+        section_path = r["section_path"]
+        chunk_index = r["chunk_index"]
+        doc_key = _row_value(r, "doc_id")
+        stored = r["content"]
+
+        identity = (doc_key, chunk_index, section_path, stored)
+        if identity in seen:
+            continue
+        seen.add(identity)
+
+        content = strip_chunk_metadata_header(stored)
+        content = strip_chunk_context_line(content, section_path)
+        section_first_chunk = content != stored
+
+        prior = previous.get(doc_key)
+        if (
+            prior is not None
+            and not section_first_chunk
+            and isinstance(chunk_index, int)
+            and prior[0] + 1 == chunk_index
+            and prior[2] == section_path
+            and (doc_key, prior[0]) not in contested
+            and (doc_key, chunk_index) not in contested
+        ):
+            content = strip_chunk_overlap_prefix(prior[1], content)
+
+        if isinstance(chunk_index, int) and content is not None:
+            previous[doc_key] = (chunk_index, content, section_path)
+
+        sections.append({
+            "section_path": section_path,
+            "content": content,
+            "chunk_index": chunk_index,
+        })
+    return sections
 
 
 def fuse_original_and_reranked_hits(
@@ -808,6 +1025,7 @@ class SearchService:
 
         pool = await get_pool()
         meta: dict[tuple[str, str], dict] = {}
+        chunk_indexes: dict[str, int] = {}
         async with pool.acquire() as conn:
             if by_type["document"]:
                 rows = await conn.fetch(
@@ -1097,6 +1315,34 @@ class SearchService:
                         else None
                     )
 
+            # Chunk-level identity for the row that matched. `VectorHit`
+            # carries `section_path` but no ordinal, and the drivers differ in
+            # what they store, so read it from `chunks` — PG is the source of
+            # truth for chunk rows, and this is one keyed lookup for the whole
+            # result page. A hit whose chunk row has since been deleted simply
+            # gets no ordinal; the hit itself is unaffected.
+            chunk_uuids = sorted(
+                {
+                    canonical
+                    for canonical in (canonical_chunk_id(h.chunk_id) for h in hits)
+                    if canonical is not None
+                }
+            )
+            if chunk_uuids:
+                rows = await conn.fetch(
+                    """
+                    SELECT c.id::text AS chunk_id, c.chunk_index
+                      FROM chunks c
+                     WHERE c.id = ANY($1::uuid[])
+                    """,
+                    [uuid.UUID(x) for x in chunk_uuids],
+                )
+                for r in rows:
+                    chunk_id = canonical_chunk_id(_row_value(r, "chunk_id"))
+                    chunk_index = _row_value(r, "chunk_index")
+                    if chunk_id is not None and isinstance(chunk_index, int):
+                        chunk_indexes[chunk_id] = chunk_index
+
         from app.services.uri_service import doc_uri, table_uri, file_uri
 
         results: list[SearchResult] = []
@@ -1133,7 +1379,18 @@ class SearchService:
                     doc_type=m["doc_type"], summary=m["summary"],
                     status=m.get("status"),
                     tags=m["tags"], score=h.score,
-                    matched_section=(strip_chunk_metadata_header(h.content) or "")[:500] or None,
+                    # Cleaned before the clip, not after: the heading-context
+                    # line duplicates `section_path` on this very row, so
+                    # leaving it in would spend the first ~40 characters of
+                    # the excerpt restating the field beside it.
+                    matched_section=(
+                        strip_chunk_context_line(
+                            strip_chunk_metadata_header(h.content),
+                            h.section_path,
+                        ) or ""
+                    )[:500] or None,
+                    section_path=(h.section_path or None),
+                    chunk_index=_chunk_index_of(h, chunk_indexes),
                 )
             )
         return results
@@ -1638,7 +1895,7 @@ class SearchService:
             if section:
                 rows = await conn.fetch(
                     f"""
-                    SELECT c.section_path, c.content, c.chunk_index
+                    SELECT c.section_path, c.content, c.chunk_index, d.id AS doc_id
                     FROM chunks c
                     JOIN documents d ON c.source_id = d.id AND c.source_type = 'document'
                     JOIN vaults v ON d.vault_id = v.id
@@ -1652,7 +1909,7 @@ class SearchService:
             else:
                 rows = await conn.fetch(
                     f"""
-                    SELECT c.section_path, c.content, c.chunk_index
+                    SELECT c.section_path, c.content, c.chunk_index, d.id AS doc_id
                     FROM chunks c
                     JOIN documents d ON c.source_id = d.id AND c.source_type = 'document'
                     JOIN vaults v ON d.vault_id = v.id
@@ -1662,35 +1919,48 @@ class SearchService:
                     vault, doc_id,
                 )
 
-            return [
-                {
-                    "section_path": r["section_path"],
-                    "content": strip_chunk_metadata_header(r["content"]),
-                    "chunk_index": r["chunk_index"],
-                }
-                for r in rows
-            ]
+            return clean_section_rows(rows)
 
     async def list_section_headings(self, vault: str, doc_id: str, limit: int | None = None) -> list[str]:
-        """Return the document's section paths without their bodies.
+        """Return the document's distinct section paths, without their bodies,
+        in first-occurrence order.
 
         Used by `akb_drill_down`'s empty-match fallback to surface the
         available headings cheaply — pulling full content for a 1000-
         section doc just to extract heading strings is wasteful.
+
+        One heading, one row. A section longer than `MAX_CHUNK_SIZE` is stored
+        as several chunks that all carry the same `section_path`, so the
+        row-per-chunk form repeated a heading once per chunk and the caller's
+        outline cap was spent on duplicates instead of on headings it had not
+        seen yet. `limit` therefore bounds *headings*: the grouping happens in
+        SQL, before the LIMIT, and the Python pass keeps the contract true
+        regardless of how the rows arrive.
         """
         from app.repositories.document_repo import DocumentRepository
         pool = await get_pool()
         async with pool.acquire() as conn:
             doc_match = DocumentRepository.match_clause(2)
             sql = f"""
-                SELECT c.section_path
+                SELECT c.section_path, MIN(c.chunk_index) AS first_chunk_index
                 FROM chunks c
                 JOIN documents d ON c.source_id = d.id AND c.source_type = 'document'
                 JOIN vaults v ON d.vault_id = v.id
                 WHERE v.name = $1 AND {doc_match}
-                ORDER BY c.chunk_index
+                  AND c.section_path IS NOT NULL
+                  AND c.section_path <> ''
+                GROUP BY c.section_path
+                ORDER BY first_chunk_index, c.section_path
             """
             if isinstance(limit, int) and limit > 0:
                 sql += f" LIMIT {int(limit)}"
             rows = await conn.fetch(sql, vault, doc_id)
-            return [r["section_path"] for r in rows if r["section_path"]]
+            headings: list[str] = []
+            seen: set[str] = set()
+            for r in rows:
+                section_path = r["section_path"]
+                if not section_path or section_path in seen:
+                    continue
+                seen.add(section_path)
+                headings.append(section_path)
+            return headings

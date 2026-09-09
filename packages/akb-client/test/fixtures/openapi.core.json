@@ -757,6 +757,36 @@
       "AkbDocumentWriteEnvelope": {},
       "AkbDrillDownEnvelope": {},
       "AkbError": {},
+      "EventCursor": {
+        "type": "string",
+        "pattern": "^ec1\\.[A-Za-z0-9_-]+$"
+      },
+      "EventKind": {
+        "type": "string",
+        "pattern": "^[A-Za-z][A-Za-z0-9]*(?:[._:-][A-Za-z0-9]+)*$"
+      },
+      "ChangeEventEnvelopeV1": {
+        "type": "object",
+        "required": ["version", "cursor", "occurred_at", "vault", "kind", "payload"],
+        "properties": {
+          "version": { "type": "integer", "enum": [1] },
+          "cursor": { "$ref": "#/components/schemas/EventCursor" },
+          "occurred_at": { "type": "string", "format": "date-time" },
+          "vault": { "type": "string" },
+          "kind": { "$ref": "#/components/schemas/EventKind" },
+          "resource_uri": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+          "actor": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+          "payload": { "$ref": "#/components/schemas/AkbJsonObject" }
+        }
+      },
+      "TailCheckpointV1": {
+        "type": "object",
+        "required": ["version", "cursor"],
+        "properties": {
+          "version": { "type": "integer", "enum": [1] },
+          "cursor": { "$ref": "#/components/schemas/EventCursor" }
+        }
+      },
       "CreateCollectionRequest": {
         "properties": {
           "path": {

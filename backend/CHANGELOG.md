@@ -26,6 +26,28 @@ personal inbox. Email, push delivery, and historical-event replay are not includ
 
 See the [personal notifications guide](../docs/guides/personal-notifications.md).
 
+### drill_down and search payload hygiene
+
+`akb_drill_down` returns section bodies, not the scaffolding the indexer wrote
+into them. The `TITLE:/SUMMARY:/TAGS:/PATH:/TYPE:` block is now stripped even
+when the document summary spans several lines — until now those chunks came
+back as nothing but their own metadata. The `[# A > ## B]` context line, which
+repeats the `section_path` field on the same row, is gone from the body, and so
+is the 200-character overlap window a continuation chunk repeats from its
+predecessor (exact matches only, so reading a section end to end still yields
+every character). A chunk that is stored more than once at the same position is
+returned once. `mode='outline'` lists each heading once instead of once per
+chunk, so the 50-row cap now bounds headings rather than repeats.
+
+Search hits gain two additive fields, `section_path` and `chunk_index`, naming
+the chunk that matched so a caller can follow up with
+`akb_drill_down(section=...)` instead of searching again; `matched_section`
+drops the same redundant context line. No response loses a field.
+
+Every `tools/call` now leaves one line on the `akb.mcp.response` logger with
+the tool name, the serialised response size in bytes and the call duration, so
+payload cost is measurable per tool without a schema change.
+
 ### Applied search filters before result limits
 
 REST search now supports repeated document types and explicit resource kinds.

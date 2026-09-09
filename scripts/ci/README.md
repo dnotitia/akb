@@ -47,20 +47,35 @@ runner, so there is no second suite array to keep synchronized.
 
 The authenticated MCP behavior suite runs through the official Python SDK.
 `test_list_vaults_e2e.py` remains the small typed `akb_list_vaults({})`
-canary, while `test_product_e2e.py` covers the migrated product scenarios:
-vault and document lifecycle, browse/search/drill-down, move and aliases,
-relations/activity/history/diff, access roles and public levels, tables/SQL/
-DDL, publication, help, and deletion. Each pytest test receives the existing
-fixture's reset/login/SDK lifecycle; the access-control scenario adds a
-second user through the same authenticated endpoint and client lifecycle.
+canary, while `test_product_e2e.py` covers the baseline product scenarios and
+`test_detail_e2e.py` covers the migrated detailed regressions: exact-text edit,
+body hash/OCC, collection boundaries, Unicode search, graph link/unlink, grep
+replacement, and ownership transfer. `test_publication_okf_e2e.py` covers
+detailed publication lifecycle and public-resolution oracles, the MCP-only
+move regression, and OKF export/import round-trips with their writer boundary.
+The baseline suite covers vault and document lifecycle, browse/search/
+drill-down, move and aliases, relations/activity/history/diff, access roles
+and public levels, tables/SQL/DDL, basic publication, help, and deletion.
+Each pytest test receives the existing fixture's reset/login/SDK lifecycle;
+scenarios that need role boundaries add a second user through the same
+authenticated endpoint and client lifecycle.
 The fixture uses the SDK's public `Client` and Streamable HTTP transport in the
 pytest process; it does not invoke Inspector, Node, or a separate MCP driver.
 
-The mixed `backend/tests/test_mcp_e2e.sh` suite now retains only transport,
-protocol/session, and direct REST response checks. Its MCP product assertions
-and raw JSON-RPC helper were removed so the product behavior has one SDK-based
-execution path. REST-only checks, initialize/session checks, and the separate
-stdio/Inspector boundaries remain in their existing lanes.
+The detailed security suite also covers declarative table constraints and
+indexes, stable permission envelopes, private-document and graph boundaries,
+SQL failure-state integrity, and PAT write scopes. The PG-native ACL backstops
+remain in `test_pg_rbac_e2e.sh` and `test_vault_scope_sql_e2e.sh`; the retained
+shell security suite keeps only REST, health, and role-source checks plus the
+MCP setup calls needed to seed those REST assertions.
+
+The mixed shell suites retain only their non-migrated boundaries: transport and
+protocol/session checks, direct REST comparisons and ACLs, file byte hashes,
+and SQL/cross-vault checks. Their migrated MCP product assertions and unused
+raw JSON-RPC helpers were removed so each detailed MCP behavior has one
+SDK-based execution path. MCP setup calls that seed data for a retained REST
+or SQL check remain. The separate stdio/Inspector boundaries remain in their
+existing lanes.
 
 The repository runtime remains the owner of backend startup, readiness,
 fixture reset, credentials, and teardown. Give the same schema-v2 descriptor
@@ -108,7 +123,7 @@ The topology is deliberately small:
 | frontend (`--with-frontend`) | Ubuntu host process | `127.0.0.1:3000` by default | existing Vite SPA and per-run backend proxy |
 | fixture control | supervisor-owned in-process app | `127.0.0.1:8889` | health, discovery, and empty reset |
 | MCP pytest behavior suite | Ubuntu host process | no public listener | authenticated MCP product scenarios through the official Python SDK |
-| curated suite runner | Ubuntu host process | no public listener | exact 15-suite gate and count semantics |
+| curated suite runner | Ubuntu host process | no public listener | curated shell gate and count semantics |
 
 Only PostgreSQL and MinIO are managed by
 `scripts/ci/dependency-compose.yaml`. The root `docker-compose.yaml`

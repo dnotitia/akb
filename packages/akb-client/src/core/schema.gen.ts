@@ -7,6 +7,26 @@ import type { AkbOperation } from "./fetch.js";
 export type AkbJsonObject = { [key: string]: AkbJsonValue | undefined };
 export type AkbJsonObjectArray = AkbJsonObject[];
 
+export type EventCursor = string;
+
+export type EventKind = string;
+
+export interface ChangeEventEnvelopeV1 {
+  version: 1;
+  cursor: EventCursor;
+  occurred_at: string;
+  vault: string;
+  kind: EventKind;
+  resource_uri?: string | null;
+  actor?: string | null;
+  payload: AkbJsonObject;
+}
+
+export interface TailCheckpointV1 {
+  version: 1;
+  cursor: EventCursor;
+}
+
 export interface AkbTableEnvelope {
   kind: "table";
   uri?: string;
@@ -164,6 +184,8 @@ export interface AkbSearchResult {
   tags: string[];
   score: number;
   matched_section?: string | null;
+  section_path?: string | null;
+  chunk_index?: number | null;
   [key: string]: unknown;
 }
 
@@ -642,6 +664,10 @@ export interface operations {
 export interface components {
   schemas: {
     AkbError: AkbErrorPayload;
+    EventCursor: EventCursor;
+    EventKind: EventKind;
+    ChangeEventEnvelopeV1: ChangeEventEnvelopeV1;
+    TailCheckpointV1: TailCheckpointV1;
     AkbTableEnvelope: AkbTableEnvelope;
     AkbTableMigrationEnvelope: AkbTableMigrationEnvelope;
     AkbTableSchemaEnvelope: AkbTableSchemaEnvelope;

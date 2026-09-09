@@ -4,6 +4,7 @@ import {
   createLocalError,
   isAbortError,
 } from "./errors.js";
+import { makeChangeEventChannel } from "./channel.js";
 import { createQueryBuilder } from "./client/query-builder.js";
 
 export { AkbError } from "./errors.js";
@@ -20,6 +21,10 @@ export type {
   AkbTypedFetchInit,
 } from "./core/fetch.js";
 export type {
+  ChangeEventEnvelopeV1,
+  EventCursor,
+  EventKind,
+  TailCheckpointV1,
   AkbDocumentEnvelope,
   AkbDocumentWriteEnvelope,
   AkbCollectionCreateEnvelope,
@@ -66,6 +71,16 @@ export type {
   operations,
   paths,
 } from "./core/schema.gen.js";
+
+export type {
+  AkbChangeEventChannel,
+  AkbChangeEventListener,
+  AkbChangeEventListenerOptions,
+  AkbChangeEventSubscribeOptions,
+  AkbChangeEventSubscription,
+  AkbEventGapDetails,
+  AkbTailCheckpointListener,
+} from "./channel.js";
 
 export type AkbJsonValue =
   | string
@@ -676,6 +691,7 @@ export interface AkbClient<Schema = unknown> {
   request<T = AkbSuccessEnvelope>(path: string | URL, init?: RequestInit): Promise<AkbResult<T>>;
   vault(vault: string): AkbClient<Schema>;
   actingAs(claims: AkbClaims): AkbClient<Schema>;
+  channel(): import("./channel.js").AkbChangeEventChannel;
   readonly sql: AkbSqlTag;
   from<TableName extends AkbTableNames<Schema>>(table: TableName): AkbTableStub<
     AkbTableRow<Schema, TableName>,
@@ -916,18 +932,7 @@ function makeClient(
 
   const request = (async (path: string | URL, init: RequestInit = {}): Promise<AkbResult<unknown>> => {
     const requestUrl = resolveRequestUrl(config.baseUrl, path);
-    const headers = new Headers(init.headers);
-    if (!headers.has("content-type") && init.body !== undefined) {
-      headers.set("content-type", "application/json");
-    }
-    const token = resolveToken(config.token ?? config.apiKey ?? null);
-    if (token && !headers.has("authorization")) {
-      headers.set("authorization", `Bearer ${token}`);
-    }
-    if (scope.claims && !headers.has("x-akb-claims")) {
-      headers.set("x-akb-claims", JSON.stringify(scope.claims));
-    }
-    return await akbFetch(requestUrl, { ...init, headers }, fetchImpl);
+    return await akbFetch(requestUrl, withClientHeaders(config, scope, init), fetchImpl);
   }) as AkbClient["request"];
 
   const client = {
@@ -937,6 +942,17 @@ function makeClient(
     },
     actingAs(claims: AkbClaims) {
       return makeClient(config, { ...scope, claims: normalizeClaims(claims) });
+    },
+    channel() {
+      const vault = resolveEventVault(scope.defaultVault);
+      return makeChangeEventChannel(vault, async (path, init) => {
+        const requestUrl = resolveRequestUrl(config.baseUrl, path);
+        return await fetchResponse(
+          requestUrl,
+          withClientHeaders(config, scope, init),
+          fetchImpl,
+        );
+      });
     },
     sql(strings: TemplateStringsArray, ...values: unknown[]) {
       if (!scope.defaultVault) {
@@ -972,6 +988,25 @@ function resolveToken(
 ): string | null {
   const value = typeof token === "function" ? token() : token;
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function withClientHeaders(
+  config: Required<Pick<AkbClientConfig, "baseUrl">> & AkbClientOptions,
+  scope: AkbClientScope,
+  init: RequestInit,
+): RequestInit {
+  const headers = new Headers(init.headers);
+  if (!headers.has("content-type") && init.body !== undefined) {
+    headers.set("content-type", "application/json");
+  }
+  const token = resolveToken(config.token ?? config.apiKey ?? null);
+  if (token && !headers.has("authorization")) {
+    headers.set("authorization", `Bearer ${token}`);
+  }
+  if (scope.claims && !headers.has("x-akb-claims")) {
+    headers.set("x-akb-claims", JSON.stringify(scope.claims));
+  }
+  return { ...init, headers };
 }
 
 function normalizeClaims(claims: AkbClaims): AkbClaims {
@@ -1595,6 +1630,11 @@ function resolveStorageVault(vault: string | null | undefined): string {
 function resolveActivityVault(vault: string | null | undefined): string {
   if (typeof vault === "string" && vault.length > 0) return vault;
   throw new TypeError("Select a vault before listing activity: client.vault(\"...\").activity.list().");
+}
+
+function resolveEventVault(vault: string | null | undefined): string {
+  if (typeof vault === "string" && vault.length > 0) return vault;
+  throw new TypeError("Select a vault before using Change Event channels: client.vault(\"...\").channel().");
 }
 
 function resolveGraphVault(vault: string | null | undefined, operation: "overview" | "health"): string {

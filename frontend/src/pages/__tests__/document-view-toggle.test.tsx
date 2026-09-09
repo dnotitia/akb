@@ -8,11 +8,14 @@ import { CurrentUserProvider } from "@/contexts/current-user-context";
 import DocumentPage from "@/pages/document";
 import { readRecentDocumentViews } from "@/lib/recent-document-views";
 
+const editorAssetIds = vi.hoisted(() => ({ value: [] as readonly string[] }));
+
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
   return {
     ...actual,
     getDocument: vi.fn(),
+    discardAsset: vi.fn(),
     getDocumentDiff: vi.fn(),
     getDocumentHistoryWithFallback: vi.fn(),
     getVaultInfo: vi.fn(),
@@ -29,17 +32,17 @@ vi.mock("@/lib/api", async (importOriginal) => {
 vi.mock("@/components/markdown-editor", () => ({
   default: ({
     value,
-    onChange,
-    ariaLabel,
-  }: {
-    value: string;
-    onChange?: (value: string) => void;
-    ariaLabel?: string;
+      onChange,
+      ariaLabel,
+    }: {
+      value: string;
+      onChange?: (value: string, assetIds?: readonly string[]) => void;
+      ariaLabel?: string;
   }) => (
     <textarea
       aria-label={ariaLabel}
       defaultValue={value}
-      onChange={(event) => onChange?.(event.currentTarget.value)}
+      onChange={(event) => onChange?.(event.currentTarget.value, editorAssetIds.value)}
     />
   ),
 }));
@@ -47,6 +50,7 @@ vi.mock("@/components/markdown-editor", () => ({
 import {
   ApiError,
   DocumentRevisionApiError,
+  discardAsset,
   deleteDocument,
   getDocument,
   getDocumentDiff,
@@ -59,6 +63,7 @@ import {
 } from "@/lib/api";
 
 const getDocumentMock = getDocument as unknown as ReturnType<typeof vi.fn>;
+const discardAssetMock = discardAsset as unknown as ReturnType<typeof vi.fn>;
 const deleteDocumentMock = deleteDocument as unknown as ReturnType<typeof vi.fn>;
 const getDocumentDiffMock = getDocumentDiff as unknown as ReturnType<typeof vi.fn>;
 const getDocumentHistoryMock = getDocumentHistoryWithFallback as unknown as ReturnType<typeof vi.fn>;
@@ -179,7 +184,7 @@ function LocationProbe() {
 
 function renderAt(url: string) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  return { ...render(
     <QueryClientProvider client={qc}>
       <MemoryRouter initialEntries={[url]}>
         <CurrentUserProvider user={CURRENT_USER}>
@@ -192,7 +197,7 @@ function renderAt(url: string) {
         <LocationProbe />
       </MemoryRouter>
     </QueryClientProvider>,
-  );
+  ), queryClient: qc };
 }
 
 function renderPreviewAt(url: string) {
@@ -234,11 +239,14 @@ function renderPreviewAt(url: string) {
 beforeEach(() => {
   localStorage.clear();
   getDocumentMock.mockReset();
+  discardAssetMock.mockReset();
+  discardAssetMock.mockResolvedValue(undefined);
   deleteDocumentMock.mockReset();
   getDocumentDiffMock.mockReset();
   getDocumentHistoryMock.mockReset();
   getVaultInfoMock.mockReset();
   getRelationsMock.mockReset();
+  editorAssetIds.value = [];
   updateDocumentMock.mockReset();
   browseVaultMock.mockReset();
   moveDocumentMock.mockReset();
@@ -839,7 +847,7 @@ describe("DocumentPage view toggle", () => {
       expect(updateDocumentMock).toHaveBeenCalledWith(
         "v",
         "notes/hello.md",
-        { content: "Updated from pinned HEAD" },
+        { content: "Updated from pinned HEAD", expected_commit: "abcdef1234567" },
       ),
     );
     await waitFor(() =>
@@ -852,6 +860,137 @@ describe("DocumentPage view toggle", () => {
       () =>
         expect(screen.getByText("Updated from pinned HEAD")).toBeInTheDocument(),
       { timeout: 5_000 },
+    );
+  });
+
+  it("keeps the dirty editor when a newer server read arrives", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "owner" });
+    let serverDoc = makeDoc();
+    getDocumentMock.mockImplementation(async () => serverDoc);
+    const rendered = renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await user.click(await screen.findByRole("button", { name: "Edit" }));
+    const editor = await screen.findByRole("textbox", {
+      name: "Document body (markdown)",
+    });
+    await user.clear(editor);
+    await user.type(editor, "Local draft that must stay visible");
+
+    serverDoc = makeDoc({
+      content: "New server body",
+      current_commit: "server-commit",
+    });
+    await rendered.queryClient.refetchQueries({
+      queryKey: ["document", "v", "notes/hello.md"],
+    });
+
+    expect(screen.getByRole("textbox", { name: "Document body (markdown)" })).toHaveValue(
+      "Local draft that must stay visible",
+    );
+    expect(screen.getByRole("textbox", { name: "Document title" })).toHaveValue("DocTitle");
+  });
+
+  it("shows a three-way OCC conflict, preserves the image draft, and rebases only explicitly", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "owner" });
+    let serverDoc = makeDoc();
+    getDocumentMock.mockImplementation(async () => serverDoc);
+    updateDocumentMock
+      .mockRejectedValueOnce(new ApiError("revision moved", 409, { code: "conflict" }))
+      .mockResolvedValueOnce({ current_commit: "saved-after-rebase", commit_hash: "saved-after-rebase" });
+    editorAssetIds.value = ["asset-1"];
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await user.click(await screen.findByRole("button", { name: "Edit" }));
+    const editor = await screen.findByRole("textbox", {
+      name: "Document body (markdown)",
+    });
+    await user.clear(editor);
+    await user.type(editor, "Local image draft");
+
+    serverDoc = makeDoc({
+      title: "Server title",
+      content: "Server changed body",
+      current_commit: "server-commit",
+    });
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(await screen.findByText("This document changed on the server")).toBeInTheDocument();
+    expect(screen.getByText("Original base")).toBeInTheDocument();
+    expect(screen.getByText("Your draft")).toBeInTheDocument();
+    expect(screen.getByText("Latest server version")).toBeInTheDocument();
+    expect(editor).toHaveValue("Local image draft");
+    expect(updateDocumentMock).toHaveBeenNthCalledWith(
+      1,
+      "v",
+      "notes/hello.md",
+      expect.objectContaining({ expected_commit: "abcdef1234567" }),
+    );
+    expect(discardAssetMock).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Apply draft to latest" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(updateDocumentMock).toHaveBeenLastCalledWith(
+        "v",
+        "notes/hello.md",
+        expect.objectContaining({ expected_commit: "server-commit" }),
+      ),
+    );
+    expect(discardAssetMock).not.toHaveBeenCalled();
+  });
+
+  it("restores the same valid draft after a failed save and reopening the document", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "owner" });
+    updateDocumentMock.mockRejectedValue(new Error("offline"));
+    const first = renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await user.click(await screen.findByRole("button", { name: "Edit" }));
+    const editor = await screen.findByRole("textbox", {
+      name: "Document body (markdown)",
+    });
+    await user.clear(editor);
+    await user.type(editor, "Offline draft body");
+    await screen.findByText("Draft saved locally");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByText("Your local draft is preserved. Retry when the server is available.")).toBeInTheDocument();
+
+    first.unmount();
+    expect(window.localStorage.length).toBeGreaterThan(0);
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+    await user.click(await screen.findByRole("button", { name: "Edit" }));
+
+    expect(await screen.findByText("Local draft restored")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Document body (markdown)" })).toHaveValue(
+      "Offline draft body",
+    );
+  });
+
+  it("does not resurrect a draft after explicit discard and a later reopen", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "owner" });
+    const first = renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await user.click(await screen.findByRole("button", { name: "Edit" }));
+    await user.type(
+      await screen.findByRole("textbox", { name: "Document body (markdown)" }),
+      "discard me",
+    );
+    await screen.findByText("Draft saved locally");
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await user.click(screen.getByRole("button", { name: "Discard changes" }));
+    await screen.findByRole("heading", { level: 2, name: "BodyHeading" });
+
+    first.unmount();
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+    await user.click(await screen.findByRole("button", { name: "Edit" }));
+
+    expect(screen.queryByText("Local draft restored")).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Document body (markdown)" })).toHaveValue(
+      SAMPLE_CONTENT,
     );
   });
 
@@ -916,6 +1055,7 @@ describe("DocumentPage view toggle", () => {
         "notes/hello.md",
         {
           content: "Updated contract body",
+          expected_commit: "abcdef1234567",
           title: "API contract",
           title_conflict_policy: "reject",
         },
@@ -977,7 +1117,7 @@ describe("DocumentPage view toggle", () => {
       expect(updateDocumentMock).toHaveBeenCalledWith(
         "v",
         "notes/hello.md",
-        { title: "API contract", title_conflict_policy: "allow" },
+        { title: "API contract", expected_commit: "abcdef1234567", title_conflict_policy: "allow" },
       ),
     );
   });
@@ -1022,7 +1162,7 @@ describe("DocumentPage view toggle", () => {
       expect(updateDocumentMock).toHaveBeenLastCalledWith(
         "v",
         "notes/hello.md",
-        { title: "API contract", title_conflict_policy: "allow" },
+        { title: "API contract", expected_commit: "abcdef1234567", title_conflict_policy: "allow" },
       ),
     );
   });
