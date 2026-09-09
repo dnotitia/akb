@@ -86,7 +86,10 @@ export function markNotificationSnapshot(snapshot: string) {
 export function documentSubscription(uri: string, method = "GET", signal?: AbortSignal) {
   return request<{ subscribed: boolean; resource_id: string }>(
     `notification-subscriptions?${new URLSearchParams({ uri })}`, { method, signal },
-  );
+  ).then(value => {
+    if (method !== "GET") window.dispatchEvent(new Event("akb:watch-changed"));
+    return value;
+  });
 }
 export function notificationSubscriptions(signal?: AbortSignal) {
   return request<{ items: DocumentSubscription[] }>("notification-subscriptions", { signal });

@@ -10,7 +10,7 @@ import {
   DialogDescription,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { documentPreviewReturnFocusId } from "@/lib/document-preview-navigation";
+import { documentPreviewReturnFocusId, documentPreviewReturnFocusFallbackId } from "@/lib/document-preview-navigation";
 
 function readWorkspaceLeftOffset() {
   if (typeof document === "undefined" || typeof window === "undefined") return 32;
@@ -34,6 +34,7 @@ export function DocumentPreviewDialog() {
   const closingRef = useRef(false);
   const [desktopLeftOffset] = useState(readWorkspaceLeftOffset);
   const returnFocusId = documentPreviewReturnFocusId(location);
+  const returnFocusFallbackId = documentPreviewReturnFocusFallbackId(location);
 
   function closePreview() {
     // Radix can report the same outside interaction through both the overlay
@@ -44,7 +45,8 @@ export function DocumentPreviewDialog() {
     if (!returnFocusId) return;
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
-        document.getElementById(returnFocusId)?.focus();
+        (document.getElementById(returnFocusId) ??
+          (returnFocusFallbackId ? document.getElementById(returnFocusFallbackId) : null))?.focus();
       });
     });
   }

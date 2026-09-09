@@ -1,11 +1,25 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "@/lib/api";
-import { notificationCount, notificationPage, NotificationsUnavailable, NotificationCategoriesUnavailable, NotificationConflict, markNotificationSnapshot } from "@/lib/api-notifications";
+import { notificationCount, notificationPage, NotificationsUnavailable, NotificationCategoriesUnavailable, NotificationConflict, markNotificationSnapshot, documentSubscription } from "@/lib/api-notifications";
 
 vi.mock("@/lib/api", () => ({ authenticatedFetch: vi.fn() }));
 afterEach(() => vi.clearAllMocks());
 
 describe("notification API compatibility", () => {
+  it("refreshes watching feeds only after a successful subscription mutation", async () => {
+    const refresh = vi.fn();
+    window.addEventListener("akb:watch-changed", refresh);
+    try {
+      vi.mocked(authenticatedFetch).mockImplementation(async () => new Response(JSON.stringify({ subscribed: false, resource_id: "id" })));
+      await documentSubscription("akb://work/doc/id");
+      expect(refresh).not.toHaveBeenCalled();
+      await documentSubscription("akb://work/doc/id", "DELETE");
+      expect(refresh).toHaveBeenCalledTimes(1);
+      vi.mocked(authenticatedFetch).mockRejectedValueOnce(new Error("offline"));
+      await expect(documentSubscription("akb://work/doc/id", "PUT")).rejects.toThrow();
+      expect(refresh).toHaveBeenCalledTimes(1);
+    } finally { window.removeEventListener("akb:watch-changed", refresh); }
+  });
   it("sends the category with the unread predicate and cursor", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce(new Response(JSON.stringify({ supported: true, unread_count: 1, snapshot: "3", items: [], category: "documents" })));
     await notificationPage("unread", "2", undefined, "documents");

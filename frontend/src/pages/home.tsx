@@ -34,6 +34,7 @@ import {
   listPATs,
   getAuthConfig,
 } from "@/lib/api";
+import { HomeRecentUpdates } from "@/components/home-recent-updates";
 import { recentIcon, recentTone } from "@/lib/recent";
 import type { AccessibleIndexingStatus } from "@/hooks/use-accessible-indexing-health";
 import { useCurrentUser } from "@/contexts/current-user-context";
@@ -42,33 +43,9 @@ import {
   type RecentDocumentView,
 } from "@/lib/recent-document-views";
 
-// Recent-activity fetch size. The list starts with this many; "Show more"
-// grows it (doubling — "this many again") up to RECENT_MAX. When a fetch comes
-// back full we render the count as "N+" rather than implying it's the total.
-const RECENT_LIMIT = 6;
-// Backend /recent caps `limit` at 100, so that's the ceiling for "Show more".
-const RECENT_MAX = 100;
 // How many vaults the Home preview shows before linking out to /vault.
 const VAULT_PREVIEW_LIMIT = 4;
 const HOME_SETUP_DISMISS_KEY = "akb.homeSetupDismissed";
-
-interface RecentRow {
-  doc_id: string;
-  vault: string;
-  path: string;
-  title: string;
-  type?: string;
-  commit?: string;
-  changed_at?: string;
-  /** Forward-compatible enrichment. Older backends omit these fields and the
-   *  row simply keeps its compact title/location shape. */
-  updated_by_name?: string;
-  author_name?: string;
-  created_by_name?: string;
-  action?: string;
-  summary?: string;
-  excerpt?: string;
-}
 
 interface PATRow {
   token_id: string;
@@ -92,6 +69,8 @@ export default function HomePage() {
   const [vaults, setVaults] = useState<VaultRow[]>([]);
   const [vaultsLoading, setVaultsLoading] = useState(true);
   const [vaultsError, setVaultsError] = useState(false);
+  const [recentKnowledge, setRecentKnowledge] = useState(false);
+  const [recentLoading, setRecentLoading] = useState(true);
   // The Home directory is a bounded preview. This state only preserves row
   // stability if an extra visible favorite is unpinned; discovery of the full
   // directory belongs to the always-visible "View all vaults" route.
@@ -99,11 +78,6 @@ export default function HomePage() {
   // Per-browser favorited vault IDs (localStorage) — same source the vault rail
   // uses, so pinning here and in the rail stay in sync.
   const { isFavorite, toggleFavorite, favOrder } = useVaultFavorites();
-  const [recent, setRecent] = useState<RecentRow[]>([]);
-  const [recentLoading, setRecentLoading] = useState(true);
-  const [recentError, setRecentError] = useState(false);
-  const [recentLimit, setRecentLimit] = useState(RECENT_LIMIT);
-  const [recentLoadingMore, setRecentLoadingMore] = useState(false);
   const [pats, setPats] = useState<PATRow[]>([]);
   const [patsLoading, setPatsLoading] = useState(true);
   const [vaultMetrics, setVaultMetrics] = useState<Record<string, VaultMetrics>>({});
@@ -114,9 +88,6 @@ export default function HomePage() {
   );
   const location = useLocation();
   const [recentViews, setRecentViews] = useState<RecentDocumentView[]>([]);
-  const recentCapped = recent.length >= recentLimit;
-  const canLoadMore =
-    !recentLoading && !recentError && recent.length >= recentLimit && recentLimit < RECENT_MAX;
 
   useEffect(() => {
     let cancelled = false;
@@ -134,8 +105,10 @@ export default function HomePage() {
       .finally(() => {
         if (!cancelled) setVaultsLoading(false);
       });
-    loadRecent(() => cancelled);
     loadPATs();
+    getRecent(undefined, 6).then(data => {
+      if (!cancelled) setRecentKnowledge(data.changes.some(change => change.path !== "overview/vault-skill.md"));
+    }).catch(() => {}).finally(() => { if (!cancelled) setRecentLoading(false); });
     return () => {
       cancelled = true;
     };
@@ -158,41 +131,6 @@ export default function HomePage() {
     } finally {
       setVaultsLoading(false);
     }
-  }
-
-  async function loadRecent(
-    isCancelled: () => boolean = () => false,
-    targetLimit: number = RECENT_LIMIT,
-    { more = false }: { more?: boolean } = {},
-  ) {
-    // "Show more" keeps the current list visible (spinner on the button);
-    // a fresh/initial load shows the skeleton.
-    if (more) setRecentLoadingMore(true);
-    else {
-      setRecentLoading(true);
-      setRecentError(false);
-    }
-    try {
-      const d = await getRecent(undefined, targetLimit);
-      if (isCancelled()) return;
-      setRecent(d.changes || []);
-      setRecentLimit(targetLimit);
-    } catch {
-      if (isCancelled()) return;
-      // On a "Show more" failure keep the existing list; only a fresh load
-      // surfaces the error panel.
-      if (!more) setRecentError(true);
-    } finally {
-      if (!isCancelled()) {
-        if (more) setRecentLoadingMore(false);
-        else setRecentLoading(false);
-      }
-    }
-  }
-
-  function loadMoreRecent() {
-    // Grow by the current count ("this many again"), capped at the backend max.
-    loadRecent(() => false, Math.min(recentLimit * 2, RECENT_MAX), { more: true });
   }
 
   // Scroll to #vaults / #recent when a link lands here with that hash. Keyed on
@@ -341,7 +279,7 @@ export default function HomePage() {
     (vault) => vault.status !== "archived" && vault.role !== "reader",
   );
   const hasKnowledge =
-    recent.some((change) => change.path !== "overview/vault-skill.md") ||
+    recentKnowledge ||
     Object.values(vaultMetrics).some(
       (metrics) =>
         (metrics.document_count ?? 0) > 1 ||
@@ -530,157 +468,8 @@ export default function HomePage() {
           className={`order-4 scroll-mt-24 2xl:col-start-1 ${
             continueWorking.length > 0 ? "2xl:row-start-3" : "2xl:row-start-2"
           }`}
-          aria-busy={recentLoading}
         >
-        <header className="flex min-h-10 flex-wrap items-center justify-between gap-3 border-b border-border pb-2.5">
-          <div className="flex min-w-0 items-center gap-2.5">
-            <TonalIcon tone="neutral" size="sm">
-              <FileClock aria-hidden />
-            </TonalIcon>
-            <h2 className="text-base font-semibold tracking-tight">Recent updates</h2>
-            {!recentLoading && !recentError && (
-              <Badge variant="default" className="tabular-nums">
-                {recent.length}{recentCapped ? "+" : ""}
-              </Badge>
-            )}
-          </div>
-          <span className="text-xs text-foreground-muted">Latest document changes across your Vaults</span>
-        </header>
-        <span className="sr-only" role="status" aria-live="polite">
-          {recentLoading
-            ? "Loading recent activity"
-            : recentError
-              ? "Could not load recent activity"
-              : `${recent.length} recent update${recent.length === 1 ? "" : "s"}`}
-        </span>
-
-        {recentLoading ? (
-          <Panel className="mt-4" aria-hidden>
-            <ul className="divide-y divide-border">
-              {Array.from({ length: 4 }).map((_, i) => (
-                <li key={i} className="grid grid-cols-[36px_minmax(0,1fr)_56px] items-center gap-3 px-4 py-3.5">
-                  <span className="h-9 w-9 rounded-[var(--radius-md)] bg-surface-muted" />
-                  <span className="min-w-0 space-y-2">
-                    <span className="block h-3 w-3/5 rounded bg-surface-muted" />
-                    <span className="block h-2.5 w-4/5 rounded bg-surface-muted" />
-                  </span>
-                  <span className="h-3 w-12 justify-self-end rounded bg-surface-muted" />
-                </li>
-              ))}
-            </ul>
-          </Panel>
-        ) : recentError ? (
-          <EmptyState
-            icon={
-              <span className="feature-tile feat-neutral h-14 w-14">
-                <AlertTriangle className="h-6 w-6" aria-hidden />
-              </span>
-            }
-            title="Couldn't load recent updates"
-            description="The latest document changes are temporarily unavailable."
-            action={<Button variant="outline" size="sm" onClick={() => loadRecent()}>Retry</Button>}
-          />
-        ) : recent.length === 0 ? (
-          <EmptyState
-            icon={
-              <span className="feature-tile feat-knowledge h-14 w-14">
-                <FileClock className="h-6 w-6" aria-hidden />
-              </span>
-            }
-            title="Nothing updated yet"
-            description="Document changes across your Vaults will appear here."
-          />
-        ) : (
-          <Panel className="mt-4">
-            <ol className="divide-y divide-border stagger">
-              {recent.map((change) => {
-                const Icon = recentIcon(change.type);
-                const tone = recentTone(change.type);
-                const updateAuthor = change.updated_by_name || change.author_name;
-                const creator = updateAuthor ? null : change.created_by_name;
-                const preview = change.excerpt?.trim() || change.summary?.trim();
-                return (
-                  <li key={`${change.doc_id}:${change.changed_at ?? change.commit ?? change.path}`}>
-                    <Link
-                      to={`/vault/${change.vault}/doc/${change.doc_id}`}
-                      className="home-activity-row group grid grid-cols-[36px_minmax(0,1fr)_auto] items-start gap-3 bg-surface px-4 py-3.5 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
-                    >
-                      <span
-                        className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-border"
-                        style={{
-                          color: tone,
-                          backgroundColor: `color-mix(in srgb, ${tone} 12%, transparent)`,
-                        }}
-                        aria-hidden
-                      >
-                        <Icon className="h-4 w-4" aria-hidden />
-                      </span>
-
-                      <span className="min-w-0">
-                        {updateAuthor && (
-                          <span className="mb-1 block truncate text-xs text-foreground-muted">
-                            <span className="font-medium text-foreground">{updateAuthor}</span>{" "}
-                            {recentActionLabel(change.action)}
-                          </span>
-                        )}
-                        <span
-                          className="block truncate text-sm font-semibold tracking-tight text-foreground transition-colors group-hover:text-link"
-                          title={change.title}
-                        >
-                          {change.title}
-                        </span>
-                        <span className="mt-1 flex min-w-0 items-center gap-1.5 text-xs text-foreground-muted">
-                          <TooltipText className="max-w-32 shrink-0 truncate font-medium text-link">
-                            {change.vault}
-                          </TooltipText>
-                          <ChevronRight className="h-3 w-3 shrink-0 text-subtle" aria-hidden />
-                          <span className="min-w-0 truncate" title={change.path}>{change.path}</span>
-                          {change.commit && (
-                            <code className="coord ml-1 hidden shrink-0 rounded-[var(--radius-sm)] border border-border bg-surface-muted px-1.5 py-0.5 font-mono sm:inline">
-                              {change.commit.slice(0, 7)}
-                            </code>
-                          )}
-                        </span>
-                        {creator && (
-                          <span className="mt-1 block truncate text-xs text-foreground-muted">
-                            Created by <span className="font-medium text-foreground">{creator}</span>
-                          </span>
-                        )}
-                        {preview && (
-                          <span className="mt-2 line-clamp-2 block max-w-4xl text-xs leading-relaxed text-foreground-muted">
-                            {preview}
-                          </span>
-                        )}
-                      </span>
-
-                      <span className="flex min-w-14 shrink-0 flex-col items-end gap-1.5">
-                        <RelativeTime iso={change.changed_at} className="justify-end text-right" />
-                        <ArrowUpRight
-                          className="h-3.5 w-3.5 text-subtle transition-token group-hover:text-link"
-                          aria-hidden
-                        />
-                      </span>
-                    </Link>
-                  </li>
-                );
-              })}
-            </ol>
-            {canLoadMore && (
-              <div className="border-t border-border p-2">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={loadMoreRecent}
-                  loading={recentLoadingMore}
-                  aria-label="Show more recent updates"
-                  className="w-full"
-                >
-                  {recentLoadingMore ? "Loading…" : "Show more"}
-                </Button>
-              </div>
-            )}
-          </Panel>
-        )}
+          <HomeRecentUpdates />
         </section>
       </div>
 
@@ -753,12 +542,6 @@ function ContinueWorkingSection({ items }: { items: RecentDocumentView[] }) {
       </ul>
     </section>
   );
-}
-
-function recentActionLabel(action?: string): string {
-  if (action === "create" || action === "created") return "created this document";
-  if (action === "move" || action === "moved") return "moved this document";
-  return "updated this document";
 }
 
 function HomeWorkspaceHeader({

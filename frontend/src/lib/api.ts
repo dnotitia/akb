@@ -2078,10 +2078,19 @@ export const deleteRelation = (source: string, target: string, relation?: string
 };
 
 // ── Recent ──
-export const getRecent = (vault?: string, limit = 20) => {
+export const getRecent = async (vault?: string, limit = 20, options?: { scope?: "all" | "watching"; cursor?: string }) => {
   const p = new URLSearchParams({ limit: String(limit) });
   if (vault) p.set("vault", vault);
-  return api<{ changes: any[] }>(`/recent?${p}`);
+  if (options?.scope) p.set("scope", options.scope);
+  if (options?.cursor) p.set("cursor", options.cursor);
+  const response = await authenticatedFetch(`${API_BASE}/recent?${p}`);
+  // Legacy routers often return string-detail errors. Keep the status so Home
+  // can distinguish missing support from a transient connection failure.
+  if ([404, 405, 501].includes(response.status)) {
+    throw new ApiError("Recent updates are unavailable on this server.", response.status, null);
+  }
+  if (!response.ok) await throwJsonApiError(response);
+  return response.json() as Promise<{ changes: any[]; scope?: "all" | "watching"; next_cursor?: string | null }>;
 };
 
 export interface ActivityEntry {

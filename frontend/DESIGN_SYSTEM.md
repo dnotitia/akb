@@ -291,7 +291,10 @@ an `sr-only` summary, never the only signal.
   browser-local scope honestly. The responsive primary
   column then carries four compact favorite-first Vault cards (four columns on
   wide desktop, two on medium screens) and the cross-Vault Recent updates ledger.
-  Recent rows progressively reveal updater provenance and a two-line excerpt
+  Recent updates offers compact All / Watching tabs with no count badges; the
+  Watching view adds a Manage watches link, not another dashboard card. Both
+  scopes show one row per document and open the shared reader preview without
+  acknowledging inbox notifications. Recent rows progressively reveal updater provenance and a one-line excerpt
   only when the backend includes those optional fields; older backends retain a
   complete compact title/location/time row with no empty labels. A
   21rem context rail carries only non-duplicated state: a dedicated Connect an

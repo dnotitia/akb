@@ -378,6 +378,8 @@ class NativeRevisionBackend:
         *,
         vault: str | None,
         limit: int,
+        watching: bool = False,
+        before: tuple | None = None,
     ) -> list[dict[str, Any]]:
         try:
             principal = uuid.UUID(user_id)
@@ -388,6 +390,8 @@ class NativeRevisionBackend:
             user_id=principal,
             vault=vault,
             limit=limit,
+            watching=watching,
+            before=before,
         )
         return await asyncio.to_thread(self._verified_changes, rows)
 
@@ -410,6 +414,7 @@ class NativeRevisionBackend:
             changes.append(
                 {
                     "doc_id": str(row["resource_id"]),
+                    "resource_id": str(row["resource_id"]),
                     "vault": row["vault_name"],
                     "path": row["path"],
                     "title": metadata.get("title") or row["path"].rsplit("/", 1)[-1],
