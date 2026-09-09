@@ -11,7 +11,7 @@ from typing import Any
 
 from .contracts import load_json
 from .evidence import write_json
-from .runner import BenchmarkRunner, NeedsUserInput, compare_artifacts, load_inputs
+from .runner import BenchmarkRunFailure, BenchmarkRunner, NeedsUserInput, compare_artifacts, load_inputs
 from .runtime import RuntimeContractError, RuntimeDescriptor
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -104,7 +104,11 @@ def validate(args: argparse.Namespace) -> int:
 async def run(args: argparse.Namespace) -> int:
     manifest, tasks, descriptor = load_inputs(args.manifest, args.corpus, args.descriptor)
     runner = BenchmarkRunner(manifest, tasks, descriptor, arm=args.arm)
-    artifact = await runner.run()
+    try:
+        artifact = await runner.run()
+    except BenchmarkRunFailure as exc:
+        write_json(args.output, exc.artifact, exc.secrets)
+        raise
     write_json(args.output, artifact, runner.secrets)
     print(
         json.dumps(
@@ -119,7 +123,7 @@ async def run(args: argparse.Namespace) -> int:
             sort_keys=True,
         )
     )
-    return 0
+    return 0 if artifact["status"] == "complete" else 1
 
 
 def compare(args: argparse.Namespace) -> int:

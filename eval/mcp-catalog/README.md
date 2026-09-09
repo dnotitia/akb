@@ -120,6 +120,13 @@ uv run --locked --project eval/mcp-catalog \
 시작하기 전에 `needs_user_input`으로 종료한다. descriptor의 credential
 환경변수 이름만 저장되며 값은 argv, log, report, trace에 남지 않는다.
 
+각 trial의 reset은 reset endpoint 응답만으로 완료 처리하지 않는다. repository가
+선언한 app/fixture health가 모두 `status=ready`이고 fixture scenario가 일치할
+때까지 기다린 뒤 state observation과 provider execution을 시작한다. reset 또는
+PAT cleanup이 실패하면 primary failure stage를 유지하고, 이미 완료된 trial과
+`budget_used`를 포함한 redacted `status=incomplete` artifact를 먼저 기록한 뒤
+non-zero로 종료한다. 불완전 artifact는 `compare` 입력으로 허용하지 않는다.
+
 ## Evidence
 
 각 run artifact에는 다음이 들어간다.

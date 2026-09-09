@@ -8,6 +8,7 @@ import json
 import os
 import re
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Callable, Literal, cast
@@ -22,7 +23,7 @@ from pydantic_ai.usage import UsageLimits
 from pydantic_evals import Case, Dataset
 from pydantic_evals.evaluators import EvaluationReason, Evaluator, EvaluatorContext, ReportEvaluator, ReportEvaluatorContext
 from pydantic_evals.lifecycle import CaseLifecycle
-from pydantic_evals.reporting import EvaluationReport, ScalarResult
+from pydantic_evals.reporting import EvaluationReport, ReportCaseFailure, ScalarResult
 
 from .catalog import ConnectionSpec, create_client, create_toolset
 from .contracts import OPENROUTER_BASE_URL, BenchmarkRunManifest, ModelSpec, TaskManifest
@@ -223,43 +224,87 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
         fixture: RuntimeFixture,
         token_for: Callable[[str], str],
         secrets_for: Callable[[str], tuple[str, ...]],
+        failure_sink: list[Exception] | None = None,
+        cleanup_sink: list[Exception] | None = None,
     ) -> None:
         super().__init__(case)
         self.fixture = fixture
         self.token_for = token_for
         self.secrets_for = secrets_for
+        self.failure_sink = failure_sink
+        self.cleanup_sink = cleanup_sink
         self.context: TrialContext | None = None
 
     async def setup(self) -> None:
         task = self.case.inputs
-        token = self.token_for(task.fixture.credential_profile)
-        await self.fixture.reset()
-        before = await self.fixture.observe(task.expected_final_state.probe, token=token)
-        self.context = TrialContext(task=task, token=token, before=before, secrets=self.secrets_for(task.fixture.credential_profile))
-        self.context.context_token = CURRENT_TRIAL.set(self.context)
+        try:
+            if self.failure_sink:
+                raise self.failure_sink[0]
+            token = self.token_for(task.fixture.credential_profile)
+            await self.fixture.reset()
+            before = await self.fixture.observe(task.expected_final_state.probe, token=token)
+            self.context = TrialContext(
+                task=task,
+                token=token,
+                before=before,
+                secrets=self.secrets_for(task.fixture.credential_profile),
+            )
+            self.context.context_token = CURRENT_TRIAL.set(self.context)
+        except Exception as exc:
+            self._record_failure(exc)
+            raise
 
     async def prepare_context(self, ctx: EvaluatorContext[TaskManifest, TrialOutcome, dict[str, Any]]) -> EvaluatorContext[TaskManifest, TrialOutcome, dict[str, Any]]:
-        if self.context is None:
-            raise RuntimeContractError("trial lifecycle context was not initialized")
-        after = await self.fixture.observe(self.case.inputs.expected_final_state.probe, token=self.context.token)
-        ctx.output.finalize(self.case.inputs, self.context.before, after)
-        ctx.metrics.update(outcome_metrics(ctx.output))
-        ctx.attributes.update(
-            {
-                "transport": ctx.output.transport,
-                "model_class": ctx.output.model_class,
-                "state_available": ctx.output.state_available_after,
-            }
-        )
-        return ctx
+        try:
+            if self.context is None:
+                raise RuntimeContractError("trial lifecycle context was not initialized")
+            after = await self.fixture.observe(self.case.inputs.expected_final_state.probe, token=self.context.token)
+            ctx.output.finalize(self.case.inputs, self.context.before, after)
+            ctx.metrics.update(outcome_metrics(ctx.output))
+            ctx.attributes.update(
+                {
+                    "transport": ctx.output.transport,
+                    "model_class": ctx.output.model_class,
+                    "state_available": ctx.output.state_available_after,
+                }
+            )
+            return ctx
+        except Exception as exc:
+            self._record_failure(exc)
+            raise
 
     async def teardown(self, result: Any) -> None:
         try:
             # A reset after the observation is the failure cleanup boundary.
-            await self.fixture.reset()
+            try:
+                await self.fixture.reset()
+            except Exception as exc:
+                if isinstance(result, ReportCaseFailure):
+                    self._record_cleanup(exc)
+                    result.error_message = (
+                        f"{result.error_message}; cleanup failed: "
+                        f"{redact_text(exc, self._secrets_for_case())}"
+                    )
+                else:
+                    self._record_failure(exc)
+                    raise
         finally:
             if self.context is not None and self.context.context_token is not None:
                 CURRENT_TRIAL.reset(self.context.context_token)
+
+    def _record_failure(self, exc: Exception) -> None:
+        if self.failure_sink is not None:
+            self.failure_sink.append(exc)
+
+    def _record_cleanup(self, exc: Exception) -> None:
+        if self.cleanup_sink is not None:
+            self.cleanup_sink.append(exc)
+
+    def _secrets_for_case(self) -> tuple[str, ...]:
+        try:
+            return self.secrets_for(self.case.inputs.fixture.credential_profile)
+        except Exception:
+            return ()
 
 
 @dataclass(slots=True)
@@ -334,6 +379,7 @@ class TrialExecutor:
         token_for: Callable[[str], str],
         secrets_for: Callable[[str], tuple[str, ...]],
         ledger: BudgetLedger,
+        outcome_sink: Callable[[TrialOutcome], None] | None = None,
     ) -> None:
         self.manifest = manifest
         self.arm = arm
@@ -344,6 +390,8 @@ class TrialExecutor:
         self.token_for = token_for
         self.secrets_for = secrets_for
         self.ledger = ledger
+        self.outcome_sink = outcome_sink
+        self._outcome_counts: dict[str, int] = defaultdict(int)
 
     async def execute(self, task: TaskManifest) -> TrialOutcome:
         context = CURRENT_TRIAL.get()
@@ -359,7 +407,7 @@ class TrialExecutor:
         try:
             await self.ledger.reserve_trial(reservation)
         except BudgetExceeded as exc:
-            return TrialOutcome(
+            outcome = TrialOutcome(
                 task_id=task.id,
                 category=task.category,
                 arm=self.arm,
@@ -368,6 +416,8 @@ class TrialExecutor:
                 transport=self.transport,
                 error=f"benchmark incomplete: {exc}",
             )
+            self._record_outcome(outcome)
+            return outcome
         settled = False
         try:
             try:
@@ -421,12 +471,21 @@ class TrialExecutor:
                 await self.ledger.charge(outcome, reserved_cost_usd=reservation)
             except BudgetExceeded as exc:
                 outcome.error = f"benchmark incomplete: {exc}"
+                self._record_outcome(outcome)
                 return outcome
             settled = True
+            self._record_outcome(outcome)
             return outcome
         finally:
             if not settled:
                 await self.ledger.release_trial(reservation)
+
+    def _record_outcome(self, outcome: TrialOutcome) -> None:
+        if self.outcome_sink is not None:
+            self._outcome_counts[outcome.task_id] += 1
+            self.outcome_sink(
+                outcome.model_copy(update={"repeat_index": self._outcome_counts[outcome.task_id]})
+            )
 
 
 def validate_model_configuration(spec: ModelSpec) -> tuple[str, str]:
@@ -791,6 +850,8 @@ async def evaluate_dataset(
     manifest: BenchmarkRunManifest,
     executor: TrialExecutor,
     fixture: RuntimeFixture,
+    failure_sink: list[Exception] | None = None,
+    cleanup_sink: list[Exception] | None = None,
 ) -> EvaluationReport[TaskManifest, TrialOutcome, dict[str, Any]]:
     cases = [Case(name=task.id, inputs=task, metadata={"category": task.category}) for task in tasks]
     dataset = Dataset(
@@ -804,20 +865,27 @@ async def evaluate_dataset(
         fixture=fixture,
         token_for=executor.token_for,
         secrets_for=executor.secrets_for,
+        failure_sink=failure_sink,
+        cleanup_sink=cleanup_sink,
     )
-    return await dataset.evaluate(
-        executor.execute,
-        max_concurrency=manifest.max_concurrency,
-        progress=False,
-        repeat=manifest.repeats,
-        lifecycle=lifecycle,
-        metadata={
-            "arm": executor.arm,
-            "model_class": executor.model_spec.class_name,
-            "transport": executor.transport,
-            "protocol_revision": manifest.protocol_revision,
-        },
-    )
+    try:
+        return await dataset.evaluate(
+            executor.execute,
+            max_concurrency=manifest.max_concurrency,
+            progress=False,
+            repeat=manifest.repeats,
+            lifecycle=lifecycle,
+            metadata={
+                "arm": executor.arm,
+                "model_class": executor.model_spec.class_name,
+                "transport": executor.transport,
+                "protocol_revision": manifest.protocol_revision,
+            },
+        )
+    except Exception as exc:
+        if failure_sink:
+            raise failure_sink[0] from exc
+        raise
 
 
 def summarize_outcomes(outcomes: list[TrialOutcome]) -> dict[str, float | int]:
