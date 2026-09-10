@@ -361,8 +361,9 @@ class BenchmarkRunManifest(ContractModel):
             details = "; ".join(f"{task_id}: {term}" for task_id, term in source_blind_violations)
             raise ValueError(f"task corpus contains source-aware tool hints: {details}")
         required_trials = len(tasks) * len(self.models) * len(self.transports) * self.repeats * len(self.arms)
-        if self.budget.max_model_requests < required_trials:
-            raise ValueError("max_model_requests is below the registered trial count")
+        smoke_cells = len(self.models) * len(self.transports)
+        if self.budget.max_model_requests < required_trials + smoke_cells:
+            raise ValueError("max_model_requests is below the registered trial and smoke-gate count")
         worst_case_per_trial = max(
             (
                 self.budget.max_input_tokens_per_trial * model.input_cost_per_million_usd
@@ -373,8 +374,17 @@ class BenchmarkRunManifest(ContractModel):
         )
         if worst_case_per_trial > self.budget.max_cost_per_trial_usd:
             raise ValueError("a preregistered worst-case trial cost exceeds max_cost_per_trial_usd")
-        if worst_case_per_trial * required_trials > self.budget.max_total_cost_usd:
-            raise ValueError("the preregistered worst-case trial set exceeds max_total_cost_usd")
+        smoke_worst_case = sum(
+            (
+                self.budget.max_input_tokens_per_trial * model.input_cost_per_million_usd
+                + self.budget.max_output_tokens_per_trial * model.output_cost_per_million_usd
+            )
+            / 1_000_000
+            for model in self.models
+            for _transport in self.transports
+        )
+        if worst_case_per_trial * required_trials + smoke_worst_case > self.budget.max_total_cost_usd:
+            raise ValueError("the preregistered worst-case trial and smoke-gate set exceeds max_total_cost_usd")
 
 
 class CatalogSnapshot(ContractModel):

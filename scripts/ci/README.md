@@ -121,7 +121,7 @@ The topology is deliberately small:
 | embedding stub | Ubuntu host process | `127.0.0.1:8888` | deterministic `/v1/embeddings` responses |
 | backend | Ubuntu host process | `127.0.0.1:8000` | AKB application under test |
 | frontend (`--with-frontend`) | Ubuntu host process | `127.0.0.1:3000` by default | existing Vite SPA and per-run backend proxy |
-| fixture control | supervisor-owned in-process app | `127.0.0.1:8889` | health, discovery, and empty reset |
+| fixture control | supervisor-owned in-process app | `127.0.0.1:8889` | health, discovery, and in-place scenario reset |
 | MCP pytest behavior suite | Ubuntu host process | no public listener | authenticated MCP product scenarios through the official Python SDK |
 | curated suite runner | Ubuntu host process | no public listener | curated shell gate and count semantics |
 
@@ -148,8 +148,11 @@ The supervisor has two modes:
   the existing frontend package's `pnpm run dev` contract on `--frontend-port`
   (default `3000`), with its `/api` and `/mcp` proxy pointed at this run's
   backend origin. The fixture's
-  `POST /reset` performs a safe empty reset and waits for backend readiness
-  again; the frontend process remains owned by the same serve lifecycle.
+  `POST /reset` performs an in-place scenario reset: it preserves the
+  PostgreSQL/MinIO containers, Compose network, and volumes while clearing
+  application schema, object, and Git fixture data, then waits for backend
+  readiness again; the frontend process remains owned by the same serve
+  lifecycle.
 
 Each invocation also selects one explicit capability profile. The default
 `tool-only` profile starts only the HTTP backend, PAT fixture, and shared
@@ -394,6 +397,8 @@ When changing this area, preserve all of the following:
 - the optional frontend process uses an explicit `--with-frontend` flag, an
   isolated `--frontend-port`, and the run's backend origin for Vite proxying;
 - descriptor stdout stays parseable as one schema v2 JSON line; and
+- fixture reset keeps PostgreSQL/MinIO dependency identities stable and
+  publishes the reset count, duration, and preservation evidence; and
 - runtime state stays private and outside the checkout.
 
 Run the focused runtime tests and the static checks described in the

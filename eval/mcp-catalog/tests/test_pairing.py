@@ -50,6 +50,7 @@ def _artifact(manifest: dict, *, candidate: bool) -> dict:
         "artifact_versions": {},
         "fixture": {"scenario": "app-control-plane", "reset": {"method": "POST", "url": "http://fixture/reset", "body": {"scenario": "app-control-plane"}}},
         "manifest": manifest,
+        "smoke_gate": {"status": "passed", "required_cells": [], "cells": []},
         "catalogs": {
             "http:default": {
                 "catalog_token_estimate": tokens,

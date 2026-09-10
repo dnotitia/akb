@@ -171,6 +171,18 @@ class TrialOutcome(BaseModel):
         )
 
 
+def _has_terminal_usage_evidence(outcome: TrialOutcome) -> bool:
+    return (
+        outcome.error is None
+        and outcome.model_requests > 0
+        and outcome.total_tokens > 0
+        and outcome.total_tokens == outcome.input_tokens + outcome.output_tokens
+        and bool(outcome.provider_evidence)
+        and outcome.routing_observed
+        and outcome.routing_valid
+    )
+
+
 @dataclass(slots=True)
 class _ObservedCall:
     tool_name: str
@@ -228,6 +240,8 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
         cleanup_sink: list[Exception] | None = None,
         refresh_token: Callable[[RuntimeFixture, str], Awaitable[str]] | None = None,
         mark_reset_complete: Callable[[], None] | None = None,
+        repeat_index: int | None = None,
+        checkpoint_sink: Callable[[TrialOutcome, Literal["completed", "failed", "incomplete"]], Awaitable[None]] | None = None,
     ) -> None:
         super().__init__(case)
         self.fixture = fixture
@@ -237,7 +251,10 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
         self.cleanup_sink = cleanup_sink
         self.refresh_token = refresh_token
         self.mark_reset_complete = mark_reset_complete
+        self.repeat_index = repeat_index
+        self.checkpoint_sink = checkpoint_sink
         self.context: TrialContext | None = None
+        self.output: TrialOutcome | None = None
 
     async def setup(self) -> None:
         task = self.case.inputs
@@ -266,6 +283,9 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
         try:
             if self.context is None:
                 raise RuntimeContractError("trial lifecycle context was not initialized")
+            self.output = ctx.output
+            if self.repeat_index is not None:
+                ctx.output.repeat_index = self.repeat_index
             after = await self.fixture.observe(self.case.inputs.expected_final_state.probe, token=self.context.token)
             ctx.output.finalize(self.case.inputs, self.context.before, after)
             ctx.metrics.update(outcome_metrics(ctx.output))
@@ -284,11 +304,21 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
     async def teardown(self, result: Any) -> None:
         try:
             # A reset after the observation is the failure cleanup boundary.
+            checkpoint_attempted = False
             try:
                 await self.fixture.reset()
                 if self.mark_reset_complete is not None:
                     self.mark_reset_complete()
+                if self.checkpoint_sink is not None and self.output is not None:
+                    checkpoint_attempted = True
+                    status: Literal["completed", "failed"] = "completed" if _has_terminal_usage_evidence(self.output) else "failed"
+                    await self.checkpoint_sink(self.output, status)
             except Exception as exc:
+                if self.checkpoint_sink is not None and self.output is not None and not checkpoint_attempted:
+                    try:
+                        await self.checkpoint_sink(self.output, "incomplete")
+                    except Exception as checkpoint_exc:
+                        self._record_cleanup(checkpoint_exc)
                 if isinstance(result, ReportCaseFailure):
                     self._record_cleanup(exc)
                     result.error_message = (
@@ -328,6 +358,27 @@ class BudgetLedger:
     reserved_cost_usd: float = 0.0
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
+    def restore(self, *, model_requests: int, input_tokens: int, output_tokens: int, cost_usd: float, wall_seconds: float) -> None:
+        """Restore already-spent usage from a checkpoint before new calls."""
+
+        if min(model_requests, input_tokens, output_tokens, cost_usd, wall_seconds) < 0:
+            raise BudgetExceeded("checkpoint budget totals cannot be negative")
+        budget = self.manifest.budget
+        if (
+            model_requests > budget.max_model_requests
+            or input_tokens > budget.max_input_tokens
+            or output_tokens > budget.max_output_tokens
+            or input_tokens + output_tokens > budget.max_total_tokens
+            or cost_usd > budget.max_total_cost_usd
+            or wall_seconds > budget.max_wall_seconds
+        ):
+            raise BudgetExceeded("checkpoint budget totals already exceed the registered run limits")
+        self.requests = model_requests
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.cost_usd = cost_usd
+        self.wall_seconds = wall_seconds
+
     async def reserve_trial(self, worst_case_cost_usd: float) -> None:
         async with self._lock:
             budget = self.manifest.budget
@@ -351,6 +402,10 @@ class BudgetLedger:
             budget = self.manifest.budget
             if outcome.model_requests > budget.max_requests_per_trial:
                 raise BudgetExceeded("max_requests_per_trial exceeded")
+            if outcome.input_tokens > budget.max_input_tokens_per_trial:
+                raise BudgetExceeded("max_input_tokens_per_trial exceeded")
+            if outcome.output_tokens > budget.max_output_tokens_per_trial:
+                raise BudgetExceeded("max_output_tokens_per_trial exceeded")
             if outcome.total_tokens > budget.max_tokens_per_trial:
                 raise BudgetExceeded("max_tokens_per_trial exceeded")
             if outcome.cost_usd > budget.max_cost_per_trial_usd:
@@ -496,6 +551,72 @@ class TrialExecutor:
             self.outcome_sink(
                 outcome.model_copy(update={"repeat_index": self._outcome_counts[outcome.task_id]})
             )
+
+
+async def execute_smoke(
+    task: TaskManifest,
+    *,
+    manifest: BenchmarkRunManifest,
+    arm: str,
+    model_spec: ModelSpec,
+    model: OpenAIChatModel,
+    transport: str,
+    fixture: RuntimeFixture,
+    token: str,
+    secrets: tuple[str, ...],
+) -> TrialOutcome:
+    """Make one real full-catalog request for the pre-run four-cell gate."""
+
+    recorder = ToolCallRecorder(operation_map=manifest.operation_map, secrets=secrets)
+    started = time.perf_counter()
+    result: Any = None
+    error: str | None = None
+    try:
+        if transport == "stdio":
+            command, args, environment = fixture.stdio_command(token)
+            spec = ConnectionSpec(
+                transport="stdio",
+                token=token,
+                app_origin=fixture.descriptor.app_origin,
+                command=command,
+                args=tuple(args),
+                environment=environment,
+            )
+        else:
+            spec = ConnectionSpec(
+                transport="http",
+                token=token,
+                app_origin=fixture.descriptor.app_origin,
+            )
+        client = create_client(spec)
+        toolset = create_toolset(client, recorder)
+        async with toolset:
+            agent = Agent(model=model, system_prompt=SYSTEM_PROMPT, retries=0)
+            result = await agent.run(
+                "Reply exactly OK without calling any tool.",
+                toolsets=cast(Any, [toolset]),
+                model_settings=cast(Any, model.settings),
+                usage_limits=UsageLimits(
+                    request_limit=manifest.budget.max_requests_per_trial,
+                    total_tokens_limit=manifest.budget.max_tokens_per_trial,
+                    cost_limit=Decimal(str(manifest.budget.max_cost_per_trial_usd)),
+                ),
+                infer_name=False,
+            )
+    except Exception as exc:
+        error = redact_exception(exc, secrets)
+    return outcome_from_run(
+        task=task,
+        arm=arm,
+        model_spec=model_spec,
+        transport=transport,
+        result=result,
+        recorder=recorder,
+        operation_map=manifest.operation_map,
+        error=error,
+        latency=time.perf_counter() - started,
+        secrets=secrets,
+    )
 
 
 def validate_model_configuration(spec: ModelSpec) -> tuple[str, str]:
@@ -870,6 +991,9 @@ async def evaluate_dataset(
     cleanup_sink: list[Exception] | None = None,
     refresh_token: Callable[[RuntimeFixture, str], Awaitable[str]] | None = None,
     mark_reset_complete: Callable[[], None] | None = None,
+    repeat: int | None = None,
+    repeat_indices: dict[str, int] | None = None,
+    checkpoint_sink: Callable[[TrialOutcome, Literal["completed", "failed", "incomplete"]], Awaitable[None]] | None = None,
 ) -> EvaluationReport[TaskManifest, TrialOutcome, dict[str, Any]]:
     cases = [Case(name=task.id, inputs=task, metadata={"category": task.category}) for task in tasks]
     dataset = Dataset(
@@ -887,13 +1011,15 @@ async def evaluate_dataset(
         cleanup_sink=cleanup_sink,
         refresh_token=refresh_token,
         mark_reset_complete=mark_reset_complete,
+        repeat_index=(repeat_indices or {}).get(case.inputs.id),
+        checkpoint_sink=checkpoint_sink,
     )
     try:
         return await dataset.evaluate(
             executor.execute,
             max_concurrency=manifest.max_concurrency,
             progress=False,
-            repeat=manifest.repeats,
+            repeat=manifest.repeats if repeat is None else repeat,
             lifecycle=lifecycle,
             metadata={
                 "arm": executor.arm,

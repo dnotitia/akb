@@ -184,6 +184,29 @@ async def test_pydantic_evals_repeat_uses_case_lifecycle_for_reset_and_report() 
 
 
 @pytest.mark.asyncio
+async def test_single_repeat_can_carry_exact_index_and_checkpoint_after_teardown() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "destructive-confirm-a")
+    events: list[tuple[int, str]] = []
+
+    async def checkpoint_sink(outcome: TrialOutcome, status: str) -> None:
+        events.append((outcome.repeat_index, status))
+
+    report = await evaluate_dataset(
+        [task],
+        manifest=manifest,
+        executor=FakeExecutor(manifest),
+        fixture=FakeFixture(),
+        repeat=1,
+        repeat_indices={task.id: 7},
+        checkpoint_sink=checkpoint_sink,
+    )
+
+    assert not report.failures
+    assert events == [(7, "failed")]
+
+
+@pytest.mark.asyncio
 async def test_provider_is_not_called_until_reset_readiness_recovers() -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "destructive-confirm-a")

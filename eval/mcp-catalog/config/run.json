@@ -57,9 +57,9 @@
     "max_total_cost_usd": 50.0,
     "max_wall_seconds": 10800,
     "max_requests_per_trial": 8,
-    "max_input_tokens_per_trial": 22400,
+    "max_input_tokens_per_trial": 40000,
     "max_output_tokens_per_trial": 1600,
-    "max_tokens_per_trial": 24000,
+    "max_tokens_per_trial": 41600,
     "max_cost_per_trial_usd": 1.0
   },
   "operation_map": {
