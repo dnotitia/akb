@@ -622,6 +622,7 @@ class BenchmarkRunner:
                         model_id=model_spec.model_id,
                         transport=transport,
                         error=f"benchmark incomplete: {redact_exception(exc, self.secrets)}",
+                        failure_kind="budget",
                     )
                     if self._checkpoint_store is not None:
                         self._refresh_store_secrets()
@@ -661,6 +662,7 @@ class BenchmarkRunner:
                         await ledger.charge(outcome, reserved_cost_usd=reservation)
                     except Exception as exc:
                         outcome.error = f"benchmark incomplete: {redact_exception(exc, self.secrets)}"
+                        outcome.failure_kind = "budget"
                         await ledger.release_trial(reservation)
                 except Exception as exc:
                     with_context = exc if isinstance(exc, RuntimeContractError) else RuntimeContractError(
@@ -675,10 +677,18 @@ class BenchmarkRunner:
                         model_id=model_spec.model_id,
                         transport=transport,
                         error=redact_exception(with_context, self.secrets),
+                        failure_kind="unknown",
                     )
                     await ledger.release_trial(reservation)
 
                 valid = valid_smoke_outcome(outcome)
+                if not valid and outcome.error is None:
+                    if outcome.successful_mcp_tool_calls == 0:
+                        outcome.error = "smoke gate did not observe a successful MCP tool call"
+                        outcome.failure_kind = "tool"
+                    else:
+                        outcome.error = "smoke gate did not observe a follow-up terminal response"
+                        outcome.failure_kind = "terminal_response"
                 status: Literal["completed", "failed", "incomplete"] = "completed" if valid else (
                     "incomplete" if outcome.error and outcome.error.startswith("benchmark incomplete:") else "failed"
                 )

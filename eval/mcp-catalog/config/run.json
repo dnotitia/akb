@@ -14,7 +14,7 @@
       "base_url_env": "MCP_BENCH_OPENROUTER_BASE_URL",
       "provider_key_env": "MCP_BENCH_OPENROUTER_API_KEY",
       "routing": {"order": ["parasail"], "allow_fallbacks": false, "require_parameters": true},
-      "settings": {"temperature": 0.0, "max_tokens": 4096},
+      "settings": {"temperature": 0.0, "max_tokens": 8192},
       "input_cost_per_million_usd": 0.14,
       "output_cost_per_million_usd": 0.28
     },
@@ -26,7 +26,7 @@
       "base_url_env": "MCP_BENCH_OPENROUTER_BASE_URL",
       "provider_key_env": "MCP_BENCH_OPENROUTER_API_KEY",
       "routing": {"order": ["parasail"], "allow_fallbacks": false, "require_parameters": true},
-      "settings": {"temperature": 0.0, "max_tokens": 4096},
+      "settings": {"temperature": 0.0, "max_tokens": 8192},
       "input_cost_per_million_usd": 0.24,
       "output_cost_per_million_usd": 2.2
     }
@@ -51,16 +51,10 @@
   },
   "budget": {
     "max_model_requests": 3000,
-    "max_input_tokens": 6000000,
-    "max_output_tokens": 1000000,
-    "max_total_tokens": 7000000,
     "max_total_cost_usd": 50.0,
     "max_wall_seconds": 10800,
     "max_requests_per_trial": 8,
-    "max_input_tokens_per_trial": 61440,
-    "max_output_tokens_per_trial": 4096,
-    "max_tokens_per_trial": 65536,
-    "max_cost_per_trial_usd": 1.0
+    "max_cost_per_trial_usd": 0.1
   },
   "operation_map": {
     "list": ["akb_list_vaults", "akb_browse"],

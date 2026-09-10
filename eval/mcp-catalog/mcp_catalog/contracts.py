@@ -223,25 +223,15 @@ class ModelSpec(ContractModel):
 
 class Budget(ContractModel):
     max_model_requests: int = Field(gt=0)
-    max_input_tokens: int = Field(gt=0)
-    max_output_tokens: int = Field(gt=0)
-    max_total_tokens: int = Field(gt=0)
     max_total_cost_usd: float = Field(gt=0)
     max_wall_seconds: int = Field(gt=0)
     max_requests_per_trial: int = Field(gt=0)
-    max_input_tokens_per_trial: int = Field(gt=0)
-    max_output_tokens_per_trial: int = Field(gt=0)
-    max_tokens_per_trial: int = Field(gt=0)
     max_cost_per_trial_usd: float = Field(gt=0)
 
     @model_validator(mode="after")
-    def validate_token_totals(self) -> Budget:
-        if self.max_total_tokens != self.max_input_tokens + self.max_output_tokens:
-            raise ValueError("max_total_tokens must equal input plus output token caps")
+    def validate_limits(self) -> Budget:
         if self.max_requests_per_trial > self.max_model_requests:
             raise ValueError("per-trial request cap cannot exceed global request cap")
-        if self.max_input_tokens_per_trial + self.max_output_tokens_per_trial != self.max_tokens_per_trial:
-            raise ValueError("per-trial input and output caps must equal the total token cap")
         return self
 
 
@@ -314,8 +304,8 @@ class BenchmarkRunManifest(ContractModel):
             raise ValueError("models must include one primary and one lightweight class")
         if len({model.class_name for model in self.models}) != len(self.models):
             raise ValueError("each model class must be registered exactly once")
-        if any(model.settings["max_tokens"] != self.budget.max_output_tokens_per_trial for model in self.models):
-            raise ValueError("model output limits must match max_output_tokens_per_trial")
+        if len({model.settings["max_tokens"] for model in self.models}) != 1:
+            raise ValueError("model output limits must be consistent across the registered models")
         if set(self.category_minimums) != {
             "single_operation",
             "ambiguous_action",
@@ -366,27 +356,9 @@ class BenchmarkRunManifest(ContractModel):
         smoke_cells = len(self.models) * len(self.transports)
         if self.budget.max_model_requests < required_trials + smoke_cells:
             raise ValueError("max_model_requests is below the registered trial and smoke-gate count")
-        worst_case_per_trial = max(
-            (
-                self.budget.max_input_tokens_per_trial * model.input_cost_per_million_usd
-                + self.budget.max_output_tokens_per_trial * model.output_cost_per_million_usd
-            )
-            / 1_000_000
-            for model in self.models
-        )
-        if worst_case_per_trial > self.budget.max_cost_per_trial_usd:
-            raise ValueError("a preregistered worst-case trial cost exceeds max_cost_per_trial_usd")
-        smoke_worst_case = sum(
-            (
-                self.budget.max_input_tokens_per_trial * model.input_cost_per_million_usd
-                + self.budget.max_output_tokens_per_trial * model.output_cost_per_million_usd
-            )
-            / 1_000_000
-            for model in self.models
-            for _transport in self.transports
-        )
-        if worst_case_per_trial * required_trials + smoke_worst_case > self.budget.max_total_cost_usd:
-            raise ValueError("the preregistered worst-case trial and smoke-gate set exceeds max_total_cost_usd")
+        reserved_cost = self.budget.max_cost_per_trial_usd * (required_trials + smoke_cells)
+        if reserved_cost > self.budget.max_total_cost_usd:
+            raise ValueError("the preregistered trial and smoke-gate cost reservations exceed max_total_cost_usd")
 
 
 class CatalogSnapshot(ContractModel):

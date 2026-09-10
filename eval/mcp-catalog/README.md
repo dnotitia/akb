@@ -22,7 +22,8 @@ task corpus와 resettable fixture로 비교하는 독립 실행 환경이다. �
 
 OpenRouter provider 설정, DeepSeek primary와 Qwen lightweight model, category별
 독립 task 수 2개, 3회 반복, paired task-mean 95% 신뢰구간,
-request/token/time/총비용 상한은 `config/run.json`에 사전 등록되어 있다.
+request/time/총비용 hard cap과 token evidence 집계는 `config/run.json`에
+사전 등록되어 있다.
 반복 결과는 독립 task로 세지 않는다. OpenRouter API key, PAT와
 password 값은 환경에서만 읽고 evidence에 쓰지 않는다.
 
@@ -33,13 +34,12 @@ password 값은 환경에서만 읽고 evidence에 쓰지 않는다.
 PydanticAI가 MCP schema에 추론해 붙이는 OpenAI strict tool flag는
 OpenRouter/Parasail 경로에서 끈다. 44개 전체 tool definition은 유지한다.
 등록 가격은 각각 입력/출력 `$0.14/$0.28` 및 `$0.24/$2.20` per million이고,
-전체 hard cap은 `$50`이다. 각 trial은 시작 전에 등록 token cap과 가격으로
-worst-case 비용을 예약하며 cap을 넘으면 다음 provider 요청을 시작하지 않는다.
-per-trial token cap은 확인된 full multi-turn catalog 요청 여유를 반영해 input
-61,440, output 4,096, total 65,536으로 등록했다. 기존 24,000 상한을 그대로
-두지 않고, 관측된 최대 58,561 total tokens보다 11.9% 높은 bound를 사용한다.
-두 model의 output limit도 4,096으로 일치시켰으며 request cap, `$50` hard cap,
-fail-closed 비용 예약은 그대로 유지한다.
+전체 hard cap은 `$50`이다. 각 trial은 시작 전에 등록한 `$0.10` max-cost
+reservation을 잡으며, 전체 manifest의 trial·smoke reservation 합계는 `$36.40`으로
+hard cap 아래에 있다. 실제 input/output/total token은 evidence와 secondary metric으로
+계속 기록하지만 정상 provider 실행을 중단시키는 누적 token budget gate로 사용하지
+않는다. 두 model의 per-response output limit은 full catalog와 terminal response를
+수용하도록 `max_tokens=8,192`로 일치시켰다.
 
 ## 독립 환경 설치와 계약 확인
 
@@ -160,8 +160,10 @@ full paid run 전에는 baseline/candidate arm 각각 primary/lightweight × HTT
 model request를 보내고, 성공한 MCP tool call을 최소 하나 수행한 뒤 그 결과를
 받은 follow-up terminal model response와 positive usage, Parasail routing evidence를
 얻어야 한다. 하나라도 pre-response failure, zero usage, token limit, tool call
-실패 또는 terminal response 누락이면 full trial을 시작하지 않는다. 이미 passing
-checkpoint가 있으면 smoke 결과도 재사용한다.
+실패 또는 terminal response 누락이면 full trial을 시작하지 않는다. smoke는 최소
+multi-turn provider/tool 계약을 검증하는 gate이며 full corpus의 최대 token 수를
+추정하는 calibration이 아니다. 이미 passing checkpoint가 있으면 smoke 결과도
+재사용한다.
 
 각 trial의 reset은 reset endpoint 응답만으로 완료 처리하지 않는다. repository가
 선언한 app/fixture health가 모두 `status=ready`이고 fixture scenario가 일치할
@@ -171,10 +173,12 @@ PAT cleanup이 실패하면 primary failure stage를 유지하고, 이미 완료
 non-zero로 종료한다. 불완전 artifact는 `compare` 입력으로 허용하지 않는다.
 일반 HTTP 요청 timeout은 30초로 유지하고, repository runtime의
 `DEFAULT_TIMEOUT_SECONDS`와 맞춘 reset/readiness budget 180초를 별도로 적용한다.
-provider/toolset 단계에서 model request와 usage evidence를 얻지 못한 실패가
-trial의 과반이면 run은 `failure_stage=model_request`인 `status=incomplete`로
-남으며, zero-request arm을 성공 baseline으로 취급하지 않는다. 오류 evidence는
-redacted exception chain과 HTTP status를 보존한다.
+provider/toolset 단계에서 model request와 usage evidence를 얻지 못한 실패는
+`status=incomplete` artifact와 failed checkpoint로 남기며, zero-request arm을
+성공 baseline으로 취급하지 않는다. 오류 evidence는 redacted exception chain,
+HTTP status와 `failure_kind`(`provider`, `output_limit`, `terminal_response`,
+`tool`, `budget`)를 구분해 보존한다. 429는 provider failure로 분류하고 hidden
+retry/fallback 없이 resume에서만 다시 실행한다.
 
 runtime supervisor의 fixture reset은 PostgreSQL/MinIO Compose dependency
 container, network, volume을 내리지 않고 유지한다. backend/embed/stdio만
