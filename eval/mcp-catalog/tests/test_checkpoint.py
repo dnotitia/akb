@@ -151,3 +151,31 @@ def test_failed_checkpoint_trial_is_not_reused_but_spent_is_preserved(tmp_path: 
     assert resumed.completed_outcome_for(key) is None
     assert resumed.status_for(key) == "failed"
     assert resumed.document.spent.model_requests == 1
+
+
+def test_smoke_checkpoint_requires_a_successful_call_and_follow_up_response(tmp_path: Path) -> None:
+    path = tmp_path / "checkpoint.json"
+    store, key = _store(path)
+    smoke_cells = {
+        "primary:http": ("primary", key.model_id, "http"),
+        "primary:stdio": ("primary", key.model_id, "stdio"),
+        "lightweight:http": ("lightweight", "qwen/qwen3.8-27b", "http"),
+        "lightweight:stdio": ("lightweight", "qwen/qwen3.8-27b", "stdio"),
+    }
+    for cell, (model_class, model_id, transport) in smoke_cells.items():
+        smoke = _outcome(key).model_copy(
+            update={
+                "model_class": model_class,
+                "model_id": model_id,
+                "transport": transport,
+                "successful_mcp_tool_calls": 1,
+                "follow_up_terminal_response": True,
+                "model_requests": 2,
+            }
+        )
+        store.record_smoke_cell(cell, smoke, status="completed")
+    store.set_smoke_status("passed")
+
+    resumed, _ = _store(path, resume=True)
+    assert resumed.smoke_is_complete()
+    assert resumed.smoke_outcome_for("primary:http") is not None

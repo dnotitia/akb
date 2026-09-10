@@ -83,10 +83,12 @@ def _valid_outcome(task, executor, repeat_index: int) -> TrialOutcome:
         transport=executor.transport,
         repeat_index=repeat_index,
         final_answer_text="완료",
+        successful_mcp_tool_calls=1,
+        follow_up_terminal_response=True,
         input_tokens=10,
         output_tokens=2,
         total_tokens=12,
-        model_requests=1,
+        model_requests=2,
         cost_usd=0.00001,
         provider_evidence=[
             {

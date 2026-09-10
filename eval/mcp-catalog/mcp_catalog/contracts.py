@@ -314,6 +314,8 @@ class BenchmarkRunManifest(ContractModel):
             raise ValueError("models must include one primary and one lightweight class")
         if len({model.class_name for model in self.models}) != len(self.models):
             raise ValueError("each model class must be registered exactly once")
+        if any(model.settings["max_tokens"] != self.budget.max_output_tokens_per_trial for model in self.models):
+            raise ValueError("model output limits must match max_output_tokens_per_trial")
         if set(self.category_minimums) != {
             "single_operation",
             "ambiguous_action",
