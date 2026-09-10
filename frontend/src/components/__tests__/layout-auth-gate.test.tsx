@@ -201,10 +201,13 @@ describe("Layout — auth gate", () => {
     expect(
       screen.getByRole("button", { name: "Expand sidebar" }),
     ).toHaveAttribute("aria-expanded", "false");
-    const brandLink = screen.getByRole("link", { name: "AKB home" });
-    expect(brandLink.parentElement).toHaveClass("lg:w-52");
-    expect(within(brandLink).getByText("AKB")).toBeVisible();
-    expect(within(brandLink).getByText("AGENT KNOWLEDGEBASE")).toBeVisible();
+    const brandLink = within(sidebar).getByRole("link", { name: "AKB home" });
+    expect(brandLink).toBeInTheDocument();
+    expect(within(brandLink).queryByText("AKB")).not.toBeInTheDocument();
+    expect(sidebar).toHaveClass("fixed", "inset-y-0", "bg-surface");
+    fireEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    expect(within(sidebar).getByText("AKB")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
     expect(localStorage.getItem("akb_app_sidebar_compact")).toBe("true");
   });
 
@@ -214,10 +217,9 @@ describe("Layout — auth gate", () => {
 
     expect(await screen.findByTestId("home")).toBeTruthy();
     expect(screen.getByRole("main").firstElementChild).toHaveClass(
-      "lg:px-8",
-      "xl:px-12",
-      "2xl:px-36",
+      "px-[var(--workspace-gutter)]",
     );
+    expect(screen.getByRole("navigation", { name: "Current page" }).parentElement).toHaveClass("lg:pl-5");
   });
 
   it("does not reserve a second root scrollbar gutter for vault workspaces", async () => {
@@ -231,6 +233,11 @@ describe("Layout — auth gate", () => {
       "true",
     );
     expect(screen.getByTestId("app-sidebar")).toHaveClass("lg:w-14");
+    expect(screen.getByTestId("app-sidebar").querySelector('[data-slot="workspace-sidebar-heading"]')).toHaveClass("h-10", "shrink-0", "border-b");
+    fireEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    expect(screen.getByTestId("app-sidebar")).toHaveAttribute("data-compact", "false");
+    fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    expect(screen.getByTestId("app-sidebar")).toHaveAttribute("data-compact", "true");
   });
 
   it("gives the advanced search route a full-height, unpadded workspace", async () => {

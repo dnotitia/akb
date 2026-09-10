@@ -1,6 +1,7 @@
-import { Outlet, useLocation, useNavigate, useParams } from "react-router-dom";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Outlet, useLocation, useNavigate, useParams, useOutletContext } from "react-router-dom";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { RailCollapseButton } from "@/components/navigation-rail-controls";
 import { VaultExplorer } from "@/components/vault-explorer";
 import { VaultCreateDialog } from "@/components/vault-create-dialog";
 import { DocumentCreateDialog } from "@/components/document-create-dialog";
@@ -36,6 +37,7 @@ export function VaultShell() {
   const { name } = useParams<{ name: string }>();
   const location = useLocation();
   const navigate = useNavigate();
+  const layout = useOutletContext<{ setVaultNavigationWidth?: (width: number) => void } | null>();
   const isGraph = location.pathname.endsWith("/graph");
   const isDocument = location.pathname.includes("/doc/");
   const isTable = location.pathname.includes("/table/");
@@ -122,24 +124,29 @@ export function VaultShell() {
   // start with it folded so their table, form, or result workspace owns the
   // horizontal space without overwriting the user's browsing preference.
   const toolView = isSearch || isMembers || isPublications || isSettings || isActivity;
-  const routeTreeKey = toolView ? `${name ?? ""}:${location.pathname}` : "";
-  const effectiveTreeVisible = toolView
+  const collectionTarget = location.pathname === `/vault/${encodeURIComponent(name ?? "")}`
+    ? new URLSearchParams(location.search).get("collection") : null;
+  const routeTreeKey = collectionTarget ? `collection:${location.key}` : toolView ? `${name ?? ""}:${location.pathname}` : "";
+  const effectiveTreeVisible = collectionTarget
+    ? routeTreeOverride?.key === routeTreeKey ? routeTreeOverride.visible : true
+    : toolView
     ? routeTreeOverride?.key === routeTreeKey && routeTreeOverride.visible
     : visible;
   const setEffectiveTreeVisible = useCallback(
     (next: boolean) => {
-      if (toolView) {
+      if (toolView || collectionTarget) {
         setRouteTreeOverride({ key: routeTreeKey, visible: next });
         return;
       }
       setTreeVisible(next);
     },
-    [routeTreeKey, setTreeVisible, toolView],
+    [routeTreeKey, setTreeVisible, toolView, collectionTarget],
   );
 
   useEffect(() => {
-    if (!toolView) setRouteTreeOverride(null);
-  }, [toolView]);
+    if (!toolView && !collectionTarget) setRouteTreeOverride(null);
+    if (collectionTarget && !desktopNav) setMobileNavOpen(true);
+  }, [toolView, collectionTarget, desktopNav]);
 
   // Callback-ref pattern: children publish their refetch fns on mount; the
   // shell stores them in refs and exposes stable thunks via context.
@@ -279,9 +286,14 @@ export function VaultShell() {
   const showTree = !!name && effectiveTreeVisible && !isGraph;
   const workspaceNavigationWidth =
     (vaultCollapsed ? 56 : rail.width) +
-    (!vaultCollapsed && !isGraph && !!name ? 8 : 0) +
+    (!vaultCollapsed && !isGraph && !!name ? 1 : 0) +
     (!isGraph && !!name ? (effectiveTreeVisible ? tree.width : 40) : 0) +
-    (showTree ? 8 : 0);
+    1;
+  const publishWidth = layout?.setVaultNavigationWidth;
+  useLayoutEffect(() => {
+    publishWidth?.(desktopNav ? workspaceNavigationWidth : 0);
+  }, [desktopNav, workspaceNavigationWidth, publishWidth]);
+  useLayoutEffect(() => () => publishWidth?.(0), [publishWidth]);
   const effectiveVaultCollapsed = desktopNav
     ? vaultCollapsed
     : mobileRailCollapsed;
@@ -312,7 +324,7 @@ export function VaultShell() {
             id="vault-workspace-navigation"
             className={cn(
               "absolute top-10 bottom-0 left-0 z-[var(--z-overlay)] hidden max-w-full shrink-0 min-h-0 bg-surface shadow-lg",
-              "lg:static lg:z-auto lg:flex lg:shadow-none",
+              "lg:static lg:z-auto lg:-mt-14 lg:h-[calc(100%+3.5rem)] lg:flex lg:shadow-none",
               mobileNavOpen && "flex",
               !showTree && "border-r border-border",
             )}
@@ -336,7 +348,7 @@ export function VaultShell() {
                 aria-label="Resize vault list"
                 title="Drag to resize · double-click to reset"
                 {...rail.handlers}
-                className="group relative z-10 w-2 shrink-0 cursor-col-resize touch-none"
+                className="group relative z-10 w-px shrink-0 cursor-col-resize touch-none before:absolute before:inset-y-0 before:-left-1 before:w-2"
               >
                 <div className="mx-auto h-full w-px bg-border transition-colors group-hover:bg-primary group-active:bg-primary" />
               </div>
@@ -365,18 +377,10 @@ export function VaultShell() {
                 aria-label="Collections (collapsed)"
                 className="h-full w-10 shrink-0 border-r border-border"
               >
-                <div className="flex h-10 items-center justify-center border-b border-border">
-                  <button
-                    type="button"
-                    onClick={() => setEffectiveTreeVisible(true)}
-                    title="Show tree (⌘\\)"
-                    aria-label="Show collection tree"
-                    aria-expanded={false}
-                    className="flex h-8 w-8 items-center justify-center rounded-[var(--radius-md)] text-foreground-muted hover:text-foreground hover:bg-surface-hover transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
-                  >
-                    <PanelLeftOpen className="h-4 w-4" aria-hidden />
-                  </button>
+                <div className="flex h-10 items-center justify-center border-b border-border lg:h-14">
+                  <RailCollapseButton collapsed label="Show collection tree" onClick={() => setEffectiveTreeVisible(true)} />
                 </div>
+                <div className="h-10 border-b border-border" aria-hidden />
               </nav>
             )}
           </div>
@@ -389,7 +393,7 @@ export function VaultShell() {
               aria-label="Resize tree panel"
               title="Drag to resize · double-click to reset"
               {...tree.handlers}
-              className="group relative z-10 w-2 shrink-0 cursor-col-resize touch-none"
+              className="group relative z-10 w-px shrink-0 cursor-col-resize touch-none before:absolute before:inset-y-0 before:-left-1 before:w-2 lg:-mt-14 lg:h-[calc(100%+3.5rem)]"
             >
               <div className="mx-auto h-full w-px bg-border transition-colors group-hover:bg-primary group-active:bg-primary" />
             </div>
@@ -401,6 +405,7 @@ export function VaultShell() {
           <div className="flex min-h-0 min-w-0 flex-1 flex-col">
             <TitleBar
               crumbs={crumbs}
+              breadcrumbClassName="lg:hidden"
               right={
                 name ? <VaultActions vault={name} page={page} /> : undefined
               }

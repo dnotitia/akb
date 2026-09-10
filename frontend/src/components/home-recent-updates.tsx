@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
-import { ArrowUpRight, FileClock } from "lucide-react";
+import { ArrowUpRight } from "lucide-react";
 import { ApiError, getRecent } from "@/lib/api";
 import { documentPreviewState } from "@/lib/document-preview-navigation";
 import { recentIcon } from "@/lib/recent";
@@ -9,7 +9,6 @@ import { Panel } from "@/components/ui/panel";
 import { Button } from "@/components/ui/button";
 import { Alert } from "@/components/ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { TonalIcon } from "@/components/ui/tonal-icon";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { LoadingState } from "@/components/ui/loading-state";
 import { EmptyState } from "@/components/empty-state";
@@ -37,14 +36,14 @@ function preference(userId: string): Scope {
 class WatchingUnavailable extends Error {}
 
 /** Account-keyed boundary prevents a previous account's rows flashing on switch. */
-export function HomeRecentUpdates() {
+export function HomeRecentUpdates({ scope }: { scope?: Scope } = {}) {
   const user = useCurrentUser();
-  return <RecentUpdates key={user?.user_id ?? "anonymous"} userId={user?.user_id ?? ""} />;
+  return <RecentUpdates key={`${user?.user_id ?? "anonymous"}:${scope ?? "tabs"}`} userId={user?.user_id ?? ""} fixedScope={scope} />;
 }
 
-function RecentUpdates({ userId }: { userId: string }) {
+function RecentUpdates({ userId, fixedScope }: { userId: string; fixedScope?: Scope }) {
   const location = useLocation();
-  const [scope, setScope] = useState<Scope>(() => preference(userId));
+  const [scope, setScope] = useState<Scope>(() => fixedScope ?? preference(userId));
   const [rows, setRows] = useState<RecentRow[]>([]);
   const [busy, setBusy] = useState(true);
   const [moreBusy, setMoreBusy] = useState(false);
@@ -113,38 +112,40 @@ function RecentUpdates({ userId }: { userId: string }) {
   const loadMore = () => void load(true, cursor ?? undefined, legacyMore ? Math.min(legacyLimit * 2, 100) : PAGE_SIZE);
   return <>
     <header className="flex min-h-10 flex-wrap items-center justify-between gap-3 border-b border-border pb-2.5">
-      <div className="flex items-center gap-2.5"><TonalIcon tone="neutral" size="sm"><FileClock aria-hidden /></TonalIcon>
-        <h2 className="text-base font-semibold tracking-tight">Recent updates</h2></div>
+      <h2 id={`home-updates-heading-${scope}`} tabIndex={-1} className="text-base font-semibold tracking-tight">{fixedScope === "watching" ? "Watched documents" : "Recent updates"}</h2>
       {scope === "watching" && <Link className="text-sm text-link hover:underline focus-visible:ring-2 focus-visible:ring-ring" to="/settings?tab=notifications">Manage watches</Link>}
     </header>
     <Tabs value={scope} onValueChange={select} activationMode="manual" className="mt-3">
-      <TabsList aria-label="Recent updates scope" className="bg-transparent p-0">
-        <TabsTrigger id="home-updates-all" value="all">All</TabsTrigger><TabsTrigger id="home-updates-watching" value="watching">Watching</TabsTrigger>
-      </TabsList>
-      <TabsContent value={scope} aria-labelledby={`home-updates-${scope}`} className="pt-3" aria-busy={busy || moreBusy}>
+      {!fixedScope && <TabsList aria-label="Recent updates scope" className="bg-transparent p-0">
+        <TabsTrigger id="home-updates-all" value="all">All documents</TabsTrigger><TabsTrigger id="home-updates-watching" value="watching">Watched documents</TabsTrigger>
+      </TabsList>}
+      <TabsContent value={scope} role={fixedScope ? "region" : "tabpanel"} aria-labelledby={fixedScope ? `home-updates-heading-${scope}` : `home-updates-${scope}`} className={fixedScope ? "pt-0" : "pt-3"} aria-busy={busy || moreBusy}>
         {busy && rows.length === 0 ? <LoadingState label="Loading recent updates"><Panel>
           {Array.from({ length: 3 }, (_, index) => <div key={index} className="space-y-2 border-b border-border p-4 last:border-0"><div className="h-4 w-2/3 rounded bg-surface-2" /><div className="h-3 w-1/3 rounded bg-surface-2" /></div>)}
-        </Panel></LoadingState> : unsupported ? <Alert variant="info">Watching is not supported on this server yet. You can still view All updates.</Alert>
+        </Panel></LoadingState> : unsupported ? <Alert variant="info">Watching is not supported on this server yet. {fixedScope ? "Recent updates remains available separately." : "Select All documents to see recent updates."}</Alert>
           : error && rows.length === 0 ? <Alert><div>Could not load recent updates.<Button variant="link" size="sm" onClick={() => void load()}>Retry</Button></div></Alert>
-          : rows.length === 0 ? <EmptyState title={scope === "watching" ? "No watched documents yet" : "Nothing updated yet"}
+          : rows.length === 0 ? <EmptyState title={scope === "watching" ? (fixedScope ? "No watched updates yet" : "No watched documents yet") : "Nothing updated yet"}
             description={scope === "watching" ? "Turn on Watch in a document to find its latest changes here." : "Document changes across your Vaults will appear here."} />
           : <Panel>
             <ol className="divide-y divide-border">{rows.map(row => {
               const Icon = recentIcon(row.type);
               const collection = row.path.includes("/") ? row.path.slice(0, row.path.lastIndexOf("/")) : null;
               const preview = row.excerpt?.trim() || row.summary?.trim();
-              const id = `home-recent-${row.resource_id ?? row.doc_id}`;
-              return <li key={row.resource_id ?? `${row.vault}:${row.doc_id}`}><Link id={id}
-                to={`/vault/${encodeURIComponent(row.vault)}/doc/${encodeURIComponent(row.doc_id)}`}
-                state={documentPreviewState(location, id, `home-updates-${scope}`)}
-                className="home-activity-row group grid grid-cols-[20px_minmax(0,1fr)_auto] items-start gap-3 bg-surface px-4 py-3 transition-token hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring">
+              const id = `home-recent-${scope}-${row.resource_id ?? row.doc_id}`;
+              const href = `/vault/${encodeURIComponent(row.vault)}/doc/${encodeURIComponent(row.doc_id)}`;
+              return <li key={row.resource_id ?? `${row.vault}:${row.doc_id}`} className="group relative flex flex-col bg-surface transition-token hover:bg-surface-hover focus-within:bg-surface-hover"><Link id={id}
+                to={href}
+                aria-label={`Preview ${row.title}`}
+                state={documentPreviewState(location, id, fixedScope ? `home-updates-heading-${scope}` : `home-updates-${scope}`)}
+                className="home-activity-row grid min-w-0 flex-1 grid-cols-[20px_minmax(0,1fr)] items-start gap-3 px-4 py-3 after:absolute after:inset-0 after:content-[''] focus-visible:outline-none focus-visible:after:ring-2 focus-visible:after:ring-inset focus-visible:after:ring-ring">
                 <Icon className="mt-0.5 h-4 w-4 text-link" aria-hidden />
-                <span className="min-w-0"><span className="block truncate text-sm font-semibold text-foreground group-hover:text-link" title={row.title}>{row.title}</span>
-                  <span className="mt-1 block truncate text-xs text-foreground-muted">{row.vault}{collection ? ` / ${collection}` : ""}{row.updated_by_name || row.author_name ? ` · ${row.updated_by_name || row.author_name}` : row.created_by_name ? ` · Created by ${row.created_by_name}` : ""}</span>
-                  {preview && <span className="mt-1 block truncate text-xs text-foreground-muted">{preview}</span>}
+                <span className="min-w-0"><span className="block sm:min-h-8 sm:pr-32"><span className="line-clamp-2 break-words text-sm font-semibold text-foreground group-hover:text-link" title={row.title}>{row.title}</span></span>
+                  <span className="mt-1 flex flex-col gap-1 text-xs text-foreground-muted sm:flex-row sm:flex-wrap sm:items-baseline sm:gap-x-3"><span className="min-w-0 break-words">{row.vault}{collection ? ` / ${collection}` : ""}</span><span className="flex flex-wrap gap-x-2 gap-y-1 sm:border-l sm:border-border sm:pl-3"><span>Updated <RelativeTime iso={row.changed_at} fallback="time unavailable" /></span>{(row.updated_by_name || row.author_name || row.created_by_name) && <span>{row.updated_by_name || row.author_name ? `by ${row.updated_by_name || row.author_name}` : `Created by ${row.created_by_name}`}</span>}</span></span>
+                  {preview && <span className="mt-2 block line-clamp-2 text-sm leading-relaxed text-foreground-muted">{preview}</span>}
                 </span>
-                <span className="flex items-center gap-2"><RelativeTime iso={row.changed_at} /><ArrowUpRight className="h-3.5 w-3.5 text-link" aria-hidden /></span>
-              </Link></li>;
+              </Link><Button asChild variant="outline" size="sm" className="relative z-10 mb-3 mr-4 min-h-9 self-end sm:absolute sm:right-4 sm:top-2 sm:m-0"><Link to={href} aria-label={`Open ${row.title} in ${row.vault} vault`}>
+                Open in vault<ArrowUpRight className="h-3.5 w-3.5" aria-hidden />
+              </Link></Button></li>;
             })}</ol>
             {error && <Alert className="m-3"><div>Could not load updates. Your current list is still available.<Button variant="link" size="sm" onClick={failedMore ? loadMore : () => void load()}>Retry</Button></div></Alert>}
             {(cursor || legacyMore) && !error && <div className="border-t border-border p-2"><Button variant="ghost" size="sm" className="w-full" loading={moreBusy || busy} onClick={loadMore}>Show more</Button></div>}

@@ -109,6 +109,16 @@ text-{family}-soft-foreground` + a tinted border).
 
 ## 5. Interaction-state tokens
 
+Home uses the Paper + Teal surface arrangement: the complete route
+canvas (including gutters) uses `surface`, not a floating white content card on
+`background`. The shared full-height app sidebar uses the standard `surface`
+token: white in light mode, neutral slate in dark mode. Standard text, border,
+hover, focus, and teal-selected tokens apply in both expanded and collapsed states.
+The optional connection
+guide retains the pale `navigation` surface. Cards and updates stay on `surface`, bounded by
+quiet hairlines. Teal/orange interaction semantics do not change. This
+Home canvas arrangement must not recolor Settings or Vault content surfaces.
+
 Solid tokens that replace the old `/opacity` and `color-mix` state hacks (those
 mis-tint on the dark canvas). **Interactive = teal; hover = neutral lift;
 selected = teal-tinted.**
@@ -233,10 +243,26 @@ an `sr-only` summary, never the only signal.
 - **Spacing = Tailwind's 4px ramp** (no custom `--spacing` token — the absence is
   deliberate). Section gaps `gap-y-10`, card padding `p-4`, list row `py-3`,
   dense row `py-1.5`.
-- **Application shell**: the global app header always spans the full viewport.
-  Its 13rem brand slot keeps the complete AKB lockup visible and the global
-  Search entry stable even when the persistent desktop app sidebar changes
-  density. From `lg`, a fixed 11rem status slot immediately left of Search
+- **Application shell**: on desktop the full-height, fixed app sidebar owns
+  the AKB logo and wordmark. The right-side header spans only the working
+  area; its right-aligned Search and account controls stay stable when the rail
+  changes density. The desktop header's left side holds a compact 14px current
+  page label, or a linked Vault name / section label for Vault routes. It is
+  preceded by a quiet 16px Lucide page icon, matching the sidebar and Vault tabs;
+  the adjacent text supplies its accessible name, so the glyph is decorative. It is
+  location chrome, not another H1 or a card. Long Vault names truncate without
+  displacing the current section or account actions. The lower Vault command
+  row keeps its tabs and Back control but omits duplicate desktop breadcrumbs;
+  mobile retains the existing logo and lower breadcrumb instead.
+  All desktop routes use a 20px header inset after the last navigation rail,
+  independent of their content gutters. Home keeps its generous body/footer
+  inset without shifting the location label. Account Settings shows the selected
+  section (Profile, Agent connections, etc.) rather than repeating the rail's
+  Settings heading. Section names, icons, and permission fallback share one contract.
+  A collapsed rail retains the logo symbol and accessible Home
+  link. Mobile retains its full-width header with logo and compact navigation.
+  Loading chrome reserves the same rail width as the destination route.
+  From `lg`, a fixed 11rem status slot immediately left of Search
   surfaces active indexing or failed work across only the Vaults the current
   user can read. The slot remains reserved when caught up so polling never
   shifts Search, while its single atomic live-status announces complete phrases
@@ -261,56 +287,126 @@ an `sr-only` summary, never the only signal.
   strip beside the rightmost rail.
 - **Control heights**: `h-8` (32, dense rails) · `h-9` (36, default) · `h-10`
   (40, inputs) · `h-11` (44, hero CTA). Keep tappable controls ≥ 36px.
+- **Workspace personal navigation**: Home, Search, then Vaults remain fixed below the
+  logo. Expanded navigation places at most five favorite Vault shortcuts beneath
+  Vaults under a visible Favorites label, with explicit Show more/less and an independent section disclosure beside Favorites. The Vaults row only navigates; it does not collapse favorites.
+  Only the personal lists scroll; compact mode keeps the three primary icons.
+  Rows use the shared Box glyph and human name, not counts or role badges.
+  The selected child owns the strong highlight; its parent must not compete.
+  Overflow offers Remove from favorites and restores focus to the disclosure
+  or Vaults link. Favorites are browser-local, account-keyed stable Vault IDs,
+  synchronized across mounted consumers and tabs, and resolved through current
+  accessible Vault data. Legacy unowned favorites remain stored but are not
+  automatically assigned to an account. An explicit import confirmation lists
+  accessible legacy favorites and merges them without replacing current pins.
+  Recently viewed, Drafts, and Pinned follow as initially collapsed sections,
+  each previewing three items with Show more/less. Empty sections disappear.
+  They store browser-local account-specific metadata; recent/pinned rows expose
+  removal, never resource deletion. Draft rows route through the existing
+  recovery flow: new drafts open the composer, edit drafts open the editor.
+  Edit drafts expire after 24 hours; new drafts retain the existing no-expiry
+  contract. Neither list previews draft bodies or adopts unowned legacy drafts.
+  Document Pin sits beside Watch, but never implies a notification subscription.
+  Collection Pin belongs in its overflow; following it reveals the collection
+  tree and focuses the target, without overwriting the normal tree preference.
+  Pins use canonical paths under the current API contract and can become stale
+  after moves; removal only changes the personal shortcut. Notifications have
+  one entry point in the header bell, whose View all action opens the existing
+  full ledger; do not duplicate it with a sidebar Inbox item.
+  Help, then Settings sit below the independent scroll region. AI connections
+  belongs inside Settings; do not duplicate it as a permanent sidebar link.
+  Settings is the bottom fixed entry into the secondary account-settings rail;
+  it stays selected across all `/settings?tab=` sections, including compact mode
+  with a labelled icon and tooltip. Re-selecting it preserves the current section.
+  Help explains Vaults, pinning, drafts, watching, and search, and is a
+  keyboard-dismissable dialog, not an invented external documentation link.
 - **Borders are structural** — most surfaces are defined by 1px `border` hairlines
   plus a soft shadow, not heavy fills. `divide-y divide-border` for list rows.
-- **Home working set**: Home is a workspace dashboard and optional onboarding
-  surface, never a second search page. Global semantic search belongs to the app
-  header; advanced filters stay on the Search route. Home uses the application
-  shell gutter directly—never a second nested inset or a 1600px cap—so ultrawide
-  screens keep the dashboard's right edge aligned with global Search rather than
-  leaving a large dead band. Its context rail joins the primary column from the
-  `2xl` tier, after the labelled app sidebar leaves enough working width for four
-  Vault cards; narrower desktop widths stack context below the primary ledger.
-  It opens with a cardless masthead anchored by a
-  neutral hairline: one `brand-gradient` word in the title, a plain-language
-  description, and labelled Vault/index facts rather than floating badges. The
-  Home index fact consumes the same reader-scoped aggregate as the app-header
-  status, not the system-wide operational counter. A
-  32px dashboard gutter separates the primary ledger from its context rail and
-  carries through the vertical section rhythm; section anchors keep 16px before
-  their first bounded content surface so neighbouring information does not read
-  as one continuous block.
-  A
-  browser-local, user-scoped Continue working strip appears only when real
-  document views exist. It sits at the top of the primary work column rather
-  than spanning the dashboard, and follows the same title, underline, and card
-  rhythm as the Vault section below it. Up to four compact two-line destinations
-  render as individually bounded cards with a consistent grid gap; a single
-  destination never stretches across the whole work column. It stores no
-  document body and labels its
-  browser-local scope honestly. The responsive primary
-  column then carries four compact favorite-first Vault cards (four columns on
-  wide desktop, two on medium screens) and the cross-Vault Recent updates ledger.
-  Recent updates offers compact All / Watching tabs with no count badges; the
-  Watching view adds a Manage watches link, not another dashboard card. Both
-  scopes show one row per document and open the shared reader preview without
-  acknowledging inbox notifications. Recent rows progressively reveal updater provenance and a one-line excerpt
-  only when the backend includes those optional fields; older backends retain a
-  complete compact title/location/time row with no empty labels. A
-  21rem context rail carries only non-duplicated state: a dedicated Connect an
-  agent action panel whenever the account has not completed a real agent call,
-  or the remaining inline setup checklist after connection, followed by a
-  compact access/index/connection summary.
-  Setup never auto-opens a modal, can be hidden, adapts to read-only users, and
-  disappears when complete. Token minting, client snippets, and token management
-  remain in the connection dialog or Account Settings; Recent changes is not
-  repeated as a summary card beside the full activity ledger. Use one orange
-  filled action only for the current setup step. Empty, loading, error, and
-  established states keep the same outer grid so async data does not reshape the
-  page unnecessarily. Below `xl`, Vaults lead, setup/context follows, and recent
-  activity completes the document flow.
-- **Vault workspace density**: the aligned Vaults / Collections / location row is
-  `h-10`; its section tabs and rail controls are `h-8`. Vault tool/admin routes
+- **Home working set**: Home is a personal starting point, not an operations
+  dashboard or second search page. Keep the application shell's symmetric
+  gutters and full-width global header. Begin directly with Recently viewed,
+  or Your vaults when no history exists. Home has an `sr-only` H1 for assistive
+  navigation, not a duplicate visible title or generic orientation sentence. Vault totals
+  belong only to the directory's View all link; indexing remains in the global
+  header and Vault context, not duplicated in the Home masthead or a stats rail.
+  Recently viewed and Your vaults each span the full working width above the
+  lower updates/context grid. Their independent cards use four columns only
+  from `xl`, two from `sm`, and one on small screens, with 12px card gaps and
+  28–32px between sections. DOM, visual, and keyboard reading order agree at
+  every breakpoint. Cardless sentence-case H2 anchors, neutral hairlines, and
+  a 12px gap before bounded content give all sections the same hierarchy.
+  Recently viewed is explicitly browser-local, account-scoped view history—not
+  saved drafts or editing progress. Show at most four currently accessible
+  destinations, two-line titles, Vault/Collection context, and labelled Viewed
+  times. A single destination uses a compact full-width row with trailing time
+  on desktop, rather than leaving empty grid columns. Multiple destinations
+  retain independent cards. Do not allocate an empty history card when no valid history exists.
+  Your vaults is a strict four-card favorite-first preview; even a large favorite
+  set must use View all for the directory. On unpin, restore focus to the same
+  favorite control or the stable View all link if the card leaves the preview.
+  Cards use content-sized height, not a fixed minimum. They prioritize the human name and actual two-line description. Do not fill
+  absent descriptions with repeated generic text. Show readable Documents /
+  Tables / Files labels only for provided numeric counts; absent is not zero.
+  Read only and Archived communicate actionable restrictions without repeating
+  the full administrative role hierarchy. Favorite controls stay visible.
+  A first-time user with no Vaults gets one explanatory empty state and the
+  existing Create a vault dialog, with an invitation alternative for joining
+  a team. Never auto-open the dialog or present access errors as empty state.
+  Recent updates and Watched documents appear as two equal independent columns
+  from `xl`, stacking on smaller screens. Each owns its server scope, pagination,
+  errors, and empty state; do not make users switch tabs. A watched document may
+  also appear in the all-document ledger, so preview IDs include scope.
+  Update-row titles open a labelled preview, while a separate always-visible
+  Open in vault link opens the same document with full Vault navigation (never
+  a nested link). The preview's promotion button uses the same Open in vault
+  vocabulary and preserves the current reading mode. Recently viewed retains
+  its direct full-page destination.
+  Rows prioritize a
+  two-line title, location, explicitly labelled update time, optional author,
+  and a short content excerpt—not an invented summary of the change. Existing
+  document previews, authorization, compatibility notices, and inbox read state
+  remain unchanged.
+  The connection guide is a small dismissible top notice, not a content sidebar.
+  Its Hide control lives inside the notice; when hidden, a quiet control in the
+  first content section's header reopens it or launches setup. Never reserve a
+  separate full-width row for this action. No automatic
+  modal or repeating toast. A verified empty PAT list may expose the notice;
+  token presence suppresses it, without claiming a working connection. OAuth
+  users do not necessarily need a PAT. The guide explains optional AI-tool use, not mandatory account
+  completion. Avoid token totals, progress fractions, or claims of a healthy
+  agent based on PAT use. Lookup
+  failure must not claim incomplete setup. Hide/show is account-scoped and
+  storage-failure tolerant, with focus transferred to the replacement control
+  or heading. Keep a quiet route to connection settings when the guide is absent.
+  Do not fill the rail with duplicate access/index statistics. Existing
+  Quickstart and connection settings retain token and OAuth flows.
+  Both entry points compose the same `ConnectionSetup`: choose a tool, use a
+  supported authentication method, configure, and try a read-only request.
+  Never interpolate token prefixes into copyable configuration. Explicitly
+  entered saved secrets and new secrets live in component memory only. Token
+  management is a separate divided ledger; token last-use is not live agent
+  health. No auto-mint, required tutorial, fabricated connection check, or
+  company-specific example Vaults. Copy failures provide manual-copy recovery.
+  Loading, error, empty, and populated states stay distinct; optional metrics
+  and connection failures never block document or Vault navigation.
+- **Vault workspace density**: on desktop, Vaults and Collections are retained
+  as independent full-height columns, beginning beside the AKB logo at viewport
+  top. Their `h-14` identity headers align with the app header: Vaults shows the
+  current Vault through a searchable, favorites-first switcher. Its borderless
+  navigation trigger uses the shared Vault glyph, semibold name, and chevron;
+  only hover/open adds a neutral background, while keyboard focus stays visible.
+  Do not style this identity control as an outlined form field. Collections
+  shows only the current collection's last path segment (or All collections),
+  with its full path available on hover. Do not repeat Collections above it.
+  Only collapse
+  controls share this top row. Creation, refresh, and role filtering belong to
+  the `h-10` management row below; existing list filters follow independently.
+  The full Vault list remains visible, and no new API is needed for switching.
+  The app header begins after the combined
+  navigation width and tracks both resize handles and collapsed states. The
+  page tab/location row remains `h-10` below it; controls remain `h-8`.
+  Mobile retains its existing drawer and `h-10` navigation headers.
+  Vault tool/admin routes
   (`Search`, `Members`, `Publish`, `Activity`, `Settings`) start with Collections folded so
   their results, roster, list, or form owns the working width without changing
   the user's persisted browsing preference. Avoid a repeated title/description
@@ -319,6 +415,20 @@ an `sr-only` summary, never the only signal.
   (search form, roster toolbar, publication list, settings local nav) and retain
   an `sr-only` H1 for route orientation and heading hierarchy. The active Vault
   tab and breadcrumb already provide visible location context; do not repeat it.
+  Account Settings (`/settings`) uses a full-height 220px secondary navigation
+  rail beside Workspace. Its 56px identity row aligns with the app header;
+  the header begins after both rails. Single-line section links replace the
+  old profile/menu card and page masthead. The content owns scrolling with
+  16/24/32px responsive padding, cardless section headings and hairlines,
+  an avatar/identity block, profile and password columns on wide screens,
+  compact appearance previews, and wide data ledgers. Agent connections keeps
+  three explicit setup phases visible from entry: prepare access, configure,
+  and try a read-only request. Wide screens place them alongside one another;
+  narrow screens stack them in order. Never hide the final phase until token
+  creation or offer a placeholder secret as a usable configuration.
+  Mobile replaces the secondary rail with a labelled section selector.
+  Preserve `?tab=` links and guard section changes with unsaved edits or a
+  newly generated token; never persist token secrets to retain them.
   On wide screens, Vault Settings is a full-height three-pane workspace that runs
   edge-to-edge inside `VaultShell`. Unlike Members and Publish, it does not add a
   second route inset or rounded outer frame: the persistent Vault rail, local
@@ -336,9 +446,19 @@ an `sr-only` summary, never the only signal.
   `rail-scroll` treatment rather than platform-default gray scrollbar slabs.
   Narrow layouts return to one document flow and restore card spacing for
   separation.
-  The expanded Vaults and Collections rails use the same two-tier control
-  grammar: an `h-10` labelled header with refresh/create/collapse actions, then
-  an `h-8` icon-led filter field. Root creation belongs in that header rather
+  The expanded Vaults and Collections rails share `RailIdentity`,
+  `RailManagement`, `RailCollapseButton`, `RailFilterToggle`, and `RailFilterField`.
+  Their grammar is identity (56px desktop / 40px mobile), management (40px),
+  then a full-width 32px search field inside a 40px row. The management row says
+  Vaults or Collections and owns refresh, filter disclosure, and create; only
+  PanelLeftClose / PanelLeftOpen toggles belong in identity headers.
+  Name search remains available in empty and filtered-empty states. Additional
+  role or resource-type/document-state filters expand on demand below search;
+  applied conditions retain a visible count and Reset filters even when folded.
+  Changing document state preserves the search text; Archived forces documents
+  without silently clearing the query. Collection rows and their overflow
+  triggers have a 36px baseline, and both lists use the same rail scrollbar.
+  Root creation belongs in the management row rather
   than at the end of a scrollable tree. Its single create menu and every
   Collection overflow menu share the same document / upload / table /
   Collection vocabulary, with the target Collection preselected in each modal.

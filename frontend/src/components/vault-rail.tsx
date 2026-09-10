@@ -1,19 +1,16 @@
-import { Link, useLocation } from "react-router-dom";
-import { useEffect, useMemo, useState } from "react";
+import { Link, useLocation, useNavigate } from "react-router-dom";
+import { useEffect, useId, useMemo, useState } from "react";
 import {
   Box,
-  ChevronsLeft,
-  ChevronsRight,
-  Filter,
   Plus,
   RefreshCw,
-  Search as SearchIcon,
   Star,
 } from "lucide-react";
 import { useVaults, type VaultSummary } from "@/hooks/use-vaults";
 import { useVaultFavorites } from "@/hooks/use-vault-favorites";
 import { VaultChip } from "@/components/ui/vault-chip";
 import { TooltipText } from "@/components/ui/tooltip-text";
+import { RailCollapseButton, RailFilterField, RailFilterToggle, RailIdentity, RailManagement } from "@/components/navigation-rail-controls";
 import { roleIcon } from "@/lib/roles";
 import {
   SCOPES,
@@ -31,6 +28,7 @@ import {
 import { cn } from "@/lib/utils";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
+import { SelectMenu } from "@/components/ui/select-menu";
 
 /**
  * The vault column — an always-visible, favoritable, role-aware list of vaults
@@ -68,9 +66,11 @@ export function VaultRail({
   const { vaults, loading, refetch } = useVaults();
   const { isFavorite, toggleFavorite, favOrder } = useVaultFavorites();
   const { pathname } = useLocation();
+  const navigate = useNavigate();
   const [filter, setFilter] = useState("");
   const [scope, setScope] = useState<RoleScope>(readScope);
   const [showScope, setShowScope] = useState(() => readScope() !== "all");
+  const filtersId = useId();
 
   useEffect(() => {
     refetch();
@@ -109,7 +109,7 @@ export function VaultRail({
   };
 
   const headBtn =
-    "inline-flex h-7 w-7 items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted hover:bg-surface-hover hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:cursor-default disabled:opacity-50";
+    "inline-flex h-8 w-8 items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted hover:bg-surface-hover hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset disabled:cursor-default disabled:opacity-50";
   const railBtn =
     "flex h-8 w-8 items-center justify-center rounded-[var(--radius-md)] text-foreground-muted hover:text-foreground hover:bg-surface-hover transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer disabled:cursor-default disabled:opacity-50";
 
@@ -123,23 +123,10 @@ export function VaultRail({
           aria-label="Vaults"
           className="w-14 shrink-0 h-full flex flex-col bg-surface border-r border-border"
         >
-          <div className="flex h-10 shrink-0 items-center justify-center border-b border-border">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  onClick={onToggleCollapsed}
-                  aria-label="Expand vault list"
-                  aria-expanded={false}
-                  className={railBtn}
-                >
-                  <ChevronsRight className="h-4 w-4" aria-hidden />
-                </button>
-              </TooltipTrigger>
-              <TooltipContent side="right">Expand vault list</TooltipContent>
-            </Tooltip>
+          <div className="flex h-10 shrink-0 items-center justify-center border-b border-border lg:h-14">
+            <RailCollapseButton collapsed label="Expand vault list" onClick={onToggleCollapsed} />
           </div>
-          <div className="flex shrink-0 justify-center py-2">
+          <div className="flex h-10 shrink-0 items-center justify-center border-b border-border">
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
@@ -291,9 +278,14 @@ export function VaultRail({
       style={{ width }}
       className="shrink-0 h-full flex flex-col bg-surface"
     >
-      <div className="flex h-10 shrink-0 items-center justify-between border-b border-border px-3">
-        <span className="coord-ink">Vaults</span>
-        <div className="flex items-center gap-0.5">
+      <RailIdentity slot="vault-identity-header">
+        <SelectMenu variant="navigation" leadingIcon={<Box className="h-4 w-4" />} value={current} placeholder={current || "Choose a vault"} aria-label="Switch vault" searchable searchThreshold={8} searchPlaceholder="Find a vault"
+          options={[...vaults].sort((a, b) => Number(isFavorite(b.id)) - Number(isFavorite(a.id)) || favOrder(a.id) - favOrder(b.id)).map(v => ({ value: v.name, label: v.name, hint: isFavorite(v.id) ? "Favorite" : undefined }))}
+          onValueChange={name => navigate(`/vault/${encodeURIComponent(name)}`)}
+          className="min-w-0 flex-1" />
+        <RailCollapseButton collapsed={false} label="Minimize vault list to a rail" onClick={onToggleCollapsed} />
+      </RailIdentity>
+      <RailManagement label="Vaults" slot="vault-management-row">
           <button
             type="button"
             onClick={refetch}
@@ -307,19 +299,7 @@ export function VaultRail({
               aria-hidden
             />
           </button>
-          <button
-            type="button"
-            onClick={() => setShowScope((s) => !s)}
-            aria-pressed={showScope}
-            title="Filter by role"
-            aria-label="Filter by role"
-            className={cn(
-              headBtn,
-              scope !== "all" && "text-primary hover:text-primary",
-            )}
-          >
-            <Filter className="h-3.5 w-3.5" aria-hidden />
-          </button>
+          <RailFilterToggle label="Filter by role" open={showScope} count={Number(scope !== "all")} controls={filtersId} onClick={() => setShowScope(value => !value)} />
           <button
             type="button"
             onClick={onCreateVault}
@@ -329,36 +309,11 @@ export function VaultRail({
           >
             <Plus className="h-3.5 w-3.5" aria-hidden />
           </button>
-          <button
-            type="button"
-            onClick={onToggleCollapsed}
-            title="Minimize to rail"
-            aria-label="Minimize vault list to a rail"
-            aria-expanded={true}
-            className={headBtn}
-          >
-            <ChevronsLeft className="h-4 w-4" aria-hidden />
-          </button>
-        </div>
-      </div>
+      </RailManagement>
 
-      {vaults.length > 0 && (
-        <div className="px-2 py-1.5 shrink-0 border-b border-border space-y-1.5">
-          <div className="relative">
-            <SearchIcon
-              className="absolute left-2 top-1/2 -translate-y-1/2 h-3 w-3 text-foreground-muted pointer-events-none"
-              aria-hidden
-            />
-            <input
-              type="search"
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-              placeholder="Filter vaults"
-              aria-label="Filter vaults"
-              className="w-full h-8 pl-6 pr-2 rounded-[var(--radius-md)] bg-background border border-border text-xs text-foreground placeholder:text-foreground-muted focus:outline-none focus:border-primary focus-visible:ring-2 focus-visible:ring-ring transition-colors"
-            />
-          </div>
-          {showScope && (
+        <div data-slot="vault-filter-row" className="flex min-h-10 shrink-0 flex-col justify-center gap-2 border-b border-border px-2 py-1">
+          <RailFilterField label="Filter vaults" value={filter} onChange={setFilter} />
+          <div id={filtersId} hidden={!showScope}>
             <div
               role="group"
               aria-label="Filter vaults by your role"
@@ -381,9 +336,9 @@ export function VaultRail({
                 </button>
               ))}
             </div>
-          )}
+          </div>
+          {scope !== "all" && <div className="flex items-center justify-between gap-2 pb-1 text-xs text-foreground-muted"><span>1 active filter</span><button type="button" onClick={event => { changeScope("all"); event.currentTarget.closest('[data-slot="vault-filter-row"]')?.querySelector("input")?.focus(); }} className="rounded-[var(--radius-sm)] text-link focus-visible:ring-2 focus-visible:ring-ring">Reset filters</button></div>}
         </div>
-      )}
 
       <div className="flex-1 overflow-y-auto rail-scroll py-1">
         {vaults.length === 0 ? (

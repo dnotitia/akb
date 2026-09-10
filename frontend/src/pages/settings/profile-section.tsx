@@ -1,10 +1,9 @@
 import { useEffect, useState } from "react";
-import { BadgeCheck, LockKeyhole, ShieldCheck, UserRound } from "lucide-react";
+import { ShieldCheck, UserRound } from "lucide-react";
 import { changePassword, updateProfile } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Panel } from "@/components/ui/panel";
 import { Alert } from "@/components/ui/alert";
 import { RoleBadge } from "@/components/status-badge";
 import { useFlashStatus } from "@/hooks/use-flash-status";
@@ -24,6 +23,7 @@ interface Props {
   localPasswordEnabled: boolean;
   localProfileEditingEnabled: boolean;
   onUserUpdate: (patch: { display_name?: string; email?: string }) => void;
+  onDirtyChange?: (dirty: boolean) => void;
 }
 
 export function ProfileSection({
@@ -31,9 +31,10 @@ export function ProfileSection({
   localPasswordEnabled,
   localProfileEditingEnabled,
   onUserUpdate,
+  onDirtyChange,
 }: Props) {
-  const [profileDisplayName, setProfileDisplayName] = useState("");
-  const [profileEmail, setProfileEmail] = useState("");
+  const [profileDisplayName, setProfileDisplayName] = useState(user.display_name ?? "");
+  const [profileEmail, setProfileEmail] = useState(user.email ?? "");
   const [profileError, setProfileError] = useState("");
   // Benign "nothing to save" message — kept off the red error channel so a
   // no-op submit doesn't read as a failure.
@@ -58,21 +59,26 @@ export function ProfileSection({
   useEffect(() => {
     setProfileDisplayName(user.display_name ?? "");
     setProfileEmail(user.email ?? "");
-  }, [user]);
+  }, [user.user_id, user.display_name, user.email]);
 
-  // Guard unsaved profile edits behind the browser's unload prompt (refresh /
-  // close / external nav). In-app SPA nav has the Save/notice as its net.
+  const profileDirty =
+    (user.display_name ?? "") !== profileDisplayName || (user.email ?? "") !== profileEmail;
+  const dirty = (localProfileEditingEnabled && profileDirty)
+    || (localPasswordEnabled && Boolean(pwCurrent || pwNew || pwConfirm));
+
+  useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
+  useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
+
+  // Protect both profile and password work during refresh / external navigation.
   useEffect(() => {
-    const dirty =
-      (user.display_name ?? "") !== profileDisplayName || user.email !== profileEmail;
-    if (!localProfileEditingEnabled || !dirty || profileBusy) return;
+    if (!dirty) return;
     const onBeforeUnload = (e: BeforeUnloadEvent) => {
       e.preventDefault();
       e.returnValue = "";
     };
     window.addEventListener("beforeunload", onBeforeUnload);
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
-  }, [user, profileDisplayName, profileEmail, profileBusy, localProfileEditingEnabled]);
+  }, [dirty]);
 
   async function handleSaveProfile(e: React.FormEvent) {
     e.preventDefault();
@@ -100,6 +106,7 @@ export function ProfileSection({
 
   async function handleChangePassword(e: React.FormEvent) {
     e.preventDefault();
+    if (!localPasswordEnabled) return;
     setPwError("");
     if (pwNew !== pwConfirm) {
       setPwError("New password and confirmation do not match");
@@ -124,48 +131,28 @@ export function ProfileSection({
     }
   }
 
-  const profileDirty =
-    (user.display_name ?? "") !== profileDisplayName || user.email !== profileEmail;
-  const displayLabel = user.display_name?.trim() || user.username;
-  const initials = initialsFor(displayLabel);
-
   return (
-    <div className="grid items-start gap-6 xl:grid-cols-[minmax(0,1.08fr)_minmax(22rem,0.92fr)]">
-      <Panel>
-        <div className="flex items-start justify-between gap-4 border-b border-border px-5 py-5 sm:px-6">
-          <div className="flex min-w-0 items-center gap-3">
-            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[var(--radius-md)] bg-surface-selected text-surface-selected-foreground">
-              <UserRound className="h-4 w-4" aria-hidden />
-            </span>
-            <div className="min-w-0">
-              <h2 className="text-base font-semibold text-foreground">Public profile</h2>
-              <p className="mt-1 text-sm text-foreground-muted">
-                Your identity across vaults and activity.
-              </p>
-            </div>
+    <div className="grid w-full max-w-6xl items-start gap-10 xl:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)] xl:gap-12">
+      <section aria-labelledby="profile-heading">
+        <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-3">
+          <h2 id="profile-heading" className="text-base font-semibold text-foreground">Public profile</h2>
+          <div className="flex min-w-0 items-center gap-2 text-xs text-foreground-muted">
+            <span className="break-all">@{user.username}</span>
+            <RoleBadge role={user.is_admin ? "admin" : "user"} />
           </div>
-          <RoleBadge role={user.is_admin ? "admin" : "user"} />
-        </div>
+        </header>
 
-        <div className="flex items-center gap-4 border-b border-border bg-surface-2/70 px-5 py-4 sm:px-6">
-          <div
-            className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full border border-border-strong bg-surface text-sm font-semibold text-primary shadow-xs"
-            aria-hidden
-          >
-            {initials || <UserRound className="h-5 w-5" />}
-          </div>
+        <div className="my-5 flex items-center gap-4 rounded-[var(--radius-md)] border border-border bg-surface p-4" data-testid="profile-identity">
+          <span className="flex h-16 w-16 shrink-0 items-center justify-center rounded-full bg-surface-selected text-xl font-semibold text-surface-selected-foreground" aria-hidden>
+            {(user.display_name?.trim() || user.username).slice(0, 2) || <UserRound className="h-6 w-6" />}
+          </span>
           <div className="min-w-0">
-            <div className="truncate text-sm font-semibold text-foreground">{displayLabel}</div>
-            <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-foreground-muted">
-              <span>@{user.username}</span>
-              <span aria-hidden>·</span>
-              <span>{user.email}</span>
-            </div>
+            <p className="break-words text-base font-semibold">{user.display_name?.trim() || user.username}</p>
+            <p className="mt-1 break-all text-sm text-foreground-muted">{user.email}</p>
           </div>
         </div>
-
-        <form onSubmit={handleSaveProfile} className="p-5 sm:p-6">
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
+        <form onSubmit={handleSaveProfile}>
+          <div className="space-y-4">
             <div>
               <Label htmlFor="profile-display-name">Display name</Label>
               <Input
@@ -190,7 +177,7 @@ export function ProfileSection({
           </div>
 
           {localProfileEditingEnabled ? (
-            <div className="mt-6 flex flex-wrap items-center gap-3 border-t border-border pt-5">
+            <div className="mt-5 flex flex-wrap items-center gap-3">
               <Button type="submit" loading={profileBusy} disabled={!profileDirty}>
                 Save profile
               </Button>
@@ -216,22 +203,14 @@ export function ProfileSection({
             </Alert>
           )}
         </form>
-      </Panel>
+      </section>
 
       {localPasswordEnabled ? (
-        <Panel aria-labelledby="change-pw-heading">
-          <div className="flex items-start gap-3 border-b border-border px-5 py-5 sm:px-6">
-            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[var(--radius-md)] bg-surface-selected text-surface-selected-foreground">
-              <LockKeyhole className="h-4 w-4" aria-hidden />
-            </span>
-            <div>
-              <h2 id="change-pw-heading" className="text-base font-semibold text-foreground">Change password</h2>
-              <p className="mt-1 text-sm text-foreground-muted">
-                Rotate your local sign-in password.
-              </p>
-            </div>
-          </div>
-          <form onSubmit={handleChangePassword} className="p-5 sm:p-6">
+        <section aria-labelledby="change-pw-heading">
+          <header className="border-b border-border pb-3">
+            <h2 id="change-pw-heading" className="text-base font-semibold text-foreground">Change password</h2>
+          </header>
+          <form onSubmit={handleChangePassword} className="pt-5">
             <div className="space-y-4">
               <div>
                 <Label htmlFor="pw-current">Current password</Label>
@@ -254,14 +233,12 @@ export function ProfileSection({
                   onChange={(e) => setPwNew(e.target.value)}
                   onBlur={() => setPwTouched((t) => ({ ...t, new: true }))}
                   aria-invalid={pwTooShort || undefined}
-                  aria-describedby={pwTooShort ? "pw-new-help" : undefined}
+                  aria-describedby="pw-new-help"
                   required
                 />
-                {pwTooShort && (
-                  <p id="pw-new-help" className="mt-1 text-xs text-destructive">
-                    Use at least 8 characters.
-                  </p>
-                )}
+                <p id="pw-new-help" className={`mt-1 text-xs ${pwTooShort ? "text-destructive" : "text-foreground-muted"}`}>
+                  Use at least 8 characters.
+                </p>
               </div>
               <div>
                 <Label htmlFor="pw-confirm">Confirm new password</Label>
@@ -293,32 +270,24 @@ export function ProfileSection({
                 {passwordFlash.message}
               </p>
             )}
-            <div className="mt-6 flex flex-wrap items-center justify-between gap-4 border-t border-border pt-5">
+            <div className="mt-5 flex flex-wrap items-center gap-3">
+              <Button type="submit" loading={pwBusy} disabled={pwSubmitDisabled} aria-disabled={pwSubmitDisabled}>
+                Change password
+              </Button>
               <span className="flex items-center gap-1.5 text-xs text-foreground-muted">
                 <ShieldCheck className="h-4 w-4" aria-hidden />
                 Current session stays active
               </span>
-              <Button type="submit" loading={pwBusy} disabled={pwSubmitDisabled} aria-disabled={pwSubmitDisabled}>
-                Change password
-              </Button>
             </div>
           </form>
-        </Panel>
+        </section>
       ) : (
-        <Panel aria-labelledby="managed-access-heading">
-          <div className="flex items-start gap-3 border-b border-border px-5 py-5 sm:px-6">
-            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[var(--radius-md)] bg-success-soft text-success-soft-foreground">
-              <BadgeCheck className="h-4 w-4" aria-hidden />
-            </span>
-            <div>
-              <h2 id="managed-access-heading" className="text-base font-semibold text-foreground">Managed access</h2>
-              <p className="mt-1 text-sm text-foreground-muted">
-                Your organization controls sign-in security.
-              </p>
-            </div>
-          </div>
-          <div className="p-5 sm:p-6">
-            <dl className="divide-y divide-border rounded-[var(--radius-md)] border border-border bg-surface-2/50 px-4">
+        <section aria-labelledby="managed-access-heading">
+          <header className="border-b border-border pb-3">
+            <h2 id="managed-access-heading" className="text-base font-semibold text-foreground">Managed access</h2>
+          </header>
+          <div className="max-w-xl pt-2">
+            <dl className="divide-y divide-border">
               <div className="flex items-center justify-between gap-4 py-3 text-sm">
                 <dt className="text-foreground-muted">Sign-in method</dt>
                 <dd className="font-medium text-foreground">Identity provider</dd>
@@ -332,16 +301,8 @@ export function ProfileSection({
               Contact your workspace administrator if you need to recover or change your sign-in credentials.
             </p>
           </div>
-        </Panel>
+        </section>
       )}
     </div>
   );
-}
-
-function initialsFor(label: string): string {
-  const words = label.trim().split(/\s+/).filter(Boolean);
-  if (words.length > 1) {
-    return `${Array.from(words[0])[0] ?? ""}${Array.from(words[words.length - 1])[0] ?? ""}`;
-  }
-  return Array.from(words[0] ?? "?").slice(0, 2).join("");
 }

@@ -1,9 +1,16 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 import { useVaultFavorites } from "../use-vault-favorites";
+import { useCurrentUser } from "@/contexts/current-user-context";
 
-const KEY = "akb-vault-favorites";
-beforeEach(() => localStorage.clear());
+vi.mock("@/contexts/current-user-context", () => ({ useCurrentUser: vi.fn(() => ({ user_id: "favorites-test" })) }));
+
+const KEY = "akb-vault-favorites:v2:favorites-test";
+beforeEach(() => {
+  localStorage.clear();
+  window.dispatchEvent(new StorageEvent("storage", { key: null }));
+  vi.mocked(useCurrentUser).mockReturnValue({ user_id: "favorites-test" } as ReturnType<typeof useCurrentUser>);
+});
 
 describe("useVaultFavorites · readIds guards", () => {
   it("starts empty with no stored value", () => {
@@ -62,6 +69,31 @@ describe("useVaultFavorites · toggle", () => {
 });
 
 describe("useVaultFavorites · cross-tab sync", () => {
+  it("updates all consumers in the same tab immediately", () => {
+    const first = renderHook(() => useVaultFavorites());
+    const second = renderHook(() => useVaultFavorites());
+    act(() => first.result.current.toggleFavorite("shared"));
+    expect(second.result.current.favorites).toEqual(["shared"]);
+    act(() => second.result.current.toggleFavorite("shared"));
+    expect(first.result.current.favorites).toEqual([]);
+  });
+
+  it("isolates accounts and does not adopt unowned legacy favorites", () => {
+    localStorage.setItem("akb-vault-favorites", JSON.stringify(["legacy"]));
+    const hook = renderHook(() => useVaultFavorites());
+    expect(hook.result.current.favorites).toEqual([]);
+    act(() => hook.result.current.toggleFavorite("mine"));
+    vi.mocked(useCurrentUser).mockReturnValue({ user_id: "another-user" } as ReturnType<typeof useCurrentUser>);
+    hook.rerender();
+    expect(hook.result.current.favorites).toEqual([]);
+    act(() => hook.result.current.toggleFavorite("theirs"));
+    vi.mocked(useCurrentUser).mockReturnValue({ user_id: "favorites-test" } as ReturnType<typeof useCurrentUser>);
+    hook.rerender();
+    expect(hook.result.current.favorites).toEqual(["mine"]);
+    vi.mocked(useCurrentUser).mockReturnValue(null);
+    hook.rerender();
+    expect(hook.result.current.favorites).toEqual([]);
+  });
   it("re-reads on a storage event for the favorites key", () => {
     const { result } = renderHook(() => useVaultFavorites());
     localStorage.setItem(KEY, JSON.stringify(["from-other-tab"]));

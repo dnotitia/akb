@@ -52,13 +52,14 @@ and path. Legacy document labels use the current stored document title.
 
 ## Follow watched documents from Home
 
-Home's **Recent updates** offers **All** and **Watching**. All shows the latest
-document changes you can access; Watching narrows the same list to documents you
-currently watch. Each document appears once, ordered by its latest modification,
+Home shows **Recent updates** and **Watched documents** in separate sections,
+side by side on wide screens and stacked on smaller screens. Recent updates
+shows accessible document changes; Watched documents limits its own list to
+documents you currently watch. Each document appears once per section, ordered by its latest modification,
 including your own edits. A newly watched document can appear immediately with
 its actual modification time; this does not replay old notifications.
 
-**Continue working** remains your browser-local recently visited list. Watching
+**Recently viewed** remains your browser-local recently visited list. Watching
 is neither a second inbox nor an unread list: opening a Home document preview
 does not acknowledge notifications. **Manage watches** opens notification
 settings, where you can review and stop subscriptions.

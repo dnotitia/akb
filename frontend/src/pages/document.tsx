@@ -50,6 +50,7 @@ import {
 import { cn, timeAgo } from "@/lib/utils";
 import { docUri } from "@/lib/uri";
 import { DocumentWatch } from "@/components/document-watch";
+import { WorkspacePin } from "@/components/workspace-pin";
 import { parseHeadings } from "@/lib/markdown";
 import { sameCommitRef } from "@/lib/commit";
 import { VAULT_SKILL_PATH } from "@/lib/skill";
@@ -1416,9 +1417,10 @@ export default function DocumentPage({
                 variant="outline"
                 size="sm"
                 onClick={() => openFullPage(view)}
+                aria-label="Open document in vault"
               >
                 <Maximize2 className="h-4 w-4" aria-hidden />
-                <span className="hidden lg:inline">Full page</span>
+                <span className="hidden sm:inline">Open in vault</span>
               </Button>
             )}
             {inEditMode ? (
@@ -1589,6 +1591,7 @@ export default function DocumentPage({
                     </span>
                   )}
                   {!isHistorical && <DocumentWatch key={docUri(name!, doc.path)} uri={docUri(name!, doc.path)} />}
+                  {!isHistorical && <WorkspacePin item={{ kind: "document", vault: name!, path: doc.path, title: doc.title || doc.path }} />}
                   <button
                     type="button"
                     onClick={() => {

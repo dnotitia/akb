@@ -1,5 +1,5 @@
 import { Link, Outlet, Navigate, useLocation } from "react-router-dom";
-import { useEffect, useLayoutEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useState, type CSSProperties } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Boxes, House, type LucideIcon } from "lucide-react";
 import {
@@ -16,6 +16,7 @@ import { GlobalSearchDialog } from "@/components/global-search-dialog";
 import { HeaderIndexingStatus } from "@/components/header-indexing-status";
 import { NotificationBell } from "@/components/notification-bell";
 import { AppSidebar } from "@/components/app-sidebar";
+import { AppPageLocation } from "@/components/app-page-location";
 import { appRouteBoundaryForPath } from "@/app-route-contract";
 import { CurrentUserProvider } from "@/contexts/current-user-context";
 import { useAccessibleIndexingHealth } from "@/hooks/use-accessible-indexing-health";
@@ -45,6 +46,8 @@ export function Layout() {
     | { status: "unauthenticated"; user: null }
   >({ status: "checking", user: null });
   const [revalidating, setRevalidating] = useState(false);
+  const [vaultNavigationWidth, setVaultNavigationWidth] = useState(0);
+  const [vaultSidebarCollapsed, setVaultSidebarCollapsed] = useState(true);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try {
       return localStorage.getItem(APP_SIDEBAR_COMPACT_KEY) === "true";
@@ -139,14 +142,19 @@ export function Layout() {
 
   const wide = appRouteBoundaryForPath(location.pathname) === "vault-shell";
   const isSearchWorkspace = location.pathname === "/search";
-  const viewportLocked = wide || isSearchWorkspace;
-  const sidebarCompact = wide || sidebarCollapsed;
+  const isSettingsWorkspace = location.pathname === "/settings";
+  const viewportLocked = wide || isSearchWorkspace || isSettingsWorkspace;
+  const sidebarCompact = wide ? vaultSidebarCollapsed : sidebarCollapsed;
   const { data: indexingStatus } = useAccessibleIndexingHealth(
     session.status === "authenticated",
     activeUser?.user_id,
   );
 
   function setSidebarCompact(compact: boolean) {
+    if (wide) {
+      setVaultSidebarCollapsed(compact);
+      return;
+    }
     setSidebarCollapsed(compact);
     try {
       localStorage.setItem(APP_SIDEBAR_COMPACT_KEY, String(compact));
@@ -162,7 +170,7 @@ export function Layout() {
   }, [viewportLocked]);
 
   if (session.status === "checking") {
-    return <AppShellLoading />;
+    return <AppShellLoading compact={sidebarCompact} />;
   }
 
   if (session.status === "unauthenticated") {
@@ -177,10 +185,12 @@ export function Layout() {
   // scroll. Document-flow routes keep natural page scroll and the footer.
   const rootClass = viewportLocked
     ? "h-screen flex flex-col overflow-hidden bg-background text-foreground"
-    : "min-h-screen flex flex-col bg-background text-foreground";
+    : location.pathname === "/"
+      ? "min-h-screen flex flex-col bg-surface text-foreground"
+      : "min-h-screen flex flex-col bg-background text-foreground";
 
   return (
-    <div className={rootClass} aria-busy={revalidating || undefined}>
+    <div className={`${rootClass} [--workspace-gutter:1rem] sm:[--workspace-gutter:1.5rem] lg:[--workspace-gutter:2rem] xl:[--workspace-gutter:3rem] 2xl:[--workspace-gutter:9rem] ${sidebarCompact ? "lg:pl-14" : "lg:pl-52"}`} style={{ "--vault-navigation-width": `${wide ? vaultNavigationWidth : isSettingsWorkspace ? 220 : 0}px` } as CSSProperties} aria-busy={revalidating || undefined}>
       {revalidating && (
         <InlineLoadingState
           label="Refreshing access…"
@@ -197,12 +207,10 @@ export function Layout() {
         Skip to content
       </a>
       {/* ── Glass app header ───────────────────────────────────────── */}
-      <header className="app-header sticky top-0 z-40 shrink-0">
-        <div className="flex h-14 w-full items-center">
-          {/* Keep the brand lockup stable while the navigation rail changes
-              density. Collapsing navigation must not remove product identity
-              or shift the global-search entry point. */}
-          <div className="flex shrink-0 items-center px-3 lg:w-52">
+      <header className={`app-header sticky top-0 z-40 h-14 shrink-0 lg:ml-[var(--vault-navigation-width)] ${wide ? "vault-app-header" : ""}`}>
+        <div className="flex h-full w-full items-center">
+          {/* Desktop identity belongs to the full-height navigation rail. */}
+          <div className="flex shrink-0 items-center px-3 lg:hidden">
             <Link
               to="/"
               aria-label="AKB home"
@@ -217,7 +225,8 @@ export function Layout() {
             </Link>
           </div>
 
-          <div className="flex min-w-0 flex-1 items-center pr-3">
+          <div className="flex min-w-0 flex-1 items-center pr-3 lg:pl-5">
+            <AppPageLocation isAdmin={session.user.is_admin} />
             <div className="ml-auto flex min-w-0 items-center gap-2">
               <HeaderIndexingStatus status={indexingStatus} />
               {/* This is a real global-search surface, not a shortcut to /search.
@@ -258,11 +267,14 @@ export function Layout() {
       </header>
 
       <div className={viewportLocked ? "flex min-h-0 flex-1" : "flex flex-1"}>
+        <CurrentUserProvider user={session.user}>
         <AppSidebar
+          key={session.user.user_id}
           compact={sidebarCompact}
-          collapsible={!wide}
+          collapsible
           onCompactChange={setSidebarCompact}
         />
+        </CurrentUserProvider>
 
         <div
           className={
@@ -277,18 +289,18 @@ export function Layout() {
             tabIndex={-1}
             className={
               viewportLocked
-                ? "min-h-0 flex-1 animate-in focus:outline-none"
+                ? "min-h-0 flex-1 focus:outline-none"
                 : "flex-1 animate-in focus:outline-none"
             }
           >
             {viewportLocked ? (
               <CurrentUserProvider user={session.user}>
                 <ErrorBoundary resetKeys={[location.pathname, location.search]}>
-                  <Outlet context={{ indexingStatus }} />
+                  <Outlet context={{ indexingStatus, setVaultNavigationWidth }} />
                 </ErrorBoundary>
               </CurrentUserProvider>
             ) : (
-              <div className="w-full px-4 py-8 sm:px-6 lg:px-8 xl:px-12 2xl:px-36">
+              <div className="w-full px-[var(--workspace-gutter)] py-8">
                 <CurrentUserProvider user={session.user}>
                   <ErrorBoundary
                     resetKeys={[location.pathname, location.search]}
@@ -303,7 +315,7 @@ export function Layout() {
           {/* Footer — hidden while a viewport-locked workspace owns scrolling. */}
           {!viewportLocked && (
             <footer className="border-t border-border">
-              <div className="flex w-full items-center justify-between px-4 py-3 sm:px-6 lg:px-8 xl:px-12 2xl:px-36">
+              <div className="flex w-full items-center justify-between px-[var(--workspace-gutter)] py-3">
                 <div className="coord">© Dnotitia · Seahorse</div>
                 <div className="coord hidden md:block">Agent Knowledgebase</div>
                 <div className="coord">v1.0</div>
@@ -316,13 +328,13 @@ export function Layout() {
   );
 }
 
-function AppShellLoading() {
+function AppShellLoading({ compact }: { compact: boolean }) {
   return (
     <LoadingState label="Verifying session" className="min-h-screen bg-background text-foreground">
-      <div className="flex min-h-screen flex-col">
+      <div className={`flex min-h-screen flex-col ${compact ? "lg:pl-14" : "lg:pl-52"}`}>
         <header className="app-header shrink-0">
           <div className="flex h-14 w-full items-center">
-            <div className="flex shrink-0 items-center px-3 lg:w-52">
+            <div className="flex shrink-0 items-center px-3 lg:hidden">
               <Logo size={28} wordmark subtitle variant="header" />
             </div>
             <div className="ml-auto flex min-w-0 items-center gap-3 pr-3">
@@ -333,12 +345,15 @@ function AppShellLoading() {
         </header>
 
         <div className="flex min-h-0 flex-1">
-          <aside className="hidden w-52 shrink-0 border-r border-border bg-surface lg:block">
+          <aside className={`fixed inset-y-0 left-0 hidden h-dvh border-r border-border bg-surface lg:block ${compact ? "w-14" : "w-52"}`}>
+            <div className="flex h-14 items-center justify-center border-b border-border">
+              <Logo size={28} wordmark={!compact} variant="header" />
+            </div>
             <div className="space-y-2 p-3">
               {[0, 1, 2, 3].map((item) => (
                 <div key={item} className="flex h-10 items-center gap-3 rounded-[var(--radius-md)] px-2">
                   <Skeleton className="h-8 w-8 shrink-0 rounded-[var(--radius-md)]" />
-                  <Skeleton className="h-3.5 w-24 rounded-[var(--radius-sm)]" />
+                  {!compact && <Skeleton className="h-3.5 w-24 rounded-[var(--radius-sm)]" />}
                 </div>
               ))}
             </div>

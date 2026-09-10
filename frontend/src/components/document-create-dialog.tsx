@@ -4,6 +4,7 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { discardAsset } from "@/lib/api";
 import { clearDocumentDraft } from "@/lib/document-draft";
+import { useCurrentUser } from "@/contexts/current-user-context";
 
 export interface DocumentCreateDialogProps {
   open: boolean;
@@ -30,6 +31,7 @@ export function DocumentCreateDialog({
   returnFocusRef,
   desktopLeftOffset = 112,
 }: DocumentCreateDialogProps) {
+  const userId = useCurrentUser()?.user_id ?? "";
   const [dirty, setDirty] = useState(false);
   const [creating, setCreating] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -91,6 +93,7 @@ export function DocumentCreateDialog({
         >
           {open && (
             <DocumentCreateForm
+              key={userId}
               vault={vault}
               initialCollection={initialCollection}
               onCreated={onCreated}
@@ -122,7 +125,7 @@ export function DocumentCreateDialog({
           await Promise.allSettled(
             draftAssetIds.map((assetId) => discardAsset(vault, assetId)),
           );
-          clearDocumentDraft(vault);
+          clearDocumentDraft(userId, vault);
           onOpenChange(false);
         }}
       />

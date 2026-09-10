@@ -1,7 +1,14 @@
 import { DOC_TYPES, type DocType } from "@/lib/doc-constants";
+import { parseDocUri } from "@/lib/uri";
 
 const DRAFT_VERSION = 1;
 const DRAFT_PREFIX = "akb:document-draft:";
+export const WORKSPACE_DRAFTS_CHANGED_EVENT = "akb:workspace-drafts-changed";
+export const WORKSPACE_DRAFTS_EVENT = WORKSPACE_DRAFTS_CHANGED_EVENT;
+
+function notifyDraftsChanged() {
+  window.dispatchEvent(new Event(WORKSPACE_DRAFTS_CHANGED_EVENT));
+}
 
 /**
  * Existing-document drafts are a separate record from the new-document
@@ -21,6 +28,7 @@ const DOCUMENT_EDIT_DRAFT_RETENTION_MS =
 
 export interface StoredDocumentDraft {
   version: typeof DRAFT_VERSION;
+  userId: string;
   vault: string;
   title: string;
   collection: string;
@@ -298,6 +306,7 @@ export function saveDocumentEditDraft(draft: DocumentEditDraftInput): boolean {
       ),
       JSON.stringify(stored),
     );
+    notifyDraftsChanged();
     return true;
   } catch {
     return false;
@@ -315,23 +324,26 @@ export function clearDocumentEditDraft(draft: Pick<StoredDocumentEditDraft, "use
         draft.draftId,
       ),
     );
+    notifyDraftsChanged();
   } catch {
     // A blocked storage area cannot be cleared reliably. The record remains
     // isolated and the server TTL is still the attachment safety net.
   }
 }
 
-export function documentDraftStorageKey(vault: string): string {
-  return `${DRAFT_PREFIX}${encodeURIComponent(vault)}`;
+export function documentDraftStorageKey(userId: string, vault: string): string {
+  return `${DRAFT_PREFIX}account:${encodeKeyPart(userId)}:${encodeKeyPart(vault)}`;
 }
 
-export function loadDocumentDraft(vault: string): StoredDocumentDraft | null {
+export function loadDocumentDraft(userId: string, vault: string): StoredDocumentDraft | null {
+  if (!userId) return null;
   try {
-    const raw = window.localStorage.getItem(documentDraftStorageKey(vault));
+    const raw = window.localStorage.getItem(documentDraftStorageKey(userId, vault));
     if (!raw) return null;
     const draft = JSON.parse(raw) as Partial<StoredDocumentDraft>;
     if (
       draft.version !== DRAFT_VERSION ||
+      draft.userId !== userId ||
       draft.vault !== vault ||
       typeof draft.title !== "string" ||
       typeof draft.collection !== "string" ||
@@ -343,9 +355,9 @@ export function loadDocumentDraft(vault: string): StoredDocumentDraft | null {
       typeof draft.body !== "string" ||
       !Array.isArray(draft.assetIds) ||
       !draft.assetIds.every((assetId) => typeof assetId === "string") ||
-      typeof draft.updatedAt !== "string"
+      typeof draft.updatedAt !== "string" ||
+      !Number.isFinite(Date.parse(draft.updatedAt))
     ) {
-      window.localStorage.removeItem(documentDraftStorageKey(vault));
       return null;
     }
     return draft as StoredDocumentDraft;
@@ -357,27 +369,92 @@ export function loadDocumentDraft(vault: string): StoredDocumentDraft | null {
 export function saveDocumentDraft(
   draft: Omit<StoredDocumentDraft, "version" | "updatedAt">,
 ): boolean {
+  if (!draft.userId) return false;
   try {
     window.localStorage.setItem(
-      documentDraftStorageKey(draft.vault),
+      documentDraftStorageKey(draft.userId, draft.vault),
       JSON.stringify({
         ...draft,
         version: DRAFT_VERSION,
         updatedAt: new Date().toISOString(),
       } satisfies StoredDocumentDraft),
     );
+    notifyDraftsChanged();
     return true;
   } catch {
     return false;
   }
 }
 
-export function clearDocumentDraft(vault: string): void {
+export function clearDocumentDraft(userId: string, vault: string): void {
+  if (!userId) return;
   try {
-    window.localStorage.removeItem(documentDraftStorageKey(vault));
+    window.localStorage.removeItem(documentDraftStorageKey(userId, vault));
+    notifyDraftsChanged();
   } catch {
     // Storage can be unavailable in hardened/private browsing contexts. The
     // in-memory composer remains usable and its close confirmation still
     // protects the current session.
+  }
+}
+
+export interface WorkspaceDraft {
+  kind: "new" | "edit";
+  vault: string;
+  document?: string;
+  collection?: string;
+  title: string;
+  updatedAt: string;
+}
+
+export function workspaceDraftHref(draft: WorkspaceDraft): string {
+  const base = `/vault/${encodeURIComponent(draft.vault)}/doc/`;
+  if (draft.kind === "new") return `${base}new`;
+  const identity = draft.document ?? "";
+  const parsed = parseDocUri(identity);
+  if (identity.startsWith("akb://") && (!parsed || parsed.vault !== draft.vault)) return `/vault/${encodeURIComponent(draft.vault)}`;
+  const ref = parsed ? parsed.id : identity.startsWith(`${draft.vault}:`)
+    ? identity.slice(draft.vault.length + 1)
+    : identity;
+  return `${base}${encodeURIComponent(ref)}?view=edit`;
+}
+
+/** Metadata only: recovery still goes through each editor's validation contract. */
+export function listWorkspaceDrafts(userId: string): WorkspaceDraft[] {
+  if (!userId) return [];
+  try {
+    const result: WorkspaceDraft[] = [];
+    const editDocuments = new Map<string, StoredDocumentEditDraft>();
+    const newPrefix = `${DRAFT_PREFIX}account:${encodeKeyPart(userId)}:`;
+    const editPrefix = `${DOCUMENT_EDIT_DRAFT_PREFIX}:${encodeKeyPart(userId)}:`;
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const key = window.localStorage.key(i);
+      if (!key) continue;
+      if (key.startsWith(newPrefix)) {
+        let vault: string;
+        try { vault = decodeURIComponent(key.slice(newPrefix.length)); } catch { continue; }
+        const draft = loadDocumentDraft(userId, vault);
+        if (draft) result.push({ kind: "new", vault, collection: draft.collection, title: draft.title, updatedAt: draft.updatedAt });
+      } else if (key.startsWith(editPrefix)) {
+        let candidate: unknown;
+        try { candidate = JSON.parse(window.localStorage.getItem(key) || "null"); } catch { continue; }
+        if (!recordLooksLikeEditDraft(candidate) || candidate.userId !== userId) continue;
+        if (key !== documentEditDraftStorageKey(userId, candidate.vault, candidate.document, candidate.tabId, candidate.draftId)) continue;
+        editDocuments.set(JSON.stringify([candidate.vault, candidate.document]), candidate);
+      }
+    }
+    for (const { vault, document } of editDocuments.values()) {
+      // Same-tab priority must match the editor, even if another tab is newer.
+      const recovered = loadDocumentEditDraft(userId, vault, document);
+      if (recovered.status !== "restored") continue;
+      if (document.startsWith("akb://")) {
+        const parsed = parseDocUri(document);
+        if (!parsed || parsed.vault !== vault) continue;
+      }
+      result.push({ kind: "edit", vault, document, title: recovered.draft.title, updatedAt: recovered.draft.updatedAt });
+    }
+    return result.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+  } catch {
+    return [];
   }
 }

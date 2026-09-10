@@ -53,17 +53,20 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
-describe("Tokens setup guide smart default", () => {
-  it("opens by default when user has zero PATs", async () => {
+describe("Shared connection setup", () => {
+  it("offers setup without forcing credential creation when no PATs exist", async () => {
     const { listPATs, getMe } = await import("@/lib/api");
     (getMe as any).mockResolvedValue({ user_id: "u1", username: "u", email: "u@x", is_admin: false });
     (listPATs as any).mockResolvedValue({ tokens: [] });
     render(wrap());
-    expect(await screen.findByText("Step 01")).toBeVisible();
-    expect(screen.getByText(/Mint a token/i)).toBeVisible();
+    expect(await screen.findByText("No tokens yet")).toBeVisible();
+    expect(document.getElementById("setup-guide-body")).not.toHaveAttribute("hidden");
+    expect(screen.getByRole("heading", { name: "1. Prepare access" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: /2. Configure/ })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "3. Try it in your agent" })).toBeVisible();
   });
 
-  it("closes by default when user has at least one PAT", async () => {
+  it("keeps all setup phases visible even when the user has a PAT", async () => {
     const { listPATs, getMe } = await import("@/lib/api");
     (getMe as any).mockResolvedValue({ user_id: "u1", username: "u", email: "u@x", is_admin: false });
     (listPATs as any).mockResolvedValue({
@@ -71,10 +74,10 @@ describe("Tokens setup guide smart default", () => {
     });
     render(wrap());
     expect(await screen.findByText(/claude/)).toBeVisible();
-    expect(screen.queryByText(/Mint a token/i)).toBeNull();
+    expect(document.getElementById("setup-guide-body")).not.toHaveAttribute("hidden");
   });
 
-  it("respects localStorage override", async () => {
+  it("does not hide the setup entry behind an old browser preference", async () => {
     localStorage.setItem("akb:tokens-setup-open", "true");
     const { listPATs, getMe } = await import("@/lib/api");
     (getMe as any).mockResolvedValue({ user_id: "u1", username: "u", email: "u@x", is_admin: false });
@@ -82,7 +85,9 @@ describe("Tokens setup guide smart default", () => {
       tokens: [{ token_id: "t1", name: "claude", prefix: "akb_xyz", created_at: "2026-05-19", last_used_at: null }],
     });
     render(wrap());
-    expect(await screen.findByText(/Mint a token/i)).toBeVisible();
+    await screen.findByRole("heading", { name: "Connect an agent" });
+    expect(document.getElementById("setup-guide-body")).not.toHaveAttribute("hidden");
+    expect(screen.queryByText(/akb_xyz…/)).not.toBeInTheDocument();
   });
 
   it("keeps PAT management available in SSO mode", async () => {
