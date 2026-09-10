@@ -38,6 +38,10 @@ SYSTEM_PROMPT = (
 )
 
 CURRENT_TRIAL: contextvars.ContextVar[TrialContext | None] = contextvars.ContextVar("mcp_catalog_trial", default=None)
+MODEL_RESPONSES: contextvars.ContextVar[list[ModelResponse] | None] = contextvars.ContextVar(
+    "mcp_catalog_model_responses",
+    default=None,
+)
 
 
 class ModelConfigurationError(ValueError):
@@ -48,28 +52,73 @@ class BudgetExceeded(RuntimeError):
     """Raised when a run would exceed its pre-registered finite cap."""
 
 
-FailureKind = Literal["none", "provider", "output_limit", "terminal_response", "tool", "budget", "unknown"]
+FailureKind = Literal[
+    "none",
+    "provider",
+    "output_limit",
+    "request_limit",
+    "terminal_response",
+    "tool",
+    "budget",
+    "unknown",
+]
 
 
 def classify_failure(error: str | None, *, result: Any, final_answer: str) -> FailureKind:
     if error is None:
         return "terminal_response" if result is not None and not final_answer.strip() else "none"
     lowered = error.casefold()
-    if any(marker in lowered for marker in ("429", "rate", "provider", "modelhttperror", "ratelimit")):
-        return "provider"
-    if any(marker in lowered for marker in ("model token limit", "max_tokens", "completion token limit", "output token")):
+    if any(
+        marker in lowered
+        for marker in (
+            "model token limit",
+            "max_tokens",
+            "completion token limit",
+            "output token",
+            "maximum output",
+            "max output",
+            "finish_reason=length",
+            "finish reason length",
+        )
+    ):
         return "output_limit"
+    if any(
+        marker in lowered
+        for marker in ("429", "rate limit", "modelhttperror", "ratelimiterror", "provider usage/cost")
+    ):
+        return "provider"
+    if any(
+        marker in lowered
+        for marker in ("request_limit", "request limit", "maximum number of requests", "too many requests per trial")
+    ):
+        return "request_limit"
     if any(marker in lowered for marker in ("terminal response", "final response", "no final", "empty response")):
         return "terminal_response"
     if any(marker in lowered for marker in ("unknown tool", "toolfailed", "tool error", "modelretry", "mcp tool")):
         return "tool"
-    if any(marker in lowered for marker in ("max_cost", "max_model_requests", "max_wall", "request_limit", "request limit", "benchmark incomplete")):
+    if any(
+        marker in lowered
+        for marker in (
+            "max_cost",
+            "cost_limit",
+            "max_model_requests",
+            "max_wall",
+            "benchmark incomplete",
+        )
+    ):
         return "budget"
     return "unknown"
 
 
 class OpenRouterChatModel(OpenAIChatModel):
     """PydanticAI's OpenAI-compatible model with OpenRouter response evidence."""
+
+    async def request(self, messages: list[Any], model_settings: Any, model_request_parameters: Any) -> ModelResponse:
+        response = await super().request(messages, model_settings, model_request_parameters)
+        captured = MODEL_RESPONSES.get()
+        if captured is not None:
+            captured.append(response)
+        return response
 
     def _process_provider_details(self, response: Any) -> dict[str, Any] | None:
         details = super()._process_provider_details(response) or {}
@@ -194,16 +243,29 @@ class TrialOutcome(BaseModel):
         )
 
 
-def _has_terminal_usage_evidence(outcome: TrialOutcome) -> bool:
+def _has_provider_usage_evidence(outcome: TrialOutcome) -> bool:
     return (
-        outcome.error is None
-        and outcome.model_requests > 0
+        outcome.model_requests > 0
         and outcome.total_tokens > 0
         and outcome.total_tokens == outcome.input_tokens + outcome.output_tokens
         and bool(outcome.provider_evidence)
+        and outcome.provider_cost_usd is not None
+        and outcome.cost_source == "provider_response"
         and outcome.routing_observed
         and outcome.routing_valid
     )
+
+
+def has_measured_evidence(outcome: TrialOutcome) -> bool:
+    """Return whether a trial has real provider and lifecycle evidence to keep."""
+
+    if not _has_provider_usage_evidence(outcome):
+        return False
+    if outcome.error is None:
+        return True
+    if outcome.failure_kind not in {"output_limit", "request_limit", "terminal_response", "tool"}:
+        return False
+    return outcome.state_available_before and outcome.state_available_after
 
 
 @dataclass(slots=True)
@@ -334,7 +396,7 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
                     self.mark_reset_complete()
                 if self.checkpoint_sink is not None and self.output is not None:
                     checkpoint_attempted = True
-                    status: Literal["completed", "failed"] = "completed" if _has_terminal_usage_evidence(self.output) else "failed"
+                    status: Literal["completed", "failed"] = "completed" if has_measured_evidence(self.output) else "failed"
                     await self.checkpoint_sink(self.output, status)
             except Exception as exc:
                 if self.checkpoint_sink is not None and self.output is not None and not checkpoint_attempted:
@@ -498,6 +560,8 @@ class TrialExecutor:
             return outcome
         settled = False
         try:
+            partial_messages: list[ModelResponse] = []
+            capture_token = MODEL_RESPONSES.set(partial_messages)
             try:
                 if self.transport == "stdio":
                     command, args, environment = self.fixture.stdio_command(token)
@@ -531,6 +595,8 @@ class TrialExecutor:
                     )
             except Exception as exc:
                 error = redact_exception(exc, secrets)
+            finally:
+                MODEL_RESPONSES.reset(capture_token)
             latency = time.perf_counter() - started
             outcome = outcome_from_run(
                 task=task,
@@ -543,6 +609,7 @@ class TrialExecutor:
                 error=error,
                 latency=latency,
                 secrets=secrets,
+                partial_messages=partial_messages,
             )
             try:
                 await self.ledger.charge(outcome, reserved_cost_usd=reservation)
@@ -584,6 +651,8 @@ async def execute_smoke(
     started = time.perf_counter()
     result: Any = None
     error: str | None = None
+    partial_messages: list[ModelResponse] = []
+    capture_token = MODEL_RESPONSES.set(partial_messages)
     try:
         if transport == "stdio":
             command, args, environment = fixture.stdio_command(token)
@@ -617,6 +686,8 @@ async def execute_smoke(
             )
     except Exception as exc:
         error = redact_exception(exc, secrets)
+    finally:
+        MODEL_RESPONSES.reset(capture_token)
     return outcome_from_run(
         task=task,
         arm=arm,
@@ -628,6 +699,7 @@ async def execute_smoke(
         error=error,
         latency=time.perf_counter() - started,
         secrets=secrets,
+        partial_messages=partial_messages,
     )
 
 
@@ -694,6 +766,7 @@ def outcome_from_run(
     error: str | None,
     latency: float,
     secrets: tuple[str, ...],
+    partial_messages: list[ModelResponse] | None = None,
 ) -> TrialOutcome:
     raw_calls: list[tuple[str, Any]] = []
     provider_evidence: list[dict[str, Any]] = []
@@ -704,40 +777,42 @@ def outcome_from_run(
     cost_source: Literal["provider_response", "registered_price_snapshot"] = "registered_price_snapshot"
     routing_observed = False
     routing_valid = False
-    messages: list[Any] = []
+    messages: list[Any] = list(partial_messages or [])
     if result is not None:
         final_answer = redact_text(result.output, secrets)
         messages = result.all_messages()
-        raw_calls = extract_tool_calls(messages, secrets)
-        provider_evidence = extract_provider_evidence(messages, secrets)
         usage = result.usage
         input_tokens = usage.input_tokens
         output_tokens = usage.output_tokens
         requests = usage.requests
-        raw_input, raw_output = provider_token_totals(provider_evidence)
-        if raw_input or raw_output:
-            input_tokens = raw_input
-            output_tokens = raw_output
-        if not requests:
-            requests = len(provider_evidence)
-        provider_cost = provider_response_cost(provider_evidence)
-        cost = provider_cost if provider_cost is not None else estimate_cost(model_spec, input_tokens, output_tokens)
-        cost_source = "provider_response" if provider_cost is not None else "registered_price_snapshot"
-        routing_observed, routing_valid = validate_routing_evidence(provider_evidence, model_spec)
-        if error is None and not routing_observed:
-            error = "OpenRouter routing evidence was not returned"
-        elif error is None and not routing_valid:
-            error = "OpenRouter response did not match the registered model/provider route"
-        registered_cost = estimate_cost(model_spec, input_tokens, output_tokens)
-        if provider_cost is not None and provider_cost > registered_cost + 1e-9:
-            error = error or "OpenRouter response cost exceeded the registered price ceiling"
-        if error is None and not final_answer.strip():
-            error = "terminal response was empty"
+    raw_calls = extract_tool_calls(messages, secrets)
+    provider_evidence = extract_provider_evidence(messages, secrets)
+    raw_input, raw_output = provider_token_totals(provider_evidence)
+    if raw_input or raw_output:
+        input_tokens = raw_input
+        output_tokens = raw_output
+    if not requests:
+        requests = len(provider_evidence)
+    provider_cost = provider_response_cost(provider_evidence)
+    cost = provider_cost if provider_cost is not None else estimate_cost(model_spec, input_tokens, output_tokens)
+    cost_source = "provider_response" if provider_cost is not None else "registered_price_snapshot"
+    routing_observed, routing_valid = validate_routing_evidence(provider_evidence, model_spec)
+    if error is None and not routing_observed:
+        error = "OpenRouter routing evidence was not returned"
+    elif error is None and not routing_valid:
+        error = "OpenRouter response did not match the registered model/provider route"
+    if provider_evidence and provider_cost is None:
+        error = error or "provider usage/cost evidence was incomplete"
+    registered_cost = estimate_cost(model_spec, input_tokens, output_tokens)
+    if provider_cost is not None and provider_cost > registered_cost + 1e-9:
+        error = error or "OpenRouter response cost exceeded the registered price ceiling"
+    if result is not None and error is None and not final_answer.strip():
+        error = "terminal response was empty"
     tool_calls = bind_tool_calls(raw_calls, recorder.calls, operation_map, secrets)
     first_operation = tool_calls[0].logical_operation if tool_calls else "none"
     successful_mcp_tool_calls = sum(call.succeeded for call in recorder.calls)
     follow_up_terminal_response = _has_terminal_response_after_tool(
-        messages if result is not None else [],
+        messages,
         final_answer,
         successful_mcp_tool_calls,
     )

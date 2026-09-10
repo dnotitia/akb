@@ -146,11 +146,14 @@ per-trial reset으로 PAT 저장소가 재생성되므로 descriptor의 username
 scope로, `read_only` profile은 기존 `read` scope로 새 token을 발급하며,
 재발급 경로가 없으면 stale PAT를 재사용하지 않고 fail-closed로 종료한다.
 
-`--checkpoint`를 지정하면 각 terminal trial 직후 redacted JSON을 같은
+`--checkpoint`를 지정하면 각 trial 직후 redacted JSON을 같은
 디렉터리에 임시 파일로 fsync한 뒤 atomic replace한다. 재개는 동일한
 `--resume /private/run/baseline.checkpoint.json`으로 실행하며, source revision,
 run manifest hash, task corpus hash, arm, model, transport, task, repeat index가
-모두 일치하는 completed trial만 재사용한다. 실패·미완료 trial만 다시 실행하고,
+모두 일치하고 provider usage/cost 및 routing 증거가 유효한 completed trial만 재사용한다.
+사용량·비용과 양쪽 state 관측이 확보된 request/output limit 또는 tool/terminal
+행동 실패도 `success=false`인 completed trial로 재사용하며 다시 실행하지 않는다.
+증거가 없는 provider/인프라 실패와 미완료 trial만 다시 실행하고,
 손상·입력 불일치·secret 포함 checkpoint는 첫 provider 호출 전에 fail-closed한다.
 checkpoint에는 이전 시도의 실제 usage/cost도 누적해 재개가 `$50` cap을 우회하지
 않도록 한다.
@@ -173,11 +176,14 @@ PAT cleanup이 실패하면 primary failure stage를 유지하고, 이미 완료
 non-zero로 종료한다. 불완전 artifact는 `compare` 입력으로 허용하지 않는다.
 일반 HTTP 요청 timeout은 30초로 유지하고, repository runtime의
 `DEFAULT_TIMEOUT_SECONDS`와 맞춘 reset/readiness budget 180초를 별도로 적용한다.
-provider/toolset 단계에서 model request와 usage evidence를 얻지 못한 실패는
-`status=incomplete` artifact와 failed checkpoint로 남기며, zero-request arm을
-성공 baseline으로 취급하지 않는다. 오류 evidence는 redacted exception chain,
-HTTP status와 `failure_kind`(`provider`, `output_limit`, `terminal_response`,
-`tool`, `budget`)를 구분해 보존한다. 429는 provider failure로 분류하고 hidden
+provider/toolset 단계에서 model request, usage/cost 또는 state evidence를 얻지
+못한 실패는 `status=incomplete` artifact와 failed checkpoint로 남기며,
+zero-request arm을 성공 baseline으로 취급하지 않는다. 반대로 실제 provider
+usage/cost와 양쪽 state 관측을 얻은 request/output limit 또는 tool/terminal 행동
+실패는 측정된 unsuccessful trial로 charge·metric·checkpoint에 남긴다. 오류
+evidence는 redacted exception chain, HTTP status와 `failure_kind`(`provider`,
+`output_limit`, `request_limit`, `terminal_response`, `tool`, `budget`)를 구분해
+보존한다. 429와 usage/cost 누락은 provider failure로 분류하고 hidden
 retry/fallback 없이 resume에서만 다시 실행한다.
 
 runtime supervisor의 fixture reset은 PostgreSQL/MinIO Compose dependency

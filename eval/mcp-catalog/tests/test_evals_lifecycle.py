@@ -207,6 +207,70 @@ async def test_single_repeat_can_carry_exact_index_and_checkpoint_after_teardown
 
 
 @pytest.mark.asyncio
+async def test_measured_behavioral_failure_is_checkpointed_as_completed_but_unsuccessful() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "read-vaults-a")
+    model_id = manifest.models[0].model_id
+    events: list[str] = []
+
+    class MeasuredFailureExecutor:
+        arm = "baseline"
+        transport = "http"
+        model_spec = manifest.models[0]
+
+        def token_for(self, _profile: str) -> str:
+            return "fixture-token"
+
+        def secrets_for(self, _profile: str) -> tuple[str, ...]:
+            return ("fixture-token",)
+
+        async def execute(self, task):
+            return TrialOutcome(
+                task_id=task.id,
+                category=task.category,
+                arm=self.arm,
+                model_class=self.model_spec.class_name,
+                model_id=model_id,
+                transport=self.transport,
+                error="Model token limit (8192) exceeded",
+                failure_kind="output_limit",
+                input_tokens=10,
+                output_tokens=2,
+                total_tokens=12,
+                model_requests=1,
+                cost_usd=0.00001,
+                provider_evidence=[
+                    {
+                        "model": model_id,
+                        "routing": {"endpoints": {"available": [{"provider": "parasail", "selected": True}]}},
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001},
+                    }
+                ],
+                provider_cost_usd=0.00001,
+                cost_source="provider_response",
+                routing_observed=True,
+                routing_valid=True,
+            )
+
+    async def checkpoint_sink(_outcome: TrialOutcome, status: str) -> None:
+        events.append(status)
+
+    report = await evaluate_dataset(
+        [task],
+        manifest=manifest,
+        executor=MeasuredFailureExecutor(),
+        fixture=FakeFixture(),
+        repeat=1,
+        checkpoint_sink=checkpoint_sink,
+    )
+
+    assert not report.failures
+    assert events == ["completed"]
+    assert report.cases[0].output.success is False
+    assert report.cases[0].output.failure_kind == "output_limit"
+
+
+@pytest.mark.asyncio
 async def test_provider_is_not_called_until_reset_readiness_recovers() -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "destructive-confirm-a")
@@ -267,13 +331,25 @@ async def test_teardown_reset_blocks_the_next_trial() -> None:
     marker.ready = True
     executor = _ReadinessGuardExecutor(manifest, marker)
     failures: list[Exception] = []
+    checkpoint_statuses: list[str] = []
+
+    async def checkpoint_sink(_outcome: TrialOutcome, status: str) -> None:
+        checkpoint_statuses.append(status)
 
     with pytest.raises(RuntimeContractError, match="before next trial") as raised:
-        await evaluate_dataset([task], manifest=manifest, executor=executor, fixture=fixture, failure_sink=failures)
+        await evaluate_dataset(
+            [task],
+            manifest=manifest,
+            executor=executor,
+            fixture=fixture,
+            failure_sink=failures,
+            checkpoint_sink=checkpoint_sink,
+        )
 
     assert raised.value.stage == "fixture_readiness"
     assert failures and failures[0] is raised.value
     assert executor.provider_calls == 1
+    assert checkpoint_statuses == ["incomplete"]
 
 
 @pytest.mark.asyncio

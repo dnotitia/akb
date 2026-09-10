@@ -17,6 +17,7 @@ from mcp_catalog.execution import (
     BudgetExceeded,
     BudgetLedger,
     CURRENT_TRIAL,
+    MODEL_RESPONSES,
     ModelConfigurationError,
     OpenRouterChatModel,
     TrialContext,
@@ -26,10 +27,12 @@ from mcp_catalog.execution import (
     _has_terminal_response_after_tool,
     build_model,
     classify_failure,
+    has_measured_evidence,
     outcome_from_run,
     validate_routing_evidence,
     worst_case_cost,
 )
+from mcp_catalog.checkpoint import valid_completed_outcome
 from mcp_catalog.runtime import StateObservation
 
 ROOT = Path(__file__).parents[1]
@@ -246,6 +249,120 @@ def test_outcome_records_provider_cost_usage_and_route_from_model_response() -> 
     assert outcome.error is None
 
 
+def _partial_provider_message(spec, *, include_cost: bool = True) -> ModelResponse:
+    usage = {"prompt_tokens": 10, "completion_tokens": 2}
+    if include_cost:
+        usage["cost"] = 0.00000196
+    return ModelResponse(
+        parts=[TextPart(content="partial response")],
+        usage=RequestUsage(input_tokens=10, output_tokens=2),
+        model_name=spec.model_id,
+        provider_name="openai",
+        provider_url=OPENROUTER_BASE_URL,
+        provider_details={
+            "openrouter_metadata": {
+                "endpoints": {"available": [{"provider": "Parasail", "selected": True}]}
+            },
+            "openrouter_usage": usage,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "failure_kind"),
+    [
+        ("Exceeded the request_limit of 8.", "request_limit"),
+        ("Model token limit (8192) exceeded", "output_limit"),
+        ("MCP tool error: server rejected the call", "tool"),
+        ("terminal response was empty", "terminal_response"),
+    ],
+)
+def test_provider_evidence_from_partial_responses_keeps_behavioral_failures_measured(error, failure_kind) -> None:
+    spec = _model_spec()
+    task = load_task_corpus(ROOT / "corpus" / "tasks.json")[0]
+    outcome = outcome_from_run(
+        task=task,
+        arm="baseline",
+        model_spec=spec,
+        transport="http",
+        result=None,
+        partial_messages=[_partial_provider_message(spec)],
+        recorder=ToolCallRecorder(operation_map={}, secrets=()),
+        operation_map={},
+        error=error,
+        latency=0.1,
+        secrets=(),
+    ).model_copy(update={"state_available_before": True, "state_available_after": True})
+
+    assert outcome.failure_kind == failure_kind
+    assert not outcome.success
+    assert outcome.model_requests == 1
+    assert outcome.provider_cost_usd == pytest.approx(0.00000196)
+    assert has_measured_evidence(outcome)
+    assert valid_completed_outcome(outcome)
+
+
+def test_missing_provider_cost_is_not_a_measured_outcome() -> None:
+    spec = _model_spec()
+    task = load_task_corpus(ROOT / "corpus" / "tasks.json")[0]
+    outcome = outcome_from_run(
+        task=task,
+        arm="baseline",
+        model_spec=spec,
+        transport="http",
+        result=None,
+        partial_messages=[_partial_provider_message(spec, include_cost=False)],
+        recorder=ToolCallRecorder(operation_map={}, secrets=()),
+        operation_map={},
+        error=None,
+        latency=0.1,
+        secrets=(),
+    )
+
+    assert outcome.error == "provider usage/cost evidence was incomplete"
+    assert outcome.failure_kind == "provider"
+    assert not has_measured_evidence(outcome)
+
+
+@pytest.mark.asyncio
+async def test_model_response_capture_survives_the_agent_request_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    spec = _model_spec()
+    model = OpenRouterChatModel(
+        spec.model_id,
+        provider=OpenAIProvider(
+            base_url=OPENROUTER_BASE_URL,
+            **{"api_" + "key": "fixture-provider-key"},
+        ),
+    )
+    response = ChatCompletion.model_validate(
+        {
+            "id": "response-1",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
+            "created": 1,
+            "model": spec.model_id,
+            "object": "chat.completion",
+            "openrouter_metadata": {
+                "endpoints": {"available": [{"provider": "Parasail", "selected": True}]}
+            },
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cost": 0.00000196},
+        }
+    )
+    monkeypatch.setattr(model, "_completions_create", AsyncMock(return_value=response))
+    captured: list[ModelResponse] = []
+    capture_token = MODEL_RESPONSES.set(captured)
+    try:
+        result = await model.request(
+            [ModelRequest(parts=[UserPromptPart("hello")])],
+            model.settings,
+            ModelRequestParameters(),
+        )
+    finally:
+        MODEL_RESPONSES.reset(capture_token)
+
+    assert captured == [result]
+    assert captured[0].provider_details["openrouter_usage"]["cost"] == 0.00000196
+
+
 def test_smoke_terminal_response_requires_a_text_turn_after_a_tool_turn() -> None:
     tool_turn = ModelResponse(parts=[ToolCallPart(tool_name="akb_list_vaults", args={})])
     final_turn = ModelResponse(parts=[TextPart(content="확인했습니다.")])
@@ -258,6 +375,7 @@ def test_smoke_terminal_response_requires_a_text_turn_after_a_tool_turn() -> Non
 def test_failure_evidence_distinguishes_provider_output_terminal_and_budget() -> None:
     assert classify_failure("ModelHTTPError: status=429", result=None, final_answer="") == "provider"
     assert classify_failure("Model token limit (8192) exceeded", result=None, final_answer="") == "output_limit"
+    assert classify_failure("Exceeded the request_limit of 8", result=None, final_answer="") == "request_limit"
     assert classify_failure("terminal response was empty", result=None, final_answer="") == "terminal_response"
     assert classify_failure("benchmark incomplete: max_cost_per_trial_usd exceeded", result=None, final_answer="") == "budget"
 

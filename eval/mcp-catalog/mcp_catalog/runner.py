@@ -397,7 +397,7 @@ class BenchmarkRunner:
                 quality_reasons.append(reason)
         for run_key, outcomes in self._completed_trials.items():
             for outcome in outcomes:
-                if outcome.error:
+                if outcome.error and not valid_completed_outcome(outcome):
                     reason = (
                         f"benchmark incomplete: {run_key} trial {outcome.task_id} "
                         f"repeat {outcome.repeat_index} failed: {redact_text(outcome.error, self.secrets)}"
