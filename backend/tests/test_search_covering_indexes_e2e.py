@@ -137,3 +137,33 @@ async def test_startup_search_prewarm_is_sized_reported_and_shared(local_store):
     finally:
         if peer._own_pool:
             await peer._own_pool.close()
+
+
+async def test_custom_search_timeout_is_scoped_to_retrieval_transaction(
+    local_store, monkeypatch
+):
+    store = local_store
+    store._search_timeout_secs = 60
+    observed = []
+
+    async def probe_dense(conn, **_kwargs):
+        observed.append(await conn.fetchval("SHOW statement_timeout"))
+        return []
+
+    monkeypatch.setattr(store, "_search_dense", probe_dense)
+    assert await store.hybrid_search(
+        query_text="",
+        query_dense=[1.0, *([0.0] * 31)],
+        query_sparse_indices=[],
+        query_sparse_values=[],
+        source_ids=None,
+        vault_ids=None,
+        limit=10,
+        prefetch_per_leg=20,
+    ) == []
+    assert observed == ["1min"]
+
+    pool = await store._pool()
+    async with pool.acquire() as conn:
+        # The override uses SET LOCAL and must not leak through the pool.
+        assert await conn.fetchval("SHOW statement_timeout") == "0"

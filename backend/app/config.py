@@ -1112,6 +1112,13 @@ class Settings(BaseModel):
     # Enabled modes fail startup when that working set does not fit safely in
     # PostgreSQL shared_buffers instead of pretending the latency SLA is met.
     vector_store_startup_prewarm: Literal["off", "index", "search"] = "off"
+    # Per-statement budget for pgvector retrieval legs.  The main database pool
+    # retains its conservative 30-second default for ordinary CRUD; only vector
+    # search may opt into a larger budget when a disk-backed/cold working set is
+    # an accepted deployment trade-off.  Raising this does not make a query
+    # faster, but prevents a legitimate cold read from being misreported as an
+    # empty result while the bounded-memory profile restores its hot set.
+    pgvector_search_timeout_secs: float = Field(default=30.0, ge=1.0, le=300.0)
 
     # Qdrant driver settings.
     vector_url: str = ""  # e.g. http://qdrant:6333

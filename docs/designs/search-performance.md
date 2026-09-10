@@ -452,3 +452,110 @@ cache, real query document-frequency distribution, relevance, write load and the
 actual embedding/reranker network stages. The common-term cutoff is intentionally
 opt-in because some corpora may value exact lexical contribution over this
 latency bound.
+
+## Fixed-memory million-vector profile
+
+The full-working-set profile above has a hard capacity boundary: its selected
+14.51 GB relation set already consumes most of the 16 GB shared-buffer safety
+budget and the PostgreSQL cgroup used about 32.4 GB. Keeping that strategy while
+the corpus grows means repeatedly increasing memory. It is therefore a
+latency-first option, not the default growth model.
+
+`deploy/helm/akb/tuning/pgvector-million-bounded-1024d.yaml` provides the
+complementary memory-first model:
+
+```text
+disk-backed corpus and HNSW (larger than RAM)
+             |
+             v
+PostgreSQL 3 GiB shared-buffer hot set  -- recorded/restored by autoprewarm
+             |
+             v
+8 GiB database cgroup ceiling          -- leaves room for OS cache and queries
+```
+
+It does not call the application full-relation prewarmer, so adding rows does not
+eventually make readiness fail merely because every vector cannot fit in RAM.
+PostgreSQL autoprewarm records at most the pages represented in the bounded
+shared buffers; those pages are still evictable. This favors recurring queries
+after restart while accepting that a new graph path may read from storage.
+
+A clean local PostgreSQL 16 restart check confirmed that this database feature
+does not depend on the AKB application prewarmer. With `shared_buffers=64MB`,
+the `pg_prewarm` library in `shared_preload_libraries`, and no `pg_prewarm` SQL
+extension installed, the background worker recorded the live buffer inventory.
+After a clean container restart it restored 8,191 of 8,192 recorded blocks;
+`pg_buffercache` observed 7,308 table and 494 index blocks from the exercised
+relation. The disposable container and volume were removed after verification.
+
+The first isolated API request after switching the existing million-vector
+fixture to this memory limit exposed a separate correctness concern: the dense
+leg spent about 33.1 seconds on a cold source-filtered HNSW path, crossed the
+hard-coded 30-second main-pool limit, and the API returned HTTP 200 with
+`degraded=true` and no results. The bounded overlay therefore configures a
+90-second **pgvector retrieval-only** budget. A first restored query completed in
+0.42 seconds, but the immediately following unseen path still crossed a
+60-second trial budget after about 61.8 seconds in the dense leg. The driver
+applies 90 seconds to both the client wait and PostgreSQL `statement_timeout`
+inside the retrieval transaction; the main CRUD pool keeps its 30-second guard.
+This prevents a measured valid cold read from being mislabeled as a zero-match
+but does not claim a latency gain or make 90 seconds an acceptable SLO.
+
+Autoprewarm recorded exactly 393,216 blocks, the configured 3 GiB shared-buffer
+capacity. On the confirmation restart PostgreSQL accepted connections at
+05:29:59 UTC and its Kubernetes Pod became Ready at 05:30:04, while the
+background worker did not finish restoring those blocks until 05:30:27.9.
+`pg_isready` therefore exposed a roughly 29-second connection-to-restore gap.
+The bounded Helm overlay sets its PostgreSQL readiness initial delay to 45
+seconds for this reference fixture. This is a measured deployment guard, not a
+portable proof of completion; installations with different storage must time
+their own restore and adjust the value.
+
+The final restart experiment kept the 8 GiB cgroup limit and alternated restored
+centres with previously untouched centres. The 90%-scope cold population used
+centres 24–31, disjoint from both the hot set and all earlier cold probes. This
+corrected an earlier 2–4 second observation whose vector pages had already been
+read by the preceding 10%-scope run.
+
+| Authorized scope / request state | p50 | p95 | Result |
+| --- | ---: | ---: | --- |
+| 10% / restored first request | 1.050 s | 1.709 s | 25 results |
+| 10% / untouched first request | 70.199 s | 77.447 s | 25 results |
+| 10% / untouched repeat | 0.191 s | 0.310 s | 25 results |
+| 90% / restored first request | 1.349 s | 1.897 s | 25 results |
+| 90% / independently untouched first request | 22.603 s | 25.493 s | 25 results |
+| 90% / independently untouched repeat | 0.941 s | 0.956 s | 25 results |
+
+The large difference between 10% and 90% cold latency is expected for this
+filtered HNSW fixture: a narrow authorized set makes the approximate scan visit
+more graph candidates before it can return 25 permitted rows. It is not evidence
+that broader permissions are intrinsically faster in every corpus. More
+importantly, both scopes collapse to sub-second or low-single-second latency on
+repeat, confirming storage reads rather than embedding or reranking as the
+dominant untouched-path cost.
+
+A subsequent 105-request HTTP scenario covered login, 10% and 90% authorization,
+archive/type/tag/vault filters, result isolation, and five concurrent searches.
+All requests returned non-degraded authorized results. Overall p95 was 1.015
+seconds and the five-request burst p95 was 0.784 seconds. One first tag-filter
+request took 2.124 seconds and first vault-filter requests took 10.289–13.091
+seconds; their repeats were fast. These outliers reinforce that the bounded
+profile stabilizes the restored working set but cannot pre-populate every filter
+and graph path. The database remained below its hard cgroup event threshold
+(`memory.events max=0`, `oom=0`, `oom_kill=0`) throughout the sequence, although
+Linux correctly used almost all otherwise idle memory for reclaimable cache.
+
+The profile keeps the already validated covering indexes and 0.8 hybrid
+common-term cutoff. Those changes reduce avoidable BM25 cache churn; they do not
+pin dense pages or remove storage latency. A complete capacity result must report
+restored and unseen queries separately, because averaging them hides the user
+who happens to issue the first new search after restart.
+
+Fixed memory is a bound, not magic compression. With additional data one or more
+of cold latency, storage throughput, CPU, or ANN recall eventually changes. The
+next structural step is justified only after the bounded profile misses its
+measured objective: partition/reroute by vault or tenant where selectivity is
+stable, or compare a disk-oriented vector store whose original vectors remain on
+disk while a smaller navigation/quantized layer is cached. Any approximation
+must pass exact filtered top-K recall gates; the earlier halfvec experiment was
+rejected after recall@20 fell to 0.50–0.55 despite reranking 5,000 candidates.

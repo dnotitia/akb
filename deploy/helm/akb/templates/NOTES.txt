@@ -15,6 +15,17 @@ Pgvector startup prewarm: {{ .Values.app.vectorStore.startupPrewarm }}
 The backend waits for the sized search working set before becoming Ready.
 Check /health -> vector_store.startup_prewarm for loaded bytes and duration.
 {{- end }}
+{{- if .Values.postgres.parameters.autoPrewarm }}
+
+PostgreSQL bounded hot-set restore: enabled (shared_buffers={{ .Values.postgres.parameters.sharedBuffers }})
+Database readiness delay: {{ .Values.postgres.readiness.initialDelaySeconds }}s
+Size this delay from the measured autoprewarm restore window for your storage.
+{{- end }}
+{{- if ne (toString .Values.app.vectorStore.searchTimeoutSeconds) "30" }}
+
+Pgvector retrieval timeout: {{ .Values.app.vectorStore.searchTimeoutSeconds }}s
+Ordinary database commands retain their 30-second guard.
+{{- end }}
 {{- if gt (.Values.app.bm25.hybridMaxDfRatio | float64) 0.0 }}
 
 Hybrid BM25 common-term pruning: document-frequency ratio

@@ -1,0 +1,29 @@
+# Optional fixed-memory profile for a pgvector corpus around one million
+# 1024-dimensional embeddings. Unlike pgvector-million-1024d.yaml, this profile
+# does not require the full search relation set to fit in RAM. PostgreSQL keeps
+# and restores only the most recently useful 3GiB working set; cold/unseen
+# vectors remain disk-backed and may be slower.
+app:
+  vectorStore:
+    startupPrewarm: "off"
+    # The reference 8GiB fixture needed more than 60 seconds for an unseen
+    # filtered HNSW path. This budget avoids returning a false empty result; it
+    # is not a latency optimization or the steady-state latency objective.
+    searchTimeoutSeconds: 90
+  bm25:
+    hybridMaxDfRatio: 0.8
+
+postgres:
+  # In the reference fixture pg_isready succeeded about 29 seconds before the
+  # 3GiB autoprewarm restore finished. Delay readiness past that measured gap.
+  # Re-measure and tune this value for materially different storage/corpora.
+  readiness:
+    initialDelaySeconds: 45
+  parameters:
+    sharedBuffers: 3GB
+    effectiveCacheSize: 6GB
+    trackIoTiming: true
+    autoPrewarm: true
+  resources:
+    requests: {cpu: "2", memory: 4Gi}
+    limits: {cpu: "4", memory: 8Gi}

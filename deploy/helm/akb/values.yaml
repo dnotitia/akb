@@ -47,6 +47,8 @@ app:
     schema: vector_index
     sparseShape: posting
     startupPrewarm: "off"
+    # Retrieval-only budget. The main PG pool keeps its 30s CRUD guard.
+    searchTimeoutSeconds: 30
     url: ""
     collection: chunks
   bm25:
@@ -83,6 +85,11 @@ postgres:
     size: 20Gi
     storageClass: ""
   sharedMemorySize: 4Gi
+  readiness:
+    # pg_isready only proves that PostgreSQL accepts connections. Profiles
+    # using asynchronous autoprewarm may increase this to cover their measured
+    # restore window before dependent workloads are considered Ready.
+    initialDelaySeconds: 5
   parameters:
     sharedBuffers: 2GB
     effectiveCacheSize: 6GB
@@ -91,8 +98,8 @@ postgres:
     randomPageCost: "1.1"
     maxConnections: 200
     trackIoTiming: false
-    # Restores the previous shared-buffer working set after PostgreSQL restarts.
-    # Enable only with a pre-sized pgvector cache and startupPrewarm above.
+    # Restores the previous bounded shared-buffer working set after PostgreSQL
+    # restarts. It can be used with startupPrewarm=off for a hot-set profile.
     autoPrewarm: false
   resources:
     requests: {cpu: "1", memory: 4Gi}

@@ -38,6 +38,11 @@
             "startupPrewarm": {
               "type": "string",
               "enum": ["off", "index", "search"]
+            },
+            "searchTimeoutSeconds": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 300
             }
           }
         },
@@ -58,6 +63,18 @@
     "postgres": {
       "type": "object",
       "properties": {
+        "readiness": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["initialDelaySeconds"],
+          "properties": {
+            "initialDelaySeconds": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 600
+            }
+          }
+        },
         "parameters": {
           "type": "object",
           "properties": {

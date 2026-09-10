@@ -116,6 +116,7 @@ class PgvectorStore:
         dense_dim: int,
         sparse_shape: SparseShape,
         startup_prewarm: StartupPrewarm = "off",
+        search_timeout_secs: float = 30.0,
         get_main_pool=None,  # callable returning the main PG pool, used when dsn is None
     ):
         if not _SCHEMA_NAME_RE.match(schema):
@@ -128,6 +129,7 @@ class PgvectorStore:
         self._dense_dim = dense_dim
         self._sparse_shape = sparse_shape
         self._startup_prewarm = startup_prewarm
+        self._search_timeout_secs = float(search_timeout_secs)
         self._get_main_pool = get_main_pool
         self._own_pool: asyncpg.Pool | None = None
         self._ensured_collection = False
@@ -869,11 +871,20 @@ class PgvectorStore:
                 async with pool.acquire() as c:
                     timings["dense_wait"] = time.perf_counter() - begin
                     await self._ensure_codec(c)
-                    return await self._search_dense(
-                        c, query_dense=query_dense,
-                        filter_uuids=filter_uuids, filter_col=filter_col,
-                        limit=prefetch_per_leg,
-                    )
+                    async def _query() -> list[str]:
+                        return await self._search_dense(
+                            c, query_dense=query_dense,
+                            filter_uuids=filter_uuids, filter_col=filter_col,
+                            limit=prefetch_per_leg,
+                        )
+                    if self._search_timeout_secs == 30.0:
+                        return await _query()
+                    async with c.transaction():
+                        await c.execute(
+                            "SELECT set_config('statement_timeout', $1, true)",
+                            f"{int(self._search_timeout_secs * 1000)}ms",
+                        )
+                        return await _query()
             finally:
                 timings["dense"] = time.perf_counter() - begin
 
@@ -883,12 +894,21 @@ class PgvectorStore:
                 async with pool.acquire() as c:
                     timings["sparse_wait"] = time.perf_counter() - begin
                     await self._ensure_codec(c)
-                    return await self._search_sparse(
-                        c, terms=list(query_sparse_indices),
-                        weights=list(query_sparse_values),
-                        filter_uuids=filter_uuids, filter_col=filter_col,
-                        limit=prefetch_per_leg,
-                    )
+                    async def _query() -> list[str]:
+                        return await self._search_sparse(
+                            c, terms=list(query_sparse_indices),
+                            weights=list(query_sparse_values),
+                            filter_uuids=filter_uuids, filter_col=filter_col,
+                            limit=prefetch_per_leg,
+                        )
+                    if self._search_timeout_secs == 30.0:
+                        return await _query()
+                    async with c.transaction():
+                        await c.execute(
+                            "SELECT set_config('statement_timeout', $1, true)",
+                            f"{int(self._search_timeout_secs * 1000)}ms",
+                        )
+                        return await _query()
             finally:
                 timings["sparse"] = time.perf_counter() - begin
 
@@ -992,6 +1012,7 @@ class PgvectorStore:
                     LIMIT $3
                     """,
                     list(query_dense), filter_uuids, int(limit),
+                    timeout=self._search_timeout_secs,
                 )
         else:
             rows = await conn.fetch(
@@ -1003,6 +1024,7 @@ class PgvectorStore:
                 LIMIT $2
                 """,
                 list(query_dense), int(limit),
+                timeout=self._search_timeout_secs,
             )
         return [r["chunk_id"] for r in rows]
 
@@ -1048,6 +1070,7 @@ class PgvectorStore:
                 rows = await conn.fetch(
                     sql, list(terms), [float(w) for w in weights],
                     filter_uuids, int(limit),
+                    timeout=self._search_timeout_secs,
                 )
             else:
                 sql = f"""
@@ -1067,6 +1090,7 @@ class PgvectorStore:
                 """
                 rows = await conn.fetch(
                     sql, list(terms), [float(w) for w in weights], int(limit),
+                    timeout=self._search_timeout_secs,
                 )
         else:  # posting
             if filter_uuids:
@@ -1119,6 +1143,7 @@ class PgvectorStore:
                 rows = await conn.fetch(
                     sql, list(terms), [float(w) for w in weights],
                     filter_uuids, int(limit),
+                    timeout=self._search_timeout_secs,
                 )
             else:
                 sql = f"""
@@ -1136,6 +1161,7 @@ class PgvectorStore:
                 """
                 rows = await conn.fetch(
                     sql, list(terms), [float(w) for w in weights], int(limit),
+                    timeout=self._search_timeout_secs,
                 )
 
         return [r["chunk_id"] for r in rows]

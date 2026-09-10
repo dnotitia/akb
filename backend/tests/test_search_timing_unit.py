@@ -41,9 +41,11 @@ async def test_sparse_posting_plan_materializes_only_source_candidates(
 ):
     class _Connection:
         sql = ""
+        fetch_kwargs = {}
 
-        async def fetch(self, sql, *_args):
+        async def fetch(self, sql, *_args, **kwargs):
             self.sql = sql
+            self.fetch_kwargs = kwargs
             return []
 
     store = PgvectorStore(
@@ -64,3 +66,73 @@ async def test_sparse_posting_plan_materializes_only_source_candidates(
     )
 
     assert ("candidate_chunks AS MATERIALIZED" in conn.sql) is expects_materialized
+    assert conn.fetch_kwargs == {"timeout": 30.0}
+
+
+async def test_pgvector_search_budget_overrides_main_pool_statement_timeout():
+    class _Transaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class _Connection:
+        def __init__(self):
+            self.executed = []
+            self.fetch_kwargs = []
+
+        def transaction(self):
+            return _Transaction()
+
+        async def execute(self, sql, *args):
+            self.executed.append((sql, args))
+
+        async def fetch(self, _sql, *_args, **kwargs):
+            self.fetch_kwargs.append(kwargs)
+            return []
+
+    class _Acquire:
+        def __init__(self, conn):
+            self.conn = conn
+
+        async def __aenter__(self):
+            return self.conn
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class _Pool:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def acquire(self):
+            return _Acquire(self.conn)
+
+    conn = _Connection()
+    store = PgvectorStore(
+        dsn=None,
+        schema="vector_index",
+        dense_dim=4,
+        sparse_shape="posting",
+        search_timeout_secs=60,
+    )
+    store.ensure_collection = AsyncMock()
+    store._ensure_codec = AsyncMock()
+    store._pool = AsyncMock(return_value=_Pool(conn))
+
+    assert await store.hybrid_search(
+        query_text="",
+        query_dense=[1.0, 0.0, 0.0, 0.0],
+        query_sparse_indices=[],
+        query_sparse_values=[],
+        source_ids=[str(uuid.uuid4())],
+        limit=10,
+        prefetch_per_leg=20,
+    ) == []
+
+    assert any(
+        "set_config('statement_timeout'" in sql and args == ("60000ms",)
+        for sql, args in conn.executed
+    )
+    assert conn.fetch_kwargs == [{"timeout": 60.0}]

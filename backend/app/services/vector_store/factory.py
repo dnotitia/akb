@@ -54,6 +54,7 @@ def get_vector_store() -> VectorStore:
             dense_dim=settings.embed_dimensions,
             sparse_shape=settings.vector_store_sparse_shape,
             startup_prewarm=settings.vector_store_startup_prewarm,
+            search_timeout_secs=settings.pgvector_search_timeout_secs,
             get_main_pool=get_pool,
         )
     elif driver == "seahorse-cloud":

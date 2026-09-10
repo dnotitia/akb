@@ -18,6 +18,9 @@
 {{- if and (ne $prewarm "off") (ne .Values.app.vectorStore.driver "pgvector") -}}
 {{- fail "vectorStore.startupPrewarm is supported only by the pgvector driver" -}}
 {{- end -}}
+{{- if and (ne .Values.app.vectorStore.driver "pgvector") (ne (toString .Values.app.vectorStore.searchTimeoutSeconds) "30") -}}
+{{- fail "vectorStore.searchTimeoutSeconds is supported only by the pgvector driver" -}}
+{{- end -}}
 {{- if and .Values.postgres.parameters.autoPrewarm (or (ne .Values.app.vectorStore.driver "pgvector") (ne .Values.app.vectorStore.dsn "")) -}}
 {{- fail "postgres.parameters.autoPrewarm applies only to the bundled same-instance pgvector store" -}}
 {{- end -}}

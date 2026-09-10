@@ -93,7 +93,7 @@ spec:
           readinessProbe:
             exec:
               command: [pg_isready, -U, {{ .Values.postgres.username | quote }}, -d, {{ .Values.postgres.database | quote }}]
-            initialDelaySeconds: 5
+            initialDelaySeconds: {{ .Values.postgres.readiness.initialDelaySeconds }}
             periodSeconds: 10
             timeoutSeconds: 10
             failureThreshold: 6

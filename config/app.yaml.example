@@ -342,6 +342,11 @@ vector_store_sparse_shape: posting
 # shared_buffers or startup fails with a sizing diagnostic. For PostgreSQL
 # restart recovery, pair this with pg_prewarm autoprewarm at the database layer.
 vector_store_startup_prewarm: "off"
+# Retrieval-only timeout for pgvector dense/BM25 statements. Ordinary AKB
+# database commands keep their separate 30-second guard. Increase this only
+# for a disk-backed bounded-memory deployment whose measured cold path needs a
+# larger completion budget; it does not make the query itself faster.
+pgvector_search_timeout_secs: 30
 
 # Qdrant-driver settings (ignored when driver is pgvector).
 # Set vector_url to your Qdrant endpoint (e.g. http://qdrant:6333)

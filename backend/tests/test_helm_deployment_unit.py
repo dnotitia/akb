@@ -114,6 +114,7 @@ def test_pgvector_scale_tuning_is_composable_with_both_profiles():
             _one(resources, "ConfigMap", "akb-app-config")["data"]["app.yaml"]
         )
         assert config["vector_store_startup_prewarm"] == "search"
+        assert config["pgvector_search_timeout_secs"] == 30
         assert config["bm25_hybrid_max_df_ratio"] == 0.8
 
         postgres = _one(resources, "StatefulSet", "postgres")
@@ -122,6 +123,25 @@ def test_pgvector_scale_tuning_is_composable_with_both_profiles():
         assert "shared_preload_libraries=pg_stat_statements,pg_prewarm" in container["args"]
         assert "pg_prewarm.autoprewarm=true" in container["args"]
         assert container["resources"]["limits"]["memory"] == "36Gi"
+
+
+def test_bounded_pgvector_tuning_restores_only_the_fixed_hot_set():
+    tuning = _CHART / "tuning" / "pgvector-million-bounded-1024d.yaml"
+    resources = _render("standalone", "--values", str(tuning))
+    config = yaml.safe_load(
+        _one(resources, "ConfigMap", "akb-app-config")["data"]["app.yaml"]
+    )
+    assert config["vector_store_startup_prewarm"] == "off"
+    assert config["pgvector_search_timeout_secs"] == 90
+    assert config["bm25_hybrid_max_df_ratio"] == 0.8
+
+    postgres = _one(resources, "StatefulSet", "postgres")
+    container = postgres["spec"]["template"]["spec"]["containers"][0]
+    assert "shared_buffers=3GB" in container["args"]
+    assert "shared_preload_libraries=pg_stat_statements,pg_prewarm" in container["args"]
+    assert "pg_prewarm.autoprewarm=true" in container["args"]
+    assert container["resources"]["limits"]["memory"] == "8Gi"
+    assert container["readinessProbe"]["initialDelaySeconds"] == 45
 
 
 def test_bundled_prewarm_requires_database_restart_support():
@@ -143,6 +163,29 @@ def test_bundled_prewarm_requires_database_restart_support():
     )
     assert result.returncode != 0
     assert "requires postgres.parameters.autoPrewarm" in result.stderr
+
+
+def test_custom_pgvector_timeout_rejects_an_unrelated_driver():
+    result = subprocess.run(
+        [
+            _helm(),
+            "template",
+            "akb",
+            str(_CHART),
+            "--values",
+            str(_CHART / "profiles" / "standalone.yaml"),
+            "--set-string",
+            "app.vectorStore.driver=qdrant",
+            "--set",
+            "app.vectorStore.searchTimeoutSeconds=60",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode != 0
+    assert "searchTimeoutSeconds is supported only by the pgvector driver" in result.stderr
 
 
 def test_chart_consumes_a_configurable_existing_secret():
