@@ -122,6 +122,7 @@ async def _fresh_schema(*, cutover_migrations: bool = True):
                     "094_native_revision_completed_reservation_transfer.py",
                     "096_native_revision_cutover_fence.py",
                     "097_native_revision_migration_inventory.py",
+                    "100_native_revision_cutover_file_applied_path.py",
                 ]
             )
         for filename in filenames:
@@ -1145,6 +1146,7 @@ async def test_plan_supersession_migration_releases_legacy_aborted_reservations(
                 "090_native_revision_vault_purge_fence.py",
                 "091_native_revision_committed_receipt_guard.py",
                 "097_native_revision_migration_inventory.py",
+                "100_native_revision_cutover_file_applied_path.py",
             ):
                 await _load(filename).migrate(conn=conn)
 
@@ -1210,6 +1212,7 @@ async def test_completed_reservation_transfer_migration_upgrades_aborted_applied
                 "092_native_revision_plan_supersession.py",
                 "093_external_git_retirement.py",
                 "097_native_revision_migration_inventory.py",
+                "100_native_revision_cutover_file_applied_path.py",
             ):
                 await _load(filename).migrate(conn=conn)
 
@@ -2371,3 +2374,97 @@ async def test_product_shadow_verifier_checks_real_git_and_native_reads(tmp_path
 
         assert verified.status == "verified"
         assert {vault.status for vault in verified.vaults} == {"verified"}
+
+
+async def test_apply_disambiguates_file_paths_that_are_already_live(tmp_path):
+    """Legacy File names are not unique; native paths are one authority namespace.
+
+    Two attachments can carry the same `logical_path` (the storage key, not the
+    name, is what the legacy UNIQUE covers), and an attachment can carry the path
+    of a Document in the same vault. The native side refuses a second live
+    resource on a path regardless of surface, so the cutover has to yield the way
+    Documents already do — keep the clean path for whoever holds it and step the
+    rest onto their own uuid — instead of failing the whole run.
+    """
+    async with _fresh_schema() as pool:
+        git = GitService(storage_path=str(tmp_path / "git"))
+        vault = await _manual_vault(pool, git, label="file-path-collision")
+        bodies: dict[str, bytes] = {}
+
+        async def _seed(label: str, data: bytes) -> uuid.UUID:
+            file_id, s3_key = await _confirmed_file(
+                pool,
+                namespace_id=vault.namespace_id,
+                label=label,
+                data=data,
+                mime_type="text/markdown",
+            )
+            bodies[s3_key] = data
+            return file_id
+
+        twin_a = await _seed("notes.md", b"first attachment\n")
+        twin_b = await _seed("notes.md", b"second attachment\n")
+        shadow = await _seed("document.md", b"an attachment named like the Document\n")
+
+        cutover = NativeRevisionCutover(
+            pool,
+            backfill=NativeRevisionBackfill(pool, git=git),
+            verifier=_FixtureVerifier(pool),
+            file_reader=lambda s3_key: bodies[s3_key],
+        )
+        planned = await cutover.plan(
+            vaults=[vault],
+            coverage_version="fixture-file-path-collision-v1",
+        )
+        assert sorted(item.logical_path for item in planned.files) == [
+            "document.md",
+            "notes.md",
+            "notes.md",
+        ]
+        assert {item.disposition for item in planned.files} == {"native_text"}
+
+        applied = await cutover.apply(planned.cutover_id)
+        assert applied.status == "applied"
+        assert {item.status for item in applied.files} == {"applied"}
+
+        async with pool.acquire() as conn:
+            live = {
+                row["resource_id"]: row["current_path"]
+                for row in await conn.fetch(
+                    """
+                    SELECT resource_id, current_path
+                      FROM native_resources
+                     WHERE namespace_id = $1 AND lifecycle = 'live'
+                    """,
+                    vault.namespace_id,
+                )
+            }
+
+        # The migrated Document keeps the path its owner chose.
+        assert "document.md" in live.values()
+        # Every File is published, and no two live resources share a path.
+        assert {twin_a, twin_b, shadow} <= set(live)
+        assert len(set(live.values())) == len(live)
+
+        # One twin keeps the clean path; the other steps onto its own uuid.
+        twin_paths = {live[twin_a], live[twin_b]}
+        assert "notes.md" in twin_paths
+        stepped = twin_b if live[twin_a] == "notes.md" else twin_a
+        assert live[stepped] == f"notes-{stepped.hex[:8]}.md"
+
+        # The attachment that shadowed the Document yields to it.
+        assert live[shadow] == f"document-{shadow.hex[:8]}.md"
+
+        # Verification reads the path that was actually published, not the
+        # colliding one the plan recorded.
+        verified = await cutover.verify(planned.cutover_id)
+        assert verified.status == "verified"
+        assert {item.status for item in verified.files} == {"verified"}
+
+        # Re-applying is a no-op: the resolved path is persisted, so the
+        # idempotency fingerprint cannot drift on a retry.
+        async with pool.acquire() as conn:
+            before = await conn.fetchval("SELECT count(*) FROM native_resources")
+        assert (await cutover.apply(planned.cutover_id)).status == "verified"
+        async with pool.acquire() as conn:
+            assert await conn.fetchval("SELECT count(*) FROM native_resources") == before

@@ -61,6 +61,7 @@ class CutoverFile:
     verification_digest: str | None
     applied_at: Any
     verified_at: Any
+    applied_path: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,7 +148,7 @@ class NativeRevisionCutoverRepository:
             SELECT cutover_id, namespace_id, file_id, logical_path, mime_type,
                    content_hash, byte_size, s3_key, etag, storage_version,
                    created_by, disposition, status, native_revision_id,
-                   verification_digest, applied_at, verified_at
+                   verification_digest, applied_at, verified_at, applied_path
               FROM native_revision_cutover_files
              WHERE cutover_id = $1
              ORDER BY namespace_id, file_id
@@ -396,6 +397,56 @@ class NativeRevisionCutoverRepository:
                     raise CutoverIntegrityError("cutover exclusion inventory drifted")
                 return _run(row)
 
+    async def set_file_applied_path(
+        self,
+        *,
+        cutover_id: uuid.UUID,
+        file_id: uuid.UUID,
+        applied_path: str,
+    ) -> CutoverFile:
+        """Claim the native path this File will be published at, before publishing.
+
+        The publication fingerprint includes the path, so a retry that re-derived
+        it against live state after a partial apply would be refused as an
+        idempotency-key reuse. Writing the claim first makes the retry replay the
+        same input. The first claim wins: a second call with a different path is
+        an integrity error, not an overwrite.
+        """
+        if not isinstance(applied_path, str) or not applied_path.strip():
+            raise ValueError("applied_path must be a non-empty path")
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT applied_path
+                      FROM native_revision_cutover_files
+                     WHERE cutover_id = $1 AND file_id = $2
+                     FOR UPDATE
+                    """,
+                    cutover_id,
+                    file_id,
+                )
+                if row is None:
+                    raise CutoverIntegrityError("cutover File disappeared")
+                if row["applied_path"] is not None and row["applied_path"] != applied_path:
+                    raise CutoverIntegrityError("cutover File publication path drifted")
+                updated = await conn.fetchrow(
+                    """
+                    UPDATE native_revision_cutover_files
+                       SET applied_path = $3
+                     WHERE cutover_id = $1 AND file_id = $2
+                    RETURNING cutover_id, namespace_id, file_id, logical_path, mime_type,
+                              content_hash, byte_size, s3_key, etag, storage_version,
+                              created_by, disposition, status, native_revision_id,
+                              verification_digest, applied_at, verified_at, applied_path
+                    """,
+                    cutover_id,
+                    file_id,
+                    applied_path,
+                )
+                assert updated is not None
+                return _file(updated)
+
     async def set_file_status(
         self,
         *,
@@ -420,7 +471,7 @@ class NativeRevisionCutoverRepository:
                     SELECT cutover_id, namespace_id, file_id, logical_path, mime_type,
                            content_hash, byte_size, s3_key, etag, storage_version,
                            created_by, disposition, status, native_revision_id,
-                           verification_digest, applied_at, verified_at
+                           verification_digest, applied_at, verified_at, applied_path
                       FROM native_revision_cutover_files
                      WHERE cutover_id = $1 AND file_id = $2
                      FOR UPDATE
@@ -446,7 +497,7 @@ class NativeRevisionCutoverRepository:
                     RETURNING cutover_id, namespace_id, file_id, logical_path, mime_type,
                               content_hash, byte_size, s3_key, etag, storage_version,
                               created_by, disposition, status, native_revision_id,
-                              verification_digest, applied_at, verified_at
+                              verification_digest, applied_at, verified_at, applied_path
                     """,
                     cutover_id,
                     file_id,

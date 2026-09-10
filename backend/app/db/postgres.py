@@ -351,6 +351,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "097_native_revision_migration_inventory.py",  # one immutable fixed-ref inventory per run
         "098_native_revision_nul_payload.py",  # permit UTF-8 NUL bytes in Native text payloads while retaining DB validation
         "099_personal_notifications.py",  # independent durable personal inbox and watches
+        "100_native_revision_cutover_file_applied_path.py",  # record the native path each cutover File was published at
     ):
         if filename in applied:
             continue
