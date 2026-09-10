@@ -1758,6 +1758,9 @@ class E2ERuntime:
                 database="akb",
             )
             try:
+                await connection.execute('DROP EXTENSION IF EXISTS "uuid-ossp" CASCADE')
+                await connection.execute("DROP EXTENSION IF EXISTS pgcrypto CASCADE")
+                await connection.execute("DROP EXTENSION IF EXISTS vector CASCADE")
                 await connection.execute("DROP SCHEMA IF EXISTS public CASCADE")
                 await connection.execute("CREATE SCHEMA public")
                 await connection.execute("GRANT ALL ON SCHEMA public TO public")
