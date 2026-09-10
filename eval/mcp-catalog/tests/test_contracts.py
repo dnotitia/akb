@@ -45,11 +45,8 @@ def test_registered_manifest_and_corpus_cover_every_category() -> None:
         assert "models" not in provider
     assert (manifest.models[0].input_cost_per_million_usd, manifest.models[0].output_cost_per_million_usd) == (0.14, 0.28)
     assert (manifest.models[1].input_cost_per_million_usd, manifest.models[1].output_cost_per_million_usd) == (0.24, 2.2)
-    assert manifest.budget.max_input_tokens_per_trial + manifest.budget.max_output_tokens_per_trial == manifest.budget.max_tokens_per_trial
-    assert manifest.budget.max_input_tokens_per_trial == 61440
-    assert manifest.budget.max_output_tokens_per_trial == 4096
-    assert manifest.budget.max_tokens_per_trial == 65536
-    assert {model.settings["max_tokens"] for model in manifest.models} == {4096}
+    assert manifest.budget.max_cost_per_trial_usd == 0.1
+    assert {model.settings["max_tokens"] for model in manifest.models} == {8192}
 
 
 def test_manifest_rejects_provider_or_price_drift() -> None:

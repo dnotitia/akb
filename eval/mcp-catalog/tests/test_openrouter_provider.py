@@ -22,8 +22,10 @@ from mcp_catalog.execution import (
     TrialContext,
     TrialExecutor,
     ToolCallRecorder,
+    TrialOutcome,
     _has_terminal_response_after_tool,
     build_model,
+    classify_failure,
     outcome_from_run,
     validate_routing_evidence,
     worst_case_cost,
@@ -253,6 +255,13 @@ def test_smoke_terminal_response_requires_a_text_turn_after_a_tool_turn() -> Non
     assert not _has_terminal_response_after_tool([tool_turn, final_turn], "", 1)
 
 
+def test_failure_evidence_distinguishes_provider_output_terminal_and_budget() -> None:
+    assert classify_failure("ModelHTTPError: status=429", result=None, final_answer="") == "provider"
+    assert classify_failure("Model token limit (8192) exceeded", result=None, final_answer="") == "output_limit"
+    assert classify_failure("terminal response was empty", result=None, final_answer="") == "terminal_response"
+    assert classify_failure("benchmark incomplete: max_cost_per_trial_usd exceeded", result=None, final_answer="") == "budget"
+
+
 @pytest.mark.asyncio
 async def test_budget_reserves_preregistered_worst_case_before_a_trial() -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
@@ -263,7 +272,32 @@ async def test_budget_reserves_preregistered_worst_case_before_a_trial() -> None
         await ledger.reserve_trial(0.01)
 
     await ledger.release_trial(manifest.budget.max_total_cost_usd)
-    assert worst_case_cost(manifest.models[1], manifest.budget) < manifest.budget.max_cost_per_trial_usd
+    assert worst_case_cost(manifest.models[1], manifest.budget) == manifest.budget.max_cost_per_trial_usd
+
+
+@pytest.mark.asyncio
+async def test_large_token_outcome_is_recorded_without_a_token_budget_gate() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    ledger = BudgetLedger(manifest)
+    outcome = TrialOutcome(
+        task_id="large-token-outcome",
+        category="single_operation",
+        arm="baseline",
+        model_class="primary",
+        model_id=manifest.models[0].model_id,
+        transport="http",
+        input_tokens=10_000_000,
+        output_tokens=8_000_000,
+        total_tokens=18_000_000,
+        model_requests=1,
+        cost_usd=0.01,
+    )
+
+    await ledger.charge(outcome)
+
+    assert ledger.input_tokens == 10_000_000
+    assert ledger.output_tokens == 8_000_000
+    assert ledger.cost_usd == 0.01
 
 
 @pytest.mark.asyncio
@@ -306,6 +340,7 @@ async def test_trial_does_not_create_a_provider_client_after_budget_reservation_
         CURRENT_TRIAL.reset(token)
 
     assert outcome.error is not None and outcome.error.startswith("benchmark incomplete:")
+    assert outcome.failure_kind == "budget"
 
 
 def test_routing_evidence_accepts_only_the_registered_model_and_upstream() -> None:

@@ -48,6 +48,26 @@ class BudgetExceeded(RuntimeError):
     """Raised when a run would exceed its pre-registered finite cap."""
 
 
+FailureKind = Literal["none", "provider", "output_limit", "terminal_response", "tool", "budget", "unknown"]
+
+
+def classify_failure(error: str | None, *, result: Any, final_answer: str) -> FailureKind:
+    if error is None:
+        return "terminal_response" if result is not None and not final_answer.strip() else "none"
+    lowered = error.casefold()
+    if any(marker in lowered for marker in ("429", "rate", "provider", "modelhttperror", "ratelimit")):
+        return "provider"
+    if any(marker in lowered for marker in ("model token limit", "max_tokens", "completion token limit", "output token")):
+        return "output_limit"
+    if any(marker in lowered for marker in ("terminal response", "final response", "no final", "empty response")):
+        return "terminal_response"
+    if any(marker in lowered for marker in ("unknown tool", "toolfailed", "tool error", "modelretry", "mcp tool")):
+        return "tool"
+    if any(marker in lowered for marker in ("max_cost", "max_model_requests", "max_wall", "request_limit", "request limit", "benchmark incomplete")):
+        return "budget"
+    return "unknown"
+
+
 class OpenRouterChatModel(OpenAIChatModel):
     """PydanticAI's OpenAI-compatible model with OpenRouter response evidence."""
 
@@ -113,6 +133,7 @@ class TrialOutcome(BaseModel):
     success: bool = False
     safety: bool = False
     error: str | None = None
+    failure_kind: FailureKind = "none"
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
     total_tokens: int = Field(default=0, ge=0)
@@ -368,9 +389,6 @@ class BudgetLedger:
         budget = self.manifest.budget
         if (
             model_requests > budget.max_model_requests
-            or input_tokens > budget.max_input_tokens
-            or output_tokens > budget.max_output_tokens
-            or input_tokens + output_tokens > budget.max_total_tokens
             or cost_usd > budget.max_total_cost_usd
             or wall_seconds > budget.max_wall_seconds
         ):
@@ -384,6 +402,10 @@ class BudgetLedger:
     async def reserve_trial(self, worst_case_cost_usd: float) -> None:
         async with self._lock:
             budget = self.manifest.budget
+            if self.requests >= budget.max_model_requests:
+                raise BudgetExceeded("max_model_requests exceeded")
+            if self.wall_seconds >= budget.max_wall_seconds:
+                raise BudgetExceeded("max_wall_seconds exceeded")
             if worst_case_cost_usd < 0 or self.cost_usd + self.reserved_cost_usd + worst_case_cost_usd > budget.max_total_cost_usd:
                 raise BudgetExceeded("preregistered worst-case trial cost would exceed max_total_cost_usd")
             self.reserved_cost_usd += worst_case_cost_usd
@@ -404,22 +426,10 @@ class BudgetLedger:
             budget = self.manifest.budget
             if outcome.model_requests > budget.max_requests_per_trial:
                 raise BudgetExceeded("max_requests_per_trial exceeded")
-            if outcome.input_tokens > budget.max_input_tokens_per_trial:
-                raise BudgetExceeded("max_input_tokens_per_trial exceeded")
-            if outcome.output_tokens > budget.max_output_tokens_per_trial:
-                raise BudgetExceeded("max_output_tokens_per_trial exceeded")
-            if outcome.total_tokens > budget.max_tokens_per_trial:
-                raise BudgetExceeded("max_tokens_per_trial exceeded")
             if outcome.cost_usd > budget.max_cost_per_trial_usd:
                 raise BudgetExceeded("max_cost_per_trial_usd exceeded")
             if next_requests > budget.max_model_requests:
                 raise BudgetExceeded("max_model_requests exceeded")
-            if next_input > budget.max_input_tokens:
-                raise BudgetExceeded("max_input_tokens exceeded")
-            if next_output > budget.max_output_tokens:
-                raise BudgetExceeded("max_output_tokens exceeded")
-            if next_input + next_output > budget.max_total_tokens:
-                raise BudgetExceeded("max_total_tokens exceeded")
             remaining_reserved = self.reserved_cost_usd - reserved_cost_usd
             if remaining_reserved < 0 or next_cost + remaining_reserved > budget.max_total_cost_usd:
                 raise BudgetExceeded("max_total_cost_usd exceeded")
@@ -482,6 +492,7 @@ class TrialExecutor:
                 model_id=self.model_spec.model_id,
                 transport=self.transport,
                 error=f"benchmark incomplete: {exc}",
+                failure_kind="budget",
             )
             self._record_outcome(outcome)
             return outcome
@@ -514,7 +525,6 @@ class TrialExecutor:
                         model_settings=cast(Any, self.model.settings),
                         usage_limits=UsageLimits(
                             request_limit=self.manifest.budget.max_requests_per_trial,
-                            total_tokens_limit=self.manifest.budget.max_tokens_per_trial,
                             cost_limit=Decimal(str(self.manifest.budget.max_cost_per_trial_usd)),
                         ),
                         infer_name=False,
@@ -538,6 +548,7 @@ class TrialExecutor:
                 await self.ledger.charge(outcome, reserved_cost_usd=reservation)
             except BudgetExceeded as exc:
                 outcome.error = f"benchmark incomplete: {exc}"
+                outcome.failure_kind = "budget"
                 self._record_outcome(outcome)
                 return outcome
             settled = True
@@ -600,7 +611,6 @@ async def execute_smoke(
                 model_settings=cast(Any, model.settings),
                 usage_limits=UsageLimits(
                     request_limit=manifest.budget.max_requests_per_trial,
-                    total_tokens_limit=manifest.budget.max_tokens_per_trial,
                     cost_limit=Decimal(str(manifest.budget.max_cost_per_trial_usd)),
                 ),
                 infer_name=False,
@@ -721,6 +731,8 @@ def outcome_from_run(
         registered_cost = estimate_cost(model_spec, input_tokens, output_tokens)
         if provider_cost is not None and provider_cost > registered_cost + 1e-9:
             error = error or "OpenRouter response cost exceeded the registered price ceiling"
+        if error is None and not final_answer.strip():
+            error = "terminal response was empty"
     tool_calls = bind_tool_calls(raw_calls, recorder.calls, operation_map, secrets)
     first_operation = tool_calls[0].logical_operation if tool_calls else "none"
     successful_mcp_tool_calls = sum(call.succeeded for call in recorder.calls)
@@ -729,6 +741,7 @@ def outcome_from_run(
         final_answer,
         successful_mcp_tool_calls,
     )
+    failure_kind = classify_failure(error, result=result, final_answer=final_answer)
     return TrialOutcome(
         task_id=task.id,
         category=task.category,
@@ -742,6 +755,7 @@ def outcome_from_run(
         follow_up_terminal_response=follow_up_terminal_response,
         first_logical_operation=first_operation,
         error=error,
+        failure_kind=failure_kind,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=input_tokens + output_tokens,
@@ -949,14 +963,10 @@ def estimate_cost(spec: ModelSpec, input_tokens: int, output_tokens: int) -> flo
     )
 
 
-def worst_case_cost(spec: ModelSpec, budget: Any) -> float:
-    """Use the preregistered token caps and endpoint prices before each trial."""
+def worst_case_cost(_spec: ModelSpec, budget: Any) -> float:
+    """Use the preregistered per-trial cost reservation before each call."""
 
-    return estimate_cost(
-        spec,
-        budget.max_input_tokens_per_trial,
-        budget.max_output_tokens_per_trial,
-    )
+    return budget.max_cost_per_trial_usd
 
 
 def outcome_metrics(outcome: TrialOutcome) -> dict[str, float | int]:
