@@ -9,6 +9,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any, Protocol
 
 import asyncpg
@@ -28,6 +29,7 @@ from app.repositories.native_revision_migration_repo import (
 )
 from app.services.native_revision_backfill import NativeRevisionBackfill
 from app.services.m1_pg_body_store import M1_PG_TEXT_MAX_BYTES, M1PgBodyStore
+from app.repositories.native_revision_repo import NativeRevisionRepository
 from app.services.native_revision_service import NativeRevisionService
 from app.services.adapters import s3_adapter
 from app.services.git_service import GitService
@@ -275,6 +277,7 @@ class NativeRevisionCutover:
                     verification_digest=None,
                     applied_at=None,
                     verified_at=None,
+                    applied_path=None,
                 )
             )
         return files
@@ -473,6 +476,49 @@ class NativeRevisionCutover:
             raise CutoverApplyError(f"File {file.file_id} is not eligible searchable text")
         return data.decode("utf-8", errors="strict")
 
+    @staticmethod
+    def _stepped_path(base_path: str, hex_slice: str) -> str:
+        """Insert a disambiguator ahead of the final suffix.
+
+        Mirrors `DocumentService._resolve_free_path`, which appends the same
+        slice before `.md`; generalizing over the suffix keeps attachments
+        (`.txt`, `.html`, `.pdf`, no suffix at all) readable and leaves the
+        Document case byte-identical to what Documents already produce.
+        """
+        suffix = PurePosixPath(base_path).suffix
+        stem = base_path[: len(base_path) - len(suffix)] if suffix else base_path
+        return f"{stem}-{hex_slice}{suffix}"
+
+    async def _resolve_free_file_path(self, file: CutoverFile) -> str:
+        """Return the native path this File should be published at.
+
+        Legacy File names are not unique — `UNIQUE(vault_id, s3_key)` covers the
+        storage key, and the partial UNIQUE on
+        `(vault, collection, name, content_hash)` does not apply to the historical
+        hash-less upload path at all — while native paths are one authority
+        namespace across Document and File Resources. So the frozen
+        `logical_path` may already be live, held by another attachment or by a
+        Document this same cutover just migrated.
+
+        Documents already answer this: keep the clean path if it is free, else
+        step onto progressively longer slices of the resource's OWN uuid
+        (8→12→16→full). Reusing that rule rather than inventing a second one is
+        the point — it preserves every byte, keeps `file_id`, and terminates
+        because the full hex is unique.
+        """
+        native_repo = NativeRevisionRepository(self.pool)
+        async with self.pool.acquire() as conn:
+            if await native_repo.find_live_path(conn, file.namespace_id, "file", file.logical_path) is None:
+                return file.logical_path
+            hexs = file.file_id.hex
+            for width in (8, 12, 16, len(hexs)):
+                candidate = self._stepped_path(file.logical_path, hexs[:width])
+                if await native_repo.find_live_path(conn, file.namespace_id, "file", candidate) is None:
+                    return candidate
+        # Unreachable in practice (the full uuid is unique); fall through and let
+        # the live-path UNIQUE surface any true clash rather than guess again.
+        return self._stepped_path(file.logical_path, file.file_id.hex)
+
     async def _apply_files(self, cutover_id: uuid.UUID) -> None:
         native = NativeRevisionService(
             self.pool,
@@ -491,10 +537,20 @@ class NativeRevisionCutover:
                 continue
             data = await asyncio.to_thread(self.file_reader, file.s3_key)
             self._validate_text_file(file, data)
+            # Claim the path before publishing: the fingerprint below includes it,
+            # so a retry that re-derived it would be refused as key reuse.
+            applied_path = file.applied_path
+            if applied_path is None:
+                applied_path = await self._resolve_free_file_path(file)
+                await self.repository.set_file_applied_path(
+                    cutover_id=cutover_id,
+                    file_id=file.file_id,
+                    applied_path=applied_path,
+                )
             result = await native.create_text(
                 namespace_id=file.namespace_id,
                 surface="file",
-                path=file.logical_path,
+                path=applied_path,
                 payload=data,
                 actor=file.created_by or "akb-native-revision-migration",
                 mutation_id=uuid.uuid5(
@@ -603,7 +659,9 @@ class NativeRevisionCutover:
                     file.file_id,
                     "file",
                     "live",
-                    file.logical_path,
+                    # The published path, which is the frozen `logical_path` unless
+                    # that path was already live and the File stepped aside.
+                    file.applied_path or file.logical_path,
                     file.native_revision_id,
                     file.content_hash,
                     file.byte_size,
