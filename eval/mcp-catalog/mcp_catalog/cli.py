@@ -31,6 +31,16 @@ def build_parser() -> argparse.ArgumentParser:
     add_inputs(run, descriptor_required=True)
     run.add_argument("--arm", choices=("baseline", "candidate"), required=True)
     run.add_argument("--output", type=Path, required=True)
+    run.add_argument(
+        "--checkpoint",
+        type=Path,
+        help="atomically persist redacted trial checkpoints at this path",
+    )
+    run.add_argument(
+        "--resume",
+        type=Path,
+        help="resume exact inputs from this existing checkpoint path",
+    )
 
     compare = subparsers.add_parser("compare", help="compare two completed arm artifacts")
     compare.add_argument("--baseline", type=Path, required=True)
@@ -103,7 +113,14 @@ def validate(args: argparse.Namespace) -> int:
 
 async def run(args: argparse.Namespace) -> int:
     manifest, tasks, descriptor = load_inputs(args.manifest, args.corpus, args.descriptor)
-    runner = BenchmarkRunner(manifest, tasks, descriptor, arm=args.arm)
+    runner = BenchmarkRunner(
+        manifest,
+        tasks,
+        descriptor,
+        arm=args.arm,
+        checkpoint_path=getattr(args, "checkpoint", None),
+        resume_path=getattr(args, "resume", None),
+    )
     try:
         artifact = await runner.run()
     except BenchmarkRunFailure as exc:

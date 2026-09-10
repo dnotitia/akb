@@ -256,6 +256,8 @@ class RuntimeFixture:
         self.readiness_timeout = readiness_timeout
         self.readiness_poll_interval = readiness_poll_interval
         self._reset_lock = asyncio.Lock()
+        self.reset_count = 0
+        self.reset_wall_seconds = 0.0
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -307,31 +309,42 @@ class RuntimeFixture:
         return payload
 
     async def reset(self) -> None:
-        async with self._reset_lock:
-            try:
-                response = await self.client.post(
-                    self.descriptor.reset_url,
-                    json=self.descriptor.reset_body,
-                    timeout=self.reset_timeout,
-                )
-            except httpx.HTTPError as exc:
-                message = "fixture reset request timed out" if isinstance(exc, httpx.TimeoutException) else "fixture reset request failed"
-                raise RuntimeContractError(message, stage="fixture_reset") from exc
-            if response.status_code != 200:
-                raise RuntimeContractError(
-                    f"fixture reset returned HTTP {response.status_code}",
-                    stage="fixture_reset",
-                )
-            try:
-                payload = _json_object(response, "fixture reset")
-            except RuntimeContractError as exc:
-                raise RuntimeContractError(str(exc), stage="fixture_reset") from exc
-            if payload.get("status") != "ready" or payload.get("scenario") != self.descriptor.scenario:
-                raise RuntimeContractError(
-                    "fixture reset response is not ready for the declared scenario",
-                    stage="fixture_reset",
-                )
-            await self.wait_until_ready(stage="fixture_readiness")
+        started = time.perf_counter()
+        try:
+            async with self._reset_lock:
+                try:
+                    response = await self.client.post(
+                        self.descriptor.reset_url,
+                        json=self.descriptor.reset_body,
+                        timeout=self.reset_timeout,
+                    )
+                except httpx.HTTPError as exc:
+                    message = "fixture reset request timed out" if isinstance(exc, httpx.TimeoutException) else "fixture reset request failed"
+                    raise RuntimeContractError(message, stage="fixture_reset") from exc
+                if response.status_code != 200:
+                    raise RuntimeContractError(
+                        f"fixture reset returned HTTP {response.status_code}",
+                        stage="fixture_reset",
+                    )
+                try:
+                    payload = _json_object(response, "fixture reset")
+                except RuntimeContractError as exc:
+                    raise RuntimeContractError(str(exc), stage="fixture_reset") from exc
+                if payload.get("status") != "ready" or payload.get("scenario") != self.descriptor.scenario:
+                    raise RuntimeContractError(
+                        "fixture reset response is not ready for the declared scenario",
+                        stage="fixture_reset",
+                    )
+                await self.wait_until_ready(stage="fixture_readiness")
+        finally:
+            self.reset_count += 1
+            self.reset_wall_seconds += time.perf_counter() - started
+
+    def reset_evidence(self) -> dict[str, float | int]:
+        return {
+            "count": self.reset_count,
+            "wall_seconds": self.reset_wall_seconds,
+        }
 
     async def mint_pat(
         self,

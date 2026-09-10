@@ -35,6 +35,11 @@ OpenRouter/Parasail 경로에서 끈다. 44개 전체 tool definition은 유지�
 등록 가격은 각각 입력/출력 `$0.14/$0.28` 및 `$0.24/$2.20` per million이고,
 전체 hard cap은 `$50`이다. 각 trial은 시작 전에 등록 token cap과 가격으로
 worst-case 비용을 예약하며 cap을 넘으면 다음 provider 요청을 시작하지 않는다.
+per-trial token cap은 확인된 full catalog 요청 여유를 반영해 input 40,000,
+output 1,600, total 41,600으로 등록했다. 기존 24,000 상한을 그대로 두지 않고,
+관측된 HTTP 약 24.8–25.4K 및 stdio 약 31.7–32.2K total-token 요청을 넘기는
+근거 기반 bound로 설정했으며 model output limit, request cap, `$50` hard cap,
+fail-closed 비용 예약은 그대로 유지한다.
 
 ## 독립 환경 설치와 계약 확인
 
@@ -117,12 +122,14 @@ export MCP_BENCH_OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 uv run --locked --project eval/mcp-catalog \
   mcp-catalog-bench run --arm baseline \
   --descriptor - \
-  --output /private/run/baseline.json
+  --output /private/run/baseline.json \
+  --checkpoint /private/run/baseline.checkpoint.json
 
 uv run --locked --project eval/mcp-catalog \
   mcp-catalog-bench run --arm candidate \
   --descriptor - \
-  --output /private/run/candidate.json
+  --output /private/run/candidate.json \
+  --checkpoint /private/run/candidate.checkpoint.json
 
 uv run --locked --project eval/mcp-catalog \
   mcp-catalog-bench compare \
@@ -139,6 +146,22 @@ per-trial reset으로 PAT 저장소가 재생성되므로 descriptor의 username
 scope로, `read_only` profile은 기존 `read` scope로 새 token을 발급하며,
 재발급 경로가 없으면 stale PAT를 재사용하지 않고 fail-closed로 종료한다.
 
+`--checkpoint`를 지정하면 각 terminal trial 직후 redacted JSON을 같은
+디렉터리에 임시 파일로 fsync한 뒤 atomic replace한다. 재개는 동일한
+`--resume /private/run/baseline.checkpoint.json`으로 실행하며, source revision,
+run manifest hash, task corpus hash, arm, model, transport, task, repeat index가
+모두 일치하는 completed trial만 재사용한다. 실패·미완료 trial만 다시 실행하고,
+손상·입력 불일치·secret 포함 checkpoint는 첫 provider 호출 전에 fail-closed한다.
+checkpoint에는 이전 시도의 실제 usage/cost도 누적해 재개가 `$50` cap을 우회하지
+않도록 한다.
+
+full paid run 전에는 baseline/candidate arm 각각 primary/lightweight × HTTP/stdio의
+네 cell smoke gate를 실행한다. 각 cell은 전체 unfiltered toolset을 붙인 실제
+model request, positive usage, terminal response와 Parasail routing evidence를
+얻어야 하며 하나라도 pre-response failure, zero usage 또는 token limit이면 full
+trial을 시작하지 않는다. 이미 passing checkpoint가 있으면 smoke 결과도
+재사용한다.
+
 각 trial의 reset은 reset endpoint 응답만으로 완료 처리하지 않는다. repository가
 선언한 app/fixture health가 모두 `status=ready`이고 fixture scenario가 일치할
 때까지 기다린 뒤 state observation과 provider execution을 시작한다. reset 또는
@@ -152,6 +175,13 @@ trial의 과반이면 run은 `failure_stage=model_request`인 `status=incomplete
 남으며, zero-request arm을 성공 baseline으로 취급하지 않는다. 오류 evidence는
 redacted exception chain과 HTTP status를 보존한다.
 
+runtime supervisor의 fixture reset은 PostgreSQL/MinIO Compose dependency
+container, network, volume을 내리지 않고 유지한다. backend/embed/stdio만
+교체하고 PostgreSQL application schema, MinIO object, Git fixture data를
+in-place로 비운 뒤 fresh backend migration/seed와 새 stdio session을 시작한다.
+reset 전후 dependency identity가 달라지면 reset은 실패하며, reset count/time과
+identity 보존 결과를 evidence에 기록한다.
+
 ## Evidence
 
 각 run artifact에는 다음이 들어간다.
@@ -163,6 +193,9 @@ redacted exception chain과 HTTP status를 보존한다.
 - model class/id/version/settings, Pydantic Evals report, 반복별 raw model
   arguments와 server-facing arguments, tool 결과·오류·usage·latency·cost
 - final response, fixture before/after state와 결정적 state checks
+- end-to-end wall-clock, checkpoint new/reused/rerun count, fixture reset count/time,
+  PostgreSQL/MinIO dependency identity preservation, four-cell smoke 결과 및
+  재현 가능한 `artifact_hash_input`/`artifact_hash`
 
 comparison은 task별 반복 평균을 만든 뒤 paired difference의 단측 95% 하한을
 계산한다. 통과에는 안전성 regression 0, success 하한 `-3%p` 이상,

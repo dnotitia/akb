@@ -632,6 +632,15 @@ class E2ERuntime:
         self._stdio_tools_list_observed = False
         self._stdio_read_call_observed = False
         self._stdio_next_id = 2
+        self._dependency_identity: dict[str, object] | None = None
+        self._dependency_reset_count = 0
+        self._dependency_reset_wall_seconds = 0.0
+        self._dependency_reset_evidence: dict[str, object] = {
+            "strategy": "in_place",
+            "preserves": ["postgres_container", "minio_container", "compose_network", "compose_volumes"],
+            "count": 0,
+            "wall_seconds": 0.0,
+        }
         self.oidc_fixture: OIDCFixture | None = (
             OIDCFixture(
                 origin=config.fixture_origin,
@@ -757,7 +766,10 @@ class E2ERuntime:
             },
             "fixture": fixture,
             "failure_stages": ["provisioning", "product_assertion"],
+            "dependency_reset": dict(self._dependency_reset_evidence),
         }
+        if self._dependency_identity is not None:
+            evidence["dependency_identity"] = self._dependency_identity
         if self.config.frontend_enabled:
             origins = evidence["origin"]
             assert isinstance(origins, dict)
@@ -1670,6 +1682,135 @@ class E2ERuntime:
             lambda status, _body: status == 200,
         )
         await asyncio.to_thread(self._ensure_minio_bucket)
+        self._dependency_identity = await asyncio.to_thread(self._dependency_identity_snapshot)
+
+    def _dependency_identity_snapshot(self) -> dict[str, object]:
+        """Capture identities that an in-place fixture reset must preserve."""
+
+        docker = os.environ.get("AKB_DOCKER_BIN", "docker")
+        services: dict[str, object] = {}
+        for service in ("postgres", "minio"):
+            try:
+                listed = subprocess.run(
+                    self._compose_command("ps", "-q", service),
+                    cwd=str(self.config.runtime_root),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    check=False,
+                )
+            except OSError:
+                raise ProvisioningFailure(f"dependency identity is unavailable for {service}") from None
+            container_ids = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+            if listed.returncode != 0 or len(container_ids) != 1:
+                raise ProvisioningFailure(f"dependency identity is unavailable for {service}")
+            try:
+                inspected = subprocess.run(
+                    [docker, "inspect", container_ids[0]],
+                    cwd=str(self.config.runtime_root),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    check=False,
+                )
+            except OSError:
+                raise ProvisioningFailure(f"dependency identity inspection failed for {service}") from None
+            if inspected.returncode != 0:
+                raise ProvisioningFailure(f"dependency identity inspection failed for {service}")
+            try:
+                payload = json.loads(inspected.stdout)
+                container = payload[0]
+                networks = container.get("NetworkSettings", {}).get("Networks", {})
+                mounts = container.get("Mounts", [])
+            except (IndexError, TypeError, ValueError, AttributeError):
+                raise ProvisioningFailure(f"dependency identity inspection returned invalid data for {service}") from None
+            network_ids = sorted(
+                str(network.get("NetworkID"))
+                for network in networks.values()
+                if isinstance(network, dict) and network.get("NetworkID")
+            )
+            volume_names = sorted(
+                str(mount.get("Name") or mount.get("Source"))
+                for mount in mounts
+                if isinstance(mount, dict) and mount.get("Type") == "volume"
+            )
+            container_id = container.get("Id")
+            if not isinstance(container_id, str) or not container_id:
+                raise ProvisioningFailure(f"dependency identity inspection returned no container id for {service}")
+            services[service] = {
+                "container_id": container_id,
+                "network_ids": network_ids,
+                "volume_names": volume_names,
+            }
+        return {"services": services}
+
+    async def _reset_postgres_in_place(self) -> None:
+        """Remove the application schema while keeping the PostgreSQL container/volume."""
+
+        try:
+            import asyncpg
+
+            connection = await asyncpg.connect(
+                host="127.0.0.1",
+                port=self.config.postgres_port,
+                user="akb",
+                password="akb",
+                database="akb",
+            )
+            try:
+                await connection.execute("DROP SCHEMA IF EXISTS public CASCADE")
+                await connection.execute("CREATE SCHEMA public")
+                await connection.execute("GRANT ALL ON SCHEMA public TO public")
+                await connection.execute(
+                    """
+                    DO $cleanup$
+                    DECLARE schema_name text;
+                    BEGIN
+                        FOR schema_name IN
+                            SELECT nspname
+                            FROM pg_namespace
+                            WHERE nspname NOT LIKE 'pg_%'
+                              AND nspname NOT IN ('information_schema', 'public')
+                        LOOP
+                            EXECUTE format('DROP SCHEMA %I CASCADE', schema_name);
+                        END LOOP;
+                    END
+                    $cleanup$
+                    """
+                )
+            finally:
+                await connection.close()
+        except Exception:
+            raise ProvisioningFailure("PostgreSQL in-place fixture reset failed") from None
+
+    def _clear_minio_objects(self) -> None:
+        """Delete scenario objects without deleting the MinIO bucket or volume."""
+
+        try:
+            import boto3
+
+            client = boto3.client(
+                "s3",
+                endpoint_url=self.config.minio_origin,
+                aws_access_key_id="akb-ci",
+                aws_secret_access_key="akb-ci-secret",
+            )
+            paginator = client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket="akb-files"):
+                objects = [
+                    {"Key": item["Key"]}
+                    for item in page.get("Contents", [])
+                    if isinstance(item, dict) and isinstance(item.get("Key"), str)
+                ]
+                if objects:
+                    response = client.delete_objects(
+                        Bucket="akb-files",
+                        Delete={"Objects": objects, "Quiet": True},
+                    )
+                    if response.get("Errors"):
+                        raise RuntimeError("object deletion returned errors")
+        except Exception:
+            raise ProvisioningFailure("MinIO in-place fixture reset failed") from None
 
     def _ensure_minio_bucket(self) -> None:
         try:
@@ -3465,9 +3606,14 @@ class E2ERuntime:
         async with self._reset_lock:
             if not self._prepared:
                 raise ProvisioningFailure("fixture reset requested before runtime readiness")
+            started = time.perf_counter()
+            identity_before: dict[str, object] | None = None
+            identity_after: dict[str, object] | None = None
+            preserved = False
             self._lifecycle_generation += 1
             self._resetting = True
             try:
+                identity_before = await asyncio.to_thread(self._dependency_identity_snapshot)
                 self._fixture_controls.clear()
                 await self._stop_named_process("stdio")
                 self._stdio_initialize_observed = False
@@ -3476,18 +3622,43 @@ class E2ERuntime:
                 self._stdio_next_id = 2
                 await self._stop_named_process("backend")
                 await self._stop_named_process("embed")
-                await self._compose("down", "--volumes", "--remove-orphans", check=False)
+                await self._reset_postgres_in_place()
+                await asyncio.to_thread(self._clear_minio_objects)
                 if self.config.vault_dir.exists():
                     shutil.rmtree(self.config.vault_dir)
                 self.config.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
                 os.chmod(self.config.vault_dir, 0o700)
-                await self._start_dependencies()
+                await self._wait_tcp("PostgreSQL", "127.0.0.1", self.config.postgres_port)
+                await self._wait_http(
+                    "MinIO",
+                    f"{self.config.minio_origin}/minio/health/live",
+                    lambda status, _body: status == 200,
+                )
+                await asyncio.to_thread(self._ensure_minio_bucket)
                 await self._start_embed_stub()
                 await self._bootstrap_backend_and_seed()
                 if self.profile.needs_stdio:
                     await self._start_stdio_proxy()
+                identity_after = await asyncio.to_thread(self._dependency_identity_snapshot)
+                if identity_before != identity_after:
+                    raise ProvisioningFailure("in-place fixture reset changed a dependency identity")
+                self._dependency_identity = identity_after
+                preserved = True
             finally:
                 self._resetting = False
+                self._dependency_reset_count += 1
+                elapsed = time.perf_counter() - started
+                self._dependency_reset_wall_seconds += elapsed
+                self._dependency_reset_evidence = {
+                    "strategy": "in_place",
+                    "preserves": ["postgres_container", "minio_container", "compose_network", "compose_volumes"],
+                    "count": self._dependency_reset_count,
+                    "wall_seconds": self._dependency_reset_wall_seconds,
+                    "last_preserved": preserved,
+                }
+                if preserved and identity_before is not None and identity_after is not None:
+                    self._dependency_reset_evidence["identity_before"] = identity_before
+                    self._dependency_reset_evidence["identity_after"] = identity_after
 
     async def _serve_foreground(self) -> int:
         stop_task = asyncio.create_task(self._stop_event.wait(), name="serve-stop")
