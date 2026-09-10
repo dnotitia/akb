@@ -57,6 +57,9 @@ data:
     vector_store_dsn: {{ .Values.app.vectorStore.dsn | quote }}
     vector_store_schema: {{ .Values.app.vectorStore.schema }}
     vector_store_sparse_shape: {{ .Values.app.vectorStore.sparseShape }}
+    vector_store_startup_prewarm: {{ .Values.app.vectorStore.startupPrewarm | quote }}
+    pgvector_search_timeout_secs: {{ .Values.app.vectorStore.searchTimeoutSeconds }}
+    bm25_hybrid_max_df_ratio: {{ .Values.app.bm25.hybridMaxDfRatio }}
     vector_url: {{ .Values.app.vectorStore.url | quote }}
     vector_collection: {{ .Values.app.vectorStore.collection }}
     public_base_url: {{ .Values.global.publicUrl }}

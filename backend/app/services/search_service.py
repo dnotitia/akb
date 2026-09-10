@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 import uuid
 from typing import Literal
 
@@ -42,6 +43,19 @@ from app.services.rerank_service import RerankError, rerank
 from app.services.uri_service import parse_uri
 
 logger = logging.getLogger("akb.search")
+
+
+def _log_search_timing(started: float, phases: dict[str, float], returned: int) -> None:
+    """Operational timing only; never log query text, user IDs or result data."""
+    logger.info(
+        "search_timing total_ms=%.2f embedding_ms=%.2f candidates_ms=%.2f "
+        "retrieval_ms=%.2f rerank_ms=%.2f hydration_ms=%.2f returned=%d",
+        (time.perf_counter() - started) * 1000,
+        *(phases.get(name, 0.0) * 1000 for name in (
+            "embedding", "candidates", "retrieval", "rerank", "hydration",
+        )),
+        returned,
+    )
 
 LEGACY_DOCUMENT_SOURCE = "document"
 NATIVE_DOCUMENT_SOURCE = "native_document"
@@ -602,6 +616,8 @@ class SearchService:
         # single entry point for every caller.
         limit = clamp_search_limit(limit)
 
+        started = time.perf_counter()
+        phases: dict[str, float] = {}
         pool = await get_pool()
 
         # Generate query embedding. When the embedding API is down we still
@@ -609,12 +625,15 @@ class SearchService:
         # short-circuit happens later once both legs are known to be empty.
         # Short timeout: a slow/hung embedding API must not stall interactive
         # search for the full 60s indexing budget.
+        phase_started = time.perf_counter()
         try:
             embeddings = await generate_embeddings([query], timeout=5.0)
         except Exception as e:  # noqa: BLE001
             logger.warning("query embedding failed: %s", e)
             embeddings = []
         query_embedding = embeddings[0] if embeddings else None
+        phases["embedding"] = time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
         # A None embedding here is intentionally NOT surfaced as `degraded`:
         # sparse-only is a legitimate by-design mode (a deployment may leave
         # `embed_base_url` unset), and we can't cheaply tell "configured but
@@ -639,9 +658,12 @@ class SearchService:
         # pre-upgrade pgvector point carries its vault_id, fall back to the
         # source-id path so a user can't miss their own un-backfilled docs.
         from app.services import vault_backfill
-        use_vault_path = not (doc_types or source_type or scope != "all") and vault_path_eligible(
+        vault_filter_candidate = not (doc_types or source_type or scope != "all") and vault_path_eligible(
             collection=collection, doc_type=doc_type, tags=tags, source_uris=source_uris,
-        ) and vault_backfill.is_ready()
+        )
+        use_vault_path = vault_filter_candidate and (
+            vault_backfill.is_ready() or await vault_backfill.refresh_ready()
+        )
 
         if use_vault_path:
             async with pool.acquire() as conn:
@@ -657,6 +679,8 @@ class SearchService:
             #         named scope always resolves to ids (a list), never None.
             # []    → the named vaults are all unreadable → no results.
             if candidate_vault_ids is not None and not candidate_vault_ids:
+                phases["candidates"] = time.perf_counter() - phase_started
+                _log_search_timing(started, phases, 0)
                 return SearchResponse(
                     query=query, total=0, returned=0, total_matches=0, results=[], archive_scope=scope,
                 )
@@ -815,8 +839,18 @@ class SearchService:
                     candidate_source_ids.extend(str(r["id"]) for r in frows)
 
                 if not candidate_source_ids:
-                    return SearchResponse(query=query, total=0, returned=0, total_matches=0, results=[], archive_scope=scope)
+                    phases["candidates"] = time.perf_counter() - phase_started
+                    _log_search_timing(started, phases, 0)
+                    return SearchResponse(
+                        query=query,
+                        total=0,
+                        returned=0,
+                        total_matches=0,
+                        results=[],
+                        archive_scope=scope,
+                    )
 
+        phases["candidates"] = time.perf_counter() - phase_started
         target_unique = resolve_first_stage_unique_limit(
             limit=limit,
             rerank_enabled=rerank_enabled,
@@ -826,6 +860,7 @@ class SearchService:
 
         # Hybrid (dense + BM25 sparse) via the configured driver. Returns [] on any vector-store
         # failure — PG is the source of truth, the index is rebuildable.
+        phase_started = time.perf_counter()
         hits, degraded_reason = await self._run_vector_search(
             query_text=query,
             query_embedding=query_embedding,
@@ -833,8 +868,10 @@ class SearchService:
             candidate_vault_ids=candidate_vault_ids,
             limit=target_unique * 3,
         )
+        phases["retrieval"] = time.perf_counter() - phase_started
 
         if not hits:
+            _log_search_timing(started, phases, 0)
             return SearchResponse(
                 archive_scope=scope,
                 query=query, total=0, returned=0, total_matches=0, results=[],
@@ -872,15 +909,20 @@ class SearchService:
         prefetch_capped = total_matches >= target_unique
 
         if rerank_enabled and len(unique_hits) > 1:
+            phase_started = time.perf_counter()
             unique_hits = await self._apply_rerank(query, unique_hits)
+            phases["rerank"] = time.perf_counter() - phase_started
 
         unique_hits = unique_hits[:limit]
 
         # Post-search metadata join — one fetch per source_type, merged back
         # in the driver-returned order. Keeps document results fully
         # backward-compatible (doc_id == source_id) while adding table/file.
+        phase_started = time.perf_counter()
         results = await self._hydrate_hits(unique_hits)
+        phases["hydration"] = time.perf_counter() - phase_started
         returned = len(results)
+        _log_search_timing(started, phases, returned)
         hint = (
             "Prefetch pool was capped; the corpus may contain more matches than reported. "
             "For an exact corpus-wide count of a literal substring use akb_grep with "
@@ -1431,6 +1473,7 @@ class SearchService:
         untouched. Previously every failure was swallowed into a silent ``[]``
         with no signal (issue #189)."""
         sparse_failed = False
+        sparse_pruned = False
         try:
             sparse_idx, sparse_vals = await sparse_encoder.encode_query(query_text)
         except Exception as e:  # noqa: BLE001
@@ -1438,13 +1481,45 @@ class SearchService:
             sparse_idx, sparse_vals = [], []
             sparse_failed = True
 
+        if (
+            not sparse_failed
+            and query_embedding is not None
+            and settings.bm25_hybrid_max_df_ratio > 0
+        ):
+            try:
+                original_sparse_count = len(sparse_idx)
+                sparse_idx, sparse_vals = await sparse_encoder.prune_common_query_terms(
+                    sparse_idx,
+                    sparse_vals,
+                    max_df_ratio=settings.bm25_hybrid_max_df_ratio,
+                )
+                sparse_pruned = original_sparse_count > 0 and not sparse_idx
+                if original_sparse_count != len(sparse_idx):
+                    logger.info(
+                        "hybrid sparse pruning retained %d/%d query terms "
+                        "(max_df_ratio=%.3f)",
+                        len(sparse_idx),
+                        original_sparse_count,
+                        settings.bm25_hybrid_max_df_ratio,
+                    )
+            except Exception as e:  # noqa: BLE001
+                # The cutoff is an optional latency optimization. If its stats
+                # lookup fails, preserve exact BM25 rather than degrading a
+                # healthy sparse leg.
+                logger.warning("hybrid sparse pruning failed; keeping all terms: %s", e)
+
         # OOV guard — fires ONLY when encode_query SUCCEEDED but produced no
         # vocab terms (nonsense query) AND the embedding API succeeded: the
         # right answer is []. Dense-only is a degraded mode for an outage, not
         # for OOV — Qwen3-style embeddings sit at ~0.4-0.5 cosine for unrelated
         # text and would return plausible-looking distractor neighbours. This
         # must NOT fire on a sparse-encoder FAILURE (that's degraded, not OOV).
-        if not sparse_failed and not sparse_idx and query_embedding is not None:
+        if (
+            not sparse_failed
+            and not sparse_pruned
+            and not sparse_idx
+            and query_embedding is not None
+        ):
             return [], None
 
         # Sparse encoder DOWN with no dense leg either → we can't search at all.

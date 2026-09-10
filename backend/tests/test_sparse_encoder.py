@@ -92,6 +92,37 @@ def test_refresh_gate_fails_safe_on_tokenizer_change_or_sequence_restore():
 
 
 @pytest.mark.asyncio
+async def test_hybrid_common_term_pruning_keeps_discriminating_terms(monkeypatch):
+    from app.services import sparse_encoder
+
+    async def _stats():
+        return {"total_docs": 100}
+
+    async def _df(_indices):
+        return {1: 100, 2: 50, 3: 0}
+
+    monkeypatch.setattr(sparse_encoder, "load_stats", _stats)
+    monkeypatch.setattr(sparse_encoder, "load_df_for_terms", _df)
+
+    assert await sparse_encoder.prune_common_query_terms(
+        [1, 2, 3], [0.01, 0.5, 1.0], max_df_ratio=0.8,
+    ) == ([2, 3], [0.5, 1.0])
+
+
+@pytest.mark.asyncio
+async def test_hybrid_common_term_pruning_disabled_avoids_stats_io(monkeypatch):
+    from app.services import sparse_encoder
+
+    async def _boom():
+        raise AssertionError("disabled pruning must not load corpus stats")
+
+    monkeypatch.setattr(sparse_encoder, "load_stats", _boom)
+    assert await sparse_encoder.prune_common_query_terms(
+        [1], [1.0], max_df_ratio=0,
+    ) == ([1], [1.0])
+
+
+@pytest.mark.asyncio
 async def test_stats_refresher_start_is_idempotent_and_keeps_one_health_runner(
     monkeypatch,
 ):

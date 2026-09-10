@@ -17,6 +17,7 @@ from app.services import vault_backfill
 def _reset_ready(monkeypatch):
     # `_ready` is module state that latches True for the process; isolate each test.
     monkeypatch.setattr(vault_backfill, "_ready", False, raising=False)
+    monkeypatch.setattr(vault_backfill, "_last_ready_refresh", 0.0, raising=False)
 
 
 def test_is_ready_defaults_false_and_reflects_module_state(monkeypatch):
@@ -122,6 +123,57 @@ async def test_process_once_short_circuits_once_ready(monkeypatch):
 
     monkeypatch.setattr(vault_backfill, "get_pool", _boom)
     assert await vault_backfill._process_once() == 0
+
+
+@pytest.mark.asyncio
+async def test_api_refresh_observes_worker_completion_from_shared_store(monkeypatch):
+    """A split API process activates without sharing the worker's memory latch."""
+    class _Store:
+        vault_filter_supported = True
+
+    monkeypatch.setattr(vault_backfill, "get_vector_store", lambda: _Store())
+    monkeypatch.setattr(vault_backfill, "_applicable", lambda: True)
+
+    class _Connection:
+        async def fetchval(self, _sql):
+            return False  # no live source point is missing vault_id
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Connection()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    async def _pool():
+        return _Pool()
+
+    monkeypatch.setattr(vault_backfill, "get_pool", _pool)
+
+    assert await vault_backfill.refresh_ready(min_interval_secs=0) is True
+    assert vault_backfill.is_ready() is True
+
+
+@pytest.mark.asyncio
+async def test_api_refresh_is_throttled_and_fails_closed(monkeypatch):
+    calls = 0
+
+    async def _not_ready(_store):
+        nonlocal calls
+        calls += 1
+        return False
+
+    monkeypatch.setattr(vault_backfill, "get_vector_store", object)
+    monkeypatch.setattr(vault_backfill, "_readiness_satisfied", _not_ready)
+    monkeypatch.setattr(vault_backfill.time, "monotonic", lambda: 100.0)
+
+    assert await vault_backfill.refresh_ready(min_interval_secs=15) is False
+    assert await vault_backfill.refresh_ready(min_interval_secs=15) is False
+    assert calls == 1
 
 
 @pytest.mark.asyncio

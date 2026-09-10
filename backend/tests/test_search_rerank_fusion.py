@@ -213,6 +213,40 @@ async def test_run_vector_search_forwards_vault_ids_to_driver(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_hybrid_common_term_pruning_failure_preserves_exact_sparse_leg(monkeypatch):
+    import app.services.search_service as ss
+
+    captured = {}
+
+    async def encode_ok(_query):
+        return [1, 2], [0.25, 0.75]
+
+    async def prune_fail(*_args, **_kwargs):
+        raise RuntimeError("stats temporarily unavailable")
+
+    class _Store:
+        async def hybrid_search(self, **kwargs):
+            captured.update(kwargs)
+            return []
+
+    monkeypatch.setattr(ss.settings, "bm25_hybrid_max_df_ratio", 0.8)
+    monkeypatch.setattr(ss.sparse_encoder, "encode_query", encode_ok)
+    monkeypatch.setattr(ss.sparse_encoder, "prune_common_query_terms", prune_fail)
+    monkeypatch.setattr(ss, "get_vector_store", lambda: _Store())
+
+    hits, reason = await ss.SearchService()._run_vector_search(
+        query_text="query",
+        query_embedding=[0.1, 0.2],
+        candidate_source_ids=["source-id"],
+        limit=10,
+    )
+
+    assert hits == [] and reason is None
+    assert captured["query_sparse_indices"] == [1, 2]
+    assert captured["query_sparse_values"] == [0.25, 0.75]
+
+
+@pytest.mark.asyncio
 async def test_run_vector_search_surfaces_store_and_sparse_failures(monkeypatch):
     """_run_vector_search returns (hits, degradation_reason) and must classify
     failures instead of swallowing them into a silent [] (issue #189):

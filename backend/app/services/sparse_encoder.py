@@ -577,6 +577,36 @@ async def encode_query(text: str) -> tuple[list[int], list[float]]:
     return indices_idf, values_idf
 
 
+async def prune_common_query_terms(
+    indices: list[int],
+    values: list[float],
+    *,
+    max_df_ratio: float,
+) -> tuple[list[int], list[float]]:
+    """Drop non-discriminating terms from a dense+sparse hybrid query.
+
+    This is deliberately separate from :func:`encode_query`: callers apply it
+    only when the dense leg is available, so a sparse-only deployment retains
+    exact keyword behavior even when a hybrid latency profile is configured.
+    A disabled cutoff or unavailable corpus statistics preserves every term.
+    """
+    if not indices or max_df_ratio <= 0.0:
+        return indices, values
+
+    stats = await load_stats()
+    total_docs = int(stats.get("total_docs") or 0)
+    if total_docs <= 0:
+        return indices, values
+
+    df_map = await load_df_for_terms(indices)
+    kept = [
+        (term_id, weight)
+        for term_id, weight in zip(indices, values, strict=True)
+        if (df_map.get(term_id, 0) / total_docs) <= max_df_ratio
+    ]
+    return [item[0] for item in kept], [item[1] for item in kept]
+
+
 # ── Corpus stats recompute ────────────────────────────────────────
 
 

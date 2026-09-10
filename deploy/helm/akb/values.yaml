@@ -46,8 +46,15 @@ app:
     dsn: ""
     schema: vector_index
     sparseShape: posting
+    startupPrewarm: "off"
+    # Retrieval-only budget. The main PG pool keeps its 30s CRUD guard.
+    searchTimeoutSeconds: 30
     url: ""
     collection: chunks
+  bm25:
+    # 0 preserves exact BM25. Large hybrid deployments may opt in to a
+    # common-term cutoff; sparse-only queries are never pruned.
+    hybridMaxDfRatio: 0
   redis:
     url: ""
     eventStream: akb:events
@@ -78,6 +85,22 @@ postgres:
     size: 20Gi
     storageClass: ""
   sharedMemorySize: 4Gi
+  readiness:
+    # pg_isready only proves that PostgreSQL accepts connections. Profiles
+    # using asynchronous autoprewarm may increase this to cover their measured
+    # restore window before dependent workloads are considered Ready.
+    initialDelaySeconds: 5
+  parameters:
+    sharedBuffers: 2GB
+    effectiveCacheSize: 6GB
+    workMem: 32MB
+    maintenanceWorkMem: 512MB
+    randomPageCost: "1.1"
+    maxConnections: 200
+    trackIoTiming: false
+    # Restores the previous bounded shared-buffer working set after PostgreSQL
+    # restarts. It can be used with startupPrewarm=off for a hot-set profile.
+    autoPrewarm: false
   resources:
     requests: {cpu: "1", memory: 4Gi}
     limits: {cpu: "4", memory: 8Gi}

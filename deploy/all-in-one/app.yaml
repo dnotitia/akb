@@ -60,6 +60,7 @@ vector_store_driver: pgvector
 vector_store_dsn: ""
 vector_store_schema: vector_index
 vector_store_sparse_shape: posting
+vector_store_startup_prewarm: "off"
 vector_url: ""
 vector_collection: chunks
 
@@ -73,6 +74,7 @@ indexing_batch_size: 16
 # === BM25 ===
 bm25_k1: 1.5
 bm25_b: 0.75
+bm25_hybrid_max_df_ratio: 0
 
 # === Redis event fanout (in-container Redis) ===
 redis_url: redis://127.0.0.1:6379/0

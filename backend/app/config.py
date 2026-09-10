@@ -1106,6 +1106,19 @@ class Settings(BaseModel):
     # production-recommended shape. `arrays` is retained for the bench
     # harness only — slower at scale.
     vector_store_sparse_shape: Literal["posting", "arrays"] = "posting"
+    # Optional pgvector cold-start policy. ``off`` preserves the lightweight
+    # default. ``index`` restores the HNSW relation; ``search`` also restores
+    # the chunks heap/TOAST relations needed by filtered distance evaluation.
+    # Enabled modes fail startup when that working set does not fit safely in
+    # PostgreSQL shared_buffers instead of pretending the latency SLA is met.
+    vector_store_startup_prewarm: Literal["off", "index", "search"] = "off"
+    # Per-statement budget for pgvector retrieval legs.  The main database pool
+    # retains its conservative 30-second default for ordinary CRUD; only vector
+    # search may opt into a larger budget when a disk-backed/cold working set is
+    # an accepted deployment trade-off.  Raising this does not make a query
+    # faster, but prevents a legitimate cold read from being misreported as an
+    # empty result while the bounded-memory profile restores its hot set.
+    pgvector_search_timeout_secs: float = Field(default=30.0, ge=1.0, le=300.0)
 
     # Qdrant driver settings.
     vector_url: str = ""  # e.g. http://qdrant:6333
@@ -1186,6 +1199,11 @@ class Settings(BaseModel):
     # BM25 corpus tuning (driver-neutral; lives in main PG vocab).
     bm25_k1: float = 1.5
     bm25_b: float = 0.75
+    # Optional hybrid-only common-term cutoff. 0 disables pruning. When dense
+    # search is available, terms present in more than this fraction of the
+    # corpus add little lexical discrimination but force an exact posting scan.
+    # Sparse-only search never applies the cutoff.
+    bm25_hybrid_max_df_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
     # How often to recompute `bm25_stats(total_docs, avgdl)` + per-term
     # df from the live chunks corpus. Startup and steady-state ticks share a
     # tokenizer/corpus-revision gate, so a stable process restart does not

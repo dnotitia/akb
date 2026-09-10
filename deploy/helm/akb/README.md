@@ -67,6 +67,66 @@ helm upgrade --install akb deploy/helm/akb \
 Public origins and the initial product-administrator identity are installation
 inputs. Configure DNS first and replace every example value.
 
+## Optional million-vector pgvector tuning
+
+Two measured reference overlays are available for roughly one million
+1,024-dimensional embeddings. They compose with either application profile and
+do not change the standalone/SSO shape:
+
+| Tuning overlay | PostgreSQL limit | Startup behavior | Intended trade-off |
+|---|---:|---|---|
+| `pgvector-million-1024d.yaml` | 36 GiB | Loads the measured search relation set before readiness | Lowest and most predictable first-query latency when the full working set fits |
+| `pgvector-million-bounded-1024d.yaml` | 8 GiB | Restores only the previous 3 GiB shared-buffer hot set | Fixed memory while the corpus remains disk-backed; unseen paths can be slower |
+
+Full-working-set example:
+
+```bash
+helm upgrade --install akb deploy/helm/akb \
+  --namespace akb \
+  --values deploy/helm/akb/profiles/standalone.yaml \
+  --values deploy/helm/akb/tuning/pgvector-million-1024d.yaml \
+  --wait
+```
+
+It enables bounded startup/autoprewarm and an opt-in hybrid BM25 common-term
+cutoff. The database limit is 36 GiB because the reference fixture used about
+32.4 GB including page cache; a 24 GiB trial reached its cgroup ceiling. Do not
+apply this overlay by corpus row count alone. First validate relation sizes,
+available node memory, search relevance, write load and latency on your own
+data. See the [search performance design](../../../docs/designs/search-performance.md#million-vector-target-profile).
+
+Fixed-memory example:
+
+```bash
+helm upgrade --install akb deploy/helm/akb \
+  --namespace akb \
+  --values deploy/helm/akb/profiles/standalone.yaml \
+  --values deploy/helm/akb/tuning/pgvector-million-bounded-1024d.yaml \
+  --wait
+```
+
+The bounded overlay keeps vectors on disk, dedicates 3 GiB of the 8 GiB
+PostgreSQL limit to shared buffers, and uses PostgreSQL autoprewarm to restore
+only the pages that were actually hot before restart. It deliberately disables
+the application's full-relation startup prewarm. Since `pg_isready` can succeed
+while PostgreSQL is still restoring those buffers in the background, the
+reference overlay delays its database readiness probe for 45 seconds; the
+measured 3 GiB restore took about 29 seconds after connections first became
+available. Re-measure this delay on materially different storage or corpora.
+
+Its 90-second retrieval budget applies only to pgvector search statements so an
+otherwise valid cold read is not returned as a false empty result; ordinary
+database commands remain at 30 seconds. A 60-second trial still timed out on an
+unseen path. The larger timeout is a completion guard, not an acceleration or
+the steady-state latency target.
+
+This profile allows the corpus to exceed RAM, but it does not promise constant
+latency for unlimited growth. Validate the hot-query hit rate, cold p95/p99,
+storage IOPS, concurrent search, OOM counters and relevance at each expected
+capacity tier. If unseen-query latency no longer meets the service objective,
+partition by tenant/access scope or evaluate a vector engine with disk-resident
+vectors and a memory-sized navigation index instead of raising memory forever.
+
 ## Render and inspect
 
 ```bash
