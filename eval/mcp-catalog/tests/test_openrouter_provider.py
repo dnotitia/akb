@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from openai.types.chat import ChatCompletion
-from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart, UserPromptPart
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.tools import ToolDefinition
@@ -22,6 +22,7 @@ from mcp_catalog.execution import (
     TrialContext,
     TrialExecutor,
     ToolCallRecorder,
+    _has_terminal_response_after_tool,
     build_model,
     outcome_from_run,
     validate_routing_evidence,
@@ -241,6 +242,15 @@ def test_outcome_records_provider_cost_usage_and_route_from_model_response() -> 
     assert outcome.routing_observed and outcome.routing_valid
     assert outcome.input_tokens == 10 and outcome.output_tokens == 2
     assert outcome.error is None
+
+
+def test_smoke_terminal_response_requires_a_text_turn_after_a_tool_turn() -> None:
+    tool_turn = ModelResponse(parts=[ToolCallPart(tool_name="akb_list_vaults", args={})])
+    final_turn = ModelResponse(parts=[TextPart(content="확인했습니다.")])
+
+    assert _has_terminal_response_after_tool([tool_turn, final_turn], "확인했습니다.", 1)
+    assert not _has_terminal_response_after_tool([tool_turn], "확인했습니다.", 1)
+    assert not _has_terminal_response_after_tool([tool_turn, final_turn], "", 1)
 
 
 @pytest.mark.asyncio

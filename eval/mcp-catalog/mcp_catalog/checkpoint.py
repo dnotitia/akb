@@ -140,6 +140,15 @@ def valid_completed_outcome(outcome: TrialOutcome) -> bool:
     )
 
 
+def valid_smoke_outcome(outcome: TrialOutcome) -> bool:
+    return (
+        valid_completed_outcome(outcome)
+        and outcome.successful_mcp_tool_calls > 0
+        and outcome.model_requests >= 2
+        and outcome.follow_up_terminal_response
+    )
+
+
 def status_for_outcome(outcome: TrialOutcome) -> TrialStatus:
     return "completed" if valid_completed_outcome(outcome) else "failed"
 
@@ -193,7 +202,7 @@ class CheckpointStore:
             return None
         if not self._smoke_cell_matches(cell_key, record):
             raise CheckpointError(f"checkpoint smoke cell identity does not match: {cell_key}")
-        if not valid_completed_outcome(record.outcome):
+        if not valid_smoke_outcome(record.outcome):
             raise CheckpointError(f"checkpoint contains an invalid completed smoke cell: {cell_key}")
         return record.outcome
 
@@ -243,7 +252,7 @@ class CheckpointStore:
         ):
             raise CheckpointError("smoke outcome does not match its checkpoint cell")
         resolved_status = status or status_for_outcome(safe_outcome)
-        if resolved_status == "completed" and not valid_completed_outcome(safe_outcome):
+        if resolved_status == "completed" and not valid_smoke_outcome(safe_outcome):
             raise CheckpointError("a completed smoke checkpoint must contain usage and routing evidence")
         existed = cell_key in self.document.smoke_gate
         self.document.smoke_status = "in_progress"
@@ -310,7 +319,7 @@ class CheckpointStore:
                 smoke_record.outcome,
             ):
                 raise CheckpointError("resume checkpoint smoke record digest does not match")
-            if smoke_record.status == "completed" and not valid_completed_outcome(smoke_record.outcome):
+            if smoke_record.status == "completed" and not valid_smoke_outcome(smoke_record.outcome):
                 raise CheckpointError(f"resume checkpoint contains an invalid completed smoke cell: {cell_key}")
         unknown_smoke = set(document.smoke_gate) - set(self.expected_smoke_cells)
         if unknown_smoke:

@@ -51,10 +51,12 @@ async def test_smoke_gate_executes_all_model_transport_cells(monkeypatch: pytest
             model_id=model_spec.model_id,
             transport=transport,
             final_answer_text="OK",
+            successful_mcp_tool_calls=1,
+            follow_up_terminal_response=True,
             input_tokens=10,
             output_tokens=2,
             total_tokens=12,
-            model_requests=1,
+            model_requests=2,
             cost_usd=0.00001,
             provider_evidence=[
                 {

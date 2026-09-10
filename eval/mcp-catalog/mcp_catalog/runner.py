@@ -19,6 +19,7 @@ from .checkpoint import (
     SmokeModelClass,
     SmokeTransport,
     valid_completed_outcome,
+    valid_smoke_outcome,
 )
 from .contracts import ArmName, BenchmarkRunManifest, TaskManifest, hash_json, load_run_manifest, load_task_corpus
 from .evidence import redact_exception, redact_text, serialize_report, write_json, safe_json
@@ -666,7 +667,7 @@ class BenchmarkRunner:
                     )
                     await ledger.release_trial(reservation)
 
-                valid = valid_completed_outcome(outcome)
+                valid = valid_smoke_outcome(outcome)
                 status: Literal["completed", "failed", "incomplete"] = "completed" if valid else (
                     "incomplete" if outcome.error and outcome.error.startswith("benchmark incomplete:") else "failed"
                 )

@@ -35,10 +35,10 @@ OpenRouter/Parasail 경로에서 끈다. 44개 전체 tool definition은 유지�
 등록 가격은 각각 입력/출력 `$0.14/$0.28` 및 `$0.24/$2.20` per million이고,
 전체 hard cap은 `$50`이다. 각 trial은 시작 전에 등록 token cap과 가격으로
 worst-case 비용을 예약하며 cap을 넘으면 다음 provider 요청을 시작하지 않는다.
-per-trial token cap은 확인된 full catalog 요청 여유를 반영해 input 40,000,
-output 1,600, total 41,600으로 등록했다. 기존 24,000 상한을 그대로 두지 않고,
-관측된 HTTP 약 24.8–25.4K 및 stdio 약 31.7–32.2K total-token 요청을 넘기는
-근거 기반 bound로 설정했으며 model output limit, request cap, `$50` hard cap,
+per-trial token cap은 확인된 full multi-turn catalog 요청 여유를 반영해 input
+61,440, output 4,096, total 65,536으로 등록했다. 기존 24,000 상한을 그대로
+두지 않고, 관측된 최대 58,561 total tokens보다 11.9% 높은 bound를 사용한다.
+두 model의 output limit도 4,096으로 일치시켰으며 request cap, `$50` hard cap,
 fail-closed 비용 예약은 그대로 유지한다.
 
 ## 독립 환경 설치와 계약 확인
@@ -157,10 +157,11 @@ checkpoint에는 이전 시도의 실제 usage/cost도 누적해 재개가 `$50`
 
 full paid run 전에는 baseline/candidate arm 각각 primary/lightweight × HTTP/stdio의
 네 cell smoke gate를 실행한다. 각 cell은 전체 unfiltered toolset을 붙인 실제
-model request, positive usage, terminal response와 Parasail routing evidence를
-얻어야 하며 하나라도 pre-response failure, zero usage 또는 token limit이면 full
-trial을 시작하지 않는다. 이미 passing checkpoint가 있으면 smoke 결과도
-재사용한다.
+model request를 보내고, 성공한 MCP tool call을 최소 하나 수행한 뒤 그 결과를
+받은 follow-up terminal model response와 positive usage, Parasail routing evidence를
+얻어야 한다. 하나라도 pre-response failure, zero usage, token limit, tool call
+실패 또는 terminal response 누락이면 full trial을 시작하지 않는다. 이미 passing
+checkpoint가 있으면 smoke 결과도 재사용한다.
 
 각 trial의 reset은 reset endpoint 응답만으로 완료 처리하지 않는다. repository가
 선언한 app/fixture health가 모두 `status=ready`이고 fixture scenario가 일치할
@@ -194,7 +195,8 @@ identity 보존 결과를 evidence에 기록한다.
   arguments와 server-facing arguments, tool 결과·오류·usage·latency·cost
 - final response, fixture before/after state와 결정적 state checks
 - end-to-end wall-clock, checkpoint new/reused/rerun count, fixture reset count/time,
-  PostgreSQL/MinIO dependency identity preservation, four-cell smoke 결과 및
+  PostgreSQL/MinIO dependency identity preservation, four-cell smoke의 successful
+  MCP call/follow-up terminal response 결과 및
   재현 가능한 `artifact_hash_input`/`artifact_hash`
 
 comparison은 task별 반복 평균을 만든 뒤 paired difference의 단측 95% 하한을

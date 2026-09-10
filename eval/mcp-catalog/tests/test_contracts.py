@@ -46,9 +46,10 @@ def test_registered_manifest_and_corpus_cover_every_category() -> None:
     assert (manifest.models[0].input_cost_per_million_usd, manifest.models[0].output_cost_per_million_usd) == (0.14, 0.28)
     assert (manifest.models[1].input_cost_per_million_usd, manifest.models[1].output_cost_per_million_usd) == (0.24, 2.2)
     assert manifest.budget.max_input_tokens_per_trial + manifest.budget.max_output_tokens_per_trial == manifest.budget.max_tokens_per_trial
-    assert manifest.budget.max_input_tokens_per_trial == 40000
-    assert manifest.budget.max_output_tokens_per_trial == 1600
-    assert manifest.budget.max_tokens_per_trial == 41600
+    assert manifest.budget.max_input_tokens_per_trial == 61440
+    assert manifest.budget.max_output_tokens_per_trial == 4096
+    assert manifest.budget.max_tokens_per_trial == 65536
+    assert {model.settings["max_tokens"] for model in manifest.models} == {4096}
 
 
 def test_manifest_rejects_provider_or_price_drift() -> None:
@@ -61,6 +62,11 @@ def test_manifest_rejects_provider_or_price_drift() -> None:
     raw["models"][0]["input_cost_per_million_usd"] = 0.14
     raw["models"][0]["routing"]["allow_fallbacks"] = True
     with pytest.raises(ValueError):
+        BenchmarkRunManifest.model_validate(raw)
+
+    raw["models"][0]["routing"]["allow_fallbacks"] = False
+    raw["models"][0]["settings"]["max_tokens"] = 2048
+    with pytest.raises(ValueError, match="output limits"):
         BenchmarkRunManifest.model_validate(raw)
 
 

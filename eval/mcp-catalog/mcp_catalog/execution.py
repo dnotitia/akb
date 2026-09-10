@@ -98,6 +98,8 @@ class TrialOutcome(BaseModel):
     repeat_index: int = Field(default=1, ge=1)
     final_answer_text: str = ""
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
+    successful_mcp_tool_calls: int = Field(default=0, ge=0)
+    follow_up_terminal_response: bool = False
     first_logical_operation: str = "none"
     state_before: Any = None
     state_after: Any = None
@@ -593,7 +595,7 @@ async def execute_smoke(
         async with toolset:
             agent = Agent(model=model, system_prompt=SYSTEM_PROMPT, retries=0)
             result = await agent.run(
-                "Reply exactly OK without calling any tool.",
+                f"{task.prompt}\nAfter the server confirms the operation, provide a concise final response.",
                 toolsets=cast(Any, [toolset]),
                 model_settings=cast(Any, model.settings),
                 usage_limits=UsageLimits(
@@ -692,6 +694,7 @@ def outcome_from_run(
     cost_source: Literal["provider_response", "registered_price_snapshot"] = "registered_price_snapshot"
     routing_observed = False
     routing_valid = False
+    messages: list[Any] = []
     if result is not None:
         final_answer = redact_text(result.output, secrets)
         messages = result.all_messages()
@@ -720,6 +723,12 @@ def outcome_from_run(
             error = error or "OpenRouter response cost exceeded the registered price ceiling"
     tool_calls = bind_tool_calls(raw_calls, recorder.calls, operation_map, secrets)
     first_operation = tool_calls[0].logical_operation if tool_calls else "none"
+    successful_mcp_tool_calls = sum(call.succeeded for call in recorder.calls)
+    follow_up_terminal_response = _has_terminal_response_after_tool(
+        messages if result is not None else [],
+        final_answer,
+        successful_mcp_tool_calls,
+    )
     return TrialOutcome(
         task_id=task.id,
         category=task.category,
@@ -729,6 +738,8 @@ def outcome_from_run(
         transport=transport,
         final_answer_text=final_answer,
         tool_calls=tool_calls,
+        successful_mcp_tool_calls=successful_mcp_tool_calls,
+        follow_up_terminal_response=follow_up_terminal_response,
         first_logical_operation=first_operation,
         error=error,
         input_tokens=input_tokens,
@@ -754,6 +765,31 @@ def extract_tool_calls(messages: list[Any], secrets: tuple[str, ...]) -> list[tu
             if isinstance(part, ToolCallPart):
                 calls.append((part.tool_name, safe_json(part.args, secrets)))
     return calls
+
+
+def _has_terminal_response_after_tool(
+    messages: list[Any],
+    final_answer: str,
+    successful_mcp_tool_calls: int,
+) -> bool:
+    """Require a text-only model response after a successful tool turn."""
+
+    if successful_mcp_tool_calls == 0 or not final_answer.strip():
+        return False
+    last_tool_response = None
+    for index, message in enumerate(messages):
+        if isinstance(message, ModelResponse) and any(
+            isinstance(part, ToolCallPart) for part in message.parts
+        ):
+            last_tool_response = index
+    if last_tool_response is None:
+        return False
+    return any(
+        index > last_tool_response
+        and isinstance(message, ModelResponse)
+        and not any(isinstance(part, ToolCallPart) for part in message.parts)
+        for index, message in enumerate(messages)
+    )
 
 
 def extract_provider_evidence(messages: list[Any], secrets: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -932,6 +968,8 @@ def outcome_metrics(outcome: TrialOutcome) -> dict[str, float | int]:
         "action_error": int(outcome.action_error),
         "argument_error": int(outcome.argument_error),
         "tool_calls": outcome.tool_call_count,
+        "successful_mcp_tool_calls": outcome.successful_mcp_tool_calls,
+        "follow_up_terminal_response": int(outcome.follow_up_terminal_response),
         "model_requests": outcome.model_requests,
         "input_tokens": outcome.input_tokens,
         "output_tokens": outcome.output_tokens,
