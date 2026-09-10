@@ -222,3 +222,33 @@ def test_zero_request_provider_failures_make_an_arm_incomplete() -> None:
     assert artifact["failure"]["stage"] == "model_request"
     assert any("model usage evidence" in reason for reason in artifact["incomplete_reasons"])
     assert artifact["completed_trials"] == 3
+
+
+def test_a_single_provider_error_keeps_the_run_incomplete_for_checkpoint_retry() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
+    runner = BenchmarkRunner(manifest, tasks, descriptor, arm="baseline")
+    outcome = TrialOutcome(
+        task_id=tasks[0].id,
+        category=tasks[0].category,
+        arm="baseline",
+        model_class="primary",
+        model_id=manifest.models[0].model_id,
+        transport="http",
+        error="ModelHTTPError: status=429",
+    )
+    runner._record_trial("primary:http", outcome)
+
+    artifact = runner._build_artifact(
+        runtime={"source_revision": "a" * 40, "discovery": {"status": "ready"}},
+        artifact_versions={"backend_artifact_version": "0.0.0", "proxy_artifact_version": "0.0.0"},
+        ledger=BudgetLedger(manifest),
+        catalogs={},
+        reports={},
+        incomplete_reasons=set(),
+    )
+
+    assert artifact["status"] == "incomplete"
+    assert artifact["failure_stage"] == "model_request"
+    assert any("status=429" in reason for reason in artifact["incomplete_reasons"])

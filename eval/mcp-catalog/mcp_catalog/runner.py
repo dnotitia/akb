@@ -390,10 +390,20 @@ class BenchmarkRunner:
         smoke_gate: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         quality_reasons: list[str] = []
+        trial_error_reasons: list[str] = []
         for outcomes in self._completed_trials.values():
             if reason := zero_evidence_failure_reason(outcomes):
                 incomplete_reasons.add(reason)
                 quality_reasons.append(reason)
+        for run_key, outcomes in self._completed_trials.items():
+            for outcome in outcomes:
+                if outcome.error:
+                    reason = (
+                        f"benchmark incomplete: {run_key} trial {outcome.task_id} "
+                        f"repeat {outcome.repeat_index} failed: {redact_text(outcome.error, self.secrets)}"
+                    )
+                    incomplete_reasons.add(reason)
+                    trial_error_reasons.append(reason)
         all_reports: dict[str, Any] = {}
         for key, outcomes in sorted(self._completed_trials.items()):
             ordered = self._ordered_outcomes(outcomes)
@@ -488,11 +498,12 @@ class BenchmarkRunner:
                 "error": redact_exception(failure, self.secrets),
                 "cleanup_errors": [redact_exception(error, self.secrets) for error in cleanup],
             }
-        elif quality_reasons:
+        elif quality_reasons or trial_error_reasons:
+            reason = (quality_reasons or trial_error_reasons)[0]
             artifact["failure_stage"] = "model_request"
             artifact["failure"] = {
                 "stage": "model_request",
-                "error": redact_text(quality_reasons[0], self.secrets),
+                "error": redact_text(reason, self.secrets),
                 "cleanup_errors": [],
             }
         safe_artifact = safe_json(artifact, self.secrets)

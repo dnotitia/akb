@@ -102,7 +102,23 @@ async def test_smoke_gate_blocks_after_zero_usage_cell(monkeypatch: pytest.Monke
             model_class=model_spec.class_name,
             model_id=model_spec.model_id,
             transport=transport,
-            error="provider returned no usage",
+            final_answer_text="OK",
+            input_tokens=10,
+            output_tokens=2,
+            total_tokens=12,
+            model_requests=2,
+            cost_usd=0.00001,
+            provider_evidence=[
+                {
+                    "model": model_spec.model_id,
+                    "routing": {
+                        "endpoints": {"available": [{"provider": "parasail", "selected": True}]}
+                    },
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+                }
+            ],
+            routing_observed=True,
+            routing_valid=True,
         )
 
     monkeypatch.setattr(runner_module, "execute_smoke", failed_smoke)
