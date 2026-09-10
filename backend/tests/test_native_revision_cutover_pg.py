@@ -2468,3 +2468,9 @@ async def test_apply_disambiguates_file_paths_that_are_already_live(tmp_path):
         assert (await cutover.apply(planned.cutover_id)).status == "verified"
         async with pool.acquire() as conn:
             assert await conn.fetchval("SELECT count(*) FROM native_resources") == before
+
+        # Authority mint runs its OWN File binding check, separate from the one
+        # verify runs. A stepped File has to survive both, or a cutover that
+        # verified clean still dies at the last gate.
+        authority = await cutover.commit(planned.cutover_id, identity=_identity("file-path-collision"))
+        assert authority.cutover_id == planned.cutover_id

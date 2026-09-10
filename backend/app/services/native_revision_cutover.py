@@ -733,7 +733,12 @@ class NativeRevisionCutover:
                 file.file_id,
                 "file",
                 "live",
-                file.logical_path,
+                # The path the File was published at. Same rule as
+                # `_verify_files`: `logical_path` unless that path was already
+                # live and the File stepped onto its own uuid. Comparing the
+                # frozen path here would reject every stepped File at authority
+                # mint, after verification had already accepted it.
+                file.applied_path or file.logical_path,
                 file.native_revision_id,
                 file.content_hash,
                 file.byte_size,
