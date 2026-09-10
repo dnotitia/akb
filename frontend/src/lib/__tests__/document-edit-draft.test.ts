@@ -27,7 +27,9 @@ function draft(overrides: Partial<DocumentEditDraftInput> = {}): DocumentEditDra
     title: "Local title",
     body: "Local body",
     assetIds: ["asset-1"],
-    assetExpiresAt: { "asset-1": "2026-09-10T01:00:00.000Z" },
+    // Keep the shared fixture independent of wall-clock time. Tests for the
+    // attachment boundary below supply their own explicit clock and expiry.
+    assetExpiresAt: { "asset-1": "2099-01-01T00:00:00.000Z" },
     editorVersion: "0.2.0",
     markdownProfile: "preserve",
     ...overrides,
