@@ -65,9 +65,11 @@ def _outcome(key: CheckpointKey, *, error: str | None = None) -> TrialOutcome:
                         "available": [{"provider": "parasail", "selected": True}]
                     }
                 },
-                "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001},
             }
         ],
+        provider_cost_usd=0.00001,
+        cost_source="provider_response",
         routing_observed=True,
         routing_valid=True,
         error=error,
@@ -151,6 +153,51 @@ def test_failed_checkpoint_trial_is_not_reused_but_spent_is_preserved(tmp_path: 
     assert resumed.completed_outcome_for(key) is None
     assert resumed.status_for(key) == "failed"
     assert resumed.document.spent.model_requests == 1
+
+
+def test_measured_behavioral_failure_is_completed_and_reusable(tmp_path: Path) -> None:
+    path = tmp_path / "checkpoint.json"
+    store, key = _store(path)
+    outcome = _outcome(key, error="Model token limit (8192) exceeded").model_copy(
+        update={
+            "failure_kind": "output_limit",
+            "state_available_before": True,
+            "state_available_after": True,
+        }
+    )
+
+    store.record_trial(key, outcome)
+
+    resumed, _ = _store(path, resume=True)
+    assert resumed.status_for(key) == "completed"
+    assert resumed.completed_outcome_for(key) is not None
+    assert resumed.document.spent.cost_usd == pytest.approx(0.00001)
+
+
+def test_provider_failure_without_usage_is_not_reusable(tmp_path: Path) -> None:
+    path = tmp_path / "checkpoint.json"
+    store, key = _store(path)
+    outcome = _outcome(key, error="ModelHTTPError: status=429").model_copy(
+        update={
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "model_requests": 0,
+            "cost_usd": 0.0,
+            "provider_evidence": [],
+            "provider_cost_usd": None,
+            "cost_source": "registered_price_snapshot",
+            "routing_observed": False,
+            "routing_valid": False,
+            "failure_kind": "provider",
+        }
+    )
+
+    store.record_trial(key, outcome)
+
+    resumed, _ = _store(path, resume=True)
+    assert resumed.status_for(key) == "failed"
+    assert resumed.completed_outcome_for(key) is None
 
 
 def test_smoke_checkpoint_requires_a_successful_call_and_follow_up_response(tmp_path: Path) -> None:

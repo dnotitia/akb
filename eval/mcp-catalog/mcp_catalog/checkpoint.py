@@ -14,7 +14,7 @@ from pydantic import Field
 
 from .contracts import ArmName, ContractModel, hash_json
 from .evidence import safe_json
-from .execution import TrialOutcome
+from .execution import TrialOutcome, has_measured_evidence
 
 
 CHECKPOINT_SCHEMA_VERSION: Literal[1] = 1
@@ -127,22 +127,15 @@ def spent_hash(spent: CheckpointBudget) -> str:
 
 
 def valid_completed_outcome(outcome: TrialOutcome) -> bool:
-    """Only a terminal provider response with usage/routing evidence is reusable."""
+    """Only measured successful or behavioral-failure trials are reusable."""
 
-    return (
-        outcome.error is None
-        and outcome.model_requests > 0
-        and outcome.total_tokens > 0
-        and outcome.total_tokens == outcome.input_tokens + outcome.output_tokens
-        and bool(outcome.provider_evidence)
-        and outcome.routing_observed
-        and outcome.routing_valid
-    )
+    return has_measured_evidence(outcome)
 
 
 def valid_smoke_outcome(outcome: TrialOutcome) -> bool:
     return (
-        valid_completed_outcome(outcome)
+        outcome.error is None
+        and valid_completed_outcome(outcome)
         and outcome.successful_mcp_tool_calls > 0
         and outcome.model_requests >= 2
         and outcome.follow_up_terminal_response

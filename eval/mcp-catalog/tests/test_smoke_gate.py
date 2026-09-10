@@ -64,11 +64,13 @@ async def test_smoke_gate_executes_all_model_transport_cells(monkeypatch: pytest
                     "routing": {
                         "endpoints": {"available": [{"provider": "parasail", "selected": True}]}
                     },
-                    "usage": {"prompt_tokens": 10, "completion_tokens": 2},
-                }
-            ],
-            routing_observed=True,
-            routing_valid=True,
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001},
+                    }
+                ],
+                provider_cost_usd=0.00001,
+                cost_source="provider_response",
+                routing_observed=True,
+                routing_valid=True,
         )
 
     monkeypatch.setattr(runner_module, "execute_smoke", smoke)
@@ -114,11 +116,13 @@ async def test_smoke_gate_blocks_after_zero_usage_cell(monkeypatch: pytest.Monke
                     "routing": {
                         "endpoints": {"available": [{"provider": "parasail", "selected": True}]}
                     },
-                    "usage": {"prompt_tokens": 10, "completion_tokens": 2},
-                }
-            ],
-            routing_observed=True,
-            routing_valid=True,
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001},
+                    }
+                ],
+                provider_cost_usd=0.00001,
+                cost_source="provider_response",
+                routing_observed=True,
+                routing_valid=True,
         )
 
     monkeypatch.setattr(runner_module, "execute_smoke", failed_smoke)
