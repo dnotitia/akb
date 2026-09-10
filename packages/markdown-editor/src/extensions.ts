@@ -26,6 +26,73 @@ interface RawMarkdownToken extends MarkdownToken {
   kind?: RawMarkdownKind
 }
 
+interface MarkdownImageToken extends MarkdownToken {
+  href?: string
+  title?: string | null
+}
+
+function escapeImageLabel(value: string): string {
+  return value.replace(/([\\\]])/g, '\\$1')
+}
+
+function imageDestination(target: string): string {
+  return /[\s()]/.test(target) ? `<${target.replace(/[<>]/g, '')}>` : target
+}
+
+/**
+ * Image is intentionally part of the shared schema rather than a product
+ * renderer. Its `target` attribute is the canonical Markdown value; runtime
+ * adapters may change only the rendered DOM `src` and never this attribute.
+ */
+export const MarkdownImage = Node.create({
+  name: 'image',
+  inline: true,
+  group: 'inline',
+  atom: true,
+  selectable: true,
+  draggable: true,
+
+  addAttributes() {
+    return {
+      target: { default: '' },
+      alt: { default: '' },
+      title: { default: null },
+    }
+  },
+
+  parseHTML() {
+    return [{ tag: 'img[src]' }]
+  },
+
+  renderHTML({ node }) {
+    const target = String(node.attrs.target || node.attrs.src || '')
+    return [
+      'img',
+      {
+        src: target,
+        alt: String(node.attrs.alt ?? ''),
+        ...(node.attrs.title ? { title: String(node.attrs.title) } : {}),
+        'data-markdown-target': target,
+      },
+    ]
+  },
+
+  parseMarkdown: (token: MarkdownImageToken, helpers) =>
+    helpers.createNode('image', {
+      target: token.href ?? '',
+      alt: token.text ?? '',
+      title: token.title ?? null,
+    }),
+
+  renderMarkdown: node => {
+    const attrs = node.attrs ?? {}
+    const target = String(attrs.target || attrs.src || '')
+    const alt = String(attrs.alt ?? '')
+    const title = attrs.title ? ` "${String(attrs.title).replace(/"/g, '\\"')}"` : ''
+    return `![${escapeImageLabel(alt)}](${imageDestination(target)}${title})`
+  },
+})
+
 const rawBlockStart = /^(?:<!--|<!\[CDATA\[|<>|<\/?[A-Za-z][A-Za-z0-9:._-]*(?:[\s/>]|$))/
 const rawInlineStart = /^(?:<!--[\s\S]*?-->|<>|<\/>|<\/?[A-Za-z][A-Za-z0-9:._-]*(?:\s[^<>]*?)?\/?>)/
 
@@ -236,7 +303,13 @@ export function createMarkdownExtensions({
   onSlash,
 }: MarkdownExtensionsOptions = {}): AnyExtension[] {
   const extensions: AnyExtension[] = [
-    StarterKit,
+    StarterKit.configure({
+      // AKB/consumer adapters resolve these durable references to a runtime
+      // URL after parsing. `akb` is only accepted as a data scheme here; no
+      // adapter or network behavior belongs in the shared schema.
+      link: { protocols: ['akb'] },
+    }),
+    MarkdownImage,
     Table.configure({ resizable: false }),
     TableRow,
     TableHeader,

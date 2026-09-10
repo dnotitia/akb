@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 import logging
 import uuid
 
@@ -81,6 +82,106 @@ async def upload_document_image(
     finally:
         if body_slot_acquired:
             _asset_body_slots.release()
+
+
+@router.get("/assets/{vault}/policy", summary="Get document attachment retention policy")
+async def document_attachment_policy(
+    vault: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Expose the active server retention boundary to draft adapters.
+
+    The values are policy metadata, not an authorization capability. Upload
+    responses also carry the individual unclaimed expiry so a recovered draft
+    can use the earliest real resource expiry rather than a client constant.
+    """
+    await check_vault_access(user.user_id, vault, required_role="reader")
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "kind": "attachment_policy",
+        "vault": vault,
+        "server_time": now,
+        "unclaimed_ttl_hours": settings.document_asset_unclaimed_ttl_hours,
+        "revision_retention_days": settings.document_asset_revision_retention_days,
+    }
+
+
+@router.post(
+    "/assets/{vault}/from-file/{file_id}",
+    status_code=201,
+    summary="Copy a standalone image File into a document attachment",
+)
+async def copy_file_attachment(
+    request: Request,
+    vault: str,
+    file_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    access, actor_id, _delegated_actor = await resolve_file_write_context(
+        request, vault, user,
+    )
+    return await asset_service.copy_file_to_attachment(
+        vault_id=access["vault_id"],
+        vault_name=vault,
+        file_id=file_id,
+        actor_id=actor_id,
+    )
+
+
+@router.get(
+    "/assets/{vault}/{file_id}/metadata",
+    summary="Read authorized document attachment metadata",
+)
+async def document_attachment_metadata(
+    request: Request,
+    vault: str,
+    file_id: str,
+    document: str | None = Query(None, min_length=1, max_length=1024),
+    commit: str | None = Query(None, min_length=7, max_length=64, pattern=r"^[0-9a-fA-F]+$"),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Return lifecycle metadata without probing an unscoped asset id.
+
+    The query uses the same reachability predicate as byte delivery. Missing,
+    cross-vault, and unauthorized ids share one 404 so the adapter cannot use
+    metadata as an existence oracle.
+    """
+    try:
+        access = await check_vault_access(user.user_id, vault, required_role="reader")
+        actor_id = user.username
+    except (ForbiddenError, NotFoundError) as exc:
+        raise NotFoundError("Asset", file_id) from exc
+    try:
+        fid = uuid.UUID(file_id)
+    except (ValueError, AttributeError) as exc:
+        raise NotFoundError("Asset", file_id) from exc
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await vault_files_repo.find_authorized_attachment(
+            conn,
+            vault_id=access["vault_id"],
+            file_id=fid,
+            created_by=actor_id,
+            document_path=document,
+            commit_prefix=commit,
+        )
+    if row is None:
+        raise NotFoundError("Asset", file_id)
+
+    target = f"{asset_service.ASSET_URL_PREFIX}{fid}"
+    expiry = None
+    if row.get("attachment_claimed_at") is None and row.get("created_at") is not None:
+        expiry = (
+            row["created_at"]
+            + timedelta(hours=settings.document_asset_unclaimed_ttl_hours)
+        ).isoformat()
+    return {
+        "kind": "attachment",
+        "target": target,
+        "status": "claimed" if row.get("attachment_claimed_at") is not None else "unclaimed",
+        "unclaimed_expires_at": expiry,
+    }
 
 
 async def load_asset_row(file_id: str, vault_id: uuid.UUID) -> dict:

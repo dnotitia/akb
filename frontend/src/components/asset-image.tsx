@@ -36,6 +36,11 @@ function safeExternalImageUrl(src: string): string | null {
 export interface AssetImageProps
   extends Omit<ImgHTMLAttributes<HTMLImageElement>, "src"> {
   src?: string | null;
+  canonicalTarget?: string | null;
+  /** Ephemeral runtime URL for a non-attachment target. Never serialized. */
+  runtimeSrc?: string | null;
+  unavailableLabel?: string;
+  unavailable?: boolean;
   assetContext?: AssetContext;
 }
 
@@ -46,6 +51,10 @@ export interface AssetImageProps
  */
 export function AssetImage({
   src,
+  canonicalTarget,
+  runtimeSrc,
+  unavailableLabel = "Image unavailable",
+  unavailable = false,
   alt = "",
   assetContext,
   className,
@@ -130,18 +139,19 @@ export function AssetImage({
       }
       return null;
     }
-    return src ? safeExternalImageUrl(src) : null;
-  }, [assetId, currentLoadState?.blobUrl, privateVault, publicationRetry, publicationSlug, renderKey, src]);
+    return safeExternalImageUrl(runtimeSrc ?? src ?? "");
+  }, [assetId, currentLoadState?.blobUrl, privateVault, publicationRetry, publicationSlug, renderKey, runtimeSrc, src]);
 
   const frameClass = cn(
     "block my-4 rounded-[var(--radius-lg)] border border-border max-w-full h-auto",
     className,
   );
 
-  if (isPrivateAsset && !currentLoadState?.blobUrl && !currentLoadState?.failed) {
+  if (!unavailable && isPrivateAsset && !currentLoadState?.blobUrl && !currentLoadState?.failed) {
     return (
       <span
         role="status"
+        data-markdown-target={canonicalTarget ?? undefined}
         aria-label={alt ? `Loading image: ${alt}` : "Loading image"}
         className={cn(
           frameClass,
@@ -154,10 +164,11 @@ export function AssetImage({
     );
   }
 
-  if (currentLoadState?.failed || imageFailed || !resolvedSrc) {
+  if (unavailable || currentLoadState?.failed || imageFailed || !resolvedSrc) {
     return (
       <span
         role="img"
+        data-markdown-target={canonicalTarget ?? undefined}
         aria-label={alt ? `Image unavailable: ${alt}` : "Image unavailable"}
         className={cn(
           frameClass,
@@ -165,7 +176,7 @@ export function AssetImage({
         )}
       >
         <ImageOff className="h-4 w-4" aria-hidden />
-        Image unavailable
+        {unavailableLabel}
       </span>
     );
   }
@@ -174,6 +185,7 @@ export function AssetImage({
     <img
       {...imgProps}
       src={resolvedSrc}
+      data-markdown-target={canonicalTarget ?? undefined}
       alt={alt}
       loading={imgProps.loading ?? "lazy"}
       decoding={imgProps.decoding ?? "async"}

@@ -62,6 +62,9 @@ describe("MarkdownEditor formatting toolbar", () => {
     expect(normalizeEditorLinkUrl("mailto:owner@example.com")).toBe(
       "mailto:owner@example.com",
     );
+    expect(
+      normalizeEditorLinkUrl("akb://team/coll/notes/doc/guide.md/"),
+    ).toBe("akb://team/coll/notes/doc/guide.md");
     expect(normalizeEditorLinkUrl("javascript:alert(1)")).toBeNull();
   });
 

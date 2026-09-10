@@ -4,14 +4,20 @@ import { EditorContent, useEditor } from '@tiptap/react'
 import type { Editor } from '@tiptap/core'
 
 import { createMarkdownExtensions } from '../extensions.js'
-import { markdownCommands } from '../core.js'
+import { extractMarkdownTargets, markdownCommands } from '../core.js'
+import { resolveMarkdownTargets } from '../adapters.js'
 import type {
+  MarkdownAdapters,
   MarkdownCommands,
   MarkdownEditorConfig,
   MarkdownProfile,
   MarkdownSlashContext,
   MarkdownState,
+  MarkdownTargetResolution,
+  MarkdownTargetResolverContext,
 } from '../types.js'
+
+const EMPTY_RESOLUTIONS: ReadonlyMap<string, MarkdownTargetResolution> = new Map()
 
 export interface UseMarkdownEditorOptions {
   initialMarkdown?: string
@@ -51,6 +57,7 @@ export function useMarkdownCommands(editor: Editor | null): MarkdownCommands {
         : {
             setMarkdown: () => false,
             insertMarkdown: () => false,
+            insertImage: () => false,
             toggleBold: () => false,
             toggleItalic: () => false,
             toggleBulletList: () => false,
@@ -99,13 +106,120 @@ export function useMarkdownState(editor: Editor | null): MarkdownState | null {
   return editor ? state : null
 }
 
+/**
+ * Resolve canonical targets for presentation. The returned map is ephemeral;
+ * it is never fed back into the editor document or its Markdown serializer.
+ */
+export function useMarkdownTargetResolutions(
+  markdown: string,
+  resolver?: MarkdownAdapters['targetResolver'],
+  context: MarkdownTargetResolverContext = {},
+): ReadonlyMap<string, MarkdownTargetResolution> {
+  const { commit, document, vault } = context
+  const targets = useMemo(() => extractMarkdownTargets(markdown), [markdown])
+  const resolutionKey = useMemo(
+    () => [vault ?? '', document ?? '', commit ?? '', ...targets.map(target => target.target)].join('\u0000'),
+    [commit, document, targets, vault],
+  )
+  const [resolutionState, setResolutionState] = useState<{
+    key: string
+    resolutions: ReadonlyMap<string, MarkdownTargetResolution>
+  }>({ key: '', resolutions: EMPTY_RESOLUTIONS })
+
+  useEffect(() => {
+    if (!resolver || targets.length === 0) return
+
+    const controller = new AbortController()
+    void resolveMarkdownTargets(resolver, targets, {
+      vault,
+      document,
+      commit,
+      signal: controller.signal,
+    }).then(next => {
+      if (!controller.signal.aborted) setResolutionState({ key: resolutionKey, resolutions: next })
+    })
+
+    return () => controller.abort()
+  }, [commit, document, resolutionKey, resolver, targets, vault])
+
+  return resolver && targets.length > 0 && resolutionState.key === resolutionKey
+    ? resolutionState.resolutions
+    : EMPTY_RESOLUTIONS
+}
+
 interface MarkdownSurfaceProps extends Omit<ComponentPropsWithoutRef<'div'>, 'onChange'> {
   editor: Editor | null
   editable: boolean
+  resolutions?: ReadonlyMap<string, MarkdownTargetResolution>
+  resolvingTargets?: boolean
   children?: ReactNode
 }
 
-function MarkdownSurface({ editor, editable, children, ...props }: MarkdownSurfaceProps) {
+function MarkdownSurface({
+  editor,
+  editable,
+  resolutions = EMPTY_RESOLUTIONS,
+  resolvingTargets = false,
+  children,
+  ...props
+}: MarkdownSurfaceProps) {
+  useEffect(() => {
+    const root = editor?.view.dom
+    if (!root) return
+
+    const applyResolutions = () => {
+      root.querySelectorAll<HTMLElement>('img[data-markdown-target], a[href]').forEach(element => {
+        const target =
+          element.dataset.markdownTarget ??
+          (element.tagName === 'A' && element.getAttribute('href')?.startsWith('akb://')
+            ? element.getAttribute('href')
+            : null)
+        if (!target) return
+        element.dataset.markdownTarget = target
+        const resolution = resolutions.get(target)
+        const previousResolution = element.dataset.markdownResolution
+        if (!resolution) {
+          if (resolvingTargets) {
+            element.dataset.markdownResolution = 'pending'
+            element.setAttribute('aria-disabled', 'true')
+            if (element.tagName === 'IMG') element.removeAttribute('src')
+            else element.setAttribute('href', '#')
+            return
+          }
+          if (element.tagName === 'IMG') element.setAttribute('src', target)
+          else element.setAttribute('href', target)
+          if (previousResolution === 'unavailable') element.removeAttribute('aria-label')
+          element.removeAttribute('aria-disabled')
+          delete element.dataset.markdownResolution
+          return
+        }
+
+        if (resolution.status === 'available' && resolution.runtimeUrl) {
+          if (element.tagName === 'IMG') element.setAttribute('src', resolution.runtimeUrl)
+          else element.setAttribute('href', resolution.runtimeUrl)
+          element.dataset.markdownResolution = 'available'
+          if (previousResolution === 'unavailable') element.removeAttribute('aria-label')
+          element.removeAttribute('aria-disabled')
+          return
+        }
+
+        element.dataset.markdownResolution = 'unavailable'
+        element.setAttribute('aria-label', resolution.label ?? 'Reference unavailable')
+        if (element.tagName === 'IMG') element.removeAttribute('src')
+        else {
+          element.setAttribute('href', '#')
+          element.setAttribute('aria-disabled', 'true')
+        }
+      })
+    }
+
+    applyResolutions()
+    editor.on('transaction', applyResolutions)
+    return () => {
+      editor.off('transaction', applyResolutions)
+    }
+  }, [editor, resolvingTargets, resolutions])
+
   return (
     <div
       {...props}
@@ -122,6 +236,8 @@ export interface MarkdownEditorProps extends Omit<MarkdownSurfaceProps, 'editor'
   profile?: MarkdownProfile
   onChange?: MarkdownEditorConfig['onChange']
   onSlash?: (context: MarkdownSlashContext) => void
+  adapters?: MarkdownAdapters
+  resolverContext?: MarkdownTargetResolverContext
 }
 
 export function MarkdownEditor({
@@ -129,6 +245,8 @@ export function MarkdownEditor({
   profile = 'preserve',
   onChange,
   onSlash,
+  adapters,
+  resolverContext,
   ...props
 }: MarkdownEditorProps) {
   const editor = useMarkdownEditor({
@@ -138,6 +256,11 @@ export function MarkdownEditor({
     onChange,
     onSlash,
   })
+  const resolutions = useMarkdownTargetResolutions(
+    markdown,
+    adapters?.targetResolver,
+    resolverContext,
+  )
 
   useEffect(() => {
     if (!editor || editor.getMarkdown() === markdown) {
@@ -147,17 +270,29 @@ export function MarkdownEditor({
     editor.commands.setContent(markdown, { contentType: 'markdown' })
   }, [editor, markdown])
 
-  return <MarkdownSurface {...props} editor={editor} editable />
+  return (
+    <MarkdownSurface
+      {...props}
+      editor={editor}
+      editable
+      resolutions={resolutions}
+      resolvingTargets={Boolean(adapters?.targetResolver)}
+    />
+  )
 }
 
 export interface MarkdownViewerProps extends Omit<MarkdownSurfaceProps, 'editor' | 'editable'> {
   markdown: string
   profile?: MarkdownProfile
+  adapters?: MarkdownAdapters
+  resolverContext?: MarkdownTargetResolverContext
 }
 
 export function MarkdownViewer({
   markdown,
   profile = 'preserve',
+  adapters,
+  resolverContext,
   ...props
 }: MarkdownViewerProps) {
   const editor = useMarkdownEditor({
@@ -165,6 +300,11 @@ export function MarkdownViewer({
     profile,
     editable: false,
   })
+  const resolutions = useMarkdownTargetResolutions(
+    markdown,
+    adapters?.targetResolver,
+    resolverContext,
+  )
 
   useEffect(() => {
     if (!editor || editor.getMarkdown() === markdown) {
@@ -174,7 +314,15 @@ export function MarkdownViewer({
     editor.commands.setContent(markdown, { contentType: 'markdown' })
   }, [editor, markdown])
 
-  return <MarkdownSurface {...props} editor={editor} editable={false} />
+  return (
+    <MarkdownSurface
+      {...props}
+      editor={editor}
+      editable={false}
+      resolutions={resolutions}
+      resolvingTargets={Boolean(adapters?.targetResolver)}
+    />
+  )
 }
 
 export { EditorContent }

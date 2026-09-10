@@ -84,4 +84,51 @@ describe('React surfaces', () => {
     await userEvent.setup().click(getByRole('button', { name: 'update' }))
     await waitFor(() => expect(container.querySelector('.ProseMirror')).toHaveTextContent('외부 갱신'))
   })
+
+  it('applies runtime URLs without changing the canonical image target', async () => {
+    const target = '/api/assets/00000000-0000-4000-8000-000000000001'
+    const resolver = {
+      resolve: async (value: string) => ({
+        target: value,
+        status: 'available' as const,
+        runtimeUrl: 'blob:runtime-image',
+      }),
+    }
+    const { container } = render(
+      <MarkdownEditor
+        markdown={`![diagram](${target})`}
+        adapters={{ targetResolver: resolver }}
+      />,
+    )
+
+    await waitFor(() => {
+      const image = container.querySelector('img[data-markdown-target]')
+      expect(image).toHaveAttribute('src', 'blob:runtime-image')
+      expect(image).toHaveAttribute('data-markdown-target', target)
+    })
+  })
+
+  it('renders an unavailable placeholder while preserving the source target', async () => {
+    const target = 'akb://vault/coll/notes/doc/missing.md'
+    const resolver = {
+      resolve: async (value: string) => ({
+        target: value,
+        status: 'unavailable' as const,
+        reason: 'unknown' as const,
+      }),
+    }
+    const { container } = render(
+      <MarkdownViewer
+        markdown={`[Missing](${target})`}
+        adapters={{ targetResolver: resolver }}
+      />,
+    )
+
+    await waitFor(() => {
+      const link = container.querySelector('a[data-markdown-target]')
+      expect(link).toHaveAttribute('data-markdown-resolution', 'unavailable')
+      expect(link).toHaveAttribute('href', '#')
+      expect(link).toHaveAttribute('data-markdown-target', target)
+    })
+  })
 })

@@ -9,10 +9,14 @@ import path from "path";
 const target = process.env.AKB_FRONTEND_BACKEND_URL || "http://localhost:8000";
 const cacheDir = process.env.AKB_FRONTEND_CACHE_DIR;
 const isHttps = false;
-const requestedMockScenario = process.env.CRABBOX_RUNTIME_SCENARIO || "empty";
-const mockScenario = requestedMockScenario === "document-edit-recovery"
+const requestedMockScenario = process.env.AKB_FE_E2E_SCENARIO || "empty";
+const mockScenario = ["document-edit-recovery", "markdown-reference-adapters"].includes(requestedMockScenario)
   ? requestedMockScenario
   : "empty";
+const FIXTURE_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  "base64",
+);
 let mockResetGeneration = 0;
 
 type MockFixtureDocument = {
@@ -26,6 +30,7 @@ type MockFixtureAsset = {
   id: string;
   filename: string;
   status: "unclaimed" | "claimed" | "discarded";
+  expires_at?: string;
 };
 
 type MockFixtureState = {
@@ -48,12 +53,20 @@ const BASE_FIXTURE_DOCUMENT: MockFixtureDocument = {
 let mockFixtureState: MockFixtureState = createMockFixtureState();
 
 function createMockFixtureState(): MockFixtureState {
+  const assets = mockScenario === "markdown-reference-adapters"
+    ? [{
+        id: "123e4567-e89b-42d3-a456-426614174000",
+        filename: "fixture.png",
+        status: "claimed" as const,
+        expires_at: "2099-01-01T00:00:00.000Z",
+      }]
+    : [];
   return {
     remote_document: null,
     refetch_generation: 0,
     expire_draft_generation: 0,
     faults: { save: 0, upload: 0 },
-    assets: [],
+    assets,
     asset_sequence: 0,
     commit_sequence: 1,
   };
@@ -64,20 +77,43 @@ function resetMockFixtureState() {
 }
 
 function currentFixtureDocument(): MockFixtureDocument {
-  return mockFixtureState.remote_document || BASE_FIXTURE_DOCUMENT;
+  if (mockFixtureState.remote_document) return mockFixtureState.remote_document;
+  if (mockScenario === "markdown-reference-adapters") {
+    return {
+      ...BASE_FIXTURE_DOCUMENT,
+      title: "Reference adapter fixture",
+      content: [
+        "# Reference adapter fixture",
+        "",
+        "[Available document](akb://fixture/doc/available.md)",
+        "",
+        "[Available file](akb://fixture/file/123e4567-e89b-42d3-a456-426614174001)",
+        "",
+        "[Unavailable file](akb://fixture/file/123e4567-e89b-42d3-a456-426614174099)",
+        "",
+        "![Fixture attachment](/api/assets/123e4567-e89b-42d3-a456-426614174000)",
+      ].join("\n"),
+    };
+  }
+  return BASE_FIXTURE_DOCUMENT;
 }
 
 function fixtureStateSnapshot() {
   const document = currentFixtureDocument();
+  const referenceScenario = mockScenario === "markdown-reference-adapters";
   return {
     scenario: mockScenario,
     reset_generation: mockResetGeneration,
     identity: {
       user_id: "u-jylkim",
       vault: "fixture",
-      document_path: "notes/recovery.md",
-      document_uri: "akb://fixture/coll/notes/doc/recovery.md",
-      start_url: "/vault/fixture/doc/notes%2Frecovery.md?view=edit",
+      document_path: referenceScenario ? "notes/references.md" : "notes/recovery.md",
+      document_uri: referenceScenario
+        ? "akb://fixture/coll/notes/doc/references.md"
+        : "akb://fixture/coll/notes/doc/recovery.md",
+      start_url: referenceScenario
+        ? "/vault/fixture/doc/notes%2Freferences.md"
+        : "/vault/fixture/doc/notes%2Frecovery.md?view=edit",
       actors: ["editor-a", "editor-b"],
     },
     document,
@@ -85,6 +121,10 @@ function fixtureStateSnapshot() {
     expire_draft_generation: mockFixtureState.expire_draft_generation,
     faults: mockFixtureState.faults,
     assets: mockFixtureState.assets,
+    attachment_policy: {
+      unclaimed_ttl_hours: 24,
+      revision_retention_days: 30,
+    },
   };
 }
 
@@ -156,7 +196,36 @@ function mockDescriptor(origin: string) {
           },
         },
       }
-    : null;
+    : mockScenario === "markdown-reference-adapters"
+      ? {
+          identity: {
+            user_id: "u-jylkim",
+            vault: "fixture",
+            document_path: "notes/references.md",
+            document_uri: "akb://fixture/coll/notes/doc/references.md",
+            start_url: `${origin}/vault/fixture/doc/notes%2Freferences.md`,
+            actors: ["reader-a", "writer-a"],
+          },
+          operations: {
+            state: { method: "GET", url: `${origin}/__akb_mock__/fixture/state` },
+            expire_attachment: {
+              method: "POST",
+              url: `${origin}/__akb_mock__/fixture/expire-attachment`,
+              body: { id: "123e4567-e89b-42d3-a456-426614174000" },
+            },
+            retryable_upload_failure: {
+              method: "POST",
+              url: `${origin}/__akb_mock__/fixture/failure`,
+              body: { operation: "upload", times: 1, status: 503 },
+            },
+            expire_draft: {
+              method: "POST",
+              url: `${origin}/__akb_mock__/fixture/expire-draft`,
+              body: {},
+            },
+          },
+        }
+      : null;
   return {
     schema_version: 2,
     status: "ready",
@@ -220,6 +289,11 @@ function mockControlPlugin(): Plugin {
 
         const origin = `http://${request.headers.host || "127.0.0.1:4173"}`;
         response.setHeader("Content-Type", "application/json");
+        if (pathname === "/__akb_mock__/fixture/available-file.png" && request.method === "GET") {
+          response.setHeader("Content-Type", "image/png");
+          response.end(FIXTURE_PNG);
+          return;
+        }
         if (pathname === "/__akb_mock__/health" && request.method === "GET") {
           response.end(
             JSON.stringify({
@@ -280,6 +354,15 @@ function mockControlPlugin(): Plugin {
           response.end(JSON.stringify({ status: "ready", expire_draft_generation: mockFixtureState.expire_draft_generation }));
           return;
         }
+        if (pathname === "/__akb_mock__/fixture/expire-attachment" && request.method === "POST") {
+          void readJsonBody(request).then((body) => {
+            const id = typeof body.id === "string" ? body.id : "";
+            const asset = mockFixtureState.assets.find((candidate) => candidate.id === id);
+            if (asset) asset.status = "discarded";
+            response.end(JSON.stringify({ status: "ready", id, expired: asset?.status === "discarded" }));
+          });
+          return;
+        }
         if (pathname === "/__akb_mock__/fixture/consume-fault" && request.method === "POST") {
           void readJsonBody(request).then((body) => {
             const operation = body.operation === "upload" ? "upload" : "save";
@@ -297,8 +380,13 @@ function mockControlPlugin(): Plugin {
               id,
               filename: typeof body.filename === "string" ? body.filename : "fixture.png",
               status: "unclaimed",
+              expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
             });
-            response.end(JSON.stringify({ status: "ready", id }));
+            response.end(JSON.stringify({
+              status: "ready",
+              id,
+              expires_at: mockFixtureState.assets.at(-1)?.expires_at,
+            }));
           });
           return;
         }
@@ -315,7 +403,7 @@ function mockControlPlugin(): Plugin {
               ? body.asset_ids.filter((assetId): assetId is string => typeof assetId === "string")
               : [];
             for (const asset of mockFixtureState.assets) {
-              if (asset.status === "unclaimed") asset.status = "claimed";
+              if (asset.status === "unclaimed" && assetIds.includes(asset.id)) asset.status = "claimed";
             }
             response.end(JSON.stringify({ status: "ready", document: currentFixtureDocument() }));
           });

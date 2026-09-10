@@ -20,6 +20,8 @@ import uuid
 from itertools import zip_longest
 from typing import Literal, get_args
 
+from markdown_it import MarkdownIt
+
 from app.exceptions import ValidationError
 from app.db.postgres import get_pool
 from app.repositories.vault_files_repo import confirmed_file_predicate
@@ -91,10 +93,11 @@ def validate_new_structured_relation_refs(
                 "use an ordinary Markdown link for a cross-vault reference."
             )
 
-# Matches markdown links and image destinations. Relative images can represent
+# CommonMark parser handles escaped labels, reference-style links, angle-bracket
+# destinations, and optional link titles. Relative images can represent
 # document-to-document references in imported Markdown; generated editor asset
 # URLs are filtered below because their lifecycle is not a graph edge.
-_MD_LINK_RE = re.compile(r"!?\[([^\]]+)\]\(([^)]+)\)")
+_MARKDOWN_PARSER = MarkdownIt("commonmark")
 # Matches Obsidian-style wikilinks: [[target]] or [[target|alias]]. Only the
 # target (before the first '|') is the link; the rest is display text. The
 # inner run cannot contain '[' or ']'.
@@ -177,9 +180,20 @@ def extract_markdown_links(content: str) -> list[str]:
             targets.append(target)
             seen.add(target)
 
-    # [text](target)
-    for match in _MD_LINK_RE.finditer(content):
-        _add(match.group(2))
+    # Standard inline/reference links and images. Use the parser rather than a
+    # parenthesis regex so a canonical target remains intact when the author
+    # adds a Markdown title or uses an angle-bracket destination.
+    pending = list(reversed(_MARKDOWN_PARSER.parse(content)))
+    while pending:
+        token = pending.pop()
+        if token.children:
+            pending.extend(reversed(token.children))
+        if token.type == "link_open":
+            href = token.attrGet("href")
+            _add(href if isinstance(href, str) else "")
+        elif token.type == "image":
+            source = token.attrGet("src")
+            _add(source if isinstance(source, str) else "")
 
     # [[target]] / [[target|alias]] — the alias after '|' is display text,
     # not part of the link, so keep only the target. Without this the

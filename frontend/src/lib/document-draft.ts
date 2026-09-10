@@ -1,6 +1,6 @@
 import { DOC_TYPES, type DocType } from "@/lib/doc-constants";
 
-const DRAFT_VERSION = 1;
+const DRAFT_VERSION = 2;
 const DRAFT_PREFIX = "akb:document-draft:";
 
 /**
@@ -9,11 +9,11 @@ const DRAFT_PREFIX = "akb:document-draft:";
  * rather than a private Plate schema: package semver + MarkdownProfile are
  * the durable compatibility boundary owned by the shared editor package.
  */
-const DOCUMENT_EDIT_DRAFT_VERSION = 1;
+const DOCUMENT_EDIT_DRAFT_VERSION = 2;
 const DOCUMENT_EDIT_DRAFT_KIND = "document-edit";
 const DOCUMENT_EDIT_DRAFT_PREFIX = "akb:document-edit-draft:";
 const DOCUMENT_EDIT_TAB_ID_KEY = "akb:document-edit-tab-id";
-export const DOCUMENT_EDIT_DRAFT_EDITOR_VERSION = "0.1.0";
+export const DOCUMENT_EDIT_DRAFT_EDITOR_VERSION = "0.2.0";
 export const DOCUMENT_EDIT_DRAFT_MARKDOWN_PROFILE = "preserve" as const;
 export const DOCUMENT_EDIT_DRAFT_RETENTION_HOURS = 24;
 const DOCUMENT_EDIT_DRAFT_RETENTION_MS =
@@ -30,7 +30,11 @@ export interface StoredDocumentDraft {
   tags: string[];
   body: string;
   assetIds: string[];
+  /** Server-provided expiry per unclaimed attachment, when available. */
+  assetExpiresAt?: Record<string, string>;
   updatedAt: string;
+  /** Earliest local/attachment recovery boundary. */
+  expiresAt?: string;
 }
 
 export interface StoredDocumentEditDraft {
@@ -47,6 +51,8 @@ export interface StoredDocumentEditDraft {
   title: string;
   body: string;
   assetIds: string[];
+  /** Server-provided expiry per unclaimed attachment, when available. */
+  assetExpiresAt?: Record<string, string>;
   editorVersion: typeof DOCUMENT_EDIT_DRAFT_EDITOR_VERSION;
   markdownProfile: typeof DOCUMENT_EDIT_DRAFT_MARKDOWN_PROFILE;
   updatedAt: string;
@@ -161,6 +167,14 @@ function recordLooksLikeEditDraft(value: unknown): value is StoredDocumentEditDr
     typeof draft.body === "string" &&
     Array.isArray(draft.assetIds) &&
     draft.assetIds.every((assetId) => typeof assetId === "string") &&
+    (draft.assetExpiresAt === undefined || (
+      !!draft.assetExpiresAt &&
+      typeof draft.assetExpiresAt === "object" &&
+      !Array.isArray(draft.assetExpiresAt) &&
+      Object.entries(draft.assetExpiresAt).every(
+        ([assetId, expiresAt]) => typeof assetId === "string" && typeof expiresAt === "string",
+      )
+    )) &&
     typeof draft.updatedAt === "string" &&
     typeof draft.expiresAt === "string"
   );
@@ -280,8 +294,18 @@ export function saveDocumentEditDraft(draft: DocumentEditDraftInput): boolean {
   const expiresAt = new Date(
     updatedAt.getTime() + DOCUMENT_EDIT_DRAFT_RETENTION_MS,
   );
+  const assetExpiresAt = Object.fromEntries(
+    Object.entries(draft.assetExpiresAt ?? {}).filter(
+      ([assetId, value]) =>
+        draft.assetIds.includes(assetId) && !Number.isNaN(Date.parse(value)),
+    ),
+  );
+  for (const value of Object.values(assetExpiresAt)) {
+    if (Date.parse(value) < expiresAt.getTime()) expiresAt.setTime(Date.parse(value));
+  }
   const stored: StoredDocumentEditDraft = {
     ...draft,
+    assetExpiresAt,
     version: DOCUMENT_EDIT_DRAFT_VERSION,
     kind: DOCUMENT_EDIT_DRAFT_KIND,
     updatedAt: updatedAt.toISOString(),
@@ -358,12 +382,27 @@ export function saveDocumentDraft(
   draft: Omit<StoredDocumentDraft, "version" | "updatedAt">,
 ): boolean {
   try {
+    const updatedAt = new Date();
+    const assetExpiresAt = Object.fromEntries(
+      Object.entries(draft.assetExpiresAt ?? {}).filter(
+        ([assetId, value]) =>
+          draft.assetIds.includes(assetId) && !Number.isNaN(Date.parse(value)),
+      ),
+    );
+    const expiresAt = new Date(
+      updatedAt.getTime() + DOCUMENT_EDIT_DRAFT_RETENTION_MS,
+    );
+    for (const value of Object.values(assetExpiresAt)) {
+      if (Date.parse(value) < expiresAt.getTime()) expiresAt.setTime(Date.parse(value));
+    }
     window.localStorage.setItem(
       documentDraftStorageKey(draft.vault),
       JSON.stringify({
         ...draft,
+        assetExpiresAt,
         version: DRAFT_VERSION,
-        updatedAt: new Date().toISOString(),
+        updatedAt: updatedAt.toISOString(),
+        expiresAt: expiresAt.toISOString(),
       } satisfies StoredDocumentDraft),
     );
     return true;
