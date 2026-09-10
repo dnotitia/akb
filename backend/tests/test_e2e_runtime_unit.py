@@ -783,14 +783,38 @@ async def test_dependency_start_waits_for_compose_health_before_backend_boot(tmp
     async def fake_wait_http(*_args: object) -> bytes:
         return b""
 
+    dependency_identity = {
+        "services": {
+            "postgres": {
+                "container_id": "postgres-container",
+                "network_ids": ["runtime-network"],
+                "volume_names": ["runtime-postgres-volume"],
+            },
+            "minio": {
+                "container_id": "minio-container",
+                "network_ids": ["runtime-network"],
+                "volume_names": ["runtime-minio-volume"],
+            },
+        }
+    }
+    identity_calls = 0
+
+    def fake_dependency_identity_snapshot() -> dict[str, object]:
+        nonlocal identity_calls
+        identity_calls += 1
+        return dependency_identity
+
     monkeypatch.setattr(runtime, "_compose", fake_compose)
     monkeypatch.setattr(runtime, "_wait_tcp", fake_wait_tcp)
     monkeypatch.setattr(runtime, "_wait_http", fake_wait_http)
     monkeypatch.setattr(runtime, "_ensure_minio_bucket", lambda: None)
+    monkeypatch.setattr(runtime, "_dependency_identity_snapshot", fake_dependency_identity_snapshot)
 
     await runtime._start_dependencies()
 
     assert compose_calls == [(("up", "--detach", "--wait"), {})]
+    assert identity_calls == 1
+    assert runtime._dependency_identity == dependency_identity
 
 
 class FakeFixtureRuntime:
