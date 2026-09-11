@@ -7,6 +7,35 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Default archive scope no longer disqualifies the vault path (akb#530)
+
+`archive_scope` defaults to `unarchived`, and the vault-path gate demanded
+`scope == "all"` — so the fast path had no reachable caller. Every ordinary
+search fell back to enumerating candidate source ids, which refuses with the
+bounded-corpus error on any scope above the candidate ceiling. Measured on one
+installation: `?q=…` returned 422 while the identical request with
+`&archive_scope=all` returned 200, with archived documents 154 of 136,183
+(0.11%).
+
+The archived predicate moves from candidate enumeration to hydration, where
+the authoritative status is already parsed: verified Head frontmatter on the
+native arm, `documents.status` on the legacy one. `unarchived` and `all` now
+take the vault path; `archived` deliberately keeps the id path, because it
+selects FOR the rare tail and a vault-path top-K would filter down to nothing.
+
+A hit excluded by scope no longer costs a result slot: the page is refilled
+from the rest of the deduped prefetch pool, and the drop is counted as
+`archive_scope_excluded` in the `hydration_dropped` degradation reason, so a
+genuinely short page (an exhausted pool) names its cause. Applying the
+predicate at hydration also closes the window where a document is archived
+between candidate selection and hydration.
+
+Note for the native arm: the retained legacy `documents` rows are a frozen
+cutover projection and are NOT the archived authority. Measured on the same
+installation, 3 of the 154 rows marked archived there carry `status: draft` in
+their native frontmatter, so filtering on that column would wrongly hide live
+documents.
+
 ### Vault-filter readiness visible to the serving tier (akb#526)
 
 `vault_backfill.is_ready()` was a process-local latch flipped only by the
