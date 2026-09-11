@@ -40,6 +40,8 @@ hard cap 아래에 있다. 실제 input/output/total token은 evidence와 second
 계속 기록하지만 정상 provider 실행을 중단시키는 누적 token budget gate로 사용하지
 않는다. 두 model의 per-response output limit은 full catalog와 terminal response를
 수용하도록 `max_tokens=8,192`로 일치시켰다.
+`budget_used.wall_seconds`는 병렬 lane duration 합이 아니라 실제 누적 elapsed
+wall-clock이며, lane 작업량은 별도의 `model_work_seconds`로 기록한다.
 
 ## 독립 환경 설치와 계약 확인
 

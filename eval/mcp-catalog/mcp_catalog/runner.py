@@ -115,6 +115,7 @@ class CredentialResolver:
     model_secrets: tuple[str, ...]
     tokens: dict[str, str] | None = None
     minted_tokens: list[tuple[str, str]] = field(default_factory=list)
+    token_fixtures: dict[str, RuntimeFixture] = field(default_factory=dict)
     stale_minted_tokens: set[str] = field(default_factory=set)
     issued_tokens: set[str] = field(default_factory=set)
 
@@ -144,6 +145,7 @@ class CredentialResolver:
     async def prepare(self, fixture: RuntimeFixture, profiles: list[str]) -> None:
         self.tokens = {}
         self.minted_tokens.clear()
+        self.token_fixtures.clear()
         self.stale_minted_tokens.clear()
         self.issued_tokens.clear()
         for profile in profiles:
@@ -179,8 +181,9 @@ class CredentialResolver:
         errors: list[Exception] = []
         remaining: list[tuple[str, str]] = []
         for token, token_id in self.minted_tokens:
+            token_fixture = self.token_fixtures.get(token, fixture)
             try:
-                await fixture.revoke_pat(
+                await token_fixture.revoke_pat(
                     token,
                     token_id,
                     allow_absent=token in self.stale_minted_tokens,
@@ -188,6 +191,8 @@ class CredentialResolver:
             except Exception as exc:
                 errors.append(exc)
                 remaining.append((token, token_id))
+            else:
+                self.token_fixtures.pop(token, None)
         self.minted_tokens = remaining
         if errors:
             primary = errors[0]
@@ -218,6 +223,7 @@ class CredentialResolver:
         assert self.tokens is not None
         self.tokens[profile] = token
         self.minted_tokens.append((token, token_id))
+        self.token_fixtures[token] = fixture
         self.issued_tokens.add(token)
 
     def _login_credentials_available(self) -> bool:
@@ -286,6 +292,7 @@ class BenchmarkRunner:
         self._timing: TimingTracker | None = None
         self._timing_attempt_index = 1
         self._resolver: CredentialResolver | None = None
+        self._ledger: BudgetLedger | None = None
         self._smoke_gate: dict[str, Any] = {
             "status": "not_run",
             "required_cells": [],
@@ -563,6 +570,7 @@ class BenchmarkRunner:
                 "total_tokens": ledger.input_tokens + ledger.output_tokens,
                 "cost_usd": ledger.cost_usd,
                 "wall_seconds": ledger.wall_seconds,
+                "model_work_seconds": ledger.model_work_seconds,
                 "reserved_cost_usd": ledger.reserved_cost_usd,
             },
         }
@@ -632,6 +640,11 @@ class BenchmarkRunner:
                     outcome,
                     status=status,
                     timing=self._timing_snapshot(),
+                    elapsed_wall_seconds=(
+                        self._ledger.current_wall_seconds()
+                        if self._ledger is not None
+                        else None
+                    ),
                 )
                 if self._timing is not None:
                     self._timing.record("checkpoint", checkpoint_started)
@@ -724,6 +737,11 @@ class BenchmarkRunner:
                             outcome,
                             status="incomplete",
                             timing=self._timing_snapshot(),
+                            elapsed_wall_seconds=(
+                                self._ledger.current_wall_seconds()
+                                if self._ledger is not None
+                                else None
+                            ),
                         )
                 raise RuntimeContractError(
                     f"smoke gate cell {cell_key} could not reserve its registered budget",
@@ -809,6 +827,11 @@ class BenchmarkRunner:
                         outcome,
                         status=status,
                         timing=self._timing_snapshot(),
+                        elapsed_wall_seconds=(
+                            self._ledger.current_wall_seconds()
+                            if self._ledger is not None
+                            else None
+                        ),
                     )
             return {
                 "cell": cell_key,
@@ -1044,7 +1067,12 @@ class BenchmarkRunner:
         self._resolver = resolver
         source_revision = runtime["source_revision"]
         artifact_versions = runtime["artifact_versions"]
-        ledger = BudgetLedger(self.manifest)
+        prior_elapsed = 0.0
+        ledger = BudgetLedger(
+            self.manifest,
+            wall_clock=lambda: prior_elapsed + max(0.0, time.perf_counter() - started),
+        )
+        self._ledger = ledger
         catalogs: dict[str, Any] = {}
         reports: dict[str, Any] = {}
         incomplete_reasons: set[str] = set()
@@ -1063,9 +1091,7 @@ class BenchmarkRunner:
         )
         if self._checkpoint_store is not None:
             self._timing_attempt_index = self._checkpoint_store.next_timing_attempt_index()
-            initial_timing = self._timing_snapshot()
-            assert initial_timing is not None
-            await asyncio.to_thread(self._checkpoint_store.update_timing, initial_timing)
+            prior_elapsed = self._checkpoint_store.document.spent.wall_seconds
             spent = self._checkpoint_store.document.spent
             ledger.restore(
                 model_requests=spent.model_requests,
@@ -1073,7 +1099,11 @@ class BenchmarkRunner:
                 output_tokens=spent.output_tokens,
                 cost_usd=spent.cost_usd,
                 wall_seconds=spent.wall_seconds,
+                model_work_seconds=spent.model_work_seconds,
             )
+            initial_timing = self._timing_snapshot()
+            assert initial_timing is not None
+            await asyncio.to_thread(self._checkpoint_store.update_timing, initial_timing)
             for planned_key in planned_keys.values():
                 outcome = self._checkpoint_store.completed_outcome_for(planned_key)
                 if outcome is not None:
@@ -1216,6 +1246,7 @@ class BenchmarkRunner:
             )
         self._refresh_secrets(resolver)
         cleanup_errors = [*lifecycle_cleanup_errors, *cleanup_errors]
+        ledger.observe_wall()
         timing_payload: dict[str, Any] = timing.snapshot(attempt_index=self._timing_attempt_index)
         if self._checkpoint_store is not None:
             try:

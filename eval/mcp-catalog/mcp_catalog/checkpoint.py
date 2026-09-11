@@ -17,7 +17,7 @@ from .evidence import safe_json
 from .execution import TrialOutcome, has_measured_evidence
 
 
-CHECKPOINT_SCHEMA_VERSION: Literal[2] = 2
+CHECKPOINT_SCHEMA_VERSION: Literal[3] = 3
 
 
 class CheckpointError(ValueError):
@@ -25,7 +25,7 @@ class CheckpointError(ValueError):
 
 
 class CheckpointHeader(ContractModel):
-    schema_version: Literal[2] = CHECKPOINT_SCHEMA_VERSION
+    schema_version: Literal[3] = CHECKPOINT_SCHEMA_VERSION
     source_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     run_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     task_corpus_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -52,6 +52,7 @@ class CheckpointBudget(ContractModel):
     output_tokens: int = Field(default=0, ge=0)
     cost_usd: float = Field(default=0.0, ge=0)
     wall_seconds: float = Field(default=0.0, ge=0)
+    model_work_seconds: float = Field(default=0.0, ge=0)
 
     def plus(self, outcome: TrialOutcome) -> CheckpointBudget:
         from decimal import Decimal
@@ -61,7 +62,10 @@ class CheckpointBudget(ContractModel):
             input_tokens=self.input_tokens + outcome.input_tokens,
             output_tokens=self.output_tokens + outcome.output_tokens,
             cost_usd=float(Decimal(str(self.cost_usd)) + Decimal(str(outcome.cost_usd))),
-            wall_seconds=self.wall_seconds + outcome.latency_seconds,
+            wall_seconds=self.wall_seconds,
+            model_work_seconds=float(
+                Decimal(str(self.model_work_seconds)) + Decimal(str(outcome.latency_seconds))
+            ),
         )
 
 
@@ -95,7 +99,7 @@ SmokeTransport = Literal["http", "stdio"]
 
 
 class TrialCheckpoint(ContractModel):
-    schema_version: Literal[2] = CHECKPOINT_SCHEMA_VERSION
+    schema_version: Literal[3] = CHECKPOINT_SCHEMA_VERSION
     status: TrialStatus
     key: CheckpointKey
     outcome: TrialOutcome
@@ -103,7 +107,7 @@ class TrialCheckpoint(ContractModel):
 
 
 class SmokeCellCheckpoint(ContractModel):
-    schema_version: Literal[2] = CHECKPOINT_SCHEMA_VERSION
+    schema_version: Literal[3] = CHECKPOINT_SCHEMA_VERSION
     status: TrialStatus
     model_class: SmokeModelClass
     model_id: str = Field(min_length=1, max_length=200)
@@ -113,7 +117,7 @@ class SmokeCellCheckpoint(ContractModel):
 
 
 class CheckpointDocument(ContractModel):
-    schema_version: Literal[2] = CHECKPOINT_SCHEMA_VERSION
+    schema_version: Literal[3] = CHECKPOINT_SCHEMA_VERSION
     header: CheckpointHeader
     spent: CheckpointBudget = Field(default_factory=CheckpointBudget)
     spent_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -250,6 +254,7 @@ class CheckpointStore:
         *,
         status: TrialStatus | None = None,
         timing: dict[str, object] | None = None,
+        elapsed_wall_seconds: float | None = None,
     ) -> bool:
         self._validate_key(key)
         safe_outcome = self._safe_outcome(outcome)
@@ -267,6 +272,13 @@ class CheckpointStore:
             record_hash=checkpoint_record_hash(resolved_status, key, safe_outcome),
         )
         self.document.spent = self.document.spent.plus(safe_outcome)
+        if elapsed_wall_seconds is not None:
+            if elapsed_wall_seconds < 0:
+                raise CheckpointError("checkpoint elapsed wall time cannot be negative")
+            self.document.spent.wall_seconds = max(
+                self.document.spent.wall_seconds,
+                elapsed_wall_seconds,
+            )
         self.document.spent_hash = spent_hash(self.document.spent)
         if timing is not None:
             self._update_timing(timing)
@@ -280,6 +292,7 @@ class CheckpointStore:
         *,
         status: TrialStatus | None = None,
         timing: dict[str, object] | None = None,
+        elapsed_wall_seconds: float | None = None,
     ) -> bool:
         expected = self.expected_smoke_cells.get(cell_key)
         if expected is None:
@@ -307,6 +320,13 @@ class CheckpointStore:
             record_hash=smoke_record_hash(resolved_status, model_class, model_id, transport, safe_outcome),
         )
         self.document.spent = self.document.spent.plus(safe_outcome)
+        if elapsed_wall_seconds is not None:
+            if elapsed_wall_seconds < 0:
+                raise CheckpointError("checkpoint elapsed wall time cannot be negative")
+            self.document.spent.wall_seconds = max(
+                self.document.spent.wall_seconds,
+                elapsed_wall_seconds,
+            )
         self.document.spent_hash = spent_hash(self.document.spent)
         if timing is not None:
             self._update_timing(timing)
@@ -399,6 +419,11 @@ class CheckpointStore:
             self.document.timing.attempts.append(active)
         self.document.timing.active_attempt = attempt
         self._recompute_timing()
+        self.document.spent.wall_seconds = max(
+            self.document.spent.wall_seconds,
+            self.document.timing.cumulative_wall_seconds,
+        )
+        self.document.spent_hash = spent_hash(self.document.spent)
         self.document.timing_hash = timing_hash(self.document.timing)
 
     def _recompute_timing(self) -> None:

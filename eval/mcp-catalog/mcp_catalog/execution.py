@@ -426,18 +426,29 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
 @dataclass(slots=True)
 class BudgetLedger:
     manifest: BenchmarkRunManifest
+    wall_clock: Callable[[], float] | None = None
     requests: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float = 0.0
     wall_seconds: float = 0.0
+    model_work_seconds: float = 0.0
     reserved_cost_usd: float = 0.0
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    def restore(self, *, model_requests: int, input_tokens: int, output_tokens: int, cost_usd: float, wall_seconds: float) -> None:
+    def restore(
+        self,
+        *,
+        model_requests: int,
+        input_tokens: int,
+        output_tokens: int,
+        cost_usd: float,
+        wall_seconds: float,
+        model_work_seconds: float = 0.0,
+    ) -> None:
         """Restore already-spent usage from a checkpoint before new calls."""
 
-        if min(model_requests, input_tokens, output_tokens, cost_usd, wall_seconds) < 0:
+        if min(model_requests, input_tokens, output_tokens, cost_usd, wall_seconds, model_work_seconds) < 0:
             raise BudgetExceeded("checkpoint budget totals cannot be negative")
         budget = self.manifest.budget
         if (
@@ -451,13 +462,24 @@ class BudgetLedger:
         self.output_tokens = output_tokens
         self.cost_usd = cost_usd
         self.wall_seconds = wall_seconds
+        self.model_work_seconds = model_work_seconds
+
+    def current_wall_seconds(self) -> float:
+        observed = self.wall_clock() if self.wall_clock is not None else self.wall_seconds
+        if observed < 0:
+            raise BudgetExceeded("wall-clock observation cannot be negative")
+        return max(self.wall_seconds, observed)
+
+    def observe_wall(self) -> float:
+        self.wall_seconds = self.current_wall_seconds()
+        return self.wall_seconds
 
     async def reserve_trial(self, worst_case_cost_usd: float) -> None:
         async with self._lock:
             budget = self.manifest.budget
             if self.requests >= budget.max_model_requests:
                 raise BudgetExceeded("max_model_requests exceeded")
-            if self.wall_seconds >= budget.max_wall_seconds:
+            if self.current_wall_seconds() >= budget.max_wall_seconds:
                 raise BudgetExceeded("max_wall_seconds exceeded")
             if worst_case_cost_usd < 0 or self.cost_usd + self.reserved_cost_usd + worst_case_cost_usd > budget.max_total_cost_usd:
                 raise BudgetExceeded("preregistered worst-case trial cost would exceed max_total_cost_usd")
@@ -475,7 +497,10 @@ class BudgetLedger:
             next_input = self.input_tokens + outcome.input_tokens
             next_output = self.output_tokens + outcome.output_tokens
             next_cost = float(Decimal(str(self.cost_usd)) + Decimal(str(outcome.cost_usd)))
-            next_wall = self.wall_seconds + outcome.latency_seconds
+            next_wall = self.current_wall_seconds()
+            next_model_work = float(
+                Decimal(str(self.model_work_seconds)) + Decimal(str(outcome.latency_seconds))
+            )
             budget = self.manifest.budget
             if outcome.model_requests > budget.max_requests_per_trial:
                 raise BudgetExceeded("max_requests_per_trial exceeded")
@@ -486,13 +511,12 @@ class BudgetLedger:
             remaining_reserved = self.reserved_cost_usd - reserved_cost_usd
             if remaining_reserved < 0 or next_cost + remaining_reserved > budget.max_total_cost_usd:
                 raise BudgetExceeded("max_total_cost_usd exceeded")
-            if next_wall > budget.max_wall_seconds:
-                raise BudgetExceeded("max_wall_seconds exceeded")
             self.requests = next_requests
             self.input_tokens = next_input
             self.output_tokens = next_output
             self.cost_usd = next_cost
             self.wall_seconds = next_wall
+            self.model_work_seconds = next_model_work
             self.reserved_cost_usd = remaining_reserved
 
 
