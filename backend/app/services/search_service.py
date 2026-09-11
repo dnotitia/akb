@@ -779,13 +779,21 @@ class SearchService:
         # AKB is purely per-vault, so this is correctness-equivalent. Otherwise
         # the existing SOURCE_IDS path runs UNCHANGED (flag off / other driver /
         # any doc-level filter present).
-        # `is_ready()` additionally gates on the auto-backfill: until every
-        # pre-upgrade pgvector point carries its vault_id, fall back to the
-        # source-id path so a user can't miss their own un-backfilled docs.
+        # Readiness is cross-process (akb#526): the backfill runner lives in the
+        # worker tier, so the serving tier must derive it from store state it
+        # can see (NULL-vault_id count, briefly cached) rather than from a
+        # process-local latch the worker flips in its own copy.
         from app.services import vault_backfill
-        use_vault_path = not (doc_types or source_type or scope != "all") and vault_path_eligible(
+        vault_path_wanted = not (doc_types or source_type or scope != "all") and vault_path_eligible(
             collection=collection, doc_type=doc_type, tags=tags, source_uris=source_uris,
-        ) and vault_backfill.is_ready()
+        )
+        vault_ready = vault_backfill.is_ready() or await vault_backfill.is_ready_async()
+        if vault_path_wanted and not vault_ready:
+            # One line on the serving side naming the disabled path (akb#526):
+            # without it this surfaces only as an unrelated search refusal
+            # downstream (bounded-corpus 422 on large scopes).
+            logger.info("vault path disabled: readiness not established")
+        use_vault_path = vault_path_wanted and vault_ready
 
         if use_vault_path:
             async with pool.acquire() as conn:

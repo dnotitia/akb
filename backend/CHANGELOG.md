@@ -7,6 +7,21 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Vault-filter readiness visible to the serving tier (akb#526)
+
+`vault_backfill.is_ready()` was a process-local latch flipped only by the
+backfill runner, which lives in the worker tier — on a split api/worker
+deployment the serving process never ran it, so its copy stayed False for
+life and every native-arm query fell back to id enumeration (and the
+bounded-corpus refusal on large scopes), even with zero NULL `vault_id`
+rows. Search now calls `is_ready_async()`: the local latch on hit, else the
+store's own NULL count — state both tiers can see — with a 30s cache on
+negative outcomes so the hot path stays cheap. A True outcome latches
+locally and is never re-checked; a counter failure stays gated (fail
+closed). When the vault path is wanted but readiness is not established,
+search logs one line (`vault path disabled: readiness not established`)
+instead of surfacing only as an unrelated search refusal downstream.
+
 ### Write cap + source_uris hardening (bounded-corpus fix, part 3)
 
 The reference placement (`m1-reference-payload-v1`) enforces the same 10MiB

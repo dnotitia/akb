@@ -27,6 +27,7 @@ vault and source paths, so they do NOT block readiness.
 from __future__ import annotations
 
 import logging
+import time
 
 from app.config import settings
 from app.db.postgres import get_pool
@@ -37,15 +38,71 @@ from app.services.vector_store.base import supports_vault_filter
 logger = logging.getLogger("akb.vault_backfill")
 
 _BATCH = 5000
-# Set once all live-source points carry vault_id. Increment A guarantees no NEW
-# nulls appear, so once True it stays True for the life of the process.
+# Process-local fast path for the search hot path. Set once THIS process has
+# established readiness (see is_ready_async); never cleared afterwards.
+# Increment A guarantees no NEW nulls appear, so once True it stays True for
+# the life of the process. It is deliberately NOT shared across processes —
+# cross-process visibility comes from the cached DB check in is_ready_async.
 _ready = False
+# Cached outcome of the last cross-process readiness check: (established_at,
+# value). A True value is latched into `_ready` above, so only False outcomes
+# are ever re-checked — and only after the TTL below.
+_last_check: tuple[float, bool] | None = None
+# How long a negative readiness outcome is trusted before re-checking the
+# store (akb#526). The check is one indexed COUNT(*) on the vector schema;
+# 30s keeps the hot path cheap while opening the vault path within half a
+# minute of the backfill completing anywhere (any process, any replica).
+_NEGATIVE_TTL_SECS = 30.0
 
 
 def is_ready() -> bool:
-    """True when the vault filter is safe to use (all live-source points have
-    vault_id). Read on the search hot path — must stay a cheap memory read."""
+    """Process-local fast path: True once THIS process has established
+    readiness. Kept for the worker loop (`_process_once` short-circuit) and
+    for tests. Search must call `is_ready_async()` instead — on a split
+    api/worker deployment the worker flips its own copy of this latch while
+    the serving process never runs the backfill runner, so a bare memory
+    read here is permanently False where search actually runs (akb#526)."""
     return _ready
+
+
+async def is_ready_async() -> bool:
+    """Cross-process readiness for the search hot path (akb#526).
+
+    Returns the process-local latch when set (zero cost). Otherwise asks the
+    store for its NULL-`vault_id` count — state every tier can see — and
+    caches a negative outcome for `_NEGATIVE_TTL_SECS`. A True outcome
+    latches process-locally and is never re-checked.
+    """
+    global _ready, _last_check
+    if _ready:
+        return True
+    now = time.monotonic()
+    if _last_check is not None:
+        checked_at, value = _last_check
+        if not value and now - checked_at < _NEGATIVE_TTL_SECS:
+            return False
+    store = get_vector_store()
+    if not supports_vault_filter(store):
+        _ready = True
+        _last_check = None
+        return True
+    fn = getattr(store, "vault_backfill_pending", None)
+    if fn is None:
+        # A capable driver that exposes no counter can't prove its existing
+        # points carry vault_id: stay gated (matches the worker branch below).
+        _last_check = (now, False)
+        return False
+    try:
+        pending = await fn()
+    except Exception:  # noqa: BLE001 — a counter failure must not open the path
+        _last_check = (now, False)
+        return False
+    if pending == 0:
+        _ready = True
+        _last_check = None
+        return True
+    _last_check = (now, False)
+    return False
 
 
 def _is_pgvector() -> bool:
