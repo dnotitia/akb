@@ -1,0 +1,43 @@
+[project]
+name = "akb-mcp-catalog-benchmark"
+version = "0.1.0"
+description = "Source-blind MCP tool catalog benchmark for AKB"
+requires-python = ">=3.14"
+dependencies = [
+    "pydantic-ai-slim[mcp,openai]==2.41.0",
+    "pydantic-evals==2.41.0",
+    "fastmcp-slim==4.0.3",
+    "mcp==2.2.0",
+    "mcp-types==2.2.0",
+    "httpx==0.28.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.3",
+    "pytest-asyncio==1.3.0",
+    "ruff==0.15.16",
+    "mypy==2.1.0",
+]
+server = [
+    "fastmcp==4.0.3",
+]
+
+[project.scripts]
+mcp-catalog-bench = "mcp_catalog.cli:main"
+mcp-catalog-runtime = "mcp_catalog.benchmark_runtime:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mcp_catalog"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 120
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

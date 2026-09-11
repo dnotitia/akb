@@ -70,6 +70,7 @@ DEFAULT_MINIO_PORT = 9000
 DEFAULT_COMPOSE_PROJECT = "akb-e2e"
 DEFAULT_TIMEOUT_SECONDS = 180.0
 DEFAULT_PROFILE = "tool-only"
+SOURCE_REVISION_ENV = "AKB_E2E_SOURCE_REVISION"
 
 
 def _canonical_fixture_json(value: object) -> bytes:
@@ -303,9 +304,8 @@ _PROFILE_CAPABILITIES: dict[str, frozenset[str]] = {
     "transport-proxy": frozenset({"http", "pat", "stdio"}),
     "oidc-resource-server": frozenset({"http", "pat", "oidc"}),
     "transport-oidc": frozenset({"http", "pat", "stdio", "oidc"}),
-    # The common runtime never starts Keycloak.  Selecting this profile is an
-    # explicit request for the specialist overlay and therefore fails closed
-    # unless the orchestrator supplies that separate runtime.
+    # The common runtime never starts Keycloak. Selecting this profile is an
+    # explicit request for a specialist overlay and therefore fails closed.
     "keycloak-overlay": frozenset({"http", "pat", "keycloak"}),
 }
 _CAPABILITY_ALIASES = {
@@ -616,6 +616,23 @@ class E2ERuntime:
         self._stdio_tools_list_observed = False
         self._stdio_read_call_observed = False
         self._stdio_next_id = 2
+        self._dependency_identity: dict[str, object] | None = None
+        self._dependency_reset_count = 0
+        self._dependency_reset_wall_seconds = 0.0
+        self._dependency_reset_evidence: dict[str, object] = {
+            "strategy": "in_place",
+            "preserves": [
+                "postgres_container",
+                "minio_container",
+                "compose_network",
+                "compose_volumes",
+                "backend_process",
+                "embedding_process",
+                "stdio_process",
+            ],
+            "count": 0,
+            "wall_seconds": 0.0,
+        }
         self.oidc_fixture: OIDCFixture | None = (
             OIDCFixture(
                 origin=config.fixture_origin,
@@ -642,6 +659,14 @@ class E2ERuntime:
         return tuple(sorted(self.profile.capabilities))
 
     def _source_revision(self) -> str:
+        explicit = os.environ.get(SOURCE_REVISION_ENV)
+        if explicit is not None:
+            if re.fullmatch(r"[0-9a-f]{40}", explicit) is None:
+                raise BlockedRuntimeConfig(
+                    f"{SOURCE_REVISION_ENV} must be a full 40-hex Git SHA"
+                )
+            self._candidate_revision = explicit
+            return explicit
         if self._candidate_revision is not None:
             return self._candidate_revision
         try:
@@ -654,7 +679,11 @@ class E2ERuntime:
             )
         except OSError:
             completed = None
-        revision = completed.stdout.strip() if completed and completed.returncode == 0 else "unknown"
+        revision = completed.stdout.strip() if completed and completed.returncode == 0 else ""
+        if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+            raise BlockedRuntimeConfig(
+                f"exact source revision requires {SOURCE_REVISION_ENV} in a raw checkout"
+            )
         self._candidate_revision = revision
         return revision
 
@@ -729,7 +758,13 @@ class E2ERuntime:
             },
             "fixture": fixture,
             "failure_stages": ["provisioning", "product_assertion"],
+            "dependency_reset": dict(self._dependency_reset_evidence),
         }
+        if self._dependency_identity is not None:
+            evidence["dependency_identity"] = self._dependency_identity
+        process_identity = self._process_identity_snapshot()
+        if process_identity:
+            evidence["process_identity"] = process_identity
         if self.config.frontend_enabled:
             origins = evidence["origin"]
             assert isinstance(origins, dict)
@@ -1637,6 +1672,172 @@ class E2ERuntime:
             lambda status, _body: status == 200,
         )
         await asyncio.to_thread(self._ensure_minio_bucket)
+        self._dependency_identity = await asyncio.to_thread(self._dependency_identity_snapshot)
+
+    def _dependency_identity_snapshot(self) -> dict[str, object]:
+        """Capture identities that an in-place fixture reset must preserve."""
+
+        docker = os.environ.get("AKB_DOCKER_BIN", "docker")
+        services: dict[str, object] = {}
+        for service in ("postgres", "minio"):
+            try:
+                listed = subprocess.run(
+                    self._compose_command("ps", "-q", service),
+                    cwd=str(self.config.runtime_root),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    check=False,
+                )
+            except OSError:
+                raise ProvisioningFailure(f"dependency identity is unavailable for {service}") from None
+            container_ids = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+            if listed.returncode != 0 or len(container_ids) != 1:
+                raise ProvisioningFailure(f"dependency identity is unavailable for {service}")
+            try:
+                inspected = subprocess.run(
+                    [docker, "inspect", container_ids[0]],
+                    cwd=str(self.config.runtime_root),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    check=False,
+                )
+            except OSError:
+                raise ProvisioningFailure(f"dependency identity inspection failed for {service}") from None
+            if inspected.returncode != 0:
+                raise ProvisioningFailure(f"dependency identity inspection failed for {service}")
+            try:
+                payload = json.loads(inspected.stdout)
+                container = payload[0]
+                networks = container.get("NetworkSettings", {}).get("Networks", {})
+                mounts = container.get("Mounts", [])
+            except (IndexError, TypeError, ValueError, AttributeError):
+                raise ProvisioningFailure(f"dependency identity inspection returned invalid data for {service}") from None
+            network_ids = sorted(
+                str(network.get("NetworkID"))
+                for network in networks.values()
+                if isinstance(network, dict) and network.get("NetworkID")
+            )
+            volume_names = sorted(
+                str(mount.get("Name") or mount.get("Source"))
+                for mount in mounts
+                if isinstance(mount, dict) and mount.get("Type") == "volume"
+            )
+            container_id = container.get("Id")
+            if not isinstance(container_id, str) or not container_id:
+                raise ProvisioningFailure(f"dependency identity inspection returned no container id for {service}")
+            services[service] = {
+                "container_id": container_id,
+                "network_ids": network_ids,
+                "volume_names": volume_names,
+            }
+        return {"services": services}
+
+    async def _reset_postgres_in_place(self) -> None:
+        """Clear application rows while keeping the database schema and process alive."""
+
+        try:
+            import asyncpg
+
+            connection = await asyncpg.connect(
+                host="127.0.0.1",
+                port=self.config.postgres_port,
+                user="akb",
+                password="akb",
+                database="akb",
+            )
+            try:
+                await connection.execute(
+                    """
+                    DO $cleanup$
+                    DECLARE table_list text;
+                    BEGIN
+                        SELECT string_agg(format('%I.%I', schemaname, tablename), ', ')
+                          INTO table_list
+                          FROM pg_tables
+                         WHERE schemaname NOT LIKE 'pg_%'
+                           AND schemaname <> 'information_schema'
+                           AND tablename NOT IN (
+                               'schema_migrations',
+                               'users',
+                               'tokens',
+                               'auth_runtime_epoch_upgrade',
+                               'auth_runtime_state',
+                               'bm25_stats',
+                               'document_revision_bootstrap_claims',
+                               'document_revision_authority_pending',
+                               'document_revision_authority_marker',
+                               'native_revision_existing_authority_fence',
+                               'native_revision_existing_authority',
+                               'native_revision_legacy_write_fence'
+                           );
+                        IF table_list IS NOT NULL THEN
+                            EXECUTE format('TRUNCATE TABLE %s RESTART IDENTITY CASCADE', table_list);
+                        END IF;
+                    END
+                    $cleanup$
+                    """
+                )
+                username, _password = self.config.credentials.values()
+                await connection.execute(
+                    """
+                    DELETE FROM tokens
+                     WHERE user_id NOT IN (
+                         SELECT id FROM users WHERE username = $1
+                     )
+                    """,
+                    username,
+                )
+                await connection.execute(
+                    "DELETE FROM users WHERE username <> $1",
+                    username,
+                )
+            finally:
+                await connection.close()
+        except Exception:
+            raise ProvisioningFailure("PostgreSQL in-place fixture reset failed") from None
+
+    def _clear_minio_objects(self) -> None:
+        """Delete scenario objects without deleting the MinIO bucket or volume."""
+
+        try:
+            import boto3
+
+            client = boto3.client(
+                "s3",
+                endpoint_url=self.config.minio_origin,
+                aws_access_key_id="akb-ci",
+                aws_secret_access_key="akb-ci-secret",
+            )
+            paginator = client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket="akb-files"):
+                objects = [
+                    {"Key": item["Key"]}
+                    for item in page.get("Contents", [])
+                    if isinstance(item, dict) and isinstance(item.get("Key"), str)
+                ]
+                if objects:
+                    response = client.delete_objects(
+                        Bucket="akb-files",
+                        Delete={"Objects": objects, "Quiet": True},
+                    )
+                    if response.get("Errors"):
+                        raise RuntimeError("object deletion returned errors")
+        except Exception:
+            raise ProvisioningFailure("MinIO in-place fixture reset failed") from None
+
+    def _process_identity_snapshot(self) -> dict[str, object]:
+        """Capture managed process identities that a fixture reset must preserve."""
+
+        return {
+            name: {
+                "pid": managed.process.pid,
+                "running": managed.process.returncode is None,
+            }
+            for name, managed in sorted(self._children.items())
+            if name in {"backend", "embed", "stdio"}
+        }
 
     def _ensure_minio_bucket(self) -> None:
         try:
@@ -3308,7 +3509,6 @@ class E2ERuntime:
             )
             self._fixture_private_marker = f"runtime-private-{uuid.uuid4().hex}"
             self._fixture_private_values = (username, password, self._fixture_private_marker)
-            system_admin_id = uuid.uuid4()
             connection = await asyncpg.connect(
                 host="127.0.0.1",
                 port=self.config.postgres_port,
@@ -3317,17 +3517,37 @@ class E2ERuntime:
                 database="akb",
             )
             try:
-                await connection.execute(
-                    """
-                    INSERT INTO users
-                        (id, username, email, password_hash, is_admin)
-                    VALUES ($1, $2, $3, $4, TRUE)
-                    """,
-                    system_admin_id,
+                system_admin_id = await connection.fetchval(
+                    "SELECT id FROM users WHERE username = $1",
                     username,
-                    f"runtime-{uuid.uuid4().hex}@invalid.akb",
-                    password_hash,
                 )
+                if system_admin_id is None:
+                    system_admin_id = uuid.uuid4()
+                    await connection.execute(
+                        """
+                        INSERT INTO users
+                            (id, username, email, password_hash, is_admin)
+                        VALUES ($1, $2, $3, $4, TRUE)
+                        """,
+                        system_admin_id,
+                        username,
+                        f"runtime-{uuid.uuid4().hex}@invalid.akb",
+                        password_hash,
+                    )
+                else:
+                    await connection.execute(
+                        """
+                        UPDATE users
+                           SET password_hash = $2,
+                               is_admin = TRUE,
+                               account_status = 'active',
+                               credential_change_required = FALSE,
+                               updated_at = NOW()
+                         WHERE id = $1
+                        """,
+                        system_admin_id,
+                        password_hash,
+                    )
                 if self.config.scenario == "app-installation-lifecycle":
                     await self._seed_app_installation_lifecycle(
                         connection,
@@ -3413,6 +3633,7 @@ class E2ERuntime:
 
     async def prepare(self) -> None:
         self._validate_checkout()
+        self._source_revision()
         self._validate_profile()
         prepare_private_runtime_root(self.config.runtime_root)
         self._write_config()
@@ -3431,29 +3652,75 @@ class E2ERuntime:
         async with self._reset_lock:
             if not self._prepared:
                 raise ProvisioningFailure("fixture reset requested before runtime readiness")
+            started = time.perf_counter()
+            identity_before: dict[str, object] | None = None
+            identity_after: dict[str, object] | None = None
+            process_before: dict[str, object] = {}
+            process_after: dict[str, object] = {}
+            preserved = False
             self._lifecycle_generation += 1
             self._resetting = True
             try:
+                identity_before = await asyncio.to_thread(self._dependency_identity_snapshot)
+                process_before = self._process_identity_snapshot()
                 self._fixture_controls.clear()
-                await self._stop_named_process("stdio")
                 self._stdio_initialize_observed = False
                 self._stdio_tools_list_observed = False
                 self._stdio_read_call_observed = False
                 self._stdio_next_id = 2
-                await self._stop_named_process("backend")
-                await self._stop_named_process("embed")
-                await self._compose("down", "--volumes", "--remove-orphans", check=False)
+                await self._reset_postgres_in_place()
+                await asyncio.to_thread(self._clear_minio_objects)
                 if self.config.vault_dir.exists():
                     shutil.rmtree(self.config.vault_dir)
                 self.config.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
                 os.chmod(self.config.vault_dir, 0o700)
-                await self._start_dependencies()
-                await self._start_embed_stub()
-                await self._bootstrap_backend_and_seed()
-                if self.profile.needs_stdio:
-                    await self._start_stdio_proxy()
+                for directory in (
+                    self.config.vault_dir / "_worktrees",
+                    self.config.vault_dir / ".akb-write-locks",
+                    self.config.vault_dir / ".akb-create-locks",
+                ):
+                    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    os.chmod(directory, 0o700)
+                await self._wait_tcp("PostgreSQL", "127.0.0.1", self.config.postgres_port)
+                await self._wait_http(
+                    "MinIO",
+                    f"{self.config.minio_origin}/minio/health/live",
+                    lambda status, _body: status == 200,
+                )
+                await asyncio.to_thread(self._ensure_minio_bucket)
+                await self._seed_external_credential()
+                await self._mint_runtime_pat()
+                identity_after = await asyncio.to_thread(self._dependency_identity_snapshot)
+                process_after = self._process_identity_snapshot()
+                if identity_before != identity_after or process_before != process_after:
+                    raise ProvisioningFailure("in-place fixture reset changed a runtime identity")
+                self._dependency_identity = identity_after
+                preserved = True
             finally:
                 self._resetting = False
+                self._dependency_reset_count += 1
+                elapsed = time.perf_counter() - started
+                self._dependency_reset_wall_seconds += elapsed
+                self._dependency_reset_evidence = {
+                    "strategy": "in_place",
+                    "preserves": [
+                        "postgres_container",
+                        "minio_container",
+                        "compose_network",
+                        "compose_volumes",
+                        "backend_process",
+                        "embedding_process",
+                        "stdio_process",
+                    ],
+                    "count": self._dependency_reset_count,
+                    "wall_seconds": self._dependency_reset_wall_seconds,
+                    "last_preserved": preserved,
+                    "process_identity_before": process_before,
+                    "process_identity_after": process_after,
+                }
+                if preserved and identity_before is not None and identity_after is not None:
+                    self._dependency_reset_evidence["identity_before"] = identity_before
+                    self._dependency_reset_evidence["identity_after"] = identity_after
 
     async def _serve_foreground(self) -> int:
         stop_task = asyncio.create_task(self._stop_event.wait(), name="serve-stop")
@@ -3782,6 +4049,8 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
     parser.add_argument("--frontend-port", type=int, default=DEFAULT_FRONTEND_PORT)
     parser.add_argument("--embed-port", type=int, default=DEFAULT_EMBED_PORT)
     parser.add_argument("--fixture-port", type=int, default=DEFAULT_FIXTURE_PORT)
+    parser.add_argument("--postgres-port", type=int, default=DEFAULT_POSTGRES_PORT)
+    parser.add_argument("--minio-port", type=int, default=DEFAULT_MINIO_PORT)
     parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--username-env", default=DEFAULT_USERNAME_ENV)
     parser.add_argument("--password-env", default=DEFAULT_PASSWORD_ENV)
@@ -3840,6 +4109,8 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
         frontend_port=args.frontend_port,
         embed_port=args.embed_port,
         fixture_port=args.fixture_port,
+        postgres_port=args.postgres_port,
+        minio_port=args.minio_port,
         timeout_seconds=args.timeout_seconds,
         credentials=CredentialNames(args.username_env, args.password_env, args.pat_env),
         scenario=args.scenario,
