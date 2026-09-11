@@ -23,13 +23,14 @@ from pydantic_ai.usage import UsageLimits
 from pydantic_evals import Case, Dataset
 from pydantic_evals.evaluators import EvaluationReason, Evaluator, EvaluatorContext, ReportEvaluator, ReportEvaluatorContext
 from pydantic_evals.lifecycle import CaseLifecycle
-from pydantic_evals.reporting import EvaluationReport, ReportCaseFailure, ScalarResult
+from pydantic_evals.reporting import EvaluationReport, ScalarResult
 
 from .catalog import ConnectionSpec, create_client, create_toolset
 from .contracts import OPENROUTER_BASE_URL, BenchmarkRunManifest, ModelSpec, TaskManifest
 from .evidence import canonical_json, redact_exception, redact_text, safe_json
 from .runtime import RuntimeContractError, RuntimeFixture, StateObservation
 from .state import StateCheckResult, evaluate_state_contract
+from .timing import TimingCategory
 
 SYSTEM_PROMPT = (
     "Complete the user's request using the available capabilities when needed. "
@@ -108,6 +109,13 @@ def classify_failure(error: str | None, *, result: Any, final_answer: str) -> Fa
     ):
         return "budget"
     return "unknown"
+
+
+def is_provider_wait_failure(error: str | None) -> bool:
+    if error is None:
+        return False
+    lowered = error.casefold()
+    return any(marker in lowered for marker in ("429", "rate limit", "ratelimiterror"))
 
 
 class OpenRouterChatModel(OpenAIChatModel):
@@ -347,6 +355,8 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
             if self.failure_sink:
                 raise self.failure_sink[0]
             await self.fixture.reset()
+            if self.mark_reset_complete is not None:
+                self.mark_reset_complete()
             token = (
                 await self.refresh_token(self.fixture, task.fixture.credential_profile)
                 if self.refresh_token is not None
@@ -388,31 +398,12 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
 
     async def teardown(self, result: Any) -> None:
         try:
-            # A reset after the observation is the failure cleanup boundary.
-            checkpoint_attempted = False
-            try:
-                await self.fixture.reset()
-                if self.mark_reset_complete is not None:
-                    self.mark_reset_complete()
-                if self.checkpoint_sink is not None and self.output is not None:
-                    checkpoint_attempted = True
-                    status: Literal["completed", "failed"] = "completed" if has_measured_evidence(self.output) else "failed"
-                    await self.checkpoint_sink(self.output, status)
-            except Exception as exc:
-                if self.checkpoint_sink is not None and self.output is not None and not checkpoint_attempted:
-                    try:
-                        await self.checkpoint_sink(self.output, "incomplete")
-                    except Exception as checkpoint_exc:
-                        self._record_cleanup(checkpoint_exc)
-                if isinstance(result, ReportCaseFailure):
-                    self._record_cleanup(exc)
-                    result.error_message = (
-                        f"{result.error_message}; cleanup failed: "
-                        f"{redact_exception(exc, self._secrets_for_case())}"
-                    )
-                else:
-                    self._record_failure(exc)
-                    raise
+            # The next setup owns the next reset boundary.  The runner performs
+            # one final cleanup reset after the dataset, so teardown never
+            # performs a duplicate reset between adjacent cases.
+            if self.checkpoint_sink is not None and self.output is not None:
+                status: Literal["completed", "failed"] = "completed" if has_measured_evidence(self.output) else "failed"
+                await self.checkpoint_sink(self.output, status)
         finally:
             if self.context is not None and self.context.context_token is not None:
                 CURRENT_TRIAL.reset(self.context.context_token)
@@ -483,7 +474,7 @@ class BudgetLedger:
             next_requests = self.requests + outcome.model_requests
             next_input = self.input_tokens + outcome.input_tokens
             next_output = self.output_tokens + outcome.output_tokens
-            next_cost = self.cost_usd + outcome.cost_usd
+            next_cost = float(Decimal(str(self.cost_usd)) + Decimal(str(outcome.cost_usd)))
             next_wall = self.wall_seconds + outcome.latency_seconds
             budget = self.manifest.budget
             if outcome.model_requests > budget.max_requests_per_trial:
@@ -519,6 +510,7 @@ class TrialExecutor:
         secrets_for: Callable[[str], tuple[str, ...]],
         ledger: BudgetLedger,
         outcome_sink: Callable[[TrialOutcome], None] | None = None,
+        timing_sink: Callable[[TimingCategory, float, float], None] | None = None,
     ) -> None:
         self.manifest = manifest
         self.arm = arm
@@ -530,6 +522,7 @@ class TrialExecutor:
         self.secrets_for = secrets_for
         self.ledger = ledger
         self.outcome_sink = outcome_sink
+        self.timing_sink = timing_sink
         self._outcome_counts: dict[str, int] = defaultdict(int)
 
     async def execute(self, task: TaskManifest) -> TrialOutcome:
@@ -611,6 +604,8 @@ class TrialExecutor:
                 secrets=secrets,
                 partial_messages=partial_messages,
             )
+            if self.timing_sink is not None and is_provider_wait_failure(outcome.error):
+                self.timing_sink("provider_wait", started, started + latency)
             try:
                 await self.ledger.charge(outcome, reserved_cost_usd=reservation)
             except BudgetExceeded as exc:
@@ -644,6 +639,7 @@ async def execute_smoke(
     fixture: RuntimeFixture,
     token: str,
     secrets: tuple[str, ...],
+    timing_sink: Callable[[TimingCategory, float, float], None] | None = None,
 ) -> TrialOutcome:
     """Make one real full-catalog request for the pre-run four-cell gate."""
 
@@ -688,7 +684,7 @@ async def execute_smoke(
         error = redact_exception(exc, secrets)
     finally:
         MODEL_RESPONSES.reset(capture_token)
-    return outcome_from_run(
+    outcome = outcome_from_run(
         task=task,
         arm=arm,
         model_spec=model_spec,
@@ -701,6 +697,9 @@ async def execute_smoke(
         secrets=secrets,
         partial_messages=partial_messages,
     )
+    if timing_sink is not None and is_provider_wait_failure(outcome.error):
+        timing_sink("provider_wait", started, started + (time.perf_counter() - started))
+    return outcome
 
 
 def validate_model_configuration(spec: ModelSpec) -> tuple[str, str]:

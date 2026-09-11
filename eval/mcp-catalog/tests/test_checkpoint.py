@@ -200,6 +200,39 @@ def test_provider_failure_without_usage_is_not_reusable(tmp_path: Path) -> None:
     assert resumed.completed_outcome_for(key) is None
 
 
+def test_checkpoint_timing_is_cumulative_across_resume_attempts(tmp_path: Path) -> None:
+    path = tmp_path / "checkpoint.json"
+    store, key = _store(path)
+    timing = {
+        "attempt_index": 1,
+        "wall_seconds": 12.0,
+        "breakdown": {"model_execution": 9.0, "fixture_reset": 2.0, "other": 1.0},
+    }
+    store.record_trial(key, _outcome(key), status="completed", timing=timing)
+    store.finalize_timing(timing)
+
+    resumed, _ = _store(path, resume=True)
+    assert resumed.next_timing_attempt_index() == 2
+    assert resumed.document.timing.cumulative_wall_seconds == pytest.approx(12.0)
+    assert len(resumed.document.timing.attempts) == 1
+
+
+def test_checkpoint_timing_tampering_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "checkpoint.json"
+    store, key = _store(path)
+    store.record_trial(key, _outcome(key), status="completed", timing={
+        "attempt_index": 1,
+        "wall_seconds": 2.0,
+        "breakdown": {"other": 2.0},
+    })
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["timing"]["cumulative_wall_seconds"] = 3.0
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(CheckpointError, match="timing digest"):
+        _store(path, resume=True)
+
+
 def test_smoke_checkpoint_requires_a_successful_call_and_follow_up_response(tmp_path: Path) -> None:
     path = tmp_path / "checkpoint.json"
     store, key = _store(path)

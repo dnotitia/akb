@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -36,6 +37,13 @@ async def test_primary_failure_survives_pat_cleanup_failure_and_serializes_incom
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
     descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
+    descriptor = dataclasses.replace(
+        descriptor,
+        benchmark_cells={
+            key: descriptor
+            for key in ("primary:http", "primary:stdio", "lightweight:http", "lightweight:stdio")
+        },
+    )
     resolver = _Resolver()
     runtime = {
         "source_revision": "a" * 40,
@@ -73,7 +81,7 @@ async def test_primary_failure_survives_pat_cleanup_failure_and_serializes_incom
     assert failure.primary_error is primary
     assert failure.__cause__ is primary
     assert "fixture-marker" not in str(failure)
-    assert closed == [True]
+    assert closed == [True, True, True, True]
     assert failure.artifact["status"] == "incomplete"
     assert failure.artifact["failure"]["stage"] == "fixture_readiness"
     assert failure.artifact["completed_trials"] == 0

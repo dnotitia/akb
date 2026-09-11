@@ -75,6 +75,13 @@ BENCHMARK_PROFILE = "transport-proxy"
 BENCHMARK_SCENARIO: Scenario = "app-control-plane"
 OPENROUTER_BASE_URL_ENV = "MCP_BENCH_OPENROUTER_BASE_URL"
 OPENROUTER_PROVIDER_KEY_ENV = "MCP_BENCH_OPENROUTER_" + "API_KEY"
+BENCHMARK_CELL_KEYS = (
+    "primary:http",
+    "primary:stdio",
+    "lightweight:http",
+    "lightweight:stdio",
+)
+BENCHMARK_CELL_PORT_STRIDE = 10
 
 
 def _canonical_fixture_json(value: object) -> bytes:
@@ -637,7 +644,15 @@ class E2ERuntime:
         self._dependency_reset_wall_seconds = 0.0
         self._dependency_reset_evidence: dict[str, object] = {
             "strategy": "in_place",
-            "preserves": ["postgres_container", "minio_container", "compose_network", "compose_volumes"],
+            "preserves": [
+                "postgres_container",
+                "minio_container",
+                "compose_network",
+                "compose_volumes",
+                "backend_process",
+                "embedding_process",
+                "stdio_process",
+            ],
             "count": 0,
             "wall_seconds": 0.0,
         }
@@ -770,6 +785,9 @@ class E2ERuntime:
         }
         if self._dependency_identity is not None:
             evidence["dependency_identity"] = self._dependency_identity
+        process_identity = self._process_identity_snapshot()
+        if process_identity:
+            evidence["process_identity"] = process_identity
         if self.config.frontend_enabled:
             origins = evidence["origin"]
             assert isinstance(origins, dict)
@@ -1745,7 +1763,7 @@ class E2ERuntime:
         return {"services": services}
 
     async def _reset_postgres_in_place(self) -> None:
-        """Remove the application schema while keeping the PostgreSQL container/volume."""
+        """Clear application rows while keeping the database schema and process alive."""
 
         try:
             import asyncpg
@@ -1758,28 +1776,50 @@ class E2ERuntime:
                 database="akb",
             )
             try:
-                await connection.execute('DROP EXTENSION IF EXISTS "uuid-ossp" CASCADE')
-                await connection.execute("DROP EXTENSION IF EXISTS pgcrypto CASCADE")
-                await connection.execute("DROP EXTENSION IF EXISTS vector CASCADE")
-                await connection.execute("DROP SCHEMA IF EXISTS public CASCADE")
-                await connection.execute("CREATE SCHEMA public")
-                await connection.execute("GRANT ALL ON SCHEMA public TO public")
                 await connection.execute(
                     """
                     DO $cleanup$
-                    DECLARE schema_name text;
+                    DECLARE table_list text;
                     BEGIN
-                        FOR schema_name IN
-                            SELECT nspname
-                            FROM pg_namespace
-                            WHERE nspname NOT LIKE 'pg_%'
-                              AND nspname NOT IN ('information_schema', 'public')
-                        LOOP
-                            EXECUTE format('DROP SCHEMA %I CASCADE', schema_name);
-                        END LOOP;
+                        SELECT string_agg(format('%I.%I', schemaname, tablename), ', ')
+                          INTO table_list
+                          FROM pg_tables
+                         WHERE schemaname NOT LIKE 'pg_%'
+                           AND schemaname <> 'information_schema'
+                           AND tablename NOT IN (
+                               'schema_migrations',
+                               'users',
+                               'tokens',
+                               'auth_runtime_epoch_upgrade',
+                               'auth_runtime_state',
+                               'bm25_stats',
+                               'document_revision_bootstrap_claims',
+                               'document_revision_authority_pending',
+                               'document_revision_authority_marker',
+                               'native_revision_existing_authority_fence',
+                               'native_revision_existing_authority',
+                               'native_revision_legacy_write_fence'
+                           );
+                        IF table_list IS NOT NULL THEN
+                            EXECUTE format('TRUNCATE TABLE %s RESTART IDENTITY CASCADE', table_list);
+                        END IF;
                     END
                     $cleanup$
                     """
+                )
+                username, _password = self.config.credentials.values()
+                await connection.execute(
+                    """
+                    DELETE FROM tokens
+                     WHERE user_id NOT IN (
+                         SELECT id FROM users WHERE username = $1
+                     )
+                    """,
+                    username,
+                )
+                await connection.execute(
+                    "DELETE FROM users WHERE username <> $1",
+                    username,
                 )
             finally:
                 await connection.close()
@@ -1814,6 +1854,18 @@ class E2ERuntime:
                         raise RuntimeError("object deletion returned errors")
         except Exception:
             raise ProvisioningFailure("MinIO in-place fixture reset failed") from None
+
+    def _process_identity_snapshot(self) -> dict[str, object]:
+        """Capture managed process identities that a fixture reset must preserve."""
+
+        return {
+            name: {
+                "pid": managed.process.pid,
+                "running": managed.process.returncode is None,
+            }
+            for name, managed in sorted(self._children.items())
+            if name in {"backend", "embed", "stdio"}
+        }
 
     def _ensure_minio_bucket(self) -> None:
         try:
@@ -3485,7 +3537,6 @@ class E2ERuntime:
             )
             self._fixture_private_marker = f"runtime-private-{uuid.uuid4().hex}"
             self._fixture_private_values = (username, password, self._fixture_private_marker)
-            system_admin_id = uuid.uuid4()
             connection = await asyncpg.connect(
                 host="127.0.0.1",
                 port=self.config.postgres_port,
@@ -3494,17 +3545,37 @@ class E2ERuntime:
                 database="akb",
             )
             try:
-                await connection.execute(
-                    """
-                    INSERT INTO users
-                        (id, username, email, password_hash, is_admin)
-                    VALUES ($1, $2, $3, $4, TRUE)
-                    """,
-                    system_admin_id,
+                system_admin_id = await connection.fetchval(
+                    "SELECT id FROM users WHERE username = $1",
                     username,
-                    f"runtime-{uuid.uuid4().hex}@invalid.akb",
-                    password_hash,
                 )
+                if system_admin_id is None:
+                    system_admin_id = uuid.uuid4()
+                    await connection.execute(
+                        """
+                        INSERT INTO users
+                            (id, username, email, password_hash, is_admin)
+                        VALUES ($1, $2, $3, $4, TRUE)
+                        """,
+                        system_admin_id,
+                        username,
+                        f"runtime-{uuid.uuid4().hex}@invalid.akb",
+                        password_hash,
+                    )
+                else:
+                    await connection.execute(
+                        """
+                        UPDATE users
+                           SET password_hash = $2,
+                               is_admin = TRUE,
+                               account_status = 'active',
+                               credential_change_required = FALSE,
+                               updated_at = NOW()
+                         WHERE id = $1
+                        """,
+                        system_admin_id,
+                        password_hash,
+                    )
                 if self.config.scenario == "app-installation-lifecycle":
                     await self._seed_app_installation_lifecycle(
                         connection,
@@ -3612,25 +3683,32 @@ class E2ERuntime:
             started = time.perf_counter()
             identity_before: dict[str, object] | None = None
             identity_after: dict[str, object] | None = None
+            process_before: dict[str, object] = {}
+            process_after: dict[str, object] = {}
             preserved = False
             self._lifecycle_generation += 1
             self._resetting = True
             try:
                 identity_before = await asyncio.to_thread(self._dependency_identity_snapshot)
+                process_before = self._process_identity_snapshot()
                 self._fixture_controls.clear()
-                await self._stop_named_process("stdio")
                 self._stdio_initialize_observed = False
                 self._stdio_tools_list_observed = False
                 self._stdio_read_call_observed = False
                 self._stdio_next_id = 2
-                await self._stop_named_process("backend")
-                await self._stop_named_process("embed")
                 await self._reset_postgres_in_place()
                 await asyncio.to_thread(self._clear_minio_objects)
                 if self.config.vault_dir.exists():
                     shutil.rmtree(self.config.vault_dir)
                 self.config.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
                 os.chmod(self.config.vault_dir, 0o700)
+                for directory in (
+                    self.config.vault_dir / "_worktrees",
+                    self.config.vault_dir / ".akb-write-locks",
+                    self.config.vault_dir / ".akb-create-locks",
+                ):
+                    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    os.chmod(directory, 0o700)
                 await self._wait_tcp("PostgreSQL", "127.0.0.1", self.config.postgres_port)
                 await self._wait_http(
                     "MinIO",
@@ -3638,13 +3716,12 @@ class E2ERuntime:
                     lambda status, _body: status == 200,
                 )
                 await asyncio.to_thread(self._ensure_minio_bucket)
-                await self._start_embed_stub()
-                await self._bootstrap_backend_and_seed()
-                if self.profile.needs_stdio:
-                    await self._start_stdio_proxy()
+                await self._seed_external_credential()
+                await self._mint_runtime_pat()
                 identity_after = await asyncio.to_thread(self._dependency_identity_snapshot)
-                if identity_before != identity_after:
-                    raise ProvisioningFailure("in-place fixture reset changed a dependency identity")
+                process_after = self._process_identity_snapshot()
+                if identity_before != identity_after or process_before != process_after:
+                    raise ProvisioningFailure("in-place fixture reset changed a runtime identity")
                 self._dependency_identity = identity_after
                 preserved = True
             finally:
@@ -3654,10 +3731,20 @@ class E2ERuntime:
                 self._dependency_reset_wall_seconds += elapsed
                 self._dependency_reset_evidence = {
                     "strategy": "in_place",
-                    "preserves": ["postgres_container", "minio_container", "compose_network", "compose_volumes"],
+                    "preserves": [
+                        "postgres_container",
+                        "minio_container",
+                        "compose_network",
+                        "compose_volumes",
+                        "backend_process",
+                        "embedding_process",
+                        "stdio_process",
+                    ],
                     "count": self._dependency_reset_count,
                     "wall_seconds": self._dependency_reset_wall_seconds,
                     "last_preserved": preserved,
+                    "process_identity_before": process_before,
+                    "process_identity_after": process_after,
                 }
                 if preserved and identity_before is not None and identity_after is not None:
                     self._dependency_reset_evidence["identity_before"] = identity_before
@@ -3966,6 +4053,173 @@ class E2ERuntime:
             await self.cleanup()
 
 
+@dataclasses.dataclass
+class BenchmarkCellProcess:
+    key: str
+    process: asyncio.subprocess.Process
+    descriptor: dict[str, object]
+
+
+class BenchmarkCellSupervisor:
+    """Run one isolated runtime per model/transport cell over shared code."""
+
+    def __init__(self, config: RuntimeConfig) -> None:
+        self.config = config
+        self._children: dict[str, BenchmarkCellProcess] = {}
+        self._stop_event = asyncio.Event()
+        self._cleaned = False
+        self._log_path = config.runtime_root / "logs" / "benchmark-cells.log"
+
+    def request_stop(self) -> None:
+        self._stop_event.set()
+
+    def _child_command(self, key: str, index: int, root: Path) -> list[str]:
+        offset = index * BENCHMARK_CELL_PORT_STRIDE
+        return [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "serve",
+            "--checkout",
+            str(self.config.checkout),
+            "--runtime-root",
+            str(root),
+            "--compose-file",
+            str(self.config.compose_file),
+            "--compose-project",
+            f"{self.config.compose_project}-{key.replace(':', '-')}",
+            "--app-port",
+            str(self.config.app_port + offset),
+            "--embed-port",
+            str(self.config.embed_port + offset),
+            "--fixture-port",
+            str(self.config.fixture_port + offset),
+            "--postgres-port",
+            str(self.config.postgres_port + offset),
+            "--minio-port",
+            str(self.config.minio_port + offset),
+            "--username-env",
+            self.config.credentials.username_env,
+            "--password-env",
+            self.config.credentials.password_env,
+            "--pat-env",
+            self.config.credentials.pat_env,
+            "--profile",
+            self.config.profile,
+            "--scenario",
+            self.config.scenario,
+        ]
+
+    async def _start_cell(self, key: str, index: int) -> BenchmarkCellProcess:
+        root = self.config.runtime_root / "cells" / key.replace(":", "-")
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(root, 0o700)
+        self._log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with self._log_path.open("ab", buffering=0) as handle:
+            process = await asyncio.create_subprocess_exec(
+                *self._child_command(key, index, root),
+                cwd=str(root),
+                env={**os.environ, "AKB_BENCHMARK_CELL": "1"},
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=handle,
+                start_new_session=True,
+            )
+        child = BenchmarkCellProcess(key, process, {})
+        self._children[key] = child
+        if process.stdout is None:
+            await terminate_process(process)
+            self._children.pop(key, None)
+            raise ProvisioningFailure(f"benchmark cell {key} did not expose a descriptor stream")
+        try:
+            line = await asyncio.wait_for(process.stdout.readline(), timeout=self.config.timeout_seconds)
+            descriptor = json.loads(line.decode("utf-8"))
+        except (asyncio.TimeoutError, UnicodeDecodeError, json.JSONDecodeError):
+            await terminate_process(process)
+            self._children.pop(key, None)
+            raise ProvisioningFailure(f"benchmark cell {key} did not become ready") from None
+        if not isinstance(descriptor, dict) or descriptor.get("status") != "ready":
+            await terminate_process(process)
+            self._children.pop(key, None)
+            raise ProvisioningFailure(f"benchmark cell {key} returned an invalid descriptor")
+        child.descriptor = descriptor
+        return child
+
+    async def _start_cells(self) -> list[BenchmarkCellProcess]:
+        tasks = [
+            asyncio.create_task(self._start_cell(key, index), name=f"start-{key}")
+            for index, key in enumerate(BENCHMARK_CELL_KEYS)
+        ]
+        try:
+            return await asyncio.gather(*tasks)
+        except Exception:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await self.cleanup()
+            raise
+
+    def descriptor(self, cells: list[BenchmarkCellProcess]) -> dict[str, object]:
+        first = json.loads(json.dumps(cells[0].descriptor))
+        first["benchmark_cells"] = {
+            child.key: child.descriptor
+            for child in sorted(cells, key=lambda item: item.key)
+        }
+        evidence = first.get("evidence")
+        if isinstance(evidence, dict):
+            evidence["benchmark_cells"] = {
+                child.key: child.descriptor.get("evidence", {})
+                for child in sorted(cells, key=lambda item: item.key)
+            }
+        return first
+
+    async def run(self) -> int:
+        try:
+            if self.config.frontend_enabled:
+                raise BlockedRuntimeConfig("benchmark cell runtime does not support a shared frontend")
+            prepare_private_runtime_root(self.config.runtime_root)
+            cells = await self._start_cells()
+            print(json.dumps(self.descriptor(cells), separators=(",", ":"), ensure_ascii=False), flush=True)
+            stop_task = asyncio.create_task(self._stop_event.wait(), name="benchmark-stop")
+            wait_tasks = {
+                key: asyncio.create_task(child.process.wait(), name=f"benchmark-{key}")
+                for key, child in self._children.items()
+            }
+            try:
+                done, _pending = await asyncio.wait(
+                    [stop_task, *wait_tasks.values()],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if stop_task in done or self._stop_event.is_set():
+                    return 0
+                return 1
+            finally:
+                stop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await stop_task
+                for task in wait_tasks.values():
+                    if not task.done():
+                        task.cancel()
+                for task in wait_tasks.values():
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+        except ProvisioningFailure as exc:
+            LOGGER.error("benchmark cell runtime failed: %s", str(exc))
+            return 1
+        finally:
+            await self.cleanup()
+
+    async def cleanup(self) -> None:
+        if self._cleaned:
+            return
+        self._cleaned = True
+        await asyncio.gather(
+            *(terminate_process(child.process) for child in self._children.values()),
+            return_exceptions=True,
+        )
+        self._children.clear()
+
+
 def _configure_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -3990,6 +4244,8 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
     parser.add_argument("--frontend-port", type=int, default=DEFAULT_FRONTEND_PORT)
     parser.add_argument("--embed-port", type=int, default=DEFAULT_EMBED_PORT)
     parser.add_argument("--fixture-port", type=int, default=DEFAULT_FIXTURE_PORT)
+    parser.add_argument("--postgres-port", type=int, default=DEFAULT_POSTGRES_PORT)
+    parser.add_argument("--minio-port", type=int, default=DEFAULT_MINIO_PORT)
     parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--username-env", default=DEFAULT_USERNAME_ENV)
     parser.add_argument("--password-env", default=DEFAULT_PASSWORD_ENV)
@@ -4048,6 +4304,8 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
         frontend_port=args.frontend_port,
         embed_port=args.embed_port,
         fixture_port=args.fixture_port,
+        postgres_port=args.postgres_port,
+        minio_port=args.minio_port,
         timeout_seconds=args.timeout_seconds,
         credentials=CredentialNames(args.username_env, args.password_env, args.pat_env),
         scenario=args.scenario,
@@ -4058,7 +4316,16 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
 
 
 async def _async_main(config: RuntimeConfig) -> int:
-    runtime = E2ERuntime(config)
+    runtime: E2ERuntime | BenchmarkCellSupervisor
+    if (
+        config.mode == "serve"
+        and config.profile == BENCHMARK_PROFILE
+        and config.scenario == BENCHMARK_SCENARIO
+        and os.environ.get("AKB_BENCHMARK_CELL") != "1"
+    ):
+        runtime = BenchmarkCellSupervisor(config)
+    else:
+        runtime = E2ERuntime(config)
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):

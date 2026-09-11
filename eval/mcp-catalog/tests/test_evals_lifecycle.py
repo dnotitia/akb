@@ -175,7 +175,7 @@ async def test_pydantic_evals_repeat_uses_case_lifecycle_for_reset_and_report() 
 
     assert len(report.cases) == manifest.repeats
     assert not report.failures
-    assert fixture.reset_calls == manifest.repeats * 2
+    assert fixture.reset_calls == manifest.repeats
     assert fixture.observe_calls == manifest.repeats * 2
     assert report.cases[0].assertions["success"].value is True
     assert report.analyses
@@ -318,12 +318,12 @@ async def test_failed_reset_preserves_readiness_stage_and_blocks_provider() -> N
     assert report.failures
     assert failures and isinstance(failures[0], RuntimeContractError)
     assert failures[0].stage == "fixture_readiness"
-    assert cleanup_errors and cleanup_errors[0].stage == "fixture_readiness"
+    assert not cleanup_errors
     assert executor.provider_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_teardown_reset_blocks_the_next_trial() -> None:
+async def test_setup_reset_blocks_the_next_trial() -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "destructive-confirm-a")
     fixture = _FailsBeforeNextTrialFixture()
@@ -336,20 +336,20 @@ async def test_teardown_reset_blocks_the_next_trial() -> None:
     async def checkpoint_sink(_outcome: TrialOutcome, status: str) -> None:
         checkpoint_statuses.append(status)
 
-    with pytest.raises(RuntimeContractError, match="before next trial") as raised:
-        await evaluate_dataset(
-            [task],
-            manifest=manifest,
-            executor=executor,
-            fixture=fixture,
-            failure_sink=failures,
-            checkpoint_sink=checkpoint_sink,
-        )
+    report = await evaluate_dataset(
+        [task],
+        manifest=manifest,
+        executor=executor,
+        fixture=fixture,
+        failure_sink=failures,
+        checkpoint_sink=checkpoint_sink,
+    )
 
-    assert raised.value.stage == "fixture_readiness"
-    assert failures and failures[0] is raised.value
+    assert report.failures
+    assert failures and isinstance(failures[0], RuntimeContractError)
+    assert failures[0].stage == "fixture_readiness"
     assert executor.provider_calls == 1
-    assert checkpoint_statuses == ["incomplete"]
+    assert checkpoint_statuses == ["failed"]
 
 
 @pytest.mark.asyncio
