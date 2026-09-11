@@ -135,6 +135,9 @@ node_install_command() {   # $1 = project directory
     .|frontend|packages/markdown-editor)
       printf '(cd %s && pnpm install --frozen-lockfile)' "$1"
       ;;
+    packages/akb-client)
+      printf '(cd %s && pnpm install --frozen-lockfile --ignore-workspace)' "$1"
+      ;;
     *)
       if [ -f "$1/pnpm-lock.yaml" ]; then
         printf '(cd %s && pnpm install --frozen-lockfile)' "$1"

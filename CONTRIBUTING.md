@@ -176,7 +176,7 @@ some of them is the common mistake:
 
 ```bash
 (cd frontend && pnpm install --frozen-lockfile)
-(cd packages/akb-client && pnpm install --frozen-lockfile)
+(cd packages/akb-client && pnpm install --frozen-lockfile --ignore-workspace)
 (cd packages/akb-mcp-client && npm ci)
 ```
 

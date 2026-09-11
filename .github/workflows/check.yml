@@ -51,10 +51,9 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Install @akb/client deps
         working-directory: packages/akb-client
-        # Its own pnpm store: typescript + vitest. No postinstall build
-        # scripts, so a plain frozen install is enough for `pnpm run build`
-        # (tsc emit) and `pnpm exec vitest run` in scripts/check.sh.
-        run: pnpm install --frozen-lockfile
+        # It has its own lockfile but lives below the root workspace; ignore
+        # the parent workspace so this installs @akb/client's own dependencies.
+        run: pnpm install --frozen-lockfile --ignore-workspace
       # ── Single entry point so CI and local pre-commit stay in sync ──
       - name: Run scripts/check.sh
         run: bash scripts/check.sh
