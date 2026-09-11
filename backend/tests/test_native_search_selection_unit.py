@@ -451,7 +451,7 @@ async def test_native_hydration_verification_and_decode_run_off_event_loop(monke
         return original_verify(candidate)
 
     monkeypatch.setattr(store, "_verify_row", staticmethod(guarded_verify))
-    results = await SearchService()._hydrate_hits(
+    results, dropped = await SearchService()._hydrate_hits(
         [
             VectorHit(
                 chunk_id=str(chunk_id),
@@ -465,6 +465,7 @@ async def test_native_hydration_verification_and_decode_run_off_event_loop(monke
     )
 
     assert results[0].title == "Hydrated"
+    assert dropped == {}
     assert verify_threads
 
 
@@ -516,7 +517,7 @@ async def test_native_file_hydration_preserves_public_file_identity(monkeypatch)
         return original_verify(candidate)
 
     monkeypatch.setattr(M1PgBodyStore, "_verify_row", staticmethod(guarded_verify))
-    results = await SearchService()._hydrate_hits(
+    results, dropped = await SearchService()._hydrate_hits(
         [
             VectorHit(
                 chunk_id=str(chunk_id),
@@ -529,6 +530,7 @@ async def test_native_file_hydration_preserves_public_file_identity(monkeypatch)
         ]
     )
 
+    assert dropped == {}
     assert len(results) == 1
     assert results[0].source_type == "file"
     assert results[0].uri == f"akb://measure/coll/files/file/{resource_id}"

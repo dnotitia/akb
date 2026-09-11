@@ -382,6 +382,7 @@ class SeahorseCloudStore:
         limit: int,
         prefetch_per_leg: int,
         vault_ids: list[str] | None = None,
+        source_types: list[str] | None = None,
     ) -> list[VectorHit]:
         # Seahorse runs its own RRF prefetch internally; the caller's
         # prefetch_per_leg hint isn't surfaced as an API knob.
@@ -433,8 +434,11 @@ class SeahorseCloudStore:
             body["fusion"] = {"type": "rrf", "parameters": {"k": RRF_K}}
         # ACL pre-filter (issue #189 Phase 2): exactly one of vault_ids /
         # source_ids; vault_filter_sql asserts that + UUID-validates each id.
+        # source_types (workbench #1069) ANDs a source_type predicate onto the
+        # same filter — the column is stored on every point (COL_SOURCE_TYPE).
         acl = _vault_filter_sql(
             vault_ids, source_ids, vault_col=COL_VAULT_ID, source_col=COL_SOURCE_ID,
+            source_types=source_types, source_type_col=COL_SOURCE_TYPE,
         )
         if acl is not None:
             body["filter"] = acl

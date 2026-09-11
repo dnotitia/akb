@@ -329,7 +329,9 @@ async def t14_nonexistent_source_ids():
         chunk_id="fake", source_type="document", source_id=str(uuid.uuid4()),
         section_path="", content="x", score=0.5,
     )
-    results = await svc._hydrate_hits([fake])
+    results, dropped = await svc._hydrate_hits([fake])
+    if dropped.get("hydration_miss") != 1:
+        fail(f"hydrator did not count the bogus source_id as hydration_miss: {dropped}")
     if results:
         fail(f"hydrator returned {len(results)} results for bogus source_id")
     else:

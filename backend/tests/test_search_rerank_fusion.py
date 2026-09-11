@@ -160,9 +160,12 @@ def test_vault_path_eligible(monkeypatch):
     assert call() is False
 
 
-def test_native_document_search_disables_vault_only_vector_filter(monkeypatch):
-    """Without a source_type vector predicate, legacy points must not consume
-    the native arm's top-K; native mode therefore uses exact source ids."""
+def test_native_document_search_uses_vault_path_with_source_type_predicate(monkeypatch):
+    """With the driver-side source_type predicate (workbench #1069), the native
+    arm takes the vault path too: stale legacy points are excluded driver-side
+    before the top-K cut, so they can no longer suppress valid native hits.
+    `source_types` is what carries the active-arm constraint (asserted in
+    test_run_vector_search_forwards_source_types_to_driver)."""
     from app.config import settings
     from app.services import search_service
 
@@ -170,9 +173,9 @@ def test_native_document_search_disables_vault_only_vector_filter(monkeypatch):
         vault_filter_supported = True
 
     monkeypatch.setattr(settings, "vault_filter_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "document_revision_backend", "native_ledger_m1")
-    monkeypatch.setattr(settings, "native_revision_m1_measurement_only", True)
-    monkeypatch.setattr(settings, "db_name", "akb_revision_m1_measurement")
+    monkeypatch.setattr(settings, "document_revision_backend", "postgres_native")
+    monkeypatch.setattr(settings, "native_revision_m1_measurement_only", False)
+    monkeypatch.setattr(settings, "db_name", "akb")
     monkeypatch.setattr(search_service, "get_vector_store", lambda: _Capable())
 
     assert vault_path_eligible(
@@ -180,7 +183,7 @@ def test_native_document_search_disables_vault_only_vector_filter(monkeypatch):
         doc_type=None,
         tags=None,
         source_uris=None,
-    ) is False
+    ) is True
 
 
 @pytest.mark.asyncio
@@ -319,3 +322,40 @@ async def test_search_requires_vault_or_user_id():
         pytest.fail("Should not raise ValidationError when vault is set")
     except Exception:
         pass  # downstream (DB / embedding) is fine to fail; we only assert the guard
+
+
+@pytest.mark.asyncio
+async def test_run_vector_search_forwards_source_types_to_driver(monkeypatch):
+    """`source_types` (workbench #1069) threads into the driver's hybrid_search
+    so stale points from the non-active Document arm are excluded driver-side
+    before the top-K cut. None (legacy callers) stays None = no constraint."""
+    import app.services.search_service as ss
+
+    svc = ss.SearchService()
+    captured = {}
+
+    async def encode_ok(_q):
+        return [1], [1.0]
+
+    class _Store:
+        async def hybrid_search(self, **kw):
+            captured.update(kw)
+            return []
+
+    monkeypatch.setattr(ss.sparse_encoder, "encode_query", encode_ok)
+    monkeypatch.setattr(ss, "get_vector_store", lambda: _Store())
+
+    await svc._run_vector_search(
+        query_text="q", query_embedding=[0.1, 0.2],
+        candidate_source_ids=["s1"], source_types=["native_document", "table"],
+        limit=10,
+    )
+    assert captured["source_types"] == ["native_document", "table"]
+    assert captured["source_ids"] == ["s1"]
+
+    captured.clear()
+    await svc._run_vector_search(
+        query_text="q", query_embedding=[0.1, 0.2],
+        candidate_source_ids=["s1"], limit=10,
+    )
+    assert captured["source_types"] is None

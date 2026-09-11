@@ -7,6 +7,24 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Native search takes the vault path (bounded-corpus fix, part 1)
+
+`hybrid_search` accepts an orthogonal `source_types` pre-filter on all five
+vector drivers (pgvector, qdrant, seahorse×3): it ANDs with whichever ACL
+filter (`vault_ids` / `source_ids`) is present and excludes stale points from
+the non-active Document arm driver-side, before the top-K cut. The native arm
+is therefore eligible for the vault-granularity path (`vault_path_eligible`),
+so vault-scoped native search no longer enumerates candidate ids through the
+10,000-resource / 128MiB bounded-corpus gate — the gate stays in place for the
+id-enumeration path only. `_hydrate_hits` keeps its arm-mismatch skip as
+defense in depth.
+
+Hydration drops are now counted by cause (`stale_arm`,
+`unknown_source_type`, `stale_native_file_path`, `hydration_miss`,
+`unuriable_source_type`) and surfaced as a `hydration_dropped:...`
+degradation reason, so `total_matches > 0, returned == 0` can never again
+read as a silent zero-match.
+
 ### Added a personal notification inbox and document watches
 
 Human browser sessions can view effective Vault-access changes and explicitly

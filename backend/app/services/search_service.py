@@ -368,15 +368,17 @@ def vault_path_eligible(
     Phase 2) instead of enumerating source ids. Requires: the flag on, a driver
     whose `vault_filter_supported` is True (it stores vault_id and filters on it),
     and NO doc-level narrowing filter (those still need per-resource source_ids).
-    When False, the existing source_ids path runs unchanged."""
+    When False, the existing source_ids path runs unchanged.
+
+    The vector-store vault filter now ALSO constrains source_type (workbench
+    #1069: the caller passes `source_types` alongside `vault_ids`), so the
+    native arm is eligible too — stale legacy Document points are excluded
+    driver-side before the top-K is cut and can no longer suppress valid
+    native hits. `_hydrate_hits` keeps its arm-mismatch skip as defense in
+    depth."""
     return (
         settings.vault_filter_enabled
         and supports_vault_filter(get_vector_store())
-        # The vector-store vault filter cannot yet constrain source_type.
-        # Under the native arm, stale legacy Document points could consume the
-        # complete top-K before hydration drops them, suppressing valid native
-        # hits. Use the source-id path until the driver accepts that predicate.
-        and _configured_document_source_type() == LEGACY_DOCUMENT_SOURCE
         and not (collection or doc_type or tags or source_uris)
     )
 
@@ -826,11 +828,17 @@ class SearchService:
 
         # Hybrid (dense + BM25 sparse) via the configured driver. Returns [] on any vector-store
         # failure — PG is the source of truth, the index is rebuildable.
+        #
+        # source_types (workbench #1069): constrain the driver-side pre-filter
+        # to the active Document arm (+ table/file, which have no second arm)
+        # so stale points from the non-active arm can never consume the top-K.
+        # `_hydrate_hits` keeps its arm-mismatch skip as defense in depth.
         hits, degraded_reason = await self._run_vector_search(
             query_text=query,
             query_embedding=query_embedding,
             candidate_source_ids=candidate_source_ids,
             candidate_vault_ids=candidate_vault_ids,
+            source_types=[document_source, "table", "file", SOURCE_NATIVE_FILE],
             limit=target_unique * 3,
         )
 
@@ -879,7 +887,16 @@ class SearchService:
         # Post-search metadata join — one fetch per source_type, merged back
         # in the driver-returned order. Keeps document results fully
         # backward-compatible (doc_id == source_id) while adding table/file.
-        results = await self._hydrate_hits(unique_hits)
+        # `dropped` counts hits lost between retrieval and hydration by cause
+        # (workbench #1069 G3): any non-empty drop set marks the response
+        # degraded so `total_matches > 0, returned == 0` can never again read
+        # as a silent zero-match.
+        results, dropped = await self._hydrate_hits(unique_hits)
+        hydrate_reason = (
+            f"hydration_dropped:{','.join(f'{k}={v}' for k, v in sorted(dropped.items()))}" if dropped else None
+        )
+        if hydrate_reason is not None and degraded_reason is None:
+            degraded_reason = hydrate_reason
         returned = len(results)
         hint = (
             "Prefetch pool was capped; the corpus may contain more matches than reported. "
@@ -1005,17 +1022,29 @@ class SearchService:
 
         return doc_ids, table_ids, file_ids
 
-    async def _hydrate_hits(self, hits: list) -> list[SearchResult]:
+    async def _hydrate_hits(self, hits: list) -> tuple[list[SearchResult], dict[str, int]]:
         from app.services.index_service import SOURCE_TYPES
         by_type: dict[str, list[str]] = {t: [] for t in SOURCE_TYPES}
         document_source = _configured_document_source_type()
         unknown_types: set[str] = set()
+        # Hydration-drop accounting (workbench #1069 G3): every hit that enters
+        # this method but leaves as no result is counted by cause, so a
+        # `total_matches > 0, returned == 0` response can say WHERE the hits
+        # went instead of reading as a silent zero-match. Keys are stable
+        # diagnostic strings (not user-facing copy).
+        dropped: dict[str, int] = {}
         for h in hits:
             if h.source_type in {LEGACY_DOCUMENT_SOURCE, NATIVE_DOCUMENT_SOURCE} and h.source_type != document_source:
                 # A selected backend has exactly one Document authority. Old
-                # vector points from the other arm are never hydrated.
+                # vector points from the other arm are never hydrated. With the
+                # driver-side `source_types` predicate (workbench #1069) these
+                # should no longer arrive; the skip stays as defense in depth
+                # and the counter proves it (stays zero when the predicate
+                # works, goes non-zero if a driver ignores it).
+                dropped["stale_arm"] = dropped.get("stale_arm", 0) + 1
                 continue
             if h.source_type not in by_type:
+                dropped["unknown_source_type"] = dropped.get("unknown_source_type", 0) + 1
                 unknown_types.add(h.source_type)
                 continue
             if h.source_id:
@@ -1212,6 +1241,7 @@ class SearchService:
                             "hydrate: stale native File path skipped for %s",
                             r["resource_id"],
                         )
+                        dropped["stale_native_file_path"] = dropped.get("stale_native_file_path", 0) + 1
                         continue
                     meta[(SOURCE_NATIVE_FILE, str(r["resource_id"]))] = {
                         "vault": r["vault_name"],
@@ -1350,6 +1380,12 @@ class SearchService:
             key = (h.source_type, h.source_id)
             m = meta.get(key)
             if not m:
+                # The hit survived retrieval but its source row is gone or stale
+                # (deleted between retrieval and hydration, or a derived chunk
+                # whose head moved). Count it — this is the workbench #1069
+                # `total_matches=30, returned=0` shape, and it must never again
+                # read as a silent zero-match.
+                dropped["hydration_miss"] = dropped.get("hydration_miss", 0) + 1
                 continue
             # Build the canonical 0.3.0 URI per resource type. Doc URIs
             # derive the collection from `path` automatically (path
@@ -1361,6 +1397,7 @@ class SearchService:
             elif h.source_type in {"file", SOURCE_NATIVE_FILE}:
                 uri = file_uri(m["vault"], h.source_id, collection=m.get("collection"))
             else:
+                dropped["unuriable_source_type"] = dropped.get("unuriable_source_type", 0) + 1
                 continue
             results.append(
                 SearchResult(
@@ -1393,7 +1430,9 @@ class SearchService:
                     chunk_index=_chunk_index_of(h, chunk_indexes),
                 )
             )
-        return results
+        if dropped:
+            logger.warning("hydrate: dropped %d hit(s): %s", sum(dropped.values()), dropped)
+        return results, dropped
 
     async def _apply_rerank(self, query: str, hits: list) -> list:
         """Rescore `hits` with the configured reranker. On any rerank
@@ -1419,6 +1458,7 @@ class SearchService:
         query_embedding: list[float] | None,
         candidate_source_ids: list[str] | None,
         candidate_vault_ids: list[str] | None = None,
+        source_types: list[str] | None = None,
         limit: int,
     ) -> tuple[list, str | None]:
         """Hybrid search over the vector store.
@@ -1470,6 +1510,7 @@ class SearchService:
                 query_sparse_values=sparse_vals,
                 source_ids=candidate_source_ids,
                 vault_ids=candidate_vault_ids,
+                source_types=source_types,
                 limit=limit,
                 prefetch_per_leg=prefetch_per_leg,
             )

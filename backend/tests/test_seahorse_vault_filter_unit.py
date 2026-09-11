@@ -183,3 +183,68 @@ async def test_cloud_hybrid_search_filter_uses_vault_col_override():
         source_ids=None, vault_ids=[_UUID], limit=5, prefetch_per_leg=10,
     )
     assert s._client.calls[-1]["json"]["filter"] == f"{COL_VAULT_ID} IN ('{_UUID}')"
+
+
+# ── workbench #1069: source_types ANDs onto the Coral WHERE clause ──
+
+def test_vault_filter_sql_source_types_ands_onto_either_branch():
+    assert vault_filter_sql([_UUID], None, source_types=["native_document"]) == (
+        f"vault_id IN ('{_UUID}') AND source_type IN ('native_document')"
+    )
+    assert vault_filter_sql(None, [_UUID], source_types=["document", "table"]) == (
+        f"source_id IN ('{_UUID}') AND source_type IN ('document', 'table')"
+    )
+    # No id filter + source_types alone still constrains.
+    assert vault_filter_sql(None, None, source_types=["native_document"]) == (
+        "source_type IN ('native_document')"
+    )
+    # Legacy default unchanged.
+    assert vault_filter_sql(None, None) is None
+
+
+def test_vault_filter_sql_rejects_unknown_source_type():
+    with pytest.raises(ValueError, match="unknown source_type"):
+        vault_filter_sql([_UUID], None, source_types=["x'; DROP TABLE chunks; --"])
+
+
+@pytest.mark.asyncio
+async def test_db_hybrid_search_source_types_reach_filter(monkeypatch):
+    """source_types must reach the Coral request `filter` ANDed with the ACL
+    branch — otherwise stale legacy points consume the top-K (workbench #1069)."""
+    from unittest.mock import AsyncMock
+    monkeypatch.setattr("app.services.sparse_encoder.load_stats", AsyncMock(return_value={}))
+
+    s = SeahorseDbStore(coordinator_url="http://x", table_name="chunks", dense_dim=4)
+    s._ensured_collection = True
+    s._client = _FakeHttp(_Resp(200, {"data": {"data": [[]]}}))
+    await s.hybrid_search(
+        query_text="q", query_dense=_DENSE, query_sparse_indices=[], query_sparse_values=[],
+        source_ids=None, vault_ids=[_UUID], source_types=["native_document", "table", "file", "native_file"],
+        limit=5, prefetch_per_leg=10,
+    )
+    assert s._client.calls[-1]["json"]["filter"] == (
+        f"vault_id IN ('{_UUID}') AND source_type IN "
+        "('native_document', 'table', 'file', 'native_file')"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cloud_hybrid_search_source_types_use_source_type_col():
+    """seahorse_cloud passes its own column constants — the source_type column
+    override must be the cloud `source_type` key, not a default-literal drift."""
+    from app.services.vector_store.seahorse_cloud import COL_SOURCE_TYPE
+    s = SeahorseCloudStore(
+        management_url="http://x", token="t", tenant_uuid="ten", table_name="chunks",
+        dense_dim=4,
+    )
+    s._ensured = True
+    s._table_host = "http://host"
+    s._client = _FakeHttp(_Resp(200, {"data": {"data": [[]]}}))
+    await s.hybrid_search(
+        query_text="q", query_dense=_DENSE, query_sparse_indices=[], query_sparse_values=[],
+        source_ids=None, vault_ids=[_UUID], source_types=["native_document"],
+        limit=5, prefetch_per_leg=10,
+    )
+    assert s._client.calls[-1]["json"]["filter"] == (
+        f"{COL_VAULT_ID} IN ('{_UUID}') AND {COL_SOURCE_TYPE} IN ('native_document')"
+    )
