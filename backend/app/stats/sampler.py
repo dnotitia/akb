@@ -35,7 +35,7 @@ from typing import Any
 
 from app.config import settings
 from app.db.postgres import get_pool
-from app.services import tool_usage
+from app.services import document_counters, tool_usage
 from app.services._backfill import BackfillRunner
 
 logger = logging.getLogger("akb.stats_sampler")
@@ -333,12 +333,20 @@ async def _read_corpus(conn) -> dict[str, Any]:
     several statements later (which `distilled_doc_count` will require) cannot
     quietly reintroduce a torn read where a subset count exceeds its superset.
     """
+    # akb#525: documents are counted from whichever authority holds them.
+    # On `postgres_native` the legacy catalog stops growing at the cutover, so
+    # a plain `COUNT(*) FROM documents` reports the pre-cutover total forever
+    # — a believable, motionless number in an operator inventory. The
+    # subquery keeps both arms inside the one snapshot below; archived
+    # documents stay counted on both, because `lifecycle` records deletion,
+    # not archival.
+    doc_count_sql = document_counters.instance_document_count_sql()
     async with conn.transaction(isolation="repeatable_read", readonly=True):
         row = await conn.fetchrow(
-            """
+            f"""
             SELECT (SELECT COUNT(*) FROM vaults)      AS vault_count,
                    (SELECT COUNT(*) FROM collections) AS collection_count,
-                   (SELECT COUNT(*) FROM documents)   AS doc_count,
+                   ({doc_count_sql})                  AS doc_count,
                    -- Chunks that are actually present in the vector index.
                    -- `chunks` is the source of truth and always holds more
                    -- during indexing; the difference is the backlog, which is

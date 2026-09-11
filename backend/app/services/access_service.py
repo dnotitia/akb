@@ -35,6 +35,7 @@ from app.services.access_contributions import (
 )
 from app.services.account_markers import is_retired_recovery_admin_password
 from app.services.account_service import presented_issuer_or_none
+from app.services import document_counters
 from app.services.edge_boundary import edge_scope_sql, vault_uri_prefix
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import vault_uri
@@ -909,41 +910,6 @@ async def list_accessible_vaults(user_id: str) -> list[dict]:
 
 # ── Vault info ───────────────────────────────────────────────
 
-# Native document counters (akb#525): on `postgres_native` the `documents`
-# catalog table is never written by the native document path, so the legacy
-# `COUNT(*) FROM documents` / latest-`updated_at` queries under-report from
-# the cutover onward (fresh vaults read 0/NULL; old vaults freeze at their
-# pre-cutover numbers). Count live native document resources instead, and
-# take last activity from the newest native revision touching them.
-_NATIVE_DOC_COUNT_SQL = (
-    "SELECT COUNT(*) FROM native_resources WHERE namespace_id = $1 AND surface = 'document' AND lifecycle = 'live'"
-)
-_NATIVE_DOC_LAST_SQL = (
-    "SELECT nr.occurred_at AS updated_at, nr.actor AS created_by "
-    "FROM native_revisions nr "
-    "JOIN native_resources r ON r.resource_id = nr.resource_id "
-    "WHERE r.namespace_id = $1 AND r.surface = 'document' AND r.lifecycle = 'live' "
-    "ORDER BY nr.occurred_at DESC LIMIT 1"
-)
-
-
-def _native_document_source_selected() -> bool:
-    """True when native documents are the authority (akb#525).
-
-    Local import avoids a module cycle: search_service owns the selector and
-    does not import this module, so importing it here is one-directional.
-    """
-    from app.services.search_service import _configured_document_source_type
-
-    try:
-        from app.services.search_service import NATIVE_DOCUMENT_SOURCE
-
-        return _configured_document_source_type() == NATIVE_DOCUMENT_SOURCE
-    except RuntimeError:
-        # Partial native guard (measurement-only mismatch etc.): fail closed
-        # to the legacy catalog rather than raising out of a read path.
-        return False
-
 async def get_vault_info(user_id: str, vault_name: str) -> dict:
     """Get detailed vault info. Requires reader access. Includes the caller's
     effective role and the lifecycle/public-access/external-mirror flags the
@@ -969,17 +935,12 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
     vid = vault["id"]
     # akb#525: document counters follow the active authority. Legacy `documents`
     # rows freeze at cutover (native writes never touch that table), so on
-    # `postgres_native` count live native resources and take last activity
-    # from native revisions instead. Tables/files/collections/edges are
+    # `postgres_native` both queries read the native ledger instead. The SQL
+    # lives in `document_counters` with every other counter that had to make
+    # the same choice. Tables/files/collections/edges are
     # authority-independent and keep their existing queries.
-    native_docs = _native_document_source_selected()
-    doc_count_sql = _NATIVE_DOC_COUNT_SQL if native_docs else "SELECT COUNT(*) FROM documents WHERE vault_id = $1"
-    doc_last_sql = (
-        _NATIVE_DOC_LAST_SQL
-        if native_docs
-        else "SELECT updated_at, created_by FROM documents WHERE vault_id = $1 "
-        "ORDER BY updated_at DESC LIMIT 1"
-    )
+    doc_count_sql = document_counters.vault_document_count_sql()
+    doc_last_sql = document_counters.vault_last_activity_sql()
     if (
         role_source in ("system_admin", "write_policy_admin_bypass")
         and vault["owner_id"] != uuid.UUID(user_id)

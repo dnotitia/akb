@@ -7,6 +7,46 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Every document counter follows the active authority (akb#525)
+
+`GET /vaults/{vault}/info` learned to read the native ledger on
+`postgres_native`, but it was not the only counter answering from a table the
+native write path never touches, and the other two do not read `documents` at
+all — a grep for the query in the issue does not find them.
+
+`akb_browse` reports each collection's `doc_count` and `last_updated` from the
+denormalised `collections` columns, which only `DocumentRepository.increment_count`
+/ `decrement_count` bump — legacy-write-path-only. On a native installation the
+browse payload therefore carried a frozen count directly above the documents
+contradicting it. Measured on one installation: 25 of 10,344 collections already
+disagreed with the live ledger — 16 reporting documents they no longer hold, one
+reporting zero while holding documents.
+
+The operator corpus inventory (`app/stats`) counted `documents` across the whole
+installation, so it reported the pre-cutover total permanently. Same
+installation: 136,183 catalog rows against 136,188 live native documents, the
+gap widening with every write.
+
+Both now read the authority that holds the documents, alongside the vault-info
+counters, through one `document_counters` module rather than three copies of the
+same branch. The legacy arm is unchanged on all three, and pays no query at all
+— the authority is resolved before the pool is touched. Browsing into a subtree
+scopes the recount to that subtree, since only its collections are rendered
+(unscoped on the 50,850-document vault: 118 ms).
+
+Vault last activity also stops sorting `native_revisions.occurred_at`, which made
+the planner scan the entire append-only revision ledger — every vault's history,
+not the one being asked about. It orders the vault's own resources instead and
+reads the actor off the head revision, which `set_head` keeps in step by writing
+`updated_at` and `head_revision_id` in one statement (verified: 136,188 of
+136,188 live document resources had a head whose `occurred_at` equalled
+`updated_at` and was that resource's newest revision). For a 50,850-document
+vault: 93.7 ms to 60.9 ms, and no longer growing with unrelated vaults' history.
+
+Counting is unchanged in meaning on both arms: archived documents still count
+(native `lifecycle` records deletion, not archival), and a collection's count is
+still its direct children.
+
 ### Default archive scope no longer disqualifies the vault path (akb#530)
 
 `archive_scope` defaults to `unarchived`, and the vault-path gate demanded
