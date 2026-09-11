@@ -37,6 +37,13 @@ class M1ReferencePayloadStore:
 
     selected_placement = "m1-reference-payload-v1"
     verification_profile = "sha256-size-utf8-v1"
+    # Write-path byte cap (workbench #1069, part 3): the same 10MiB the
+    # pg-bodystore placement enforces (`M1_PG_TEXT_MAX_BYTES`). Without a cap
+    # here, an unbounded body can enter the corpus and every read path —
+    # candidate filtering, hydration, grep — must assume the unbounded case.
+    # Larger content belongs in File storage (S3/CAS + projection), not in a
+    # Document body row. Raised as ValidationError to match the sibling store.
+    max_text_bytes = 10 * 1024 * 1024
 
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
@@ -49,11 +56,19 @@ class M1ReferencePayloadStore:
         expected_size: int | None = None,
     ) -> tuple[bytes, str]:
         if isinstance(payload, str):
+            if len(payload.encode("utf-8")) > M1ReferencePayloadStore.max_text_bytes:
+                raise ValidationError(
+                    "Reference text payload exceeds the 10 MiB limit; store larger content as a File, not a Document body"
+                )
             canonical = payload.encode("utf-8")
         elif isinstance(payload, bytes):
             canonical = payload
         else:
             raise ValidationError("Reference payload must be str or bytes")
+        if len(canonical) > M1ReferencePayloadStore.max_text_bytes:
+            raise ValidationError(
+                "Reference text payload exceeds the 10 MiB limit; store larger content as a File, not a Document body"
+            )
         try:
             canonical.decode("utf-8", errors="strict")
         except UnicodeDecodeError as exc:

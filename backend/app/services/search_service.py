@@ -48,6 +48,9 @@ NATIVE_DOCUMENT_SOURCE = "native_document"
 NATIVE_MEASUREMENT_DATABASE = "akb_revision_m1_measurement"
 NATIVE_SEARCH_MAX_CANDIDATE_RESOURCES = 10_000
 NATIVE_SEARCH_MAX_BODY_BYTES = 128 * 1024 * 1024
+# Legacy alias for the caller-supplied `source_uris` scope cap. The live limit
+# is `settings.search_max_source_uris` (configurable, documented there); this
+# constant stays so older imports keep resolving, but nothing reads it anymore.
 NATIVE_SEARCH_MAX_SOURCE_URIS = 200
 # Frontmatter slice for candidate filtering (workbench #1069, part 2): the
 # filter decision needs only the leading frontmatter envelope (`type`/`tags`/
@@ -562,23 +565,41 @@ class SearchService:
                 f"OR v.owner_id = ${index} OR v.public_access IN ('reader', 'writer'))"
             )
         if source_uris:
-            if len(source_uris) > NATIVE_SEARCH_MAX_SOURCE_URIS:
+            max_uris = settings.search_max_source_uris
+            if len(source_uris) > max_uris:
                 raise ValidationError(
-                    f"native search accepts at most {NATIVE_SEARCH_MAX_SOURCE_URIS} source URIs"
+                    f"native search accepts at most {max_uris} source URIs "
+                    f"(got {len(source_uris)}); split the request or use a "
+                    "vault scope instead"
                 )
-            source_clauses: list[str] = []
+            # Pairwise scope match via unnested (vault, identifier) rows: the SQL
+            # text stays constant-size no matter how many URIs arrive (only the
+            # bind arrays grow). Each pair matches exactly the way the old
+            # per-URI OR expansion did — vault AND (path OR id) PER PAIR — so
+            # no cross-pairing: vault A can never match vault B's identifier.
+            # (A naive `v.name = ANY($1) AND ident = ANY($2)` WOULD cross-match
+            # and pollute the scope across vaults.) Non-doc URIs are skipped,
+            # so every identifier here is a doc path-or-id by construction.
+            uri_pairs: list[tuple[str, str]] = []
             for uri in source_uris:
                 parsed = parse_uri(uri)
                 if parsed is None or parsed.kind != "doc" or not parsed.identifier:
                     continue
-                params.extend([parsed.vault, parsed.identifier])
-                source_clauses.append(
-                    f"(v.name = ${len(params) - 1} AND "
-                    f"(r.current_path = ${len(params)} OR r.resource_id::text = ${len(params)}))"
-                )
-            if not source_clauses:
+                uri_pairs.append((parsed.vault, parsed.identifier))
+            if not uri_pairs:
                 return [], {}
-            conditions.append("(" + " OR ".join(source_clauses) + ")")
+            params.extend([
+                [v for v, _ in uri_pairs],
+                [i for _, i in uri_pairs],
+            ])
+            pair_idx = len(params) - 1
+            ident_idx = len(params)
+            conditions.append(
+                f"((v.name, r.current_path) IN ("
+                f"SELECT * FROM unnest(${pair_idx}::text[], ${ident_idx}::text[])) OR "
+                f"(v.name, r.resource_id::text) IN ("
+                f"SELECT * FROM unnest(${pair_idx}::text[], ${ident_idx}::text[])))"
+            )
 
         joins = """
               FROM native_resources r
@@ -698,9 +719,11 @@ class SearchService:
         include_archived = scope != "unarchived"
         if mode != "hybrid":
             raise ValidationError("unsupported search mode")
-        if source_uris and len(source_uris) > NATIVE_SEARCH_MAX_SOURCE_URIS:
+        if source_uris and len(source_uris) > settings.search_max_source_uris:
             raise ValidationError(
-                f"search accepts at most {NATIVE_SEARCH_MAX_SOURCE_URIS} source URIs"
+                f"search accepts at most {settings.search_max_source_uris} source URIs "
+                f"(got {len(source_uris)}); split the request or use a "
+                "vault scope instead"
             )
 
         document_source = _configured_document_source_type()

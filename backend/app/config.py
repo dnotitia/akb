@@ -744,6 +744,18 @@ class Settings(BaseModel):
     # caller (MCP, REST, internal) is bounded uniformly.
     search_limit_max: int = Field(default=50, ge=1)
 
+    # Cap on the caller-supplied `source_uris` scope list (workbench #1069,
+    # part 3). Each URI expands into SQL OR-clauses (candidate scope) and a
+    # vector-store IN-list entry, so an unbounded list lets one request grow
+    # the query text and the downstream filter payload without bound (the
+    # seahorse drivers have overflowed on giant IN lists before). 200 is a
+    # provisional value — large enough for the "previously found resources"
+    # agent loop, small enough to keep both expansions trivial. Revisit with
+    # a measured per-driver IN-list limit if callers ever need more; until
+    # then the error message tells them to split the request or use a vault
+    # scope instead.
+    search_max_source_uris: int = Field(default=200, ge=1)
+
     # Push the ACL filter down to VAULT granularity in the vector store (issue
     # #189 Phase 2). When True AND the driver is pgvector AND a search has no
     # doc-level filter (collection/doc_type/tags/source_uris), search filters by

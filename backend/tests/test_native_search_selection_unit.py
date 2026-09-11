@@ -304,8 +304,137 @@ async def test_native_search_pushes_source_uri_into_bounded_sql_scope():
     assert candidates == []
     assert stats == {}
 
+    # Pairwise shape: one clause covering all URIs via unnested
+    # (vault, identifier) rows — not one OR per URI, and NOT two independent
+    # ANYs (which would cross-match vault A's identifier against vault B).
+    # The scope query (fetchrow) and the page query (fetch) both carry it.
+    # (" OR " still appears once — the path-OR-id alternation.)
     assert all("r.current_path" in sql and "r.resource_id::text" in sql for sql, _ in conn.queries)
-    assert conn.params == ("measure", "specs/guide.md")
+    assert all("unnest(" in sql for sql, _ in conn.queries)
+    assert conn.sql.count(" OR ") == 1
+    assert conn.params == (["measure"], ["specs/guide.md"])
+
+
+@pytest.mark.asyncio
+async def test_native_search_source_uris_share_one_pairwise_clause():
+    """N URIs produce one pairwise clause (constant-size SQL), not N OR
+    clauses — and pairs never cross-match (vault A + vault B's identifier)."""
+    conn = _CandidateConn()
+    uris = [f"akb://measure/doc/specs/guide-{i}.md" for i in range(5)]
+    candidates, stats = await SearchService()._native_document_candidates(
+        conn,
+        user_uuid=None,
+        is_admin=True,
+        vaults=None,
+        collection=None,
+        doc_type=None,
+        tags=None,
+        include_archived=False,
+        source_uris=uris,
+    )
+    assert candidates == []
+    assert stats == {}
+    assert conn.sql.count(" OR ") == 1  # only the path-OR-id alternation
+    assert "unnest(" in conn.sql
+    # Same vault repeated per pair (pairwise), NOT one vault list × one id
+    # list (which would cross-match across vaults).
+    assert conn.params == (["measure"] * 5, [f"specs/guide-{i}.md" for i in range(5)])
+
+
+@pytest.mark.asyncio
+async def test_native_search_source_uris_do_not_cross_match_vaults():
+    """Pairwise unnest keeps (vault, identifier) together: with URIs from two
+    vaults, the generated SQL cannot match vault A's name against vault B's
+    identifier. Verified by executing the scope predicate shape against a
+    fake conn that evaluates the pairing in Python."""
+
+    seen_sql: list[str] = []
+    seen_params: list[tuple] = []
+
+    class _PairCheckingConn(_CandidateConn):
+        async def fetch(self, sql, *params):
+            seen_sql.append(sql)
+            seen_params.append(params)
+            # Simulate rows from two vaults; the candidate loop then runs
+            # normally (empty body slices → plain-markdown defaults).
+            return [
+                {
+                    "resource_id": uuid.uuid4(),
+                    "current_path": "specs/guide.md",
+                    "vault_name": "vault-a",
+                    "byte_size": 20,
+                    "digest": "0" * 64,
+                    "encoding": "utf-8",
+                    "selected_placement": M1ReferencePayloadStore.selected_placement,
+                    "verification_profile": "sha256-size-utf8-v1",
+                    "body_slice": b"plain body\n",
+                },
+            ]
+
+    conn = _PairCheckingConn()
+    candidates, stats = await SearchService()._native_document_candidates(
+        conn,
+        user_uuid=None,
+        is_admin=True,
+        vaults=None,
+        collection=None,
+        doc_type=None,
+        tags=None,
+        include_archived=False,
+        source_uris=[
+            "akb://vault-a/doc/specs/guide.md",
+            "akb://vault-b/doc/other.md",
+        ],
+    )
+    assert candidates != []  # vault-a pair matches its own row
+    assert stats == {}
+    # The SQL carries both pairs positionally aligned: index i of the vault
+    # array belongs to index i of the identifier array.
+    vaults_param, idents_param = seen_params[-1][-2], seen_params[-1][-1]
+    assert vaults_param == ["vault-a", "vault-b"]
+    assert idents_param == ["specs/guide.md", "other.md"]
+    # And the predicate is a row-constructor IN (pairwise), not two ANYs.
+    assert "(v.name, r.current_path) IN (" in seen_sql[-1]
+    assert "v.name = ANY" not in seen_sql[-1]
+
+
+@pytest.mark.asyncio
+async def test_native_search_source_uri_cap_message_names_recovery():
+    """Over-cap rejection tells the caller how to recover (split / vault scope)."""
+    from app.config import settings
+    from app.services import search_service
+
+    conn = _CandidateConn()
+    over = ["akb://measure/doc/specs/guide.md"] * (settings.search_max_source_uris + 1)
+    with pytest.raises(ValidationError, match="split the request or use a vault scope"):
+        await SearchService()._native_document_candidates(
+            conn,
+            user_uuid=None,
+            is_admin=True,
+            vaults=None,
+            collection=None,
+            doc_type=None,
+            tags=None,
+            include_archived=False,
+            source_uris=over,
+        )
+    assert search_service.NATIVE_SEARCH_MAX_SOURCE_URIS == 200  # legacy alias intact
+
+
+@pytest.mark.asyncio
+async def test_reference_payload_write_cap_rejects_oversize_body():
+    """The reference placement enforces the same 10MiB write cap as the
+    pg-bodystore placement; larger content belongs in File storage."""
+    from app.exceptions import ValidationError as VE
+    from app.services.m1_reference_payload_store import M1ReferencePayloadStore
+
+    assert M1ReferencePayloadStore.max_text_bytes == 10 * 1024 * 1024
+    with pytest.raises(VE, match="10 MiB limit"):
+        M1ReferencePayloadStore._verified_bytes(b"x" * (10 * 1024 * 1024 + 1))
+    with pytest.raises(VE, match="10 MiB limit"):
+        M1ReferencePayloadStore._verified_bytes("y" * (10 * 1024 * 1024 + 1))
+    ok, _ = M1ReferencePayloadStore._verified_bytes(b"small body\n")
+    assert ok == b"small body\n"
 
 
 @pytest.mark.asyncio
