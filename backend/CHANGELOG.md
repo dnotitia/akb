@@ -7,6 +7,23 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Native candidate filtering reads frontmatter slices, paginated (bounded-corpus fix, part 2)
+
+`_native_document_candidates` no longer selects full `canonical_bytes` rows to
+decide `type`/`tags`/`status` filters. It fetches an 8KiB leading-body slice
+per row (`substring(canonical_bytes ...)`, the same shape the native grep path
+already uses) and parses only the frontmatter envelope — per-resource memory
+is slice-sized regardless of body size. Rows are keyset-paginated by
+`resource_id` (2,000/page, ids only accumulate), so peak memory is page-sized
+rather than scope-sized.
+
+A resource whose envelope opens but never closes inside the slice is excluded
+from candidates AND counted (`unparseable_envelope`, logged as a warning) —
+never filtered on defaults. The aggregate `COUNT(*)` / `SUM(byte_size)` guard
+still runs first on manifest numbers (no body bytes touched), and hydration
+still re-verifies the winners, so the per-row verify step is gone from this
+path without losing integrity.
+
 ### Native search takes the vault path (bounded-corpus fix, part 1)
 
 `hybrid_search` accepts an orthogonal `source_types` pre-filter on all five

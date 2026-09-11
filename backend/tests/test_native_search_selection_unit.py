@@ -215,6 +215,8 @@ class _CandidateConn:
         self.resource_count = resource_count
         self.body_bytes = body_bytes
         self.rows = rows or []
+        for r in self.rows:
+            r.setdefault("body_slice", r.get("canonical_bytes", b""))
 
     class _Transaction:
         async def __aenter__(self):
@@ -248,7 +250,7 @@ class _CandidateConn:
 async def test_native_search_collection_is_exact_descendant_boundary_and_escaped(collection, escaped):
     conn = _CandidateConn()
 
-    await SearchService()._native_document_candidates(
+    candidates, stats = await SearchService()._native_document_candidates(
         conn,
         user_uuid=None,
         is_admin=True,
@@ -260,6 +262,8 @@ async def test_native_search_collection_is_exact_descendant_boundary_and_escaped
         source_uris=None,
     )
 
+    assert candidates == []
+    assert stats == {}
     assert "r.current_path =" in conn.sql
     assert "ESCAPE '\\'" in conn.sql
     assert conn.params == (collection, escaped)
@@ -267,23 +271,26 @@ async def test_native_search_collection_is_exact_descendant_boundary_and_escaped
 
 @pytest.mark.asyncio
 async def test_native_archived_candidates_use_current_metadata_before_ranking(monkeypatch):
-    from app.services import search_service as module
-
     conn = _CandidateConn()
-    conn.rows = [{"resource_id": uuid.UUID(int=i + 1), "status": status}
-                 for i, status in enumerate(["draft", "active", "archived"])]
-    monkeypatch.setattr(module, "_verified_native_metadata", lambda row: {"status": row["status"]})
-    candidates = await SearchService()._native_document_candidates(
+    conn.rows = [
+        {
+            "resource_id": uuid.UUID(int=i + 1),
+            "body_slice": f"---\nstatus: {status}\n---\nbody\n".encode(),
+        }
+        for i, status in enumerate(["draft", "active", "archived"])
+    ]
+    candidates, stats = await SearchService()._native_document_candidates(
         conn, user_uuid=None, is_admin=True, vaults=["mine"], collection=None,
         doc_type=None, tags=None, include_archived=False, archive_scope="archived", source_uris=None,
     )
     assert candidates == [str(uuid.UUID(int=3))]
+    assert stats == {}
 
 
 @pytest.mark.asyncio
 async def test_native_search_pushes_source_uri_into_bounded_sql_scope():
     conn = _CandidateConn()
-    await SearchService()._native_document_candidates(
+    candidates, stats = await SearchService()._native_document_candidates(
         conn,
         user_uuid=None,
         is_admin=True,
@@ -294,6 +301,8 @@ async def test_native_search_pushes_source_uri_into_bounded_sql_scope():
         include_archived=False,
         source_uris=["akb://measure/doc/specs/guide.md"],
     )
+    assert candidates == []
+    assert stats == {}
 
     assert all("r.current_path" in sql and "r.resource_id::text" in sql for sql, _ in conn.queries)
     assert conn.params == ("measure", "specs/guide.md")
@@ -323,39 +332,43 @@ async def test_native_search_rejects_corpus_before_fetching_bodies():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "store",
-    (M1ReferencePayloadStore, M1PgBodyStore),
-)
-async def test_native_candidate_verification_and_decode_run_off_event_loop(monkeypatch, store):
-    body = b"---\ntitle: Worker\n---\nbody\n"
+async def test_native_candidate_slice_parse_runs_off_event_loop(monkeypatch):
+    """The slice path parses the frontmatter envelope off the loop and never
+    touches the payload stores (no per-row verify: the aggregate guard already
+    ran on manifest numbers, and hydration re-verifies the winners)."""
+    body = b"---\ntitle: Worker\ntype: note\n---\nbody\n"
     row = {
         "resource_id": uuid.uuid4(),
         "current_path": "worker.md",
         "vault_name": "measure",
-        "payload_id": uuid.uuid4(),
-        "namespace_id": uuid.uuid4(),
-        "content_profile": "text",
-        "digest": hashlib.sha256(body).hexdigest(),
         "byte_size": len(body),
+        "digest": hashlib.sha256(body).hexdigest(),
         "encoding": "utf-8",
-        "selected_placement": store.selected_placement,
+        "selected_placement": M1ReferencePayloadStore.selected_placement,
         "verification_profile": "sha256-size-utf8-v1",
-        "canonical_bytes": body,
+        "body_slice": body,
     }
     conn = _CandidateConn(resource_count=1, body_bytes=len(body), rows=[row])
     loop_thread = threading.get_ident()
-    verify_threads = []
-    original_verify = store._verify_row
+    parse_threads = []
 
-    def guarded_verify(candidate):
-        verify_threads.append(threading.get_ident())
+    import app.services.document_service as docs
+
+    original_parse = docs._parse_markdown
+
+    def guarded_parse(content, **kw):
+        parse_threads.append(threading.get_ident())
         assert threading.get_ident() != loop_thread
-        return original_verify(candidate)
+        return original_parse(content, **kw)
 
-    monkeypatch.setattr(store, "_verify_row", staticmethod(guarded_verify))
+    monkeypatch.setattr(docs, "_parse_markdown", guarded_parse)
+    for store in (M1ReferencePayloadStore, M1PgBodyStore):
+        monkeypatch.setattr(
+            store, "_verify_row", staticmethod(lambda candidate: (_ for _ in ()).throw(
+                AssertionError("slice path must not verify per-row")))
+        )
 
-    candidates = await SearchService()._native_document_candidates(
+    candidates, stats = await SearchService()._native_document_candidates(
         conn,
         user_uuid=None,
         is_admin=True,
@@ -368,7 +381,77 @@ async def test_native_candidate_verification_and_decode_run_off_event_loop(monke
     )
 
     assert candidates == [str(row["resource_id"])]
-    assert verify_threads
+    assert stats == {}
+    assert parse_threads
+
+
+@pytest.mark.asyncio
+async def test_native_candidate_slice_never_selects_full_body():
+    """The candidate SELECT must not fetch `canonical_bytes`: with a 10MiB body
+    behind a small envelope, the bytes crossing the wire stay slice-sized."""
+    body = b"---\ntitle: Big\n---\n" + b"x" * (10 * 1024 * 1024)
+    row = {
+        "resource_id": uuid.uuid4(),
+        "current_path": "big.md",
+        "vault_name": "measure",
+        "byte_size": len(body),
+        "digest": hashlib.sha256(body).hexdigest(),
+        "encoding": "utf-8",
+        "selected_placement": M1ReferencePayloadStore.selected_placement,
+        "verification_profile": "sha256-size-utf8-v1",
+        # The fake conn hands back only what the SELECT asked for: a slice.
+        "body_slice": body[:8192 + 1],
+    }
+    conn = _CandidateConn(resource_count=1, body_bytes=len(body), rows=[row])
+    candidates, stats = await SearchService()._native_document_candidates(
+        conn,
+        user_uuid=None,
+        is_admin=True,
+        vaults=None,
+        collection=None,
+        doc_type=None,
+        tags=None,
+        include_archived=False,
+        source_uris=None,
+    )
+    assert candidates == [str(row["resource_id"])]
+    assert stats == {}
+    # The only occurrence of the column name is inside substring(...): the full
+    # body is never selected.
+    assert conn.sql.count("canonical_bytes") == 1
+    assert "substring(" in conn.sql
+
+
+@pytest.mark.asyncio
+async def test_native_candidate_unparseable_envelope_is_counted_not_dropped_silently():
+    """An envelope that opens but never closes inside the slice is excluded
+    from candidates AND reported in stats (never filtered on defaults)."""
+    row = {
+        # Opens --- but the closing --- lies beyond the 8KiB slice.
+        "resource_id": uuid.uuid4(),
+        "current_path": "huge-frontmatter.md",
+        "vault_name": "measure",
+        "byte_size": 20000,
+        "digest": "0" * 64,
+        "encoding": "utf-8",
+        "selected_placement": M1ReferencePayloadStore.selected_placement,
+        "verification_profile": "sha256-size-utf8-v1",
+        "body_slice": b"---\ntitle: " + b"y" * 8100,
+    }
+    conn = _CandidateConn(resource_count=1, body_bytes=20000, rows=[row])
+    candidates, stats = await SearchService()._native_document_candidates(
+        conn,
+        user_uuid=None,
+        is_admin=True,
+        vaults=None,
+        collection=None,
+        doc_type=None,
+        tags=None,
+        include_archived=False,
+        source_uris=None,
+    )
+    assert candidates == []
+    assert stats == {"unparseable_envelope": 1}
 
 
 class _HydrationConn:

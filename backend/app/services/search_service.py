@@ -49,6 +49,16 @@ NATIVE_MEASUREMENT_DATABASE = "akb_revision_m1_measurement"
 NATIVE_SEARCH_MAX_CANDIDATE_RESOURCES = 10_000
 NATIVE_SEARCH_MAX_BODY_BYTES = 128 * 1024 * 1024
 NATIVE_SEARCH_MAX_SOURCE_URIS = 200
+# Frontmatter slice for candidate filtering (workbench #1069, part 2): the
+# filter decision needs only the leading frontmatter envelope (`type`/`tags`/
+# `status`), never the body. Reading the first 8KiB bounds per-resource memory
+# regardless of body size; a resource whose envelope does not close inside the
+# slice is classified "unparseable" (counted, never silently dropped).
+NATIVE_CANDIDATE_FRONTMATTER_SLICE_BYTES = 8 * 1024
+# Candidate pagination: filter loop pages through scope rows keyset-ordered by
+# resource_id, so peak memory is page-sized, not scope-sized. Page of 2,000 ×
+# 8KiB slices ≈ 16MiB worst case per page, GC'd before the next page.
+NATIVE_CANDIDATE_PAGE_SIZE = 2_000
 
 
 def active_document_source_type(
@@ -436,11 +446,54 @@ def _verified_native_metadata(row) -> dict:
     return metadata
 
 
+# Matches a complete leading frontmatter envelope: an opening `---` line, then
+# a closing `---` line. `re.DOTALL` so the envelope may span lines; `\Z`-safe
+# via `$` with MULTILINE. Only the envelope presence is tested here — full
+# YAML parsing still goes through `_parse_markdown` on the slice.
+_FRONTMATTER_ENVELOPE_RE = re.compile(r"\A---[ \t]*\r?\n.*?\r?\n---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
+
+
+def _slice_has_complete_frontmatter(slice_text: str) -> bool:
+    """Whether a body slice contains a complete leading frontmatter envelope.
+
+    A body without a leading `---` line has no envelope to complete (plain
+    Markdown: metadata defaults apply). Only a body that OPENS an envelope
+    but never closes it inside the slice is "incomplete" — its filter fields
+    may lie beyond the slice, so the caller must count it as unparseable
+    rather than filter it on defaults.
+    """
+    if not slice_text.startswith("---"):
+        return True
+    return _FRONTMATTER_ENVELOPE_RE.match(slice_text) is not None
+
+
 def _verify_native_body(row) -> None:
     """Verify one native body without interpreting File bytes as Markdown."""
     from app.services.native_payload_verification import verify_native_head_body
 
     verify_native_head_body(row)
+
+
+def _filtered_native_metadata(row) -> dict | None:
+    """Parse filter metadata from a frontmatter slice on a worker thread.
+
+    Returns the metadata dict, or None when the slice holds an INCOMPLETE
+    envelope (opens `---` but never closes inside the slice): the filter
+    fields may lie beyond the slice, so the caller must exclude + count the
+    resource rather than filter it on defaults. A body with no leading `---`
+    parses normally (plain Markdown: defaults apply).
+    """
+    from app.services.document_service import _parse_markdown
+
+    raw = bytes(row["body_slice"])
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None
+    if not _slice_has_complete_frontmatter(text):
+        return None
+    metadata, _ = _parse_markdown(text)
+    return metadata
 
 
 class SearchService:
@@ -459,7 +512,7 @@ class SearchService:
         archive_scope: ArchiveScope | None = None,
         source_uris: list[str] | None,
         doc_types: list[str] | None = None,
-    ) -> list[str]:
+    ) -> tuple[list[str], dict[str, int]]:
         conditions = ["r.surface = 'document'", "r.lifecycle = 'live'"]
         params: list = []
         if vaults:
@@ -498,7 +551,7 @@ class SearchService:
                     f"(r.current_path = ${len(params)} OR r.resource_id::text = ${len(params)}))"
                 )
             if not source_clauses:
-                return []
+                return [], {}
             conditions.append("(" + " OR ".join(source_clauses) + ")")
 
         joins = """
@@ -506,12 +559,15 @@ class SearchService:
               JOIN vaults v ON v.id = r.namespace_id
               JOIN native_revisions nr
                 ON nr.resource_id = r.resource_id
-               AND nr.revision_id = r.head_revision_id
+                AND nr.revision_id = r.head_revision_id
               JOIN native_payload_manifests pm
                 ON pm.payload_manifest_id = nr.payload_manifest_id
               JOIN m1_reference_payloads p ON p.payload_id = pm.private_locator
         """
         where_sql = " AND ".join(conditions)
+        # The aggregate guard reads manifest numbers only — no body bytes are
+        # touched, so an oversized scope is rejected before asyncpg
+        # materializes anything (same shape as the grep guard).
         async with conn.transaction(isolation="repeatable_read", readonly=True):
             scope = await conn.fetchrow(
                 f"""
@@ -529,27 +585,64 @@ class SearchService:
                 raise ValidationError(
                     "native search scope exceeds the bounded candidate corpus"
                 )
-            rows = await conn.fetch(
-                f"""
-            SELECT r.resource_id, r.current_path, v.name AS vault_name,
-                   p.payload_id, p.namespace_id, p.content_profile, p.digest,
-                   p.byte_size, p.encoding, p.selected_placement,
-                   p.verification_profile, p.canonical_bytes
-              {joins}
-             WHERE {where_sql}
-             ORDER BY r.resource_id
-                """,
-                *params,
+            # Slice + paginate (workbench #1069, part 2): filter 판정 needs only
+            # the leading frontmatter envelope, so fetch an 8KiB prefix per row
+            # instead of the full body, keyset-paged by resource_id so peak
+            # memory is page-sized rather than scope-sized. `byte_size` still
+            # comes along so the per-row slice can be sanity-checked.
+            candidates: list[str] = []
+            filter_stats: dict[str, int] = {}
+            last_seen: str | None = None
+            while True:
+                page_params = list(params)
+                page_where = where_sql
+                if last_seen is not None:
+                    page_params.append(last_seen)
+                    page_where = f"{where_sql} AND r.resource_id > ${len(page_params)}::uuid"
+                rows = await conn.fetch(
+                    f"""
+                SELECT r.resource_id, r.current_path, v.name AS vault_name,
+                       p.byte_size, p.digest, p.encoding,
+                       p.selected_placement, p.verification_profile,
+                       substring(
+                           p.canonical_bytes FROM 1
+                           FOR {NATIVE_CANDIDATE_FRONTMATTER_SLICE_BYTES + 1}
+                       ) AS body_slice
+                  {joins}
+                 WHERE {page_where}
+                 ORDER BY r.resource_id
+                 LIMIT {NATIVE_CANDIDATE_PAGE_SIZE}
+                    """,
+                    *page_params,
+                )
+                if not rows:
+                    break
+                for row in rows:
+                    last_seen = str(row["resource_id"])
+                    metadata = await asyncio.to_thread(
+                        _filtered_native_metadata, row
+                    )
+                    if metadata is None:
+                        # Envelope opens but never closes inside the slice:
+                        # filter fields may lie beyond it. Exclude + count,
+                        # never filter on defaults.
+                        filter_stats["unparseable_envelope"] = (
+                            filter_stats.get("unparseable_envelope", 0) + 1
+                        )
+                        continue
+                    if doc_type and (metadata.get("type") or "note") != doc_type:
+                        continue
+                    if not metadata_matches(metadata, doc_types, tags, include_archived, archive_scope):
+                        continue
+                    candidates.append(str(row["resource_id"]))
+                if len(rows) < NATIVE_CANDIDATE_PAGE_SIZE:
+                    break
+        if filter_stats:
+            logger.warning(
+                "native candidates: %d unparseable envelope(s) excluded: %s",
+                sum(filter_stats.values()), filter_stats,
             )
-        candidates: list[str] = []
-        for row in rows:
-            metadata = await asyncio.to_thread(_verified_native_metadata, row)
-            if doc_type and (metadata.get("type") or "note") != doc_type:
-                continue
-            if not metadata_matches(metadata, doc_types, tags, include_archived, archive_scope):
-                continue
-            candidates.append(str(row["resource_id"]))
-        return candidates
+        return candidates, filter_stats
 
     async def search(
         self,
@@ -739,7 +832,7 @@ class SearchService:
                 if source_type in {"file", "table"}:
                     candidate_source_ids = []
                 elif document_source == NATIVE_DOCUMENT_SOURCE:
-                    candidate_source_ids = await self._native_document_candidates(
+                    candidate_source_ids, _filter_stats = await self._native_document_candidates(
                         conn,
                         user_uuid=user_uuid,
                         is_admin=is_admin,
