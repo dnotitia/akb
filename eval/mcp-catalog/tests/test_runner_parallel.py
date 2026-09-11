@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,10 +17,7 @@ from test_runtime_contract import descriptor_dict
 ROOT = Path(__file__).parents[1]
 
 
-class _RunResolver:
-    def __init__(self) -> None:
-        self.refreshes = 0
-
+class _ParallelResolver:
     def required_profiles(self, _tasks):
         return ["default"]
 
@@ -36,8 +34,7 @@ class _RunResolver:
         return ("fixture-token",)
 
     async def refresh_after_reset(self, _fixture, _profile: str) -> str:
-        self.refreshes += 1
-        return f"fresh-token-{self.refreshes}"
+        return "fresh-token"
 
     def mark_reset_complete(self) -> None:
         return None
@@ -46,8 +43,10 @@ class _RunResolver:
         return None
 
 
-class _RunFixture:
-    instances: list[_RunFixture] = []
+class _ParallelFixture:
+    active = 0
+    maximum_active = 0
+    instances: list[_ParallelFixture] = []
 
     def __init__(self, descriptor) -> None:
         self.descriptor = descriptor
@@ -67,21 +66,29 @@ class _RunFixture:
         return {"count": self.reset_calls, "wall_seconds": 0.0}
 
 
-class _Report:
+class _ParallelReport:
     def __init__(self, outcomes: list[TrialOutcome]) -> None:
         self.failures: list[object] = []
         self.cases = [SimpleNamespace(output=outcome) for outcome in outcomes]
 
 
-def _valid_outcome(task, executor, repeat_index: int) -> TrialOutcome:
-    model_id = executor.model_spec.model_id
+def _parallel_descriptor() -> RuntimeDescriptor:
+    raw = descriptor_dict()
+    raw["scenario"] = "app-control-plane"
+    raw["services"]["fixture"]["reset"]["body"] = {"scenario": "app-control-plane"}
+    descriptor = RuntimeDescriptor.from_dict(raw)
+    keys = ("primary:http", "primary:stdio", "lightweight:http", "lightweight:stdio")
+    return dataclasses.replace(descriptor, benchmark_cells={key: descriptor for key in keys})
+
+
+def _outcome(task, model_spec, transport, repeat_index: int) -> TrialOutcome:
     return TrialOutcome(
         task_id=task.id,
         category=task.category,
-        arm=executor.arm,
-        model_class=executor.model_spec.class_name,
-        model_id=model_id,
-        transport=executor.transport,
+        arm="baseline",
+        model_class=model_spec.class_name,
+        model_id=model_spec.model_id,
+        transport=transport,
         repeat_index=repeat_index,
         final_answer_text="완료",
         successful_mcp_tool_calls=1,
@@ -93,7 +100,7 @@ def _valid_outcome(task, executor, repeat_index: int) -> TrialOutcome:
         cost_usd=0.00001,
         provider_evidence=[
             {
-                "model": model_id,
+                "model": model_spec.model_id,
                 "routing": {"endpoints": {"available": [{"provider": "parasail", "selected": True}]}},
                 "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001},
             }
@@ -106,27 +113,15 @@ def _valid_outcome(task, executor, repeat_index: int) -> TrialOutcome:
 
 
 @pytest.mark.asyncio
-async def test_runner_resume_reuses_completed_trials_and_preserves_hash_input(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    loaded_manifest = load_run_manifest(ROOT / "config" / "run.json")
-    manifest = loaded_manifest.model_copy(update={"repeats": 2})
+async def test_registered_cells_run_in_parallel_and_keep_deterministic_hash_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
-    descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
-    descriptor = dataclasses.replace(
-        descriptor,
-        benchmark_cells={
-            key: descriptor
-            for key in ("primary:http", "primary:stdio", "lightweight:http", "lightweight:stdio")
-        },
-    )
-    checkpoint = tmp_path / "benchmark.checkpoint.json"
-    resolver = _RunResolver()
-    smoke_calls: list[str] = []
-    evaluation_calls: list[str] = []
+    descriptor = _parallel_descriptor()
+    resolver = _ParallelResolver()
+    active = 0
+    maximum_active = 0
 
-    async def fake_preflight(_self):
+    async def fake_preflight(_runner):
         return {
             "runtime": {
                 "source_revision": "a" * 40,
@@ -139,40 +134,38 @@ async def test_runner_resume_reuses_completed_trials_and_preserves_hash_input(
             "resolver": resolver,
         }
 
-    async def fake_capture(*_args, **_kwargs):
-        tools = []
+    async def fake_capture(*_args, **kwargs):
         return CatalogSnapshot(
-            transport=_kwargs["transport"],
+            transport=kwargs["transport"],
             source_revision="a" * 40,
             artifact_version="0.0.0",
             tool_count=0,
-            catalog_hash=hash_json(tools),
-            catalog_token_estimate=token_estimate(tools),
-            tools=tools,
+            catalog_hash=hash_json([]),
+            catalog_token_estimate=token_estimate([]),
+            tools=[],
         )
 
     async def fake_smoke(task, *, model_spec, transport, **_kwargs):
-        smoke_calls.append(f"{model_spec.class_name}:{transport}")
-        return _valid_outcome(
-            task,
-            SimpleNamespace(
-                arm="baseline",
-                model_spec=model_spec,
-                transport=transport,
-            ),
-            1,
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return _outcome(task, model_spec, transport, 1)
+
+    async def fake_evaluate(tasks_for_repeat, *, executor, repeat_indices, **_kwargs):
+        nonlocal active, maximum_active
+        for _task in tasks_for_repeat:
+            await _kwargs["fixture"].reset()
+        active += 1
+        maximum_active = max(maximum_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return _ParallelReport(
+            [_outcome(task, executor.model_spec, executor.transport, repeat_indices[task.id]) for task in tasks_for_repeat]
         )
 
-    async def fake_evaluate(tasks_for_repeat, *, executor, repeat_indices, checkpoint_sink, **_kwargs):
-        evaluation_calls.append(f"{executor.model_spec.class_name}:{executor.transport}")
-        outcomes = []
-        for task in tasks_for_repeat:
-            outcome = _valid_outcome(task, executor, repeat_indices[task.id])
-            await checkpoint_sink(outcome, "completed")
-            outcomes.append(outcome)
-        return _Report(outcomes)
-
-    monkeypatch.setattr(runner_module, "RuntimeFixture", _RunFixture)
+    monkeypatch.setattr(runner_module, "RuntimeFixture", _ParallelFixture)
     monkeypatch.setattr(BenchmarkRunner, "preflight", fake_preflight)
     monkeypatch.setattr(runner_module, "capture_catalog", fake_capture)
     monkeypatch.setattr(runner_module, "build_model", lambda spec: SimpleNamespace(settings={}, model_spec=spec))
@@ -180,28 +173,25 @@ async def test_runner_resume_reuses_completed_trials_and_preserves_hash_input(
     monkeypatch.setattr(runner_module, "evaluate_dataset", fake_evaluate)
     monkeypatch.setattr(runner_module, "serialize_report", lambda *_args, **_kwargs: {})
 
-    first = BenchmarkRunner(manifest, tasks, descriptor, arm="baseline", checkpoint_path=checkpoint)
-    first_artifact = await first.run()
-    assert first_artifact["status"] == "complete"
-    assert first_artifact["completed_trials"] == 120
-    assert first_artifact["checkpoint"]["new_trials"] == 120
-    assert first_artifact["checkpoint"]["reused_trials"] == 0
-    assert len(smoke_calls) == 4
-    assert len(evaluation_calls) == 8
+    parallel = await BenchmarkRunner(manifest, tasks, descriptor, arm="baseline").run()
+    parallel_fixtures = list(_ParallelFixture.instances)
+    second_parallel = await BenchmarkRunner(manifest, tasks, descriptor, arm="baseline").run()
 
-    smoke_calls.clear()
-    evaluation_calls.clear()
-    second = BenchmarkRunner(manifest, tasks, descriptor, arm="baseline", resume_path=checkpoint)
-    second_artifact = await second.run()
-
-    assert second_artifact["status"] == "complete"
-    assert second_artifact["completed_trials"] == 120
-    assert second_artifact["checkpoint"]["new_trials"] == 0
-    assert second_artifact["checkpoint"]["reused_trials"] == 120
-    assert second_artifact["checkpoint"]["rerun_trials"] == 0
-    assert smoke_calls == []
-    assert evaluation_calls == []
-    assert first_artifact["artifact_hash"] == second_artifact["artifact_hash"]
-    assert first_artifact["artifact_hash_input"] == second_artifact["artifact_hash_input"]
-    assert second_artifact["end_to_end_wall_seconds"] > first_artifact["end_to_end_wall_seconds"]
-    assert len(second_artifact["timing"]["attempts"]) == 2
+    expected_trials = sum(
+        1
+        for model in manifest.models
+        for transport in manifest.transports
+        for task in tasks
+        if transport in task.fixture.transports
+        for _repeat in range(1, manifest.repeats + 1)
+    )
+    assert maximum_active == 4
+    assert parallel["completed_trials"] == expected_trials
+    for fixture, key in zip(parallel_fixtures, ("primary:http", "primary:stdio", "lightweight:http", "lightweight:stdio"), strict=True):
+        transport = key.split(":", 1)[1]
+        expected_resets = 1 + sum(transport in task.fixture.transports for task in tasks) * manifest.repeats + 1
+        assert fixture.reset_calls == expected_resets
+    assert sum(parallel["timing"]["breakdown"].values()) == pytest.approx(
+        parallel["timing"]["wall_seconds"]
+    )
+    assert parallel["artifact_hash_input"] == second_parallel["artifact_hash_input"]

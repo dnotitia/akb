@@ -252,6 +252,8 @@ class BenchmarkRunManifest(ContractModel):
     transports: list[Transport] = Field(default_factory=default_transports)
     models: list[ModelSpec] = Field(min_length=2)
     repeats: int = Field(ge=2, le=100)
+    # Task cases stay serial within one mutable cell; the runner owns the
+    # independent model/transport cell parallelism.
     max_concurrency: Literal[1] = 1
     category_minimums: dict[Category, int]
     statistical_procedure: StatisticalProcedure

@@ -9,9 +9,9 @@ import re
 import shutil
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -109,6 +109,7 @@ class RuntimeDescriptor:
     password_env: str
     pat_env: str | None
     stdio_service: dict[str, Any] | None
+    benchmark_cells: dict[str, RuntimeDescriptor] = field(default_factory=dict)
 
     @classmethod
     def from_file(cls, path: Path) -> RuntimeDescriptor:
@@ -167,6 +168,18 @@ class RuntimeDescriptor:
             if pat_env is None:
                 raise RuntimeContractError("stdio descriptor must expose credentials.pat_env")
 
+        benchmark_cells: dict[str, RuntimeDescriptor] = {}
+        cells_raw = descriptor.get("benchmark_cells")
+        if cells_raw is not None:
+            cells = _object(cells_raw, "benchmark cells")
+            for name, cell_raw in cells.items():
+                if not isinstance(name, str) or not name:
+                    raise RuntimeContractError("benchmark cell name is invalid")
+                cell = cls.from_dict(cell_raw)
+                if cell.benchmark_cells:
+                    raise RuntimeContractError("benchmark cells cannot be nested")
+                benchmark_cells[name] = cell
+
         return cls(
             raw=descriptor,
             scenario=scenario,
@@ -181,11 +194,15 @@ class RuntimeDescriptor:
             password_env=password_env,
             pat_env=pat_env,
             stdio_service=stdio_service,
+            benchmark_cells=benchmark_cells,
         )
 
     @property
     def supports_stdio(self) -> bool:
         return self.stdio_service is not None
+
+    def cell_for(self, key: str) -> RuntimeDescriptor:
+        return self.benchmark_cells.get(key, self)
 
     def source_revision_from(self, discovery: dict[str, Any]) -> str:
         candidates: list[Any] = []
@@ -256,6 +273,7 @@ class RuntimeFixture:
         self.readiness_timeout = readiness_timeout
         self.readiness_poll_interval = readiness_poll_interval
         self._reset_lock = asyncio.Lock()
+        self.timing_sink: Callable[[str, float, float], None] | None = None
         self.reset_count = 0
         self.reset_wall_seconds = 0.0
 
@@ -337,8 +355,11 @@ class RuntimeFixture:
                     )
                 await self.wait_until_ready(stage="fixture_readiness")
         finally:
+            finished = time.perf_counter()
             self.reset_count += 1
-            self.reset_wall_seconds += time.perf_counter() - started
+            self.reset_wall_seconds += finished - started
+            if self.timing_sink is not None:
+                self.timing_sink("fixture_reset", started, finished)
 
     def reset_evidence(self) -> dict[str, float | int]:
         return {

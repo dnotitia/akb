@@ -17,7 +17,7 @@ from .evidence import safe_json
 from .execution import TrialOutcome, has_measured_evidence
 
 
-CHECKPOINT_SCHEMA_VERSION: Literal[1] = 1
+CHECKPOINT_SCHEMA_VERSION: Literal[2] = 2
 
 
 class CheckpointError(ValueError):
@@ -25,7 +25,7 @@ class CheckpointError(ValueError):
 
 
 class CheckpointHeader(ContractModel):
-    schema_version: Literal[1] = CHECKPOINT_SCHEMA_VERSION
+    schema_version: Literal[2] = CHECKPOINT_SCHEMA_VERSION
     source_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     run_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     task_corpus_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -54,13 +54,39 @@ class CheckpointBudget(ContractModel):
     wall_seconds: float = Field(default=0.0, ge=0)
 
     def plus(self, outcome: TrialOutcome) -> CheckpointBudget:
+        from decimal import Decimal
+
         return CheckpointBudget(
             model_requests=self.model_requests + outcome.model_requests,
             input_tokens=self.input_tokens + outcome.input_tokens,
             output_tokens=self.output_tokens + outcome.output_tokens,
-            cost_usd=self.cost_usd + outcome.cost_usd,
+            cost_usd=float(Decimal(str(self.cost_usd)) + Decimal(str(outcome.cost_usd))),
             wall_seconds=self.wall_seconds + outcome.latency_seconds,
         )
+
+
+class TimingBreakdown(ContractModel):
+    provisioning: float = Field(default=0.0, ge=0)
+    credential: float = Field(default=0.0, ge=0)
+    catalog_capture: float = Field(default=0.0, ge=0)
+    fixture_reset: float = Field(default=0.0, ge=0)
+    provider_wait: float = Field(default=0.0, ge=0)
+    model_execution: float = Field(default=0.0, ge=0)
+    checkpoint: float = Field(default=0.0, ge=0)
+    other: float = Field(default=0.0, ge=0)
+
+
+class TimingAttempt(ContractModel):
+    attempt_index: int = Field(ge=1)
+    wall_seconds: float = Field(ge=0)
+    breakdown: TimingBreakdown = Field(default_factory=TimingBreakdown)
+
+
+class CheckpointTiming(ContractModel):
+    attempts: list[TimingAttempt] = Field(default_factory=list)
+    active_attempt: TimingAttempt | None = None
+    cumulative_wall_seconds: float = Field(default=0.0, ge=0)
+    cumulative_breakdown: TimingBreakdown = Field(default_factory=TimingBreakdown)
 
 
 TrialStatus = Literal["completed", "failed", "incomplete"]
@@ -69,7 +95,7 @@ SmokeTransport = Literal["http", "stdio"]
 
 
 class TrialCheckpoint(ContractModel):
-    schema_version: Literal[1] = CHECKPOINT_SCHEMA_VERSION
+    schema_version: Literal[2] = CHECKPOINT_SCHEMA_VERSION
     status: TrialStatus
     key: CheckpointKey
     outcome: TrialOutcome
@@ -77,7 +103,7 @@ class TrialCheckpoint(ContractModel):
 
 
 class SmokeCellCheckpoint(ContractModel):
-    schema_version: Literal[1] = CHECKPOINT_SCHEMA_VERSION
+    schema_version: Literal[2] = CHECKPOINT_SCHEMA_VERSION
     status: TrialStatus
     model_class: SmokeModelClass
     model_id: str = Field(min_length=1, max_length=200)
@@ -87,10 +113,12 @@ class SmokeCellCheckpoint(ContractModel):
 
 
 class CheckpointDocument(ContractModel):
-    schema_version: Literal[1] = CHECKPOINT_SCHEMA_VERSION
+    schema_version: Literal[2] = CHECKPOINT_SCHEMA_VERSION
     header: CheckpointHeader
     spent: CheckpointBudget = Field(default_factory=CheckpointBudget)
     spent_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    timing: CheckpointTiming = Field(default_factory=CheckpointTiming)
+    timing_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     records: dict[str, TrialCheckpoint] = Field(default_factory=dict)
     smoke_status: Literal["in_progress", "passed", "failed"] | None = None
     smoke_gate: dict[str, SmokeCellCheckpoint] = Field(default_factory=dict)
@@ -124,6 +152,10 @@ def smoke_record_hash(status: TrialStatus, model_class: str, model_id: str, tran
 
 def spent_hash(spent: CheckpointBudget) -> str:
     return hash_json(spent.model_dump(mode="json"))
+
+
+def timing_hash(timing: CheckpointTiming) -> str:
+    return hash_json(timing.model_dump(mode="json"))
 
 
 def valid_completed_outcome(outcome: TrialOutcome) -> bool:
@@ -172,7 +204,14 @@ class CheckpointStore:
             if self.path.exists():
                 raise CheckpointError(f"checkpoint already exists; use --resume: {self.path}")
             initial_spent = CheckpointBudget()
-            self.document = CheckpointDocument(header=header, spent=initial_spent, spent_hash=spent_hash(initial_spent))
+            initial_timing = CheckpointTiming()
+            self.document = CheckpointDocument(
+                header=header,
+                spent=initial_spent,
+                spent_hash=spent_hash(initial_spent),
+                timing=initial_timing,
+                timing_hash=timing_hash(initial_timing),
+            )
 
     def set_secrets(self, secrets: tuple[str, ...]) -> None:
         self.secrets = secrets
@@ -204,7 +243,14 @@ class CheckpointStore:
             return False
         return all(self.smoke_outcome_for(key) is not None for key in self.expected_smoke_cells)
 
-    def record_trial(self, key: CheckpointKey, outcome: TrialOutcome, *, status: TrialStatus | None = None) -> bool:
+    def record_trial(
+        self,
+        key: CheckpointKey,
+        outcome: TrialOutcome,
+        *,
+        status: TrialStatus | None = None,
+        timing: dict[str, object] | None = None,
+    ) -> bool:
         self._validate_key(key)
         safe_outcome = self._safe_outcome(outcome)
         if not self._outcome_matches_key(safe_outcome, key):
@@ -222,6 +268,8 @@ class CheckpointStore:
         )
         self.document.spent = self.document.spent.plus(safe_outcome)
         self.document.spent_hash = spent_hash(self.document.spent)
+        if timing is not None:
+            self._update_timing(timing)
         self._write_atomic()
         return existed
 
@@ -231,6 +279,7 @@ class CheckpointStore:
         outcome: TrialOutcome,
         *,
         status: TrialStatus | None = None,
+        timing: dict[str, object] | None = None,
     ) -> bool:
         expected = self.expected_smoke_cells.get(cell_key)
         if expected is None:
@@ -259,8 +308,30 @@ class CheckpointStore:
         )
         self.document.spent = self.document.spent.plus(safe_outcome)
         self.document.spent_hash = spent_hash(self.document.spent)
+        if timing is not None:
+            self._update_timing(timing)
         self._write_atomic()
         return existed
+
+    def next_timing_attempt_index(self) -> int:
+        indexes = [attempt.attempt_index for attempt in self.document.timing.attempts]
+        if self.document.timing.active_attempt is not None:
+            indexes.append(self.document.timing.active_attempt.attempt_index)
+        return max(indexes, default=0) + 1
+
+    def update_timing(self, timing: dict[str, object]) -> None:
+        self._update_timing(timing)
+        self._write_atomic()
+
+    def finalize_timing(self, timing: dict[str, object]) -> None:
+        self._update_timing(timing)
+        active = self.document.timing.active_attempt
+        if active is not None:
+            self.document.timing.attempts.append(active)
+            self.document.timing.active_attempt = None
+            self._recompute_timing()
+            self.document.timing_hash = timing_hash(self.document.timing)
+        self._write_atomic()
 
     def set_smoke_status(self, status: Literal["in_progress", "passed", "failed"]) -> None:
         if status == "passed" and not all(
@@ -287,6 +358,8 @@ class CheckpointStore:
             raise CheckpointError("resume checkpoint exact-input header does not match this run")
         if document.spent_hash != spent_hash(document.spent):
             raise CheckpointError("resume checkpoint spent-usage digest does not match")
+        if document.timing_hash != timing_hash(document.timing):
+            raise CheckpointError("resume checkpoint timing digest does not match")
         for digest, trial_record in document.records.items():
             if digest != checkpoint_key_digest(trial_record.key):
                 raise CheckpointError("resume checkpoint contains a tampered trial key digest")
@@ -318,6 +391,27 @@ class CheckpointStore:
         if unknown_smoke:
             raise CheckpointError(f"resume checkpoint contains unexpected smoke cells: {sorted(unknown_smoke)}")
         return document
+
+    def _update_timing(self, raw_timing: dict[str, object]) -> None:
+        attempt = TimingAttempt.model_validate(raw_timing)
+        active = self.document.timing.active_attempt
+        if active is not None and active.attempt_index != attempt.attempt_index:
+            self.document.timing.attempts.append(active)
+        self.document.timing.active_attempt = attempt
+        self._recompute_timing()
+        self.document.timing_hash = timing_hash(self.document.timing)
+
+    def _recompute_timing(self) -> None:
+        attempts = [*self.document.timing.attempts]
+        if self.document.timing.active_attempt is not None:
+            attempts.append(self.document.timing.active_attempt)
+        self.document.timing.cumulative_wall_seconds = sum(attempt.wall_seconds for attempt in attempts)
+        self.document.timing.cumulative_breakdown = TimingBreakdown(
+            **{
+                name: sum(getattr(attempt.breakdown, name) for attempt in attempts)
+                for name in TimingBreakdown.model_fields
+            }
+        )
 
     def _validate_key(self, key: CheckpointKey) -> None:
         expected = self.expected_keys.get(checkpoint_key_digest(key))

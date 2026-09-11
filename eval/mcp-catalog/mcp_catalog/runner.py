@@ -6,6 +6,7 @@ import asyncio
 import math
 import os
 import time
+from collections.abc import Mapping
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +36,7 @@ from .execution import (
     worst_case_cost,
 )
 from .runtime import RuntimeContractError, RuntimeDescriptor, RuntimeFixture
+from .timing import TimingCategory, TimingTracker
 
 
 class NeedsUserInput(RuntimeError):
@@ -275,6 +277,10 @@ class BenchmarkRunner:
         self._checkpoint_new_trials = 0
         self._checkpoint_reused_trials = 0
         self._checkpoint_rerun_trials = 0
+        self._checkpoint_lock = asyncio.Lock()
+        self._timing: TimingTracker | None = None
+        self._timing_attempt_index = 1
+        self._resolver: CredentialResolver | None = None
         self._smoke_gate: dict[str, Any] = {
             "status": "not_run",
             "required_cells": [],
@@ -283,6 +289,37 @@ class BenchmarkRunner:
 
     def _refresh_secrets(self, resolver: CredentialResolver) -> None:
         self.secrets = resolver.secret_values()
+
+    def _cell_descriptors(self) -> dict[str, RuntimeDescriptor]:
+        keys = [
+            f"{model.class_name}:{transport}"
+            for model in self.manifest.models
+            for transport in self.manifest.transports
+        ]
+        if not self.descriptor.benchmark_cells:
+            raise RuntimeContractError("benchmark runtime must expose isolated benchmark_cells")
+        if set(self.descriptor.benchmark_cells) != set(keys):
+            raise RuntimeContractError("runtime benchmark cells do not match the registered model/transport matrix")
+        return {key: self.descriptor.cell_for(key) for key in keys}
+
+    def _timing_snapshot(self) -> dict[str, object] | None:
+        if self._timing is None:
+            return None
+        return self._timing.snapshot(attempt_index=self._timing_attempt_index)
+
+    async def _refresh_token(self, fixture: RuntimeFixture, profile: str) -> str:
+        if self._resolver is None:
+            raise RuntimeContractError("credential resolver is not initialized")
+        if self._timing is None:
+            return await self._resolver.refresh_after_reset(fixture, profile)
+        with self._timing.measure("credential"):
+            return await self._resolver.refresh_after_reset(fixture, profile)
+
+    @staticmethod
+    def _attach_timing(fixture: RuntimeFixture, timing: TimingTracker) -> None:
+        fixture.timing_sink = lambda category, started, finished: timing.record(
+            cast(TimingCategory, category), started, finished
+        )
 
     def _record_trial(self, key: str, outcome: TrialOutcome) -> None:
         trials = self._completed_trials[key]
@@ -386,7 +423,9 @@ class BenchmarkRunner:
         failure_stage: str | None = None,
         cleanup_errors: list[Exception] | None = None,
         fixture: RuntimeFixture | None = None,
+        fixtures: Mapping[str, RuntimeFixture] | None = None,
         end_to_end_wall_seconds: float = 0.0,
+        timing: dict[str, Any] | None = None,
         smoke_gate: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         quality_reasons: list[str] = []
@@ -430,6 +469,18 @@ class BenchmarkRunner:
                 f"benchmark incomplete: completed {completed_trials}/{expected_trials} planned trials"
             )
         safe_runtime = safe_json(runtime["discovery"], self.secrets)
+        reset_evidence: dict[str, Any]
+        if fixtures:
+            reset_evidence = {
+                "count": sum(item.reset_evidence()["count"] for item in fixtures.values()),
+                "wall_seconds": sum(item.reset_evidence()["wall_seconds"] for item in fixtures.values()),
+                "cells": {
+                    key: item.reset_evidence()
+                    for key, item in sorted(fixtures.items())
+                },
+            }
+        else:
+            reset_evidence = fixture.reset_evidence() if fixture is not None else {"count": 0, "wall_seconds": 0.0}
         fixture_evidence: dict[str, Any] = {
             "scenario": self.descriptor.scenario,
             "reset": {
@@ -437,15 +488,28 @@ class BenchmarkRunner:
                 "url": self.descriptor.reset_url,
                 "body": self.descriptor.reset_body,
             },
-            "reset_evidence": fixture.reset_evidence() if fixture is not None else {"count": 0, "wall_seconds": 0.0},
+            "reset_evidence": reset_evidence,
         }
+        if self.descriptor.benchmark_cells:
+            fixture_evidence["cells"] = {
+                key: {
+                    "app_origin": descriptor.app_origin,
+                    "fixture_origin": descriptor.fixture_origin,
+                    "reset": {
+                        "method": "POST",
+                        "url": descriptor.reset_url,
+                        "body": descriptor.reset_body,
+                    },
+                }
+                for key, descriptor in sorted(self.descriptor.benchmark_cells.items())
+            }
         if isinstance(safe_runtime, dict):
             runtime_evidence = safe_runtime.get("runtime")
             if isinstance(runtime_evidence, dict):
                 for name in ("dependency_identity", "dependency_reset"):
                     if name in runtime_evidence:
                         fixture_evidence[name] = runtime_evidence[name]
-        checkpoint_evidence = {
+        checkpoint_evidence: dict[str, Any] = {
             "enabled": self._checkpoint_store is not None,
             "path": str(self.checkpoint_path) if self.checkpoint_path is not None else None,
             "new_trials": self._checkpoint_new_trials,
@@ -457,6 +521,13 @@ class BenchmarkRunner:
                 for outcome in outcomes
                 if valid_completed_outcome(outcome)
             ),
+        }
+        if self._checkpoint_store is not None:
+            checkpoint_evidence["timing"] = self._checkpoint_store.document.timing.model_dump(mode="json")
+        timing_payload = timing or {
+            "attempt_index": 1,
+            "wall_seconds": end_to_end_wall_seconds,
+            "breakdown": {"other": end_to_end_wall_seconds},
         }
         artifact: dict[str, Any] = {
             "schema_version": 1,
@@ -478,7 +549,8 @@ class BenchmarkRunner:
             "runs": all_reports,
             "checkpoint": checkpoint_evidence,
             "smoke_gate": smoke_gate or self._smoke_gate,
-            "end_to_end_wall_seconds": end_to_end_wall_seconds,
+            "timing": timing_payload,
+            "end_to_end_wall_seconds": timing_payload.get("cumulative_wall_seconds", end_to_end_wall_seconds),
             "budget_used": {
                 "model_requests": ledger.requests,
                 "input_tokens": ledger.input_tokens,
@@ -546,13 +618,18 @@ class BenchmarkRunner:
         status: Literal["completed", "failed", "incomplete"],
     ) -> None:
         if self._checkpoint_store is not None:
-            self._refresh_store_secrets()
-            existed = await asyncio.to_thread(
-                self._checkpoint_store.record_trial,
-                key,
-                outcome,
-                status=status,
-            )
+            async with self._checkpoint_lock:
+                self._refresh_store_secrets()
+                checkpoint_started = time.perf_counter()
+                existed = await asyncio.to_thread(
+                    self._checkpoint_store.record_trial,
+                    key,
+                    outcome,
+                    status=status,
+                    timing=self._timing_snapshot(),
+                )
+                if self._timing is not None:
+                    self._timing.record("checkpoint", checkpoint_started)
             if not existed:
                 self._checkpoint_new_trials += 1
         self._record_trial(run_key, outcome)
@@ -576,11 +653,12 @@ class BenchmarkRunner:
     async def _run_smoke_gate(
         self,
         *,
-        fixture: RuntimeFixture,
+        fixture: RuntimeFixture | None = None,
+        fixtures: Mapping[str, RuntimeFixture] | None = None,
         resolver: CredentialResolver,
         ledger: BudgetLedger,
     ) -> dict[str, Any]:
-        cells: dict[str, dict[str, Any]] = {}
+        self._resolver = resolver
         required_cells = [
             f"{model.class_name}:{transport}"
             for model in self.manifest.models
@@ -591,62 +669,69 @@ class BenchmarkRunner:
             "required_cells": required_cells,
             "cells": [],
         }
-        for model_spec in self.manifest.models:
-            for transport in self.manifest.transports:
-                cell_key = f"{model_spec.class_name}:{transport}"
-                cached = (
-                    self._checkpoint_store.smoke_outcome_for(cell_key)
-                    if self._checkpoint_store is not None
-                    else None
-                )
-                if cached is not None:
-                    cells[cell_key] = {
-                        "cell": cell_key,
-                        "status": "completed",
-                        "reused": True,
-                        "outcome": safe_json(cached.model_dump(mode="json"), self.secrets),
-                    }
-                    continue
+        cell_fixtures = {
+            key: (fixtures[key] if fixtures is not None and key in fixtures else fixture)
+            for key in required_cells
+        }
+        if any(value is None for value in cell_fixtures.values()):
+            raise RuntimeContractError("smoke gate fixtures are incomplete", stage="smoke_gate")
 
-                task = self._smoke_task(transport)
-                model = build_model(model_spec)
-                try:
-                    reservation = worst_case_cost(model_spec, self.manifest.budget)
-                    await ledger.reserve_trial(reservation)
-                except Exception as exc:
-                    outcome = TrialOutcome(
-                        task_id=task.id,
-                        category=task.category,
-                        arm=self.arm,
-                        model_class=model_spec.class_name,
-                        model_id=model_spec.model_id,
-                        transport=transport,
-                        error=f"benchmark incomplete: {redact_exception(exc, self.secrets)}",
-                        failure_kind="budget",
-                    )
-                    if self._checkpoint_store is not None:
+        async def run_cell(model_spec: Any, transport: str) -> dict[str, Any]:
+            cell_key = f"{model_spec.class_name}:{transport}"
+            cell_fixture = cell_fixtures[cell_key]
+            assert cell_fixture is not None
+            cached = (
+                self._checkpoint_store.smoke_outcome_for(cell_key)
+                if self._checkpoint_store is not None
+                else None
+            )
+            if cached is not None:
+                return {
+                    "cell": cell_key,
+                    "status": "completed",
+                    "reused": True,
+                    "outcome": safe_json(cached.model_dump(mode="json"), self.secrets),
+                }
+
+            task = self._smoke_task(transport)
+            model = build_model(model_spec)
+            reservation = worst_case_cost(model_spec, self.manifest.budget)
+            outcome: TrialOutcome | None = None
+            try:
+                await ledger.reserve_trial(reservation)
+            except Exception as exc:
+                outcome = TrialOutcome(
+                    task_id=task.id,
+                    category=task.category,
+                    arm=self.arm,
+                    model_class=model_spec.class_name,
+                    model_id=model_spec.model_id,
+                    transport=transport,
+                    error=f"benchmark incomplete: {redact_exception(exc, self.secrets)}",
+                    failure_kind="budget",
+                )
+                if self._checkpoint_store is not None:
+                    async with self._checkpoint_lock:
                         self._refresh_store_secrets()
                         await asyncio.to_thread(
                             self._checkpoint_store.record_smoke_cell,
                             cell_key,
                             outcome,
                             status="incomplete",
+                            timing=self._timing_snapshot(),
                         )
-                    cells[cell_key] = {
-                        "cell": cell_key,
-                        "status": "incomplete",
-                        "reused": False,
-                        "outcome": safe_json(outcome.model_dump(mode="json"), self.secrets),
-                    }
-                    raise RuntimeContractError(
-                        f"smoke gate cell {cell_key} could not reserve its registered budget",
-                        stage="smoke_gate",
-                    ) from exc
+                raise RuntimeContractError(
+                    f"smoke gate cell {cell_key} could not reserve its registered budget",
+                    stage="smoke_gate",
+                ) from exc
 
-                try:
-                    await fixture.reset()
-                    token = await resolver.refresh_after_reset(fixture, task.fixture.credential_profile)
-                    self._refresh_secrets(resolver)
+            settled = False
+            try:
+                await cell_fixture.reset()
+                self._resolver = resolver
+                token = await self._refresh_token(cell_fixture, task.fixture.credential_profile)
+                self._refresh_secrets(resolver)
+                if self._timing is None:
                     outcome = await execute_smoke(
                         task,
                         manifest=self.manifest,
@@ -654,21 +739,33 @@ class BenchmarkRunner:
                         model_spec=model_spec,
                         model=model,
                         transport=transport,
-                        fixture=fixture,
+                        fixture=cell_fixture,
                         token=token,
                         secrets=self.secrets,
+                        timing_sink=self._timing.record if self._timing is not None else None,
                     )
-                    try:
-                        await ledger.charge(outcome, reserved_cost_usd=reservation)
-                    except Exception as exc:
-                        outcome.error = f"benchmark incomplete: {redact_exception(exc, self.secrets)}"
-                        outcome.failure_kind = "budget"
-                        await ledger.release_trial(reservation)
-                except Exception as exc:
-                    with_context = exc if isinstance(exc, RuntimeContractError) else RuntimeContractError(
-                        f"smoke gate cell {cell_key} failed: {redact_exception(exc, self.secrets)}",
-                        stage="smoke_gate",
-                    )
+                else:
+                    with self._timing.measure("model_execution"):
+                        outcome = await execute_smoke(
+                            task,
+                            manifest=self.manifest,
+                            arm=self.arm,
+                            model_spec=model_spec,
+                            model=model,
+                            transport=transport,
+                            fixture=cell_fixture,
+                            token=token,
+                            secrets=self.secrets,
+                            timing_sink=self._timing.record if self._timing is not None else None,
+                        )
+                await ledger.charge(outcome, reserved_cost_usd=reservation)
+                settled = True
+            except Exception as exc:
+                with_context = exc if isinstance(exc, RuntimeContractError) else RuntimeContractError(
+                    f"smoke gate cell {cell_key} failed: {redact_exception(exc, self.secrets)}",
+                    stage="smoke_gate",
+                )
+                if outcome is None:
                     outcome = TrialOutcome(
                         task_id=task.id,
                         category=task.category,
@@ -679,48 +776,72 @@ class BenchmarkRunner:
                         error=redact_exception(with_context, self.secrets),
                         failure_kind="unknown",
                     )
+                else:
+                    outcome.error = f"benchmark incomplete: {redact_exception(exc, self.secrets)}"
+                    outcome.failure_kind = "budget"
+            finally:
+                if not settled:
                     await ledger.release_trial(reservation)
 
-                valid = valid_smoke_outcome(outcome)
-                if not valid and outcome.error is None:
-                    if outcome.successful_mcp_tool_calls == 0:
-                        outcome.error = "smoke gate did not observe a successful MCP tool call"
-                        outcome.failure_kind = "tool"
-                    else:
-                        outcome.error = "smoke gate did not observe a follow-up terminal response"
-                        outcome.failure_kind = "terminal_response"
-                status: Literal["completed", "failed", "incomplete"] = "completed" if valid else (
-                    "incomplete" if outcome.error and outcome.error.startswith("benchmark incomplete:") else "failed"
-                )
-                if self._checkpoint_store is not None:
+            assert outcome is not None
+            valid = valid_smoke_outcome(outcome)
+            if not valid and outcome.error is None:
+                if outcome.successful_mcp_tool_calls == 0:
+                    outcome.error = "smoke gate did not observe a successful MCP tool call"
+                    outcome.failure_kind = "tool"
+                else:
+                    outcome.error = "smoke gate did not observe a follow-up terminal response"
+                    outcome.failure_kind = "terminal_response"
+            status: Literal["completed", "failed", "incomplete"] = "completed" if valid else (
+                "incomplete" if outcome.error and outcome.error.startswith("benchmark incomplete:") else "failed"
+            )
+            if self._checkpoint_store is not None:
+                async with self._checkpoint_lock:
                     self._refresh_store_secrets()
                     await asyncio.to_thread(
                         self._checkpoint_store.record_smoke_cell,
                         cell_key,
                         outcome,
                         status=status,
+                        timing=self._timing_snapshot(),
                     )
-                cells[cell_key] = {
-                    "cell": cell_key,
-                    "status": status,
-                    "reused": False,
-                    "outcome": safe_json(outcome.model_dump(mode="json"), self.secrets),
-                }
-                if not valid:
-                    if self._checkpoint_store is not None:
-                        await asyncio.to_thread(self._checkpoint_store.set_smoke_status, "failed")
-                    self._smoke_gate = {
-                        "status": "failed",
-                        "required_cells": required_cells,
-                        "cells": [cells[key] for key in required_cells if key in cells],
-                    }
-                    raise RuntimeContractError(
-                        f"smoke gate cell {cell_key} did not produce model usage and a terminal routed outcome",
-                        stage="smoke_gate",
-                    )
+            return {
+                "cell": cell_key,
+                "status": status,
+                "reused": False,
+                "outcome": safe_json(outcome.model_dump(mode="json"), self.secrets),
+            }
+
+        jobs = [
+            (model_spec, transport)
+            for model_spec in self.manifest.models
+            for transport in self.manifest.transports
+        ]
+        if self.descriptor.benchmark_cells:
+            results = await asyncio.gather(*(run_cell(model, transport) for model, transport in jobs))
+        else:
+            results = [await run_cell(model, transport) for model, transport in jobs]
+        cells = {item["cell"]: item for item in results}
+        for cell_key in required_cells:
+            item = cells[cell_key]
+            if item["status"] == "completed":
+                continue
+            if self._checkpoint_store is not None:
+                async with self._checkpoint_lock:
+                    await asyncio.to_thread(self._checkpoint_store.set_smoke_status, "failed")
+            self._smoke_gate = {
+                "status": "failed",
+                "required_cells": required_cells,
+                "cells": [cells[key] for key in required_cells if key in cells],
+            }
+            raise RuntimeContractError(
+                f"smoke gate cell {cell_key} did not produce model usage and a terminal routed outcome",
+                stage="smoke_gate",
+            )
 
         if self._checkpoint_store is not None:
-            await asyncio.to_thread(self._checkpoint_store.set_smoke_status, "passed")
+            async with self._checkpoint_lock:
+                await asyncio.to_thread(self._checkpoint_store.set_smoke_status, "passed")
         self._smoke_gate = {
             "status": "passed",
             "required_cells": required_cells,
@@ -750,22 +871,44 @@ class BenchmarkRunner:
         resolver = CredentialResolver(self.manifest, self.descriptor, tuple(model_secrets))
         profiles = resolver.required_profiles(self.tasks)
         resolver.validate_inputs(profiles)
-        fixture = RuntimeFixture(self.descriptor)
-        runtime: dict[str, Any] | None = None
+        cell_descriptors = self._cell_descriptors()
+        if any(not descriptor.supports_stdio for descriptor in cell_descriptors.values()):
+            raise RuntimeContractError("every benchmark cell must expose the runtime stdio service")
+        preflight_cells = cell_descriptors
+
+        async def preflight_cell(descriptor: RuntimeDescriptor) -> dict[str, Any]:
+            fixture = RuntimeFixture(descriptor)
+            try:
+                return await fixture.preflight()
+            finally:
+                await fixture.close()
+
+        runtime_cells: dict[str, dict[str, Any]] = {}
         primary_error: Exception | None = None
         try:
-            runtime = await fixture.preflight()
+            results = await asyncio.gather(
+                *(preflight_cell(descriptor) for descriptor in preflight_cells.values())
+            )
+            runtime_cells = dict(zip(preflight_cells, results, strict=True))
         except Exception as exc:
             primary_error = exc
-        finally:
-            cleanup_errors = await _collect_cleanup_errors(fixture.close)
         if primary_error is not None:
-            _attach_cleanup_errors(primary_error, cleanup_errors, tuple(model_secrets))
             raise primary_error
-        if cleanup_errors:
-            _attach_cleanup_errors(cleanup_errors[0], cleanup_errors[1:], tuple(model_secrets))
-            raise cleanup_errors[0]
-        assert runtime is not None
+        if not runtime_cells:
+            raise RuntimeContractError("runtime preflight returned no cells")
+        first_runtime = next(iter(runtime_cells.values()))
+        for other_runtime in runtime_cells.values():
+            if (
+                other_runtime["source_revision"] != first_runtime["source_revision"]
+                or other_runtime["artifact_versions"] != first_runtime["artifact_versions"]
+            ):
+                raise RuntimeContractError("benchmark cell runtime identities differ")
+        runtime = dict(first_runtime)
+        if self.descriptor.benchmark_cells:
+            runtime["discovery"] = {
+                "cells": {key: value["discovery"] for key, value in sorted(runtime_cells.items())}
+            }
+            runtime["cell_runtimes"] = runtime_cells
         if self.manifest.source_revision != "runtime_descriptor" and self.manifest.source_revision != runtime["source_revision"]:
             raise RuntimeContractError("runtime source revision does not match the pinned run manifest")
         return {
@@ -773,18 +916,133 @@ class BenchmarkRunner:
             "resolver": resolver,
         }
 
+    async def _run_cell(
+        self,
+        *,
+        run_key: str,
+        model_spec: Any,
+        transport: str,
+        pending: list[tuple[TaskManifest, int, CheckpointKey]],
+        fixture: RuntimeFixture,
+        resolver: CredentialResolver,
+        ledger: BudgetLedger,
+        planned_by_identity: dict[tuple[str, str, str, int], CheckpointKey],
+        profiles: list[str],
+        lifecycle_cleanup_errors: list[Exception],
+        incomplete_reasons: set[str],
+        reports: dict[str, Any],
+    ) -> None:
+        model = build_model(model_spec)
+        executor = TrialExecutor(
+            self.manifest,
+            arm=self.arm,
+            model_spec=model_spec,
+            model=model,
+            transport=transport,
+            fixture=fixture,
+            token_for=resolver.token_for,
+            secrets_for=resolver.secrets_for,
+            ledger=ledger,
+            timing_sink=self._timing.record if self._timing is not None else None,
+        )
+        report_fragments: list[dict[str, Any]] = []
+        for repeat_index in sorted({item[1] for item in pending}):
+            repeat_trials = [item for item in pending if item[1] == repeat_index]
+            selected_tasks = [item[0] for item in repeat_trials]
+            repeat_indices = {task.id: repeat_index for task in selected_tasks}
+
+            async def checkpoint_sink(
+                outcome: TrialOutcome,
+                status: Literal["completed", "failed", "incomplete"],
+                *,
+                target_run_key: str = run_key,
+            ) -> None:
+                identity = self._trial_identity(outcome)
+                checkpoint_key = planned_by_identity.get(identity)
+                if checkpoint_key is None:
+                    raise RuntimeContractError("trial outcome is not an exact planned checkpoint input")
+                await self._checkpoint_trial(
+                    target_run_key,
+                    checkpoint_key,
+                    outcome,
+                    status=status,
+                )
+
+            local_failures: list[Exception] = []
+            if self._timing is None:
+                report = await evaluate_dataset(
+                    selected_tasks,
+                    manifest=self.manifest,
+                    executor=executor,
+                    fixture=fixture,
+                    failure_sink=local_failures,
+                    cleanup_sink=lifecycle_cleanup_errors,
+                    refresh_token=self._refresh_token,
+                    mark_reset_complete=resolver.mark_reset_complete,
+                    repeat=1,
+                    repeat_indices=repeat_indices,
+                    checkpoint_sink=checkpoint_sink,
+                )
+            else:
+                with self._timing.measure("model_execution"):
+                    report = await evaluate_dataset(
+                        selected_tasks,
+                        manifest=self.manifest,
+                        executor=executor,
+                        fixture=fixture,
+                        failure_sink=local_failures,
+                        cleanup_sink=lifecycle_cleanup_errors,
+                        refresh_token=self._refresh_token,
+                        mark_reset_complete=resolver.mark_reset_complete,
+                        repeat=1,
+                        repeat_indices=repeat_indices,
+                        checkpoint_sink=checkpoint_sink,
+                    )
+            if local_failures:
+                raise local_failures[0]
+            outcomes = outcomes_from_report(
+                report,
+                1,
+                repeat_indices=repeat_indices,
+            )
+            for outcome in outcomes:
+                self._record_trial(run_key, outcome)
+            report_fragments.append(serialize_report(report, self.secrets))
+            self._refresh_secrets(resolver)
+            incomplete_reasons.update(
+                outcome.error
+                for outcome in outcomes
+                if outcome.error and outcome.error.startswith("benchmark incomplete:")
+            )
+        reports[run_key] = {
+            "catalog_keys": sorted(
+                f"{transport}:{profile}"
+                for profile in profiles
+                if any(
+                    task.fixture.credential_profile == profile and transport in task.fixture.transports
+                    for task in self.tasks
+                )
+            ),
+            "report": report_fragments,
+            "trials": [outcome.model_dump(mode="json") for outcome in self._completed_trials[run_key]],
+            "summary": summarize_outcomes(self._completed_trials[run_key]),
+        }
+
     async def run(self) -> dict[str, Any]:
-        started = time.perf_counter()
-        preflight = await self.preflight()
+        timing = TimingTracker()
+        self._timing = timing
+        started = timing.started_at
+        with timing.measure("provisioning"):
+            preflight = await self.preflight()
         runtime = preflight["runtime"]
         resolver: CredentialResolver = preflight["resolver"]
+        self._resolver = resolver
         source_revision = runtime["source_revision"]
         artifact_versions = runtime["artifact_versions"]
         ledger = BudgetLedger(self.manifest)
         catalogs: dict[str, Any] = {}
         reports: dict[str, Any] = {}
         incomplete_reasons: set[str] = set()
-        lifecycle_failures: list[Exception] = []
         lifecycle_cleanup_errors: list[Exception] = []
         current_stage = "run_initialization"
         self._refresh_secrets(resolver)
@@ -799,6 +1057,10 @@ class BenchmarkRunner:
             planned_keys=planned_keys,
         )
         if self._checkpoint_store is not None:
+            self._timing_attempt_index = self._checkpoint_store.next_timing_attempt_index()
+            initial_timing = self._timing_snapshot()
+            assert initial_timing is not None
+            await asyncio.to_thread(self._checkpoint_store.update_timing, initial_timing)
             spent = self._checkpoint_store.document.spent
             ledger.restore(
                 model_requests=spent.model_requests,
@@ -823,14 +1085,28 @@ class BenchmarkRunner:
             ]
             for run_key, trials in planned_by_run.items()
         }
-        fixture = RuntimeFixture(self.descriptor)
+        cell_descriptors = self._cell_descriptors()
+        if self.descriptor.benchmark_cells:
+            fixtures = {
+                key: RuntimeFixture(descriptor)
+                for key, descriptor in cell_descriptors.items()
+            }
+        else:
+            shared_fixture = RuntimeFixture(self.descriptor)
+            fixtures = {key: shared_fixture for key in cell_descriptors}
+        for cell_fixture in {id(item): item for item in fixtures.values()}.values():
+            self._attach_timing(cell_fixture, timing)
+        fixture = next(iter(fixtures.values()))
         primary_error: Exception | None = None
         try:
             current_stage = "runtime_readiness"
-            await fixture.wait_until_ready(stage="runtime_readiness")
+            await asyncio.gather(
+                *(item.wait_until_ready(stage="runtime_readiness") for item in {id(value): value for value in fixtures.values()}.values())
+            )
             current_stage = "credential_preparation"
             profiles = resolver.required_profiles(self.tasks)
-            await resolver.prepare(fixture, profiles)
+            with timing.measure("credential"):
+                await resolver.prepare(fixture, profiles)
             self._refresh_secrets(resolver)
             for transport in self.manifest.transports:
                 for profile in profiles:
@@ -844,18 +1120,20 @@ class BenchmarkRunner:
                         if transport == "http"
                         else artifact_versions["proxy_artifact_version"]
                     )
-                    catalogs[f"{transport}:{profile}"] = await capture_catalog(
-                        fixture,
-                        transport=transport,
-                        token=token,
-                        source_revision=source_revision,
-                        artifact_version=artifact_version,
-                        capability_profile=_capability_profile(self.descriptor, runtime, transport, profile),
-                    )
+                    catalog_fixture = fixtures[f"{self.manifest.models[0].class_name}:{transport}"]
+                    with timing.measure("catalog_capture"):
+                        catalogs[f"{transport}:{profile}"] = await capture_catalog(
+                            catalog_fixture,
+                            transport=transport,
+                            token=token,
+                            source_revision=source_revision,
+                            artifact_version=artifact_version,
+                            capability_profile=_capability_profile(self.descriptor, runtime, transport, profile),
+                        )
 
             if any(pending_by_run.values()) or self._checkpoint_store is not None:
                 current_stage = "smoke_gate"
-                await self._run_smoke_gate(fixture=fixture, resolver=resolver, ledger=ledger)
+                await self._run_smoke_gate(fixtures=fixtures, resolver=resolver, ledger=ledger)
             else:
                 self._smoke_gate = {
                     "status": "not_required",
@@ -863,96 +1141,48 @@ class BenchmarkRunner:
                     "cells": [],
                 }
 
-            for model_spec in self.manifest.models:
-                for transport in self.manifest.transports:
-                    run_key = f"{model_spec.class_name}:{transport}"
-                    pending = pending_by_run.get(run_key, [])
-                    if not pending:
-                        continue
-                    current_stage = f"model_build:{model_spec.class_name}"
-                    model = build_model(model_spec)
-                    current_stage = f"evaluation:{run_key}"
-                    executor = TrialExecutor(
-                        self.manifest,
-                        arm=self.arm,
-                        model_spec=model_spec,
-                        model=model,
-                        transport=transport,
-                        fixture=fixture,
-                        token_for=resolver.token_for,
-                        secrets_for=resolver.secrets_for,
-                        ledger=ledger,
+            jobs = [
+                (model_spec, transport, f"{model_spec.class_name}:{transport}")
+                for model_spec in self.manifest.models
+                for transport in self.manifest.transports
+                if pending_by_run.get(f"{model_spec.class_name}:{transport}")
+            ]
+            if self.descriptor.benchmark_cells:
+                await asyncio.gather(
+                    *(
+                        self._run_cell(
+                            run_key=run_key,
+                            model_spec=model_spec,
+                            transport=transport,
+                            pending=pending_by_run[run_key],
+                            fixture=fixtures[run_key],
+                            resolver=resolver,
+                            ledger=ledger,
+                            planned_by_identity=planned_by_identity,
+                            profiles=profiles,
+                            lifecycle_cleanup_errors=lifecycle_cleanup_errors,
+                            incomplete_reasons=incomplete_reasons,
+                            reports=reports,
+                        )
+                        for model_spec, transport, run_key in jobs
                     )
-                    report_fragments: list[dict[str, Any]] = []
-                    for repeat_index in sorted({item[1] for item in pending}):
-                        repeat_trials = [item for item in pending if item[1] == repeat_index]
-                        selected_tasks = [item[0] for item in repeat_trials]
-                        repeat_indices = {task.id: repeat_index for task in selected_tasks}
-
-                        async def checkpoint_sink(
-                            outcome: TrialOutcome,
-                            status: Literal["completed", "failed", "incomplete"],
-                            *,
-                            target_run_key: str = run_key,
-                        ) -> None:
-                            identity = self._trial_identity(outcome)
-                            checkpoint_key = planned_by_identity.get(identity)
-                            if checkpoint_key is None:
-                                raise RuntimeContractError("trial outcome is not an exact planned checkpoint input")
-                            await self._checkpoint_trial(
-                                target_run_key,
-                                checkpoint_key,
-                                outcome,
-                                status=status,
-                            )
-
-                        report = await evaluate_dataset(
-                            selected_tasks,
-                            manifest=self.manifest,
-                            executor=executor,
-                            fixture=fixture,
-                            failure_sink=lifecycle_failures,
-                            cleanup_sink=lifecycle_cleanup_errors,
-                            refresh_token=resolver.refresh_after_reset,
-                            mark_reset_complete=resolver.mark_reset_complete,
-                            repeat=1,
-                            repeat_indices=repeat_indices,
-                            checkpoint_sink=checkpoint_sink,
-                        )
-                        if lifecycle_failures:
-                            raise lifecycle_failures[0]
-                        outcomes = outcomes_from_report(
-                            report,
-                            1,
-                            repeat_indices=repeat_indices,
-                        )
-                        for outcome in outcomes:
-                            self._record_trial(run_key, outcome)
-                        report_fragments.append(serialize_report(report, self.secrets))
-                        self._refresh_secrets(resolver)
-                        incomplete_reasons.update(
-                            outcome.error
-                            for outcome in outcomes
-                            if outcome.error and outcome.error.startswith("benchmark incomplete:")
-                        )
-                        reports[run_key] = {
-                            "catalog_keys": sorted(
-                                f"{transport}:{profile}"
-                                for profile in profiles
-                                if any(
-                                    task.fixture.credential_profile == profile and transport in task.fixture.transports
-                                    for task in self.tasks
-                                )
-                            ),
-                            "report": report_fragments,
-                            "trials": [outcome.model_dump(mode="json") for outcome in self._completed_trials[run_key]],
-                            "summary": summarize_outcomes(self._completed_trials[run_key]),
-                        }
-            discover = getattr(fixture, "discover", None)
-            if callable(discover):
-                final_discovery = await discover()
-                if isinstance(final_discovery, dict):
-                    runtime = {**runtime, "discovery": final_discovery}
+                )
+            else:
+                for model_spec, transport, run_key in jobs:
+                    await self._run_cell(
+                        run_key=run_key,
+                        model_spec=model_spec,
+                        transport=transport,
+                        pending=pending_by_run[run_key],
+                        fixture=fixtures[run_key],
+                        resolver=resolver,
+                        ledger=ledger,
+                        planned_by_identity=planned_by_identity,
+                        profiles=profiles,
+                        lifecycle_cleanup_errors=lifecycle_cleanup_errors,
+                        incomplete_reasons=incomplete_reasons,
+                        reports=reports,
+                    )
         except Exception as exc:
             primary_error = exc
             if current_stage == "smoke_gate" and self._smoke_gate.get("status") == "in_progress":
@@ -963,12 +1193,34 @@ class BenchmarkRunner:
                     except Exception:
                         pass
         finally:
+            async def cleanup_fixture_state() -> None:
+                mark_reset_complete = getattr(resolver, "mark_reset_complete", None)
+                if callable(mark_reset_complete):
+                    mark_reset_complete()
+                unique_fixtures = list({id(item): item for item in fixtures.values()}.values())
+                await asyncio.gather(*(item.reset() for item in unique_fixtures))
+
             cleanup_errors = await _collect_cleanup_errors(
+                cleanup_fixture_state,
                 lambda: resolver.cleanup(fixture),
-                fixture.close,
+                *(
+                    item.close
+                    for item in {id(value): value for value in fixtures.values()}.values()
+                ),
             )
         self._refresh_secrets(resolver)
         cleanup_errors = [*lifecycle_cleanup_errors, *cleanup_errors]
+        timing_payload: dict[str, Any] = timing.snapshot(attempt_index=self._timing_attempt_index)
+        if self._checkpoint_store is not None:
+            try:
+                async with self._checkpoint_lock:
+                    await asyncio.to_thread(
+                        self._checkpoint_store.finalize_timing,
+                        timing_payload,
+                    )
+                timing_payload = self._checkpoint_store.document.timing.model_dump(mode="json")
+            except Exception as exc:
+                cleanup_errors.append(exc)
         if primary_error is None and cleanup_errors:
             primary_error = cleanup_errors[0]
         if primary_error is not None:
@@ -986,6 +1238,8 @@ class BenchmarkRunner:
                 failure_stage=_exception_stage(primary_error, current_stage),
                 cleanup_errors=cleanup_errors,
                 fixture=fixture,
+                fixtures=fixtures,
+                timing=timing_payload,
                 end_to_end_wall_seconds=time.perf_counter() - started,
                 smoke_gate=self._smoke_gate,
             )
@@ -1003,6 +1257,8 @@ class BenchmarkRunner:
             reports=reports,
             incomplete_reasons=incomplete_reasons,
             fixture=fixture,
+            fixtures=fixtures,
+            timing=timing_payload,
             end_to_end_wall_seconds=time.perf_counter() - started,
             smoke_gate=self._smoke_gate,
         )

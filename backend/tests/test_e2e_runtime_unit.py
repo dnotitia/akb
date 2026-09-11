@@ -20,6 +20,9 @@ sys.path.insert(0, str(CI_DIR))
 
 from e2e_runtime import (  # noqa: E402
     BlockedRuntimeConfig,
+    BENCHMARK_CELL_KEYS,
+    BenchmarkCellProcess,
+    BenchmarkCellSupervisor,
     CapabilityProfile,
     CredentialNames,
     E2ERuntime,
@@ -182,6 +185,43 @@ def test_frontend_runtime_requires_explicit_flag_and_supports_isolated_port():
     )
     assert configured.frontend_enabled is True
     assert configured.frontend_port == 3017
+
+
+def test_runtime_accepts_isolated_dependency_ports_for_benchmark_cells():
+    configured = _parse_args(
+        [
+            "serve",
+            "--postgres-port",
+            "15532",
+            "--minio-port",
+            "9100",
+        ]
+    )
+
+    assert configured.postgres_port == 15532
+    assert configured.minio_port == 9100
+
+
+def test_benchmark_cell_supervisor_assigns_isolated_ports_and_descriptor_cells(tmp_path):
+    config = dataclasses.replace(
+        make_config(tmp_path),
+        profile="transport-proxy",
+        scenario="app-control-plane",
+    )
+    supervisor = BenchmarkCellSupervisor(config)
+    commands = [supervisor._child_command(key, index, tmp_path / key.replace(":", "-")) for index, key in enumerate(BENCHMARK_CELL_KEYS)]
+
+    assert len({command[command.index("--app-port") + 1] for command in commands}) == 4
+    assert len({command[command.index("--postgres-port") + 1] for command in commands}) == 4
+    assert len({command[command.index("--compose-project") + 1] for command in commands}) == 4
+
+    base_descriptor = E2ERuntime(config).descriptor()
+    cells = [
+        BenchmarkCellProcess(key, object(), base_descriptor)  # type: ignore[arg-type]
+        for key in BENCHMARK_CELL_KEYS
+    ]
+    combined = supervisor.descriptor(cells)
+    assert set(combined["benchmark_cells"]) == set(BENCHMARK_CELL_KEYS)
 
 
 def test_frontend_owns_package_script_and_toolchain_contract():

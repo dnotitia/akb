@@ -146,6 +146,25 @@ def test_schema_v2_descriptor_resolves_exact_source_and_artifacts() -> None:
     }
 
 
+def test_benchmark_cell_descriptors_are_explicit_and_non_nested() -> None:
+    raw = descriptor_dict()
+    raw["benchmark_cells"] = {
+        "primary:http": descriptor_dict(),
+        "primary:stdio": descriptor_dict(),
+    }
+
+    descriptor = RuntimeDescriptor.from_dict(raw)
+
+    assert set(descriptor.benchmark_cells) == {"primary:http", "primary:stdio"}
+    assert descriptor.cell_for("primary:http") is descriptor.benchmark_cells["primary:http"]
+    assert descriptor.cell_for("missing") is descriptor
+
+    nested = descriptor_dict()
+    nested["benchmark_cells"] = {"nested": raw}
+    with pytest.raises(RuntimeContractError, match="cannot be nested"):
+        RuntimeDescriptor.from_dict(nested)
+
+
 def test_descriptor_rejects_cross_origin_reset() -> None:
     raw = descriptor_dict()
     raw["services"]["fixture"]["reset"]["url"] = "http://other.invalid/reset"

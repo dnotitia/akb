@@ -99,8 +99,10 @@ uv run --locked --extra dev --project backend python -m pytest \
 The descriptor must come from `scripts/ci/e2e_runtime.py serve` or the
 Ubuntu bootstrap. The fixture consumes the descriptor's app/fixture origins,
 health and reset operations, discovery-declared credential environment names,
-and the existing `empty` reset contract. It does not create another backend,
-database, port topology, or credential fixture.
+and the existing `empty` reset contract. A normal descriptor does not create
+another backend, database, port topology, or credential fixture; the explicit
+catalog-benchmark descriptor is the exception and carries its four isolated
+cell descriptors in `benchmark_cells`.
 
 ### 2. Repository-owned isolated runtime
 
@@ -149,10 +151,17 @@ The supervisor has two modes:
   (default `3000`), with its `/api` and `/mcp` proxy pointed at this run's
   backend origin. The fixture's
   `POST /reset` performs an in-place scenario reset: it preserves the
-  PostgreSQL/MinIO containers, Compose network, and volumes while clearing
-  application schema, object, and Git fixture data, then waits for backend
-  readiness again; the frontend process remains owned by the same serve
-  lifecycle.
+  PostgreSQL/MinIO containers, Compose network/volumes, and managed backend,
+  embedding, and stdio process identities while clearing application rows,
+  objects, and Git fixture data, then waits for backend readiness again; the
+  frontend process remains owned by the same serve lifecycle.
+
+For the `transport-proxy` + `app-control-plane` benchmark profile, `serve`
+starts four isolated child runtimes (`primary/lightweight × http/stdio`) over
+separate Compose projects and ports. The parent prints one schema-v2 descriptor
+whose `benchmark_cells` map contains each child descriptor. Each child keeps its
+own mutable fixture namespace while the benchmark runner executes the four cells
+in parallel and keeps trials within one cell serial.
 
 Each invocation also selects one explicit capability profile. The default
 `tool-only` profile starts only the HTTP backend, PAT fixture, and shared
@@ -399,6 +408,8 @@ When changing this area, preserve all of the following:
 - descriptor stdout stays parseable as one schema v2 JSON line; and
 - fixture reset keeps PostgreSQL/MinIO dependency identities stable and
   publishes the reset count, duration, and preservation evidence; and
+- the catalog benchmark's four cell runtimes remain isolated, with parallel
+  cells and serial mutable-state trials inside each cell; and
 - runtime state stays private and outside the checkout.
 
 Run the focused runtime tests and the static checks described in the

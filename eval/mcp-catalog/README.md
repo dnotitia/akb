@@ -58,9 +58,10 @@ uv run --locked --project eval/mcp-catalog \
 ```
 
 descriptor는 repository-owned schema-v2 `serve --profile transport-proxy`가
-stdout에 제공한 ready JSON이어야 한다. benchmark가 runtime을 시작하거나
-warm하지 않는다. runtime supervisor와 같은 stdin handoff를 사용할 때는
-`--descriptor -`를 쓴다.
+stdout에 제공한 ready JSON이어야 한다. `app-control-plane` benchmark runtime은
+model×transport별 isolated child descriptor 네 개를 `benchmark_cells`에 함께
+제공하며, benchmark가 runtime을 시작하거나 warm하지 않는다. runtime supervisor와
+같은 stdin handoff를 사용할 때는 `--descriptor -`를 쓴다.
 
 ### Runtime credential handoff
 
@@ -187,11 +188,21 @@ evidence는 redacted exception chain, HTTP status와 `failure_kind`(`provider`,
 retry/fallback 없이 resume에서만 다시 실행한다.
 
 runtime supervisor의 fixture reset은 PostgreSQL/MinIO Compose dependency
-container, network, volume을 내리지 않고 유지한다. backend/embed/stdio만
-교체하고 PostgreSQL application schema, MinIO object, Git fixture data를
-in-place로 비운 뒤 fresh backend migration/seed와 새 stdio session을 시작한다.
-reset 전후 dependency identity가 달라지면 reset은 실패하며, reset count/time과
-identity 보존 결과를 evidence에 기록한다.
+container, network, volume과 backend/embed/stdio process identity를 내리지 않고
+유지한다. PostgreSQL application rows, MinIO object, Git fixture data만
+in-place로 비운 뒤 seed하고, benchmark의 네 cell은 서로 다른 runtime/Compose
+project로 격리된다. reset 전후 identity가 달라지면 reset은 실패하며, reset
+count/time과 identity 보존 결과를 evidence에 기록한다. 인접 trial 사이에는
+teardown reset을 중복 실행하지 않고 다음 setup이 하나의 reset boundary를
+소유한다.
+
+artifact와 checkpoint의 timing에는 resume 전후 모든 attempt의 누적
+`end_to_end_wall_seconds`와 provisioning, credential, catalog capture,
+fixture reset, provider-wait, model execution, checkpoint, 기타 overhead breakdown이
+포함된다. OpenRouter 429/rate-limit 구간은 provider failure로 보존하면서
+`provider_wait`에 별도 배정한다.
+겹치는 병렬 구간은 한 번만 wall time에 배정되며, breakdown 합은 해당 attempt의
+실제 elapsed wall time과 일치한다.
 
 ## Evidence
 
