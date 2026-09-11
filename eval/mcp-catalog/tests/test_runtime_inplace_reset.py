@@ -39,7 +39,7 @@ def test_runtime_reset_is_in_place_and_checks_dependency_identity() -> None:
     assert {"_dependency_identity_snapshot", "_reset_postgres_in_place", "_clear_minio_objects"} <= called
 
 
-def test_benchmark_reset_keeps_runtime_processes_and_reseeds_without_bootstrap() -> None:
+def test_reset_keeps_runtime_processes_and_reseeds_without_bootstrap() -> None:
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
     reset = next(
         node

@@ -25,6 +25,7 @@ server = [
 
 [project.scripts]
 mcp-catalog-bench = "mcp_catalog.cli:main"
+mcp-catalog-runtime = "mcp_catalog.benchmark_runtime:main"
 
 [build-system]
 requires = ["hatchling"]
