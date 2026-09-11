@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import httpx
 import pytest
 
 from mcp_catalog.contracts import load_run_manifest
 from mcp_catalog.runner import CredentialResolver, NeedsUserInput
-from mcp_catalog.runtime import RuntimeContractError, RuntimeDescriptor
+from mcp_catalog.runtime import RuntimeContractError, RuntimeDescriptor, RuntimeFixture
 from test_runtime_contract import descriptor_dict
 
 ROOT = Path(__file__).parents[1]
@@ -158,3 +159,36 @@ async def test_cleanup_does_not_swallow_a_real_cell_transport_failure(
         await resolver.cleanup(fixture)
 
     assert resolver.minted_tokens == [("failure-token", "failure-id")]
+
+
+@pytest.mark.asyncio
+async def test_reset_stale_pat_403_is_idempotent_but_active_pat_403_fails() -> None:
+    descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
+    fixture = RuntimeFixture(descriptor)
+    await fixture.close()
+
+    async def return_forbidden(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, request=request)
+
+    fixture.client = httpx.AsyncClient(transport=httpx.MockTransport(return_forbidden))
+
+    stale = _resolver()
+    stale.tokens = {"default": "stale-token"}
+    stale.minted_tokens = [("stale-token", "stale-token-id")]
+    stale.token_fixtures["stale-token"] = fixture
+    stale.issued_tokens.add("stale-token")
+    stale.mark_reset_complete()
+
+    await stale.cleanup(fixture)
+    assert stale.minted_tokens == []
+
+    active = _resolver()
+    active.tokens = {"default": "active-token"}
+    active.minted_tokens = [("active-token", "active-token-id")]
+    active.token_fixtures["active-token"] = fixture
+    active.issued_tokens.add("active-token")
+
+    with pytest.raises(RuntimeContractError, match="cleanup failed"):
+        await active.cleanup(fixture)
+    assert active.minted_tokens == [("active-token", "active-token-id")]
+    await fixture.close()
