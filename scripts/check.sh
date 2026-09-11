@@ -134,11 +134,7 @@ echo "  mypy + bandit parse Python ${REQUIRED_PYTHON}"
 # not run this script. Say it here and in CONTRIBUTING.md.
 node_install_command() {   # $1 = project directory
   if [ -f "$1/pnpm-lock.yaml" ]; then
-    if [ "$1" = "frontend" ]; then
-      printf '(npm install --global npm@11.16.0 && cd %s && pnpm install --frozen-lockfile)' "$1"
-    else
-      printf '(cd %s && pnpm install --frozen-lockfile)' "$1"
-    fi
+    printf '(cd %s && pnpm install --frozen-lockfile)' "$1"
   else
     printf '(cd %s && npm ci)' "$1"
   fi
@@ -243,9 +239,8 @@ step "eslint (frontend)"
 # ─── frontend: tsc --noEmit (type) ────────────────────────────────
 # `frontend/` has its own tsconfig; running tsc from inside the dir
 # picks it up automatically. node_modules must already be installed —
-# CI installs npm 11.16.0 before the frontend's plain `pnpm install
-# --frozen-lockfile` so the Git package's nested prepare keeps peer validation
-# enabled without npm 10's Arborist peer-tree crash.
+# CI installs the frontend workspace before this script so its sibling
+# markdown-editor package is built and linked for the frontend checks.
 step "tsc (frontend)"
 (cd frontend && npx --no-install tsc --noEmit)
 

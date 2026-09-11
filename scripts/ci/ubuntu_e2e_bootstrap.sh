@@ -225,8 +225,6 @@ if [ "$WITH_FRONTEND" -eq 1 ]; then
     "node@$FRONTEND_NODE_VERSION" "pnpm@$FRONTEND_PNPM_VERSION" \
     || die "Node.js/pnpm frontend toolchain installation failed"
   export PATH="/usr/local/bin:$PATH"
-  "${SUDO[@]}" npm install --global --prefix /usr/local npm@11.16.0 \
-    || die "npm frontend toolchain installation failed"
   NODE_VERSION=$(node --version) \
     || die "Node.js version check failed for the frontend runtime"
   [ "$NODE_VERSION" = "v$FRONTEND_NODE_VERSION" ] \

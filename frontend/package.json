@@ -55,7 +55,7 @@
   },
   "dependencies": {
     "@fontsource-variable/jetbrains-mono": "^5.2.8",
-    "@akb/markdown-editor": "git+https://github.com/dnotitia/akb.git#e86537fc0681d75d9b9251c5774adbf9b8b974cf&path:/packages/markdown-editor",
+    "@akb/markdown-editor": "workspace:*",
     "@radix-ui/react-avatar": "^1.1.11",
     "@radix-ui/react-dialog": "^1.1.15",
     "@radix-ui/react-dropdown-menu": "^2.1.16",

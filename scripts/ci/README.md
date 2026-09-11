@@ -260,7 +260,6 @@ To run the existing frontend against that isolated backend, install the
 frontend's locked dependencies first, then use the public `serve` entrypoint:
 
 ```bash
-npm install --global npm@11.16.0
 (cd frontend && pnpm install --frozen-lockfile)
 RUNTIME_ROOT="$(mktemp -d /tmp/akb-fe-runtime.XXXXXX)"
 export AKB_E2E_USERNAME="$(uv run --locked --project backend python -c \

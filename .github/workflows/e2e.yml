@@ -41,9 +41,7 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: frontend
-        run: |
-          npm install --global npm@11.16.0
-          pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Install Chromium for the real frontend smoke
         working-directory: frontend
@@ -112,9 +110,7 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: frontend
-        run: |
-          npm install --global npm@11.16.0
-          pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Build frontend production bundle
         working-directory: frontend

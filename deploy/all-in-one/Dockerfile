@@ -31,16 +31,17 @@
 FROM node:22-slim AS frontend-builder
 
 WORKDIR /src
-COPY frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml ./
-RUN npm install --global npm@11.16.0
-RUN corepack enable && corepack prepare "$(node -p 'require("./package.json").packageManager')" --activate
-# The Git-pinned shared Markdown package needs its artifact-scoped prepare
-# build before Vite bundles the frontend. npm 11.16 keeps peer validation enabled
-# while avoiding npm 10's Arborist peer-tree crash.
+COPY pnpm-workspace.yaml ./
+COPY frontend/package.json frontend/pnpm-lock.yaml ./frontend/
+COPY packages/markdown-editor/package.json packages/markdown-editor/pnpm-lock.yaml packages/markdown-editor/tsconfig.json packages/markdown-editor/tsconfig.build.json ./packages/markdown-editor/
+COPY packages/markdown-editor/src ./packages/markdown-editor/src
+RUN corepack enable && corepack prepare "$(node -p 'require("./frontend/package.json").packageManager')" --activate
+# The workspace install runs the common package's prepare build before Vite;
+# the workspace allowBuilds list stays limited to esbuild/msw.
 RUN pnpm install --frozen-lockfile
 
-COPY frontend/ ./
-RUN npx vite build
+COPY frontend/ ./frontend/
+RUN pnpm --filter frontend run build
 
 # ---------- final image ----------
 FROM pgvector/pgvector:pg16
@@ -101,7 +102,7 @@ COPY backend /app/backend
 RUN rm -rf /app/backend/config
 
 # Frontend static bundle.
-COPY --from=frontend-builder /src/dist /var/www/akb
+COPY --from=frontend-builder /src/frontend/dist /var/www/akb
 
 # All-in-one bundle config + supervisord + nginx + entrypoint.
 COPY deploy/all-in-one/app.yaml /opt/akb/app.yaml

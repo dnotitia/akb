@@ -123,7 +123,6 @@ For an isolated browser session, the same runtime can own the existing Vite
 frontend and point its `/api` and `/mcp` proxy at the run's backend:
 
 ```bash
-npm install --global npm@11.16.0
 (cd frontend && pnpm install --frozen-lockfile)
 uv run --locked --project backend python \
   scripts/ci/e2e_runtime.py serve \
@@ -175,10 +174,8 @@ separate `node_modules`, and the gate runs steps in each. They are not all the
 same package manager. Installing only some of them is the common mistake:
 
 ```bash
-npm install --global npm@11.16.0
 (cd frontend && pnpm install --frozen-lockfile)
 (cd packages/akb-client && pnpm install --frozen-lockfile)
-(cd packages/markdown-editor && pnpm install --frozen-lockfile)
 (cd packages/akb-mcp-client && npm ci)
 ```
 

@@ -47,23 +47,15 @@ jobs:
         run: npm ci
       - name: Install frontend deps
         working-directory: frontend
-        # The Git-pinned @akb/markdown-editor consumer is source-only and
-        # needs its resolved artifact's prepare build to create dist/. Keep
-        # the repository-scoped allowBuilds list narrow; do not replace this
-        # with a global scripts allowance or a local source copy.
-        run: |
-          npm install --global npm@11.16.0
-          pnpm install --frozen-lockfile
+        # The frontend workspace install also prepares the sibling
+        # packages/markdown-editor package before the frontend checks run.
+        run: pnpm install --frozen-lockfile
       - name: Install @akb/client deps
         working-directory: packages/akb-client
         # Its own pnpm store: typescript + vitest. No postinstall build
         # scripts, so a plain frozen install is enough for `pnpm run build`
         # (tsc emit) and `pnpm exec vitest run` in scripts/check.sh.
         run: pnpm install --frozen-lockfile
-      - name: Install Markdown editor deps
-        working-directory: packages/markdown-editor
-        run: pnpm install --frozen-lockfile --ignore-scripts
-
       # ── Single entry point so CI and local pre-commit stay in sync ──
       - name: Run scripts/check.sh
         run: bash scripts/check.sh

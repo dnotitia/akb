@@ -1,0 +1,7 @@
+packages:
+  - frontend
+  - packages/markdown-editor
+sharedWorkspaceLockfile: false
+allowBuilds:
+  esbuild: true
+  msw: true
