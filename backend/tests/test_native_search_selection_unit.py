@@ -454,6 +454,47 @@ async def test_native_candidate_unparseable_envelope_is_counted_not_dropped_sile
     assert stats == {"unparseable_envelope": 1}
 
 
+@pytest.mark.asyncio
+async def test_native_candidate_slice_cut_mid_codepoint_still_filters():
+    """A byte-cut slice ending inside a multibyte character decodes after
+    trimming the partial tail — the envelope is still parsed, not counted
+    as unparseable. Only genuinely invalid bytes stay unparseable."""
+    from app.services.search_service import _decode_slice_prefix
+
+    # '가' = 3 bytes in UTF-8; cut after the first byte.
+    full = "---\ntitle: 가\n---\nbody\n".encode("utf-8")
+    cut = full[:len("---\ntitle: ".encode("utf-8")) + 1]
+    assert _decode_slice_prefix(cut) == "---\ntitle: "
+    # Genuinely invalid bytes (not a cut tail) stay None.
+    assert _decode_slice_prefix(b"---\ntitle: \xff\xfe\n---\n") is None
+
+    row = {
+        "resource_id": uuid.uuid4(),
+        "current_path": "korean.md",
+        "vault_name": "measure",
+        "byte_size": len(full),
+        "digest": "0" * 64,
+        "encoding": "utf-8",
+        "selected_placement": M1ReferencePayloadStore.selected_placement,
+        "verification_profile": "sha256-size-utf8-v1",
+        "body_slice": full,
+    }
+    conn = _CandidateConn(resource_count=1, body_bytes=len(full), rows=[row])
+    candidates, stats = await SearchService()._native_document_candidates(
+        conn,
+        user_uuid=None,
+        is_admin=True,
+        vaults=None,
+        collection=None,
+        doc_type=None,
+        tags=None,
+        include_archived=False,
+        source_uris=None,
+    )
+    assert candidates == [str(row["resource_id"])]
+    assert stats == {}
+
+
 class _HydrationConn:
     def __init__(self, row):
         self.row = row

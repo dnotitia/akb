@@ -482,18 +482,44 @@ def _filtered_native_metadata(row) -> dict | None:
     fields may lie beyond the slice, so the caller must exclude + count the
     resource rather than filter it on defaults. A body with no leading `---`
     parses normally (plain Markdown: defaults apply).
+
+    The slice is byte-cut (`substring(bytes ...)`), so it can end mid-codepoint
+    on multibyte text. The trailing incomplete sequence (at most 3 bytes for
+    UTF-8) is trimmed before decoding — only a cut inside the first 8KiB+1
+    bytes triggers this, and dropping ≤3 tail bytes cannot hide a complete
+    envelope close. A body that is genuinely non-UTF-8 still returns None.
     """
     from app.services.document_service import _parse_markdown
 
     raw = bytes(row["body_slice"])
-    try:
-        text = raw.decode("utf-8", errors="strict")
-    except UnicodeDecodeError:
+    text = _decode_slice_prefix(raw)
+    if text is None:
         return None
     if not _slice_has_complete_frontmatter(text):
         return None
     metadata, _ = _parse_markdown(text)
     return metadata
+
+
+def _decode_slice_prefix(raw: bytes) -> str | None:
+    """Decode a byte-cut slice, trimming a trailing partial codepoint.
+
+    Tries strict decode first (the common case: cut landed on a character
+    boundary). On failure, drops up to 3 trailing bytes (the max length of an
+    incomplete UTF-8 sequence) and retries — progressively, so a body ending
+    in genuinely invalid bytes still returns None instead of silently
+    decoding past the corruption.
+    """
+    try:
+        return raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        pass
+    for cut in (1, 2, 3):
+        try:
+            return raw[:-cut].decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            continue
+    return None
 
 
 class SearchService:
