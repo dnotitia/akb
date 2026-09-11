@@ -47,12 +47,11 @@ jobs:
         run: npm ci
       - name: Install frontend deps
         working-directory: frontend
-        # `--ignore-scripts` skips package postinstall hooks. We don't need
-        # them in CI — msw's postinstall registers a browser service-worker
-        # bundle that node-only vitest/RTL never touches — and pnpm 10+
-        # exits non-zero on any unapproved build script even with
-        # `pnpm.onlyBuiltDependencies` set when run via the action.
-        run: pnpm install --frozen-lockfile --ignore-scripts
+        # The Git-pinned @akb/markdown-editor consumer is source-only and
+        # needs its resolved artifact's prepare build to create dist/. Keep
+        # the repository-scoped allowBuilds list narrow; do not replace this
+        # with a global scripts allowance or a local source copy.
+        run: pnpm install --frozen-lockfile
       - name: Install @akb/client deps
         working-directory: packages/akb-client
         # Its own pnpm store: typescript + vitest. No postinstall build

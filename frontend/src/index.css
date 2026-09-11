@@ -727,8 +727,8 @@ body::before {
 
 /* ── MarkdownRender (.akb-md) — KaTeX math ───────────────────────
    The shared <MarkdownRender> component styles block elements via its
-   components map; KaTeX, however, injects its own DOM (.katex-display)
-   that we can't reach through react-markdown's component overrides. So
+   editor surface; KaTeX, however, injects its own DOM (.katex-display)
+   that the shared viewer injects. So
    the display-math card + inline color land here, scoped to .akb-md. */
 .akb-md .katex { color: var(--color-foreground); }
 .akb-md .katex-display {

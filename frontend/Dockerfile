@@ -4,11 +4,10 @@ RUN npm install -g pnpm@latest
 
 WORKDIR /app
 COPY package.json pnpm-lock.yaml ./
-# `--ignore-scripts` skips devDependency postinstall hooks (e.g. msw's
-# service-worker bundle registration). The image only runs the built
-# SPA via nginx — none of those hooks are needed at runtime, and pnpm
-# 10+ otherwise exits non-zero when it sees them.
-RUN pnpm install --frozen-lockfile --ignore-scripts
+# The Git-pinned shared Markdown package runs its artifact-scoped prepare
+# build here so the production bundle consumes the resolved dist/. The
+# frontend workspace keeps third-party build approval narrow.
+RUN pnpm install --frozen-lockfile
 
 COPY . .
 RUN npx vite build

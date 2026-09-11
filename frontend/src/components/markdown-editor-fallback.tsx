@@ -1,9 +1,8 @@
 import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 
-// Separate module so the Suspense fallback ships in the main bundle —
-// importing it from `markdown-editor.tsx` would pull in the full Plate
-// chunk before the editor is needed, defeating the lazy split.
+// Separate module so the Suspense fallback stays in the main bundle while the
+// shared editor package remains lazy-loaded for authoring routes.
 export function MarkdownEditorFallback() {
   return (
     <LoadingState label="Loading editor" className="min-h-[300px] border border-border bg-surface px-5 py-5">

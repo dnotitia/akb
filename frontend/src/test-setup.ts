@@ -33,6 +33,30 @@ if (!Element.prototype.scrollIntoView) {
   Element.prototype.scrollIntoView = () => {};
 }
 
+// ProseMirror asks the browser for layout information while a contenteditable
+// selection is being moved. jsdom intentionally has no layout engine, so keep
+// the shared Tiptap surface deterministic in unit tests.
+const editorRect = {
+  bottom: 0,
+  height: 0,
+  left: 0,
+  right: 0,
+  top: 0,
+  width: 0,
+  x: 0,
+  y: 0,
+  toJSON: () => ({}),
+} as DOMRect;
+Object.defineProperty(document, "elementFromPoint", {
+  configurable: true,
+  value: () => document.body,
+});
+HTMLElement.prototype.getBoundingClientRect = () => editorRect;
+HTMLElement.prototype.getClientRects = () =>
+  [editorRect] as unknown as DOMRectList;
+Range.prototype.getBoundingClientRect = () => editorRect;
+Range.prototype.getClientRects = () => [editorRect] as unknown as DOMRectList;
+
 // jsdom doesn't implement matchMedia — stub it so theme hooks don't throw.
 if (typeof window.matchMedia === "undefined") {
   Object.defineProperty(window, "matchMedia", {

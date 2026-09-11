@@ -306,7 +306,7 @@ describe("MarkdownEditor image insertion", () => {
     fireEvent.click(screen.getByRole("button", { name: "Remove image: diagram" }));
 
     // Physical cleanup is deferred until the edit session ends so Save and
-    // Plate's Undo continue to reference the same asset.
+    // Editor Undo should continue to reference the same asset.
     expect(apiMocks.discardAsset).not.toHaveBeenCalled();
     unmount();
     await waitFor(() =>

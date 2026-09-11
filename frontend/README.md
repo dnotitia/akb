@@ -20,7 +20,7 @@ pnpm run test:e2e:real # Playwright against AKB_FRONTEND_URL from the runtime de
 ## Editing documents
 
 Two write surfaces live in the SPA — both reuse the same lazy-loaded
-[Plate](https://platejs.org)-based `MarkdownEditor`:
+`@akb/markdown-editor` Tiptap `MarkdownEditor`:
 
 - **New document** — `+ NEW DOC` link on the vault page, or
   `/vault/:name/doc/new`. Visible to writers/admins/owners. The form
@@ -58,11 +58,11 @@ recoverable drafts do not promise a longer attachment lifetime than the configur
 src/
   pages/                       route components
     document.tsx               read + edit body (Rendered / Raw / Agent / Edit)
-    document-new.tsx           create page with form + Plate body
+    document-new.tsx           create page with form + shared Markdown body
     vault.tsx                  vault home; `+ NEW DOC` entry point
     ...
   components/
-    markdown-editor.tsx        Plate editor (lazy chunk)
+    markdown-editor.tsx        shared Tiptap editor wrapper (lazy chunk)
     markdown-editor-fallback.tsx  Suspense placeholder (main bundle)
     document-view.tsx          Rendered/Raw/Agent + WAI-ARIA tab strip
     frontmatter-edit-dialog.tsx  metadata + optional body edit
@@ -75,8 +75,8 @@ src/
     markdown.ts                heading parsing for the outline
 ```
 
-The Plate chunk is ~260 KB gzipped and only loads when the user enters
-`EDIT` or `/doc/new`, so the read-only path is unaffected.
+The shared editor chunk only loads when the user enters `EDIT` or `/doc/new`,
+so the read-only path is unaffected.
 
 ## Testing
 

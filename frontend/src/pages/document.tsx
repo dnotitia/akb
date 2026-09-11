@@ -105,7 +105,7 @@ import {
   type DocumentTitleConflict,
 } from "@/lib/document-title-conflict";
 
-// Plate is heavy (~hundreds of KB gzipped); lazy-load so the read-only path
+// The shared editor package is lazy-loaded so the read-only path
 // (Rendered / Raw) stays cheap.
 const MarkdownEditor = lazy(() => import("@/components/markdown-editor"));
 const DocumentDiffView = lazy(() => import("@/components/document-diff-view"));
@@ -208,7 +208,7 @@ export default function DocumentPage({
   const diffOriginHashRef = useRef<string | null>(null);
   const wasDiffModeRef = useRef(false);
   const restoreEditFocusRef = useRef(false);
-  // Plate manages its own state; we remount via `editorKey` when hydrating
+  // The editor owns its document state; remount via `editorKey` when hydrating
   // a fresh server value rather than treating `value` as controlled.
   const [editingContent, setEditingContent] = useState("");
   const [editingTitle, setEditingTitle] = useState("");
@@ -241,7 +241,7 @@ export default function DocumentPage({
   const [draftNotice, setDraftNotice] = useState("");
   const [draftRecovery, setDraftRecovery] = useState<DocumentEditDraftLoadResult | null>(null);
   const [editorInitialContent, setEditorInitialContent] = useState("");
-  // Plate's markdown roundtrip is not byte-identity: adopt the first
+  // The editor's Markdown roundtrip is not byte-identity: adopt the first
   // post-hydration emission as the new `originalContent` baseline so the
   // editor doesn't flash "UNSAVED" the moment it mounts.
   const hydratedKey = useRef<number | null>(null);
