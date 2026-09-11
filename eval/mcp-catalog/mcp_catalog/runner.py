@@ -149,12 +149,17 @@ class CredentialResolver:
         for profile in profiles:
             env_name = self.env_name_for(profile)
             value = os.environ.get(env_name, "")
-            if value:
+            if value and not self.descriptor.benchmark_cells:
                 self.tokens[profile] = value
                 continue
             await self._mint(fixture, profile)
 
     def validate_inputs(self, profiles: list[str]) -> None:
+        if self.descriptor.benchmark_cells and not self._login_credentials_available():
+            raise NeedsUserInput(
+                "isolated benchmark cells require runtime login environments "
+                f"{self.descriptor.username_env}/{self.descriptor.password_env}"
+            )
         for profile in profiles:
             env_name = self.manifest.credential_profiles.get(profile)
             if env_name and os.environ.get(env_name):
@@ -1114,13 +1119,14 @@ class BenchmarkRunner:
                     if not selected_tasks:
                         continue
                     current_stage = f"catalog_capture:{transport}:{profile}"
-                    token = resolver.token_for(profile)
                     artifact_version = (
                         artifact_versions["backend_artifact_version"]
                         if transport == "http"
                         else artifact_versions["proxy_artifact_version"]
                     )
                     catalog_fixture = fixtures[f"{self.manifest.models[0].class_name}:{transport}"]
+                    token = await self._refresh_token(catalog_fixture, profile)
+                    self._refresh_secrets(resolver)
                     with timing.measure("catalog_capture"):
                         catalogs[f"{transport}:{profile}"] = await capture_catalog(
                             catalog_fixture,

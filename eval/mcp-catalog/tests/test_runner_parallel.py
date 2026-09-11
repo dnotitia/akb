@@ -34,7 +34,7 @@ class _ParallelResolver:
         return ("fixture-token",)
 
     async def refresh_after_reset(self, _fixture, _profile: str) -> str:
-        return "fresh-token"
+        return f"{_fixture.descriptor.app_origin}:fresh-token"
 
     def mark_reset_complete(self) -> None:
         return None
@@ -78,7 +78,20 @@ def _parallel_descriptor() -> RuntimeDescriptor:
     raw["services"]["fixture"]["reset"]["body"] = {"scenario": "app-control-plane"}
     descriptor = RuntimeDescriptor.from_dict(raw)
     keys = ("primary:http", "primary:stdio", "lightweight:http", "lightweight:stdio")
-    return dataclasses.replace(descriptor, benchmark_cells={key: descriptor for key in keys})
+    cells = {}
+    for index, key in enumerate(keys):
+        app_port = 8000 + index * 10
+        fixture_port = 8889 + index * 10
+        cells[key] = dataclasses.replace(
+            descriptor,
+            app_origin=f"http://127.0.0.1:{app_port}",
+            app_health_url=f"http://127.0.0.1:{app_port}/readyz",
+            fixture_origin=f"http://127.0.0.1:{fixture_port}",
+            fixture_health_url=f"http://127.0.0.1:{fixture_port}/health",
+            reset_url=f"http://127.0.0.1:{fixture_port}/reset",
+            discovery_url=f"http://127.0.0.1:{fixture_port}/discover",
+        )
+    return dataclasses.replace(descriptor, benchmark_cells=cells)
 
 
 def _outcome(task, model_spec, transport, repeat_index: int) -> TrialOutcome:
@@ -135,6 +148,7 @@ async def test_registered_cells_run_in_parallel_and_keep_deterministic_hash_inpu
         }
 
     async def fake_capture(*_args, **kwargs):
+        assert kwargs["token"] == f"{_args[0].descriptor.app_origin}:fresh-token"
         return CatalogSnapshot(
             transport=kwargs["transport"],
             source_revision="a" * 40,
