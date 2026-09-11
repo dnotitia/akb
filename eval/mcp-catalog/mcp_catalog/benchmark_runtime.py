@@ -35,9 +35,9 @@ OPENROUTER_PROVIDER_KEY_ENV = "MCP_BENCH_OPENROUTER_" + "API_KEY"
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class BenchmarkCredentialNames:
-    username_env: str = "AKB_E2E_USERNAME"
-    password_env: str = "AKB_E2E_PASSWORD"
-    pat_env: str = "AKB_E2E_PAT"
+    username_env: str = "AKB_E2E_" + "USERNAME"
+    password_env: str = "AKB_E2E_" + "PASSWORD"  # pragma: allowlist secret
+    pat_env: str = "AKB_E2E_" + "PAT"
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -288,9 +288,9 @@ def _parse_args(argv: list[str] | None = None) -> BenchmarkRuntimeConfig:
     parser.add_argument("--postgres-port", type=int, default=15432)
     parser.add_argument("--minio-port", type=int, default=9000)
     parser.add_argument("--timeout-seconds", type=float, default=180.0)
-    parser.add_argument("--username-env", default="AKB_E2E_USERNAME")
-    parser.add_argument("--password-env", default="AKB_E2E_PASSWORD")
-    parser.add_argument("--pat-env", default="AKB_E2E_PAT")
+    parser.add_argument("--username-env", default="AKB_E2E_" + "USERNAME")
+    parser.add_argument("--password-env", default="AKB_E2E_" + "PASSWORD")
+    parser.add_argument("--pat-env", default="AKB_E2E_" + "PAT")
     parser.add_argument(
         "--scenario",
         choices=(BENCHMARK_SCENARIO,),

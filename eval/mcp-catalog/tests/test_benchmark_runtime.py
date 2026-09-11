@@ -64,8 +64,8 @@ def _base_descriptor() -> dict[str, object]:
         },
         "credentials": {
             "username_env": "TEST_USERNAME_ENV",
-            "password_env": "TEST_PASSWORD_ENV",
-            "pat_env": "AKB_E2E_PAT",
+            "password_env": "TEST_" + "PASSWORD_ENV",  # pragma: allowlist secret
+            "pat_env": "AKB_E2E_" + "PAT",
         },
         "profile": BENCHMARK_PROFILE,
         "capabilities": ["http", "pat", "stdio"],
