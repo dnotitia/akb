@@ -1,7 +1,7 @@
 FROM node:22-slim AS builder
 
 WORKDIR /app
-COPY pnpm-workspace.yaml ./
+COPY pnpm-workspace.yaml pnpm-lock.yaml ./
 COPY frontend/package.json frontend/pnpm-lock.yaml ./frontend/
 COPY packages/markdown-editor/package.json packages/markdown-editor/pnpm-lock.yaml packages/markdown-editor/tsconfig.json packages/markdown-editor/tsconfig.build.json ./packages/markdown-editor/
 COPY packages/markdown-editor/src ./packages/markdown-editor/src

@@ -39,6 +39,7 @@ jobs:
           node-version: '22'
           cache: pnpm
           cache-dependency-path: |
+            pnpm-lock.yaml
             frontend/pnpm-lock.yaml
             packages/akb-client/pnpm-lock.yaml
             packages/markdown-editor/pnpm-lock.yaml

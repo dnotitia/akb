@@ -102,9 +102,11 @@ echo "  mypy + bandit parse Python ${REQUIRED_PYTHON}"
 
 # 2. Node deps must be installed in every node project this gate runs in.
 #
-# There are four, they do not share a package manager, and each has its own
-# lockfile and its own node_modules: frontend/, packages/akb-client/, and
-# packages/markdown-editor/ are pnpm; packages/akb-mcp-client/ is npm.
+# There are four package projects plus the root workspace lockfile. The
+# frontend/ and packages/markdown-editor/ projects share that root pnpm
+# workspace while retaining their own lockfiles/node_modules for package-local
+# commands; packages/akb-client/ is an independent pnpm project and
+# packages/akb-mcp-client/ is an independent npm project.
 # Installing only some of them dies
 # several steps later, inside one of the others, as something that names
 # neither the package nor the missing install:
