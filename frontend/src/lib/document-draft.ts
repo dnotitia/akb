@@ -6,7 +6,7 @@ const DRAFT_PREFIX = "akb:document-draft:";
 /**
  * Existing-document drafts are a separate record from the new-document
  * composer.  A draft is deliberately pinned to the public markdown contract
- * rather than a private Plate schema: package semver + MarkdownProfile are
+ * rather than a product-private editor schema: package semver + MarkdownProfile are
  * the durable compatibility boundary owned by the shared editor package.
  */
 const DOCUMENT_EDIT_DRAFT_VERSION = 2;

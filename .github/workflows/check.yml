@@ -39,30 +39,21 @@ jobs:
           node-version: '22'
           cache: pnpm
           cache-dependency-path: |
-            frontend/pnpm-lock.yaml
+            pnpm-lock.yaml
             packages/akb-client/pnpm-lock.yaml
-            packages/markdown-editor/pnpm-lock.yaml
       - name: Install stdio proxy deps
         working-directory: packages/akb-mcp-client
         run: npm ci
       - name: Install frontend deps
         working-directory: frontend
-        # `--ignore-scripts` skips package postinstall hooks. We don't need
-        # them in CI — msw's postinstall registers a browser service-worker
-        # bundle that node-only vitest/RTL never touches — and pnpm 10+
-        # exits non-zero on any unapproved build script even with
-        # `pnpm.onlyBuiltDependencies` set when run via the action.
-        run: pnpm install --frozen-lockfile --ignore-scripts
+        # The frontend workspace install also prepares the sibling
+        # packages/markdown-editor package before the frontend checks run.
+        run: pnpm install --frozen-lockfile
       - name: Install @akb/client deps
         working-directory: packages/akb-client
-        # Its own pnpm store: typescript + vitest. No postinstall build
-        # scripts, so a plain frozen install is enough for `pnpm run build`
-        # (tsc emit) and `pnpm exec vitest run` in scripts/check.sh.
-        run: pnpm install --frozen-lockfile
-      - name: Install Markdown editor deps
-        working-directory: packages/markdown-editor
-        run: pnpm install --frozen-lockfile --ignore-scripts
-
+        # It has its own lockfile but lives below the root workspace; ignore
+        # the parent workspace so this installs @akb/client's own dependencies.
+        run: pnpm install --frozen-lockfile --ignore-workspace
       # ── Single entry point so CI and local pre-commit stay in sync ──
       - name: Run scripts/check.sh
         run: bash scripts/check.sh

@@ -130,7 +130,8 @@ else
     "${ROOT_DIR}/backend/"
   docker buildx build --platform "${IMAGE_PLATFORM}" \
     -t "${REGISTRY}/akb-frontend:${VERSION}" -t "${FRONTEND_IMAGE}" --push \
-    "${ROOT_DIR}/frontend/"
+    -f "${ROOT_DIR}/frontend/Dockerfile" \
+    "${ROOT_DIR}"
 fi
 
 echo "=== Rendering ${AKB_PROFILE} ==="

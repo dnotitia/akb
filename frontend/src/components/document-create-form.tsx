@@ -84,7 +84,7 @@ function collectDocuments(
   return out;
 }
 
-// Plate's markdown serializer represents its visually empty paragraph with a
+// The editor serializer represents its visually empty paragraph with a
 // whitespace/escape-only value. Treat that transport detail as empty so the
 // composer neither marks a fresh draft dirty nor enables Create prematurely.
 function hasMeaningfulMarkdown(markdown: string): boolean {
