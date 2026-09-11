@@ -416,7 +416,10 @@ class RuntimeFixture:
             raise RuntimeContractError("runtime benchmark PAT cleanup request failed", stage="pat_cleanup") from exc
         if response.status_code in {200, 204}:
             return
-        if allow_absent and response.status_code in {401, 404}:
+        # A reset-invalidated PAT can be rejected as unauthorized, forbidden,
+        # or not found depending on which auth layer observes the deletion.
+        # Only the resolver's reset-marked stale-token path sets allow_absent.
+        if allow_absent and response.status_code in {401, 403, 404}:
             return
         if response.status_code not in {200, 204}:
             raise RuntimeContractError("runtime benchmark PAT cleanup failed", stage="pat_cleanup")
