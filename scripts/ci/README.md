@@ -2,9 +2,7 @@
 
 This document is the source of truth for AKB's endpoint-driven E2E suites, the
 isolated repository-owned runtime used by hosted CI, and the optional clean
-Ubuntu 24.04 host bootstrap. It describes repository behavior only; an
-external launcher may invoke the same entrypoints but is not part of this
-runtime contract.
+Ubuntu 24.04 host bootstrap. It describes repository behavior only.
 
 ## Three layers
 
@@ -100,9 +98,9 @@ The descriptor must come from `scripts/ci/e2e_runtime.py serve` or the
 Ubuntu bootstrap. The fixture consumes the descriptor's app/fixture origins,
 health and reset operations, discovery-declared credential environment names,
 and the existing `empty` reset contract. A normal descriptor does not create
-another backend, database, port topology, or credential fixture; the explicit
-catalog-benchmark descriptor is the exception and carries its four isolated
-cell descriptors in `benchmark_cells`.
+another backend, database, port topology, or credential fixture. The native
+catalog benchmark launcher is documented in `eval/mcp-catalog/README.md` and
+composes this runtime through its CLI and descriptor contract.
 
 ### 2. Repository-owned isolated runtime
 
@@ -156,12 +154,10 @@ The supervisor has two modes:
   objects, and Git fixture data, then waits for backend readiness again; the
   frontend process remains owned by the same serve lifecycle.
 
-For the `transport-proxy` + `app-control-plane` benchmark profile, `serve`
-starts four isolated child runtimes (`primary/lightweight × http/stdio`) over
-separate Compose projects and ports. The parent prints one schema-v2 descriptor
-whose `benchmark_cells` map contains each child descriptor. Each child keeps its
-own mutable fixture namespace while the benchmark runner executes the four cells
-in parallel and keeps trials within one cell serial.
+The native catalog benchmark launcher is separate from this generic runtime;
+its interface and descriptor composition are documented in
+`eval/mcp-catalog/README.md`. The generic runtime itself has no model or
+benchmark-topology knowledge.
 
 Each invocation also selects one explicit capability profile. The default
 `tool-only` profile starts only the HTTP backend, PAT fixture, and shared
@@ -382,8 +378,7 @@ bash scripts/ci/ubuntu_e2e_bootstrap.sh serve \
 ```
 
 Both commands end in the same supervisor used by hosted CI. The `serve`
-descriptor can be consumed by a caller that needs the app and fixture URLs;
-the runtime itself remains unaware of that caller's orchestration protocol.
+descriptor can be consumed by a client that needs the app and fixture URLs.
 When no `--runtime-root` is supplied, the bootstrap creates a private
 `/tmp/akb-e2e-bootstrap.XXXXXX` root. Child processes and dependency resources
 are cleaned on exit, while that root and its logs remain caller-owned for
