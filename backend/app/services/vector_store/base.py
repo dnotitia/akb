@@ -275,6 +275,7 @@ class VectorStore(Protocol):
         limit: int,
         prefetch_per_leg: int,
         vault_ids: list[str] | None = None,
+        source_types: list[str] | None = None,
     ) -> list[VectorHit]:
         """Dense + sparse search, RRF-fused.
 
@@ -294,6 +295,14 @@ class VectorStore(Protocol):
           caller's `vault_path_eligible` gate is False for them) and keep
           filtering by `source_ids`. The caller sends EXACTLY ONE of the two,
           never both — capable drivers assert this.
+        - `source_types` is an orthogonal resource-kind filter (workbench
+          #1069): the caller passes the active Document arm (e.g. exactly one
+          of `document` / `native_document`) so stale points from the other arm
+          can never consume the top-K before hydration drops them. It ANDs
+          with whichever of `vault_ids` / `source_ids` is present. `None`
+          means no constraint (legacy behaviour, unchanged). Values are
+          driver-owned discriminator strings (`SOURCE_TYPES`), never user
+          input — drivers validate against the known set and reject unknown.
         - `prefetch_per_leg` caps each leg's candidate pool before
           fusion. Caller decides — typically `max(limit * 3, 50)`.
         """

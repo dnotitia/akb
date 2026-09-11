@@ -249,6 +249,7 @@ class QdrantStore:
         limit: int,
         prefetch_per_leg: int,
         vault_ids: list[str] | None = None,
+        source_types: list[str] | None = None,
     ) -> list[VectorHit]:
         await self.ensure_collection()
         client = self._get_client()
@@ -263,7 +264,10 @@ class QdrantStore:
         if not has_dense and not has_sparse:
             return []
 
-        flt = _acl_filter(vault_ids=vault_ids, source_ids=source_ids)
+        flt = _acl_filter(
+            vault_ids=vault_ids, source_ids=source_ids,
+            source_types=_validated_source_types(source_types),
+        )
 
         if has_dense and has_sparse:
             prefetch = [
@@ -339,20 +343,50 @@ async def _qdrant_errors(op: str):
         raise VectorStoreUnavailable(f"qdrant {op}: {e}") from e
 
 
-def _acl_filter(*, vault_ids: list[str] | None, source_ids: list[str] | None):
+def _validated_source_types(source_types: list[str] | None) -> list[str] | None:
+    """Validate the driver-owned `source_type` discriminator filter (workbench
+    #1069). Returns the list unchanged (None stays None = no constraint); an
+    unknown value is a caller bug and fails loud instead of silently matching
+    nothing."""
+    if source_types is None:
+        return None
+    from app.services.index_service import SOURCE_TYPES
+    unknown = [t for t in source_types if t not in SOURCE_TYPES]
+    if unknown:
+        raise ValueError(f"unknown source_type filter: {unknown!r}")
+    return list(source_types)
+
+
+def _acl_filter(
+    *,
+    vault_ids: list[str] | None,
+    source_ids: list[str] | None,
+    source_types: list[str] | None = None,
+):
     """The ACL pre-filter: vault_ids (per-vault, issue #189 Phase 2) wins when
     present, else source_ids (per-resource), else no filter. The qdrant analogue
     of pgvector's `WHERE {vault_id|source_id} = ANY(...)`. vault_id is stored as
-    UUID text (like source_id), so MatchAny over the keyword index is exact."""
+    UUID text (like source_id), so MatchAny over the keyword index is exact.
+
+    `source_types` (workbench #1069) ANDs an additional `source_type` MatchAny
+    onto the `must` list — stale points from the non-active Document arm can
+    never consume the top-K. Orthogonal to the ACL filter, so it combines with
+    either branch (or with no ACL filter at all)."""
+    must = []
     if vault_ids:
         key, vals = PAYLOAD_VAULT_ID, vault_ids
+        must.append(qm.FieldCondition(key=key, match=qm.MatchAny(any=[str(v) for v in vals])))
     elif source_ids:
         key, vals = PAYLOAD_SOURCE_ID, source_ids
-    else:
+        must.append(qm.FieldCondition(key=key, match=qm.MatchAny(any=[str(v) for v in vals])))
+    if source_types:
+        must.append(qm.FieldCondition(
+            key=PAYLOAD_SOURCE_TYPE,
+            match=qm.MatchAny(any=[str(t) for t in source_types]),
+        ))
+    if not must:
         return None
-    return qm.Filter(
-        must=[qm.FieldCondition(key=key, match=qm.MatchAny(any=[str(v) for v in vals]))],
-    )
+    return qm.Filter(must=must)
 
 
 def _to_hit(point) -> VectorHit:

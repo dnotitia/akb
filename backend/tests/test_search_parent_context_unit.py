@@ -68,7 +68,7 @@ async def test_search_hydration_adds_parent_context_without_changing_score(monke
     monkeypatch.setattr(search_service, "get_pool", get_test_pool)
     monkeypatch.setattr(search_service, "_configured_document_source_type", lambda: "document")
 
-    results = await SearchService()._hydrate_hits([
+    results, dropped = await SearchService()._hydrate_hits([
         VectorHit(
             chunk_id=str(uuid.uuid4()),
             source_type="document",
@@ -79,6 +79,7 @@ async def test_search_hydration_adds_parent_context_without_changing_score(monke
         )
     ])
 
+    assert dropped == {}
     assert len(results) == 1
     assert results[0].collection == "research"
     assert results[0].collection_summary == "Technical comparisons and AKB recommendations"

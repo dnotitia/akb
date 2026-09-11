@@ -372,6 +372,7 @@ class SeahorseDbGrpcStore:
         limit: int,
         prefetch_per_leg: int,
         vault_ids: list[str] | None = None,
+        source_types: list[str] | None = None,
     ) -> list[VectorHit]:
         """Server-streaming search. Each ``ResultStreamEvent`` carries
         one of ``header`` / ``chunk`` / ``result_set_boundary`` /
@@ -448,7 +449,9 @@ class SeahorseDbGrpcStore:
         )
         # ACL pre-filter (issue #189 Phase 2): exactly one of vault_ids /
         # source_ids; vault_filter_sql asserts that + UUID-validates each id.
-        acl = _vault_filter_sql(vault_ids, source_ids)
+        # source_types (workbench #1069) ANDs a source_type predicate onto the
+        # same filter — the column is stored on every point (schema below).
+        acl = _vault_filter_sql(vault_ids, source_ids, source_types=source_types)
         if acl is not None:
             request.filter = acl
 
