@@ -1,3 +1,4 @@
 allowBuilds:
+  '@akb/markdown-editor@https://codeload.github.com/dnotitia/akb/tar.gz/e86537fc0681d75d9b9251c5774adbf9b8b974cf#path:/packages/markdown-editor': true
   esbuild: true
   msw: true

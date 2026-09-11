@@ -3,7 +3,7 @@ FROM node:22-slim AS builder
 RUN npm install -g pnpm@latest
 
 WORKDIR /app
-COPY package.json pnpm-lock.yaml ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 # The Git-pinned shared Markdown package runs its artifact-scoped prepare
 # build here so the production bundle consumes the resolved dist/. The
 # frontend workspace keeps third-party build approval narrow.
