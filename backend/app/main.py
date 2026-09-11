@@ -471,8 +471,24 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
     in one atomic worker), so backfill stats live under
     `vector_store.backfill` and `embed_backfill` is gone — they were
     reporting the same `chunks.vector_indexed_at IS NULL` count.
+
+    Every indexing queue reported here carries its own terminal-failure count
+    beside its progress, and that adjacency is the point: a queue that gave up
+    on an item drains to `pending: 0` exactly like one that finished, so
+    progress alone reads as complete while documents are missing from ranked
+    search. `native_derived` is the document/File-level queue — one intent per
+    Resource revision, and `abandoned` there is a count of Resources that will
+    never be chunked or embedded; `vector_store.backfill.upsert` is the
+    chunk-level one below it; `native_file_projection` is the S3-to-Native
+    admission ahead of both.
     """
-    from app.services import native_file_projection, queue_rescuer, sparse_encoder, vault_backfill
+    from app.services import (
+        native_derived_worker,
+        native_file_projection,
+        queue_rescuer,
+        sparse_encoder,
+        vault_backfill,
+    )
 
     store = get_vector_store()
     vs_info: dict = {"reachable": await store.health()}
@@ -510,6 +526,7 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
         "events": await _safe(events_publisher.pending_stats),
         "notifications": await _safe(notification_worker.pending_stats),
         "native_file_projection": await _safe(native_file_projection.pending_stats),
+        "native_derived": await _safe(native_derived_worker.pending_stats),
         "vector_store": vs_info,
     }
 
