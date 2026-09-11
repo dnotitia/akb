@@ -108,8 +108,6 @@ jobs:
           cache: pnpm
           cache-dependency-path: |
             pnpm-lock.yaml
-            frontend/pnpm-lock.yaml
-            packages/markdown-editor/pnpm-lock.yaml
 
       - name: Install frontend dependencies
         working-directory: frontend

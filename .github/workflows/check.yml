@@ -40,9 +40,7 @@ jobs:
           cache: pnpm
           cache-dependency-path: |
             pnpm-lock.yaml
-            frontend/pnpm-lock.yaml
             packages/akb-client/pnpm-lock.yaml
-            packages/markdown-editor/pnpm-lock.yaml
       - name: Install stdio proxy deps
         working-directory: packages/akb-mcp-client
         run: npm ci

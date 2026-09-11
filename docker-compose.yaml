@@ -123,7 +123,9 @@ services:
       start_period: 60s
 
   frontend:
-    build: ./frontend
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
     depends_on:
       backend:
         condition: service_healthy
