@@ -6,7 +6,9 @@ import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Panel, PanelHeader } from "@/components/ui/panel";
+import { SelectMenu } from "@/components/ui/select-menu";
 import { Logo } from "@/components/logo";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { LoadingState } from "@/components/ui/loading-state";
@@ -193,13 +195,19 @@ export default function AdminPage() {
 }
 
 const EMPTY_PROVIDER_FORM = {
-  providerType: "oidc",
+  providerType: "",
   alias: "",
   displayName: "",
   issuer: "",
+  discoveryUrl: "",
   clientId: "",
   clientSecret: "",
 };
+
+function derivedDiscoveryUrl(issuer: string): string {
+  const normalized = issuer.trim().replace(/\/+$/, "");
+  return normalized ? `${normalized}/.well-known/openid-configuration` : "";
+}
 
 function providerBadge(state: AdminSsoProvider["state"]) {
   if (state === "enabled") return <Badge variant="success">Enabled</Badge>;
@@ -232,6 +240,7 @@ function SsoProviderControl() {
       alias: provider.alias,
       displayName: provider.display_name,
       issuer: provider.issuer || "",
+      discoveryUrl: "",
       clientId: provider.client_id || "",
       clientSecret: "",
     });
@@ -245,15 +254,27 @@ function SsoProviderControl() {
     setNotice("");
     setSubmitting(true);
     const issuer = form.issuer.trim().replace(/\/+$/, "");
-    const providerType = catalog?.supported_provider_types.includes(form.providerType)
-      ? form.providerType
-      : catalog?.supported_provider_types[0] || form.providerType;
+    const providerType = form.providerType.trim();
+    // Refuse rather than substitute: silently saving a provider as a different
+    // kind (akb#522) produced a discovery-endpoint refusal that named the wrong
+    // cause. The type list is already loaded in this component.
+    if (!providerType || !catalog?.supported_provider_types.includes(providerType)) {
+      setError("Choose a provider type this installation supports before saving.");
+      setSubmitting(false);
+      return;
+    }
+    const discoveryUrl = form.discoveryUrl.trim() || derivedDiscoveryUrl(issuer);
+    if (!discoveryUrl) {
+      setError("Enter an upstream issuer or an explicit discovery URL.");
+      setSubmitting(false);
+      return;
+    }
     try {
       await configureAdminSsoProvider(form.alias.trim(), {
         provider_type: providerType,
         display_name: form.displayName.trim(),
         issuer,
-        discovery_url: `${issuer}/.well-known/openid-configuration`,
+        discovery_url: discoveryUrl,
         client_id: form.clientId.trim(),
         ...(form.clientSecret ? { client_secret: form.clientSecret } : {}),
       });
@@ -296,6 +317,11 @@ function SsoProviderControl() {
       </Alert>
     );
   }
+
+  const selectedProvider = catalog.providers.find(
+    (provider) => provider.provider_type === form.providerType,
+  );
+  const selectedCapabilities = selectedProvider?.capabilities;
 
   return (
     <div className="space-y-4" aria-labelledby="sso-providers-heading">
@@ -358,14 +384,70 @@ function SsoProviderControl() {
           <AdminField label="Alias" id="sso-alias" value={form.alias} onChange={(value) => setField("alias", value)} pattern="[a-z0-9][a-z0-9._-]{0,62}" autoComplete="off" required />
           <AdminField label="Button label" id="sso-display-name" value={form.displayName} onChange={(value) => setField("displayName", value)} maxLength={80} autoComplete="organization" required />
           <div className="sm:col-span-2">
+            <Label htmlFor="sso-provider-type">Provider type</Label>
+            <SelectMenu
+              id="sso-provider-type"
+              aria-label="Provider type"
+              value={form.providerType}
+              onValueChange={(value) => setField("providerType", value)}
+              className="mt-1.5"
+              placeholder="Choose a provider type…"
+              options={catalog.supported_provider_types.map((type) => {
+                const capabilities = catalog.providers.find(
+                  (provider) => provider.provider_type === type,
+                )?.capabilities;
+                return {
+                  value: type,
+                  label: type,
+                  hint: capabilities
+                    ? [
+                        capabilities.supports_logout ? "logout" : "no logout",
+                        capabilities.supports_identity_migration ? "identity migration" : "no identity migration",
+                      ].join(" · ")
+                    : undefined,
+                };
+              })}
+            />
+            {selectedCapabilities ? (
+              <p className="mt-2 text-xs leading-5 text-foreground-muted">
+                Capabilities: {selectedCapabilities.supports_logout ? "logout" : "no logout"} · {selectedCapabilities.supports_identity_migration ? "identity migration" : "no identity migration"}.
+              </p>
+            ) : (
+              <p className="mt-2 text-xs leading-5 text-foreground-muted">
+                The installation supports {catalog.supported_provider_types.join(", ")}.
+              </p>
+            )}
+          </div>
+          <div className="sm:col-span-2">
             <AdminField label="Upstream issuer" id="sso-issuer" type="url" value={form.issuer} onChange={(value) => setField("issuer", value)} placeholder="https://id.example.com/realms/workforce" autoComplete="url" required />
           </div>
           <AdminField label="Client ID" id="sso-client-id" value={form.clientId} onChange={(value) => setField("clientId", value)} autoComplete="off" required />
           <AdminField label="Client secret" id="sso-client-secret" type="password" value={form.clientSecret} onChange={(value) => setField("clientSecret", value)} placeholder="Required for a new provider" autoComplete="new-password" />
           <div className="sm:col-span-2">
+            <details className="group rounded-[var(--radius-md)] border border-border bg-surface-2/60 px-3">
+              <summary className="flex min-h-10 cursor-pointer list-none items-center gap-2 text-sm font-medium text-foreground transition-token hover:text-link focus:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                Advanced: discovery URL
+              </summary>
+              <div className="pb-3">
+                <AdminField
+                  label="Discovery URL"
+                  id="sso-discovery-url"
+                  type="url"
+                  value={form.discoveryUrl}
+                  onChange={(value) => setField("discoveryUrl", value)}
+                  placeholder={derivedDiscoveryUrl(form.issuer) || "https://id.example.com/realms/workforce/.well-known/openid-configuration"}
+                  autoComplete="url"
+                />
+                <p className="mt-2 text-xs leading-5 text-foreground-muted">
+                  Defaults to the issuer&apos;s standard .well-known endpoint. Set it only when the upstream publishes its discovery document elsewhere.
+                </p>
+              </div>
+            </details>
+          </div>
+          <div className="sm:col-span-2">
             <Button type="submit" loading={submitting}>Save disabled configuration</Button>
             <p className="mt-2 text-xs leading-5 text-foreground-muted">
-              Discovery uses the issuer&apos;s standard .well-known endpoint. Secrets are write-only.
+              Secrets are write-only.
             </p>
           </div>
         </form>
