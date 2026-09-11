@@ -20,7 +20,7 @@ from typing import Literal
 from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import ValidationError
-from app.services.search_filters import ArchiveScope, collection_predicate, escape_like, metadata_matches, resolve_archive_scope
+from app.services.search_filters import ArchiveScope, collection_predicate, escape_like, metadata_matches, resolve_archive_scope, status_matches
 from app.models.document import SearchResponse, SearchResult
 from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.services import sparse_encoder
@@ -394,6 +394,24 @@ def vault_path_eligible(
         and supports_vault_filter(get_vector_store())
         and not (collection or doc_type or tags or source_uris)
     )
+
+
+def archive_scope_allows_vault_path(scope: ArchiveScope) -> bool:
+    """Whether `scope` can be served by the VAULT path, with the archived
+    predicate applied at hydration instead of by candidate enumeration.
+
+    `unarchived` (the DEFAULT) and `all` can. Requiring `all` here is what
+    disqualified every ordinary search from the fast path (akb#530): archive
+    scope is unlike `collection` / `doc_type` / `tags`, which a caller opts
+    into — it is set on every request nobody customised, so treating it as a
+    narrowing filter meant the fast path had no reachable caller at all.
+
+    `archived` cannot, and stays on the id path. It selects FOR a set that was
+    0.11% of the measured corpus, so a vault-path top-K would be almost
+    entirely non-matching and hydration would filter the page down to nothing.
+    Enumerating ids is the right tool for narrowing to a rare set; it is the
+    wrong one for excluding it."""
+    return scope != "archived"
 
 
 def clamp_search_limit(limit: int) -> int:
@@ -784,8 +802,25 @@ class SearchService:
         # can see (NULL-vault_id count, briefly cached) rather than from a
         # process-local latch the worker flips in its own copy.
         from app.services import vault_backfill
-        vault_path_wanted = not (doc_types or source_type or scope != "all") and vault_path_eligible(
-            collection=collection, doc_type=doc_type, tags=tags, source_uris=source_uris,
+        # Archive scope is the one doc-level narrowing that is NOT opt-in: it
+        # defaults to `unarchived`, so requiring `scope == "all"` here
+        # disqualified EVERY ordinary search from the vault path and sent it to
+        # the id-enumeration fallback — which refuses with the bounded-corpus
+        # error on any scope above the candidate ceiling (akb#530). The
+        # archived predicate moves to hydration, where the AUTHORITATIVE status
+        # is already parsed for free: verified native frontmatter on the native
+        # arm, `documents.status` on the legacy one.
+        #
+        # `archived` deliberately stays on the id path. It asks FOR the ~0.1%
+        # tail, so a vault-path top-K would be almost entirely non-matching and
+        # hydration would filter the page down to nothing. Narrowing to a rare
+        # set is what id enumeration is for; excluding one is not.
+        vault_path_wanted = (
+            not (doc_types or source_type)
+            and archive_scope_allows_vault_path(scope)
+            and vault_path_eligible(
+                collection=collection, doc_type=doc_type, tags=tags, source_uris=source_uris,
+            )
         )
         vault_ready = vault_backfill.is_ready() or await vault_backfill.is_ready_async()
         if vault_path_wanted and not vault_ready:
@@ -1032,8 +1067,6 @@ class SearchService:
         if rerank_enabled and len(unique_hits) > 1:
             unique_hits = await self._apply_rerank(query, unique_hits)
 
-        unique_hits = unique_hits[:limit]
-
         # Post-search metadata join — one fetch per source_type, merged back
         # in the driver-returned order. Keeps document results fully
         # backward-compatible (doc_id == source_id) while adding table/file.
@@ -1041,7 +1074,24 @@ class SearchService:
         # (workbench #1069 G3): any non-empty drop set marks the response
         # degraded so `total_matches > 0, returned == 0` can never again read
         # as a silent zero-match.
-        results, dropped = await self._hydrate_hits(unique_hits)
+        #
+        # The page is the first `limit` deduped hits; `spare` is the rest of
+        # the prefetch pool. Hydration can drop rows — archive scope (akb#530),
+        # a stale head, a deleted source — so refill from `spare` rather than
+        # return a short page whenever the pool left headroom. At the measured
+        # archived density (0.11%) the loop body essentially never runs, so the
+        # common case still pays exactly one hydration round trip. Each pass
+        # consumes at least one spare hit, so it terminates; when the pool is
+        # exhausted the page really is short and `dropped` names the cause.
+        page, spare = unique_hits[:limit], unique_hits[limit:]
+        results, dropped = await self._hydrate_hits(page, archive_scope=scope)
+        while len(results) < limit and spare:
+            take, spare = spare[: limit - len(results)], spare[limit - len(results):]
+            more, more_dropped = await self._hydrate_hits(take, archive_scope=scope)
+            results.extend(more)
+            for cause, count in more_dropped.items():
+                dropped[cause] = dropped.get(cause, 0) + count
+        results = results[:limit]
         hydrate_reason = (
             f"hydration_dropped:{','.join(f'{k}={v}' for k, v in sorted(dropped.items()))}" if dropped else None
         )
@@ -1172,7 +1222,9 @@ class SearchService:
 
         return doc_ids, table_ids, file_ids
 
-    async def _hydrate_hits(self, hits: list) -> tuple[list[SearchResult], dict[str, int]]:
+    async def _hydrate_hits(
+        self, hits: list, *, archive_scope: ArchiveScope = "all",
+    ) -> tuple[list[SearchResult], dict[str, int]]:
         from app.services.index_service import SOURCE_TYPES
         by_type: dict[str, list[str]] = {t: [] for t in SOURCE_TYPES}
         document_source = _configured_document_source_type()
@@ -1536,6 +1588,23 @@ class SearchService:
                 # `total_matches=30, returned=0` shape, and it must never again
                 # read as a silent zero-match.
                 dropped["hydration_miss"] = dropped.get("hydration_miss", 0) + 1
+                continue
+            # Archive scope (akb#530). `m["status"]` is the AUTHORITY for this
+            # arm and it is already in hand: the native branch parsed it out of
+            # the verified Head body, the legacy branch selected `d.status`.
+            # Applying it here is what lets the default `unarchived` request
+            # take the vault path instead of enumerating candidate ids.
+            #
+            # Table and File carry no document status; `status_matches(None, …)`
+            # keeps them under `unarchived`/`all` and excludes them under
+            # `archived`, which is exactly what the candidate-side branches do.
+            #
+            # Unconditional, not vault-path-only: on the id path the same
+            # predicate already ran during candidate selection, so this is
+            # idempotent — and it closes the window where a document is
+            # archived between candidate selection and hydration.
+            if not status_matches(m.get("status"), archive_scope):
+                dropped["archive_scope_excluded"] = dropped.get("archive_scope_excluded", 0) + 1
                 continue
             # Build the canonical 0.3.0 URI per resource type. Doc URIs
             # derive the collection from `path` automatically (path
