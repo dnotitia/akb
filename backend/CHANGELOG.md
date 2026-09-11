@@ -36,6 +36,18 @@ installation, 3 of the 154 rows marked archived there carry `status: draft` in
 their native frontmatter, so filtering on that column would wrongly hide live
 documents.
 
+### Vault info document counters follow the active authority (akb#525)
+
+On `postgres_native` the native document path never writes the legacy
+`documents` catalog, so `document_count` froze at its pre-cutover number
+(and read 0/NULL on fresh vaults) while `last_activity`/`last_active_user`
+went stale. `get_vault_info` now branches on the configured document
+authority: native backends count live `native_resources` document surfaces
+and take last activity from the newest touching `native_revisions` row
+(`occurred_at`/`actor`, aliased to the legacy field names); `bare_git`
+keeps the exact legacy queries. Tables/files/collections/edges are
+authority-independent and unchanged.
+
 ### Vault-filter readiness visible to the serving tier (akb#526)
 
 `vault_backfill.is_ready()` was a process-local latch flipped only by the
