@@ -141,6 +141,18 @@ async def test_ensure_collection_indexes_vault_id():
     assert PAYLOAD_VAULT_ID in fake.indexes
 
 
+async def test_ensure_collection_indexes_source_type():
+    """`source_type` is a per-search pre-filter (workbench #1069) — it needs
+    the same keyword index as the ACL keys, on new AND pre-existing
+    collections (ensure runs outside the create branch)."""
+    from app.services.vector_store.qdrant import PAYLOAD_SOURCE_TYPE
+    fake = _FakeClient()
+    store = QdrantStore(url="http://x", api_key=None, collection="chunks", dense_dim=4)
+    store._client = fake
+    await store.ensure_collection()
+    assert PAYLOAD_SOURCE_TYPE in fake.indexes
+
+
 # ── #207: client errors → VectorStoreUnavailable (write + search paths) ──
 
 from app.services.vector_store.base import VectorStoreUnavailable

@@ -109,24 +109,34 @@ class QdrantStore:
         # for the same reason as source_id. Created OUTSIDE the `if not exists`
         # block (idempotent server-side) so an ALREADY-deployed collection
         # — created before vault_id existed — also gets the index on first ensure.
+        # source_type joins them as a driver-side pre-filter (workbench #1069):
+        # same treatment — every search carrying `source_types` filters on it.
         # Best-effort (non-fatal) — but a TypeError/ValueError is a programming
         # bug, not a transient index hiccup, so let it surface.
-        try:
-            await client.create_payload_index(
-                collection_name=self._collection,
-                field_name=PAYLOAD_VAULT_ID,
-                field_schema=qm.PayloadSchemaType.KEYWORD,
-            )
-        except (TypeError, ValueError):
-            raise
-        except Exception as e:  # noqa: BLE001
-            # Non-fatal: a missing index doesn't break correctness (the readiness
-            # gate keys off the NULL-vault_id count, not the index), but every
-            # vault-filtered search then does a full payload scan. Log at ERROR,
-            # not WARNING, so a PERSISTENT failure (e.g. a managed cluster
-            # rejecting the schema) leaves a standing, greppable signal — this
-            # fires once per process since `_ensured_collection` latches below.
-            logger.error("qdrant vault_id payload index ensure failed (non-fatal, search falls back to full scan): %s", e)
+        for _key, _label in (
+            (PAYLOAD_VAULT_ID, "vault_id"),
+            (PAYLOAD_SOURCE_TYPE, "source_type"),
+        ):
+            try:
+                await client.create_payload_index(
+                    collection_name=self._collection,
+                    field_name=_key,
+                    field_schema=qm.PayloadSchemaType.KEYWORD,
+                )
+            except (TypeError, ValueError):
+                raise
+            except Exception as e:  # noqa: BLE001
+                # Non-fatal: a missing index doesn't break correctness (the readiness
+                # gate keys off the NULL-vault_id count, not the index), but every
+                # filtered search then does a full payload scan. Log at ERROR,
+                # not WARNING, so a PERSISTENT failure (e.g. a managed cluster
+                # rejecting the schema) leaves a standing, greppable signal — this
+                # fires once per process since `_ensured_collection` latches below.
+                logger.error(
+                    "qdrant %s payload index ensure failed (non-fatal, search falls back to full scan): %s",
+                    _label,
+                    e,
+                )
         self._ensured_collection = True
 
     async def health(self) -> bool:
