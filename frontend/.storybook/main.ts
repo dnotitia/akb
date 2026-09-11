@@ -40,22 +40,8 @@ const config: StorybookConfig = {
         new Set(
           [
             ...(config.optimizeDeps?.include || []),
-            "@platejs/basic-nodes/react",
-            "@platejs/code-block/react",
-            "@platejs/link",
-            "@platejs/link/react",
-            "@platejs/list",
-            "@platejs/list/react",
-            "@platejs/markdown",
-            "@platejs/table",
-            "@platejs/table/react",
             "react-force-graph-2d",
-            "platejs/react",
             "@tanstack/react-virtual",
-            "react-markdown",
-            "rehype-katex",
-            "remark-gfm",
-            "remark-math",
           ]
             .filter((dep) => dep !== "react-kapsule"),
         ),
