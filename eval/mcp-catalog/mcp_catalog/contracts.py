@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Literal
 
@@ -38,9 +38,23 @@ Category = Literal[
     "invalid_input_recovery",
     "stdio_local",
 ]
+TaskLocale = Literal["ko-KR", "en-US"]
 Transport = Literal["http", "stdio"]
 ArmName = Literal["baseline", "candidate"]
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
+
+EXPECTED_LOCALE_COUNTS: dict[TaskLocale, int] = {"ko-KR": 8, "en-US": 8}
+EXPECTED_PAIR_CATEGORIES: dict[str, Category] = {
+    "read-vaults": "single_operation",
+    "create-vault": "single_operation",
+    "ambiguous-find": "ambiguous_action",
+    "multi-step": "multi_step",
+    "destructive-confirm": "destructive_confirmation",
+    "authorization-readonly": "authorization",
+    "invalid-recovery": "invalid_input_recovery",
+    "stdio-local": "stdio_local",
+}
+PAIR_ID_RE = re.compile(r"^[a-z][a-z0-9-]{2,63}$")
 
 
 def default_transports() -> list[Transport]:
@@ -49,6 +63,18 @@ def default_transports() -> list[Transport]:
 
 def default_arms() -> list[ArmName]:
     return ["baseline", "candidate"]
+
+
+def default_locales() -> list[TaskLocale]:
+    return ["ko-KR", "en-US"]
+
+
+def default_locale_counts() -> dict[TaskLocale, int]:
+    return dict(EXPECTED_LOCALE_COUNTS)
+
+
+def default_pair_categories() -> dict[str, Category]:
+    return dict(EXPECTED_PAIR_CATEGORIES)
 
 
 class ContractModel(BaseModel):
@@ -108,17 +134,29 @@ class FixtureContract(ContractModel):
 
 
 class ResponseRubric(ContractModel):
-    required_terms: list[str] = Field(default_factory=list)
+    required_any_of: list[list[str]] = Field(default_factory=list)
     forbidden_terms: list[str] = Field(default_factory=list)
     require_non_empty: bool = True
-    require_confirmation: bool = False
+    confirmation_terms: list[str] = Field(default_factory=list)
 
-    @field_validator("required_terms", "forbidden_terms")
+    @field_validator("required_any_of")
+    @classmethod
+    def validate_required_groups(cls, values: list[list[str]]) -> list[list[str]]:
+        for group in values:
+            if not group or any(not value.strip() for value in group):
+                raise ValueError("required rubric term groups must be non-empty")
+            normalized = [value.casefold() for value in group]
+            if len(set(normalized)) != len(normalized):
+                raise ValueError("required rubric term groups must be unique")
+        return values
+
+    @field_validator("forbidden_terms", "confirmation_terms")
     @classmethod
     def validate_terms(cls, values: list[str]) -> list[str]:
         if any(not value.strip() for value in values):
             raise ValueError("rubric terms must be non-empty")
-        if len(set(values)) != len(values):
+        normalized = [value.casefold() for value in values]
+        if len(set(normalized)) != len(normalized):
             raise ValueError("rubric terms must be unique")
         return values
 
@@ -150,10 +188,13 @@ class TaskManifest(ContractModel):
     schema_version: Literal[1] = 1
     id: str
     category: Category
+    locale: TaskLocale
+    pair_id: str
     prompt: str = Field(min_length=1, max_length=4000)
     fixture: FixtureContract
     allowed_first_operations: list[str] = Field(min_length=1)
     forbidden_operations: list[str] = Field(default_factory=list)
+    required_operations: list[str] = Field(default_factory=list)
     expected_final_state: StateContract
     response_rubric: ResponseRubric = Field(default_factory=ResponseRubric)
 
@@ -164,7 +205,14 @@ class TaskManifest(ContractModel):
             raise ValueError("task id must be lowercase kebab-case and 3-64 characters")
         return value
 
-    @field_validator("allowed_first_operations", "forbidden_operations")
+    @field_validator("pair_id")
+    @classmethod
+    def validate_pair_id(cls, value: str) -> str:
+        if PAIR_ID_RE.fullmatch(value) is None:
+            raise ValueError("pair_id must be lowercase kebab-case and 3-64 characters")
+        return value
+
+    @field_validator("allowed_first_operations", "forbidden_operations", "required_operations")
     @classmethod
     def validate_operations(cls, values: list[str]) -> list[str]:
         if any(not re.fullmatch(r"^[a-z][a-z0-9_]*$", value) for value in values):
@@ -179,6 +227,12 @@ class TaskManifest(ContractModel):
             raise ValueError("stdio_local tasks must run on stdio")
         if set(self.allowed_first_operations) & set(self.forbidden_operations):
             raise ValueError("an operation cannot be both allowed first and forbidden")
+        if set(self.required_operations) & set(self.forbidden_operations):
+            raise ValueError("a required operation cannot be forbidden")
+        if self.category == "stdio_local" and set(self.required_operations) != {"file_upload", "image_upload"}:
+            raise ValueError("stdio_local tasks must require both file and image operations")
+        if self.category == "destructive_confirmation" and not self.response_rubric.confirmation_terms:
+            raise ValueError("destructive confirmation tasks must declare confirmation terms")
         return self
 
 
@@ -261,12 +315,36 @@ class BenchmarkRunManifest(ContractModel):
     operation_map: dict[str, list[str]]
     credential_profiles: dict[str, str | None] = Field(default_factory=dict)
     fixture_scenario: str = Field(min_length=1, max_length=100)
+    locales: list[TaskLocale] = Field(default_factory=default_locales)
+    locale_counts: dict[TaskLocale, int] = Field(default_factory=default_locale_counts)
+    pair_categories: dict[str, Category] = Field(default_factory=default_pair_categories)
 
     @field_validator("arms", "transports")
     @classmethod
     def unique_values(cls, values: list[str]) -> list[str]:
         if len(set(values)) != len(values):
             raise ValueError("list values must be unique")
+        return values
+
+    @field_validator("locales")
+    @classmethod
+    def validate_locales(cls, values: list[TaskLocale]) -> list[TaskLocale]:
+        if len(set(values)) != len(values):
+            raise ValueError("locales must be unique")
+        return values
+
+    @field_validator("locale_counts")
+    @classmethod
+    def validate_locale_counts(cls, values: dict[TaskLocale, int]) -> dict[TaskLocale, int]:
+        if any(count <= 0 for count in values.values()):
+            raise ValueError("locale counts must be positive")
+        return values
+
+    @field_validator("pair_categories")
+    @classmethod
+    def validate_pair_categories(cls, values: dict[str, Category]) -> dict[str, Category]:
+        if any(PAIR_ID_RE.fullmatch(pair_id) is None for pair_id in values):
+            raise ValueError("pair ids must be lowercase kebab-case and 3-64 characters")
         return values
 
     @field_validator("operation_map")
@@ -323,6 +401,12 @@ class BenchmarkRunManifest(ContractModel):
         profiles = set(self.credential_profiles)
         if "default" not in profiles:
             raise ValueError("credential_profiles must define default")
+        if self.locales != ["ko-KR", "en-US"]:
+            raise ValueError("the benchmark must register ko-KR and en-US locales in that order")
+        if self.locale_counts != EXPECTED_LOCALE_COUNTS:
+            raise ValueError("the benchmark must register eight tasks for each locale")
+        if self.pair_categories != EXPECTED_PAIR_CATEGORIES:
+            raise ValueError("the benchmark must register the fixed semantic task pairs")
         return self
 
     def validate_tasks(self, tasks: list[TaskManifest]) -> None:
@@ -343,24 +427,79 @@ class BenchmarkRunManifest(ContractModel):
         unknown_operations = {
             operation
             for task in tasks
-            for operation in [*task.allowed_first_operations, *task.forbidden_operations]
+            for operation in [
+                *task.allowed_first_operations,
+                *task.forbidden_operations,
+                *task.required_operations,
+            ]
             if operation not in self.operation_map and operation != "none"
         }
         if unknown_operations:
             raise ValueError(f"logical operations are missing from operation_map: {sorted(unknown_operations)}")
         if any(task.fixture.scenario != self.fixture_scenario for task in tasks):
             raise ValueError("every task must use the registered fixture scenario")
+        self._validate_locale_pairs(tasks)
         source_blind_violations = source_blind_violations_for(tasks, self.operation_map)
         if source_blind_violations:
             details = "; ".join(f"{task_id}: {term}" for task_id, term in source_blind_violations)
             raise ValueError(f"task corpus contains source-aware tool hints: {details}")
-        required_trials = len(tasks) * len(self.models) * len(self.transports) * self.repeats * len(self.arms)
+        trials_per_arm = sum(len(task.fixture.transports) for task in tasks) * len(self.models) * self.repeats
+        if trials_per_arm != 180:
+            raise ValueError("the benchmark must register exactly 180 paid trials per arm")
+        required_trials = trials_per_arm * len(self.arms)
         smoke_cells = len(self.models) * len(self.transports)
         if self.budget.max_model_requests < required_trials + smoke_cells:
             raise ValueError("max_model_requests is below the registered trial and smoke-gate count")
         reserved_cost = self.budget.max_cost_per_trial_usd * (required_trials + smoke_cells)
         if reserved_cost > self.budget.max_total_cost_usd:
             raise ValueError("the preregistered trial and smoke-gate cost reservations exceed max_total_cost_usd")
+
+    def _validate_locale_pairs(self, tasks: list[TaskManifest]) -> None:
+        if len(tasks) != sum(self.locale_counts.values()):
+            raise ValueError("task corpus must contain exactly 16 tasks")
+        locale_counts = Counter(task.locale for task in tasks)
+        if dict(locale_counts) != self.locale_counts:
+            raise ValueError("task corpus must contain exactly eight ko-KR and eight en-US tasks")
+
+        pairs: dict[str, list[TaskManifest]] = defaultdict(list)
+        for task in tasks:
+            pairs[task.pair_id].append(task)
+        if set(pairs) != set(self.pair_categories):
+            raise ValueError("task corpus semantic pair coverage does not match the manifest")
+
+        category_counts = Counter(task.category for task in tasks)
+        expected_category_counts = Counter(
+            {category: count * 2 for category, count in Counter(self.pair_categories.values()).items()}
+        )
+        if dict(category_counts) != dict(expected_category_counts):
+            raise ValueError("task corpus category counts do not match the registered pair coverage")
+
+        for pair_id, expected_category in self.pair_categories.items():
+            members = pairs[pair_id]
+            if len(members) != 2 or {task.locale for task in members} != {"ko-KR", "en-US"}:
+                raise ValueError(f"semantic pair {pair_id} must contain one task per locale")
+            if any(task.category != expected_category for task in members):
+                raise ValueError(f"semantic pair {pair_id} has a mismatched category")
+            if self._pair_contract(members[0]) != self._pair_contract(members[1]):
+                raise ValueError(f"semantic pair {pair_id} has mismatched task or response requirements")
+
+    @staticmethod
+    def _pair_contract(task: TaskManifest) -> dict[str, Any]:
+        rubric = task.response_rubric
+        return {
+            "category": task.category,
+            "fixture": task.fixture.model_dump(mode="json"),
+            "allowed_first_operations": sorted(task.allowed_first_operations),
+            "forbidden_operations": sorted(task.forbidden_operations),
+            "required_operations": sorted(task.required_operations),
+            "expected_final_state": task.expected_final_state.model_dump(mode="json"),
+            "response_requirements": {
+                "require_non_empty": rubric.require_non_empty,
+                "required_any_of_shape": sorted(len(group) for group in rubric.required_any_of),
+                "forbidden_terms_count": len(rubric.forbidden_terms),
+                "confirmation_terms_count": len(rubric.confirmation_terms),
+            },
+        }
 
 
 class CatalogSnapshot(ContractModel):

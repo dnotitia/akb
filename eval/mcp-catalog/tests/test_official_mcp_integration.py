@@ -50,9 +50,11 @@ def test_raw_and_server_arguments_are_separately_recorded() -> None:
     task = TaskManifest.model_validate(
         {
             "schema_version": 1,
-            "id": "raw-server-args",
-            "category": "single_operation",
-            "prompt": "값을 읽어 줘.",
+                "id": "raw-server-args",
+                "category": "single_operation",
+                "locale": "en-US",
+                "pair_id": "raw-server",
+                "prompt": "값을 읽어 줘.",
             "fixture": {"scenario": "empty", "transports": ["http"]},
             "allowed_first_operations": ["read"],
             "expected_final_state": {

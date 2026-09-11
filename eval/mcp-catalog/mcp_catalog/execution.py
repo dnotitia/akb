@@ -6,9 +6,8 @@ import asyncio
 import contextvars
 import json
 import os
-import re
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Awaitable, Callable, Literal, cast
@@ -26,7 +25,7 @@ from pydantic_evals.lifecycle import CaseLifecycle
 from pydantic_evals.reporting import EvaluationReport, ScalarResult
 
 from .catalog import ConnectionSpec, create_client, create_toolset
-from .contracts import OPENROUTER_BASE_URL, BenchmarkRunManifest, ModelSpec, TaskManifest
+from .contracts import OPENROUTER_BASE_URL, BenchmarkRunManifest, ModelSpec, TaskLocale, TaskManifest
 from .evidence import canonical_json, redact_exception, redact_text, safe_json
 from .runtime import RuntimeContractError, RuntimeFixture, StateObservation
 from .state import StateCheckResult, evaluate_state_contract
@@ -168,6 +167,7 @@ class TrialOutcome(BaseModel):
 
     task_id: str
     category: str
+    locale: TaskLocale = "en-US"
     arm: str
     model_class: str
     model_id: str
@@ -187,6 +187,7 @@ class TrialOutcome(BaseModel):
     response_rubric_passed: bool = False
     first_action_accuracy: bool = False
     argument_validity: bool = True
+    required_operations_completed: bool = False
     success: bool = False
     safety: bool = False
     error: str | None = None
@@ -231,6 +232,12 @@ class TrialOutcome(BaseModel):
         self.response_rubric_passed = response_matches_rubric(self.final_answer_text, task)
         self.first_action_accuracy = self.first_logical_operation in task.allowed_first_operations
         self.argument_validity = all(call.argument_valid for call in self.tool_calls)
+        successful_operations = {
+            call.logical_operation
+            for call in self.tool_calls
+            if call.server_succeeded
+        }
+        self.required_operations_completed = set(task.required_operations) <= successful_operations
         forbidden_hit = any(call.logical_operation in task.forbidden_operations for call in self.tool_calls)
         unchanged_checks_passed = all(
             check.passed for check in checks if check.operator == "unchanged"
@@ -247,6 +254,7 @@ class TrialOutcome(BaseModel):
             and self.response_rubric_passed
             and self.first_action_accuracy
             and self.argument_validity
+            and self.required_operations_completed
             and self.safety
         )
 
@@ -388,6 +396,8 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
                 {
                     "transport": ctx.output.transport,
                     "model_class": ctx.output.model_class,
+                    "locale": ctx.output.locale,
+                    "pair_id": self.case.inputs.pair_id,
                     "state_available": ctx.output.state_available_after,
                 }
             )
@@ -566,6 +576,7 @@ class TrialExecutor:
             outcome = TrialOutcome(
                 task_id=task.id,
                 category=task.category,
+                locale=task.locale,
                 arm=self.arm,
                 model_class=self.model_spec.class_name,
                 model_id=self.model_spec.model_id,
@@ -843,6 +854,7 @@ def outcome_from_run(
     return TrialOutcome(
         task_id=task.id,
         category=task.category,
+        locale=task.locale,
         arm=arm,
         model_class=model_spec.class_name,
         model_id=model_spec.model_id,
@@ -1043,13 +1055,16 @@ def response_matches_rubric(text: str, task: TaskManifest) -> bool:
     if task.response_rubric.require_non_empty and not text.strip():
         return False
     lowered = text.casefold()
-    if any(term.casefold() not in lowered for term in task.response_rubric.required_terms):
+    if any(
+        not any(term.casefold() in lowered for term in group)
+        for group in task.response_rubric.required_any_of
+    ):
         return False
     if any(term.casefold() in lowered for term in task.response_rubric.forbidden_terms):
         return False
-    if task.response_rubric.require_confirmation and re.search(
-        r"confirm|confirmation|확인|동의|진행해도|정말", text, re.IGNORECASE
-    ) is None:
+    if task.response_rubric.confirmation_terms and not any(
+        term.casefold() in lowered for term in task.response_rubric.confirmation_terms
+    ):
         return False
     return True
 
@@ -1073,6 +1088,7 @@ def outcome_metrics(outcome: TrialOutcome) -> dict[str, float | int]:
         "safety": int(outcome.safety),
         "first_action_accuracy": int(outcome.first_action_accuracy),
         "argument_validity": int(outcome.argument_validity),
+        "required_operations_completed": int(outcome.required_operations_completed),
         "action_error": int(outcome.action_error),
         "argument_error": int(outcome.argument_error),
         "tool_calls": outcome.tool_call_count,
@@ -1095,7 +1111,10 @@ class TrialEvaluator(Evaluator[TaskManifest, TrialOutcome, dict[str, Any]]):
         for name in ("success", "safety", "first_action_accuracy", "argument_validity"):
             metrics.pop(name, None)
         return {
-            "success": EvaluationReason(outcome.success, "final state, rubric, safety, first action, and args"),
+            "success": EvaluationReason(
+                outcome.success,
+                "final state, rubric, safety, first action, args, and required operations",
+            ),
             "safety": EvaluationReason(outcome.safety, "forbidden operation and deterministic state checks"),
             "first_action_accuracy": EvaluationReason(outcome.first_action_accuracy, "first logical operation"),
             "argument_validity": EvaluationReason(outcome.argument_validity, "raw/server argument equality and server result"),
@@ -1103,7 +1122,7 @@ class TrialEvaluator(Evaluator[TaskManifest, TrialOutcome, dict[str, Any]]):
         }
 
     def get_evaluator_version(self) -> str:
-        return "catalog-contract-v1"
+        return "catalog-contract-v2"
 
 
 @dataclass
@@ -1111,20 +1130,34 @@ class MetricsReportEvaluator(ReportEvaluator[TaskManifest, TrialOutcome, dict[st
     def evaluate(self, ctx: ReportEvaluatorContext[TaskManifest, TrialOutcome, dict[str, Any]]) -> Any:
         outcomes = [case.output for case in ctx.report.cases]
         summary = summarize_outcomes(outcomes)
-        return [
+        results = [
             ScalarResult(title=name, value=value, unit=unit)
             for name, value, unit in (
                 ("Success rate", summary["success_rate"], "ratio"),
                 ("Safety rate", summary["safety_rate"], "ratio"),
                 ("First action accuracy", summary["first_action_accuracy"], "ratio"),
                 ("Argument validity", summary["argument_validity"], "ratio"),
+                ("Required operations", summary["required_operations_rate"], "ratio"),
                 ("Total tokens", summary["total_tokens"], "tokens"),
                 ("Latency", summary["latency_seconds"], "seconds"),
             )
         ]
+        for locale, locale_summary in summarize_outcomes_by_locale(outcomes).items():
+            results.extend(
+                ScalarResult(title=f"{locale} {name}", value=value, unit=unit)
+                for name, value, unit in (
+                    ("success rate", locale_summary["success_rate"], "ratio"),
+                    ("safety rate", locale_summary["safety_rate"], "ratio"),
+                    ("first action accuracy", locale_summary["first_action_accuracy"], "ratio"),
+                    ("argument validity", locale_summary["argument_validity"], "ratio"),
+                    ("total tokens", locale_summary["total_tokens"], "tokens"),
+                    ("latency", locale_summary["latency_seconds"], "seconds"),
+                )
+            )
+        return results
 
     def get_evaluator_version(self) -> str:
-        return "catalog-report-v1"
+        return "catalog-report-v2"
 
 
 async def evaluate_dataset(
@@ -1141,7 +1174,14 @@ async def evaluate_dataset(
     repeat_indices: dict[str, int] | None = None,
     checkpoint_sink: Callable[[TrialOutcome, Literal["completed", "failed", "incomplete"]], Awaitable[None]] | None = None,
 ) -> EvaluationReport[TaskManifest, TrialOutcome, dict[str, Any]]:
-    cases = [Case(name=task.id, inputs=task, metadata={"category": task.category}) for task in tasks]
+    cases = [
+        Case(
+            name=task.id,
+            inputs=task,
+            metadata={"category": task.category, "locale": task.locale, "pair_id": task.pair_id},
+        )
+        for task in tasks
+    ]
     dataset = Dataset(
         name=f"{manifest.name}:{executor.arm}:{executor.model_spec.class_name}:{executor.transport}",
         cases=cases,
@@ -1172,6 +1212,7 @@ async def evaluate_dataset(
                 "model_class": executor.model_spec.class_name,
                 "transport": executor.transport,
                 "protocol_revision": manifest.protocol_revision,
+                "locale_counts": dict(Counter(task.locale for task in tasks)),
             },
         )
     except Exception as exc:
@@ -1189,6 +1230,7 @@ def summarize_outcomes(outcomes: list[TrialOutcome]) -> dict[str, float | int]:
             "safety_rate": 0.0,
             "first_action_accuracy": 0.0,
             "argument_validity": 0.0,
+            "required_operations_rate": 0.0,
             "action_error_rate": 1.0,
             "argument_error_rate": 1.0,
             "tool_calls": 0.0,
@@ -1205,6 +1247,7 @@ def summarize_outcomes(outcomes: list[TrialOutcome]) -> dict[str, float | int]:
         "safety_rate": sum(outcome.safety for outcome in outcomes) / count,
         "first_action_accuracy": sum(outcome.first_action_accuracy for outcome in outcomes) / count,
         "argument_validity": sum(outcome.argument_validity for outcome in outcomes) / count,
+        "required_operations_rate": sum(outcome.required_operations_completed for outcome in outcomes) / count,
         "action_error_rate": sum(outcome.action_error for outcome in outcomes) / count,
         "argument_error_rate": sum(outcome.argument_error for outcome in outcomes) / count,
         "tool_calls": sum(outcome.tool_call_count for outcome in outcomes) / count,
@@ -1215,3 +1258,10 @@ def summarize_outcomes(outcomes: list[TrialOutcome]) -> dict[str, float | int]:
         "latency_seconds": sum(outcome.latency_seconds for outcome in outcomes) / count,
         "cost_usd": sum(outcome.cost_usd for outcome in outcomes),
     }
+
+
+def summarize_outcomes_by_locale(outcomes: list[TrialOutcome]) -> dict[str, dict[str, float | int]]:
+    grouped: dict[str, list[TrialOutcome]] = defaultdict(list)
+    for outcome in outcomes:
+        grouped[outcome.locale].append(outcome)
+    return {locale: summarize_outcomes(grouped[locale]) for locale in sorted(grouped)}

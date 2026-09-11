@@ -38,6 +38,7 @@ def _inputs() -> tuple[object, list[object], CheckpointHeader, CheckpointKey, di
         transport="http",
         task_id=task.id,
         repeat_index=1,
+        locale=task.locale,
     )
     return manifest, tasks, header, key, {hash_json(key.model_dump(mode="json")): key}
 
@@ -50,6 +51,7 @@ def _outcome(key: CheckpointKey, *, error: str | None = None) -> TrialOutcome:
         model_class=key.model_class,
         model_id=key.model_id,
         transport=key.transport,
+        locale=key.locale,
         repeat_index=key.repeat_index,
         final_answer_text="완료",
         input_tokens=10,

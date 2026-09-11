@@ -32,6 +32,7 @@ from .execution import (
     evaluate_dataset,
     execute_smoke,
     summarize_outcomes,
+    summarize_outcomes_by_locale,
     validate_model_configuration,
     worst_case_cost,
 )
@@ -341,6 +342,7 @@ class BenchmarkRunner:
                 and existing.repeat_index == outcome.repeat_index
                 and existing.model_class == outcome.model_class
                 and existing.transport == outcome.transport
+                and existing.locale == outcome.locale
             ):
                 trials[index] = outcome
                 return
@@ -366,6 +368,7 @@ class BenchmarkRunner:
                             transport=transport,
                             task_id=task.id,
                             repeat_index=repeat_index,
+                            locale=task.locale,
                         )
                         planned[hash_json(key.model_dump(mode="json"))] = key
         return planned
@@ -465,9 +468,11 @@ class BenchmarkRunner:
                 "report": existing.get("report"),
                 "trials": [safe_json(outcome.model_dump(mode="json"), self.secrets) for outcome in ordered],
                 "summary": summarize_outcomes(ordered),
+                "locale_metrics": summarize_outcomes_by_locale(ordered),
                 "partial": bool(existing.get("partial", False)) or failure is not None,
             }
         completed_trials = sum(len(outcomes) for outcomes in self._completed_trials.values())
+        all_outcomes = [outcome for outcomes in self._completed_trials.values() for outcome in outcomes]
         expected_trials = sum(
             1
             for model_spec in self.manifest.models
@@ -550,7 +555,12 @@ class BenchmarkRunner:
             "run_manifest_hash": hash_json(self.manifest.model_dump(mode="json")),
             "task_corpus_hash": hash_json([task.model_dump(mode="json") for task in self.tasks]),
             "task_ids": [task.id for task in self.tasks],
+            "task_locales": [
+                {"id": task.id, "locale": task.locale, "pair_id": task.pair_id}
+                for task in self.tasks
+            ],
             "category_counts": dict(sorted(Counter(task.category for task in self.tasks).items())),
+            "locale_counts": dict(sorted(Counter(task.locale for task in self.tasks).items())),
             "source_revision": runtime["source_revision"],
             "protocol_revision": self.manifest.protocol_revision,
             "artifact_versions": artifact_versions,
@@ -559,6 +569,8 @@ class BenchmarkRunner:
             "manifest": self.manifest.model_dump(mode="json"),
             "catalogs": {key: safe_json(value.model_dump(mode="json"), self.secrets) for key, value in sorted(catalogs.items())},
             "runs": all_reports,
+            "overall_metrics": summarize_outcomes(all_outcomes),
+            "locale_metrics": summarize_outcomes_by_locale(all_outcomes),
             "checkpoint": checkpoint_evidence,
             "smoke_gate": smoke_gate or self._smoke_gate,
             "timing": timing_payload,
@@ -605,7 +617,9 @@ class BenchmarkRunner:
             "run_manifest_hash": artifact["run_manifest_hash"],
             "task_corpus_hash": artifact["task_corpus_hash"],
             "task_ids": artifact["task_ids"],
+            "task_locales": artifact["task_locales"],
             "category_counts": artifact["category_counts"],
+            "locale_counts": artifact["locale_counts"],
             "source_revision": artifact["source_revision"],
             "protocol_revision": artifact["protocol_revision"],
             "artifact_versions": artifact["artifact_versions"],
@@ -615,6 +629,8 @@ class BenchmarkRunner:
             ],
             "catalogs": artifact["catalogs"],
             "runs": hash_runs,
+            "overall_metrics": artifact["overall_metrics"],
+            "locale_metrics": artifact["locale_metrics"],
             "smoke_gate_status": (smoke_gate or self._smoke_gate).get("status"),
         }
         safe_hash_input = safe_json(hash_input, self.secrets)
@@ -721,6 +737,7 @@ class BenchmarkRunner:
                 outcome = TrialOutcome(
                     task_id=task.id,
                     category=task.category,
+                    locale=task.locale,
                     arm=self.arm,
                     model_class=model_spec.class_name,
                     model_id=model_spec.model_id,
@@ -792,6 +809,7 @@ class BenchmarkRunner:
                     outcome = TrialOutcome(
                         task_id=task.id,
                         category=task.category,
+                        locale=task.locale,
                         arm=self.arm,
                         model_class=model_spec.class_name,
                         model_id=model_spec.model_id,
@@ -1344,41 +1362,50 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
     for key in sorted(set(baseline_runs) & set(candidate_runs)):
         base_trials = [TrialOutcome.model_validate(item) for item in baseline_runs[key]["trials"]]
         cand_trials = [TrialOutcome.model_validate(item) for item in candidate_runs[key]["trials"]]
-        base_by_task = _group_by_task(base_trials)
-        cand_by_task = _group_by_task(cand_trials)
-        if set(base_by_task) != set(cand_by_task):
-            raise ValueError(f"paired task sets differ for {key}")
-        pair_metrics = {}
-        for metric in ("success", "safety", "first_action_accuracy", "argument_validity", "total_tokens", "latency_seconds"):
-            pair_metrics[metric] = paired_metric(
-                base_by_task,
-                cand_by_task,
-                metric,
-                z_value=z_value,
-                confidence=confidence,
-            )
-        success_pass = pair_metrics["success"]["lower_bound"] >= -baseline["manifest"]["statistical_procedure"]["noninferiority_margin"]
-        action_pass = pair_metrics["first_action_accuracy"]["candidate_mean"] >= pair_metrics["first_action_accuracy"]["baseline_mean"]
-        argument_pass = pair_metrics["argument_validity"]["candidate_mean"] >= pair_metrics["argument_validity"]["baseline_mean"]
-        token_better = pair_metrics["total_tokens"]["candidate_mean"] < pair_metrics["total_tokens"]["baseline_mean"]
-        latency_better = pair_metrics["latency_seconds"]["candidate_mean"] < pair_metrics["latency_seconds"]["baseline_mean"]
-        efficiency_pass = token_better or latency_better
+        dimension = _paired_dimension(
+            base_trials,
+            cand_trials,
+            z_value=z_value,
+            confidence=confidence,
+            margin=float(baseline["manifest"]["statistical_procedure"]["noninferiority_margin"]),
+        )
+        pair_metrics = dimension["metrics"]
+        gate = dimension["gate"]
+        efficiency_pass = bool(gate["token_or_latency_improvement"])
         efficiency_any = efficiency_any or efficiency_pass
-        all_success = all_success and success_pass
-        all_action = all_action and action_pass
-        all_argument = all_argument and argument_pass
+        all_success = all_success and bool(gate["success_noninferiority"])
+        all_action = all_action and bool(gate["action_error_not_worse"])
+        all_argument = all_argument and bool(gate["argument_error_not_worse"])
         paired[key] = {
             "model_class": key.split(":", 1)[0],
             "transport": key.split(":", 1)[1],
             "metrics": pair_metrics,
-            "gate": {
-                "success_noninferiority": success_pass,
-                "action_error_not_worse": action_pass,
-                "argument_error_not_worse": argument_pass,
-                "token_or_latency_improvement": efficiency_pass,
-            },
-            "category": _category_comparison(base_trials, cand_trials, z_value=z_value, confidence=confidence),
+            "gate": gate,
+            "category": dimension["category"],
         }
+
+    baseline_outcomes = _all_run_outcomes(baseline_runs)
+    candidate_outcomes = _all_run_outcomes(candidate_runs)
+    overall = _paired_dimension(
+        baseline_outcomes,
+        candidate_outcomes,
+        z_value=z_value,
+        confidence=confidence,
+        margin=float(baseline["manifest"]["statistical_procedure"]["noninferiority_margin"]),
+        by_cell=True,
+    )
+    locales = sorted({outcome.locale for outcome in baseline_outcomes} | {outcome.locale for outcome in candidate_outcomes})
+    locale = {
+        task_locale: _paired_dimension(
+            [outcome for outcome in baseline_outcomes if outcome.locale == task_locale],
+            [outcome for outcome in candidate_outcomes if outcome.locale == task_locale],
+            z_value=z_value,
+            confidence=confidence,
+            margin=float(baseline["manifest"]["statistical_procedure"]["noninferiority_margin"]),
+            by_cell=True,
+        )
+        for task_locale in locales
+    }
 
     catalog_reduction: dict[str, float] = {}
     catalog_pass = True
@@ -1420,6 +1447,8 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
         "repeated_trials_are_averaged_per_task": True,
         "independent_task_count": len(baseline["task_ids"]),
         "repeat_count": baseline["manifest"]["repeats"],
+        "overall": overall,
+        "locale": locale,
         "paired": paired,
         "gate": gate,
     }
@@ -1433,8 +1462,13 @@ def paired_metric(
     z_value: float = 1.644854,
     confidence: float = 0.95,
 ) -> dict[str, Any]:
-    if any(len(base_by_task[task_id]) != len(cand_by_task[task_id]) for task_id in base_by_task):
-        raise ValueError(f"paired repeat counts differ for metric {metric}")
+    for task_id in base_by_task:
+        if len(base_by_task[task_id]) != len(cand_by_task[task_id]):
+            raise ValueError(f"paired repeat counts differ for metric {metric}")
+        if {item.repeat_index for item in base_by_task[task_id]} != {
+            item.repeat_index for item in cand_by_task[task_id]
+        }:
+            raise ValueError(f"paired repeat indices differ for metric {metric}")
     base_means = [_mean_metric(base_by_task[task_id], metric) for task_id in sorted(base_by_task)]
     cand_means = [_mean_metric(cand_by_task[task_id], metric) for task_id in sorted(base_by_task)]
     diffs = [candidate - baseline for baseline, candidate in zip(base_means, cand_means)]
@@ -1463,6 +1497,80 @@ def _group_by_task(outcomes: list[TrialOutcome]) -> dict[str, list[TrialOutcome]
     return dict(grouped)
 
 
+def _all_run_outcomes(runs: dict[str, Any]) -> list[TrialOutcome]:
+    return [
+        TrialOutcome.model_validate(item)
+        for key in sorted(runs)
+        for item in runs[key].get("trials", [])
+    ]
+
+
+def _group_for_comparison(
+    outcomes: list[TrialOutcome],
+    *,
+    by_cell: bool,
+) -> dict[str, list[TrialOutcome]]:
+    if not by_cell:
+        return _group_by_task(outcomes)
+    grouped: dict[str, list[TrialOutcome]] = defaultdict(list)
+    for outcome in outcomes:
+        grouped[f"{outcome.model_class}:{outcome.transport}:{outcome.task_id}"].append(outcome)
+    return dict(grouped)
+
+
+def _paired_dimension(
+    base: list[TrialOutcome],
+    candidate: list[TrialOutcome],
+    *,
+    z_value: float,
+    confidence: float,
+    margin: float,
+    by_cell: bool = False,
+) -> dict[str, Any]:
+    base_by_task = _group_for_comparison(base, by_cell=by_cell)
+    candidate_by_task = _group_for_comparison(candidate, by_cell=by_cell)
+    if set(base_by_task) != set(candidate_by_task):
+        raise ValueError("paired task sets differ")
+    metrics = {
+        metric: paired_metric(
+            base_by_task,
+            candidate_by_task,
+            metric,
+            z_value=z_value,
+            confidence=confidence,
+        )
+        for metric in (
+            "success",
+            "safety",
+            "first_action_accuracy",
+            "argument_validity",
+            "total_tokens",
+            "latency_seconds",
+        )
+    }
+    success_pass = metrics["success"]["lower_bound"] >= -margin
+    action_pass = metrics["first_action_accuracy"]["candidate_mean"] >= metrics["first_action_accuracy"]["baseline_mean"]
+    argument_pass = metrics["argument_validity"]["candidate_mean"] >= metrics["argument_validity"]["baseline_mean"]
+    token_better = metrics["total_tokens"]["candidate_mean"] < metrics["total_tokens"]["baseline_mean"]
+    latency_better = metrics["latency_seconds"]["candidate_mean"] < metrics["latency_seconds"]["baseline_mean"]
+    return {
+        "metrics": metrics,
+        "gate": {
+            "success_noninferiority": success_pass,
+            "action_error_not_worse": action_pass,
+            "argument_error_not_worse": argument_pass,
+            "token_or_latency_improvement": token_better or latency_better,
+        },
+        "category": _category_comparison(
+            base,
+            candidate,
+            z_value=z_value,
+            confidence=confidence,
+            by_cell=by_cell,
+        ),
+    }
+
+
 def _mean_metric(outcomes: list[TrialOutcome], metric: str) -> float:
     if metric in {"success", "safety", "first_action_accuracy", "argument_validity"}:
         return sum(bool(getattr(outcome, metric)) for outcome in outcomes) / len(outcomes)
@@ -1475,12 +1583,19 @@ def _category_comparison(
     *,
     z_value: float,
     confidence: float,
+    by_cell: bool = False,
 ) -> dict[str, Any]:
     categories = sorted({outcome.category for outcome in base} | {outcome.category for outcome in cand})
     result: dict[str, Any] = {}
     for category in categories:
-        base_group = _group_by_task([outcome for outcome in base if outcome.category == category])
-        cand_group = _group_by_task([outcome for outcome in cand if outcome.category == category])
+        base_group = _group_for_comparison(
+            [outcome for outcome in base if outcome.category == category],
+            by_cell=by_cell,
+        )
+        cand_group = _group_for_comparison(
+            [outcome for outcome in cand if outcome.category == category],
+            by_cell=by_cell,
+        )
         if not base_group or set(base_group) != set(cand_group):
             result[category] = {"status": "inconclusive"}
             continue
@@ -1531,11 +1646,35 @@ def _validate_artifact_pair(baseline: dict[str, Any], candidate: dict[str, Any])
         if hash_input is not None or artifact_hash is not None:
             if not isinstance(hash_input, dict) or not isinstance(artifact_hash, str) or hash_json(hash_input) != artifact_hash:
                 raise ValueError(f"invalid {expected_arm} artifact hash")
-    for key in ("run_manifest_hash", "task_corpus_hash", "protocol_revision", "task_ids"):
+    for key in (
+        "run_manifest_hash",
+        "task_corpus_hash",
+        "protocol_revision",
+        "task_ids",
+        "task_locales",
+        "locale_counts",
+    ):
         if baseline.get(key) != candidate.get(key):
             raise ValueError(f"paired artifacts differ in {key}")
     if baseline.get("manifest") != candidate.get("manifest"):
         raise ValueError("paired artifacts differ in the registered run manifest")
+    for artifact in (baseline, candidate):
+        task_locales = artifact.get("task_locales")
+        if isinstance(task_locales, list):
+            declared = {
+                item["id"]: item["locale"]
+                for item in task_locales
+                if isinstance(item, dict) and isinstance(item.get("id"), str) and isinstance(item.get("locale"), str)
+            }
+            if len(declared) != len(task_locales):
+                raise ValueError("artifact task locale declarations are invalid")
+            if set(declared) != set(artifact.get("task_ids", [])):
+                raise ValueError("artifact task locale declarations do not cover its task ids")
+            for run in artifact.get("runs", {}).values():
+                for raw_outcome in run.get("trials", []) if isinstance(run, dict) else []:
+                    outcome = TrialOutcome.model_validate(raw_outcome)
+                    if declared.get(outcome.task_id) != outcome.locale:
+                        raise ValueError("artifact trial locale does not match its task declaration")
     baseline_fixture = baseline.get("fixture", {})
     candidate_fixture = candidate.get("fixture", {})
     if (

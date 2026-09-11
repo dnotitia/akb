@@ -71,5 +71,17 @@
     "default": null,
     "read_only": "MCP_BENCH_READ_ONLY_PAT"
   },
-  "fixture_scenario": "app-control-plane"
+  "fixture_scenario": "app-control-plane",
+  "locales": ["ko-KR", "en-US"],
+  "locale_counts": {"ko-KR": 8, "en-US": 8},
+  "pair_categories": {
+    "read-vaults": "single_operation",
+    "create-vault": "single_operation",
+    "ambiguous-find": "ambiguous_action",
+    "multi-step": "multi_step",
+    "destructive-confirm": "destructive_confirmation",
+    "authorization-readonly": "authorization",
+    "invalid-recovery": "invalid_input_recovery",
+    "stdio-local": "stdio_local"
+  }
 }

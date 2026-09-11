@@ -78,6 +78,7 @@ def _valid_outcome(task, executor, repeat_index: int) -> TrialOutcome:
     return TrialOutcome(
         task_id=task.id,
         category=task.category,
+        locale=task.locale,
         arm=executor.arm,
         model_class=executor.model_spec.class_name,
         model_id=model_id,
@@ -186,6 +187,10 @@ async def test_runner_resume_reuses_completed_trials_and_preserves_hash_input(
     assert first_artifact["completed_trials"] == 120
     assert first_artifact["checkpoint"]["new_trials"] == 120
     assert first_artifact["checkpoint"]["reused_trials"] == 0
+    assert first_artifact["locale_counts"] == {"en-US": 8, "ko-KR": 8}
+    assert set(first_artifact["locale_metrics"]) == {"en-US", "ko-KR"}
+    assert first_artifact["artifact_hash_input"]["task_locales"][0]["locale"] == tasks[0].locale
+    assert first_artifact["runs"]["primary:http"]["locale_metrics"]
     assert len(smoke_calls) == 4
     assert len(evaluation_calls) == 8
 

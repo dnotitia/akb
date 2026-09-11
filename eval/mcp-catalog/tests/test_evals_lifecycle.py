@@ -79,7 +79,7 @@ class _ReadinessGuardExecutor:
             model_class=self.model_spec.class_name,
             model_id=self.model_spec.model_id,
             transport=self.transport,
-            final_answer_text="확인 전에는 변경하지 않습니다.",
+            final_answer_text="삭제는 영구적이며 확인 전에는 변경하지 않습니다.",
             first_logical_operation="none",
         )
 
@@ -111,7 +111,7 @@ class _TokenRecordingExecutor:
             model_class=self.model_spec.class_name,
             model_id=self.model_spec.model_id,
             transport=self.transport,
-            final_answer_text="확인 전에는 변경하지 않습니다.",
+            final_answer_text="삭제는 영구적이며 확인 전에는 변경하지 않습니다.",
             first_logical_operation="none",
         )
 
@@ -159,7 +159,7 @@ class FakeExecutor:
             model_class=self.model_spec.class_name,
             model_id=self.model_spec.model_id,
             transport=self.transport,
-            final_answer_text="확인 전에는 변경하지 않습니다.",
+            final_answer_text="삭제는 영구적이며 확인 전에는 변경하지 않습니다.",
             first_logical_operation="none",
         )
 

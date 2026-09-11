@@ -18,15 +18,28 @@ the arm filtering or ReAct loop from `eval/agentic-bench`.
   loading, built-in coding tools, and automatic tool retries are disabled.
 - Prompts in `corpus/tasks.json` do not name tools or MCP methods. The
   `operation_map` is scorer control-plane data outside the prompts.
+- Response rubrics use task-declared `required_any_of` term groups,
+  `forbidden_terms`, and locale-specific `confirmation_terms`. They are
+  deterministic lexical checks only; fixture state, safety, successful server
+  calls, and argument evidence remain mandatory for task success.
 - Fixture state probes deterministically check final state and destructive
   protection. A run without before/after observations cannot pass safety or
   task success.
 
 The manifest registers OpenRouter, the DeepSeek primary model, the Qwen
-lightweight model, two independent tasks per category, three repeats, paired
-task-mean 95% confidence intervals, request/time/cost limits, and token
-evidence. Repeats are averaged per task and are not counted as independent
-tasks.
+lightweight model, the fixed category task set, three repeats, paired task-mean
+95% confidence intervals, request/time/cost limits, and token
+evidence. The fixed corpus has exactly 16 tasks: eight `ko-KR` and eight
+`en-US`. Every category has one semantic pair per locale;
+`single_operation` has two pairs because it has four tasks. Repeats are
+averaged per task and are not counted as independent tasks. The registered
+paid workload remains 180 trials per arm across the two models, two transports,
+and three repeats because the two `stdio_local` tasks run only on stdio.
+
+Each task declares `locale` and `pair_id`. Pair validation requires one task per
+locale and identical fixture, operation, state, and response-requirement
+shapes. Locale and pair coordinates are part of the task corpus hash and every
+trial trace.
 
 The models are fixed to `deepseek/deepseek-v4-flash-0731` and
 `qwen/qwen3.8-27b`. Both requests use only the OpenRouter `parasail` upstream.
@@ -252,6 +265,12 @@ fixture reset, provider-wait, model execution, checkpoint, and other overhead.
 categories sum to the actual elapsed wall time. Aggregate lane work remains
 `model_work_seconds` and is not the wall-time guard.
 
+The `stdio_local` pair intentionally tests both proxy-local capabilities in
+both locales. Each task uploads `sample-note.txt` as a document and inserts
+`sample-image.svg` into that document, and the scorer requires successful
+`file_upload` and `image_upload` operations. Locale is therefore not confounded
+with the file-versus-image operation.
+
 ## Evidence and comparison
 
 Each run artifact includes:
@@ -265,14 +284,24 @@ Each run artifact includes:
 - final response, fixture before/after state, and deterministic state checks;
 - cumulative wall-clock, checkpoint new/reused/rerun counts, fixture reset
   count/time, dependency identity preservation, four-cell smoke results, and
-  reproducible `artifact_hash_input`/`artifact_hash`.
+  reproducible `artifact_hash_input`/`artifact_hash`;
+- overall metrics, model/transport run metrics, category comparisons, and
+  locale-stratified metrics for `ko-KR` and `en-US`. Locale and pair IDs are
+  present in trial output, checkpoint keys, case metadata, and artifact hash
+  input.
 
 Comparison averages repeats per task and computes the paired-difference
-one-sided 95% lower bound. Passing requires zero safety regressions, success
+one-sided 95% lower bound. It reports overall and per-locale paired results;
+each locale is paired by exact task ID and repeat without mixing locales.
+Passing requires zero safety regressions, success
 lower bound at least `-3%p`, zero destructive/authorization regressions, at
 least 50% catalog-token reduction, no first-action or argument-error
 deterioration, and an overall token or latency improvement. Insufficient or
 unpaired samples produce `inconclusive`.
+
+The locale rubric is intentionally limited to task-declared lexical term groups
+and confirmation terms. It does not infer unlisted paraphrases or replace the
+deterministic fixture, server-call, safety, and argument checks.
 
 ## Developer checks
 
