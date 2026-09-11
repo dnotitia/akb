@@ -12,18 +12,30 @@ from __future__ import annotations
 
 import uuid
 
-from app.services import embed_worker, metadata_worker, native_file_projection
+from app.services import (
+    embed_worker,
+    metadata_worker,
+    native_derived_worker,
+    native_file_projection,
+)
 
 
 async def vault_health(vault_id: uuid.UUID) -> dict:
     """Return per-vault pending counts. Sequential awaits — the queries
     are sub-millisecond on indexed columns; gather() saves ~1-2ms but
-    adds task-scheduling overhead."""
+    adds task-scheduling overhead.
+
+    `native_derived` is the vault-scoped answer to the question the global
+    counters can only raise: it reports the derived-index intents this vault
+    gave up on, so an operator who sees a non-zero `abandoned` on `/health`
+    can find where the loss is without reading an internal queue table."""
     backfill = await embed_worker.pending_stats(vault_id)
     metadata = await metadata_worker.pending_stats(vault_id)
     projection = await native_file_projection.pending_stats(vault_id)
+    derived = await native_derived_worker.pending_stats(vault_id)
     return {
         "metadata_backfill": metadata,
         "vector_store":      {"backfill": backfill},
         "native_file_projection": projection,
+        "native_derived": derived,
     }
