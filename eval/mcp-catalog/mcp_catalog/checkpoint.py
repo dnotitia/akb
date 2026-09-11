@@ -12,7 +12,7 @@ from typing import Literal
 
 from pydantic import Field
 
-from .contracts import ArmName, ContractModel, hash_json
+from .contracts import ArmName, ContractModel, TaskLocale, hash_json
 from .evidence import safe_json
 from .execution import TrialOutcome, has_measured_evidence
 
@@ -44,6 +44,7 @@ class CheckpointKey(ContractModel):
     transport: Literal["http", "stdio"]
     task_id: str = Field(min_length=1, max_length=100)
     repeat_index: int = Field(ge=1)
+    locale: TaskLocale = "en-US"
 
 
 class CheckpointBudget(ContractModel):
@@ -456,6 +457,7 @@ class CheckpointStore:
             and outcome.model_id == key.model_id
             and outcome.transport == key.transport
             and outcome.repeat_index == key.repeat_index
+            and outcome.locale == key.locale
         )
 
     def _smoke_cell_matches(self, cell_key: str, record: SmokeCellCheckpoint) -> bool:

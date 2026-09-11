@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -103,6 +104,8 @@ def validate(args: argparse.Namespace) -> int:
         "valid": True,
         "task_count": len(tasks),
         "category_counts": {key: sum(task.category == key for task in tasks) for key in sorted(manifest.category_minimums)},
+        "locale_counts": dict(sorted(Counter(task.locale for task in tasks).items())),
+        "pair_ids": sorted({task.pair_id for task in tasks}),
         "repeats": manifest.repeats,
         "model_classes": [model.class_name for model in manifest.models],
         "descriptor": descriptor_info,
