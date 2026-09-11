@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -416,6 +417,59 @@ async def test_large_token_outcome_is_recorded_without_a_token_budget_gate() -> 
     assert ledger.input_tokens == 10_000_000
     assert ledger.output_tokens == 8_000_000
     assert ledger.cost_usd == 0.01
+
+
+@pytest.mark.asyncio
+async def test_parallel_lane_work_does_not_trip_the_actual_wall_guard() -> None:
+    loaded = load_run_manifest(ROOT / "config" / "run.json")
+    manifest = loaded.model_copy(
+        update={"budget": loaded.budget.model_copy(update={"max_wall_seconds": 10})}
+    )
+    ledger = BudgetLedger(manifest, wall_clock=lambda: 5.0)
+    provider_calls = 0
+
+    async def lane() -> None:
+        nonlocal provider_calls
+        outcome = TrialOutcome(
+            task_id="parallel-lane",
+            category="single_operation",
+            arm="baseline",
+            model_class="primary",
+            model_id=manifest.models[0].model_id,
+            transport="http",
+            model_requests=1,
+            input_tokens=1,
+            output_tokens=1,
+            total_tokens=2,
+            latency_seconds=4.0,
+            cost_usd=0.001,
+        )
+        await ledger.reserve_trial(0.001)
+        provider_calls += 1
+        await ledger.charge(outcome, reserved_cost_usd=0.001)
+
+    await asyncio.gather(*(lane() for _ in range(4)))
+
+    assert provider_calls == 4
+    assert ledger.wall_seconds == pytest.approx(5.0)
+    assert ledger.model_work_seconds == pytest.approx(16.0)
+    assert ledger.wall_seconds < manifest.budget.max_wall_seconds
+
+
+@pytest.mark.asyncio
+async def test_actual_cumulative_wall_guard_blocks_before_provider_call() -> None:
+    loaded = load_run_manifest(ROOT / "config" / "run.json")
+    manifest = loaded.model_copy(
+        update={"budget": loaded.budget.model_copy(update={"max_wall_seconds": 10})}
+    )
+    ledger = BudgetLedger(manifest, wall_clock=lambda: 10.0)
+    provider_calls = 0
+
+    with pytest.raises(BudgetExceeded, match="max_wall_seconds"):
+        await ledger.reserve_trial(0.001)
+        provider_calls += 1
+
+    assert provider_calls == 0
 
 
 @pytest.mark.asyncio
