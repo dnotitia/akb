@@ -339,7 +339,7 @@ async def test_mcp_oauth_maps_suspended_external_account_to_auth_failure(monkeyp
     async def verify(_token: str, _route_profile: str):
         return principal
 
-    async def _suspended(_claims):
+    async def _suspended(_claims, **_kwargs):
         raise AccountSuspendedError()
 
     monkeypatch.setattr(auth_service, "verify_keycloak_access_v1", verify)

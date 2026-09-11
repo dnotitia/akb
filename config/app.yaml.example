@@ -254,6 +254,19 @@ app_credential_overlap_seconds: 300
 #                                         # Exact subject bindings need no email claim.
 #                                         # Set false ONLY for a trusted realm with
 #                                         # controlled emails.
+# keycloak_authoritative_email_domains_by_provider: {}  # alias -> [domains].
+#                                         # Declares one provider the authority
+#                                         # for its corporate domains on the
+#                                         # BROWSER login path only. A verified
+#                                         # login through a declared alias adopts
+#                                         # the active human account carrying that
+#                                         # address, or provisions a fresh one.
+#                                         # Empty (default) keeps today's
+#                                         # behaviour. Exact domain match only
+#                                         # (no subdomain inheritance); `local`
+#                                         # is rejected. Design:
+#                                         # docs/design/proposal/2026-09-12-provider-authoritative-email-domains/README.md
+#                                         # e.g. {workforce: ["example.com"]}
 # sso_local_realm_login_enabled: false    # offer THIS installation's own realm as a
 #                                         # login option, for a deployment with no
 #                                         # external identity provider to broker to.

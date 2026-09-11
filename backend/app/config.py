@@ -55,6 +55,10 @@ NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME = "akb_revision_m1_measurement"
 
 _DNS1123_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _NATIVE_RUNTIME_IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+# One DNS label of an authoritative email domain: lowercase ASCII
+# alphanumerics with interior hyphens only. Checked after IDNA encoding,
+# so this never sees non-ASCII input.
+_AUTHORITY_DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 AuthMode = Literal["local", "sso"]
 LegacyAuthModeStatus = Literal["local_only", "strict_sso", "ambiguous_hybrid", "invalid"]
@@ -201,6 +205,98 @@ def _resolve_auth_mode_config(
     resolved["local_auth_enabled"] = expected_local_auth
     resolved["keycloak_sso_only"] = expected_sso_only
     return resolved
+
+
+def _normalize_authority_domain(value: object) -> str:
+    """Normalize one authoritative email domain, or raise.
+
+    Lowercase, one trailing dot stripped, exact-match only: no wildcards, no
+    subdomain inheritance (``example.com`` never covers ``sub.example.com``).
+    A rejecting caller reports the alias; the raw value never reaches an
+    error message (it is operator config, but value-less codes are the
+    house rule for identity-adjacent inputs).
+    """
+    if not isinstance(value, str):
+        raise AuthModeConfigurationError(
+            "keycloak_authoritative_email_domains_by_provider domains must be strings"
+        )
+    cleaned = value.strip().lower()
+    if cleaned.endswith("."):
+        cleaned = cleaned[:-1]
+    if not cleaned or len(cleaned) > 253 or ".." in cleaned:
+        raise AuthModeConfigurationError(
+            "keycloak_authoritative_email_domains_by_provider holds an invalid email domain"
+        )
+    try:
+        ascii_domain = cleaned.encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
+        raise AuthModeConfigurationError(
+            "keycloak_authoritative_email_domains_by_provider holds an invalid email domain"
+        ) from None
+    labels = ascii_domain.split(".")
+    if len(labels) < 2 or any(
+        not 1 <= len(label) <= 63 or _AUTHORITY_DOMAIN_LABEL_RE.fullmatch(label) is None for label in labels
+    ):
+        raise AuthModeConfigurationError(
+            "keycloak_authoritative_email_domains_by_provider holds an invalid email domain"
+        )
+    return ascii_domain
+
+
+def _normalize_authoritative_email_domains(value: object) -> dict[str, list[str]]:
+    """Validate the alias-keyed authoritative-domain map into canonical form.
+
+    The map is validated here — in the canonical loader — so the same value
+    fails identically whether it arrives from YAML or a directly constructed
+    ``Settings``. Alias validation reuses the provider contract
+    (``validate_alias`` + the reserved ``local`` alias); a bad alias, a
+    non-list domain set, or a bad domain fails the load fail-closed.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise AuthModeConfigurationError(
+            "keycloak_authoritative_email_domains_by_provider must be a mapping of provider alias to domain list"
+        )
+    # Local imports keep the module graph acyclic: providers must not import
+    # config, and config needs only the alias contract, not Keycloak I/O.
+    from app.sso import local_realm
+    from app.sso.providers.keycloak_oidc import ProviderDefinitionError, validate_alias
+
+    normalized: dict[str, list[str]] = {}
+    for raw_alias, raw_domains in value.items():
+        if not isinstance(raw_alias, str):
+            raise AuthModeConfigurationError(
+                "keycloak_authoritative_email_domains_by_provider keys must be provider aliases"
+            )
+        # Alias keys are case-sensitive and lowercase-only, exactly like the
+        # provider contract: Keycloak aliases are exact strings and the
+        # browser flow compares them with equality. An uppercase key would
+        # silently never match a login, so reject rather than fold.
+        try:
+            alias = validate_alias(raw_alias)
+        except ProviderDefinitionError:
+            raise AuthModeConfigurationError(
+                "keycloak_authoritative_email_domains_by_provider holds an invalid provider alias"
+            ) from None
+        if local_realm.is_local_alias(alias):
+            raise AuthModeConfigurationError(
+                "keycloak_authoritative_email_domains_by_provider must not name the local realm; "
+                "it brokers nowhere and its logins never adopt"
+            )
+        if not isinstance(raw_domains, list) or not raw_domains:
+            raise AuthModeConfigurationError(
+                f"keycloak_authoritative_email_domains_by_provider[{alias}] must be a non-empty domain list"
+            )
+        seen: set[str] = set()
+        domains: list[str] = []
+        for entry in raw_domains:
+            domain = _normalize_authority_domain(entry)
+            if domain not in seen:
+                seen.add(domain)
+                domains.append(domain)
+        normalized[alias] = domains
+    return normalized
 
 
 def is_dns1123_namespace(value: str) -> bool:
@@ -1021,6 +1117,15 @@ class Settings(BaseModel):
     # and the projection service repeats that guard for directly constructed
     # Settings. Runtime email adoption has no compatibility bypass.
     keycloak_link_by_email: bool = False
+    # Per-provider email-domain authority for the browser login path
+    # (dnotitia/akb#529). ``alias -> [domains]``; empty (the default) keeps
+    # every installation on today's behaviour. A declared domain lets a
+    # verified brokered login adopt the one active human account carrying
+    # that address, or provision a fresh one — evaluated only when no exact
+    # (issuer, subject) binding exists, only for the alias the flow
+    # selected, and never for the local realm. Flat key so the shallow
+    # app.yaml+secret.yaml merge cannot clobber a nested block.
+    keycloak_authoritative_email_domains_by_provider: dict[str, list[str]] = Field(default_factory=dict)
     # Deprecated pre-custody callback input. The active ordinary browser
     # callback is derived from public_base_url and never trusts this value.
     keycloak_redirect_uri: str = ""
@@ -1241,6 +1346,14 @@ class Settings(BaseModel):
     stats: StatsSettings = Field(default_factory=StatsSettings)
 
     @model_validator(mode="after")
+    def validate_authoritative_email_domains(self) -> "Settings":
+        """Normalize the provider authority map so direct construction fails closed too."""
+        self.keycloak_authoritative_email_domains_by_provider = _normalize_authoritative_email_domains(
+            self.keycloak_authoritative_email_domains_by_provider
+        )
+        return self
+
+    @model_validator(mode="after")
     def validate_service_admin_client(self) -> "Settings":
         """Refuse a service-authority client that is not exactly one non-human client."""
         client_id = self.keycloak_service_admin_client_id.strip()
@@ -1338,11 +1451,9 @@ class Settings(BaseModel):
     def keycloak_jwks_uri(self) -> str:
         # Server→Keycloak → backchannel issuer.
         return f"{self._keycloak_backchannel_issuer}/protocol/openid-connect/certs"
-
     @property
     def keycloak_human_client_ids(self) -> frozenset[str]:
         """OIDC clients allowed to authorize human API access tokens.
-
         MCP DCR clients are intentionally excluded: MCP has its own route
         profile, audience, and scope contract rather than this static list.
         """
@@ -1354,6 +1465,19 @@ class Settings(BaseModel):
             )
             if client_id.strip()
         )
+
+    def authoritative_email_domains_for(self, provider_alias: str | None) -> tuple[str, ...]:
+        """Declared authority domains for one provider alias, or empty.
+
+        The lookup key is the alias the browser flow selected and verified —
+        never a claim read out of the token at this layer. ``None`` (the
+        non-browser projection paths, which pass no alias) is inert: unknown
+        and local aliases resolve through the same empty answer, so a second
+        upstream can never inherit the first one's trust.
+        """
+        if not provider_alias:
+            return ()
+        return tuple(self.keycloak_authoritative_email_domains_by_provider.get(provider_alias, ()))
 
     @property
     def keycloak_service_admin_client_id_effective(self) -> str:
