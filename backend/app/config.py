@@ -215,6 +215,10 @@ def _normalize_authority_domain(value: object) -> str:
     A rejecting caller reports the alias; the raw value never reaches an
     error message (it is operator config, but value-less codes are the
     house rule for identity-adjacent inputs).
+
+    Length is enforced AFTER IDNA encoding: punycode expansion can push an
+    ASCII-short name past the 253-octet DNS limit, and only the wire form
+    is what the limit constrains.
     """
     if not isinstance(value, str):
         raise AuthModeConfigurationError(
@@ -223,7 +227,7 @@ def _normalize_authority_domain(value: object) -> str:
     cleaned = value.strip().lower()
     if cleaned.endswith("."):
         cleaned = cleaned[:-1]
-    if not cleaned or len(cleaned) > 253 or ".." in cleaned:
+    if not cleaned or ".." in cleaned:
         raise AuthModeConfigurationError(
             "keycloak_authoritative_email_domains_by_provider holds an invalid email domain"
         )
@@ -234,8 +238,13 @@ def _normalize_authority_domain(value: object) -> str:
             "keycloak_authoritative_email_domains_by_provider holds an invalid email domain"
         ) from None
     labels = ascii_domain.split(".")
-    if len(labels) < 2 or any(
-        not 1 <= len(label) <= 63 or _AUTHORITY_DOMAIN_LABEL_RE.fullmatch(label) is None for label in labels
+    if (
+        len(ascii_domain) > 253
+        or len(labels) < 2
+        or any(
+            not 1 <= len(label) <= 63 or _AUTHORITY_DOMAIN_LABEL_RE.fullmatch(label) is None
+            for label in labels
+        )
     ):
         raise AuthModeConfigurationError(
             "keycloak_authoritative_email_domains_by_provider holds an invalid email domain"
@@ -1079,8 +1088,13 @@ class Settings(BaseModel):
     keycloak_verify_ssl: bool = True  # set false only for local self-signed Keycloak
     # Exact identity is issuer/subject and does not require email. Open-mode
     # JIT requires a verified email only when creating a brand-new AKB user;
-    # email is never an account lookup or adoption key. Set false ONLY for a
-    # trusted realm where every account's email is controlled out-of-band.
+    # otherwise email is never an account lookup or adoption key — the one
+    # exception is a browser login through a provider declared in
+    # keycloak_authoritative_email_domains_by_provider for the address's
+    # domain, where the directory owns the mailbox. Set false ONLY for a
+    # trusted realm where every account's email is controlled out-of-band;
+    # on a declared domain that choice additionally admits unverified
+    # adoption, so keep it true wherever authority domains are configured.
     keycloak_require_verified_email: bool = True
     # OIDC account admission policy. `open` permits atomic creation of a fresh
     # user plus exact binding. `invite_only` accepts only an exact prebound
@@ -1125,7 +1139,16 @@ class Settings(BaseModel):
     # (issuer, subject) binding exists, only for the alias the flow
     # selected, and never for the local realm. Flat key so the shallow
     # app.yaml+secret.yaml merge cannot clobber a nested block.
-    keycloak_authoritative_email_domains_by_provider: dict[str, list[str]] = Field(default_factory=dict)
+    #
+    # This is deliberately NOT keycloak_link_by_email under another name:
+    # that flag (still rejected at canonical load) was install-wide,
+    # unverified, unguarded, and unaudited. This one is per-provider,
+    # domain-scoped, browser-only, verified-email-gated, guard-checked
+    # (active human, no issuer binding, never the recovery admin), and
+    # emits a distinct auth.user_adopted event.
+    # None normalizes to {} (explicit null in YAML is "not configured",
+    # not a type error); anything else non-mapping fails the load.
+    keycloak_authoritative_email_domains_by_provider: dict[str, list[str]] | None = Field(default_factory=dict)
     # Deprecated pre-custody callback input. The active ordinary browser
     # callback is derived from public_base_url and never trusts this value.
     keycloak_redirect_uri: str = ""
@@ -1471,13 +1494,14 @@ class Settings(BaseModel):
 
         The lookup key is the alias the browser flow selected and verified —
         never a claim read out of the token at this layer. ``None`` (the
-        non-browser projection paths, which pass no alias) is inert: unknown
-        and local aliases resolve through the same empty answer, so a second
-        upstream can never inherit the first one's trust.
+        non-browser projection paths, which pass no alias) is inert, as is
+        ``""``: unknown and local aliases resolve through the same empty
+        answer, so a second upstream can never inherit the first one's trust.
         """
         if not provider_alias:
             return ()
-        return tuple(self.keycloak_authoritative_email_domains_by_provider.get(provider_alias, ()))
+        mapping = self.keycloak_authoritative_email_domains_by_provider or {}
+        return tuple(mapping.get(provider_alias, ()))
 
     @property
     def keycloak_service_admin_client_id_effective(self) -> str:

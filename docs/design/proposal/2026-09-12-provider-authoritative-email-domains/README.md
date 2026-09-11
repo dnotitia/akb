@@ -47,9 +47,10 @@ keycloak_authoritative_email_domains_by_provider:
 
 | condition (browser callback, verified principal, alias-bound) | result |
 | --- | --- |
-| domain declared for this alias, an account has that email | **adopt** — write the binding, sign in |
-| domain declared for this alias, no account has that email | **provision** — create, sign in (existing open-path) |
+| domain declared for this alias, an account has that email | **adopt** — write the binding, clear any pending admission, sign in |
+| domain declared for this alias, no account has that email | **provision** — create, clear any pending admission, sign in |
 | domain not declared | unchanged — record the arrival, refuse |
+| declared domain, adopt guard fails (suspended, bound, recovery, …) | record the arrival, refuse with the guard's error |
 
 Empty by default: every existing installation behaves exactly as it does now,
 and a provider added later starts closed.
@@ -65,15 +66,28 @@ Scope is deliberately narrow:
   today; extending trust there is a separate decision and is out of scope.
   PAT resolution (`_resolve_pat` in `backend/app/services/auth_service.py`) is
   untouched — it reads the token row plus active account and knows no
-  enrollment, provider, or domain concept. Existing PATs keep working; only the
-  account's `auth_provider` flips from `local` to `keycloak` at adoption, which
-  disables local-password login for that account by the existing rule.
+  enrollment, provider, or domain concept. Existing PATs keep working
+  (pinned by a regression test that resolves a pre-adopt PAT after the
+  adoption); only the account's `auth_provider` flips from `local` to
+  `keycloak` at adoption, which disables local-password login for that
+  account by the existing rule.
+- **Concurrency.** The whole unbound-identity path runs inside one
+  transaction holding an advisory lock: address-keyed on the authority path
+  (concurrent logins for one address serialize on the row they read),
+  subject-keyed elsewhere (the address is untrusted input off the authority
+  path and is never a lock key). The adopt INSERT uses a savepoint so a
+  lost race rolls back only the INSERT and returns the winner's binding;
+  the provision collision handler re-checks authority before refusing.
+  Two simultaneous adopts of one address converge to one binding; the loser
+  is refused with `identity_conflict` rather than double-binding.
 - **`disabled` stays disabled.** The authority overrides `invite_only` and the
   collision branch of `open` for declared domains only. It never admits
   anything when enrollment is `disabled`.
-- **Exact match on domains.** Lowercase, strip one trailing dot, exact equality
-  only — no subdomain inheritance. The `local` alias can never carry domains
-  (fail-closed at config load).
+- **Exact match on domains, IDNA-aware both sides.** Lowercase, strip one
+  trailing dot, IDNA-encode, exact equality only — no subdomain inheritance.
+  Declared and asserted halves are both encoded before comparison, so a
+  punycode declaration matches the Unicode address a directory asserts.
+  The `local` alias can never carry domains (fail-closed at config load).
 - **Four adoption guards** (account ambiguity is impossible — `users.email` is
   unique): `email_verified` per the existing setting; target is an active human
   account (suspended must not be revived by signing in); target has no binding
@@ -82,9 +96,12 @@ Scope is deliberately narrow:
   (a break-glass path is never claimable by an IdP assertion).
 - **Notice, not proof.** No verification mail (none exists in this codebase).
   Provisioning already emits `auth.user_provisioned`; adoption emits a new
-  distinct `auth.user_adopted` event (payload carries `is_admin` legibility,
-  domain, issuer, subject, prior `auth_provider`) so subscribers can tell
-  "created" from "claimed".
+  distinct `auth.user_adopted` event (payload mirrors the provision event
+  plus the authority facts: `domain`, upstream-stable `subject`,
+  `prior_auth_provider`, and `is_admin` legibility) so subscribers can tell
+  "created" from "claimed". A failed adopt still records the arrival before
+  refusing, so guard rejections leave the same audit note as any other
+  refusal.
 
 ## Compatibility
 
@@ -110,8 +127,9 @@ unknown-key rejection inherited from the existing config contract.
   `local` alias rejected; unknown alias is inert (never matches a login).
 - Postgres: declared-domain adopt writes the exact binding and clears the
   pending admission; declared-domain provision creates and signs in; undeclared
-  domain still records + refuses; `open`-mode collision on a declared domain
-  adopts instead of `identity_conflict`.
+  domain still records + refuses; failed adopt records + refuses with the
+  guard's error; `open`-mode collision on a declared domain adopts instead
+  of `identity_conflict`.
 - Guards: unverified email refused; suspended account refused (and stays
   suspended); already-bound-for-issuer refused; recovery admin refused.
 - Concurrency: two simultaneous adopts of the same email converge to one

@@ -473,14 +473,20 @@ def _authority_domain_of(email: str, domains: tuple[str, ...]) -> str | None:
     """Return the declared authority domain covering ``email``, or None.
 
     Exact equality on the lowercased domain half only — no subdomain
-    inheritance, no IDNA re-encoding here (config load already canonicalized
-    the declared set; the email half is lowercased ASCII at this layer, and
-    a non-ASCII half simply matches nothing).
+    inheritance. The half is IDNA-encoded before comparison so a declared
+    punycode domain matches the Unicode address a directory asserts
+    (``münchen.de`` ↔ ``xn--mnchen-3ya.de``); a half that cannot encode
+    matches nothing. A malformed address (no ``@``, empty halves) matches
+    nothing — the caller's email-presence check reports it.
     """
     if "@" not in email:
         return None
-    domain = email.rsplit("@", 1)[1].lower()
-    if not domain:
+    local, _, raw_domain = email.rpartition("@")
+    if not local or not raw_domain:
+        return None
+    try:
+        domain = raw_domain.lower().encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
         return None
     return domain if domain in domains else None
 
@@ -501,9 +507,19 @@ async def _adopt_authoritative_user(conn, issuer: str, subject: str, claims: dic
       unique on (issuer, subject), not on (issuer, user_id));
     - never the recovery admin (break-glass is not claimable by assertion).
 
-    Runs inside the caller's address-keyed advisory lock
-    (``external-identity-authority:``), so concurrent adopts of one address
-    converge instead of double-binding.
+    Runs inside the caller's transaction (address advisory lock +
+    ``SELECT ... FOR UPDATE`` on the target), so concurrent adopts of one
+    address converge instead of double-binding. Uses SAVEPOINTs, never a
+    nested transaction: the INSERT is the only statement allowed to fail,
+    and its savepoint rolls back just that statement so the race fallback
+    below can still read.
+
+    Returns the resolved user, or None when no account holds the address
+    (the caller falls through to the mode's provision path). Emits
+    ``auth.user_adopted`` with the upstream-stable ``subject`` so the
+    "claimed" audit trail joins to the binding row without a lookup; the
+    payload otherwise mirrors ``auth.user_provisioned`` plus the authority
+    facts (``domain``, ``prior_auth_provider``, ``is_admin`` legibility).
     """
     if settings.keycloak_require_verified_email and claims.get("email_verified") is not True:
         raise AuthenticationError("Identity provider has not verified this email address")
@@ -540,51 +556,54 @@ async def _adopt_authoritative_user(conn, issuer: str, subject: str, claims: dic
         if has_issuer_binding:
             raise ExternalIdentityConflictError()
         prior_provider = target["auth_provider"]
+        await conn.execute(
+            """
+            UPDATE users
+               SET auth_provider = 'keycloak',
+                   display_name = COALESCE($2, display_name),
+                   updated_at = NOW()
+             WHERE id = $1
+            """,
+            target["id"],
+            display_name,
+        )
         try:
-            await conn.execute(
-                """
-                UPDATE users
-                   SET auth_provider = 'keycloak',
-                       display_name = COALESCE($2, display_name),
-                       updated_at = NOW()
-                 WHERE id = $1
-                """,
-                target["id"],
-                display_name,
-            )
-            await conn.execute(
-                """
-                INSERT INTO external_identities (
-                    user_id, issuer, subject, email_snapshot
-                ) VALUES ($1, $2, $3, $4)
-                """,
-                target["id"],
-                issuer,
-                subject,
-                email,
-            )
-            await emit_event(
-                conn,
-                "auth.user_adopted",
-                actor_id=str(target["id"]),
-                payload={
-                    "auth_provider": "keycloak",
-                    "prior_auth_provider": prior_provider,
-                    "email": email,
-                    "domain": domain,
-                    "issuer": issuer,
-                    "is_admin": bool(target["is_admin"]),
-                },
-            )
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO external_identities (
+                        user_id, issuer, subject, email_snapshot
+                    ) VALUES ($1, $2, $3, $4)
+                    """,
+                    target["id"],
+                    issuer,
+                    subject,
+                    email,
+                )
         except asyncpg.UniqueViolationError:
             # Lost the race: a concurrent login bound this subject, or bound
-            # this target to this issuer, first. Re-read under the same lock
-            # key and take the winner's answer.
+            # this target to this issuer, first. The savepoint rolled back
+            # only the INSERT, so re-read under the same lock and take the
+            # winner's answer.
             bound = await _bound_external_user(conn, issuer, subject)
             if bound is None:
                 raise ExternalIdentityConflictError() from None
             refreshed = await _refresh_bound_external_user(conn, bound, claims)
             return _resolved_external_user(refreshed, newly_provisioned=False)
+        await emit_event(
+            conn,
+            "auth.user_adopted",
+            actor_id=str(target["id"]),
+            payload={
+                "auth_provider": "keycloak",
+                "prior_auth_provider": prior_provider,
+                "email": email,
+                "domain": domain,
+                "issuer": issuer,
+                "subject": subject,
+                "is_admin": bool(target["is_admin"]),
+            },
+        )
     row = await conn.fetchrow(
         """
         SELECT id, username, email, display_name, is_admin,
@@ -623,31 +642,33 @@ async def _resolve_or_provision_keycloak_user(claims: dict, *, provider_alias: s
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # The lock key is the ADDRESS on the authority path: concurrent logins
-        # for one claimed email must serialize on the row they will all read.
-        # The subject key alone would let two adopts interleave (different
-        # subjects, same email) and double-bind. Off the authority path the
-        # address is untrusted input — never a lock key — so keep the
-        # subject key there.
-        if provider_alias is not None:
-            pre_email = (_optional_external_string(claims, "email") or "").strip().lower()
-            pre_domain = _authority_domain_of(
-                pre_email, settings.authoritative_email_domains_for(provider_alias)
+        # The browser authority path serializes concurrent logins for one
+        # claimed address on the row they will all read: the adopt helper
+        # runs inside this transaction, and the address advisory lock plus
+        # SELECT ... FOR UPDATE keep two adopts from interleaving (different
+        # subjects, same email) into a double bind. Off the authority path
+        # the address is untrusted input — never a lock key — so the
+        # subject key applies there instead.
+        async with conn.transaction():
+            if provider_alias is not None:
+                pre_email = (_optional_external_string(claims, "email") or "").strip().lower()
+                pre_domain = _authority_domain_of(
+                    pre_email, settings.authoritative_email_domains_for(provider_alias)
+                )
+            else:
+                pre_email, pre_domain = "", None
+            if pre_email and pre_domain is not None:
+                lock_key = f"external-identity-authority:{len(pre_email)}:{pre_email}"
+            else:
+                lock_key = f"external-identity:{len(issuer)}:{issuer}{subject}"
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                lock_key,
             )
-        else:
-            pre_email, pre_domain = "", None
-        if pre_email and pre_domain is not None:
-            lock_key = f"external-identity-authority:{len(pre_email)}:{pre_email}"
-        else:
-            lock_key = f"external-identity:{len(issuer)}:{issuer}{subject}"
-        await conn.execute(
-            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-            lock_key,
-        )
-        bound = await _bound_external_user(conn, issuer, subject)
-        if bound is not None:
-            refreshed = await _refresh_bound_external_user(conn, bound, claims)
-            return _resolved_external_user(refreshed, newly_provisioned=False)
+            bound = await _bound_external_user(conn, issuer, subject)
+            if bound is not None:
+                refreshed = await _refresh_bound_external_user(conn, bound, claims)
+                return _resolved_external_user(refreshed, newly_provisioned=False)
 
         email = (_optional_external_string(claims, "email") or "").strip().lower()
         if provider_alias is not None:
@@ -662,10 +683,22 @@ async def _resolve_or_provision_keycloak_user(claims: dict, *, provider_alias: s
             # Declared authority for this provider+domain: the directory owns
             # the mailbox, so the address selects the account. Adopt when one
             # holds it, else fall through to the mode's provision path.
-            # `disabled` never reaches here (refused above); a failed adopt
-            # records the arrival exactly like any other refusal.
-            adopted = await _adopt_authoritative_user(conn, issuer, subject, claims, email, domain)
+            # `disabled` never reaches here (refused above).
+            try:
+                adopted = await _adopt_authoritative_user(conn, issuer, subject, claims, email, domain)
+            except (AccountSuspendedError, ExternalIdentityConflictError, AuthenticationError):
+                # A failed adopt is still a refused arrival: record it before
+                # refusing, exactly like every other refusal. The note keeps
+                # the subject an administrator needs to act on; the refusal
+                # below is raised whether or not the note lands.
+                await record_arrival(conn, issuer=issuer, subject=subject, claims=claims)
+                raise
             if adopted is not None:
+                await conn.execute(
+                    "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
+                    issuer,
+                    subject,
+                )
                 return adopted
 
         if settings.keycloak_enrollment_mode == "invite_only" and domain is None:
@@ -735,21 +768,42 @@ async def _resolve_or_provision_keycloak_user(claims: dict, *, provider_alias: s
                     subject,
                     email,
                 )
+                await conn.execute(
+                    "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
+                    issuer,
+                    subject,
+                )
         except asyncpg.UniqueViolationError:
-            # Same-subject concurrent JIT is idempotent. A collision on a
-            # declared authority domain is an adopt the SELECT above missed
-            # (concurrent signup raced us): bind the winner's account instead
-            # of refusing. Any other uniqueness collision needs explicit
-            # administrative resolution.
+            # Same-subject concurrent provision is idempotent: the winner's
+            # binding now exists, so return it. An email collision on a
+            # declared authority domain is an adopt the pre-check missed
+            # (a concurrent signup raced us, or the address was claimed
+            # between the check and the insert): bind the winner's account
+            # instead of refusing. Any other uniqueness collision needs
+            # explicit administrative resolution.
+            #
+            # The loser's arrival is recorded when it refuses: like every
+            # other refusal, the note below is raised whether or not the
+            # record lands.
+            bound = await _bound_external_user(conn, issuer, subject)
+            if bound is not None:
+                refreshed = await _refresh_bound_external_user(conn, bound, claims)
+                await conn.execute(
+                    "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
+                    issuer,
+                    subject,
+                )
+                return _resolved_external_user(refreshed, newly_provisioned=False)
             if email and _authority_domain_of(email, settings.authoritative_email_domains_for(provider_alias)) is not None:
                 adopted = await _adopt_authoritative_user(conn, issuer, subject, claims, email, domain or "")
                 if adopted is not None:
+                    await conn.execute(
+                        "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
+                        issuer,
+                        subject,
+                    )
                     return adopted
-            bound = await _bound_external_user(conn, issuer, subject)
-            if bound is None:
-                raise ExternalIdentityConflictError() from None
-            refreshed = await _refresh_bound_external_user(conn, bound, claims)
-            return _resolved_external_user(refreshed, newly_provisioned=False)
+            raise ExternalIdentityConflictError() from None
 
         row = await conn.fetchrow(
             """

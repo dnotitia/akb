@@ -97,25 +97,40 @@ async def _insert_unbound_user(
     recovery: bool = False,
     admin: bool = False,
 ) -> uuid.UUID:
-    user_id = uuid.uuid4()
     async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO users (
-                id, username, email, password_hash, auth_provider,
-                account_status, account_kind, is_admin, is_recovery_admin
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            """,
-            user_id,
-            f"auth-{uuid.uuid4().hex[:12]}",
-            email,
-            "!keycloak-sso:no-local-login!",
-            provider,
-            status,
-            kind,
-            admin,
-            recovery,
+        return await _insert_unbound_user_on(
+            conn, email, status=status, kind=kind, provider=provider, recovery=recovery, admin=admin
         )
+
+
+async def _insert_unbound_user_on(
+    conn,
+    email: str,
+    *,
+    status: str = "active",
+    kind: str = "human",
+    provider: str = "local",
+    recovery: bool = False,
+    admin: bool = False,
+) -> uuid.UUID:
+    user_id = uuid.uuid4()
+    await conn.execute(
+        """
+        INSERT INTO users (
+            id, username, email, password_hash, auth_provider,
+            account_status, account_kind, is_admin, is_recovery_admin
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        """,
+        user_id,
+        f"auth-{uuid.uuid4().hex[:12]}",
+        email,
+        "!keycloak-sso:no-local-login!",
+        provider,
+        status,
+        kind,
+        admin,
+        recovery,
+    )
     return user_id
 
 
@@ -168,8 +183,43 @@ async def test_invite_only_adopts_on_declared_domain(pool):
     assert account["auth_provider"] == "keycloak"
     adopted = await _events(pool, str(user_id), "auth.user_adopted")
     assert len(adopted) == 1
-    assert adopted[0]["domain"] == _DOMAIN
-    assert adopted[0]["is_admin"] is False
+    payload = adopted[0]
+    assert payload["domain"] == _DOMAIN
+    assert payload["is_admin"] is False
+    assert payload["prior_auth_provider"] == "local"
+    assert payload["email"] == email
+    assert payload["issuer"] == _ISSUER
+    assert payload["subject"]
+    # The note invite_only took on an earlier refusal is answered by the
+    # binding, like every other exact-binding writer (covered directly by
+    # test_adopt_clears_a_prior_pending_admission below).
+
+
+async def test_adopt_clears_a_prior_pending_admission(pool):
+    from app.services.auth_service import _resolve_or_provision_keycloak_user
+
+    email = f"auth-note-{uuid.uuid4().hex[:8]}@{_DOMAIN}"
+    user_id = await _insert_unbound_user(pool, email)
+    subject = f"note-{uuid.uuid4().hex}"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO pending_admissions (issuer, subject, email) VALUES ($1, $2, $3)",
+            _ISSUER,
+            subject,
+            email,
+        )
+
+    resolved = await _resolve_or_provision_keycloak_user(
+        _claims(subject, email), provider_alias=_ALIAS
+    )
+
+    assert resolved["user_id"] == user_id
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM pending_admissions WHERE issuer = $1 AND subject = $2",
+            _ISSUER,
+            subject,
+        ) == 0
 
 
 async def test_invite_only_provisions_unknown_address_on_declared_domain(pool):
@@ -185,6 +235,28 @@ async def test_invite_only_provisions_unknown_address_on_declared_domain(pool):
     assert resolved["newly_provisioned"] is True
     row = await _binding(pool, subject)
     assert row is not None and row["email_snapshot"] == email
+    provisioned = await _events(pool, str(resolved["user_id"]), "auth.user_provisioned")
+    assert len(provisioned) == 1
+    assert (await _events(pool, str(resolved["user_id"]), "auth.user_adopted")) == []
+
+
+async def test_failed_adopt_records_the_arrival(pool):
+    from app.services.auth_service import _resolve_or_provision_keycloak_user
+
+    email = f"auth-guard-{uuid.uuid4().hex[:8]}@{_DOMAIN}"
+    await _insert_unbound_user(pool, email, status="suspended")
+    subject = f"guard-{uuid.uuid4().hex}"
+
+    with pytest.raises(AccountSuspendedError):
+        await _resolve_or_provision_keycloak_user(
+            _claims(subject, email), provider_alias=_ALIAS
+        )
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM pending_admissions WHERE issuer = $1 AND subject = $2",
+            _ISSUER,
+            subject,
+        ) == 1
 
 
 async def test_undeclared_domain_still_refuses_and_records(pool):
@@ -306,6 +378,42 @@ async def test_non_human_target_is_refused(pool):
         )
 
 
+async def test_admin_adopt_is_legible_in_the_event(pool):
+    from app.services.auth_service import _resolve_or_provision_keycloak_user
+
+    email = f"auth-admin-{uuid.uuid4().hex[:8]}@{_DOMAIN}"
+    user_id = await _insert_unbound_user(pool, email, admin=True)
+
+    resolved = await _resolve_or_provision_keycloak_user(
+        _claims(f"admin-{uuid.uuid4().hex}", email), provider_alias=_ALIAS
+    )
+
+    assert resolved["user_id"] == user_id
+    adopted = await _events(pool, str(user_id), "auth.user_adopted")
+    assert len(adopted) == 1
+    assert adopted[0]["is_admin"] is True
+
+
+async def test_pat_resolves_unchanged_across_adoption(pool):
+    from app.services import auth_service
+    from app.services.auth_service import _resolve_or_provision_keycloak_user
+
+    email = f"auth-pat-{uuid.uuid4().hex[:8]}@{_DOMAIN}"
+    user_id = await _insert_unbound_user(pool, email)
+    issued = await auth_service.create_pat(str(user_id), "pre-adopt-pat")
+    raw_token = issued["token"]
+
+    resolved = await _resolve_or_provision_keycloak_user(
+        _claims(f"pat-{uuid.uuid4().hex}", email), provider_alias=_ALIAS
+    )
+    assert resolved["user_id"] == user_id
+
+    authed = await auth_service._resolve_pat(raw_token)
+    assert authed is not None
+    assert authed.user_id == str(user_id)
+    assert authed.auth_method == "pat"
+
+
 # ── open-mode collision adopts on authority ───────────────────────────
 
 
@@ -369,3 +477,42 @@ async def test_concurrent_adopts_of_one_address_converge(pool):
         assert await conn.fetchval(
             "SELECT COUNT(*) FROM external_identities WHERE user_id = $1", user_id
         ) == 1
+
+
+async def test_collision_after_provision_insert_adopts_on_authority(pool, monkeypatch):
+    """The UniqueViolationError branch re-checks authority before refusing.
+
+    The address is pre-claimed by a winner and the pre-check adopt is forced
+    to miss, so the provision INSERT fails on the email constraint while the
+    subject is still unbound. The handler must bind the winner's account
+    through the authority adopt instead of refusing.
+    """
+    from app.services import auth_service
+    from app.services.auth_service import _resolve_or_provision_keycloak_user
+
+    monkeypatch.setattr(settings, "keycloak_enrollment_mode", "open", raising=False)
+    email = f"auth-late-{uuid.uuid4().hex[:8]}@{_DOMAIN}"
+    subject = f"late-{uuid.uuid4().hex}"
+    winner_id = await _insert_unbound_user(pool, email)
+
+    original_adopt = auth_service._adopt_authoritative_user
+    calls = 0
+
+    async def adopt_miss_then_hit(conn, issuer, sub, claims, addr, domain):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None  # pre-check misses; the INSERT then collides
+        return await original_adopt(conn, issuer, sub, claims, addr, domain)
+
+    monkeypatch.setattr(auth_service, "_adopt_authoritative_user", adopt_miss_then_hit)
+
+    resolved = await _resolve_or_provision_keycloak_user(
+        _claims(subject, email), provider_alias=_ALIAS
+    )
+
+    assert calls == 2
+    assert resolved["user_id"] == winner_id
+    assert resolved["newly_provisioned"] is False
+    row = await _binding(pool, subject)
+    assert row is not None and row["user_id"] == winner_id
