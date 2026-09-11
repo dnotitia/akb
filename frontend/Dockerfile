@@ -2,13 +2,14 @@ FROM node:22-slim AS builder
 
 WORKDIR /app
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN npm install --global npm@12.0.2
 RUN corepack enable && corepack prepare "$(node -p 'require("./package.json").packageManager')" --activate
 # The Git-pinned shared Markdown package runs its artifact-scoped prepare
 # build here so the production bundle consumes the resolved dist/. The
 # frontend workspace keeps third-party build approval narrow.
-# pnpm's Git prepare invokes npm for this subdirectory. Keep the peer resolver
-# workaround scoped to this install; it is not a global lifecycle allowance.
-RUN NPM_CONFIG_LEGACY_PEER_DEPS=true pnpm install --frozen-lockfile
+# pnpm's Git prepare invokes npm for this subdirectory. npm 12 keeps peer
+# validation enabled while avoiding npm 10's Arborist peer-tree crash.
+RUN pnpm install --frozen-lockfile
 
 COPY . .
 RUN npx vite build

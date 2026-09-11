@@ -6,7 +6,8 @@ React 19 + TypeScript + Vite + Radix UI + Tailwind CSS v4. The web UI for
 ## Scripts
 
 ```sh
-NPM_CONFIG_LEGACY_PEER_DEPS=true pnpm install  # install deps + Git-pinned editor prepare
+npm install --global npm@12.0.2
+pnpm install  # install deps + Git-pinned editor prepare
 pnpm dev              # vite dev server on :5173 (proxies /api to :8000)
 pnpm typecheck        # tsc --noEmit
 pnpm lint             # eslint src

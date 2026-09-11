@@ -225,6 +225,8 @@ if [ "$WITH_FRONTEND" -eq 1 ]; then
     "node@$FRONTEND_NODE_VERSION" "pnpm@$FRONTEND_PNPM_VERSION" \
     || die "Node.js/pnpm frontend toolchain installation failed"
   export PATH="/usr/local/bin:$PATH"
+  "${SUDO[@]}" npm install --global --prefix /usr/local npm@12.0.2 \
+    || die "npm frontend toolchain installation failed"
   NODE_VERSION=$(node --version) \
     || die "Node.js version check failed for the frontend runtime"
   [ "$NODE_VERSION" = "v$FRONTEND_NODE_VERSION" ] \
@@ -236,7 +238,7 @@ if [ "$WITH_FRONTEND" -eq 1 ]; then
     || die "pnpm version check failed for the frontend runtime"
   [ "$PNPM_VERSION" = "$FRONTEND_PNPM_VERSION" ] \
     || die "frontend pnpm version verification failed (expected $FRONTEND_PNPM_VERSION, found $PNPM_VERSION)"
-  (cd -- "$CHECKOUT/frontend" && NPM_CONFIG_LEGACY_PEER_DEPS=true pnpm install --frozen-lockfile) \
+  (cd -- "$CHECKOUT/frontend" && pnpm install --frozen-lockfile) \
     || die "frontend pnpm install --frozen-lockfile failed"
 fi
 
