@@ -32,10 +32,10 @@ FROM node:22-slim AS frontend-builder
 
 WORKDIR /src
 COPY frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml ./
-RUN npm install --global npm@12.0.2
+RUN npm install --global npm@11.16.0
 RUN corepack enable && corepack prepare "$(node -p 'require("./package.json").packageManager')" --activate
 # The Git-pinned shared Markdown package needs its artifact-scoped prepare
-# build before Vite bundles the frontend. npm 12 keeps peer validation enabled
+# build before Vite bundles the frontend. npm 11.16 keeps peer validation enabled
 # while avoiding npm 10's Arborist peer-tree crash.
 RUN pnpm install --frozen-lockfile
 
