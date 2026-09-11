@@ -7,6 +7,24 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Write cap + source_uris hardening (bounded-corpus fix, part 3)
+
+The reference placement (`m1-reference-payload-v1`) enforces the same 10MiB
+write cap the pg-bodystore placement already had (`max_text_bytes`). Without
+it, an unbounded body could enter the corpus and every read path had to assume
+the unbounded case; with it, hydration memory is statically bounded by
+`limit × 10MiB` and larger content has a directed home (File storage +
+projection, with the 413 pointing there).
+
+`source_uris` scope resolution collapses from one SQL OR-clause per URI to a
+single `= ANY(...)` predicate per dimension (vaults, paths-or-ids): request
+SQL text stays constant-size no matter how many URIs arrive. The caller-side
+cap moves from the `NATIVE_SEARCH_MAX_SOURCE_URIS` module constant to the
+`search_max_source_uris` setting (default 200, provisional — documented with
+its derivation path: per-driver IN-list measurement). Over-cap rejections now
+name the recovery (split the request or use a vault scope) instead of a bare
+refusal. The old constant stays as an untouched legacy alias.
+
 ### Native candidate filtering reads frontmatter slices, paginated (bounded-corpus fix, part 2)
 
 `_native_document_candidates` no longer selects full `canonical_bytes` rows to
