@@ -41,7 +41,7 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: frontend
-        run: pnpm install --frozen-lockfile
+        run: NPM_CONFIG_LEGACY_PEER_DEPS=true pnpm install --frozen-lockfile
 
       - name: Install Chromium for the real frontend smoke
         working-directory: frontend
@@ -110,7 +110,7 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: frontend
-        run: pnpm install --frozen-lockfile
+        run: NPM_CONFIG_LEGACY_PEER_DEPS=true pnpm install --frozen-lockfile
 
       - name: Build frontend production bundle
         working-directory: frontend

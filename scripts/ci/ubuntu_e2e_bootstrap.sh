@@ -236,7 +236,7 @@ if [ "$WITH_FRONTEND" -eq 1 ]; then
     || die "pnpm version check failed for the frontend runtime"
   [ "$PNPM_VERSION" = "$FRONTEND_PNPM_VERSION" ] \
     || die "frontend pnpm version verification failed (expected $FRONTEND_PNPM_VERSION, found $PNPM_VERSION)"
-  (cd -- "$CHECKOUT/frontend" && pnpm install --frozen-lockfile) \
+  (cd -- "$CHECKOUT/frontend" && NPM_CONFIG_LEGACY_PEER_DEPS=true pnpm install --frozen-lockfile) \
     || die "frontend pnpm install --frozen-lockfile failed"
 fi
 

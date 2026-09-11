@@ -134,7 +134,11 @@ echo "  mypy + bandit parse Python ${REQUIRED_PYTHON}"
 # not run this script. Say it here and in CONTRIBUTING.md.
 node_install_command() {   # $1 = project directory
   if [ -f "$1/pnpm-lock.yaml" ]; then
-    printf '(cd %s && pnpm install --frozen-lockfile)' "$1"
+    if [ "$1" = "frontend" ]; then
+      printf '(cd %s && NPM_CONFIG_LEGACY_PEER_DEPS=true pnpm install --frozen-lockfile)' "$1"
+    else
+      printf '(cd %s && pnpm install --frozen-lockfile)' "$1"
+    fi
   else
     printf '(cd %s && npm ci)' "$1"
   fi
@@ -239,7 +243,8 @@ step "eslint (frontend)"
 # ─── frontend: tsc --noEmit (type) ────────────────────────────────
 # `frontend/` has its own tsconfig; running tsc from inside the dir
 # picks it up automatically. node_modules must already be installed —
-# CI does `pnpm install --frozen-lockfile` upstream of this script.
+# CI does the frontend's install-scoped `NPM_CONFIG_LEGACY_PEER_DEPS=true pnpm
+# install --frozen-lockfile` upstream of this script.
 step "tsc (frontend)"
 (cd frontend && npx --no-install tsc --noEmit)
 

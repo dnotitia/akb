@@ -51,7 +51,7 @@ jobs:
         # needs its resolved artifact's prepare build to create dist/. Keep
         # the repository-scoped allowBuilds list narrow; do not replace this
         # with a global scripts allowance or a local source copy.
-        run: pnpm install --frozen-lockfile
+        run: NPM_CONFIG_LEGACY_PEER_DEPS=true pnpm install --frozen-lockfile
       - name: Install @akb/client deps
         working-directory: packages/akb-client
         # Its own pnpm store: typescript + vitest. No postinstall build

@@ -31,10 +31,12 @@
 FROM node:22-slim AS frontend-builder
 
 WORKDIR /src
-RUN npm install -g pnpm@latest
-
-COPY frontend/package.json frontend/pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile --ignore-scripts
+COPY frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml ./
+RUN corepack enable && corepack prepare "$(node -p 'require("./package.json").packageManager')" --activate
+# The Git-pinned shared Markdown package needs its artifact-scoped prepare
+# build before Vite bundles the frontend. Keep npm's peer setting scoped to
+# this install rather than weakening lifecycle-script approval.
+RUN NPM_CONFIG_LEGACY_PEER_DEPS=true pnpm install --frozen-lockfile
 
 COPY frontend/ ./
 RUN npx vite build
