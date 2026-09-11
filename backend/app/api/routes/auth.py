@@ -544,7 +544,11 @@ async def keycloak_callback(
         expected_provider_alias=provider_alias,
     )
     _require_signed_provider(id_claims, provider_alias)
-    outcome = await project_verified_principal_with_reason(principal)
+    # The alias below is the provider this flow selected (transient) and both
+    # tokens vouched for (biconditional claim check above) — never a value
+    # taken from one token alone. It is the only key the
+    # authority-domain decision reads.
+    outcome = await project_verified_principal_with_reason(principal, provider_alias=provider_alias)
     user = outcome.user
     if user is None:
         # The one place the reason is repeated, and only for the refusal the

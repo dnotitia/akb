@@ -103,6 +103,11 @@ sso:
   keycloakPublicUrl: https://auth.akb.example.com
   enrollmentMode: open
   requireVerifiedEmail: true
+  # Provider-alias-keyed email-domain authority for the browser login path
+  # (dnotitia/akb#529). Empty (default) keeps today's behaviour; e.g.
+  # authoritativeEmailDomains: {workforce: ["example.com"]}.
+  # Exact domain match only; `local` is rejected at config load.
+  authoritativeEmailDomains: {}
   localRealmLogin:
     enabled: false
     displayName: This workspace

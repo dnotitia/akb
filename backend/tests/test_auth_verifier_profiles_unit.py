@@ -909,7 +909,7 @@ async def test_invalid_keycloak_profile_never_reaches_account_projection(
     )
     monkeypatch.setattr(keycloak_oidc, "get_keycloak_oidc", lambda: service)
 
-    async def forbidden_projection(_claims):
+    async def forbidden_projection(_claims, **_kwargs):
         raise AssertionError("invalid profile must be rejected before account projection")
 
     monkeypatch.setattr(

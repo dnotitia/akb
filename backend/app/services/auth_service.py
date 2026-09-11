@@ -469,13 +469,166 @@ async def _refresh_bound_external_user(conn, row, claims: dict):
     return refreshed
 
 
-async def _resolve_or_provision_keycloak_user(claims: dict) -> dict:
-    """Resolve exact issuer/subject, or transactionally create a fresh account.
+def _authority_domain_of(email: str, domains: tuple[str, ...]) -> str | None:
+    """Return the declared authority domain covering ``email``, or None.
 
-    Email and username are collision checks only. Canonical SSO never adopts
-    an existing account from mutable profile claims. ``invite_only`` therefore
-    accepts only an exact prebound identity, while ``open`` may create one new
-    AKB user and its exact external binding in the same transaction.
+    Exact equality on the lowercased domain half only — no subdomain
+    inheritance. The half is IDNA-encoded before comparison so a declared
+    punycode domain matches the Unicode address a directory asserts
+    (``münchen.de`` ↔ ``xn--mnchen-3ya.de``); a half that cannot encode
+    matches nothing. A malformed address (no ``@``, empty halves) matches
+    nothing — the caller's email-presence check reports it.
+    """
+    if "@" not in email:
+        return None
+    local, _, raw_domain = email.rpartition("@")
+    if not local or not raw_domain:
+        return None
+    try:
+        domain = raw_domain.lower().encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
+        return None
+    return domain if domain in domains else None
+
+
+async def _adopt_authoritative_user(conn, issuer: str, subject: str, claims: dict, email: str, domain: str):
+    """Bind one verified brokered identity to the account holding its address.
+
+    This is the single deliberate exception to "never adopt from mutable
+    profile claims": the operator declared this provider the authority for
+    this domain, so the address is directory-owned rather than user-chosen.
+    Every guard below is load-bearing:
+
+    - verified email per the existing setting (checked by the caller before
+      the domain lookup; re-asserted here so the helper is safe standalone);
+    - active human target (a suspended account must not be revived by
+      signing in);
+    - no existing binding for this issuer on the target (the schema is
+      unique on (issuer, subject), not on (issuer, user_id));
+    - never the recovery admin (break-glass is not claimable by assertion).
+
+    Runs inside the caller's transaction (address advisory lock +
+    ``SELECT ... FOR UPDATE`` on the target), so concurrent adopts of one
+    address converge instead of double-binding. Uses SAVEPOINTs, never a
+    nested transaction: the INSERT is the only statement allowed to fail,
+    and its savepoint rolls back just that statement so the race fallback
+    below can still read.
+
+    Returns the resolved user, or None when no account holds the address
+    (the caller falls through to the mode's provision path). Emits
+    ``auth.user_adopted`` with the upstream-stable ``subject`` so the
+    "claimed" audit trail joins to the binding row without a lookup; the
+    payload otherwise mirrors ``auth.user_provisioned`` plus the authority
+    facts (``domain``, ``prior_auth_provider``, ``is_admin`` legibility).
+    """
+    if settings.keycloak_require_verified_email and claims.get("email_verified") is not True:
+        raise AuthenticationError("Identity provider has not verified this email address")
+    display_name = _optional_external_string(claims, "name") or _optional_external_string(claims, "preferred_username")
+    async with conn.transaction():
+        target = await conn.fetchrow(
+            """
+            SELECT id, username, email, display_name, is_admin,
+                   tokens_revoked_before, auth_provider,
+                   account_status, account_kind, is_recovery_admin
+              FROM users WHERE email = $1
+               FOR UPDATE
+            """,
+            email,
+        )
+        if target is None:
+            return None
+        if target["account_status"] != "active":
+            raise AccountSuspendedError()
+        if target["account_kind"] != "human":
+            raise ExternalIdentityConflictError()
+        if target["is_recovery_admin"]:
+            raise ExternalIdentityConflictError()
+        has_issuer_binding = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM external_identities
+                 WHERE user_id = $1 AND issuer = $2
+            )
+            """,
+            target["id"],
+            issuer,
+        )
+        if has_issuer_binding:
+            raise ExternalIdentityConflictError()
+        prior_provider = target["auth_provider"]
+        await conn.execute(
+            """
+            UPDATE users
+               SET auth_provider = 'keycloak',
+                   display_name = COALESCE($2, display_name),
+                   updated_at = NOW()
+             WHERE id = $1
+            """,
+            target["id"],
+            display_name,
+        )
+        try:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO external_identities (
+                        user_id, issuer, subject, email_snapshot
+                    ) VALUES ($1, $2, $3, $4)
+                    """,
+                    target["id"],
+                    issuer,
+                    subject,
+                    email,
+                )
+        except asyncpg.UniqueViolationError:
+            # Lost the race: a concurrent login bound this subject, or bound
+            # this target to this issuer, first. The savepoint rolled back
+            # only the INSERT, so re-read under the same lock and take the
+            # winner's answer.
+            bound = await _bound_external_user(conn, issuer, subject)
+            if bound is None:
+                raise ExternalIdentityConflictError() from None
+            refreshed = await _refresh_bound_external_user(conn, bound, claims)
+            return _resolved_external_user(refreshed, newly_provisioned=False)
+        await emit_event(
+            conn,
+            "auth.user_adopted",
+            actor_id=str(target["id"]),
+            payload={
+                "auth_provider": "keycloak",
+                "prior_auth_provider": prior_provider,
+                "email": email,
+                "domain": domain,
+                "issuer": issuer,
+                "subject": subject,
+                "is_admin": bool(target["is_admin"]),
+            },
+        )
+    row = await conn.fetchrow(
+        """
+        SELECT id, username, email, display_name, is_admin,
+               tokens_revoked_before, auth_provider,
+               account_status, account_kind
+          FROM users WHERE id = $1
+        """,
+        target["id"],
+    )
+    _assert_active_human(row)
+    return _resolved_external_user(row, newly_provisioned=False)
+
+
+async def _resolve_or_provision_keycloak_user(claims: dict, *, provider_alias: str | None = None) -> dict:
+    """Resolve exact issuer/subject, adopt or create on authority, or refuse.
+
+    Email and username are collision checks only — except on the one path
+    the operator explicitly opened: a browser login through a provider
+    declared authoritative for the address's domain (``provider_alias``
+    names the provider the flow selected and verified; ``None`` is the
+    non-browser projection paths, which stay on today's behaviour).
+    ``invite_only`` therefore accepts an exact prebound identity, an
+    authority adopt, or an authority provision; ``open`` additionally keeps
+    its fresh-account JIT, whose collision branch adopts on authority
+    instead of refusing when the domain is declared.
     """
     if settings.keycloak_link_by_email:
         # Keep the field readable for migration tooling, but make direct
@@ -489,22 +642,78 @@ async def _resolve_or_provision_keycloak_user(claims: dict) -> dict:
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        bound = await _bound_external_user(conn, issuer, subject)
-        if bound is not None:
-            refreshed = await _refresh_bound_external_user(conn, bound, claims)
-            return _resolved_external_user(refreshed, newly_provisioned=False)
+        # The browser authority path serializes concurrent logins for one
+        # claimed address on the row they will all read: the adopt helper
+        # runs inside this transaction, and the address advisory lock plus
+        # SELECT ... FOR UPDATE keep two adopts from interleaving (different
+        # subjects, same email) into a double bind. Off the authority path
+        # the address is untrusted input — never a lock key — so the
+        # subject key applies there instead.
+        async with conn.transaction():
+            if provider_alias is not None:
+                pre_email = (_optional_external_string(claims, "email") or "").strip().lower()
+                pre_domain = _authority_domain_of(
+                    pre_email, settings.authoritative_email_domains_for(provider_alias)
+                )
+            else:
+                pre_email, pre_domain = "", None
+            if pre_email and pre_domain is not None:
+                lock_key = f"external-identity-authority:{len(pre_email)}:{pre_email}"
+            else:
+                lock_key = f"external-identity:{len(issuer)}:{issuer}{subject}"
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                lock_key,
+            )
+            bound = await _bound_external_user(conn, issuer, subject)
+            if bound is not None:
+                refreshed = await _refresh_bound_external_user(conn, bound, claims)
+                return _resolved_external_user(refreshed, newly_provisioned=False)
 
-        if settings.keycloak_enrollment_mode == "invite_only":
+        email = (_optional_external_string(claims, "email") or "").strip().lower()
+        if provider_alias is not None:
+            if not email:
+                raise AuthenticationError("Identity provider account has no email claim")
+            if settings.keycloak_require_verified_email and claims.get("email_verified") is not True:
+                raise AuthenticationError("Identity provider has not verified this email address")
+            domain = _authority_domain_of(email, settings.authoritative_email_domains_for(provider_alias))
+        else:
+            domain = None
+        if email and domain is not None:
+            # Declared authority for this provider+domain: the directory owns
+            # the mailbox, so the address selects the account. Adopt when one
+            # holds it, else fall through to the mode's provision path.
+            # `disabled` never reaches here (refused above).
+            try:
+                adopted = await _adopt_authoritative_user(conn, issuer, subject, claims, email, domain)
+            except (AccountSuspendedError, ExternalIdentityConflictError, AuthenticationError):
+                # A failed adopt is still a refused arrival: record it before
+                # refusing, exactly like every other refusal. The note keeps
+                # the subject an administrator needs to act on; the refusal
+                # below is raised whether or not the note lands.
+                await record_arrival(conn, issuer=issuer, subject=subject, claims=claims)
+                raise
+            if adopted is not None:
+                await conn.execute(
+                    "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
+                    issuer,
+                    subject,
+                )
+                return adopted
+
+        if settings.keycloak_enrollment_mode == "invite_only" and domain is None:
             # The broker has just verified this person and minted them a stable
             # subject in this realm. That subject is the one value an exact
             # binding needs and the one value nobody could name in advance, so
             # it is written down here rather than discarded with the refusal.
             # Recording never changes the answer: the refusal below is raised
             # whether or not the note was taken.
+            #
+            # A declared domain skips this refusal: authority provision is
+            # the answer for an unknown address there, not a note.
             await record_arrival(conn, issuer=issuer, subject=subject, claims=claims)
             raise MembershipRequiredError()
 
-        email = (_optional_external_string(claims, "email") or "").strip().lower()
         if not email:
             raise AuthenticationError("Identity provider account has no email claim")
         if settings.keycloak_require_verified_email and claims.get("email_verified") is not True:
@@ -559,14 +768,42 @@ async def _resolve_or_provision_keycloak_user(claims: dict) -> dict:
                     subject,
                     email,
                 )
+                await conn.execute(
+                    "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
+                    issuer,
+                    subject,
+                )
         except asyncpg.UniqueViolationError:
-            # Same-subject concurrent JIT is idempotent. Any other uniqueness
-            # collision needs explicit administrative resolution.
+            # Same-subject concurrent provision is idempotent: the winner's
+            # binding now exists, so return it. An email collision on a
+            # declared authority domain is an adopt the pre-check missed
+            # (a concurrent signup raced us, or the address was claimed
+            # between the check and the insert): bind the winner's account
+            # instead of refusing. Any other uniqueness collision needs
+            # explicit administrative resolution.
+            #
+            # The loser's arrival is recorded when it refuses: like every
+            # other refusal, the note below is raised whether or not the
+            # record lands.
             bound = await _bound_external_user(conn, issuer, subject)
-            if bound is None:
-                raise ExternalIdentityConflictError() from None
-            refreshed = await _refresh_bound_external_user(conn, bound, claims)
-            return _resolved_external_user(refreshed, newly_provisioned=False)
+            if bound is not None:
+                refreshed = await _refresh_bound_external_user(conn, bound, claims)
+                await conn.execute(
+                    "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
+                    issuer,
+                    subject,
+                )
+                return _resolved_external_user(refreshed, newly_provisioned=False)
+            if email and _authority_domain_of(email, settings.authoritative_email_domains_for(provider_alias)) is not None:
+                adopted = await _adopt_authoritative_user(conn, issuer, subject, claims, email, domain or "")
+                if adopted is not None:
+                    await conn.execute(
+                        "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
+                        issuer,
+                        subject,
+                    )
+                    return adopted
+            raise ExternalIdentityConflictError() from None
 
         row = await conn.fetchrow(
             """
@@ -602,14 +839,22 @@ class ProjectionOutcome:
 
 async def _project_keycloak_principal(
     principal: VerifiedPrincipal,
+    *,
+    provider_alias: str | None = None,
 ) -> ProjectionOutcome:
-    """Project a completely verified OIDC identity onto the AKB account path."""
+    """Project a completely verified OIDC identity onto the AKB account path.
+
+    ``provider_alias`` is the provider the browser flow selected and
+    verified (``None`` on the bearer paths, which pass none and therefore
+    stay on today's behaviour). It is the only key the authority-domain
+    decision reads — never a claim reinterpreted at this layer.
+    """
     claims = dict(principal.claims)
     try:
         issuer, subject = _external_identity_key(claims)
         if (issuer, subject) != (principal.issuer, principal.subject):
             return ProjectionOutcome(None, "identity_claims_inconsistent")
-        resolved = await _resolve_or_provision_keycloak_user(claims)
+        resolved = await _resolve_or_provision_keycloak_user(claims, provider_alias=provider_alias)
     except AKBError as e:
         logging.getLogger("akb.auth").info("Keycloak access token: account projection rejected (%s)", e)
         return ProjectionOutcome(None, getattr(e, "code", None))
@@ -675,6 +920,7 @@ async def project_verified_principal(
     principal: VerifiedPrincipal,
     *,
     for_credential_change: bool = False,
+    provider_alias: str | None = None,
 ) -> AuthenticatedUser | None:
     """Common verified-human boundary before existing AKB authorization.
 
@@ -683,10 +929,15 @@ async def project_verified_principal(
     route alone. Defaulting it to False is what keeps the refusal
     fail-closed: a future caller of this boundary is gated unless it
     deliberately asks not to be.
+
+    ``provider_alias`` carries the browser flow's verified provider into
+    the keycloak projection only. ``None`` (the default every bearer path
+    keeps) disables the authority-domain decision entirely.
     """
     outcome = await project_verified_principal_with_reason(
         principal,
         for_credential_change=for_credential_change,
+        provider_alias=provider_alias,
     )
     return outcome.user
 
@@ -695,6 +946,7 @@ async def project_verified_principal_with_reason(
     principal: VerifiedPrincipal,
     *,
     for_credential_change: bool = False,
+    provider_alias: str | None = None,
 ) -> ProjectionOutcome:
     """The same boundary, carrying the reason when it refuses.
 
@@ -711,7 +963,7 @@ async def project_verified_principal_with_reason(
             )
         )
     if principal.profile_id == KEYCLOAK_ACCESS_V1:
-        return await _project_keycloak_principal(principal)
+        return await _project_keycloak_principal(principal, provider_alias=provider_alias)
     if principal.profile_id == KEYCLOAK_SERVICE_AUTHORITY_V1:
         return ProjectionOutcome(
             await _project_service_authority_principal(principal)
