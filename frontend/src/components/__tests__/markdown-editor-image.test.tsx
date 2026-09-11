@@ -581,9 +581,10 @@ describe("MarkdownEditor image insertion", () => {
     ));
   });
 
-  it("preserves unrelated plain text when a clipboard also exposes an image file", () => {
+  it("preserves unrelated plain text when a clipboard also exposes an image file", async () => {
+    const onChange = vi.fn();
     const { container } = render(
-      <MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />,
+      <MarkdownEditor value="Draft" vault="team" onChange={onChange} />,
     );
     const file = new File(["image"], "finder.png", { type: "image/png" });
     const editor = container.querySelector('[contenteditable="true"]');
@@ -591,17 +592,26 @@ describe("MarkdownEditor image insertion", () => {
     const allowed = fireEvent.paste(editor!, {
       clipboardData: {
         files: [file],
-        getData: (type: string) => type === "text/plain" ? "Keep this caption" : "",
+        getData: (type: string) =>
+          type === "text/plain" ? "Keep this caption" : "",
       },
     });
 
-    expect(allowed).toBe(true);
+    expect(allowed).toBe(false);
+    await waitFor(() =>
+      expect(
+        onChange.mock.calls.some(([markdown]) =>
+          markdown.includes("Keep this caption"),
+        ),
+      ).toBe(true),
+    );
     expect(apiMocks.uploadAsset).not.toHaveBeenCalled();
   });
 
-  it("leaves mixed rich-text clipboard content to the normal paste path", () => {
+  it("preserves mixed rich-text clipboard content on the normal paste path", async () => {
+    const onChange = vi.fn();
     const { container } = render(
-      <MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />,
+      <MarkdownEditor value="Draft" vault="team" onChange={onChange} />,
     );
     const file = new File(["image"], "sheet.png", { type: "image/png" });
     const editor = container.querySelector('[contenteditable="true"]');
@@ -612,11 +622,20 @@ describe("MarkdownEditor image insertion", () => {
         getData: (type: string) =>
           type === "text/html"
             ? "<table><tr><td>Copied cell</td></tr></table>"
-            : "Copied cell",
+            : type === "text/plain"
+              ? "Copied cell"
+              : "",
       },
     });
 
-    expect(allowed).toBe(true);
+    expect(allowed).toBe(false);
+    await waitFor(() =>
+      expect(
+        onChange.mock.calls.some(([markdown]) =>
+          markdown.includes("Copied cell"),
+        ),
+      ).toBe(true),
+    );
     expect(apiMocks.uploadAsset).not.toHaveBeenCalled();
   });
 

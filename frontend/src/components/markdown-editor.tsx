@@ -1425,10 +1425,24 @@ function isStandaloneImageClipboard(transfer: DataTransfer): boolean {
   const files = transferredImages(transfer);
   if (!files.length) return false;
   const html = transfer.getData("text/html");
-  if (html && !/<img\b/i.test(html)) return false;
-  if (html && /<img\b/i.test(html)) return true;
-  const text = transfer.getData("text/plain").trim();
-  return !text || files.some((file) => file.name === text);
+  if (!html.trim()) {
+    const plain = transfer.getData("text/plain").trim();
+    if (!plain) return true;
+    const imageNames = new Set(files.map((file) => file.name));
+    const lines = plain
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    return lines.length > 0 && lines.every((line) => imageNames.has(line));
+  }
+
+  if (!/<img\b/i.test(html)) return false;
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  for (const node of template.content.querySelectorAll("img, meta, link, style")) {
+    node.remove();
+  }
+  return !(template.content.textContent ?? "").trim();
 }
 
 export interface MarkdownEditorProps {
@@ -1945,10 +1959,7 @@ export function MarkdownEditor({
           if (readOnly) return;
           const files = transferredImages(event.clipboardData);
           if (!files.length) return;
-          if (!isStandaloneImageClipboard(event.clipboardData)) {
-            event.stopPropagation();
-            return;
-          }
+          if (!isStandaloneImageClipboard(event.clipboardData)) return;
           event.preventDefault();
           event.stopPropagation();
           if (uploadInFlightRef.current)
