@@ -57,6 +57,12 @@ code. A correctly formed expected denial has valid arguments and a matching
 tool outcome; provider, transport, wrong-target, missing-attempt, and bypass
 errors do not pass.
 
+Expected material payloads are compared against the server's public
+`tools/list` input schema after applying declared JSON-schema defaults. Raw
+model arguments and raw server arguments remain preserved separately for
+argument-validity evidence; defaults do not relax required or non-default
+fields.
+
 The models are fixed to `deepseek/deepseek-v4-flash-0731` and
 `qwen/qwen3.8-27b`. Both requests use only the OpenRouter `parasail` upstream.
 Request bodies force `allow_fallbacks=false`, `require_parameters=true`, and

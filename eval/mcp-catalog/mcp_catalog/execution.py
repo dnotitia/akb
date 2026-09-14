@@ -176,6 +176,7 @@ class ToolCallRecord(BaseModel):
     operation_kind: Literal["preparatory", "material", "unknown"] = "unknown"
     raw_model_args: Any = None
     server_args: dict[str, Any] | None = None
+    effective_server_args: dict[str, Any] | None = None
     raw_args_valid: bool = False
     server_args_equal_raw: bool = False
     transport_succeeded: bool = False
@@ -386,6 +387,10 @@ class ToolCallRecorder:
         self.operation_map = operation_map
         self.secrets = secrets
         self.calls: list[_ObservedCall] = []
+        self.input_schemas: dict[str, dict[str, Any]] = {}
+
+    def set_input_schemas(self, schemas: dict[str, dict[str, Any]]) -> None:
+        self.input_schemas = schemas
 
     async def __call__(self, _ctx: Any, call: Callable[..., Any], name: str, server_args: dict[str, Any]) -> Any:
         observed = _ObservedCall(
@@ -442,6 +447,17 @@ def is_timeout_exception(error: BaseException) -> bool:
     name = type(error).__name__.casefold()
     message = str(error).casefold()
     return isinstance(error, TimeoutError) or "timeout" in name or "timed out" in message
+
+
+async def capture_tool_input_schemas(toolset: Any) -> dict[str, dict[str, Any]]:
+    """Capture the public tools/list schemas used to canonicalize server arguments."""
+    schemas: dict[str, dict[str, Any]] = {}
+    for tool in await toolset.list_tools():
+        name = getattr(tool, "name", None)
+        schema = getattr(tool, "input_schema", None)
+        if isinstance(name, str) and isinstance(schema, dict):
+            schemas[name] = safe_json(schema, ())
+    return schemas
 
 
 def public_result_error(result: Any, secrets: tuple[str, ...]) -> tuple[str | None, str | None]:
@@ -805,6 +821,7 @@ class TrialExecutor:
                 client = create_client(spec)
                 toolset = create_toolset(client, recorder)
                 async with toolset:
+                    recorder.set_input_schemas(await capture_tool_input_schemas(toolset))
                     agent = Agent(model=self.model, system_prompt=SYSTEM_PROMPT, retries=0)
                     result = await run_agent_with_deadline(
                         agent,
@@ -916,6 +933,7 @@ async def execute_smoke(
         client = create_client(spec)
         toolset = create_toolset(client, recorder)
         async with toolset:
+            recorder.set_input_schemas(await capture_tool_input_schemas(toolset))
             agent = Agent(model=model, system_prompt=SYSTEM_PROMPT, retries=0)
             result = await run_agent_with_deadline(
                 agent,
@@ -1069,7 +1087,13 @@ def outcome_from_run(
         error = error or "OpenRouter response cost exceeded the registered price ceiling"
     if result is not None and error is None and not final_answer.strip():
         error = "terminal response was empty"
-    tool_calls = bind_tool_calls(raw_calls, recorder.calls, operation_map, secrets)
+    tool_calls = bind_tool_calls(
+        raw_calls,
+        recorder.calls,
+        operation_map,
+        secrets,
+        input_schemas=recorder.input_schemas,
+    )
     first_operation = tool_calls[0].logical_operation if tool_calls else "none"
     successful_mcp_tool_calls = sum(call.succeeded for call in recorder.calls)
     follow_up_terminal_response = _has_terminal_response_after_tool(
@@ -1223,6 +1247,8 @@ def bind_tool_calls(
     server_calls: list[_ObservedCall],
     operation_map: dict[str, list[str]],
     secrets: tuple[str, ...],
+    *,
+    input_schemas: dict[str, dict[str, Any]] | None = None,
 ) -> list[ToolCallRecord]:
     records: list[ToolCallRecord] = []
     remaining = list(server_calls)
@@ -1237,6 +1263,14 @@ def bind_tool_calls(
                 logical_operation=logical_operation_for(name, operation_map),
                 raw_model_args=raw_args,
                 server_args=observed.server_args if observed else None,
+                effective_server_args=(
+                    canonicalize_arguments(
+                        observed.server_args,
+                        input_schemas.get(name, {}) if input_schemas else {},
+                    )
+                    if observed
+                    else None
+                ),
                 raw_args_valid=raw_valid,
                 server_args_equal_raw=bool(observed and raw_valid and observed.server_args == raw_dict),
                 transport_succeeded=bool(observed and (observed.transport_succeeded or observed.succeeded)),
@@ -1254,6 +1288,10 @@ def bind_tool_calls(
                 tool_name=observed.tool_name,
                 logical_operation=logical_operation_for(observed.tool_name, operation_map),
                 server_args=observed.server_args,
+                effective_server_args=canonicalize_arguments(
+                    observed.server_args,
+                    input_schemas.get(observed.tool_name, {}) if input_schemas else {},
+                ),
                 transport_succeeded=observed.transport_succeeded or observed.succeeded,
                 server_succeeded=observed.succeeded,
                 server_status_code=observed.status_code,
@@ -1263,6 +1301,21 @@ def bind_tool_calls(
             )
         )
     return records
+
+
+def canonicalize_arguments(actual: dict[str, Any] | None, schema: dict[str, Any]) -> dict[str, Any] | None:
+    if actual is None:
+        return None
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(properties, dict):
+        return dict(actual)
+    result = dict(actual)
+    for name, property_schema in properties.items():
+        if name not in result and isinstance(property_schema, dict) and "default" in property_schema:
+            result[name] = safe_json(property_schema["default"], ())
+        elif name in result and isinstance(property_schema, dict) and isinstance(result[name], dict):
+            result[name] = canonicalize_arguments(result[name], property_schema) or {}
+    return result
 
 
 def _arguments_include(actual: dict[str, Any] | None, expected: dict[str, Any]) -> bool:
@@ -1281,7 +1334,10 @@ def _arguments_include(actual: dict[str, Any] | None, expected: dict[str, Any]) 
 
 
 def _material_attempt_matches(call: ToolCallRecord, expected: ExpectedMaterialAttempt) -> bool:
-    if call.logical_operation != expected.logical_operation or not _arguments_include(call.server_args, expected.arguments):
+    if call.logical_operation != expected.logical_operation or not _arguments_include(
+        call.effective_server_args or call.server_args,
+        expected.arguments,
+    ):
         return False
     if expected.outcome == "success":
         return call.server_succeeded
@@ -1328,7 +1384,7 @@ def material_outcome_matches(
             matched = False
             continue
         if call.logical_operation in expected_args and not _arguments_include(
-            call.server_args,
+            call.effective_server_args or call.server_args,
             expected_args[call.logical_operation],
         ):
             matched = False

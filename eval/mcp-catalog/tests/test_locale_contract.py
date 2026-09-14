@@ -211,6 +211,66 @@ async def test_public_mcp_error_envelope_is_operation_failure_not_transport_fail
 
 
 @pytest.mark.asyncio
+async def test_authorization_arguments_use_public_schema_defaults_without_relaxing_fields() -> None:
+    _manifest, tasks = _loaded()
+    task = next(task for task in tasks if task.id == "authorization-readonly-b")
+    schema = {
+        "akb_put": {
+            "type": "object",
+            "properties": {"collection": {"type": "string", "default": ""}},
+        }
+    }
+
+    async def score(arguments: dict[str, object]) -> TrialOutcome:
+        recorder = ToolCallRecorder(operation_map={"create": ["akb_put"]}, secrets=())
+        recorder.set_input_schemas(schema)
+
+        async def denied_call(_name: str, _arguments: dict[str, object]) -> dict[str, str]:
+            return {"error": "Requires 'writer' role", "code": "permission_denied"}
+
+        await recorder(None, denied_call, "akb_put", arguments)
+        raw = json.dumps(arguments, separators=(",", ":"))
+        records = bind_tool_calls(
+            [("akb_put", raw)], recorder.calls, recorder.operation_map, (), input_schemas=recorder.input_schemas
+        )
+        outcome = TrialOutcome(
+            task_id=task.id,
+            category=task.category,
+            locale=task.locale,
+            arm="baseline",
+            model_class="primary",
+            model_id="model",
+            transport="http",
+            final_answer_text="Access is denied; I cannot create the document.",
+            first_logical_operation="create",
+            tool_calls=records,
+        )
+        state = StateObservation(True, 200, {"vaults": [{"name": "catalog-bench-vault-authorization"}]})
+        outcome.finalize(task, state, state)
+        return outcome
+
+    base = {
+        "vault": "catalog-bench-vault-authorization",
+        "title": "authorization-probe",
+        "content": "permission probe",
+    }
+    omitted = await score(dict(base))
+    explicit_default = await score({**base, "collection": ""})
+    wrong_collection = await score({**base, "collection": "other"})
+    wrong_vault = await score({**base, "vault": "wrong-vault"})
+    wrong_title = await score({**base, "title": "other-title"})
+    wrong_content = await score({**base, "content": "other-content"})
+
+    assert omitted.argument_validity is True and omitted.tool_outcome_match is True and omitted.success is True
+    assert explicit_default.argument_validity is True and explicit_default.tool_outcome_match is True
+    assert explicit_default.success is True
+    assert wrong_collection.argument_validity is True and wrong_collection.tool_outcome_match is False
+    assert wrong_vault.tool_outcome_match is False
+    assert wrong_title.tool_outcome_match is False
+    assert wrong_content.tool_outcome_match is False
+
+
+@pytest.mark.asyncio
 async def test_public_mcp_envelopes_score_recovery_sequence_and_reject_success_bypass() -> None:
     _manifest, tasks = _loaded()
     recovery_task = next(task for task in tasks if task.id == "invalid-recovery-b")
