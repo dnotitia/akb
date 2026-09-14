@@ -102,8 +102,9 @@ echo "  mypy + bandit parse Python ${REQUIRED_PYTHON}"
 
 # 2. Node deps must be installed in every node project this gate runs in.
 #
-# The root lockfile covers the frontend/ and packages/markdown-editor/ workspace
-# members, so those members are included explicitly even without nested locks.
+# The frontend lockfile covers the frontend/ and its
+# frontend/packages/markdown-editor/ workspace member, so the nested member is
+# included explicitly even without its own lock.
 # packages/akb-client/ is an independent pnpm project and
 # packages/akb-mcp-client/ is an independent npm project.
 # Installing only some of them dies
@@ -123,20 +124,17 @@ echo "  mypy + bandit parse Python ${REQUIRED_PYTHON}"
 # went stale the moment a third project arrived: the preflight announced "2 of
 # the 2 pnpm projects this gate runs in" while the gate ran in three, so the one
 # it did not know about failed as ERR_MODULE_NOT_FOUND minutes later, which is
-# precisely the failure this preflight exists to prevent. The root-workspace
-# members are added explicitly below because they no longer carry nested locks.
+# precisely the failure this preflight exists to prevent. The nested frontend
+# workspace member is added explicitly below because it has no lock.
 #
 # The independent projects are derived from their committed lockfiles; the
-# workspace members are listed below because the root lockfile owns their
+# nested workspace member is listed below because the frontend lockfile owns its
 # install. CI installs the workspace once from frontend/ and installs each
 # independent project explicitly (.github/workflows/check.yml).
 node_install_command() {   # $1 = project directory
   case "$1" in
-    .|frontend|packages/markdown-editor)
+    frontend/packages/markdown-editor)
       printf '(cd %s && pnpm install --frozen-lockfile)' "$1"
-      ;;
-    packages/akb-client)
-      printf '(cd %s && pnpm install --frozen-lockfile --ignore-workspace)' "$1"
       ;;
     *)
       if [ -f "$1/pnpm-lock.yaml" ]; then
@@ -148,19 +146,23 @@ node_install_command() {   # $1 = project directory
   esac
 }
 
-node_projects=(".")
+node_projects=()
 while IFS= read -r lockfile; do
   project_dir="$(dirname "${lockfile}")"
-  case " ${node_projects[*]} " in
-    *" ${project_dir} "*) ;;
-    *) node_projects+=("${project_dir}");;
-  esac
+  if [ "${#node_projects[@]}" -eq 0 ]; then
+    node_projects+=("${project_dir}")
+  else
+    case " ${node_projects[*]} " in
+      *" ${project_dir} "*) ;;
+      *) node_projects+=("${project_dir}");;
+    esac
+  fi
 done < <(git ls-files | grep -E '(^|/)(pnpm-lock\.yaml|package-lock\.json)$' | sort)
 
-# These two directories are root-workspace members, not independent lockfile
-# projects. Keep them in the preflight so frontend validation cannot disappear
-# merely because its nested lockfile was removed.
-node_projects+=("frontend" "packages/markdown-editor")
+# The app and common editor are frontend workspace members, not independent
+# lockfile projects. Keep the nested member in the preflight so its checks
+# cannot disappear merely because it has no separate lockfile.
+node_projects+=("frontend/packages/markdown-editor")
 
 if [ "${#node_projects[@]}" -eq 0 ]; then
   echo "  ✗ found no committed node lockfiles — this preflight is measuring the wrong tree" >&2
@@ -178,7 +180,7 @@ if [ "${#missing_installs[@]}" -ne 0 ]; then
     echo "      ${node_project}" >&2
   done
   echo >&2
-  echo "    All of them are required — workspace members share the root lockfile;" >&2
+  echo "    All of them are required — frontend workspace members share its lockfile;" >&2
   echo "    independent projects keep their own lockfiles and package managers:" >&2
   for node_project in "${missing_installs[@]}"; do
     echo "      $(node_install_command "${node_project}")" >&2
@@ -256,7 +258,7 @@ step "eslint (frontend)"
 # ─── frontend: tsc --noEmit (type) ────────────────────────────────
 # `frontend/` has its own tsconfig; running tsc from inside the dir
 # picks it up automatically. node_modules must already be installed —
-# CI installs the frontend workspace before this script so its sibling
+# CI installs the frontend workspace before this script so its nested
 # markdown-editor package is built and linked for the frontend checks.
 step "tsc (frontend)"
 (cd frontend && npx --no-install tsc --noEmit)
@@ -285,16 +287,16 @@ step "packed SDK consumer proof (@akb/client)"
 # ─── shared Markdown editor package ───────────────────────────────
 # The package owns the exact Tiptap versions and its minimum static/unit proof.
 step "build (@akb/markdown-editor)"
-(cd packages/markdown-editor && pnpm run build)
+(cd frontend/packages/markdown-editor && pnpm run build)
 
 step "typecheck (@akb/markdown-editor)"
-(cd packages/markdown-editor && pnpm run typecheck)
+(cd frontend/packages/markdown-editor && pnpm run typecheck)
 
 step "lint (@akb/markdown-editor)"
-(cd packages/markdown-editor && pnpm run lint)
+(cd frontend/packages/markdown-editor && pnpm run lint)
 
 step "vitest (@akb/markdown-editor)"
-(cd packages/markdown-editor && pnpm run test)
+(cd frontend/packages/markdown-editor && pnpm run test)
 
 # ─── stdio proxy + MCP Inspector developer contract ──────────────
 # The package owns its exact Inspector devDependency, command, and focused

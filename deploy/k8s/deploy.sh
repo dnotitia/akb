@@ -131,7 +131,7 @@ else
   docker buildx build --platform "${IMAGE_PLATFORM}" \
     -t "${REGISTRY}/akb-frontend:${VERSION}" -t "${FRONTEND_IMAGE}" --push \
     -f "${ROOT_DIR}/frontend/Dockerfile" \
-    "${ROOT_DIR}"
+    "${ROOT_DIR}/frontend"
 fi
 
 echo "=== Rendering ${AKB_PROFILE} ==="

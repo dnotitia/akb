@@ -31,17 +31,16 @@
 FROM node:22-slim AS frontend-builder
 
 WORKDIR /src
-COPY pnpm-workspace.yaml pnpm-lock.yaml ./
-COPY frontend/package.json ./frontend/
-COPY packages/markdown-editor/package.json packages/markdown-editor/tsconfig.json packages/markdown-editor/tsconfig.build.json ./packages/markdown-editor/
-COPY packages/markdown-editor/src ./packages/markdown-editor/src
+COPY frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml ./frontend/
+COPY frontend/packages/markdown-editor/package.json frontend/packages/markdown-editor/tsconfig.json frontend/packages/markdown-editor/tsconfig.build.json ./frontend/packages/markdown-editor/
+COPY frontend/packages/markdown-editor/src ./frontend/packages/markdown-editor/src
 RUN corepack enable && corepack prepare "$(node -p 'require("./frontend/package.json").packageManager')" --activate
 # The workspace install runs the common package's prepare build before Vite;
 # the workspace allowBuilds list stays limited to esbuild/msw.
-RUN pnpm install --frozen-lockfile
+RUN cd frontend && pnpm install --frozen-lockfile
 
 COPY frontend/ ./frontend/
-RUN pnpm --filter frontend run build
+RUN cd frontend && pnpm run build
 
 # ---------- final image ----------
 FROM pgvector/pgvector:pg16

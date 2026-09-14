@@ -1,5 +1,4 @@
 packages:
-  - frontend
   - packages/markdown-editor
 allowBuilds:
   esbuild: true

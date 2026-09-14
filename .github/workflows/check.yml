@@ -39,7 +39,7 @@ jobs:
           node-version: '22'
           cache: pnpm
           cache-dependency-path: |
-            pnpm-lock.yaml
+            frontend/pnpm-lock.yaml
             packages/akb-client/pnpm-lock.yaml
       - name: Install stdio proxy deps
         working-directory: packages/akb-mcp-client
@@ -51,9 +51,8 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Install @akb/client deps
         working-directory: packages/akb-client
-        # It has its own lockfile but lives below the root workspace; ignore
-        # the parent workspace so this installs @akb/client's own dependencies.
-        run: pnpm install --frozen-lockfile --ignore-workspace
+        # It is outside the frontend workspace and installs from its own lockfile.
+        run: pnpm install --frozen-lockfile
       # ── Single entry point so CI and local pre-commit stay in sync ──
       - name: Run scripts/check.sh
         run: bash scripts/check.sh

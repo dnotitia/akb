@@ -168,15 +168,16 @@ uv tool install --python 3.14 --force 'detect-secrets==1.5.0'
 ```
 
 **2. Node deps in the workspace and independent projects.** `frontend/` and
-`packages/markdown-editor/` are the two members of the root pnpm workspace;
+`frontend/packages/markdown-editor/` are the two members of the frontend pnpm
+workspace;
 `packages/akb-client/` and `packages/akb-mcp-client/` remain independent
-projects. The workspace uses the root `pnpm-lock.yaml`; each independent
+projects. The workspace uses `frontend/pnpm-lock.yaml`; each independent
 project uses its own lockfile, and the gate runs steps in each. Installing only
 some of them is the common mistake:
 
 ```bash
 (cd frontend && pnpm install --frozen-lockfile)
-(cd packages/akb-client && pnpm install --frozen-lockfile --ignore-workspace)
+(cd packages/akb-client && pnpm install --frozen-lockfile)
 (cd packages/akb-mcp-client && npm ci)
 ```
 
