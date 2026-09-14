@@ -9,7 +9,7 @@ specifically; the proxy has its own log in
 
 ### Companion BFF login completes AKB account linking
 
-An opt-in `POST /api/v1/auth/sso/companion/complete` lets a registered companion
+An optional onboarding/migration `POST /api/v1/auth/sso/companion/complete` lets a registered companion
 BFF complete the same verified-provider account adoption/enrollment policy
 as AKB's browser callback without navigating the browser to AKB. It requires
 a dedicated deployment RSA request signature and independently verified
@@ -21,6 +21,10 @@ no AKB cookie, API token or refresh token is issued. Public configuration exampl
 Helm registration values and the OpenAPI contract support independently developed
 companion applications. Configuration and rollout:
 `docs/designs/keycloak-oidc/companion-login.md`.
+Already linked identities continue ordinary SSO through `/auth/me` with completion
+disabled. Disable the companion callback configuration before removing its AKB
+completion registration, and retain the separate human API client allowlist.
+Future unlinked users require reactivation or administrative provisioning.
 
 ### Every document counter follows the active authority (akb#525)
 

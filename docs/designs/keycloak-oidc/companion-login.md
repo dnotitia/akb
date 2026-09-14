@@ -15,9 +15,12 @@ and identity-conflict rules still apply. Registering a BFF does not by itself
 enable email-based adoption. Ordinary `/auth/me`, refresh, PAT and MCP requests
 do not gain account-adoption authority.
 
-This is an opt-in AKB extension on top of OIDC, not a standard OAuth token
-endpoint. It supports any operator-reviewed companion BFF meeting the contract
-below; AKB has no dependency on a particular companion product or framework.
+This is an optional onboarding/account-migration capability, not a prerequisite
+for ordinary SSO login and not a standard OAuth token endpoint. Once an identity
+is linked, a companion can complete its own OIDC login and call `/auth/me`
+directly without this API or a BFF assertion key. It supports any
+operator-reviewed companion BFF meeting the contract below; AKB has no dependency
+on a particular companion product or framework.
 
 ## Deployment registration
 
@@ -89,11 +92,13 @@ Before enabling a companion, its operator must:
 2. At the companion callback, consume and validate state/cookie binding, exchange
    the code using PKCE, and verify the ID token and nonce. Bind the selected
    provider to that login; do not accept it from a callback query parameter.
-3. Sign and send the completion request below from the BFF server. Do this only
-   for a completed browser login, never from refresh or ordinary API handling.
-4. On success, call `/api/v1/auth/me` with the same access token and require the
-   returned user ID to match completion. Then create the application's own
-   server-side session and return the user to their original application page.
+3. When onboarding/account-migration completion is enabled, sign and send the
+   completion request below from the BFF server. Do this only for a completed
+   browser login, never from refresh or ordinary API handling. When completion
+   is disabled, proceed directly to `/api/v1/auth/me`.
+4. Call `/api/v1/auth/me` with the access token. If completion was requested,
+   require the returned user ID to match its result. Then create the application's
+   own server-side session and return the user to their original application page.
    An account denial or failed verification must not establish a session.
 
 ## Exact wire contract
@@ -183,6 +188,38 @@ a cached success. A user can explicitly start a fresh OIDC login after failure.
 New-user PostgreSQL role synchronization follows the same existing best-effort
 lifecycle and periodic reconciliation policy as AKB's browser callback. This
 endpoint does not add a separate role-sync receipt or retry mechanism.
+
+## Optional onboarding and migration lifecycle
+
+Enable completion only for applications and periods that need account linking
+or enrollment. Ordinary SSO uses the separate human API client allowlist,
+`keycloak_companion_client_ids_by_origin` (`sso.companionClientIdsByOrigin`
+in Helm), and does not need `keycloak_companion_login_clients`.
+
+1. Enable the reviewed AKB completion registration and the application's
+   callback completion configuration for the onboarding/migration period.
+2. Once the required identities are linked, disable completion in the
+   companion application and redeploy all its instances first. Its callbacks
+   must then call `/auth/me` directly. Remove that application's completion
+   settings together; partial configuration must fail closed.
+3. After in-flight completion callbacks have drained, remove that application's
+   entry from `keycloak_companion_login_clients` (`sso.companionLoginClients`).
+   Use `{}` when no applications need completion. Keep its ordinary
+   `keycloak_companion_client_ids_by_origin` entry: removing the API client
+   allowlist would also deny normal bearer login.
+4. Verify a new OIDC login resolves `/auth/me` to the existing AKB user ID.
+   Completion requests are now refused; existing identity bindings are retained.
+   Retain migration 101 and identity data. Remove the signing private key from
+   active deployment secrets after no application instance uses it; ordinary
+   OIDC and session-encryption configuration remain necessary.
+
+A future unlinked user is not automatically adopted through `/auth/me`.
+Existing open-enrollment/JIT policy remains unchanged; this capability only adds
+the explicitly delegated completion path.
+To provide this linking flow again, re-enable both the reviewed AKB completion
+registration and the application's callback configuration, or provision the
+identity through an existing administrative process. A failed enabled
+completion request must never silently fall back to direct `/auth/me`.
 
 ## Rollout and observability
 

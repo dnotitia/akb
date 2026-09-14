@@ -93,3 +93,52 @@ async def test_expired_at_db_consumption_refused(pool, completion):
         await service._consume_assertion("example-app", str(uuid.uuid4()), int(time.time()) - 1)
     async with pool.acquire() as conn:
         assert await conn.fetchval("SELECT COUNT(*) FROM companion_login_assertions") == 0
+
+
+async def test_disabling_completion_keeps_bound_rest_and_me_login(pool, completion, monkeypatch):
+    import httpx
+    from fastapi import FastAPI
+    from app.api.routes.auth import router
+    from app.services import keycloak_oidc
+
+    req, tokens, sign, _, subject = completion
+    uid = await _insert_unbound_user(pool, f"{subject}@corp.example")
+    access, identity = tokens()
+    result = await service.complete_companion_login(req, access, identity, sign(access, identity))
+    assert result["user"]["id"] == str(uid)
+    allowed_clients = dict(settings.keycloak_companion_client_ids_by_origin)
+    monkeypatch.setattr(keycloak_oidc, "get_keycloak_oidc", service.get_keycloak_oidc)
+    monkeypatch.setattr(settings, "keycloak_companion_login_clients", {})
+    assert settings.keycloak_companion_client_ids_by_origin == allowed_clients
+    # Simulate a later OIDC login, not reuse of an issued AKB/BFF session.
+    fresh_access, fresh_identity = tokens()
+    user = await auth_service.resolve_rest_user_authorization("Bearer " + fresh_access)
+    assert user is not None and user.user_id == str(uid)
+    app = FastAPI()
+    app.include_router(router, prefix="/api/v1")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://akb.example.com") as client:
+        me = await client.get("/api/v1/auth/me", headers={"Authorization": "Bearer " + fresh_access})
+        assert me.status_code == 200 and me.json()["user_id"] == str(uid)
+        refused = await client.post(service.ENDPOINT, json=req.model_dump(), headers={
+            "Authorization": "Bearer " + fresh_access, "X-AKB-ID-Token": fresh_identity,
+            "X-AKB-Login-Assertion": sign(fresh_access, fresh_identity),
+        })
+        assert refused.status_code == 401 and refused.json()["code"] == "authentication_failed"
+    async with pool.acquire() as conn:
+        assert await conn.fetchval("SELECT user_id FROM external_identities WHERE subject=$1", subject) == uid
+        assert await conn.fetchval("SELECT COUNT(*) FROM companion_login_assertions") == 1
+
+
+async def test_disabled_completion_does_not_adopt_new_unbound_user(pool, completion, monkeypatch):
+    from app.services import keycloak_oidc
+
+    req, tokens, sign, _, subject = completion
+    uid = await _insert_unbound_user(pool, f"{subject}@corp.example")
+    monkeypatch.setattr(keycloak_oidc, "get_keycloak_oidc", service.get_keycloak_oidc)
+    monkeypatch.setattr(settings, "keycloak_companion_login_clients", {})
+    access, identity = tokens()
+    assert await auth_service.resolve_rest_user_authorization("Bearer " + access) is None
+    with pytest.raises(AuthenticationError):
+        await service.complete_companion_login(req, access, identity, sign(access, identity))
+    async with pool.acquire() as conn:
+        assert await conn.fetchval("SELECT COUNT(*) FROM external_identities WHERE user_id=$1", uid) == 0

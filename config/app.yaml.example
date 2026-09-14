@@ -309,7 +309,10 @@ app_credential_overlap_seconds: 300
 # server-side token custody.
 # keycloak_companion_client_ids_by_origin:
 #   "https://app.example.com": "example-app"
-# Explicit account-completion authority is separate and disabled by default.
+# Optional onboarding/migration completion authority; not required for linked-user SSO.
+# Disable the BFF completion configuration/redeploy first, then remove its registration.
+# Keep keycloak_companion_client_ids_by_origin for ordinary login; future unlinked
+# users need completion re-enabled or administrative identity provisioning.
 # Register only dedicated BFF public keys (never its private key or OIDC secret).
 # keycloak_companion_login_clients: {}
 # keycloak_companion_login_clients:

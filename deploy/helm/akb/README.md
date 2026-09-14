@@ -70,7 +70,8 @@ inputs. Configure DNS first and replace every example value.
 ## Companion applications
 
 An SSO deployment can separately register trusted companion backends for API
-access and account completion. Both maps default to empty. Add these public
+access and optional onboarding/account-migration completion. Both maps default
+to empty. Linked-user SSO requires only the API client allowlist. Add these public
 settings to your own values file alongside the `standalone-sso` profile:
 
 ```yaml
@@ -98,7 +99,11 @@ companion's own secret store, outside AKB and Helm values.
 The chart does not provision companion Keycloak clients, callbacks, token
 mappers or application sessions. Follow the
 [integration and signing contract](../../../docs/designs/keycloak-oidc/companion-login.md)
-before enabling the companion login flow.
+before enabling account completion. After the required identities are linked,
+disable completion in the companion application and redeploy it first; then
+remove its `companionLoginClients` registration. Keep `companionClientIdsByOrigin`
+for normal login. A future unlinked user requires completion reactivation or
+administrative identity provisioning; no new feature flag is needed.
 
 ## Render and inspect
 

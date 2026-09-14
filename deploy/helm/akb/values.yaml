@@ -112,8 +112,9 @@ sso:
   # Accepted human API token client IDs; this alone cannot link accounts.
   # companionClientIdsByOrigin: {"https://app.example.com": "example-app"}
   companionClientIdsByOrigin: {}
-  # Explicit account-completion authority. Public keys only; the companion
-  # application owns its private signing key and OIDC credentials.
+  # Optional onboarding/migration authority, not required for linked-user SSO.
+  # Disable BFF completion/redeploy before clearing this; retain companionClientIdsByOrigin.
+  # Public keys only; the companion owns its private signing key and OIDC credentials.
   # See README.md and docs/designs/keycloak-oidc/companion-login.md.
   companionLoginClients: {}
   localRealmLogin:
