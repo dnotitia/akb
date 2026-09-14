@@ -236,6 +236,45 @@ def test_checkpoint_timing_tampering_fails_closed(tmp_path: Path) -> None:
         _store(path, resume=True)
 
 
+def test_checkpoint_closing_rejects_late_writes_and_finalizes_once(tmp_path: Path) -> None:
+    path = tmp_path / "checkpoint.json"
+    store, key = _store(path)
+    timing = {
+        "attempt_index": 1,
+        "wall_seconds": 3.0,
+        "breakdown": {"model_execution": 3.0},
+    }
+
+    store.begin_closing()
+    with pytest.raises(CheckpointError, match="late writes"):
+        store.record_trial(key, _outcome(key), status="failed")
+    with pytest.raises(CheckpointError, match="late writes"):
+        store.update_timing(timing)
+
+    store.finalize_timing(timing)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert raw["lifecycle"] == "finalized"
+    assert raw["reserved_cost_usd"] == 0
+    assert raw["timing"]["active_attempt"] is None
+
+    with pytest.raises(CheckpointError, match="finalized"):
+        store.finalize_timing(timing)
+
+
+def test_resume_rejects_closing_or_orphaned_checkpoint_state(tmp_path: Path) -> None:
+    closing_path = tmp_path / "closing.json"
+    closing, _ = _store(closing_path)
+    closing.begin_closing()
+    with pytest.raises(CheckpointError, match="finalization"):
+        _store(closing_path, resume=True)
+
+    reserved_path = tmp_path / "reserved.json"
+    reserved, _ = _store(reserved_path)
+    reserved.set_reserved_cost(0.1)
+    with pytest.raises(CheckpointError, match="orphaned reserved cost"):
+        _store(reserved_path, resume=True)
+
+
 def test_smoke_checkpoint_requires_a_successful_call_and_follow_up_response(tmp_path: Path) -> None:
     path = tmp_path / "checkpoint.json"
     store, key = _store(path)

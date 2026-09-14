@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,7 +11,7 @@ import pytest
 import mcp_catalog.runner as runner_module
 from mcp_catalog.contracts import CatalogSnapshot, hash_json, load_run_manifest, load_task_corpus, token_estimate
 from mcp_catalog.execution import TrialOutcome
-from mcp_catalog.runner import BenchmarkRunner
+from mcp_catalog.runner import BenchmarkRunFailure, BenchmarkRunner
 from mcp_catalog.runtime import RuntimeDescriptor
 from test_runtime_contract import descriptor_dict
 
@@ -209,3 +210,112 @@ async def test_registered_cells_run_in_parallel_and_keep_deterministic_hash_inpu
         parallel["timing"]["wall_seconds"]
     )
     assert parallel["artifact_hash_input"] == second_parallel["artifact_hash_input"]
+
+
+@pytest.mark.asyncio
+async def test_timeout_cancels_and_joins_sibling_lanes_before_checkpoint_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    descriptor = _parallel_descriptor()
+    resolver = _ParallelResolver()
+    settled: list[str] = []
+    failed_once = True
+    checkpoint = tmp_path / "timeout.checkpoint.json"
+
+    async def fake_preflight(_runner):
+        return {
+            "runtime": {
+                "source_revision": "a" * 40,
+                "artifact_versions": {"backend_artifact_version": "0.0.0", "proxy_artifact_version": "0.0.0"},
+                "discovery": {"status": "ready"},
+            },
+            "resolver": resolver,
+        }
+
+    async def fake_capture(*_args, **kwargs):
+        return CatalogSnapshot(
+            transport=kwargs["transport"],
+            source_revision="a" * 40,
+            artifact_version="0.0.0",
+            tool_count=0,
+            catalog_hash=hash_json([]),
+            catalog_token_estimate=token_estimate([]),
+            tools=[],
+        )
+
+    async def fake_smoke(task, *, model_spec, transport, **_kwargs):
+        return _outcome(task, model_spec, transport, 1).model_copy(update={"locale": task.locale})
+
+    async def fake_evaluate(tasks_for_repeat, *, executor, repeat_indices, checkpoint_sink, **_kwargs):
+        nonlocal failed_once
+        run_key = f"{executor.model_spec.class_name}:{executor.transport}"
+        if run_key == "primary:http" and failed_once:
+            failed_once = False
+            task = tasks_for_repeat[0]
+            timeout = _outcome(task, executor.model_spec, executor.transport, repeat_indices[task.id]).model_copy(
+                update={
+                    "locale": task.locale,
+                    "error": "benchmark incomplete: provider request timeout",
+                    "failure_kind": "request_timeout",
+                    "model_requests": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "cost_usd": 0.0,
+                    "provider_evidence": [],
+                    "provider_cost_usd": None,
+                    "cost_source": "registered_price_snapshot",
+                    "routing_observed": False,
+                    "routing_valid": False,
+                }
+            )
+            await checkpoint_sink(timeout, "failed")
+            return _ParallelReport([timeout])
+        try:
+            await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            settled.append(run_key)
+            raise
+        return _ParallelReport(
+            [
+                _outcome(task, executor.model_spec, executor.transport, repeat_indices[task.id]).model_copy(
+                    update={"locale": task.locale}
+                )
+                for task in tasks_for_repeat
+            ]
+        )
+
+    monkeypatch.setattr(runner_module, "RuntimeFixture", _ParallelFixture)
+    monkeypatch.setattr(BenchmarkRunner, "preflight", fake_preflight)
+    monkeypatch.setattr(runner_module, "capture_catalog", fake_capture)
+    monkeypatch.setattr(runner_module, "build_model", lambda spec: SimpleNamespace(settings={}, model_spec=spec))
+    monkeypatch.setattr(runner_module, "execute_smoke", fake_smoke)
+    monkeypatch.setattr(runner_module, "evaluate_dataset", fake_evaluate)
+    monkeypatch.setattr(runner_module, "serialize_report", lambda *_args, **_kwargs: {})
+
+    runner = BenchmarkRunner(manifest, tasks, descriptor, arm="baseline", checkpoint_path=checkpoint)
+    with pytest.raises(BenchmarkRunFailure) as raised:
+        await runner.run()
+
+    raw = json.loads(checkpoint.read_text(encoding="utf-8"))
+    artifact = raised.value.artifact
+    assert len(settled) == 3
+    assert raw["lifecycle"] == "finalized"
+    assert raw["timing"]["active_attempt"] is None
+    assert len(raw["timing"]["attempts"]) == 1
+    assert len(raw["records"]) == 1
+    assert raw["reserved_cost_usd"] == 0
+    assert artifact["checkpoint"]["lifecycle"] == "finalized"
+    assert artifact["checkpoint"]["record_count"] == artifact["completed_trials"] == len(raw["records"])
+    assert artifact["checkpoint"]["timing"] == raw["timing"]
+    assert artifact["budget_used"]["reserved_cost_usd"] == 0
+    assert runner._checkpoint_store is not None
+    with pytest.raises(Exception, match="late writes"):
+        runner._checkpoint_store.record_trial(
+            next(iter(runner._checkpoint_store.expected_keys.values())),
+            _outcome(tasks[0], manifest.models[0], "http", 1).model_copy(update={"locale": tasks[0].locale}),
+            status="failed",
+        )

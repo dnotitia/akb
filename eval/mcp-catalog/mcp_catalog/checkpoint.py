@@ -119,8 +119,10 @@ class SmokeCellCheckpoint(ContractModel):
 
 class CheckpointDocument(ContractModel):
     schema_version: Literal[3] = CHECKPOINT_SCHEMA_VERSION
+    lifecycle: Literal["open", "closing", "finalized"] = "open"
     header: CheckpointHeader
     spent: CheckpointBudget = Field(default_factory=CheckpointBudget)
+    reserved_cost_usd: float = Field(default=0.0, ge=0)
     spent_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     timing: CheckpointTiming = Field(default_factory=CheckpointTiming)
     timing_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -217,9 +219,25 @@ class CheckpointStore:
                 timing=initial_timing,
                 timing_hash=timing_hash(initial_timing),
             )
+        if resume and self.document.lifecycle == "finalized":
+            self.document.lifecycle = "open"
+            self._write_atomic()
 
     def set_secrets(self, secrets: tuple[str, ...]) -> None:
         self.secrets = secrets
+
+    def begin_closing(self) -> None:
+        if self.document.lifecycle != "open":
+            raise CheckpointError(f"checkpoint cannot begin closing from {self.document.lifecycle}")
+        self.document.lifecycle = "closing"
+        self._write_atomic()
+
+    def set_reserved_cost(self, reserved_cost_usd: float) -> None:
+        self._ensure_writable()
+        if reserved_cost_usd < 0:
+            raise CheckpointError("checkpoint reserved cost cannot be negative")
+        self.document.reserved_cost_usd = reserved_cost_usd
+        self._write_atomic()
 
     def status_for(self, key: CheckpointKey) -> TrialStatus | None:
         record = self.document.records.get(checkpoint_key_digest(key))
@@ -256,7 +274,11 @@ class CheckpointStore:
         status: TrialStatus | None = None,
         timing: dict[str, object] | None = None,
         elapsed_wall_seconds: float | None = None,
+        reserved_cost_usd: float = 0.0,
     ) -> bool:
+        self._ensure_writable()
+        if reserved_cost_usd < 0:
+            raise CheckpointError("checkpoint reserved cost cannot be negative")
         self._validate_key(key)
         safe_outcome = self._safe_outcome(outcome)
         if not self._outcome_matches_key(safe_outcome, key):
@@ -281,6 +303,7 @@ class CheckpointStore:
                 elapsed_wall_seconds,
             )
         self.document.spent_hash = spent_hash(self.document.spent)
+        self.document.reserved_cost_usd = reserved_cost_usd
         if timing is not None:
             self._update_timing(timing)
         self._write_atomic()
@@ -294,7 +317,11 @@ class CheckpointStore:
         status: TrialStatus | None = None,
         timing: dict[str, object] | None = None,
         elapsed_wall_seconds: float | None = None,
+        reserved_cost_usd: float = 0.0,
     ) -> bool:
+        self._ensure_writable()
+        if reserved_cost_usd < 0:
+            raise CheckpointError("checkpoint reserved cost cannot be negative")
         expected = self.expected_smoke_cells.get(cell_key)
         if expected is None:
             raise CheckpointError(f"unexpected smoke cell: {cell_key}")
@@ -329,6 +356,7 @@ class CheckpointStore:
                 elapsed_wall_seconds,
             )
         self.document.spent_hash = spent_hash(self.document.spent)
+        self.document.reserved_cost_usd = reserved_cost_usd
         if timing is not None:
             self._update_timing(timing)
         self._write_atomic()
@@ -341,20 +369,31 @@ class CheckpointStore:
         return max(indexes, default=0) + 1
 
     def update_timing(self, timing: dict[str, object]) -> None:
+        self._ensure_writable()
         self._update_timing(timing)
         self._write_atomic()
 
     def finalize_timing(self, timing: dict[str, object]) -> None:
+        if self.document.lifecycle == "open":
+            self.document.lifecycle = "closing"
+        if self.document.lifecycle != "closing":
+            raise CheckpointError(f"checkpoint cannot finalize from {self.document.lifecycle}")
+        if self.document.reserved_cost_usd != 0:
+            raise CheckpointError("checkpoint has an orphaned reserved cost")
         self._update_timing(timing)
         active = self.document.timing.active_attempt
         if active is not None:
+            if any(item.attempt_index == active.attempt_index for item in self.document.timing.attempts):
+                raise CheckpointError("checkpoint timing attempt is both active and finalized")
             self.document.timing.attempts.append(active)
             self.document.timing.active_attempt = None
             self._recompute_timing()
             self.document.timing_hash = timing_hash(self.document.timing)
+        self.document.lifecycle = "finalized"
         self._write_atomic()
 
     def set_smoke_status(self, status: Literal["in_progress", "passed", "failed"]) -> None:
+        self._ensure_writable()
         if status == "passed" and not all(
             self.smoke_outcome_for(key) is not None for key in self.expected_smoke_cells
         ):
@@ -411,7 +450,19 @@ class CheckpointStore:
         unknown_smoke = set(document.smoke_gate) - set(self.expected_smoke_cells)
         if unknown_smoke:
             raise CheckpointError(f"resume checkpoint contains unexpected smoke cells: {sorted(unknown_smoke)}")
+        if document.lifecycle == "closing":
+            raise CheckpointError("resume checkpoint was captured during finalization")
+        if document.reserved_cost_usd != 0:
+            raise CheckpointError("resume checkpoint contains an orphaned reserved cost")
+        finalized_indexes = {item.attempt_index for item in document.timing.attempts}
+        active = document.timing.active_attempt
+        if active is not None and active.attempt_index in finalized_indexes:
+            raise CheckpointError("resume checkpoint timing attempt is both active and finalized")
         return document
+
+    def _ensure_writable(self) -> None:
+        if self.document.lifecycle != "open":
+            raise CheckpointError(f"checkpoint is {self.document.lifecycle}; late writes are forbidden")
 
     def _update_timing(self, raw_timing: dict[str, object]) -> None:
         attempt = TimingAttempt.model_validate(raw_timing)

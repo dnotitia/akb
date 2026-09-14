@@ -652,6 +652,12 @@ class BudgetLedger:
                 raise BudgetExceeded("trial cost reservation accounting is inconsistent")
             self.reserved_cost_usd -= reserved_cost_usd
 
+    async def release_all_reservations(self) -> float:
+        async with self._lock:
+            released = self.reserved_cost_usd
+            self.reserved_cost_usd = 0.0
+            return released
+
     async def charge(self, outcome: TrialOutcome, *, reserved_cost_usd: float = 0.0) -> None:
         async with self._lock:
             next_requests = self.requests + outcome.model_requests

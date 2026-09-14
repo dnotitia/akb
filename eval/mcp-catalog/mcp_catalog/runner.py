@@ -15,6 +15,7 @@ from typing import Any, Awaitable, Callable, Literal, cast
 from .catalog import capture_catalog
 from .checkpoint import (
     CheckpointHeader,
+    CheckpointDocument,
     CheckpointKey,
     CheckpointStore,
     SmokeModelClass,
@@ -26,6 +27,7 @@ from .contracts import ArmName, BenchmarkRunManifest, TaskManifest, hash_json, l
 from .evidence import redact_exception, redact_text, serialize_report, write_json, safe_json
 from .execution import (
     BudgetLedger,
+    BudgetExceeded,
     TrialExecutor,
     TrialOutcome,
     build_model,
@@ -458,6 +460,7 @@ class BenchmarkRunner:
         end_to_end_wall_seconds: float = 0.0,
         timing: dict[str, Any] | None = None,
         smoke_gate: dict[str, Any] | None = None,
+        checkpoint_snapshot: CheckpointDocument | None = None,
     ) -> dict[str, Any]:
         quality_reasons: list[str] = []
         trial_error_reasons: list[str] = []
@@ -555,8 +558,25 @@ class BenchmarkRunner:
                 if valid_completed_outcome(outcome)
             ),
         }
-        if self._checkpoint_store is not None:
-            checkpoint_evidence["timing"] = self._checkpoint_store.document.timing.model_dump(mode="json")
+        checkpoint_doc = checkpoint_snapshot or (
+            self._checkpoint_store.document if self._checkpoint_store is not None else None
+        )
+        if checkpoint_doc is not None:
+            checkpoint_evidence["timing"] = checkpoint_doc.timing.model_dump(mode="json")
+            checkpoint_evidence["lifecycle"] = checkpoint_doc.lifecycle
+            checkpoint_evidence["record_count"] = len(checkpoint_doc.records)
+            checkpoint_evidence["reserved_cost_usd"] = checkpoint_doc.reserved_cost_usd
+            checkpoint_evidence["spent"] = checkpoint_doc.spent.model_dump(mode="json")
+            checkpoint_evidence["spent_hash"] = checkpoint_doc.spent_hash
+            checkpoint_evidence["timing_hash"] = checkpoint_doc.timing_hash
+            if checkpoint_doc.lifecycle != "finalized":
+                incomplete_reasons.add("benchmark incomplete: checkpoint lifecycle was not finalized")
+            if len(checkpoint_doc.records) != completed_trials:
+                incomplete_reasons.add("benchmark incomplete: checkpoint and artifact trial counts differ")
+            if checkpoint_doc.reserved_cost_usd != 0:
+                incomplete_reasons.add("benchmark incomplete: checkpoint has an orphaned reservation")
+        if ledger.reserved_cost_usd != 0:
+            incomplete_reasons.add("benchmark incomplete: artifact has an orphaned reservation")
         timing_payload = timing or {
             "attempt_index": 1,
             "wall_seconds": end_to_end_wall_seconds,
@@ -680,6 +700,7 @@ class BenchmarkRunner:
                         if self._ledger is not None
                         else None
                     ),
+                    reserved_cost_usd=(self._ledger.reserved_cost_usd if self._ledger is not None else 0.0),
                 )
                 if self._timing is not None:
                     self._timing.record("checkpoint", checkpoint_started)
@@ -778,6 +799,7 @@ class BenchmarkRunner:
                                 if self._ledger is not None
                                 else None
                             ),
+                            reserved_cost_usd=(self._ledger.reserved_cost_usd if self._ledger is not None else 0.0),
                         )
                 raise RuntimeContractError(
                     f"smoke gate cell {cell_key} could not reserve its registered budget",
@@ -878,6 +900,7 @@ class BenchmarkRunner:
                             if self._ledger is not None
                             else None
                         ),
+                        reserved_cost_usd=(self._ledger.reserved_cost_usd if self._ledger is not None else 0.0),
                     )
             return {
                 "cell": cell_key,
@@ -1136,6 +1159,7 @@ class BenchmarkRunner:
         reports: dict[str, Any] = {}
         incomplete_reasons: set[str] = set()
         lifecycle_cleanup_errors: list[Exception] = []
+        checkpoint_snapshot: CheckpointDocument | None = None
         current_stage = "run_initialization"
         self._refresh_secrets(resolver)
         planned_keys = self._planned_keys(source_revision)
@@ -1243,25 +1267,24 @@ class BenchmarkRunner:
                 if pending_by_run.get(f"{model_spec.class_name}:{transport}")
             ]
             if self.descriptor.benchmark_cells:
-                await asyncio.gather(
-                    *(
-                        self._run_cell(
-                            run_key=run_key,
-                            model_spec=model_spec,
-                            transport=transport,
-                            pending=pending_by_run[run_key],
-                            fixture=fixtures[run_key],
-                            resolver=resolver,
-                            ledger=ledger,
-                            planned_by_identity=planned_by_identity,
-                            profiles=profiles,
-                            lifecycle_cleanup_errors=lifecycle_cleanup_errors,
-                            incomplete_reasons=incomplete_reasons,
-                            reports=reports,
+                async with asyncio.TaskGroup() as group:
+                    for model_spec, transport, run_key in jobs:
+                        group.create_task(
+                            self._run_cell(
+                                run_key=run_key,
+                                model_spec=model_spec,
+                                transport=transport,
+                                pending=pending_by_run[run_key],
+                                fixture=fixtures[run_key],
+                                resolver=resolver,
+                                ledger=ledger,
+                                planned_by_identity=planned_by_identity,
+                                profiles=profiles,
+                                lifecycle_cleanup_errors=lifecycle_cleanup_errors,
+                                incomplete_reasons=incomplete_reasons,
+                                reports=reports,
+                            )
                         )
-                        for model_spec, transport, run_key in jobs
-                    )
-                )
             else:
                 for model_spec, transport, run_key in jobs:
                     await self._run_cell(
@@ -1293,6 +1316,21 @@ class BenchmarkRunner:
                     except Exception:
                         pass
         finally:
+            try:
+                orphaned_reservation = await ledger.release_all_reservations()
+                if orphaned_reservation > 1e-12:
+                    lifecycle_cleanup_errors.append(
+                        BudgetExceeded(
+                            f"checkpoint finalization released orphaned reservation ${orphaned_reservation:.8f}"
+                        )
+                    )
+                if self._checkpoint_store is not None:
+                    async with self._checkpoint_lock:
+                        await asyncio.to_thread(self._checkpoint_store.set_reserved_cost, 0.0)
+                        await asyncio.to_thread(self._checkpoint_store.begin_closing)
+            except Exception as exc:
+                lifecycle_cleanup_errors.append(exc)
+
             async def cleanup_fixture_state() -> None:
                 mark_reset_complete = getattr(resolver, "mark_reset_complete", None)
                 if callable(mark_reset_complete):
@@ -1320,6 +1358,7 @@ class BenchmarkRunner:
                         timing_payload,
                     )
                 timing_payload = self._checkpoint_store.document.timing.model_dump(mode="json")
+                checkpoint_snapshot = self._checkpoint_store.document.model_copy(deep=True)
             except Exception as exc:
                 cleanup_errors.append(exc)
         if primary_error is None and cleanup_errors:
@@ -1343,6 +1382,7 @@ class BenchmarkRunner:
                 timing=timing_payload,
                 end_to_end_wall_seconds=time.perf_counter() - started,
                 smoke_gate=self._smoke_gate,
+                checkpoint_snapshot=checkpoint_snapshot,
             )
             raise BenchmarkRunFailure(
                 primary_error,
@@ -1362,6 +1402,7 @@ class BenchmarkRunner:
             timing=timing_payload,
             end_to_end_wall_seconds=time.perf_counter() - started,
             smoke_gate=self._smoke_gate,
+            checkpoint_snapshot=checkpoint_snapshot,
         )
 
 def outcomes_from_report(
