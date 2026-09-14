@@ -19,6 +19,29 @@ describe("MarkdownEditor formatting toolbar", () => {
     expect(screen.getByRole("button", { name: "Paragraph" })).toHaveFocus();
   });
 
+  it("applies the shared bold command to the selected AKB document text", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(
+      <MarkdownEditor
+        value="Draft"
+        vault="team"
+        ariaLabel="Document content"
+        onChange={onChange}
+      />,
+    );
+
+    const editor = screen.getByRole("textbox", { name: "Document content" });
+    editor.focus();
+    await user.keyboard("{Control>}a{/Control}");
+    await user.click(screen.getByRole("button", { name: "Bold" }));
+
+    await waitFor(() => {
+      const latest = onChange.mock.calls.at(-1)?.[0] as string | undefined;
+      expect(latest).toContain("**Draft**");
+    });
+  });
+
   it("loads multiline code through the shared Tiptap code block", () => {
     const onChange = vi.fn();
     render(
