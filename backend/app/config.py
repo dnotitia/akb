@@ -543,6 +543,32 @@ class ExternalGitHostRule(BaseModel):
         return self
 
 
+class CompanionLoginClient(BaseModel):
+    """Explicit account-completion authority for one independently authenticated BFF."""
+
+    model_config = ConfigDict(extra="forbid")
+    public_keys: dict[str, str] = Field(min_length=1, max_length=8)
+    provider_aliases: list[str] = Field(min_length=1, max_length=32)
+
+    @model_validator(mode="after")
+    def validate_keys_and_providers(self) -> "CompanionLoginClient":
+        from cryptography.hazmat.primitives.serialization import load_pem_public_key
+        from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
+
+        for kid, pem in self.public_keys.items():
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", kid):
+                raise ValueError("Invalid companion login key ID")
+            try:
+                key = load_pem_public_key(pem.encode("ascii"))
+            except (ValueError, TypeError, UnicodeError):
+                raise ValueError("Invalid companion login public key") from None
+            if not isinstance(key, RSAPublicKey) or key.key_size < 2048:
+                raise ValueError("Companion login requires RSA public keys of at least 2048 bits")
+        if any(not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,62}", alias) for alias in self.provider_aliases):
+            raise ValueError("Invalid companion login provider alias")
+        return self
+
+
 class Settings(BaseModel):
     notifications_enabled: bool = True
     notification_retention_days: int = Field(default=90, ge=1, le=3650)
@@ -1159,6 +1185,8 @@ class Settings(BaseModel):
     # Companion client IDs remain active as accepted `azp` values for the
     # human API profile. They never select AKB's own browser callback.
     keycloak_companion_client_ids_by_origin: dict[str, str] = Field(default_factory=dict)
+    # Separate opt-in; API azp acceptance alone never grants account linking.
+    keycloak_companion_login_clients: dict[str, CompanionLoginClient] = Field(default_factory=dict)
     # Deprecated legacy exchange-code input; no route issues or redeems it.
     keycloak_exchange_code_ttl_secs: int = 60
 
@@ -1367,6 +1395,23 @@ class Settings(BaseModel):
     # Tenant `/stats` snapshot listener. Off unless `stats.port` (or
     # AKB_STATS_PORT) is set. See StatsSettings above.
     stats: StatsSettings = Field(default_factory=StatsSettings)
+
+    @model_validator(mode="after")
+    def validate_companion_login_clients(self) -> "Settings":
+        if self.keycloak_companion_login_clients:
+            origin = urlsplit(self.public_base_url)
+            if (origin.scheme != "https" or not origin.hostname or origin.username or origin.password
+                    or origin.path not in {"", "/"} or origin.query or origin.fragment):
+                raise ValueError("Companion login requires an HTTPS public_base_url origin")
+            if self.auth_mode != "sso" or not self.keycloak_enabled:
+                raise ValueError("Companion login requires SSO mode and Keycloak")
+            allowed = set(self.keycloak_companion_client_ids_by_origin.values())
+            for client_id in self.keycloak_companion_login_clients:
+                if (not client_id or len(client_id) > 255 or client_id.strip() != client_id
+                        or client_id not in allowed or client_id == self.keycloak_admin_client_id
+                        or client_id == self.keycloak_client_id):
+                    raise ValueError("Companion login client must be a registered companion human API client")
+        return self
 
     @model_validator(mode="after")
     def validate_authoritative_email_domains(self) -> "Settings":

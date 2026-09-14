@@ -70,7 +70,7 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # first whitespace) so a value that itself contains spaces — e.g. a reflected
     # `Basic <b64>` sitting after the header name — is removed in full instead of
     # leaving its tail exposed.
-    (re.compile(r"(?i)(x-access-token)\s*[:=]\s*[^\r\n,;]+"), r"\1: <redacted>"),
+    (re.compile(r"(?i)(x-access-token|x-akb-id-token|x-akb-login-assertion)\s*[:=]\s*[^\r\n,;]+"), r"\1: <redacted>"),
     # A `Basic`/`Bearer` credential blob NOT necessarily behind an Authorization
     # label (e.g. a bare `Basic <b64>` reflected in an error body). Redact a
     # token-shaped run of >= 16 chars regardless of character class, so an
@@ -98,7 +98,7 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 # skip rendering ``msg % args`` for the common benign record). One compiled
 # alternation, run once.
 _TRIGGER = re.compile(
-    r"(?i)://|@|authorization|x-access-token|\bbasic\s|\bbearer\s|"
+    r"(?i)://|@|authorization|x-access-token|x-akb-id-token|x-akb-login-assertion|\bbasic\s|\bbearer\s|"
     r"gh[pousr]_|github_pat_|glpat-|xox[baprs]-|\bsk-"
 )
 

@@ -305,6 +305,18 @@ app_credential_overlap_seconds: 300
 # server-side token custody.
 # keycloak_companion_client_ids_by_origin:
 #   "https://reef.example.com": "reef-web"
+# Explicit account-completion authority is separate and disabled by default.
+# Register only dedicated BFF public keys (never its private key or OIDC secret).
+# keycloak_companion_login_clients: {}
+# keycloak_companion_login_clients:
+#   reef-web:
+#     provider_aliases: [workforce]
+#     public_keys:
+#       reef-login-v1: |-
+#         -----BEGIN PUBLIC KEY-----
+#         <deployment RSA public key, at least 2048 bits>
+#         -----END PUBLIC KEY-----
+# See docs/designs/keycloak-oidc/companion-login.md for the exact signed contract.
 # api_oauth_audience: ""               # default: <public_base_url>/api
 # mcp_oauth_enabled: false
 # mcp_oauth_audience: ""               # default: <public_base_url>/mcp

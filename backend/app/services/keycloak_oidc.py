@@ -694,11 +694,13 @@ class KeycloakOIDC:
         expected_nonce: str,
         access_token: str,
         expected_provider_alias: str,
+        client_id: str | None = None,
     ) -> dict[str, Any]:
         """Verify the ordinary browser ID token and bind it to this exchange."""
+        selected_client_id = self._effective_client_id(client_id)
         claims = await self.verify_id_token(
             id_token,
-            client_id=settings.keycloak_client_id,
+            client_id=selected_client_id,
         )
         required_string_limits = {
             "iss": 2048,
@@ -723,7 +725,7 @@ class KeycloakOIDC:
             raise AuthenticationError("Invalid browser identity token")
         if claims["iss"] != settings.keycloak_issuer:
             raise AuthenticationError("Invalid browser identity token")
-        if claims["azp"] != settings.keycloak_client_id:
+        if claims["azp"] != selected_client_id:
             raise AuthenticationError("Invalid browser identity token")
         try:
             actual_provider_alias = (
@@ -748,7 +750,7 @@ class KeycloakOIDC:
             raise AuthenticationError("Invalid browser identity token")
         digest = hashlib.sha256(access_token.encode("ascii")).digest()
         expected_at_hash = _encode_base64url(digest[: len(digest) // 2])
-        if not secrets.compare_digest(claims["at_hash"], expected_at_hash):
+        if not claims["at_hash"].isascii() or not secrets.compare_digest(claims["at_hash"], expected_at_hash):
             raise AuthenticationError("Invalid browser identity token")
         if type(claims.get("iat")) is not int or type(claims.get("exp")) is not int or claims["exp"] <= claims["iat"]:
             raise AuthenticationError("Invalid browser identity token")

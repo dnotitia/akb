@@ -12,6 +12,7 @@ from pydantic import ConfigDict, Field, field_validator
 from app.api.deps import get_credential_change_user, get_current_user
 from app.config import settings
 from app.exceptions import (
+    AKBError,
     AuthenticationError,
     BrowserSessionNotReadyError,
     ForbiddenError,
@@ -32,6 +33,7 @@ from app.services.auth_service import (
 )
 from app.services.auth_policy import require_local_auth_enabled, sso_browser_session_ready
 from app.services.keycloak_oidc import get_keycloak_oidc
+from app.services.companion_login import CompanionLoginRequest, complete_companion_login
 from app.services.sso_browser_session_service import (
     IssuedSsoBrowserSession,
     SSO_BROWSER_CSRF_HEADER,
@@ -141,6 +143,33 @@ class ChangePasswordRequest(NFCModel):
 class UpdateProfileRequest(NFCModel):
     display_name: str | None = None
     email: str | None = None
+
+
+@router.post("/auth/sso/companion/complete", summary="Complete an authenticated companion BFF login")
+async def companion_login_complete(req: CompanionLoginRequest, request: Request):
+    try:
+        # Header multiplicity is rejected rather than allowing proxy/framework
+        # disagreement about which credential was authenticated.
+        values = []
+        for name in ("authorization", "x-akb-id-token", "x-akb-login-assertion"):
+            headers = request.headers.getlist(name)
+            if len(headers) != 1:
+                raise AuthenticationError()
+            values.append(headers[0])
+        authorization, id_token, assertion = values
+        if not authorization.startswith("Bearer "):
+            raise AuthenticationError()
+        result = await complete_companion_login(req, authorization[7:], id_token, assertion)
+    except AKBError as exc:
+        # Only stable account denials cross this credential-bearing boundary.
+        code = exc.code if exc.code in {"membership_required", "account_suspended", "identity_conflict"} else None
+        message = exc.message if code else "Companion login could not be completed"
+        status_code = exc.status_code
+        return JSONResponse(
+            {"message": message, "error": message, "code": code or "authentication_failed", "detail": message},
+            status_code=status_code, headers={"Cache-Control": "no-store"},
+        )
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
 
 @router.post("/auth/register", summary="Register a local user")

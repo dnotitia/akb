@@ -7,6 +7,19 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Companion BFF login completes AKB account linking
+
+An opt-in `POST /api/v1/auth/sso/companion/complete` lets a registered companion
+BFF complete the same verified-provider account adoption/enrollment policy
+as AKB's browser callback without navigating the browser to AKB. It requires
+a dedicated deployment RSA request signature and independently verified
+Keycloak access/ID tokens. A short-lived assertion replay table prevents duplicate signed requests;
+the existing public account-projection service owns concurrent adoption,
+pending admissions, account denials and role synchronization. No completion
+receipt or cached login result is stored. Existing bearer/PAT/MCP authority is unchanged;
+no AKB cookie, API token or refresh token is issued. Configuration and rollout:
+`docs/designs/keycloak-oidc/companion-login.md`.
+
 ### Every document counter follows the active authority (akb#525)
 
 `GET /vaults/{vault}/info` learned to read the native ledger on
