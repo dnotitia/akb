@@ -47,9 +47,9 @@ beforeEach(() => {
   window.localStorage.setItem("akb.treeVisible", "1");
 });
 
-function renderShell() {
+function renderShell(entry = "/vault/demo/search") {
   return render(
-    <MemoryRouter initialEntries={["/vault/demo/search"]}>
+    <MemoryRouter initialEntries={[entry]}>
       <Routes>
         <Route path="/vault/:name" element={<VaultShell />}>
           <Route
@@ -81,6 +81,16 @@ function renderShell() {
 }
 
 describe("VaultShell search collection tree", () => {
+  it("does not interpret the Search collection filter as a shortcut reveal", () => {
+    renderShell("/vault/demo/search?collection=guides");
+    expect(screen.queryByText("Collection tree content")).toBeNull();
+  });
+  it("reveals a pinned collection without changing the saved preference", async () => {
+    localStorage.setItem("akb.treeVisible", "0");
+    renderShell("/vault/demo?collection=guides");
+    expect(screen.getByText("Collection tree content")).toBeTruthy();
+    expect(localStorage.getItem("akb.treeVisible")).toBe("0");
+  });
   it("starts Search collapsed without changing the persisted tree preference", async () => {
     const user = userEvent.setup();
     renderShell();

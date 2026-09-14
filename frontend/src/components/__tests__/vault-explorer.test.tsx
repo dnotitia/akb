@@ -88,12 +88,55 @@ beforeEach(() => {
 
 afterEach(() => cleanup());
 
+describe("collection shortcut navigation", () => {
+  it("does not steal focus for a Search collection filter", async () => {
+    renderAt("/vault/v/search?collection=architecture");
+    const row = await screen.findByRole("button", { name: "architecture" });
+    expect(row).not.toHaveFocus();
+    expect(row.closest('[role="treeitem"]')).not.toHaveAttribute("aria-selected", "true");
+  });
+  it("reveals and focuses a requested collection without navigating to a document", async () => {
+    renderAt("/vault/v?collection=architecture");
+    const row = await screen.findByRole("button", { name: "architecture" });
+    await waitFor(() => expect(row).toHaveFocus());
+    expect(row.closest('[role="treeitem"]')).toHaveAttribute("aria-selected", "true");
+    expect(row.closest('[role="treeitem"]')).toHaveAttribute("aria-expanded", "true");
+  });
+});
+
 describe("archive document navigation", () => {
+  it("keeps identity concise and preserves a query while changing and resetting filters", async () => {
+    browseMock.mockImplementation(async (_v: string, _c: unknown, _d: number, options: { archive_scope?: string } = {}) => ({ ...sample, archive_scope: options.archive_scope ?? "unarchived" }));
+    const { container } = renderAt("/vault/v/doc/architecture%2Fschema.md");
+    const user = userEvent.setup();
+    await screen.findByRole("button", { name: "architecture" });
+    expect(container.querySelector('[data-slot="collection-identity-header"]')).toHaveTextContent("architecture");
+    expect(container.querySelector('[data-slot="collection-identity-header"] svg.lucide-folder')).toHaveAttribute("aria-hidden", "true");
+    expect(container.querySelector('[data-slot="collection-identity-header"]')).not.toHaveTextContent("Collections");
+    expect(container.querySelector('[data-slot="collection-management-row"]')).toHaveTextContent("Collections");
+    expect(screen.queryByText("Manage content")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Collection document state" })).not.toBeInTheDocument();
+    const query = screen.getByRole("searchbox", { name: "Filter resources" });
+    await user.type(query, "not found");
+    await user.click(screen.getByRole("button", { name: "Filter collections" }));
+    await user.click(screen.getByRole("button", { name: "Collection document state" }));
+    await user.click(screen.getByRole("menuitemradio", { name: /^All documents/ }));
+    expect(query).toHaveValue("not found");
+    await user.click(screen.getByRole("button", { name: "Filter collections, 1 active" }));
+    expect(screen.queryByRole("button", { name: "Collection document state" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Reset filters" }));
+    expect(query).toHaveValue("not found");
+    await user.click(screen.getByRole("button", { name: "Clear filter resources" }));
+    expect(query).toHaveValue("");
+    expect(query).toHaveFocus();
+  });
+
   it("keeps the scope selector available in an empty Vault and gives compatibility recovery", async () => {
     browseMock.mockResolvedValue({ vault: "v", path: "", items: [] });
     renderAt("/vault/v");
     const user = userEvent.setup();
     await screen.findByText(/No collections yet/);
+    await user.click(screen.getByRole("button", { name: "Filter collections" }));
     await user.click(screen.getByRole("button", { name: "Collection document state" }));
     await user.click(screen.getByRole("menuitemradio", { name: /Archived documents/ }));
     await screen.findByText(/This server does not support/);
@@ -110,6 +153,7 @@ describe("archive document navigation", () => {
     }));
     renderAt("/vault/v");
     const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Filter collections" }));
     await user.click(screen.getByRole("button", { name: "Collection document state" }));
     await user.click(screen.getByRole("menuitemradio", { name: /Archived documents/ }));
     await user.click(await screen.findByRole("button", { name: "guides" }));
@@ -258,6 +302,7 @@ describe("VaultExplorer — interaction", () => {
   it("filters by resource kind without making users traverse unrelated rows", async () => {
     const user = userEvent.setup();
     renderAt("/vault/v");
+    await user.click(screen.getByRole("button", { name: "Filter collections" }));
     await user.click(await screen.findByRole("button", { name: /resource type/i }));
     await user.click(screen.getByRole("menuitemradio", { name: /Tables/i }));
     await user.click(screen.getByRole("button", { name: /^architecture/i }));

@@ -73,6 +73,6 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/dnotitia/akb.git",
-    "directory": "packages/markdown-editor"
+    "directory": "frontend/packages/markdown-editor"
   }
 }

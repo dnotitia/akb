@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Outlet, Route, Routes } from "react-router-dom";
@@ -15,8 +15,11 @@ import {
   listVaults,
 } from "@/lib/api";
 
-vi.mock("@/lib/api", () => ({
+vi.mock("@/lib/api", async () => ({
+  ApiError: (await vi.importActual<typeof import("@/lib/api")>("@/lib/api")).ApiError,
   createPAT: vi.fn(),
+  createVault: vi.fn(),
+  listVaultTemplates: vi.fn().mockResolvedValue([]),
   getAuthConfig: vi.fn(),
   getRecent: vi.fn(),
   getVaultInfo: vi.fn(),
@@ -130,25 +133,26 @@ afterEach(cleanup);
 
 describe("Home working set", () => {
   it("keeps search global and presents Vaults, activity, and inline setup", async () => {
+    listPATsMock.mockResolvedValue({ tokens: [] });
     renderPage();
 
     expect(
-      await screen.findByRole("heading", { level: 1, name: "Your workspace" }),
-    ).toBeInTheDocument();
+      await screen.findByRole("heading", { level: 1, name: "Home" }),
+    ).toHaveClass("sr-only");
+    expect(screen.queryByText("Return to your documents and catch up on changes across your vaults.")).not.toBeInTheDocument();
     expect(screen.queryByRole("searchbox")).not.toBeInTheDocument();
     expect(screen.queryByText("Find what the team already knows.")).not.toBeInTheDocument();
 
     expect(screen.getByRole("heading", { name: "Your vaults" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Recent updates" })).toBeInTheDocument();
-    expect(screen.getByText(/Mina Park/)).toBeInTheDocument();
+    expect(await screen.findByText(/Mina Park/)).toBeInTheDocument();
     expect(screen.getByText(/Deployment checks, rollback signals/)).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Connect an agent" })).toBeInTheDocument();
-    expect(screen.getByText("2 of 3 complete")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Hide connection guide" })).toBeInTheDocument();
+    expect(screen.queryByText(/of 3 complete/)).not.toBeInTheDocument();
+    expect(screen.queryByText("Knowledge index")).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Workspace" })).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Finish setup" })).not.toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Finish connection" })).toHaveAttribute(
-      "href",
-      "/settings?tab=tokens",
-    );
+    expect(screen.getByRole("button", { name: "Set up a connection" })).toBeInTheDocument();
 
     expect(screen.queryByText("Recent changes")).not.toBeInTheDocument();
     expect(screen.queryByText("Mint token")).not.toBeInTheDocument();
@@ -168,9 +172,9 @@ describe("Home working set", () => {
     renderPage();
 
     expect(
-      await screen.findByRole("heading", { name: "Continue working" }),
+      await screen.findByRole("heading", { name: "Recently viewed" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("Recent on this browser")).toBeInTheDocument();
+    expect(screen.getByText("On this browser")).toBeInTheDocument();
     expect(
       screen.getByRole("link", { name: /August incident review/ }),
     ).toHaveAttribute(
@@ -215,9 +219,10 @@ describe("Home working set", () => {
 
     renderPage();
 
-    expect(await screen.findByText("Agent connection active")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Connect an agent" })).toBeInTheDocument();
+    expect(screen.queryByText("Agent connection active")).not.toBeInTheDocument();
     await waitFor(() => {
-      expect(screen.queryByRole("heading", { name: "Finish setup" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("heading", { name: "Use AKB with your AI tools" })).not.toBeInTheDocument();
     });
   });
 
@@ -229,16 +234,61 @@ describe("Home working set", () => {
 
     renderPage();
 
-    expect(await screen.findByText("0 of 3 complete")).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Connect an agent" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Create a vault" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Hide connection guide" })).toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "Hide" }));
-    expect(screen.queryByRole("heading", { name: "Finish setup" })).not.toBeInTheDocument();
-    expect(localStorage.getItem("akb.homeSetupDismissed")).toBe("1");
+    await user.click(screen.getByRole("button", { name: "Hide connection guide" }));
+    expect(screen.queryByRole("heading", { name: "Use AKB with your AI tools" })).not.toBeInTheDocument();
+    expect(localStorage.getItem("akb.homeConnectionGuideDismissed:user-home")).toBe("1");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Show connection guide" })).toHaveFocus());
 
-    await user.click(screen.getByRole("button", { name: "Show setup" }));
-    expect(screen.getByRole("heading", { name: "Connect an agent" })).toBeInTheDocument();
-    expect(localStorage.getItem("akb.homeSetupDismissed")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Show connection guide" }));
+    expect(screen.getByRole("button", { name: "Hide connection guide" })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Hide connection guide" })).toHaveFocus());
+    expect(localStorage.getItem("akb.homeConnectionGuideDismissed:user-home")).toBeNull();
+  });
+
+  it("caps a large favorite set and restores focus if an unpinned card leaves Home", async () => {
+    const vaults = Array.from({ length: 8 }, (_, i) => ({ id: `v${i}`, name: `vault-${i}`, role: "reader" }));
+    listVaultsMock.mockResolvedValue({ vaults });
+    localStorage.setItem("akb-vault-favorites:v2:user-home", JSON.stringify(vaults.map(v => v.id)));
+    renderPage();
+    const section = screen.getByRole("region", { name: "Your vaults" });
+    await screen.findByRole("heading", { name: "vault-0" });
+    expect(within(section).getAllByRole("heading", { level: 3 })).toHaveLength(4);
+    expect(screen.getByRole("link", { name: /View all vaults \(8\)/ })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Remove vault-0 from favorites" }));
+    expect(screen.queryByRole("heading", { name: "vault-0" })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("link", { name: /View all vaults/ })).toHaveFocus());
+    expect(within(section).getAllByRole("heading", { level: 3 })).toHaveLength(4);
+  });
+
+  it("does not invent absent counts or repeat generic descriptions", async () => {
+    listVaultsMock.mockResolvedValue({ vaults: [{ id: "v1", name: "legacy", role: "reader" }] });
+    getVaultInfoMock.mockResolvedValue({ document_count: 3 });
+    renderPage();
+    await screen.findByText("Documents");
+    expect(screen.queryByText("Tables")).not.toBeInTheDocument();
+    expect(screen.queryByText("Files")).not.toBeInTheDocument();
+    expect(screen.queryByText(/A shared knowledge space for your team/)).not.toBeInTheDocument();
+    expect(screen.getByText("Read only")).toBeInTheDocument();
+    expect(getVaultInfoMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not label a failed connection lookup as incomplete setup", async () => {
+    listPATsMock.mockRejectedValue(new Error("Offline"));
+    renderPage();
+    expect(await screen.findByRole("button", { name: "Connect an agent" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Use AKB with your AI tools" })).not.toBeInTheDocument();
+  });
+
+  it("opens the existing vault creation dialog from the first-run action", async () => {
+    listVaultsMock.mockResolvedValue({ vaults: [] });
+    renderPage();
+    await userEvent.click(await screen.findByRole("button", { name: "Create a vault" }));
+    expect(screen.getByRole("dialog", { name: "Create a vault" })).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Create a vault" })).toHaveFocus());
   });
 });

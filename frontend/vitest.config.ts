@@ -26,7 +26,7 @@ export default defineConfig({
           // Playwright lives under e2e/ and runs via `npm run test:e2e`.
           // Excluding here prevents vitest from importing @playwright/test,
           // which complains when invoked outside a Playwright runner.
-          exclude: ["e2e/**", "node_modules/**", "dist/**", "storybook-static/**"],
+          exclude: ["e2e/**", "**/node_modules/**", "**/dist/**", "storybook-static/**"],
         },
       },
       {

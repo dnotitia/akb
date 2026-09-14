@@ -1,739 +1,313 @@
-/**
- * MarkdownRender — the shared, hand-tuned markdown renderer for AKB
- * read views (DocumentView "Rendered" tab + public publication body).
- *
- * Tone reference: Notion / Linear / Coda — soft, rounded, editorial,
- * NOT IDE / dev-doc. The styling approach is adapted from
- * seahorse-mcp-agent-server's chat renderer, re-mapped onto AKB's
- * design tokens (var(--color-*) + bg-surface / bg-surface-2 /
- * border-border / text-accent / text-primary). NO hardcoded hex —
- * scripts/design-check.mjs fails the build on 6-digit hex.
- *
- * What we deliberately do here:
- *   • Code fences → soft rounded card with a chrome bar (language
- *     label + copy button), monochrome body. We DROP rehype-highlight
- *     and stay monochrome: syntax coloring would (a) require hljs hex
- *     theme colors the design-check forbids and (b) shift the tone to
- *     "developer tool." Matches seahorse's choice.
- *   • Inline code → small brand-tinted chip.
- *   • Blockquotes with `> [!NOTE|TIP|IMPORTANT|WARNING|CAUTION]` →
- *     Notion-style soft callout cards with a leading icon tile.
- *   • Tables → rounded overflow card, tinted thead, zebra + hover.
- *   • Headings → tuned cascade + stable `id`s consumed in document
- *     order from parseHeadings() so the outline scroll-sync keeps
- *     matching `#slug` anchors.
- *   • Links → run through sanitizeLinkUrl (strips javascript:/data:/
- *     vbscript:/protocol-relative), accent underline, external rel.
- *   • KaTeX math → remark-math + rehype-katex, display math styled
- *     as a soft rounded card. `\[..\]` / `\(..\)` pre-normalized to
- *     `$$` / `$`.
- */
-import React, { useCallback, useMemo, useState, type ComponentProps } from "react";
-import Markdown, { defaultUrlTransform, type Components, type ExtraProps } from "react-markdown";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
-import rehypeKatex from "rehype-katex";
 import {
-  AlertCircle,
-  Check,
-  Copy,
-  Info,
-  Lightbulb,
-  AlertTriangle,
-  OctagonAlert,
-  Sparkles,
-  type LucideIcon,
-} from "lucide-react";
+  EditorContent,
+  useMarkdownEditor,
+  useMarkdownTargetResolutions,
+} from "@akb/markdown-editor/react";
+import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import "katex/dist/katex.min.css";
-import { AssetImage, type AssetContext } from "@/components/asset-image";
-import { cn, sanitizeLinkUrl } from "@/lib/utils";
-import { parseHeadings, slugify, stripFrontmatter } from "@/lib/markdown";
+import type { AssetContext } from "@/components/asset-image";
+import {
+  getAssetBlob,
+  publicationAssetUrl,
+  refreshPublicationViewGrant,
+} from "@/lib/api";
 import {
   canonicalAkbMarkdownTarget,
   classifyAkbMarkdownTarget,
-  useAkbMarkdownTargetResolutions,
+  createAkbMarkdownAdapters,
   type AkbMarkdownTargetResolution,
 } from "@/lib/markdown-adapters";
+import { assetIdFromUrl } from "@/lib/image-assets";
+import { parseHeadings, stripFrontmatter } from "@/lib/markdown";
+import { cn } from "@/lib/utils";
 
-/* ── LaTeX delimiter normalization ────────────────────────────────
-   GPT-family models emit \[..\] / \(..\); remark-math only groks the
-   $ family, so convert before render. Code fences / inline code are
-   protected. Ported zero-dep from seahorse's normalize-latex.ts. */
-function normalizeLatexDelimiters(text: string): string {
-  const segments: string[] = [];
-  let lastIndex = 0;
-  const codeRegex = /```[\s\S]*?```|`[^`\n]+`/g;
-  let match: RegExpExecArray | null;
-  while ((match = codeRegex.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      segments.push(convertDelimiters(text.slice(lastIndex, match.index)));
+function applyViewerTargetResolutions(
+  root: HTMLElement,
+  resolutions: ReadonlyMap<string, AkbMarkdownTargetResolution>,
+  resolving: boolean,
+): void {
+  root.querySelectorAll<HTMLAnchorElement>("a[href]").forEach((link) => {
+    const rawTarget =
+      link.dataset.markdownTarget ?? link.getAttribute("href") ?? "";
+    const target = canonicalAkbMarkdownTarget(rawTarget);
+    const kind = target ? classifyAkbMarkdownTarget(target) : null;
+    if (!target || !kind || kind === "attachment") return;
+
+    link.dataset.markdownTarget = target;
+    const resolution = resolutions.get(target);
+    if (resolution?.status === "available" && resolution.runtimeUrl) {
+      link.href = resolution.runtimeUrl;
+      link.dataset.markdownResolution = "available";
+      link.removeAttribute("aria-disabled");
+      link.removeAttribute("aria-label");
+      link.removeAttribute("title");
+      return;
     }
-    segments.push(match[0]);
-    lastIndex = match.index + match[0].length;
-  }
-  if (lastIndex < text.length) {
-    segments.push(convertDelimiters(text.slice(lastIndex)));
-  }
-  return segments.join("");
-}
 
-function convertDelimiters(text: string): string {
-  text = text.replace(/\\\[([\s\S]*?)\\\]/g, (_, inner) => "$$" + inner + "$$");
-  text = text.replace(/\\\(([\s\S]*?)\\\)/g, (_, inner) => "$" + inner + "$");
-  return text;
-}
-
-/* ── shared utility tokens ───────────────────────────────────────── */
-const PROSE_LEADING = "leading-[1.7]";
-const HEADING_BASE = "font-semibold scroll-mt-24";
-const EYEBROW =
-  "mt-4 mb-1 font-semibold text-[11px] uppercase tracking-[0.06em] text-subtle";
-
-/* ── language label table for code fences ───────────────────────── */
-const LANGUAGE_LABELS: Record<string, string> = {
-  ts: "TypeScript",
-  tsx: "TSX",
-  typescript: "TypeScript",
-  js: "JavaScript",
-  jsx: "JSX",
-  javascript: "JavaScript",
-  py: "Python",
-  python: "Python",
-  rb: "Ruby",
-  go: "Go",
-  rs: "Rust",
-  rust: "Rust",
-  sh: "Shell",
-  bash: "Shell",
-  zsh: "Shell",
-  shell: "Shell",
-  json: "JSON",
-  yaml: "YAML",
-  yml: "YAML",
-  toml: "TOML",
-  md: "Markdown",
-  mdx: "MDX",
-  html: "HTML",
-  xml: "XML",
-  css: "CSS",
-  scss: "SCSS",
-  sql: "SQL",
-  diff: "Diff",
-  dockerfile: "Dockerfile",
-  java: "Java",
-  c: "C",
-  cpp: "C++",
-  cs: "C#",
-  php: "PHP",
-  swift: "Swift",
-  kotlin: "Kotlin",
-  kt: "Kotlin",
-};
-
-function labelFor(lang: string | undefined): string {
-  if (!lang) return "Plain text";
-  return LANGUAGE_LABELS[lang.toLowerCase()] ?? lang;
-}
-
-/** Detect the language hint on `<pre><code class="language-xxx">`. */
-function getPreNodeLanguage(node: ExtraProps["node"]): string | null {
-  const firstChild = node?.children?.[0];
-  if (!firstChild || firstChild.type !== "element" || firstChild.tagName !== "code") {
-    return null;
-  }
-  const raw = firstChild.properties?.className;
-  const className = Array.isArray(raw) ? String(raw[0] ?? "") : typeof raw === "string" ? raw : "";
-  const match = className.match(/language-([\w+-]+)/);
-  return match ? match[1] : null;
-}
-
-/** Flatten react children to raw text (clipboard copy on fences). */
-function extractCodeText(children: React.ReactNode): string {
-  let out = "";
-  React.Children.forEach(children, (child) => {
-    if (typeof child === "string") {
-      out += child;
-    } else if (React.isValidElement<{ children?: React.ReactNode }>(child)) {
-      out += extractCodeText(child.props.children);
-    }
+    link.dataset.markdownResolution = resolution ? "unavailable" : "pending";
+    link.href = "#";
+    link.setAttribute("aria-disabled", "true");
+    if (resolution || !resolving)
+      link.setAttribute("title", "Reference unavailable");
   });
-  return out;
 }
 
-/* ── CodeBlock — rounded card, chrome bar, monochrome body ───────── */
-type CopyState = "idle" | "copied" | "failed";
+function normalizeViewerTopLevelImages(
+  editor: NonNullable<ReturnType<typeof useMarkdownEditor>>,
+): void {
+  const document = editor.getJSON();
+  if (!document.content?.some((node) => node.type === "image")) return;
+  editor.commands.setContent({
+    ...document,
+    content: document.content.map((node) =>
+      node.type === "image" ? { type: "paragraph", content: [node] } : node,
+    ),
+  });
+}
 
-function CodeBlock({ language, code }: { language?: string; code: string }) {
-  const [copyState, setCopyState] = useState<CopyState>("idle");
-  const label = labelFor(language);
-
-  const handleCopy = useCallback(async () => {
-    const reportSuccess = () => {
-      setCopyState("copied");
-      setTimeout(() => setCopyState("idle"), 1600);
-    };
-    const reportFailure = () => {
-      setCopyState("failed");
-      setTimeout(() => setCopyState("idle"), 2200);
-    };
-    if (navigator.clipboard?.writeText) {
-      try {
-        await navigator.clipboard.writeText(code);
-        reportSuccess();
-        return;
-      } catch {
-        /* fall through to legacy path */
+function normalizeViewerHeadings(root: HTMLElement, markdown: string): void {
+  const headings = parseHeadings(markdown);
+  root
+    .querySelectorAll<HTMLElement>("h1, h2, h3, h4, h5, h6")
+    .forEach((heading, index) => {
+      const source = headings[index];
+      const level = source
+        ? Math.min(source.level + 1, 6)
+        : Math.min(Number(heading.tagName.slice(1)) + 1, 6);
+      const tagName = `h${level}`;
+      if (heading.tagName.toLowerCase() !== tagName) {
+        const replacement = window.document.createElement(tagName);
+        [...heading.attributes].forEach((attribute) =>
+          replacement.setAttribute(attribute.name, attribute.value),
+        );
+        replacement.innerHTML = heading.innerHTML;
+        heading.replaceWith(replacement);
+        heading = replacement;
       }
-    }
-    // Hidden-textarea fallback for http:// (non-secure) origins where
-    // navigator.clipboard is undefined.
-    try {
-      const ta = document.createElement("textarea");
-      ta.value = code;
-      ta.setAttribute("readonly", "");
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      const ok = document.execCommand("copy");
-      document.body.removeChild(ta);
-      if (ok) reportSuccess();
-      else reportFailure();
-    } catch {
-      reportFailure();
-    }
-  }, [code]);
-
-  const copied = copyState === "copied";
-  const failed = copyState === "failed";
-
-  return (
-    <div className="group/code my-4 rounded-[var(--radius-lg)] border border-border bg-surface-2/50 overflow-hidden">
-      <div className="flex items-center justify-between px-4 pt-2.5 pb-1.5 border-b border-border/60">
-        <span className="text-[11px] font-medium tracking-wide text-foreground-muted">
-          {label}
-        </span>
-        <button
-          type="button"
-          onClick={handleCopy}
-          aria-label={copied ? "Copied" : failed ? "Copy failed" : "Copy code"}
-          className={cn(
-            "inline-flex items-center gap-1 h-6 px-2 rounded-[var(--radius-sm)] text-[11px] font-medium transition-token cursor-pointer",
-            "text-foreground-muted hover:text-foreground hover:bg-surface",
-            "opacity-0 group-hover/code:opacity-100 focus-visible:opacity-100",
-            (copied || failed) && "opacity-100",
-            "focus:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-          )}
-        >
-          {copied ? (
-            <>
-              <Check className="w-3 h-3 text-success" strokeWidth={2.5} aria-hidden />
-              <span className="text-success">Copied</span>
-            </>
-          ) : failed ? (
-            <>
-              <AlertCircle className="w-3 h-3 text-destructive" aria-hidden />
-              <span className="text-destructive">Failed</span>
-            </>
-          ) : (
-            <>
-              <Copy className="w-3 h-3" strokeWidth={2} />
-              <span>Copy</span>
-            </>
-          )}
-        </button>
-      </div>
-      <pre className="px-4 pb-3 pt-2.5 overflow-auto max-h-[480px] text-[13px] leading-relaxed font-mono text-foreground whitespace-pre">
-        {code}
-      </pre>
-    </div>
-  );
+      if (source?.slug) heading.id = source.slug;
+    });
 }
 
-/* ── Callouts (Notion-style) ─────────────────────────────────────── */
-type AlertKind = "note" | "tip" | "important" | "warning" | "caution";
+function useViewerTargetDom(
+  rootRef: React.RefObject<HTMLDivElement | null>,
+  resolutions: ReadonlyMap<string, AkbMarkdownTargetResolution>,
+  resolving: boolean,
+  editor: ReturnType<typeof useMarkdownEditor>,
+): void {
+  useLayoutEffect(() => {
+    const host = rootRef.current;
+    if (!host) return;
 
-interface AlertConfig {
-  label: string;
-  icon: LucideIcon;
-  /** glyph color (semantic base token) */
-  iconClass: string;
-  /** tinted card surface (solid -soft token + hairline) */
-  cardClass: string;
-  /** icon-tile surface */
-  tileClass: string;
-  /** card body text (AA on the soft surface) */
-  textClass: string;
-}
-
-// Solid -soft semantic quads (flip correctly on the dark canvas; the old
-// color-mix tints did not). note→info, tip→success, warning, caution→danger;
-// `important` keeps the brand orange as legitimate decoration.
-const ALERTS: Record<AlertKind, AlertConfig> = {
-  note: {
-    label: "Note",
-    icon: Info,
-    iconClass: "text-info",
-    cardClass: "bg-info-soft border border-info/30",
-    tileClass: "bg-info/15",
-    textClass: "text-info-soft-foreground",
-  },
-  tip: {
-    label: "Tip",
-    icon: Lightbulb,
-    iconClass: "text-success",
-    cardClass: "bg-success-soft border border-success/30",
-    tileClass: "bg-success/15",
-    textClass: "text-success-soft-foreground",
-  },
-  important: {
-    label: "Important",
-    icon: Sparkles,
-    iconClass: "text-accent-strong",
-    cardClass: "bg-accent/5 border border-accent/30",
-    tileClass: "bg-accent/15",
-    textClass: "text-foreground",
-  },
-  warning: {
-    label: "Warning",
-    icon: AlertTriangle,
-    iconClass: "text-warning",
-    cardClass: "bg-warning-soft border border-warning/30",
-    tileClass: "bg-warning/15",
-    textClass: "text-warning-soft-foreground",
-  },
-  caution: {
-    label: "Caution",
-    icon: OctagonAlert,
-    iconClass: "text-destructive",
-    cardClass: "bg-danger-soft border border-destructive/30",
-    tileClass: "bg-destructive/15",
-    textClass: "text-danger-soft-foreground",
-  },
-};
-
-const ALERT_PATTERN = /^\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*$/i;
-
-/** Pull a leading `[!KIND]` marker out of a blockquote's children. */
-function detectAlert(
-  children: React.ReactNode,
-): { kind: AlertKind; rest: React.ReactNode } | null {
-  const arr = React.Children.toArray(children);
-  if (arr.length === 0) return null;
-  const first = arr[0];
-  if (!React.isValidElement<{ children?: React.ReactNode }>(first)) return null;
-
-  const innerChildren = React.Children.toArray(first.props.children);
-  if (innerChildren.length === 0) return null;
-  const head = innerChildren[0];
-  if (typeof head !== "string") return null;
-
-  const match = head.match(ALERT_PATTERN);
-  if (!match) {
-    // Marker may share the first text node with following content on
-    // the next line (`[!NOTE]\nbody`).
-    const lines = head.split(/\r?\n/);
-    if (lines.length < 2) return null;
-    const lineMatch = lines[0].match(ALERT_PATTERN);
-    if (!lineMatch) return null;
-    const remainder = lines.slice(1).join("\n");
-    const newInner = [remainder, ...innerChildren.slice(1)];
-    const newFirst = React.cloneElement(first, {}, newInner);
-    return {
-      kind: lineMatch[1].toLowerCase() as AlertKind,
-      rest: [newFirst, ...arr.slice(1)],
+    const apply = () => {
+      const root =
+        (editor?.view.dom as HTMLElement | undefined) ??
+        host.querySelector<HTMLElement>(".ProseMirror");
+      if (root) applyViewerTargetResolutions(root, resolutions, resolving);
     };
-  }
-
-  const newInner = innerChildren.slice(1);
-  if (newInner.length === 0) {
-    return { kind: match[1].toLowerCase() as AlertKind, rest: arr.slice(1) };
-  }
-  const newFirst = React.cloneElement(first, {}, newInner);
-  return {
-    kind: match[1].toLowerCase() as AlertKind,
-    rest: [newFirst, ...arr.slice(1)],
-  };
+    apply();
+    const timer = window.setTimeout(apply, 25);
+    const observer =
+      typeof MutationObserver === "undefined"
+        ? null
+        : new MutationObserver(apply);
+    observer?.observe(host, { childList: true, subtree: true });
+    return () => {
+      window.clearTimeout(timer);
+      observer?.disconnect();
+    };
+  }, [editor, resolutions, resolving, rootRef]);
 }
 
-function MarkdownAlert({
-  kind,
-  children,
-}: {
-  kind: AlertKind;
-  children: React.ReactNode;
-}) {
-  const cfg = ALERTS[kind];
-  const Icon = cfg.icon;
-  return (
-    <div
-      role="note"
-      aria-label={cfg.label}
-      className={cn(
-        "my-4 rounded-[var(--radius-lg)] px-4 py-3.5 flex items-start gap-3",
-        cfg.cardClass,
-      )}
-    >
-      <span
-        className={cn(
-          "shrink-0 w-7 h-7 rounded-[var(--radius-md)] flex items-center justify-center mt-0.5",
-          cfg.tileClass,
-        )}
-      >
-        <Icon className={cn("w-4 h-4", cfg.iconClass)} strokeWidth={2.25} />
-      </span>
-      <div className={cn("min-w-0 flex-1 text-[14px] leading-relaxed [&_p:first-child]:mt-0 [&_p:last-child]:mb-0", cfg.textClass)}>
-        {children}
-      </div>
-    </div>
-  );
-}
-
-/* ── Task-list checkbox row (GFM `- [x]` / `- [ ]`) ──────────────── */
-function TaskListItem({ children }: { children: React.ReactNode }) {
-  const arr = React.Children.toArray(children);
-  const checkbox = arr.find(
-    (c): c is React.ReactElement<{ type?: string; checked?: boolean }> =>
-      React.isValidElement<{ type?: string; checked?: boolean }>(c) &&
-      (c.type === "input" || c.props?.type === "checkbox"),
-  );
-  const checked = checkbox?.props?.checked === true;
-  const rest = arr.filter((c) => c !== checkbox);
-  return (
-    <li className="list-none -ml-6 my-1 leading-[1.7] flex items-start gap-2 [&>p]:my-0 [&>input]:hidden">
-      <span
-        aria-hidden
-        className={cn(
-          "mt-[6px] shrink-0 w-[15px] h-[15px] rounded-[5px] border transition-token",
-          checked
-            ? "bg-success border-success text-success-foreground flex items-center justify-center"
-            : "bg-surface border-border-strong",
-        )}
-      >
-        {checked && (
-          <svg
-            viewBox="0 0 16 16"
-            className="w-2.5 h-2.5"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="3"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          >
-            <path d="M3 8.5 L7 12 L13 4" />
-          </svg>
-        )}
-      </span>
-      <span className={cn("min-w-0 flex-1", checked && "text-subtle line-through")}>
-        {rest}
-      </span>
-    </li>
-  );
-}
-
-/* ── Heading factory with stable, outline-matched ids ────────────── */
-function flattenText(children: React.ReactNode): string {
-  if (typeof children === "string") return children;
-  if (Array.isArray(children)) return children.map(flattenText).join("");
-  if (React.isValidElement<{ children?: React.ReactNode }>(children)) {
-    return flattenText(children.props.children);
-  }
-  return "";
-}
-
-/* ── Build the full components map ───────────────────────────────── */
-type HeadingProps = ComponentProps<"h1"> & ExtraProps;
-
-function buildComponents(
-  markdown: string,
+function useViewerResources(
+  rootRef: React.RefObject<HTMLDivElement | null>,
   assetContext?: AssetContext,
-  targetResolutions: ReadonlyMap<string, AkbMarkdownTargetResolution> = new Map(),
-): Components {
-  // Heading slugs in document order — matches parseHeadings() so the
-  // outline's `#slug` anchors line up with the rendered `id`s. The
-  // cursor advances once per heading element react-markdown renders,
-  // mirroring the source order parseHeadings walks.
-  const slugQueue = parseHeadings(markdown).map((h) => h.slug);
-  let cursor = 0;
-  const nextId = (children: React.ReactNode, level: number) =>
-    slugQueue[cursor++] ?? slugify(flattenText(children)) ?? `heading-${level}`;
+  editor: ReturnType<typeof useMarkdownEditor> = null,
+  markdown = "",
+): void {
+  const assetMode = assetContext?.mode;
+  const authenticatedContext =
+    assetMode === "authenticated" ? assetContext : undefined;
+  const publicationContext =
+    assetMode === "publication" ? assetContext : undefined;
+  const assetVault = authenticatedContext?.vault;
+  const assetDocument = authenticatedContext?.document;
+  const assetCommit = authenticatedContext?.commit;
+  const publicationSlug = publicationContext?.slug;
 
-  const heading =
-    (level: 1 | 2 | 3 | 4 | 5 | 6, cls: string) =>
-    ({ node: _node, children, ...props }: HeadingProps) => {
-      // Demote one semantic level: the page already owns the single <h1>, so a
-      // body that starts with `# ` must not emit a second top-level heading.
-      // Tag is demoted; the visual class + slug/id are unchanged.
-      const Tag = `h${Math.min(level + 1, 6)}` as React.ElementType;
-      return (
-        <Tag id={nextId(children, level)} className={cls} {...props}>
-          {children}
-        </Tag>
-      );
+  useLayoutEffect(() => {
+    const host = rootRef.current;
+    if (!host) return;
+
+    const objectUrls = new Map<string, string>();
+    const pending = new Set<string>();
+    const controllers = new Map<string, AbortController>();
+    let disposed = false;
+    const placeholders = new Map<
+      string,
+      { element: HTMLSpanElement; alt: string; title: string | null }
+    >();
+    const publicationRefreshes = new Set<string>();
+    const publicationListeners: Array<{
+      image: HTMLImageElement;
+      listener: () => void;
+    }> = [];
+
+    const sync = () => {
+      const root =
+        (editor?.view.dom as HTMLElement | undefined) ??
+        host.querySelector<HTMLElement>(".ProseMirror");
+      if (!root) return;
+      normalizeViewerHeadings(root, markdown);
+
+      root.querySelectorAll<HTMLImageElement>("img").forEach((image) => {
+        image.setAttribute("referrerpolicy", "no-referrer");
+        const rawTarget =
+          image.dataset.markdownTarget ?? image.getAttribute("src") ?? "";
+        const target = canonicalAkbMarkdownTarget(rawTarget, "attachment");
+        const assetId = target ? assetIdFromUrl(target) : null;
+        if (!target || !assetId) return;
+        image.dataset.markdownTarget = target;
+
+        if (assetMode === "publication" && publicationSlug) {
+          const publicationKey = `${publicationSlug}:${assetId}`;
+          image.src = publicationAssetUrl(publicationSlug, assetId);
+          if (!image.dataset.publicationRefreshListener) {
+            const listener = () => {
+              if (publicationRefreshes.has(publicationKey)) return;
+              publicationRefreshes.add(publicationKey);
+              void refreshPublicationViewGrant(publicationSlug)
+                .then(() => {
+                  image.src = publicationAssetUrl(publicationSlug, assetId);
+                })
+                .finally(() => publicationRefreshes.delete(publicationKey));
+            };
+            image.addEventListener("error", listener);
+            image.dataset.publicationRefreshListener = "true";
+            publicationListeners.push({ image, listener });
+          }
+          return;
+        }
+
+        if (assetMode !== "authenticated" || !assetVault) return;
+        const key = `${assetVault}\u0000${assetDocument ?? ""}\u0000${assetCommit ?? ""}\u0000${assetId}`;
+        const existing = objectUrls.get(key);
+        if (existing) {
+          image.src = existing;
+          return;
+        }
+        if (pending.has(key)) return;
+        pending.add(key);
+        const placeholder = window.document.createElement("span");
+        placeholder.role = "status";
+        placeholder.setAttribute(
+          "aria-label",
+          image.alt ? `Loading image: ${image.alt}` : "Loading image",
+        );
+        placeholder.dataset.markdownTarget = target;
+        placeholder.className =
+          "block min-h-28 rounded-[var(--radius-lg)] border border-border bg-surface-2 p-4 text-sm text-foreground-muted";
+        placeholders.set(key, {
+          element: placeholder,
+          alt: image.alt,
+          title: image.getAttribute("title"),
+        });
+        image.replaceWith(placeholder);
+        const controller = new AbortController();
+        controllers.set(key, controller);
+        void getAssetBlob(
+          assetId,
+          assetVault,
+          controller.signal,
+          assetDocument && assetCommit
+            ? { document: assetDocument, commit: assetCommit }
+            : undefined,
+        )
+          .then((blob) => {
+            if (controller.signal.aborted || disposed) return;
+            const url =
+              typeof URL.createObjectURL === "function"
+                ? URL.createObjectURL(blob)
+                : target;
+            objectUrls.set(key, url);
+            const current = placeholders.get(key);
+            if (current) {
+              const element = window.document.createElement("img");
+              element.src = url;
+              element.alt = current.alt;
+              if (current.title) element.title = current.title;
+              element.dataset.markdownTarget = target;
+              element.dataset.markdownResolution = "available";
+              element.setAttribute("referrerpolicy", "no-referrer");
+              current.element.replaceWith(element);
+              placeholders.delete(key);
+            }
+          })
+          .catch(() => {
+            if (controller.signal.aborted || disposed) return;
+            const current = placeholders.get(key);
+            if (current) {
+              current.element.role = "img";
+              current.element.setAttribute(
+                "aria-label",
+                current.alt
+                  ? `Image unavailable: ${current.alt}`
+                  : "Image unavailable",
+              );
+              current.element.dataset.markdownResolution = "unavailable";
+            }
+          })
+          .finally(() => {
+            pending.delete(key);
+            controllers.delete(key);
+          });
+      });
+
+      root.querySelectorAll<HTMLTableElement>("table").forEach((table) => {
+        table.classList.add("w-max", "min-w-full");
+        if (table.parentElement?.classList.contains("akb-md-table")) return;
+        const wrapper = window.document.createElement("div");
+        wrapper.className =
+          "akb-md-table my-5 overflow-x-auto rounded-[var(--radius-lg)] border border-border";
+        table.replaceWith(wrapper);
+        wrapper.append(table);
+      });
     };
 
-  return {
-    /* ── Block prose ──────────────────────────────────────────── */
-    p: ({ node: _node, children, ...props }) => (
-      <p className={cn(PROSE_LEADING, "my-3 wrap-break-word")} {...props}>
-        {children}
-      </p>
-    ),
+    sync();
+    const observer =
+      typeof MutationObserver === "undefined"
+        ? null
+        : new MutationObserver(sync);
+    observer?.observe(host, { childList: true, subtree: true });
 
-    hr: ({ node: _node, ...props }) => (
-      <hr
-        className="my-7 border-0 h-px bg-gradient-to-r from-transparent via-border-strong to-transparent"
-        {...props}
-      />
-    ),
-
-    /* ── Headings — tuned cascade + negative tracking ─────────── */
-    h1: heading(
-      1,
-      cn(HEADING_BASE, "mt-8 mb-3.5 text-[1.9em] text-foreground tracking-[-0.02em] leading-tight"),
-    ),
-    h2: heading(
-      2,
-      cn(HEADING_BASE, "mt-7 mb-3 text-[1.5em] text-foreground tracking-[-0.015em] leading-snug"),
-    ),
-    h3: heading(
-      3,
-      cn(HEADING_BASE, "mt-6 mb-2.5 text-[1.25em] text-foreground tracking-[-0.01em]"),
-    ),
-    h4: heading(
-      4,
-      cn(HEADING_BASE, "mt-5 mb-2 text-[1.08em] text-foreground tracking-[-0.006em]"),
-    ),
-    h5: heading(5, cn(HEADING_BASE, "mt-4 mb-1.5 text-[0.95em] text-foreground-muted")),
-    h6: ({ node: _node, children, ...props }) => (
-      <h6 id={nextId(children, 6)} className={EYEBROW} {...props}>
-        {children}
-      </h6>
-    ),
-
-    /* ── Inline phrase elements ───────────────────────────────── */
-    strong: ({ node: _node, children, ...props }) => (
-      <strong className="font-semibold text-foreground tracking-[-0.005em]" {...props}>
-        {children}
-      </strong>
-    ),
-    em: ({ node: _node, children, ...props }) => (
-      <em className="italic text-foreground-muted" {...props}>
-        {children}
-      </em>
-    ),
-    del: ({ node: _node, children, ...props }) => (
-      <del className="text-subtle" {...props}>
-        {children}
-      </del>
-    ),
-    kbd: ({ node: _node, children, ...props }) => (
-      <kbd
-        className="font-mono text-[0.825em] px-1.5 min-w-[1.5em] inline-flex items-center justify-center rounded-[var(--radius-sm)] bg-surface text-foreground border border-border align-baseline mx-[1px]"
-        {...props}
-      >
-        {children}
-      </kbd>
-    ),
-    sup: ({ node: _node, children, ...props }) => (
-      <sup className="text-[0.7em] text-link [&_a]:no-underline" {...props}>
-        {children}
-      </sup>
-    ),
-    sub: ({ node: _node, children, ...props }) => (
-      <sub className="text-[0.7em] text-foreground-muted" {...props}>
-        {children}
-      </sub>
-    ),
-
-    /* ── Lists ────────────────────────────────────────────────── */
-    ul: ({ node: _node, children, ...props }) => (
-      <ul
-        className={cn("pl-6 my-3 list-disc marker:text-subtle", PROSE_LEADING)}
-        {...props}
-      >
-        {children}
-      </ul>
-    ),
-    ol: ({ node: _node, children, ...props }) => (
-      <ol
-        className={cn(
-          "pl-6 my-3 list-decimal marker:text-subtle marker:font-semibold",
-          PROSE_LEADING,
-        )}
-        {...props}
-      >
-        {children}
-      </ol>
-    ),
-    li: ({ node, children, ...props }) => {
-      const className = typeof props.className === "string" ? props.className : "";
-      const nodeClass = node?.properties?.className;
-      const nodeClasses = Array.isArray(nodeClass) ? nodeClass.map(String) : [];
-      const isTask =
-        className.includes("task-list-item") || nodeClasses.includes("task-list-item");
-      if (isTask) return <TaskListItem>{children}</TaskListItem>;
-      return (
-        <li
-          className={cn("my-1 [&>p]:my-0 [&>ul]:my-1 [&>ol]:my-1", PROSE_LEADING)}
-          {...props}
-        >
-          {children}
-        </li>
+    return () => {
+      disposed = true;
+      observer?.disconnect();
+      controllers.forEach((controller) => controller.abort());
+      publicationListeners.forEach(({ image, listener }) =>
+        image.removeEventListener("error", listener),
       );
-    },
-
-    /* ── Links + media ────────────────────────────────────────── */
-    a: ({ node: _node, href, children, ...props }) => {
-      const canonical = typeof href === "string" ? canonicalAkbMarkdownTarget(href) : null;
-      const resolution = canonical ? targetResolutions.get(canonical) : undefined;
-      const ownedTarget = canonical && classifyAkbMarkdownTarget(canonical);
-      const safe = ownedTarget
-        ? resolution?.status === "available" && resolution.runtimeUrl
-          ? resolution.runtimeUrl
-          : "#"
-        : sanitizeLinkUrl(href);
-      const unavailable =
-        !!ownedTarget && (!resolution || resolution.status === "unavailable");
-      const external = /^https?:\/\//i.test(safe);
-      return (
-        <a
-          href={safe}
-          data-markdown-target={ownedTarget ? canonical : undefined}
-          data-markdown-resolution={ownedTarget ? resolution?.status ?? "unavailable" : undefined}
-          aria-disabled={unavailable || undefined}
-          title={unavailable ? "Reference unavailable" : undefined}
-          {...(external ? { rel: "noopener noreferrer", target: "_blank" } : {})}
-          className="text-link underline decoration-link/40 underline-offset-[3px] decoration-1 hover:text-link-hover hover:decoration-link-hover transition-token break-words"
-          {...props}
-        >
-          {children}
-        </a>
-      );
-    },
-    img: ({ node: _node, src, alt, ...props }) => (
-      (() => {
-        const rawTarget = typeof src === "string" ? src : "";
-        const canonical = canonicalAkbMarkdownTarget(rawTarget);
-        const resolution = canonical ? targetResolutions.get(canonical) : undefined;
-        return (
-          <AssetImage
-            src={canonical ?? rawTarget}
-            canonicalTarget={canonical ?? rawTarget}
-            runtimeSrc={resolution?.status === "available" ? resolution.runtimeUrl : null}
-            unavailable={resolution?.status === "unavailable"}
-            unavailableLabel="Reference unavailable"
-            alt={alt}
-            assetContext={assetContext}
-            className="block my-4 rounded-[var(--radius-lg)] border border-border max-w-full h-auto"
-            {...props}
-          />
-        );
-      })()
-    ),
-
-    /* ── Code (inline + fenced) ───────────────────────────────── */
-    // react-markdown v8 used to pass `inline: boolean`; v9+ dropped
-    // it. We accept the prop via a defensive intersection in case a
-    // custom rehype/remark path still sets it, and fall back to
-    // className inspection (fenced blocks carry `language-xxx`).
-    code: ({ node: _node, className, children, ...props }: ComponentProps<"code"> & ExtraProps & { inline?: boolean }) => {
-      const inline =
-        props.inline ?? !(typeof className === "string" && className.startsWith("language-"));
-      // Strip the local `inline` switch off `props` before spreading onto a DOM node.
-      const { inline: _inline, ...domProps } = props;
-      if (inline) {
-        return (
-          <code
-            className="font-mono text-[0.875em] px-1.5 py-0.5 mx-[1px] rounded-[var(--radius-sm)] bg-surface-2 text-primary border border-border wrap-anywhere"
-            {...domProps}
-          >
-            {children}
-          </code>
-        );
-      }
-      return (
-        <code className={className} {...domProps}>
-          {children}
-        </code>
-      );
-    },
-    pre: ({ node, children }) => {
-      const lang = getPreNodeLanguage(node);
-      const code = extractCodeText(children).replace(/\n+$/, "");
-      return <CodeBlock language={lang ?? undefined} code={code} />;
-    },
-
-    /* ── Blockquote → callout or quiet quote ──────────────────── */
-    blockquote: ({ node: _node, children, ...props }) => {
-      const alert = detectAlert(children);
-      if (alert) return <MarkdownAlert kind={alert.kind}>{alert.rest}</MarkdownAlert>;
-      return (
-        <blockquote
-          className={cn(
-            "my-4 pl-4 pr-3 py-2 italic",
-            PROSE_LEADING,
-            "border-l-2 border-border-strong bg-surface-2/50 text-foreground-muted rounded-r-[var(--radius-md)]",
-            "[&>p:first-child]:mt-0 [&>p:last-child]:mb-0",
-          )}
-          {...props}
-        >
-          {children}
-        </blockquote>
-      );
-    },
-
-    /* ── Tables ───────────────────────────────────────────────── */
-    table: ({ node: _node, children, ...props }) => (
-      <div className="akb-md-table my-5 overflow-x-auto rounded-[var(--radius-lg)] border border-border">
-        <table className="w-max min-w-full border-collapse text-[0.92em]" {...props}>
-          {children}
-        </table>
-      </div>
-    ),
-    thead: ({ node: _node, children, ...props }) => (
-      <thead className="bg-surface-2" {...props}>
-        {children}
-      </thead>
-    ),
-    tbody: ({ node: _node, children, ...props }) => (
-      <tbody
-        className="[&>tr:nth-child(even)]:bg-surface-2/30 [&>tr:hover]:bg-surface-2/60"
-        {...props}
-      >
-        {children}
-      </tbody>
-    ),
-    tr: ({ node: _node, children, ...props }) => (
-      <tr className="transition-token" {...props}>
-        {children}
-      </tr>
-    ),
-    th: ({ node: _node, children, ...props }) => (
-      <th
-        className="px-4 py-2.5 text-left font-semibold text-foreground-muted border-b border-border whitespace-nowrap text-[0.86em]"
-        {...props}
-      >
-        {children}
-      </th>
-    ),
-    td: ({ node: _node, children, ...props }) => (
-      <td
-        className="px-4 py-2.5 text-foreground border-b border-border/60 align-top"
-        {...props}
-      >
-        {children}
-      </td>
-    ),
-  };
+      placeholders.clear();
+      objectUrls.forEach((url) => {
+        if (
+          url.startsWith("blob:") &&
+          typeof URL.revokeObjectURL === "function"
+        ) {
+          URL.revokeObjectURL(url);
+        }
+      });
+    };
+  }, [
+    assetCommit,
+    assetDocument,
+    assetMode,
+    assetVault,
+    publicationSlug,
+    editor,
+    markdown,
+    rootRef,
+  ]);
 }
-
-function preserveCanonicalTargetUrl(url: string): string {
-  return canonicalAkbMarkdownTarget(url) ?? defaultUrlTransform(url);
-}
-
-const REMARK_PLUGINS = [remarkGfm, remarkMath];
-const REHYPE_PLUGINS = [rehypeKatex];
 
 export interface MarkdownRenderProps {
   markdown: string;
@@ -741,66 +315,99 @@ export interface MarkdownRenderProps {
   assetContext?: AssetContext;
 }
 
-/**
- * Shared markdown renderer. Wraps react-markdown with a hand-tuned
- * components map (NOT `.prose`). The outer wrapper carries the base
- * font color + a `.akb-md` scope used to style KaTeX display blocks
- * (see src/index.css).
- */
-export function MarkdownRender({ markdown, className, assetContext }: MarkdownRenderProps) {
-  // Drop any leading embedded frontmatter block before rendering so its
-  // closing `---` isn't parsed as a setext heading (see stripFrontmatter).
-  // Sharing the stripped body keeps the rendered headings and the slug
-  // queue built inside buildComponents in lock-step.
-  const body = useMemo(() => stripFrontmatter(markdown || ""), [markdown]);
-  const normalized = useMemo(
-    () => normalizeLatexDelimiters(body),
-    [body],
-  );
-  const authenticatedContext =
-    assetContext?.mode === "authenticated" ? assetContext : undefined;
-  const publicationContext =
-    assetContext?.mode === "publication" ? assetContext : undefined;
-  const assetMode = assetContext?.mode;
-  const assetVault = authenticatedContext?.vault;
-  const assetDocument = authenticatedContext?.document;
-  const assetCommit = authenticatedContext?.commit;
-  const publicationSlug = publicationContext?.slug;
-  const stableAssetContext = useMemo<AssetContext | undefined>(() => {
-    if (assetMode === "authenticated" && assetVault) {
-      return {
-        mode: "authenticated",
-        vault: assetVault,
-        document: assetDocument,
-        commit: assetCommit,
-      };
-    }
-    if (assetMode === "publication" && publicationSlug) {
-      return { mode: "publication", slug: publicationSlug };
-    }
-    return undefined;
-  }, [assetCommit, assetDocument, assetMode, assetVault, publicationSlug]);
-  const targetResolutions = useAkbMarkdownTargetResolutions(body, {
-    vault: assetVault,
-    document: assetDocument,
-    commit: assetCommit,
+function CommonMarkdownViewer({
+  markdown,
+  className,
+  assetContext,
+  adapters,
+  resolverContext,
+}: {
+  markdown: string;
+  className?: string;
+  assetContext?: AssetContext;
+  adapters?: ReturnType<typeof createAkbMarkdownAdapters>;
+  resolverContext?: { vault?: string; document?: string; commit?: string };
+}) {
+  const rootRef = useRef<HTMLDivElement>(null);
+  const editor = useMarkdownEditor({
+    initialMarkdown: markdown,
+    profile: "preserve",
+    editable: false,
   });
-  const components = useMemo(
-    () => buildComponents(body, stableAssetContext, targetResolutions),
-    [body, stableAssetContext, targetResolutions],
+  const resolutions = useMarkdownTargetResolutions(
+    markdown,
+    adapters?.targetResolver,
+    resolverContext,
   );
 
+  useLayoutEffect(() => {
+    if (editor) normalizeViewerTopLevelImages(editor);
+  }, [editor]);
+
+  useEffect(() => {
+    if (!editor || editor.getMarkdown() === markdown) return;
+    editor.commands.setContent(markdown, { contentType: "markdown" });
+  }, [editor, markdown]);
+
+  useViewerTargetDom(
+    rootRef,
+    resolutions,
+    Boolean(adapters?.targetResolver),
+    editor,
+  );
+  useViewerResources(rootRef, assetContext, editor, markdown);
+
   return (
-    <div className={cn("akb-md min-w-0 text-[15px] text-foreground", className)}>
-      <Markdown
-        remarkPlugins={REMARK_PLUGINS}
-        rehypePlugins={REHYPE_PLUGINS}
-        urlTransform={preserveCanonicalTargetUrl}
-        components={components}
-      >
-        {normalized}
-      </Markdown>
+    <div
+      ref={rootRef}
+      className={cn(
+        "akb-md min-w-0 text-[15px] text-foreground prose dark:prose-invert !max-w-none",
+        className,
+      )}
+    >
+      {editor ? <EditorContent editor={editor} /> : null}
     </div>
+  );
+}
+
+export function MarkdownRender({
+  markdown,
+  className,
+  assetContext,
+}: MarkdownRenderProps) {
+  const body = useMemo(() => stripFrontmatter(markdown || ""), [markdown]);
+  const authenticated =
+    assetContext?.mode === "authenticated" ? assetContext : undefined;
+  const authenticatedVault = authenticated?.vault;
+  const authenticatedDocument = authenticated?.document;
+  const authenticatedCommit = authenticated?.commit;
+  const adapters = useMemo(
+    () =>
+      authenticatedVault
+        ? createAkbMarkdownAdapters({
+            vault: authenticatedVault,
+            document: authenticatedDocument,
+            commit: authenticatedCommit,
+          })
+        : undefined,
+    [authenticatedCommit, authenticatedDocument, authenticatedVault],
+  );
+  return (
+    <CommonMarkdownViewer
+      markdown={body}
+      className={className}
+      assetContext={assetContext}
+      adapters={adapters}
+      resolverContext={
+        authenticated
+          ? {
+              vault: authenticatedVault,
+              document: authenticatedDocument,
+              commit: authenticatedCommit,
+            }
+          : {}
+      }
+    />
   );
 }
 

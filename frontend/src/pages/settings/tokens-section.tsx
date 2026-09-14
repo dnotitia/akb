@@ -1,12 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { useEffect, useState } from "react";
 import {
-  ChevronRight,
   Copy,
   Eye,
   EyeOff,
   KeyRound,
-  Plus,
   RotateCw,
   Trash2,
   X,
@@ -16,23 +13,9 @@ import { formatDate, timeAgo } from "@/lib/utils";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { CodeSnippet } from "@/components/ui/code-snippet";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/empty-state";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import {
-  MCP_URL,
-  mcpInstallSnippets,
-  mcpOAuthSnippets,
-  MCP_AGENT_FILES,
-  MCP_AGENT_LABELS,
-  type McpAgent,
-} from "@/lib/mcp-snippets";
-
-type ClientTab = McpAgent;
-type ConnectMode = "pat" | "oauth";
+import { ConnectionSetup } from "@/components/connection-setup";
 
 export interface PAT {
   token_id: string;
@@ -47,6 +30,8 @@ interface Props {
   patsError: boolean;
   mcpOauthEnabled: boolean;
   onReloadPats: () => void;
+  onDirtyChange?: (dirty: boolean) => void;
+  onBusyChange?: (busy: boolean) => void;
 }
 
 export function TokensSection({
@@ -54,13 +39,12 @@ export function TokensSection({
   patsError,
   mcpOauthEnabled,
   onReloadPats,
+  onDirtyChange,
+  onBusyChange,
 }: Props) {
-  const [newName, setNewName] = useState("");
   const [newPat, setNewPat] = useState<string | null>(null);
   const [showPat, setShowPat] = useState<boolean>(true);
   const [copied, setCopied] = useState<string | null>(null);
-  const [creating, setCreating] = useState(false);
-  const [mintError, setMintError] = useState<string | null>(null);
   // Reissue = revoke-then-mint. Routed through a ConfirmDialog (the old token
   // dies immediately) with a per-row pending guard so a double-click can't
   // fire two revoke/mint pairs, and an error channel for the dangerous
@@ -70,33 +54,13 @@ export function TokensSection({
   const [reissueError, setReissueError] = useState<string | null>(null);
   const [pendingRevokePat, setPendingRevokePat] = useState<PAT | null>(null);
 
-  const [clientTab, setClientTab] = useState<ClientTab>("claude");
-  const [connectMode, setConnectMode] = useState<ConnectMode>("pat");
-  // OAuth snippets cover only the agents whose remote-HTTP MCP support
-  // is solid (Claude Code, Cursor, VS Code). Codex / OpenClaw still
-  // route through the stdio PAT proxy, so a tab in OAuth mode that has
-  // no snippet falls back to a hint pointing the user back to PAT.
-  const oauthSnippetsMap = useMemo(() => mcpOAuthSnippets(), []);
-  const [setupOpen, setSetupOpen] = useState<boolean | null>(() => {
-    const saved = localStorage.getItem("akb:tokens-setup-open");
-    if (saved === "true") return true;
-    if (saved === "false") return false;
-    return null;
-  });
-
-  // Smart default: open setup guide when user has no PATs, closed otherwise.
-  // Only applies when localStorage has no saved preference (setupOpen === null).
-  useEffect(() => {
-    if (setupOpen !== null) return;
-    if (pats === null) return;
-    setSetupOpen(pats.length === 0);
-  }, [pats, setupOpen]);
-
-  function toggleSetup() {
-    const next = !setupOpen;
-    setSetupOpen(next);
-    localStorage.setItem("akb:tokens-setup-open", String(next));
-  }
+  const [copyError, setCopyError] = useState(false);
+  const [invalidatedTokenId, setInvalidatedTokenId] = useState<string>();
+  const [setupSecret, setSetupSecret] = useState(false);
+  const [setupBusy, setSetupBusy] = useState(false);
+  useEffect(() => { onDirtyChange?.(!!newPat || setupSecret); }, [newPat, setupSecret, onDirtyChange]);
+  useEffect(() => { onBusyChange?.(setupBusy || reissuingId !== null); }, [setupBusy, reissuingId, onBusyChange]);
+  useEffect(() => () => { onDirtyChange?.(false); onBusyChange?.(false); }, [onDirtyChange, onBusyChange]);
 
   async function copy(text: string, label: string) {
     // clipboard is undefined on insecure (plain-HTTP) origins — and AKB ships
@@ -104,33 +68,13 @@ export function TokensSection({
     // copying a show-once secret never throws an uncaught TypeError with no
     // feedback; the value stays on screen to copy manually.
     try {
-      await navigator.clipboard?.writeText(text);
+      setCopyError(false);
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
+      await navigator.clipboard.writeText(text);
       setCopied(label);
       setTimeout(() => setCopied(null), 2000);
     } catch {
-      /* clipboard blocked — value remains visible for manual copy */
-    }
-  }
-
-  async function handleCreatePAT(e: React.FormEvent) {
-    e.preventDefault();
-    if (!newName.trim()) return;
-    setMintError(null);
-    setCreating(true);
-    try {
-      const r = await createPAT(newName);
-      setNewPat(r.token);
-      setShowPat(true);
-      setNewName("");
-      onReloadPats();
-    } catch (err) {
-      // No app-wide toast — surface inline or the button settles with no token
-      // and no explanation on a secret the user is waiting for.
-      setMintError(
-        err instanceof Error ? err.message : "Couldn't mint a token. Please try again.",
-      );
-    } finally {
-      setCreating(false);
+      setCopyError(true);
     }
   }
 
@@ -141,15 +85,18 @@ export function TokensSection({
   async function handleReissue(p: PAT) {
     setReissuingId(p.token_id);
     setReissueError(null);
+    let revoked = false;
     try {
       await revokePAT(p.token_id);
+      revoked = true;
+      setInvalidatedTokenId(p.token_id);
       const r = await createPAT(p.name);
       setNewPat(r.token);
       setShowPat(true);
       onReloadPats();
     } catch {
       setReissueError(
-        `"${p.name}" was revoked but a replacement could not be minted — mint a new token now to restore access.`,
+        revoked ? `"${p.name}" was revoked, but replacement creation failed. Open connection setup to create a new token.` : `"${p.name}" could not be revoked. No replacement was created.`,
       );
       onReloadPats();
     } finally {
@@ -160,21 +107,13 @@ export function TokensSection({
   async function confirmRevokePat() {
     if (!pendingRevokePat) return;
     await revokePAT(pendingRevokePat.token_id);
+    setInvalidatedTokenId(pendingRevokePat.token_id);
     onReloadPats();
   }
 
-  // Pat used in snippets: prefer fresh mint, else first active, else placeholder.
-  const snippetPat = newPat || (pats?.[0] ? pats[0].prefix + "…" : "<YOUR_PAT>");
-  const snippets = useMemo(() => mcpInstallSnippets(snippetPat), [snippetPat]);
-  // Fresh-token banner embeds the real, un-masked token in its config block.
-  const freshSnippet = useMemo(
-    () => (newPat ? mcpInstallSnippets(newPat).cursor : ""),
-    [newPat],
-  );
-
   return (
     <>
-      <div className="grid items-start gap-6 xl:grid-cols-[minmax(0,1.3fr)_minmax(22rem,0.7fr)]">
+      <div className="space-y-8">
       {newPat && (
         <section
           className="overflow-hidden rounded-[var(--radius-lg)] border border-accent/40 bg-accent/5 shadow-sm xl:col-span-2"
@@ -223,257 +162,39 @@ export function TokensSection({
               </button>
             </div>
 
-            <CodeSnippet code={freshSnippet} filename={MCP_AGENT_FILES.cursor} />
+            {copyError && <Alert variant="warning">Copy was blocked. Select and copy the token manually.</Alert>}
           </div>
         </section>
       )}
 
 
-      {/* Collapsible setup guide */}
-      <section className="order-2 overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm xl:order-none">
-        <button
-          type="button"
-          onClick={toggleSetup}
-          aria-expanded={!!setupOpen}
-          aria-controls="setup-guide-body"
-          className="flex w-full cursor-pointer items-start justify-between gap-4 border-b border-border px-5 py-4 text-left transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background sm:px-6"
-        >
-          <span>
-            <span className="block text-base font-semibold text-foreground">Connect an agent</span>
-            <span className="mt-1 block text-sm text-foreground-muted">
-              Create credentials, add the client config, and verify the connection.
-            </span>
-          </span>
-          <span className="flex shrink-0 items-center gap-2 pt-0.5">
-            <Badge variant="default">3 steps</Badge>
-            <ChevronRight
-              className={`h-4 w-4 text-foreground-muted transition-transform ${setupOpen ? "rotate-90" : ""}`}
-              aria-hidden
-            />
-          </span>
-        </button>
-        {setupOpen && (
-          <div id="setup-guide-body" className="p-6 space-y-6">
-
-            {/* STEP 01 — Mint a token */}
-            <div>
-              <header className="flex items-baseline justify-between flex-wrap gap-2 mb-3">
-                <div className="flex items-baseline gap-3">
-                  <span className="coord-spark">Step 01</span>
-                  <h2 className="text-base font-semibold tracking-tight text-foreground">
-                    Mint a token
-                  </h2>
-                </div>
-                <span className="coord">Personal Access Token</span>
-              </header>
-              <div className="space-y-3">
-                <p className="text-sm text-foreground-muted leading-relaxed max-w-prose">
-                  A Personal Access Token authorizes your agent against the base.
-                  You can reissue or revoke it any time.
-                </p>
-                <form onSubmit={handleCreatePAT} className="flex gap-2">
-                  <Label htmlFor="new-pat-name" className="sr-only">
-                    Token name
-                  </Label>
-                  <Input
-                    id="new-pat-name"
-                    placeholder="Token name (e.g. claude-code-macbook)"
-                    value={newName}
-                    onChange={(e) => setNewName(e.target.value)}
-                    aria-invalid={mintError ? true : undefined}
-                    className="flex-1"
-                  />
-                  <Button
-                    type="submit"
-                    variant="accent"
-                    loading={creating}
-                    disabled={!newName.trim()}
-                  >
-                    {!creating && <Plus className="h-4 w-4" aria-hidden />}
-                    {creating ? "Minting" : "Mint"}
-                  </Button>
-                </form>
-                {mintError && (
-                  <Alert variant="destructive">{mintError}</Alert>
-                )}
-              </div>
-            </div>
-
-            <div className="border-t border-border" />
-
-            {/* STEP 02 — Drop the snippet */}
-            <div>
-              <header className="flex items-baseline justify-between flex-wrap gap-2 mb-3">
-                <div className="flex items-baseline gap-3">
-                  <span className="coord-spark">Step 02</span>
-                  <h2 className="text-base font-semibold tracking-tight text-foreground">
-                    Drop the snippet
-                  </h2>
-                </div>
-                <span className="coord">npm: akb-mcp</span>
-              </header>
-              <div className="space-y-3">
-                <p className="text-sm text-foreground-muted leading-relaxed max-w-prose">
-                  Pick your client. Paste once. Your agent learns the base on the
-                  next launch.
-                </p>
-
-                {/* PAT vs OAuth mode toggle — only visible when this AKB
-                    deployment has the OAuth Resource Server path enabled.
-                    OAuth is the lighter UX (no token to mint or rotate) but
-                    requires a configured OIDC provider on the backend; the
-                    PAT flow keeps working unchanged in either mode. */}
-                {mcpOauthEnabled && (
-                  <div className="flex items-center gap-2 text-xs">
-                    <span className="coord">Auth</span>
-                    <div className="inline-flex rounded-[var(--radius-sm)] border border-border overflow-hidden">
-                      <button
-                        type="button"
-                        onClick={() => setConnectMode("pat")}
-                        className={`px-3 py-1 ${connectMode === "pat" ? "bg-primary text-primary-foreground" : "bg-surface text-foreground-muted hover:text-foreground"}`}
-                        aria-pressed={connectMode === "pat"}
-                      >
-                        Token (PAT)
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setConnectMode("oauth")}
-                        className={`px-3 py-1 ${connectMode === "oauth" ? "bg-primary text-primary-foreground" : "bg-surface text-foreground-muted hover:text-foreground"}`}
-                        aria-pressed={connectMode === "oauth"}
-                      >
-                        OAuth
-                      </button>
-                    </div>
-                    <span className="text-foreground-muted">
-                      {connectMode === "oauth"
-                        ? "Agent signs in via browser — no PAT needed."
-                        : "Mint a token in Step 01 above and paste below."}
-                    </span>
-                  </div>
-                )}
-
-                {/* Client picker + snippet — Tabs gives roving tabindex,
-                    role=tab/aria-selected, arrow-key nav, and the teal
-                    raised-pill active state for free. CodeSnippet supplies
-                    the insecure-origin-guarded copy + teal hover. */}
-                <Tabs value={clientTab} onValueChange={(v) => setClientTab(v as ClientTab)}>
-                  <TabsList className="flex-wrap">
-                    {(Object.keys(MCP_AGENT_LABELS) as ClientTab[]).map((id) => (
-                      <TabsTrigger key={id} value={id}>
-                        {MCP_AGENT_LABELS[id]}
-                      </TabsTrigger>
-                    ))}
-                  </TabsList>
-                  <TabsContent value={clientTab} className="space-y-2">
-                    {connectMode === "oauth" ? (
-                      oauthSnippetsMap[clientTab] !== undefined ? (
-                        <CodeSnippet
-                          code={oauthSnippetsMap[clientTab] as string}
-                          filename={MCP_AGENT_FILES[clientTab]}
-                        />
-                      ) : (
-                        // Agents without a known remote-HTTP-OAuth integration
-                        // (Codex / OpenClaw at the time of writing) — bounce
-                        // the user back to PAT for that tab specifically,
-                        // rather than rendering an empty snippet box.
-                        <div className="rounded-[var(--radius-md)] border border-border px-4 py-3 text-sm text-foreground-muted">
-                          {MCP_AGENT_LABELS[clientTab]} uses the stdio path —
-                          switch the toggle to <span className="font-medium text-foreground">Token (PAT)</span>
-                          {" "}to see its snippet.
-                        </div>
-                      )
-                    ) : (
-                      <CodeSnippet
-                        code={snippets[clientTab]}
-                        filename={MCP_AGENT_FILES[clientTab]}
-                      />
-                    )}
-                    {connectMode === "pat" && clientTab === "cursor" && (
-                      <div className="rounded-[var(--radius-md)] border border-border px-4 py-2 text-[11px] font-mono bg-surface-muted text-foreground-muted space-y-0.5">
-                        <div><span className="coord mr-2">Cursor</span>~/.cursor/mcp.json</div>
-                        <div><span className="coord mr-2">Windsurf</span>~/.codeium/windsurf/mcp_config.json</div>
-                        <div><span className="coord mr-2">Gemini</span>~/.gemini/settings.json</div>
-                        <div>
-                          <span className="coord mr-2">Claude Desktop</span>
-                          ~/Library/Application Support/Claude/claude_desktop_config.json{" "}
-                          <span className="text-subtle">(macOS)</span>
-                        </div>
-                      </div>
-                    )}
-                    {connectMode === "oauth" && clientTab === "claude" && (
-                      <div className="rounded-[var(--radius-md)] border border-border px-4 py-2 text-[11px] font-mono bg-surface-muted text-foreground-muted">
-                        First line registers the server, second opens a browser
-                        for the OAuth + consent flow. Run them back-to-back.
-                        Resource: <span className="text-foreground">{MCP_URL}</span>
-                      </div>
-                    )}
-                  </TabsContent>
-                </Tabs>
-                {connectMode === "pat" && snippetPat === "<YOUR_PAT>" && (
-                  <p className="coord text-foreground-muted">
-                    ↑ Replace <span className="text-accent-strong">&lt;YOUR_PAT&gt;</span> with the
-                    token string shown after Step 01.
-                  </p>
-                )}
-              </div>
-            </div>
-
-            <div className="border-t border-border" />
-
-            {/* STEP 03 — Talk to your agent */}
-            <div>
-              <header className="flex items-baseline justify-between flex-wrap gap-2 mb-3">
-                <div className="flex items-baseline gap-3">
-                  <span className="coord-spark">Step 03</span>
-                  <h2 className="text-base font-semibold tracking-tight text-foreground">
-                    Talk to your agent
-                  </h2>
-                </div>
-                <Link
-                  to="/search?q=AKB+usage+guide"
-                  className="coord hover:text-link rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-                >
-                  Full guide
-                </Link>
-              </header>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-3 text-sm">
-                <PromptExample
-                  text='"Show me how to use AKB with akb_help()"'
-                  label="tools + quickstart"
-                />
-                <PromptExample
-                  text='"Search the dnotitia vault for the remote-work policy"'
-                  label="internal knowledge"
-                />
-                <PromptExample
-                  text='"From the sales vault, show deals with win-rate ≥ 60%"'
-                  label="data analysis"
-                />
-                <PromptExample
-                  text='"Create a todo for Jinwoo: please upload materials"'
-                  label="task assignment"
-                />
-              </div>
-            </div>
-
+      <section aria-labelledby="connection-heading">
+        <header className="mb-3 flex flex-wrap items-center justify-between gap-3 border-b border-border pb-3">
+          <div>
+            <h2 id="connection-heading" className="text-base font-semibold">Connect an agent</h2>
+            <p className="mt-1 text-sm text-foreground-muted">Prepare access, add the configuration, then try a read-only request in your agent.</p>
           </div>
-        )}
+          <Badge variant="default">3 steps</Badge>
+        </header>
+        <div id="setup-guide-body" className="py-2">
+          <ConnectionSetup layout="workspace" mcpOauthEnabled={mcpOauthEnabled} onTokenCreated={onReloadPats} onSecretCreated={() => setSetupSecret(true)} onBusyChange={setSetupBusy} invalidatedTokenId={invalidatedTokenId} />
+        </div>
       </section>
 
       {/* Active tokens — primary content on this tab (management). */}
-      <section className="order-1 overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm xl:order-none">
-        <header className="flex items-start justify-between gap-4 border-b border-border px-5 py-4 sm:px-6">
+      <section aria-labelledby="active-tokens-heading">
+        <header className="mb-3 flex items-start justify-between gap-4 border-b border-border pb-3">
           <div>
-            <h2 className="text-base font-semibold text-foreground">Active tokens</h2>
+            <h2 id="active-tokens-heading" className="text-base font-semibold text-foreground">Active tokens</h2>
             <p className="mt-1 text-sm text-foreground-muted">
-              Review agent access, recent use, and rotation status.
+              Manage credentials separately from setup. Last use does not indicate a live AI connection.
             </p>
           </div>
           <Badge variant="default" className="shrink-0 tabular-nums">
             {pats ? pats.length : "··"}
           </Badge>
         </header>
-        <div className="space-y-4 p-5 sm:p-6">
+        <div className="space-y-4">
           {reissueError && <Alert variant="destructive">{reissueError}</Alert>}
           {patsError ? (
             <EmptyState
@@ -491,7 +212,7 @@ export function TokensSection({
                 Loading tokens
               </span>
               <div
-                className="rounded-[var(--radius-md)] border border-border divide-y divide-border overflow-hidden"
+                className="divide-y divide-border"
                 aria-hidden
               >
                 {Array.from({ length: 3 }).map((_, i) => (
@@ -508,21 +229,14 @@ export function TokensSection({
           ) : pats.length === 0 ? (
             <EmptyState
               title="No tokens yet"
-              description="Mint your first token to connect an agent."
-              action={
-                !setupOpen ? (
-                  <Button variant="outline" size="sm" onClick={() => setSetupOpen(true)}>
-                    Set up a token
-                  </Button>
-                ) : undefined
-              }
+              description="A token is only needed for token-based connections. Browser sign-in does not require one."
             />
           ) : (
             <div className="rounded-[var(--radius-md)] border border-border divide-y divide-border overflow-hidden">
               {(pats ?? []).map((p) => (
-                <div key={p.token_id} className="flex flex-col gap-3 px-4 py-4">
-                  <div className="flex min-w-0 items-start gap-3">
-                    <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[var(--radius-md)] bg-surface-selected text-surface-selected-foreground">
+                <div key={p.token_id} className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-3 py-3 sm:px-4">
+                  <div className="flex min-w-0 flex-1 items-start gap-3">
+                    <span className="flex h-5 w-5 shrink-0 items-center justify-center text-foreground-muted">
                       <KeyRound className="h-4 w-4" aria-hidden />
                     </span>
                     <div className="min-w-0 flex-1">
@@ -548,7 +262,7 @@ export function TokensSection({
                       </div>
                     </div>
                   </div>
-                  <div className="flex items-center justify-end gap-1 border-t border-border pt-2">
+                  <div className="flex items-center justify-end gap-1">
                     <button
                       onClick={() => setPendingReissue(p)}
                       disabled={reissuingId === p.token_id}
@@ -604,16 +318,5 @@ export function TokensSection({
         }}
       />
     </>
-  );
-}
-
-function PromptExample({ text, label }: { text: string; label: string }) {
-  return (
-    <div className="flex flex-col gap-1">
-      <div className="coord">{label}</div>
-      {/* Conversational example prompts — sans, not code (they are sentences to
-          say to an agent, not a snippet to paste). */}
-      <span className="text-sm leading-relaxed text-foreground">{text}</span>
-    </div>
   );
 }

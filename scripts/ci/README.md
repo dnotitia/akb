@@ -117,7 +117,7 @@ The topology is deliberately small:
 | Component | Process owner | Endpoint / image | Responsibility |
 | --- | --- | --- | --- |
 | PostgreSQL + pgvector | dependency Compose | `pgvector/pgvector:pg16`, `127.0.0.1:15432` by default | AKB database and vector index |
-| MinIO | dependency Compose | pinned `minio/minio:RELEASE.2025-09-07T16-13-09Z`, `127.0.0.1:9000` by default | S3-compatible file storage |
+| MinIO | dependency Compose | pinned `quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z`, `127.0.0.1:9000` by default | S3-compatible file storage |
 | embedding stub | Ubuntu host process | `127.0.0.1:8888` | deterministic `/v1/embeddings` responses |
 | backend | Ubuntu host process | `127.0.0.1:8000` | AKB application under test |
 | frontend (`--with-frontend`) | Ubuntu host process | `127.0.0.1:3000` by default | existing Vite SPA and per-run backend proxy |

@@ -42,6 +42,9 @@ data:
     keycloak_management_client_id: akb-sso-manager
     keycloak_enrollment_mode: {{ .Values.sso.enrollmentMode }}
     keycloak_require_verified_email: {{ .Values.sso.requireVerifiedEmail }}
+    {{- if .Values.sso.authoritativeEmailDomains }}
+    keycloak_authoritative_email_domains_by_provider: {{ .Values.sso.authoritativeEmailDomains | toJson | nindent 6 }}
+    {{- end }}
     api_oauth_audience: {{ printf "%s/api" (.Values.global.publicUrl | trimSuffix "/") }}
     keycloak_verify_ssl: true
     {{- if .Values.sso.localRealmLogin.enabled }}

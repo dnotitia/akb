@@ -31,13 +31,16 @@
 FROM node:22-slim AS frontend-builder
 
 WORKDIR /src
-RUN npm install -g pnpm@latest
+COPY frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml ./frontend/
+COPY frontend/packages/markdown-editor/package.json frontend/packages/markdown-editor/tsconfig.json frontend/packages/markdown-editor/tsconfig.build.json ./frontend/packages/markdown-editor/
+COPY frontend/packages/markdown-editor/src ./frontend/packages/markdown-editor/src
+RUN corepack enable && corepack prepare "$(node -p 'require("./frontend/package.json").packageManager')" --activate
+# The workspace install runs the common package's prepare build before Vite;
+# the workspace allowBuilds list stays limited to esbuild/msw.
+RUN cd frontend && pnpm install --frozen-lockfile
 
-COPY frontend/package.json frontend/pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile --ignore-scripts
-
-COPY frontend/ ./
-RUN npx vite build
+COPY frontend/ ./frontend/
+RUN cd frontend && pnpm run build
 
 # ---------- final image ----------
 FROM pgvector/pgvector:pg16
@@ -98,7 +101,7 @@ COPY backend /app/backend
 RUN rm -rf /app/backend/config
 
 # Frontend static bundle.
-COPY --from=frontend-builder /src/dist /var/www/akb
+COPY --from=frontend-builder /src/frontend/dist /var/www/akb
 
 # All-in-one bundle config + supervisord + nginx + entrypoint.
 COPY deploy/all-in-one/app.yaml /opt/akb/app.yaml

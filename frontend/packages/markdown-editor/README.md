@@ -3,7 +3,7 @@
 `@akb/markdown-editor` is the product-neutral Tiptap Markdown core shared by AKB and Reef.
 It owns the document schema, Markdown parsing/serialization, editor/viewer surfaces, commands,
 state hooks, and the conformance contract. It does not own product UI, storage, search, uploads,
-permissions, Plate, or collaboration.
+permissions, product-specific UI, or collaboration.
 
 The package is built against the exact Tiptap `3.31.3` package set and React 19.
 

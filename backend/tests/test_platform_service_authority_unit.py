@@ -607,7 +607,7 @@ async def test_projection_never_reaches_the_human_account_path(monkeypatch, rsa_
 
     _configure_workspace(monkeypatch)
 
-    async def forbidden_human_resolution(_claims):
+    async def forbidden_human_resolution(_claims, **_kwargs):
         raise AssertionError("a machine principal must never enter human enrollment")
 
     resolved: list[tuple[str, str, str]] = []

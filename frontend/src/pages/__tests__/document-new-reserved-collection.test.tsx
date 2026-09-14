@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { DocumentCreateDialog } from "@/components/document-create-dialog";
+import { CurrentUserProvider } from "@/contexts/current-user-context";
 
 const putDocument = vi.fn();
 const getDocument = vi.fn();
@@ -69,13 +70,18 @@ function renderPage(initialCollection = "overview") {
   const onCreated = vi.fn();
   const result = render(
     <MemoryRouter>
-      <DocumentCreateDialog
-        open
-        vault="my-v"
-        initialCollection={initialCollection}
-        onOpenChange={onOpenChange}
-        onCreated={onCreated}
-      />
+      <CurrentUserProvider user={{
+        user_id: "composer-user", username: "composer", email: "composer@example.test",
+        display_name: "Composer", is_admin: false, auth_method: "jwt", key_class: null,
+      }}>
+        <DocumentCreateDialog
+          open
+          vault="my-v"
+          initialCollection={initialCollection}
+          onOpenChange={onOpenChange}
+          onCreated={onCreated}
+        />
+      </CurrentUserProvider>
     </MemoryRouter>,
   );
   return { ...result, onOpenChange, onCreated };

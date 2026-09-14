@@ -1,5 +1,6 @@
 const STORAGE_PREFIX = "akb.recentDocumentViews.v1";
 const STORED_VIEW_LIMIT = 12;
+export const RECENT_DOCUMENT_VIEWS_EVENT = "akb:recent-document-views-changed";
 
 export interface RecentDocumentView {
   vault: string;
@@ -87,8 +88,19 @@ export function recordRecentDocumentView(
       storageKey(userId),
       JSON.stringify([next, ...deduplicated].slice(0, STORED_VIEW_LIMIT)),
     );
+    window.dispatchEvent(new CustomEvent(RECENT_DOCUMENT_VIEWS_EVENT, { detail: userId }));
   } catch {
     // Recent views are progressive enhancement. Storage denial must never
     // interrupt or report failure in the primary document-reading workflow.
   }
+}
+
+export function removeRecentDocumentView(userId: string, vault: string, path: string): void {
+  if (!userId) return;
+  try {
+    window.localStorage.setItem(storageKey(userId), JSON.stringify(
+      readRecentDocumentViews(userId).filter(item => item.vault !== vault || item.path !== path),
+    ));
+    window.dispatchEvent(new CustomEvent(RECENT_DOCUMENT_VIEWS_EVENT, { detail: userId }));
+  } catch { /* History is optional. */ }
 }

@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Key, Loader2, Search, Trash2, UsersRound } from "lucide-react";
+import { Key, Loader2, Search, Trash2 } from "lucide-react";
 import { adminDeleteUser, type AdminUser } from "@/lib/api";
 import { useDebounce } from "@/hooks/use-debounce";
 import { formatDate } from "@/lib/utils";
@@ -84,14 +84,11 @@ export function AdminSection({
 
   return (
     <>
-      <Panel>
-        <header className="flex items-start justify-between gap-4 border-b border-border px-5 py-5 sm:px-6">
+      <section aria-labelledby="settings-users-heading">
+        <header className="mb-4 flex items-start justify-between gap-4 border-b border-border pb-4">
           <div className="flex items-start gap-3">
-            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[var(--radius-md)] bg-surface-selected text-surface-selected-foreground">
-              <UsersRound className="h-4 w-4" aria-hidden />
-            </span>
             <div>
-              <h2 className="text-base font-semibold text-foreground">Users</h2>
+              <h2 id="settings-users-heading" className="text-base font-semibold text-foreground">Users</h2>
               <p className="mt-1 text-sm text-foreground-muted">
                 Everyone with an account on this AKB server.
               </p>
@@ -101,7 +98,8 @@ export function AdminSection({
             {users ? `${filteredUsers.length} of ${users.length}` : "··"}
           </Badge>
         </header>
-        <div className="flex flex-col gap-3 border-b border-border bg-surface-2/60 p-4 sm:flex-row sm:items-center sm:px-6">
+        <Panel variant="workspace">
+        <div className="flex flex-col gap-3 border-b border-border p-3 sm:flex-row sm:items-center">
           <div className="relative min-w-0 flex-1">
             <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-foreground-muted" aria-hidden />
             <Input
@@ -127,7 +125,7 @@ export function AdminSection({
             ]}
           />
         </div>
-        <div className="p-5 sm:p-6">
+        <div>
           {usersError ? (
             <EmptyState
               title="Couldn't load users"
@@ -165,7 +163,7 @@ export function AdminSection({
               }
             />
           ) : (
-            <div className="rounded-[var(--radius-md)] border border-border divide-y divide-border overflow-hidden">
+            <div className="divide-y divide-border overflow-hidden">
               {filteredUsers.map((u) => (
                 <div
                   key={u.id}
@@ -244,6 +242,7 @@ export function AdminSection({
           )}
         </div>
       </Panel>
+      </section>
 
       <ConfirmDialog
         open={pendingDeleteUser !== null}
