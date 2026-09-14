@@ -161,11 +161,17 @@ class ToolCallRecord(BaseModel):
     server_args: dict[str, Any] | None = None
     raw_args_valid: bool = False
     server_args_equal_raw: bool = False
+    transport_succeeded: bool = False
     server_succeeded: bool = False
     server_status_code: int | None = Field(default=None, ge=100, le=599)
     server_error_code: str | None = None
     error: str | None = None
     result_preview: str | None = None
+
+    @property
+    def operation_succeeded(self) -> bool:
+        """Whether the public MCP result represented a successful operation."""
+        return self.server_succeeded
 
     @property
     def argument_valid(self) -> bool:
@@ -348,6 +354,7 @@ def has_measured_evidence(outcome: TrialOutcome) -> bool:
 class _ObservedCall:
     tool_name: str
     server_args: dict[str, Any]
+    transport_succeeded: bool = False
     succeeded: bool = False
     status_code: int | None = None
     error_code: str | None = None
@@ -372,10 +379,13 @@ class ToolCallRecorder:
         try:
             result = await call(name, server_args)
         except Exception as exc:
+            observed.transport_succeeded = False
             observed.status_code, observed.error_code = error_details(exc)
             observed.error = redact_exception(exc, self.secrets)
             raise
-        observed.succeeded = True
+        observed.transport_succeeded = True
+        observed.error_code, observed.error = public_result_error(result, self.secrets)
+        observed.succeeded = observed.error_code is None
         result_text = canonical_json(safe_json(result, self.secrets))
         observed.result_preview = result_text[:2000] + ("…" if len(result_text) > 2000 else "")
         return result
@@ -409,6 +419,22 @@ def error_details(error: BaseException) -> tuple[int | None, str | None]:
         status_code if isinstance(status_code, int) else None,
         error_code if isinstance(error_code, str) else None,
     )
+
+
+def public_result_error(result: Any, secrets: tuple[str, ...]) -> tuple[str | None, str | None]:
+    """Extract a domain error from the normal MCP tool-result envelope."""
+    value = safe_json(result, secrets)
+    if isinstance(value, str) and value.startswith(("{", "[")):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return None, None
+    if isinstance(value, dict):
+        code = value.get("code")
+        message = value.get("error")
+        if isinstance(code, str) and isinstance(message, str):
+            return code, redact_text(message, secrets)
+    return None, None
 
 
 @dataclass(slots=True)
@@ -1105,6 +1131,7 @@ def bind_tool_calls(
                 server_args=observed.server_args if observed else None,
                 raw_args_valid=raw_valid,
                 server_args_equal_raw=bool(observed and raw_valid and observed.server_args == raw_dict),
+                transport_succeeded=bool(observed and (observed.transport_succeeded or observed.succeeded)),
                 server_succeeded=bool(observed and observed.succeeded),
                 server_status_code=observed.status_code if observed else None,
                 server_error_code=observed.error_code if observed else None,
@@ -1119,6 +1146,7 @@ def bind_tool_calls(
                 tool_name=observed.tool_name,
                 logical_operation=logical_operation_for(observed.tool_name, operation_map),
                 server_args=observed.server_args,
+                transport_succeeded=observed.transport_succeeded or observed.succeeded,
                 server_succeeded=observed.succeeded,
                 server_status_code=observed.status_code,
                 server_error_code=observed.error_code,
@@ -1151,7 +1179,10 @@ def _material_attempt_matches(call: ToolCallRecord, expected: ExpectedMaterialAt
         return call.server_succeeded
     return (
         not call.server_succeeded
-        and call.server_status_code == expected.status_code
+        and (
+            expected.status_code is None
+            or call.server_status_code == expected.status_code
+        )
         and call.server_error_code == expected.error_code
     )
 
@@ -1199,7 +1230,10 @@ def material_outcome_matches(
                 matched = False
         elif (
             call.server_succeeded
-            or call.server_status_code != contract.status_code
+            or (
+                contract.status_code is not None
+                and call.server_status_code != contract.status_code
+            )
             or call.server_error_code != contract.error_code
         ):
             matched = False

@@ -170,8 +170,8 @@ class ExpectedMaterialOutcome(ContractModel):
     @model_validator(mode="after")
     def validate_expected_outcome(self) -> ExpectedMaterialOutcome:
         if self.outcome == "permission_denied":
-            if self.status_code != 403 or not self.error_code:
-                raise ValueError("permission_denied outcomes must declare HTTP 403 and an error code")
+            if (self.status_code is not None and self.status_code != 403) or not self.error_code:
+                raise ValueError("permission_denied outcomes must declare the stable error code and optional HTTP 403")
         elif self.status_code is not None or self.error_code is not None:
             raise ValueError("successful outcomes cannot declare an error response")
         return self
@@ -190,10 +190,10 @@ class ExpectedMaterialAttempt(ContractModel):
             if self.status_code is not None or self.error_code is not None:
                 raise ValueError("successful attempts cannot declare an error response")
         elif self.outcome == "permission_denied":
-            if self.status_code != 403 or not self.error_code:
-                raise ValueError("permission_denied attempts must declare HTTP 403 and an error code")
-        elif self.status_code is None or self.status_code < 400 or not self.error_code:
-            raise ValueError("rejected attempts must declare an HTTP error and an error code")
+            if (self.status_code is not None and self.status_code != 403) or not self.error_code:
+                raise ValueError("permission_denied attempts must declare the stable error code and optional HTTP 403")
+        elif (self.status_code is not None and self.status_code < 400) or not self.error_code:
+            raise ValueError("rejected attempts must declare the stable error code and optional HTTP error")
         return self
 
 

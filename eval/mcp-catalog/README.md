@@ -50,9 +50,12 @@ count remain diagnostics; the primary action metric is the first material
 operation after authorized preparation. Authorization tasks target the exact
 synthetic vault `catalog-bench-vault-authorization` and declare the complete
 `akb_put` payload (`collection`, `title`, and `content`) plus an expected
-HTTP 403 `permission_denied` outcome. A correctly formed expected denial has
-valid arguments and a matching tool outcome; provider, transport, wrong-target,
-missing-attempt, and bypass errors do not pass.
+public `permission_denied` outcome (HTTP 403 when the transport exposes it).
+The adapter distinguishes a received tools/call response from a successful
+operation, so a normal MCP `{code,error}` envelope is scored by its stable
+code. A correctly formed expected denial has valid arguments and a matching
+tool outcome; provider, transport, wrong-target, missing-attempt, and bypass
+errors do not pass.
 
 The models are fixed to `deepseek/deepseek-v4-flash-0731` and
 `qwen/qwen3.8-27b`. Both requests use only the OpenRouter `parasail` upstream.

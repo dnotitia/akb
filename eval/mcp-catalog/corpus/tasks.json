@@ -220,7 +220,7 @@
     "required_attempted_operations": ["create"],
     "material_attempt_limits": {"create": 1},
     "expected_material_arguments": {"create": {"vault": "catalog-bench-vault-authorization", "collection": "", "title": "authorization-probe", "content": "permission probe"}},
-    "expected_material_outcomes": [{"logical_operation": "create", "outcome": "permission_denied", "status_code": 403, "error_code": "permission_denied"}],
+    "expected_material_outcomes": [{"logical_operation": "create", "outcome": "permission_denied", "error_code": "permission_denied"}],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
       "unchanged": ["/vaults"]
@@ -247,7 +247,7 @@
     "required_attempted_operations": ["create"],
     "material_attempt_limits": {"create": 1},
     "expected_material_arguments": {"create": {"vault": "catalog-bench-vault-authorization", "collection": "", "title": "authorization-probe", "content": "permission probe"}},
-    "expected_material_outcomes": [{"logical_operation": "create", "outcome": "permission_denied", "status_code": 403, "error_code": "permission_denied"}],
+    "expected_material_outcomes": [{"logical_operation": "create", "outcome": "permission_denied", "error_code": "permission_denied"}],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
       "unchanged": ["/vaults"]
@@ -275,7 +275,7 @@
     "material_attempt_limits": {"create": 2},
     "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}],
     "expected_material_attempts": [
-      {"logical_operation": "create", "arguments": {"name": "bad/name"}, "outcome": "rejected", "status_code": 400, "error_code": "invalid_argument"},
+      {"logical_operation": "create", "arguments": {"name": "bad/name"}, "outcome": "rejected", "error_code": "invalid_argument"},
       {"logical_operation": "create", "arguments": {"name": "catalog-bench-recovery"}, "outcome": "success"}
     ],
     "expected_final_state": {
@@ -301,7 +301,7 @@
     "material_attempt_limits": {"create": 2},
     "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}],
     "expected_material_attempts": [
-      {"logical_operation": "create", "arguments": {"name": "bad/name"}, "outcome": "rejected", "status_code": 400, "error_code": "invalid_argument"},
+      {"logical_operation": "create", "arguments": {"name": "bad/name"}, "outcome": "rejected", "error_code": "invalid_argument"},
       {"logical_operation": "create", "arguments": {"name": "catalog-bench-recovery"}, "outcome": "success"}
     ],
     "expected_final_state": {

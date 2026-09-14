@@ -151,6 +151,187 @@ async def test_expected_permission_denial_keeps_arguments_valid_and_matches_real
     assert outcome.success is True
 
 
+@pytest.mark.asyncio
+async def test_public_mcp_error_envelope_is_operation_failure_not_transport_failure() -> None:
+    _manifest, tasks = _loaded()
+    task = next(task for task in tasks if task.id == "authorization-readonly-b")
+    recorder = ToolCallRecorder(operation_map={"create": ["akb_put"]}, secrets=())
+
+    async def denied_call(_name: str, _arguments: dict[str, object]) -> dict[str, str]:
+        return {"error": "Requires 'writer' role", "code": "permission_denied"}
+
+    result = await recorder(
+        None,
+        denied_call,
+        "akb_put",
+        {
+            "vault": "catalog-bench-vault-authorization",
+            "collection": "",
+            "title": "authorization-probe",
+            "content": "permission probe",
+        },
+    )
+    records = bind_tool_calls(
+        [
+            (
+                "akb_put",
+                '{"vault":"catalog-bench-vault-authorization","collection":"","title":"authorization-probe","content":"permission probe"}',
+            )
+        ],
+        recorder.calls,
+        recorder.operation_map,
+        (),
+    )
+    outcome = TrialOutcome(
+        task_id=task.id,
+        category=task.category,
+        locale=task.locale,
+        arm="baseline",
+        model_class="primary",
+        model_id="model",
+        transport="http",
+        final_answer_text="Access is denied; I cannot create the document.",
+        first_logical_operation="create",
+        tool_calls=records,
+    )
+    state = StateObservation(True, 200, {"vaults": [{"name": "catalog-bench-vault-authorization"}]})
+    outcome.finalize(task, state, state)
+
+    assert result == {"error": "Requires 'writer' role", "code": "permission_denied"}
+    assert records[0].transport_succeeded is True
+    assert records[0].operation_succeeded is False
+    assert records[0].server_succeeded is False
+    assert records[0].server_status_code is None
+    assert records[0].server_error_code == "permission_denied"
+    assert records[0].argument_valid is True
+    assert outcome.argument_validity is True
+    assert outcome.tool_outcome_match is True
+    assert outcome.expected_error_match is True
+    assert outcome.success is True
+
+
+@pytest.mark.asyncio
+async def test_public_mcp_envelopes_score_recovery_sequence_and_reject_success_bypass() -> None:
+    _manifest, tasks = _loaded()
+    recovery_task = next(task for task in tasks if task.id == "invalid-recovery-b")
+    auth_task = next(task for task in tasks if task.id == "authorization-readonly-b")
+    recovery_recorder = ToolCallRecorder(operation_map={"create": ["akb_create_vault"]}, secrets=())
+
+    async def recovery_call(_name: str, arguments: dict[str, object]) -> dict[str, str]:
+        if arguments["name"] == "bad/name":
+            return {"error": "invalid vault name", "code": "invalid_argument"}
+        return {"name": "catalog-bench-recovery"}
+
+    await recovery_recorder(
+        None,
+        recovery_call,
+        "akb_create_vault",
+        {"name": "bad/name"},
+    )
+    await recovery_recorder(
+        None,
+        recovery_call,
+        "akb_create_vault",
+        {"name": "catalog-bench-recovery"},
+    )
+    recovery_records = bind_tool_calls(
+        [
+            ("akb_create_vault", '{"name":"bad/name"}'),
+            ("akb_create_vault", '{"name":"catalog-bench-recovery"}'),
+        ],
+        recovery_recorder.calls,
+        recovery_recorder.operation_map,
+        (),
+    )
+    recovery_outcome = TrialOutcome(
+        task_id=recovery_task.id,
+        category=recovery_task.category,
+        locale=recovery_task.locale,
+        arm="baseline",
+        model_class="primary",
+        model_id="model",
+        transport="http",
+        final_answer_text="The invalid name was rejected, then the recovery vault was created.",
+        first_logical_operation="create",
+        tool_calls=recovery_records,
+    )
+    recovery_outcome.finalize(
+        recovery_task,
+        StateObservation(True, 200, {"vaults": []}),
+        StateObservation(True, 200, {"vaults": [{"name": "catalog-bench-recovery"}]}),
+    )
+    assert recovery_records[0].transport_succeeded is True
+    assert recovery_records[0].operation_succeeded is False
+    assert recovery_records[0].server_error_code == "invalid_argument"
+    assert recovery_records[1].operation_succeeded is True
+    assert recovery_outcome.tool_outcome_match is True
+    assert recovery_outcome.success is True
+
+    success_recorder = ToolCallRecorder(operation_map={"create": ["akb_put"]}, secrets=())
+
+    async def successful_write(_name: str, _arguments: dict[str, object]) -> dict[str, str]:
+        return {"uri": "akb://catalog-bench-vault-authorization/doc/created"}
+
+    await success_recorder(
+        None,
+        successful_write,
+        "akb_put",
+        {
+            "vault": "catalog-bench-vault-authorization",
+            "collection": "",
+            "title": "authorization-probe",
+            "content": "permission probe",
+        },
+    )
+    success_records = bind_tool_calls(
+        [
+            (
+                "akb_put",
+                '{"vault":"catalog-bench-vault-authorization","collection":"","title":"authorization-probe","content":"permission probe"}',
+            )
+        ],
+        success_recorder.calls,
+        success_recorder.operation_map,
+        (),
+    )
+    success_outcome = TrialOutcome(
+        task_id=auth_task.id,
+        category=auth_task.category,
+        locale=auth_task.locale,
+        arm="baseline",
+        model_class="primary",
+        model_id="model",
+        transport="http",
+        final_answer_text="The document was created.",
+        first_logical_operation="create",
+        tool_calls=success_records,
+    )
+    state = StateObservation(True, 200, {"vaults": [{"name": "catalog-bench-vault-authorization"}]})
+    success_outcome.finalize(auth_task, state, state)
+    assert success_records[0].transport_succeeded is True
+    assert success_records[0].operation_succeeded is True
+    assert success_outcome.tool_outcome_match is False
+    assert success_outcome.success is False
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_is_not_a_public_operation_rejection() -> None:
+    recorder = ToolCallRecorder(operation_map={"create": ["akb_put"]}, secrets=())
+
+    async def transport_failure(_name: str, _arguments: dict[str, object]) -> object:
+        raise ConnectionError("connection closed")
+
+    with pytest.raises(ConnectionError):
+        await recorder(None, transport_failure, "akb_put", {})
+
+    records = bind_tool_calls(
+        [("akb_put", "{}")], recorder.calls, recorder.operation_map, ()
+    )
+    assert records[0].transport_succeeded is False
+    assert records[0].operation_succeeded is False
+    assert records[0].server_error_code is None
+
+
 def test_authorization_retry_fails_the_declared_single_attempt_limit() -> None:
     _manifest, tasks = _loaded()
     task = next(task for task in tasks if task.id == "authorization-readonly-b")
