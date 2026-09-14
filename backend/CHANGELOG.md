@@ -205,15 +205,11 @@ concurrent-index maintenance script supports posting-store upgrades. Search
 logs now separate embedding, candidate selection, retrieval, reranking and
 hydration, with pgvector leg and pool-wait timings that omit query/result data.
 Explicitly empty pgvector scopes return no results instead of scanning the
-whole index. A local synthetic benchmark checks ranking parity before and
-after adding indexes; see `docs/designs/search-performance.md` for limitations.
-
-An optional million-vector Helm overlay adds capacity-checked pgvector startup
-prewarm, PostgreSQL autoprewarm, and a hybrid-only common-term cutoff. Defaults
-remain unchanged. Sparse-only search remains exact, and cutoff-stat failures
-fall back to full BM25. Split API/worker deployments now observe vault-ID
-backfill readiness through the shared store instead of leaving the API on the
-large source-ID compatibility path indefinitely.
+whole index. Source-ID-filtered sparse retrieval materializes its authorized
+chunk set before joining common posting lists, bounding the join without
+changing BM25 terms or scores; wide vault filters retain the direct join. Local
+synthetic benchmarks and real-pgvector tests check ranking and scope parity; see
+`docs/designs/search-performance.md` for limitations.
 
 ### Applied search filters before result limits
 

@@ -1044,12 +1044,12 @@ class SearchService:
 
         # Hybrid (dense + BM25 sparse) via the configured driver. Returns [] on any vector-store
         # failure — PG is the source of truth, the index is rebuildable.
-        phase_started = time.perf_counter()
         #
         # source_types (workbench #1069): constrain the driver-side pre-filter
         # to the active Document arm (+ table/file, which have no second arm)
         # so stale points from the non-active arm can never consume the top-K.
         # `_hydrate_hits` keeps its arm-mismatch skip as defense in depth.
+        phase_started = time.perf_counter()
         hits, degraded_reason = await self._run_vector_search(
             query_text=query,
             query_embedding=query_embedding,
@@ -1729,7 +1729,6 @@ class SearchService:
         untouched. Previously every failure was swallowed into a silent ``[]``
         with no signal (issue #189)."""
         sparse_failed = False
-        sparse_pruned = False
         try:
             sparse_idx, sparse_vals = await sparse_encoder.encode_query(query_text)
         except Exception as e:  # noqa: BLE001
@@ -1737,45 +1736,13 @@ class SearchService:
             sparse_idx, sparse_vals = [], []
             sparse_failed = True
 
-        if (
-            not sparse_failed
-            and query_embedding is not None
-            and settings.bm25_hybrid_max_df_ratio > 0
-        ):
-            try:
-                original_sparse_count = len(sparse_idx)
-                sparse_idx, sparse_vals = await sparse_encoder.prune_common_query_terms(
-                    sparse_idx,
-                    sparse_vals,
-                    max_df_ratio=settings.bm25_hybrid_max_df_ratio,
-                )
-                sparse_pruned = original_sparse_count > 0 and not sparse_idx
-                if original_sparse_count != len(sparse_idx):
-                    logger.info(
-                        "hybrid sparse pruning retained %d/%d query terms "
-                        "(max_df_ratio=%.3f)",
-                        len(sparse_idx),
-                        original_sparse_count,
-                        settings.bm25_hybrid_max_df_ratio,
-                    )
-            except Exception as e:  # noqa: BLE001
-                # The cutoff is an optional latency optimization. If its stats
-                # lookup fails, preserve exact BM25 rather than degrading a
-                # healthy sparse leg.
-                logger.warning("hybrid sparse pruning failed; keeping all terms: %s", e)
-
         # OOV guard — fires ONLY when encode_query SUCCEEDED but produced no
         # vocab terms (nonsense query) AND the embedding API succeeded: the
         # right answer is []. Dense-only is a degraded mode for an outage, not
         # for OOV — Qwen3-style embeddings sit at ~0.4-0.5 cosine for unrelated
         # text and would return plausible-looking distractor neighbours. This
         # must NOT fire on a sparse-encoder FAILURE (that's degraded, not OOV).
-        if (
-            not sparse_failed
-            and not sparse_pruned
-            and not sparse_idx
-            and query_embedding is not None
-        ):
+        if not sparse_failed and not sparse_idx and query_embedding is not None:
             return [], None
 
         # Sparse encoder DOWN with no dense leg either → we can't search at all.

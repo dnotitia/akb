@@ -56,13 +56,6 @@ logger = logging.getLogger("akb.vector_store.pgvector")
 
 
 SparseShape = Literal["arrays", "posting"]
-StartupPrewarm = Literal["off", "index", "search"]
-
-# Leave working room for PostgreSQL catalogs, sessions and ordinary queries.
-# A requested warmup fails closed when the selected relations exceed this
-# fraction; loading a set larger than shared_buffers only evicts its own first
-# pages and gives operators a misleading green readiness signal.
-_PREWARM_SHARED_BUFFER_FRACTION = 0.90
 
 
 # RRF constant (Qdrant's default). Same value across drivers so the
@@ -115,8 +108,6 @@ class PgvectorStore:
         schema: str,
         dense_dim: int,
         sparse_shape: SparseShape,
-        startup_prewarm: StartupPrewarm = "off",
-        search_timeout_secs: float = 30.0,
         get_main_pool=None,  # callable returning the main PG pool, used when dsn is None
     ):
         if not _SCHEMA_NAME_RE.match(schema):
@@ -128,8 +119,6 @@ class PgvectorStore:
         self._schema = schema
         self._dense_dim = dense_dim
         self._sparse_shape = sparse_shape
-        self._startup_prewarm = startup_prewarm
-        self._search_timeout_secs = float(search_timeout_secs)
         self._get_main_pool = get_main_pool
         self._own_pool: asyncpg.Pool | None = None
         self._ensured_collection = False
@@ -140,10 +129,6 @@ class PgvectorStore:
         # The lock makes only the first caller hit the DB; the rest see
         # _ensured_collection=True and short-circuit.
         self._ensure_lock = asyncio.Lock()
-        self._startup_prewarm_status: dict[str, object] = {
-            "mode": startup_prewarm,
-            "state": "disabled" if startup_prewarm == "off" else "pending",
-        }
 
     async def _pool(self) -> asyncpg.Pool:
         """Return the pool we read/write through."""
@@ -475,210 +460,6 @@ class PgvectorStore:
         except Exception:  # noqa: BLE001
             return False
 
-    def startup_prewarm_status(self) -> dict[str, object]:
-        """Return safe operational metadata for ``/health``.
-
-        Relation names, credentials and query values are intentionally absent.
-        """
-        return dict(self._startup_prewarm_status)
-
-    async def startup_prewarm(self) -> None:
-        """Restore the configured pgvector read working set before API readiness.
-
-        ``index`` loads only the dense HNSW relation. ``search`` additionally
-        loads the chunks heap and its TOAST heap/index: filtered HNSW execution
-        can detoast vectors even when the SELECT list only returns ``chunk_id``.
-        Every selected relation is loaded into shared buffers so PostgreSQL's
-        optional autoprewarm worker can restore the same pages after a database
-        restart. The mode is opt-in because a million 1024-dimensional vectors
-        need a materially larger cache than AKB's general-purpose default.
-        """
-        mode = self._startup_prewarm
-        if mode == "off":
-            return
-
-        self._startup_prewarm_status = {"mode": mode, "state": "running"}
-        started = time.perf_counter()
-        try:
-            await self.ensure_collection()
-            pool = await self._pool()
-            async with pool.acquire() as conn:
-                await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_prewarm")
-                async with conn.transaction():
-                    await conn.execute(
-                        "SELECT pg_advisory_xact_lock($1)",
-                        _advisory_lock_key(f"{self._schema}:startup_prewarm"),
-                    )
-                    await conn.execute(
-                        f"""
-                        CREATE TABLE IF NOT EXISTS "{self._schema}".startup_prewarm_state (
-                            singleton           BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
-                            server_started_at    TIMESTAMPTZ NOT NULL,
-                            mode                 TEXT NOT NULL,
-                            relation_signature   TEXT NOT NULL,
-                            relation_bytes       BIGINT NOT NULL,
-                            loaded_blocks        BIGINT NOT NULL,
-                            duration_ms          DOUBLE PRECISION NOT NULL,
-                            completed_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                        )
-                        """
-                    )
-
-                    hnsw_oid = await conn.fetchval(
-                        """
-                        SELECT i.indexrelid
-                          FROM pg_index i
-                          JOIN pg_class c ON c.oid = i.indexrelid
-                          JOIN pg_namespace n ON n.oid = c.relnamespace
-                         WHERE n.nspname = $1 AND c.relname = 'idx_vi_chunks_dense'
-                        """,
-                        self._schema,
-                    )
-                    chunks_oid = await conn.fetchval(
-                        "SELECT to_regclass($1)::oid",
-                        f'"{self._schema}".chunks',
-                    )
-                    if hnsw_oid is None or chunks_oid is None:
-                        raise RuntimeError("pgvector search relations are not initialized")
-
-                    relation_oids = [int(hnsw_oid)]
-                    if mode == "search":
-                        relation_oids.append(int(chunks_oid))
-                        toast_oid = await conn.fetchval(
-                            "SELECT reltoastrelid FROM pg_class WHERE oid = $1::oid",
-                            int(chunks_oid),
-                        )
-                        if toast_oid:
-                            relation_oids.append(int(toast_oid))
-                            relation_oids.extend(
-                                int(row["indexrelid"])
-                                for row in await conn.fetch(
-                                    "SELECT indexrelid FROM pg_index WHERE indrelid = $1::oid",
-                                    int(toast_oid),
-                                )
-                            )
-
-                    relation_rows = await conn.fetch(
-                        """
-                        SELECT c.oid::bigint AS oid,
-                               c.relfilenode::bigint AS relfilenode,
-                               pg_relation_size(c.oid)::bigint AS bytes
-                          FROM pg_class c
-                         WHERE c.oid = ANY($1::oid[])
-                         ORDER BY c.oid
-                        """,
-                        relation_oids,
-                    )
-                    relation_bytes = sum(int(row["bytes"]) for row in relation_rows)
-                    shared_buffers_bytes = int(
-                        await conn.fetchval(
-                            "SELECT pg_size_bytes(current_setting('shared_buffers'))"
-                        )
-                    )
-                    safe_bytes = int(
-                        shared_buffers_bytes * _PREWARM_SHARED_BUFFER_FRACTION
-                    )
-                    if relation_bytes > safe_bytes:
-                        raise RuntimeError(
-                            "pgvector startup prewarm working set does not fit safely: "
-                            f"selected={relation_bytes} bytes, shared_buffers={shared_buffers_bytes} "
-                            f"bytes, allowed_fraction={_PREWARM_SHARED_BUFFER_FRACTION:.2f}; "
-                            "increase the vector PostgreSQL cache or use a narrower/off mode"
-                        )
-
-                    signature_material = ",".join(
-                        f'{int(row["oid"])}:{int(row["relfilenode"])}:{int(row["bytes"])}'
-                        for row in relation_rows
-                    )
-                    relation_signature = hashlib.sha256(
-                        signature_material.encode("ascii")
-                    ).hexdigest()
-                    server_started_at = await conn.fetchval(
-                        "SELECT pg_postmaster_start_time()"
-                    )
-                    previous = await conn.fetchrow(
-                        f"""
-                        SELECT loaded_blocks, duration_ms
-                          FROM "{self._schema}".startup_prewarm_state
-                         WHERE singleton = TRUE
-                           AND server_started_at = $1
-                           AND mode = $2
-                           AND relation_signature = $3
-                        """,
-                        server_started_at,
-                        mode,
-                        relation_signature,
-                    )
-                    if previous is not None:
-                        self._startup_prewarm_status = {
-                            "mode": mode,
-                            "state": "ready",
-                            "source": "peer",
-                            "relation_bytes": relation_bytes,
-                            "loaded_blocks": int(previous["loaded_blocks"]),
-                            "duration_ms": round(float(previous["duration_ms"]), 2),
-                        }
-                        return
-
-                    loaded_blocks = 0
-                    for oid in relation_oids:
-                        loaded_blocks += int(
-                            await conn.fetchval(
-                                "SELECT pg_prewarm($1::oid::regclass, 'buffer')",
-                                oid,
-                                timeout=900,
-                            )
-                        )
-                    duration_ms = (time.perf_counter() - started) * 1000
-                    await conn.execute(
-                        f"""
-                        INSERT INTO "{self._schema}".startup_prewarm_state
-                            (singleton, server_started_at, mode, relation_signature,
-                             relation_bytes, loaded_blocks, duration_ms, completed_at)
-                        VALUES (TRUE, $1, $2, $3, $4, $5, $6, NOW())
-                        ON CONFLICT (singleton) DO UPDATE SET
-                            server_started_at = EXCLUDED.server_started_at,
-                            mode = EXCLUDED.mode,
-                            relation_signature = EXCLUDED.relation_signature,
-                            relation_bytes = EXCLUDED.relation_bytes,
-                            loaded_blocks = EXCLUDED.loaded_blocks,
-                            duration_ms = EXCLUDED.duration_ms,
-                            completed_at = EXCLUDED.completed_at
-                        """,
-                        server_started_at,
-                        mode,
-                        relation_signature,
-                        relation_bytes,
-                        loaded_blocks,
-                        duration_ms,
-                    )
-                    self._startup_prewarm_status = {
-                        "mode": mode,
-                        "state": "ready",
-                        "source": "local",
-                        "relation_bytes": relation_bytes,
-                        "loaded_blocks": loaded_blocks,
-                        "duration_ms": round(duration_ms, 2),
-                    }
-                    logger.info(
-                        "pgvector startup prewarm complete mode=%s relations=%d "
-                        "bytes=%d blocks=%d duration_ms=%.2f",
-                        mode,
-                        len(relation_oids),
-                        relation_bytes,
-                        loaded_blocks,
-                        duration_ms,
-                    )
-        except Exception as error:
-            self._startup_prewarm_status = {
-                "mode": mode,
-                "state": "failed",
-                "error": str(error),
-            }
-            raise VectorStoreUnavailable(
-                f"pgvector startup prewarm failed: {error}"
-            ) from error
-
     async def vault_backfill_pending(self) -> int:
         """How many points still have NULL `vault_id` (issue #189 Phase 2). The
         vault filter (`vault_filter_enabled`) is only safe to enable once this is
@@ -884,21 +665,12 @@ class PgvectorStore:
                 async with pool.acquire() as c:
                     timings["dense_wait"] = time.perf_counter() - begin
                     await self._ensure_codec(c)
-                    async def _query() -> list[str]:
-                        return await self._search_dense(
-                            c, query_dense=query_dense,
-                            filter_uuids=filter_uuids, filter_col=filter_col,
-                            source_type_values=source_type_values,
-                            limit=prefetch_per_leg,
-                        )
-                    if self._search_timeout_secs == 30.0:
-                        return await _query()
-                    async with c.transaction():
-                        await c.execute(
-                            "SELECT set_config('statement_timeout', $1, true)",
-                            f"{int(self._search_timeout_secs * 1000)}ms",
-                        )
-                        return await _query()
+                    return await self._search_dense(
+                        c, query_dense=query_dense,
+                        filter_uuids=filter_uuids, filter_col=filter_col,
+                        source_type_values=source_type_values,
+                        limit=prefetch_per_leg,
+                    )
             finally:
                 timings["dense"] = time.perf_counter() - begin
 
@@ -908,22 +680,13 @@ class PgvectorStore:
                 async with pool.acquire() as c:
                     timings["sparse_wait"] = time.perf_counter() - begin
                     await self._ensure_codec(c)
-                    async def _query() -> list[str]:
-                        return await self._search_sparse(
-                            c, terms=list(query_sparse_indices),
-                            weights=list(query_sparse_values),
-                            filter_uuids=filter_uuids, filter_col=filter_col,
-                            source_type_values=source_type_values,
-                            limit=prefetch_per_leg,
-                        )
-                    if self._search_timeout_secs == 30.0:
-                        return await _query()
-                    async with c.transaction():
-                        await c.execute(
-                            "SELECT set_config('statement_timeout', $1, true)",
-                            f"{int(self._search_timeout_secs * 1000)}ms",
-                        )
-                        return await _query()
+                    return await self._search_sparse(
+                        c, terms=list(query_sparse_indices),
+                        weights=list(query_sparse_values),
+                        filter_uuids=filter_uuids, filter_col=filter_col,
+                        source_type_values=source_type_values,
+                        limit=prefetch_per_leg,
+                    )
             finally:
                 timings["sparse"] = time.perf_counter() - begin
 
@@ -1039,7 +802,6 @@ class PgvectorStore:
                     """,
                     list(query_dense), filter_uuids, int(limit),
                     *([source_type_values] if source_type_values else []),
-                    timeout=self._search_timeout_secs,
                 )
         else:
             rows = await conn.fetch(
@@ -1052,7 +814,6 @@ class PgvectorStore:
                 """,
                 list(query_dense), int(limit),
                 *([source_type_values] if source_type_values else []),
-                timeout=self._search_timeout_secs,
             )
         return [r["chunk_id"] for r in rows]
 
@@ -1106,7 +867,6 @@ class PgvectorStore:
                     rows = await conn.fetch(
                         sql, list(terms), [float(w) for w in weights],
                         filter_uuids, int(limit), source_type_values,
-                        timeout=self._search_timeout_secs,
                     )
                 else:
                     sql = f"""
@@ -1132,7 +892,6 @@ class PgvectorStore:
                     rows = await conn.fetch(
                         sql, list(terms), [float(w) for w in weights],
                         filter_uuids, int(limit),
-                        timeout=self._search_timeout_secs,
                     )
             elif source_type_values:
                 sql = f"""
@@ -1154,7 +913,6 @@ class PgvectorStore:
                 rows = await conn.fetch(
                     sql, list(terms), [float(w) for w in weights], int(limit),
                     source_type_values,
-                    timeout=self._search_timeout_secs,
                 )
             else:
                 sql = f"""
@@ -1174,19 +932,14 @@ class PgvectorStore:
                 """
                 rows = await conn.fetch(
                     sql, list(terms), [float(w) for w in weights], int(limit),
-                    timeout=self._search_timeout_secs,
                 )
         else:  # posting
             if filter_uuids:
                 if filter_col == "source_id":
-                    # A source filter can contain thousands of document IDs,
-                    # while one common term can match nearly the whole corpus.
-                    # Letting the planner inline this relation often starts at
-                    # the common posting list and discards almost everything
-                    # only after the chunks join. Materializing the authorized
-                    # chunk IDs first gives that bounded set a stable cost and
-                    # prevents the narrow-filter/common-term worst case. The
-                    # candidate CTE changes only join order, never BM25 scores.
+                    # Source lists can contain thousands of IDs while a common
+                    # term can match almost the whole corpus. Bound the join by
+                    # materializing the authorized chunk IDs first. This only
+                    # changes join order; terms, weights and scores are intact.
                     sql = f"""
                         WITH q AS (
                           SELECT unnest($1::bigint[]) AS tid,
@@ -1208,8 +961,9 @@ class PgvectorStore:
                         LIMIT $4
                     """
                 else:
-                    # Vault filtering is already a compact relation predicate;
-                    # forcing a 90%-of-corpus materialization would be harmful.
+                    # A vault filter can cover most of the corpus. Forcing that
+                    # large set into a materialized CTE would increase memory and
+                    # temporary-I/O pressure, so leave its direct join intact.
                     sql = f"""
                         WITH q AS (
                           SELECT unnest($1::bigint[]) AS tid,
@@ -1230,7 +984,6 @@ class PgvectorStore:
                     sql, list(terms), [float(w) for w in weights],
                     filter_uuids, int(limit),
                     *([source_type_values] if source_type_values else []),
-                    timeout=self._search_timeout_secs,
                 )
             elif source_type_values:
                 sql = f"""
@@ -1250,7 +1003,7 @@ class PgvectorStore:
                 """
                 rows = await conn.fetch(
                     sql, list(terms), [float(w) for w in weights], int(limit),
-                    source_type_values, timeout=self._search_timeout_secs,
+                    source_type_values,
                 )
             else:
                 sql = f"""
@@ -1268,7 +1021,6 @@ class PgvectorStore:
                 """
                 rows = await conn.fetch(
                     sql, list(terms), [float(w) for w in weights], int(limit),
-                    timeout=self._search_timeout_secs,
                 )
 
         return [r["chunk_id"] for r in rows]

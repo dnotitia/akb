@@ -2,11 +2,9 @@
 
 ## Scope and evidence
 
-This change improves PostgreSQL/pgvector retrieval while preserving the default
-BM25 weights, dense embeddings, RRF, reranking, candidate limits, and application
-authorization. An optional large-corpus profile can omit very common BM25 query
-terms when a dense leg is available; that explicit latency/relevance tradeoff is
-disabled by default. It does not replace the search engine or deploy a new model.
+This change improves PostgreSQL/pgvector posting retrieval without changing
+BM25 weights, dense embeddings, RRF, reranking, candidate limits, or application
+authorization. It does not replace the search engine or deploy a new model.
 
 A read-only investigation of an older deployed backend found:
 
@@ -116,6 +114,19 @@ The pgvector driver now treats `source_ids=[]` or `vault_ids=[]` as no matches.
 scan if a caller passes an empty authorized set. It supplements, rather than
 replaces, the service's existing authorization checks.
 
+### Bound source-filtered sparse joins
+
+Source-ID filters may contain thousands of already authorized documents while a
+common BM25 term can match nearly the whole posting corpus. The posting query now
+materializes only the matching chunk IDs before joining the posting list. This
+stabilizes that bounded candidate side without changing query terms, weights,
+scores, result limits or authorization.
+
+Vault filtering keeps its direct join. A vault scope can legitimately cover most
+of the corpus, and materializing that large set would add memory and temporary-I/O
+pressure. The two branches are deliberately different based on their data shape,
+not exposed as memory-size profiles or deployment tuning.
+
 ## Local benchmark
 
 The reproducible script is `backend/scripts/benchmark_search_posting.py`.
@@ -167,8 +178,7 @@ acceleration. No reliable concurrent-write or cold-cache result is claimed.
 
 The benchmark isolates sparse SQL; it is **not full HTTP search latency** and
 does not model the production corpus's distribution. Native document-head
-verification, long source-ID lists and external embedding/reranking require
-separate measurements.
+verification and external embedding/reranking require separate measurements.
 
 ## Functional verification
 
@@ -177,7 +187,8 @@ separate measurements.
 
 - New covering definitions and preservation of old indexes on startup.
 - Dense+sparse retrieval, dense-only and sparse-only fallback.
-- Vault/source scoping and explicitly empty authorized sets.
+- Vault/source scoping, the bounded source-ID join, and explicitly empty
+  authorized sets.
 - Timing output without fixture query text, source IDs or result content.
 
 The maintenance SQL was also executed twice against a disposable local database:
@@ -185,14 +196,16 @@ all three indexes were valid/ready, and the second execution was idempotent.
 Search filter, source URI, parent-context, native selection, reranking and
 multi-vault regression suites remain part of the verification gate.
 
-Validation on this branch: **66 search regression tests, four real-pgvector
-tests, and one live HTTP scenario passed**. The HTTP scenario ran against a
-separate local repository-owned runtime with deterministic embedding responses,
-not the existing development stack. It covered registration/login, document
-creation and asynchronous indexing, tags/types/archive/collection boundaries,
-result-limit ordering, unauthorized access, and file/table search. Ruff, mypy
-for the two changed service modules, and whitespace checks passed. No real
-external embedding/reranker latency or browser SSO behavior was tested here.
+Validation after reducing the change to this bounded scope: **104 focused search
+regression tests and two real-pgvector tests passed**. A 1,000-chunk/64,000-
+posting smoke benchmark also preserved exact ordered IDs and scores in all 18
+before/after cases. Earlier on the same branch, one live HTTP scenario ran
+against a separate local repository-owned runtime with deterministic embedding
+responses. It covered registration/login, document creation and asynchronous
+indexing, tags/types/archive/collection boundaries, result-limit ordering,
+unauthorized access, and file/table search. Ruff, mypy for the two changed
+service modules, and whitespace checks passed. No real external
+embedding/reranker latency or browser SSO behavior was tested here.
 
 PR review also added DB-free coverage for empty scopes and stage timing units,
 moved the empty-scope return ahead of database initialization, and delayed the
@@ -200,28 +213,11 @@ successful driver timing flag until payload conversion succeeds. The new
 real-pgvector suite runs in the existing CI database job rather than silently
 skipping in both jobs. These adjustments do not change ranking or measured SQL.
 
-## Alternatives and next decisions
-
-- Do not add a reranker to address a sparse database bottleneck: this deployment
-  already uses one, and reranking adds another network/model stage.
-- Do not lower candidate counts blindly: that changes recall, especially after
-  source deduplication and filtering.
-- Do not replace source filters with vault-only filtering when archive/type
-  constraints require source selection. That would undo correctness fixes.
-- A materialized aggregate-before-scope experiment was slower locally; a
-  redundant term predicate did not show a consistent gain. Neither is shipped.
-- Dense HNSW filtering can still dominate for some workloads. Measure its
-  iterative scans and selectivity before tuning recall/latency parameters;
-  see [pgvector filtering guidance](https://github.com/pgvector/pgvector#filtering).
-- Collect current per-stage timings before adding caches, changing engines or
-  provisioning models. An engine replacement needs a relevance dataset and
-  operational cost comparison, not just this SQL benchmark.
-
 **Status:** a bounded first improvement, not a claim that every slow production
 search is resolved. Production remains unchanged. Existing installations need
 an explicitly approved index-maintenance step to receive the index benefit.
 
-## Production-scale cache follow-up
+## Production-scale validation
 
 A further read-only settings check found production `shared_buffers=2 GiB`,
 `effective_cache_size=6 GiB`, `work_mem=32 MiB`, `random_page_cost=1.1`, and
@@ -354,208 +350,13 @@ indexes were retained. The application/ranking logic and measurement memory
 budget were unchanged. Only read-mostly data was tested: updates and visibility
 map churn can reduce index-only benefits and need separate verification.
 
-### Consequence for the next improvement
+### Decision from the scale validation
 
-Keep the covering-index improvement as the first bounded change: it reduced
-both repeated BM25 cost and the observed cache competition. Treat startup
-warming as a separate follow-up, for example evaluating bounded hot-block
-restoration through `pg_prewarm`/autoprewarm in this isolated environment.
-Do not preload an entire 7.8 GiB index into a 2 GiB cache or raise all memory
-limits indiscriminately. At that experiment stage no warming configuration was
-enabled; the opt-in target profile below is the separately validated follow-up.
-A true host/VM cold-disk experiment, concurrent writes, production
-query diversity and whole-request embedding/reranker latency remain untested.
+Only the changes that reduce recurring reads under the existing memory budget
+are retained: covering indexes, the bounded source-ID join, empty-scope
+short-circuiting and stage diagnostics. No 8/32 GiB profile, startup prewarm,
+readiness delay, retrieval-timeout expansion, BM25 term cutoff, candidate-limit
+change or engine replacement is enabled. The remaining first-read latency is a
+documented limitation rather than a hidden tuning policy.
 
 No production deployment, restart, index change or setting change was made.
-
-## Million-vector target profile
-
-The follow-up implementation adds an opt-in Helm overlay for a pgvector corpus
-around one million 1,024-dimensional embeddings:
-`deploy/helm/akb/tuning/pgvector-million-1024d.yaml`. It composes with both
-`standalone` and `standalone-sso`; it is not a third application profile.
-
-```bash
-helm upgrade --install akb deploy/helm/akb \
-  --namespace akb \
-  --values deploy/helm/akb/profiles/standalone.yaml \
-  --values deploy/helm/akb/tuning/pgvector-million-1024d.yaml
-```
-
-The overlay is a measured reference, not automatic capacity detection. It sets
-`shared_buffers=16GB`, enables PostgreSQL autoprewarm, requests 16 GiB and limits
-the database container to 36 GiB. The application loads the HNSW index plus the
-vector heap/TOAST search working set before becoming ready. It refuses startup
-when the selected relations exceed 90% of `shared_buffers`, so an undersized
-deployment cannot report a misleading healthy warmup. `/health` publishes only
-safe status, byte, block, source and duration metadata.
-
-The database records autoprewarm state so PostgreSQL can restore the buffer set
-after restart. The application also stores one completion record keyed by the
-PostgreSQL postmaster start time, selected mode and relation signature. This
-prevents duplicate loads across API replicas while ensuring a new database
-process or changed relation is warmed again. Worker-only processes skip the
-application prewarm.
-
-Two query-path changes complement cache restoration:
-
-- Source-filtered posting search materializes the already authorized chunk IDs
-  before joining a common posting list. This changes join order, not BM25 scores;
-  the regression fixture preserved ordered IDs and scores in all tested cases.
-- `bm25_hybrid_max_df_ratio` optionally omits terms above a document-frequency
-  ratio only when dense retrieval succeeded. The default `0` keeps exact BM25.
-  The scale overlay uses `0.8`. A sparse-only deployment or embedding outage
-  retains every term, and a failed cutoff-stat lookup falls back to exact BM25.
-
-The vault-filter activation gate was also corrected for split deployments. The
-background worker and API are separate processes, so the worker's memory-only
-“backfill complete” flag could never activate the API. While gated, each API
-process now checks the durable store at most once per 15 seconds and latches the
-result locally. It fails closed to the correct source-ID path on any check error.
-
-### Isolated Kubernetes result
-
-The target was validated in namespace `akb-search-perf-20260908`; no production
-resource was modified. The fixture contained 997,935 vectors, 71,536,566 posting
-rows and 100 vaults. It exercised local login, 10% and 90% vault access, archive,
-type, tag and explicit-vault filters, five concurrent requests, and cross-vault
-result assertions.
-
-After a PostgreSQL and backend restart, application prewarm loaded
-14,509,932,544 bytes (1,771,232 blocks) in 10.20 seconds before readiness.
-PostgreSQL autoprewarm restored 1,907,704 previously loaded blocks. The database
-cgroup used about 32.4 GB of a 36 GiB limit and reported zero OOM events. A 24 GiB
-limit tested earlier reached its hard ceiling and was rejected; `kubectl top`
-alone understated the page-cache pressure.
-
-Steady HTTP measurements (105 requests) were:
-
-| Scenario | p95 | Maximum |
-| --- | ---: | ---: |
-| All tested requests | 985 ms | 1,009 ms |
-| 90% access, default archive filter | 1,009 ms | 1,009 ms |
-| 90% access, type filter | 616 ms | 616 ms |
-| 90% access, tag filter | 467 ms | 467 ms |
-| 10% access, default archive filter | 327 ms | 327 ms |
-| Five concurrent requests | 763 ms | 763 ms |
-
-The first request after process restart took 2.66 seconds because Kiwi initialized
-its tokenizer process on first use; subsequent identical requests were about
-0.19 seconds. This satisfies the chosen exceptional restart ceiling of 5 seconds,
-but it is not counted as steady-state p95. A synthetic rare term below the 0.8
-cutoff exercised both dense and BM25 legs in 360 ms, confirming that the profile
-does not turn all searches into dense-only retrieval.
-
-These numbers are specific to the synthetic distribution and test storage. Before
-using the overlay elsewhere, measure relation size, cgroup memory including page
-cache, real query document-frequency distribution, relevance, write load and the
-actual embedding/reranker network stages. The common-term cutoff is intentionally
-opt-in because some corpora may value exact lexical contribution over this
-latency bound.
-
-## Fixed-memory million-vector profile
-
-The full-working-set profile above has a hard capacity boundary: its selected
-14.51 GB relation set already consumes most of the 16 GB shared-buffer safety
-budget and the PostgreSQL cgroup used about 32.4 GB. Keeping that strategy while
-the corpus grows means repeatedly increasing memory. It is therefore a
-latency-first option, not the default growth model.
-
-`deploy/helm/akb/tuning/pgvector-million-bounded-1024d.yaml` provides the
-complementary memory-first model:
-
-```text
-disk-backed corpus and HNSW (larger than RAM)
-             |
-             v
-PostgreSQL 3 GiB shared-buffer hot set  -- recorded/restored by autoprewarm
-             |
-             v
-8 GiB database cgroup ceiling          -- leaves room for OS cache and queries
-```
-
-It does not call the application full-relation prewarmer, so adding rows does not
-eventually make readiness fail merely because every vector cannot fit in RAM.
-PostgreSQL autoprewarm records at most the pages represented in the bounded
-shared buffers; those pages are still evictable. This favors recurring queries
-after restart while accepting that a new graph path may read from storage.
-
-A clean local PostgreSQL 16 restart check confirmed that this database feature
-does not depend on the AKB application prewarmer. With `shared_buffers=64MB`,
-the `pg_prewarm` library in `shared_preload_libraries`, and no `pg_prewarm` SQL
-extension installed, the background worker recorded the live buffer inventory.
-After a clean container restart it restored 8,191 of 8,192 recorded blocks;
-`pg_buffercache` observed 7,308 table and 494 index blocks from the exercised
-relation. The disposable container and volume were removed after verification.
-
-The first isolated API request after switching the existing million-vector
-fixture to this memory limit exposed a separate correctness concern: the dense
-leg spent about 33.1 seconds on a cold source-filtered HNSW path, crossed the
-hard-coded 30-second main-pool limit, and the API returned HTTP 200 with
-`degraded=true` and no results. The bounded overlay therefore configures a
-90-second **pgvector retrieval-only** budget. A first restored query completed in
-0.42 seconds, but the immediately following unseen path still crossed a
-60-second trial budget after about 61.8 seconds in the dense leg. The driver
-applies 90 seconds to both the client wait and PostgreSQL `statement_timeout`
-inside the retrieval transaction; the main CRUD pool keeps its 30-second guard.
-This prevents a measured valid cold read from being mislabeled as a zero-match
-but does not claim a latency gain or make 90 seconds an acceptable SLO.
-
-Autoprewarm recorded exactly 393,216 blocks, the configured 3 GiB shared-buffer
-capacity. On the confirmation restart PostgreSQL accepted connections at
-05:29:59 UTC and its Kubernetes Pod became Ready at 05:30:04, while the
-background worker did not finish restoring those blocks until 05:30:27.9.
-`pg_isready` therefore exposed a roughly 29-second connection-to-restore gap.
-The bounded Helm overlay sets its PostgreSQL readiness initial delay to 45
-seconds for this reference fixture. This is a measured deployment guard, not a
-portable proof of completion; installations with different storage must time
-their own restore and adjust the value.
-
-The final restart experiment kept the 8 GiB cgroup limit and alternated restored
-centres with previously untouched centres. The 90%-scope cold population used
-centres 24–31, disjoint from both the hot set and all earlier cold probes. This
-corrected an earlier 2–4 second observation whose vector pages had already been
-read by the preceding 10%-scope run.
-
-| Authorized scope / request state | p50 | p95 | Result |
-| --- | ---: | ---: | --- |
-| 10% / restored first request | 1.050 s | 1.709 s | 25 results |
-| 10% / untouched first request | 70.199 s | 77.447 s | 25 results |
-| 10% / untouched repeat | 0.191 s | 0.310 s | 25 results |
-| 90% / restored first request | 1.349 s | 1.897 s | 25 results |
-| 90% / independently untouched first request | 22.603 s | 25.493 s | 25 results |
-| 90% / independently untouched repeat | 0.941 s | 0.956 s | 25 results |
-
-The large difference between 10% and 90% cold latency is expected for this
-filtered HNSW fixture: a narrow authorized set makes the approximate scan visit
-more graph candidates before it can return 25 permitted rows. It is not evidence
-that broader permissions are intrinsically faster in every corpus. More
-importantly, both scopes collapse to sub-second or low-single-second latency on
-repeat, confirming storage reads rather than embedding or reranking as the
-dominant untouched-path cost.
-
-A subsequent 105-request HTTP scenario covered login, 10% and 90% authorization,
-archive/type/tag/vault filters, result isolation, and five concurrent searches.
-All requests returned non-degraded authorized results. Overall p95 was 1.015
-seconds and the five-request burst p95 was 0.784 seconds. One first tag-filter
-request took 2.124 seconds and first vault-filter requests took 10.289–13.091
-seconds; their repeats were fast. These outliers reinforce that the bounded
-profile stabilizes the restored working set but cannot pre-populate every filter
-and graph path. The database remained below its hard cgroup event threshold
-(`memory.events max=0`, `oom=0`, `oom_kill=0`) throughout the sequence, although
-Linux correctly used almost all otherwise idle memory for reclaimable cache.
-
-The profile keeps the already validated covering indexes and 0.8 hybrid
-common-term cutoff. Those changes reduce avoidable BM25 cache churn; they do not
-pin dense pages or remove storage latency. A complete capacity result must report
-restored and unseen queries separately, because averaging them hides the user
-who happens to issue the first new search after restart.
-
-Fixed memory is a bound, not magic compression. With additional data one or more
-of cold latency, storage throughput, CPU, or ANN recall eventually changes. The
-next structural step is justified only after the bounded profile misses its
-measured objective: partition/reroute by vault or tenant where selectivity is
-stable, or compare a disk-oriented vector store whose original vectors remain on
-disk while a smaller navigation/quantized layer is cached. Any approximation
-must pass exact filtered top-K recall gates; the earlier halfvec experiment was
-rejected after recall@20 fell to 0.50–0.55 despite reranking 5,000 candidates.

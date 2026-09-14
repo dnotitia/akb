@@ -89,100 +89,15 @@ async def test_synthetic_hybrid_acl_empty_scope_and_timing(local_store, caplog):
     assert "hybrid_timing" in caplog.text
     assert "PRIVATE" not in caplog.text
     assert all(value not in caplog.text for value in vaults + sources)
-    # Merge regression: the active-authority source_type filter from main must
-    # compose with both the vault predicate and this branch's retrieval timeout.
-    store._search_timeout_secs = 60
-    typed = await store.hybrid_search(
-        **args,
-        source_ids=None,
-        vault_ids=[vaults[0]],
-        source_types=["document"],
-    )
-    assert len(typed) == 10
-    assert await store.hybrid_search(
-        **args,
-        source_ids=None,
-        vault_ids=[vaults[0]],
-        source_types=["table"],
-    ) == []
-    store._search_timeout_secs = 30
-    one = await store.hybrid_search(
-        **args, source_ids=[sources[3]], source_types=["document"],
-    )
+    one = await store.hybrid_search(**args, source_ids=[sources[3]])
     assert [str(hit.source_id) for hit in one] == [sources[3]]
+    typed = await store.hybrid_search(
+        **args, source_ids=[sources[3]], source_types=["document"]
+    )
+    assert [str(hit.source_id) for hit in typed] == [sources[3]]
     assert await store.hybrid_search(**args, source_ids=[]) == []
     assert await store.hybrid_search(**args, source_ids=None, vault_ids=[]) == []
     sparse = await store.hybrid_search(**(args | {"query_dense": None}), source_ids=[sources[3]])
     dense = await store.hybrid_search(**(args | {"query_sparse_indices": [], "query_sparse_values": []}), source_ids=[sources[3]])
     assert [str(hit.source_id) for hit in sparse] == [sources[3]]
     assert [str(hit.source_id) for hit in dense] == [sources[3]]
-
-
-async def test_startup_search_prewarm_is_sized_reported_and_shared(local_store):
-    store = local_store
-    await store.upsert_one(
-        chunk_id=str(uuid.uuid4()),
-        source_id=str(uuid.uuid4()),
-        vault_id=str(uuid.uuid4()),
-        source_type="document",
-        content="small prewarm contract fixture",
-        section_path=None,
-        chunk_index=0,
-        dense=[1.0, *([0.0] * 31)],
-        sparse_indices=[1],
-        sparse_values=[1.0],
-    )
-    store._startup_prewarm = "search"
-
-    await store.startup_prewarm()
-
-    status = store.startup_prewarm_status()
-    assert status["state"] == "ready"
-    assert status["source"] == "local"
-    assert status["relation_bytes"] > 0
-    assert status["loaded_blocks"] > 0
-
-    peer = PgvectorStore(
-        dsn=store._dsn,
-        schema="vector_index",
-        dense_dim=32,
-        sparse_shape="posting",
-        startup_prewarm="search",
-    )
-    try:
-        await peer.ensure_collection()
-        await peer.startup_prewarm()
-        assert peer.startup_prewarm_status()["source"] == "peer"
-    finally:
-        if peer._own_pool:
-            await peer._own_pool.close()
-
-
-async def test_custom_search_timeout_is_scoped_to_retrieval_transaction(
-    local_store, monkeypatch
-):
-    store = local_store
-    store._search_timeout_secs = 60
-    observed = []
-
-    async def probe_dense(conn, **_kwargs):
-        observed.append(await conn.fetchval("SHOW statement_timeout"))
-        return []
-
-    monkeypatch.setattr(store, "_search_dense", probe_dense)
-    assert await store.hybrid_search(
-        query_text="",
-        query_dense=[1.0, *([0.0] * 31)],
-        query_sparse_indices=[],
-        query_sparse_values=[],
-        source_ids=None,
-        vault_ids=None,
-        limit=10,
-        prefetch_per_leg=20,
-    ) == []
-    assert observed == ["1min"]
-
-    pool = await store._pool()
-    async with pool.acquire() as conn:
-        # The override uses SET LOCAL and must not leak through the pool.
-        assert await conn.fetchval("SHOW statement_timeout") == "0"
