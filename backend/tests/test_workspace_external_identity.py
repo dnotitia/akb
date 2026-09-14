@@ -26,7 +26,7 @@ _ISSUER = "https://id.example.com/realms/akb"
 @pytest.fixture
 async def pool(monkeypatch):
     try:
-        pool = await asyncpg.create_pool(_DSN, min_size=1, max_size=2)
+        pool = await asyncpg.create_pool(_DSN, min_size=1, max_size=3)
     except Exception:
         pytest.skip("Postgres unreachable at AKB_TEST_DSN")
 
@@ -224,30 +224,47 @@ async def test_concurrent_open_mode_creation_of_same_subject_is_idempotent(
     email = f"wsg-concurrent-jit-{uuid.uuid4().hex[:8]}@example.com"
 
     original_lookup = auth_service._bound_external_user
-    initial_lookups = 0
-    both_initial_lookups_finished = asyncio.Event()
+    first_lookup_started = asyncio.Event()
+    release_first_lookup = asyncio.Event()
+    first_pid = None
 
-    async def synchronized_initial_lookup(conn, issuer, subject):
-        nonlocal initial_lookups
-        result = await original_lookup(conn, issuer, subject)
-        if initial_lookups < 2:
-            initial_lookups += 1
-            if initial_lookups == 2:
-                both_initial_lookups_finished.set()
-            await both_initial_lookups_finished.wait()
-        return result
+    async def pause_first_lookup(conn, issuer, subject):
+        nonlocal first_pid
+        if first_pid is None:
+            first_pid = conn.get_server_pid()
+            first_lookup_started.set()
+            await release_first_lookup.wait()
+        return await original_lookup(conn, issuer, subject)
 
-    monkeypatch.setattr(
-        auth_service,
-        "_bound_external_user",
-        synchronized_initial_lookup,
-    )
+    monkeypatch.setattr(auth_service, "_bound_external_user", pause_first_lookup)
     claims = _claims("concurrent-jit", email)
-
-    results = await asyncio.gather(
-        auth_service._resolve_or_provision_keycloak_user(claims),
-        auth_service._resolve_or_provision_keycloak_user(claims),
-    )
+    tasks = []
+    try:
+        async with asyncio.timeout(10):
+            tasks.append(asyncio.create_task(
+                auth_service._resolve_or_provision_keycloak_user(claims)
+            ))
+            await first_lookup_started.wait()
+            tasks.append(asyncio.create_task(
+                auth_service._resolve_or_provision_keycloak_user(claims)
+            ))
+            # Wait for an actual PostgreSQL lock waiter instead of requiring
+            # both callbacks to pass the lock and deadlocking a two-party barrier.
+            async with pool.acquire() as observer:
+                while not await observer.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity"
+                    " WHERE $1::integer = ANY(pg_blocking_pids(pid)))",
+                    first_pid,
+                ):
+                    await asyncio.sleep(0.01)
+            release_first_lookup.set()
+            results = await asyncio.gather(*tasks)
+    finally:
+        release_first_lookup.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     assert len({result["user_id"] for result in results}) == 1
     assert sorted(result["newly_provisioned"] for result in results) == [False, True]
@@ -331,6 +348,17 @@ async def test_first_keycloak_api_principal_is_never_bootstrap_admin(
                     email_snapshot TEXT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (issuer, subject)
+                );
+                CREATE TABLE pending_admissions (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    issuer TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    email TEXT,
+                    display_name TEXT,
+                    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    arrivals INTEGER NOT NULL DEFAULT 1,
                     UNIQUE (issuer, subject)
                 );
                 CREATE TABLE events (

@@ -277,6 +277,34 @@ async def test_undeclared_domain_still_refuses_and_records(pool):
         ) == 1
 
 
+@pytest.mark.parametrize("authority_enabled", [False, True])
+@pytest.mark.parametrize("email_present", [False, True])
+async def test_non_authoritative_browser_arrival_keeps_pending_without_verified_email(
+    pool, monkeypatch, authority_enabled, email_present
+):
+    from app.services.auth_service import _resolve_or_provision_keycloak_user
+
+    if not authority_enabled:
+        monkeypatch.setattr(settings, "keycloak_authoritative_email_domains_by_provider", {})
+    # When authority is enabled, this address is outside the trusted domain.
+    email = f"auth-arrival-{uuid.uuid4().hex[:8]}@other.example" if email_present else None
+    subject = f"arrival-{uuid.uuid4().hex}"
+    with pytest.raises(MembershipRequiredError):
+        await _resolve_or_provision_keycloak_user(
+            _claims(subject, email, verified=False), provider_alias=_ALIAS
+        )
+    async with pool.acquire() as conn:
+        pending = await conn.fetchrow(
+            "SELECT email, arrivals FROM pending_admissions WHERE issuer = $1 AND subject = $2",
+            _ISSUER,
+            subject,
+        )
+        assert pending is not None
+        assert pending["email"] == email
+        assert pending["arrivals"] == 1
+    assert await _binding(pool, subject) is None
+
+
 async def test_wrong_alias_does_not_inherit_authority(pool):
     from app.services.auth_service import _resolve_or_provision_keycloak_user
 
@@ -448,6 +476,73 @@ async def test_open_mode_collision_off_domain_still_conflicts(pool, monkeypatch)
 # ── concurrency ───────────────────────────────────────────────────────
 
 
+async def test_concurrent_adopts_of_same_subject_are_idempotent(pool, monkeypatch):
+    from app.services import auth_service
+
+    email = f"auth-same-race-{uuid.uuid4().hex[:8]}@{_DOMAIN}"
+    user_id = await _insert_unbound_user(pool, email)
+    subject = f"same-race-{uuid.uuid4().hex}"
+    claims = _claims(subject, email)
+    original_adopt = auth_service._adopt_authoritative_user
+    first_adopt_started = asyncio.Event()
+    release_first_adopt = asyncio.Event()
+    first_pid = None
+
+    async def pause_first_adopt(conn, *args):
+        nonlocal first_pid
+        if first_pid is None:
+            first_pid = conn.get_server_pid()
+            first_adopt_started.set()
+            await release_first_adopt.wait()
+        return await original_adopt(conn, *args)
+
+    monkeypatch.setattr(auth_service, "_adopt_authoritative_user", pause_first_adopt)
+    tasks = []
+    try:
+        async with asyncio.timeout(10):
+            tasks.append(asyncio.create_task(
+                auth_service._resolve_or_provision_keycloak_user(
+                    claims, provider_alias=_ALIAS
+                )
+            ))
+            await first_adopt_started.wait()
+            tasks.append(asyncio.create_task(
+                auth_service._resolve_or_provision_keycloak_user(
+                    claims, provider_alias=_ALIAS
+                )
+            ))
+            # The exact-identity lock must still be held during adoption.
+            # Observe the second callback blocked in PostgreSQL before allowing
+            # the first to write, so this exercises a real overlapping login.
+            async with pool.acquire() as observer:
+                while not await observer.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity"
+                    " WHERE $1::integer = ANY(pg_blocking_pids(pid)))",
+                    first_pid,
+                ):
+                    await asyncio.sleep(0.01)
+            release_first_adopt.set()
+            results = await asyncio.gather(*tasks)
+    finally:
+        release_first_adopt.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert [result["user_id"] for result in results] == [user_id, user_id]
+    assert all(result["newly_provisioned"] is False for result in results)
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM external_identities WHERE user_id = $1", user_id
+        ) == 1
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE email = $1", email
+        ) == 1
+    assert (await _binding(pool, subject))["user_id"] == user_id
+    assert len(await _events(pool, str(user_id), "auth.user_adopted")) == 1
+
+
 async def test_concurrent_adopts_of_one_address_converge(pool):
     from app.services import auth_service
 
@@ -460,7 +555,7 @@ async def test_concurrent_adopts_of_one_address_converge(pool):
     # One winner binds; the loser sees the issuer already bound to the
     # target and is refused rather than double-binding. gather without
     # return_exceptions would hide the loser's refusal, so expect it.
-    outcomes = await asyncio.gather(
+    outcomes = await asyncio.wait_for(asyncio.gather(
         auth_service._resolve_or_provision_keycloak_user(
             _claims(first_subject, email), provider_alias=_ALIAS
         ),
@@ -468,7 +563,7 @@ async def test_concurrent_adopts_of_one_address_converge(pool):
             _claims(second_subject, email), provider_alias=_ALIAS
         ),
         return_exceptions=True,
-    )
+    ), timeout=10)
     winners = [o for o in outcomes if not isinstance(o, BaseException)]
     losers = [o for o in outcomes if isinstance(o, ExternalIdentityConflictError)]
     assert len(winners) == 1 and len(losers) == 1

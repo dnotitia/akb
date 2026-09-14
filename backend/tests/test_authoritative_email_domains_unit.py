@@ -134,3 +134,45 @@ def test_authority_domain_of_matches_exact_only(email: str, expected: str | None
     from app.services.auth_service import _authority_domain_of
 
     assert _authority_domain_of(email, ("example.com", "xn--mnchen-3ya.de")) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alias", [None, "local", "workforce", "other"])
+@pytest.mark.parametrize("email", [None, "person@outside.example"])
+@pytest.mark.parametrize("authority_map", [{}, {"workforce": ["corp.example"]}])
+async def test_non_authority_browser_arrival_keeps_membership_refusal(
+    monkeypatch, alias, email, authority_map
+):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.exceptions import MembershipRequiredError
+    from app.services import auth_service
+
+    conn = MagicMock()
+    conn.execute = AsyncMock()
+    conn.transaction.return_value = MagicMock(
+        __aenter__=AsyncMock(), __aexit__=AsyncMock(return_value=False)
+    )
+    pool = MagicMock()
+    pool.acquire.return_value = MagicMock(
+        __aenter__=AsyncMock(return_value=conn), __aexit__=AsyncMock(return_value=False)
+    )
+    monkeypatch.setattr(auth_service, "get_pool", AsyncMock(return_value=pool))
+    monkeypatch.setattr(auth_service, "_bound_external_user", AsyncMock(return_value=None))
+    arrival = AsyncMock()
+    monkeypatch.setattr(auth_service, "record_arrival", arrival)
+    monkeypatch.setattr(auth_service, "settings", _settings(
+        keycloak_enrollment_mode="invite_only",
+        keycloak_require_verified_email=True,
+        keycloak_authoritative_email_domains_by_provider=authority_map,
+    ))
+    claims = {"iss": "https://id.example/realms/test", "sub": "arrived", "email_verified": False}
+    if email is not None:
+        claims["email"] = email
+
+    with pytest.raises(MembershipRequiredError):
+        await auth_service._resolve_or_provision_keycloak_user(claims, provider_alias=alias)
+
+    arrival.assert_awaited_once_with(
+        conn, issuer=claims["iss"], subject=claims["sub"], claims=claims
+    )

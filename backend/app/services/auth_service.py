@@ -650,13 +650,13 @@ async def _resolve_or_provision_keycloak_user(claims: dict, *, provider_alias: s
         # the address is untrusted input — never a lock key — so the
         # subject key applies there instead.
         async with conn.transaction():
+            pre_email = (_optional_external_string(claims, "email") or "").strip().lower()
             if provider_alias is not None:
-                pre_email = (_optional_external_string(claims, "email") or "").strip().lower()
                 pre_domain = _authority_domain_of(
                     pre_email, settings.authoritative_email_domains_for(provider_alias)
                 )
             else:
-                pre_email, pre_domain = "", None
+                pre_domain = None
             if pre_email and pre_domain is not None:
                 lock_key = f"external-identity-authority:{len(pre_email)}:{pre_email}"
             else:
@@ -670,29 +670,133 @@ async def _resolve_or_provision_keycloak_user(claims: dict, *, provider_alias: s
                 refreshed = await _refresh_bound_external_user(conn, bound, claims)
                 return _resolved_external_user(refreshed, newly_provisioned=False)
 
-        email = (_optional_external_string(claims, "email") or "").strip().lower()
-        if provider_alias is not None:
-            if not email:
-                raise AuthenticationError("Identity provider account has no email claim")
-            if settings.keycloak_require_verified_email and claims.get("email_verified") is not True:
-                raise AuthenticationError("Identity provider has not verified this email address")
-            domain = _authority_domain_of(email, settings.authoritative_email_domains_for(provider_alias))
-        else:
-            domain = None
-        if email and domain is not None:
-            # Declared authority for this provider+domain: the directory owns
-            # the mailbox, so the address selects the account. Adopt when one
-            # holds it, else fall through to the mode's provision path.
-            # `disabled` never reaches here (refused above).
             try:
-                adopted = await _adopt_authoritative_user(conn, issuer, subject, claims, email, domain)
-            except (AccountSuspendedError, ExternalIdentityConflictError, AuthenticationError):
-                # A failed adopt is still a refused arrival: record it before
-                # refusing, exactly like every other refusal. The note keeps
-                # the subject an administrator needs to act on; the refusal
-                # below is raised whether or not the note lands.
+                # Roll back any partial account mutation on refusal, but keep
+                # the admission note in the outer transaction with the lock.
+                async with conn.transaction():
+                    return await _resolve_unbound_keycloak_user(
+                        conn, issuer, subject, claims, pre_email, pre_domain
+                    )
+            except (
+                MembershipRequiredError,
+                AccountSuspendedError,
+                ExternalIdentityConflictError,
+                AuthenticationError,
+            ) as exc:
+                if pre_domain is None and not isinstance(exc, MembershipRequiredError):
+                    raise
                 await record_arrival(conn, issuer=issuer, subject=subject, claims=claims)
-                raise
+                refusal = exc
+        # Refuse only after the arrival has committed. Raising inside the
+        # transaction would discard the administrator's pending record.
+        raise refusal
+
+
+async def _resolve_unbound_keycloak_user(
+    conn, issuer: str, subject: str, claims: dict, email: str, domain: str | None
+) -> dict:
+    """Resolve an unbound identity while the caller holds its transaction lock."""
+    if email and domain is not None:
+        # Declared authority for this provider+domain: the directory owns
+        # the mailbox, so the address selects the account. Adopt when one
+        # holds it, else fall through to the mode's provision path.
+        # `disabled` never reaches here (refused above).
+        adopted = await _adopt_authoritative_user(conn, issuer, subject, claims, email, domain)
+        if adopted is not None:
+            await conn.execute(
+                "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
+                issuer,
+                subject,
+            )
+            return adopted
+
+    if settings.keycloak_enrollment_mode == "invite_only" and domain is None:
+        # The caller records this exact identity before returning the refusal.
+        # Only a declared authority domain permits automatic provisioning.
+        raise MembershipRequiredError()
+
+    if not email:
+        raise AuthenticationError("Identity provider account has no email claim")
+    if settings.keycloak_require_verified_email and claims.get("email_verified") is not True:
+        raise AuthenticationError("Identity provider has not verified this email address")
+
+    raw_preferred_username = _optional_external_string(claims, "preferred_username")
+    preferred_username = (
+        raw_preferred_username.strip()
+        if isinstance(raw_preferred_username, str) and raw_preferred_username.strip()
+        else email.split("@", 1)[0]
+    )
+    display_name = _optional_external_string(claims, "name") or raw_preferred_username
+    user_id = uuid.uuid4()
+    try:
+        async with conn.transaction():
+            # Deliberately do not SELECT by email or username first. Their
+            # unique constraints are atomic collision guards, never
+            # identity resolution or account-linking inputs.
+            await conn.execute(
+                """
+                INSERT INTO users (
+                    id, username, email, password_hash, display_name,
+                    auth_provider, is_admin, account_status, account_kind
+                )
+                VALUES ($1, $2, $3, $4, $5, 'keycloak',
+                        false, 'active', 'human')
+                """,
+                user_id,
+                preferred_username,
+                email,
+                _SSO_SENTINEL_HASH,
+                display_name,
+            )
+            await emit_event(
+                conn,
+                "auth.user_provisioned",
+                actor_id=str(user_id),
+                payload={
+                    "auth_provider": "keycloak",
+                    "email": email,
+                    "issuer": issuer,
+                },
+            )
+            await conn.execute(
+                """
+                INSERT INTO external_identities (
+                    user_id, issuer, subject, email_snapshot
+                ) VALUES ($1, $2, $3, $4)
+                """,
+                user_id,
+                issuer,
+                subject,
+                email,
+            )
+            await conn.execute(
+                "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
+                issuer,
+                subject,
+            )
+    except asyncpg.UniqueViolationError:
+        # Same-subject concurrent provision is idempotent: the winner's
+        # binding now exists, so return it. An email collision on a
+        # declared authority domain is an adopt the pre-check missed
+        # (a concurrent signup raced us, or the address was claimed
+        # between the check and the insert): bind the winner's account
+        # instead of refusing. Any other uniqueness collision needs
+        # explicit administrative resolution.
+        #
+        # The loser's arrival is recorded when it refuses: like every
+        # other refusal, the note below is raised whether or not the
+        # record lands.
+        bound = await _bound_external_user(conn, issuer, subject)
+        if bound is not None:
+            refreshed = await _refresh_bound_external_user(conn, bound, claims)
+            await conn.execute(
+                "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
+                issuer,
+                subject,
+            )
+            return _resolved_external_user(refreshed, newly_provisioned=False)
+        if domain is not None:
+            adopted = await _adopt_authoritative_user(conn, issuer, subject, claims, email, domain or "")
             if adopted is not None:
                 await conn.execute(
                     "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
@@ -700,122 +804,19 @@ async def _resolve_or_provision_keycloak_user(claims: dict, *, provider_alias: s
                     subject,
                 )
                 return adopted
+        raise ExternalIdentityConflictError() from None
 
-        if settings.keycloak_enrollment_mode == "invite_only" and domain is None:
-            # The broker has just verified this person and minted them a stable
-            # subject in this realm. That subject is the one value an exact
-            # binding needs and the one value nobody could name in advance, so
-            # it is written down here rather than discarded with the refusal.
-            # Recording never changes the answer: the refusal below is raised
-            # whether or not the note was taken.
-            #
-            # A declared domain skips this refusal: authority provision is
-            # the answer for an unknown address there, not a note.
-            await record_arrival(conn, issuer=issuer, subject=subject, claims=claims)
-            raise MembershipRequiredError()
-
-        if not email:
-            raise AuthenticationError("Identity provider account has no email claim")
-        if settings.keycloak_require_verified_email and claims.get("email_verified") is not True:
-            raise AuthenticationError("Identity provider has not verified this email address")
-
-        raw_preferred_username = _optional_external_string(claims, "preferred_username")
-        preferred_username = (
-            raw_preferred_username.strip()
-            if isinstance(raw_preferred_username, str) and raw_preferred_username.strip()
-            else email.split("@", 1)[0]
-        )
-        display_name = _optional_external_string(claims, "name") or raw_preferred_username
-        user_id = uuid.uuid4()
-        try:
-            async with conn.transaction():
-                # Deliberately do not SELECT by email or username first. Their
-                # unique constraints are atomic collision guards, never
-                # identity resolution or account-linking inputs.
-                await conn.execute(
-                    """
-                    INSERT INTO users (
-                        id, username, email, password_hash, display_name,
-                        auth_provider, is_admin, account_status, account_kind
-                    )
-                    VALUES ($1, $2, $3, $4, $5, 'keycloak',
-                            false, 'active', 'human')
-                    """,
-                    user_id,
-                    preferred_username,
-                    email,
-                    _SSO_SENTINEL_HASH,
-                    display_name,
-                )
-                await emit_event(
-                    conn,
-                    "auth.user_provisioned",
-                    actor_id=str(user_id),
-                    payload={
-                        "auth_provider": "keycloak",
-                        "email": email,
-                        "issuer": issuer,
-                    },
-                )
-                await conn.execute(
-                    """
-                    INSERT INTO external_identities (
-                        user_id, issuer, subject, email_snapshot
-                    ) VALUES ($1, $2, $3, $4)
-                    """,
-                    user_id,
-                    issuer,
-                    subject,
-                    email,
-                )
-                await conn.execute(
-                    "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
-                    issuer,
-                    subject,
-                )
-        except asyncpg.UniqueViolationError:
-            # Same-subject concurrent provision is idempotent: the winner's
-            # binding now exists, so return it. An email collision on a
-            # declared authority domain is an adopt the pre-check missed
-            # (a concurrent signup raced us, or the address was claimed
-            # between the check and the insert): bind the winner's account
-            # instead of refusing. Any other uniqueness collision needs
-            # explicit administrative resolution.
-            #
-            # The loser's arrival is recorded when it refuses: like every
-            # other refusal, the note below is raised whether or not the
-            # record lands.
-            bound = await _bound_external_user(conn, issuer, subject)
-            if bound is not None:
-                refreshed = await _refresh_bound_external_user(conn, bound, claims)
-                await conn.execute(
-                    "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
-                    issuer,
-                    subject,
-                )
-                return _resolved_external_user(refreshed, newly_provisioned=False)
-            if email and _authority_domain_of(email, settings.authoritative_email_domains_for(provider_alias)) is not None:
-                adopted = await _adopt_authoritative_user(conn, issuer, subject, claims, email, domain or "")
-                if adopted is not None:
-                    await conn.execute(
-                        "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
-                        issuer,
-                        subject,
-                    )
-                    return adopted
-            raise ExternalIdentityConflictError() from None
-
-        row = await conn.fetchrow(
-            """
-            SELECT id, username, email, display_name, is_admin,
-                   tokens_revoked_before, auth_provider,
-                   account_status, account_kind
-              FROM users WHERE id = $1
-            """,
-            user_id,
-        )
-        _assert_active_human(row)
-        return _resolved_external_user(row, newly_provisioned=True)
+    row = await conn.fetchrow(
+        """
+        SELECT id, username, email, display_name, is_admin,
+               tokens_revoked_before, auth_provider,
+               account_status, account_kind
+          FROM users WHERE id = $1
+        """,
+        user_id,
+    )
+    _assert_active_human(row)
+    return _resolved_external_user(row, newly_provisioned=True)
 
 
 @dataclass(frozen=True)
