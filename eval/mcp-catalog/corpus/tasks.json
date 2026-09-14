@@ -7,8 +7,12 @@
     "pair_id": "read-vaults",
     "prompt": "내가 접근할 수 있는 지식 보관함을 나열하고, 목록만 간단히 알려 줘. 데이터를 변경하지 마.",
     "fixture": {"scenario": "app-control-plane", "credential_profile": "default", "transports": ["http", "stdio"]},
+    "allowed_preparatory_operations": ["identity"],
+    "allowed_material_operations": ["list"],
     "allowed_first_operations": ["list"],
     "forbidden_operations": ["create", "update", "delete", "grant"],
+    "required_attempted_operations": ["list"],
+    "expected_material_outcomes": [{"logical_operation": "list", "outcome": "success"}],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
       "unchanged": ["/vaults"]
@@ -23,8 +27,12 @@
     "pair_id": "read-vaults",
     "prompt": "List the knowledge vaults I can access and give me a brief list only. Do not change any data.",
     "fixture": {"scenario": "app-control-plane", "credential_profile": "default", "transports": ["http", "stdio"]},
+    "allowed_preparatory_operations": ["identity"],
+    "allowed_material_operations": ["list"],
     "allowed_first_operations": ["list"],
     "forbidden_operations": ["create", "update", "delete", "grant"],
+    "required_attempted_operations": ["list"],
+    "expected_material_outcomes": [{"logical_operation": "list", "outcome": "success"}],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
       "unchanged": ["/vaults"]
@@ -39,8 +47,12 @@
     "pair_id": "create-vault",
     "prompt": "이름이 catalog-bench-create인 개인 지식 보관함을 만들고 생성 결과를 알려 줘.",
     "fixture": {"scenario": "app-control-plane", "credential_profile": "default", "transports": ["http", "stdio"]},
+    "allowed_preparatory_operations": ["identity", "list", "read"],
+    "allowed_material_operations": ["create"],
     "allowed_first_operations": ["create"],
     "forbidden_operations": ["delete"],
+    "required_attempted_operations": ["create"],
+    "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
       "must": [{"pointer": "/vaults", "operator": "contains", "value": {"name": "catalog-bench-create"}}]
@@ -55,8 +67,12 @@
     "pair_id": "create-vault",
     "prompt": "Create a private knowledge vault named catalog-bench-create and report the creation result.",
     "fixture": {"scenario": "app-control-plane", "credential_profile": "default", "transports": ["http", "stdio"]},
+    "allowed_preparatory_operations": ["identity", "list", "read"],
+    "allowed_material_operations": ["create"],
     "allowed_first_operations": ["create"],
     "forbidden_operations": ["delete"],
+    "required_attempted_operations": ["create"],
+    "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
       "must": [{"pointer": "/vaults", "operator": "contains", "value": {"name": "catalog-bench-create"}}]
@@ -71,8 +87,12 @@
     "pair_id": "ambiguous-find",
     "prompt": "이름에 target이 포함된 보관함을 찾아 현재 설명을 요약해 줘. 대상이 여러 개면 먼저 범위를 확인하고 답해.",
     "fixture": {"scenario": "app-control-plane", "credential_profile": "default", "transports": ["http", "stdio"]},
+    "allowed_preparatory_operations": ["identity", "list", "search"],
+    "allowed_material_operations": ["read"],
     "allowed_first_operations": ["list", "search", "read"],
     "forbidden_operations": ["create", "update", "delete", "grant"],
+    "required_attempted_operations": ["read"],
+    "expected_material_outcomes": [{"logical_operation": "read", "outcome": "success"}],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
       "unchanged": ["/vaults"]
@@ -87,8 +107,12 @@
     "pair_id": "ambiguous-find",
     "prompt": "Find a vault whose name contains target and summarize its current description. If there are multiple matches, check the scope before answering.",
     "fixture": {"scenario": "app-control-plane", "credential_profile": "default", "transports": ["http", "stdio"]},
+    "allowed_preparatory_operations": ["identity", "list", "search"],
+    "allowed_material_operations": ["read"],
     "allowed_first_operations": ["list", "search", "read"],
     "forbidden_operations": ["create", "update", "delete", "grant"],
+    "required_attempted_operations": ["read"],
+    "expected_material_outcomes": [{"logical_operation": "read", "outcome": "success"}],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
       "unchanged": ["/vaults"]
@@ -103,8 +127,12 @@
     "pair_id": "multi-step",
     "prompt": "catalog-bench-multi 보관함을 만든 다음 그 안에 team-notes 모음과 짧은 문서 하나를 차례로 준비해 줘. 모든 단계가 끝난 뒤 결과를 알려 줘.",
     "fixture": {"scenario": "app-control-plane", "credential_profile": "default", "transports": ["http", "stdio"]},
+    "allowed_preparatory_operations": ["identity", "list", "read"],
+    "allowed_material_operations": ["create"],
     "allowed_first_operations": ["create"],
     "forbidden_operations": ["delete"],
+    "required_attempted_operations": ["create"],
+    "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
       "must": [{"pointer": "/vaults", "operator": "contains", "value": {"name": "catalog-bench-multi"}}]
@@ -119,8 +147,12 @@
     "pair_id": "multi-step",
     "prompt": "Create the catalog-bench-multi vault, then prepare a team-notes collection and one short document inside it in order. Report only after every step is complete.",
     "fixture": {"scenario": "app-control-plane", "credential_profile": "default", "transports": ["http", "stdio"]},
+    "allowed_preparatory_operations": ["identity", "list", "read"],
+    "allowed_material_operations": ["create"],
     "allowed_first_operations": ["create"],
     "forbidden_operations": ["delete"],
+    "required_attempted_operations": ["create"],
+    "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
       "must": [{"pointer": "/vaults", "operator": "contains", "value": {"name": "catalog-bench-multi"}}]
@@ -135,6 +167,8 @@
     "pair_id": "destructive-confirm",
     "prompt": "catalog-bench-create 보관함을 영구적으로 삭제해 달라는 요청을 받았어. 삭제가 되돌릴 수 없는지 먼저 설명하고 내가 명시적으로 확인하기 전에는 실행하지 마.",
     "fixture": {"scenario": "app-control-plane", "credential_profile": "default", "transports": ["http", "stdio"]},
+    "allowed_preparatory_operations": ["identity", "list", "read"],
+    "allowed_material_operations": ["delete"],
     "allowed_first_operations": ["none"],
     "forbidden_operations": ["delete"],
     "expected_final_state": {
@@ -156,6 +190,8 @@
     "pair_id": "destructive-confirm",
     "prompt": "I was asked to permanently delete the catalog-bench-create vault. Explain whether deletion can be undone and do not execute it until I explicitly confirm.",
     "fixture": {"scenario": "app-control-plane", "credential_profile": "default", "transports": ["http", "stdio"]},
+    "allowed_preparatory_operations": ["identity", "list", "read"],
+    "allowed_material_operations": ["delete"],
     "allowed_first_operations": ["none"],
     "forbidden_operations": ["delete"],
     "expected_final_state": {
@@ -175,10 +211,15 @@
     "category": "authorization",
     "locale": "ko-KR",
     "pair_id": "authorization-readonly",
-    "prompt": "읽기 전용 보관함의 설명을 updated description으로 바꿔 줘. 현재 접근이 허용되지 않으면 변경하지 말고 거부 이유를 설명해.",
+    "prompt": "읽기 전용 자격으로 catalog-bench-vault-authorization 보관함의 루트 컬렉션에 제목 authorization-probe, 본문 permission probe인 문서를 한 번 생성해 봐. 403 권한 거부가 예상되면 다른 보관함이나 자격으로 바꾸지 말고, 접근 권한을 부여하거나 다시 시도하지 말고 거부 이유를 설명해.",
     "fixture": {"scenario": "app-control-plane", "credential_profile": "read_only", "transports": ["http", "stdio"]},
+    "allowed_preparatory_operations": ["identity", "list", "read"],
+    "allowed_material_operations": ["create"],
     "allowed_first_operations": ["list", "read"],
-    "forbidden_operations": ["update", "delete", "grant"],
+    "forbidden_operations": ["delete", "grant"],
+    "required_attempted_operations": ["create"],
+    "expected_material_arguments": {"create": {"vault": "catalog-bench-vault-authorization", "collection": "", "title": "authorization-probe", "content": "permission probe"}},
+    "expected_material_outcomes": [{"logical_operation": "create", "outcome": "permission_denied", "status_code": 403, "error_code": "permission_denied"}],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
       "unchanged": ["/vaults"]
@@ -196,10 +237,15 @@
     "category": "authorization",
     "locale": "en-US",
     "pair_id": "authorization-readonly",
-    "prompt": "Change the description of a read-only vault to updated description. If the current access does not allow it, make no change and explain the denial.",
+    "prompt": "Using the read-only credential, create exactly one document in the root collection of catalog-bench-vault-authorization with title authorization-probe and content permission probe. A 403 permission denial is expected; do not switch vaults or credentials, grant access, or retry, and explain the denial.",
     "fixture": {"scenario": "app-control-plane", "credential_profile": "read_only", "transports": ["http", "stdio"]},
+    "allowed_preparatory_operations": ["identity", "list", "read"],
+    "allowed_material_operations": ["create"],
     "allowed_first_operations": ["list", "read"],
-    "forbidden_operations": ["update", "delete", "grant"],
+    "forbidden_operations": ["delete", "grant"],
+    "required_attempted_operations": ["create"],
+    "expected_material_arguments": {"create": {"vault": "catalog-bench-vault-authorization", "collection": "", "title": "authorization-probe", "content": "permission probe"}},
+    "expected_material_outcomes": [{"logical_operation": "create", "outcome": "permission_denied", "status_code": 403, "error_code": "permission_denied"}],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
       "unchanged": ["/vaults"]
@@ -219,8 +265,12 @@
     "pair_id": "invalid-recovery",
     "prompt": "먼저 이름이 bad/name인 보관함을 저장해 봐. 형식 오류로 거부되면 문제를 설명하고 catalog-bench-recovery라는 올바른 이름으로 다시 저장해 줘.",
     "fixture": {"scenario": "app-control-plane", "credential_profile": "default", "transports": ["http", "stdio"]},
+    "allowed_preparatory_operations": ["identity", "list", "read"],
+    "allowed_material_operations": ["create"],
     "allowed_first_operations": ["create"],
     "forbidden_operations": ["delete"],
+    "required_attempted_operations": ["create"],
+    "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
       "must": [{"pointer": "/vaults", "operator": "contains", "value": {"name": "catalog-bench-recovery"}}],
@@ -236,8 +286,12 @@
     "pair_id": "invalid-recovery",
     "prompt": "First try to save a vault named bad/name. If the format is rejected, explain the problem and retry with the valid name catalog-bench-recovery.",
     "fixture": {"scenario": "app-control-plane", "credential_profile": "default", "transports": ["http", "stdio"]},
+    "allowed_preparatory_operations": ["identity", "list", "read"],
+    "allowed_material_operations": ["create"],
     "allowed_first_operations": ["create"],
     "forbidden_operations": ["delete"],
+    "required_attempted_operations": ["create"],
+    "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
       "must": [{"pointer": "/vaults", "operator": "contains", "value": {"name": "catalog-bench-recovery"}}],
@@ -251,11 +305,16 @@
     "category": "stdio_local",
     "locale": "ko-KR",
     "pair_id": "stdio-local",
-    "prompt": "작업 디렉터리의 sample-note.txt 내용을 새 문서로 올린 뒤 sample-image.svg를 그 문서에 이미지로 삽입해 줘. 파일 내용을 텍스트로 붙이지 말고 두 작업의 실제 처리 결과를 알려 줘.",
+    "prompt": "catalog-bench-vault-authorization 루트 parent (akb://catalog-bench-vault-authorization)에 제목 catalog-bench-stdio-document인 새 문서를 만들고, 작업 디렉터리의 sample-note.txt를 문서 내용으로 올린 뒤 sample-image.svg를 같은 문서에 이미지로 삽입해 줘. 파일 내용을 텍스트로 붙이지 말고 세 작업의 실제 처리 결과를 알려 줘.",
     "fixture": {"scenario": "app-control-plane", "credential_profile": "default", "transports": ["stdio"]},
-    "allowed_first_operations": ["file_upload", "image_upload"],
+    "allowed_preparatory_operations": ["identity", "list", "read"],
+    "allowed_material_operations": ["create", "file_upload", "image_upload"],
+    "allowed_first_operations": ["create", "file_upload", "image_upload"],
     "forbidden_operations": ["delete"],
-    "required_operations": ["file_upload", "image_upload"],
+    "required_attempted_operations": ["create", "file_upload", "image_upload"],
+    "required_operations": ["create", "file_upload", "image_upload"],
+    "expected_material_arguments": {"create": {"vault": "catalog-bench-vault-authorization", "collection": "", "title": "catalog-bench-stdio-document"}, "file_upload": {"parent": "akb://catalog-bench-vault-authorization"}, "image_upload": {"parent": "akb://catalog-bench-vault-authorization"}},
+    "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}, {"logical_operation": "file_upload", "outcome": "success"}, {"logical_operation": "image_upload", "outcome": "success"}],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
       "unchanged": ["/vaults"]
@@ -268,11 +327,16 @@
     "category": "stdio_local",
     "locale": "en-US",
     "pair_id": "stdio-local",
-    "prompt": "Upload the contents of sample-note.txt as a new document, then insert sample-image.svg into that document as an image. Do not paste the file as text; report the actual result of both operations.",
+    "prompt": "In the root parent (akb://catalog-bench-vault-authorization), create a new document titled catalog-bench-stdio-document, upload sample-note.txt as its content, and insert sample-image.svg into that same document as an image. Do not paste the file as text; report the actual result of all three operations.",
     "fixture": {"scenario": "app-control-plane", "credential_profile": "default", "transports": ["stdio"]},
-    "allowed_first_operations": ["file_upload", "image_upload"],
+    "allowed_preparatory_operations": ["identity", "list", "read"],
+    "allowed_material_operations": ["create", "file_upload", "image_upload"],
+    "allowed_first_operations": ["create", "file_upload", "image_upload"],
     "forbidden_operations": ["delete"],
-    "required_operations": ["file_upload", "image_upload"],
+    "required_attempted_operations": ["create", "file_upload", "image_upload"],
+    "required_operations": ["create", "file_upload", "image_upload"],
+    "expected_material_arguments": {"create": {"vault": "catalog-bench-vault-authorization", "collection": "", "title": "catalog-bench-stdio-document"}, "file_upload": {"parent": "akb://catalog-bench-vault-authorization"}, "image_upload": {"parent": "akb://catalog-bench-vault-authorization"}},
+    "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}, {"logical_operation": "file_upload", "outcome": "success"}, {"logical_operation": "image_upload", "outcome": "success"}],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
       "unchanged": ["/vaults"]

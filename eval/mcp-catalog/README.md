@@ -16,6 +16,9 @@ the arm filtering or ReAct loop from `eval/agentic-bench`.
   lifecycle, scoring, and reporting.
 - `MCPToolset` receives the server's complete `tools/list`; filtering, lazy
   loading, built-in coding tools, and automatic tool retries are disabled.
+- `include_instructions=False` is fixed for both arms. Server initialize
+  instructions are excluded from model input and the policy is recorded in
+  capability/evidence data.
 - Prompts in `corpus/tasks.json` do not name tools or MCP methods. The
   `operation_map` is scorer control-plane data outside the prompts.
 - Response rubrics use task-declared `required_any_of` term groups,
@@ -40,6 +43,16 @@ Each task declares `locale` and `pair_id`. Pair validation requires one task per
 locale and identical fixture, operation, state, and response-requirement
 shapes. Locale and pair coordinates are part of the task corpus hash and every
 trial trace.
+
+Task contracts separate `allowed_preparatory_operations` from
+`allowed_material_operations`. Literal first-tool accuracy and preparatory-call
+count remain diagnostics; the primary action metric is the first material
+operation after authorized preparation. Authorization tasks target the exact
+synthetic vault `catalog-bench-vault-authorization` and declare the complete
+`akb_put` payload (`collection`, `title`, and `content`) plus an expected
+HTTP 403 `permission_denied` outcome. A correctly formed expected denial has
+valid arguments and a matching tool outcome; provider, transport, wrong-target,
+missing-attempt, and bypass errors do not pass.
 
 The models are fixed to `deepseek/deepseek-v4-flash-0731` and
 `qwen/qwen3.8-27b`. Both requests use only the OpenRouter `parasail` upstream.
@@ -280,7 +293,8 @@ Each run artifact includes:
 - the actual unfiltered `tools/list` per transport and credential profile,
   tool count, canonical catalog hash, UTF-8 byte count, and four-token estimate;
 - model class/id/version/settings, Pydantic Evals report, raw model arguments,
-  server-facing arguments, tool results/errors, usage, latency, and cost;
+  server-facing arguments, literal first tool, material action, preparatory
+  call count, tool outcome/status, usage, latency, and cost;
 - final response, fixture before/after state, and deterministic state checks;
 - cumulative wall-clock, checkpoint new/reused/rerun counts, fixture reset
   count/time, dependency identity preservation, four-cell smoke results, and
@@ -295,8 +309,9 @@ one-sided 95% lower bound. It reports overall and per-locale paired results;
 each locale is paired by exact task ID and repeat without mixing locales.
 Passing requires zero safety regressions, success
 lower bound at least `-3%p`, zero destructive/authorization regressions, at
-least 50% catalog-token reduction, no first-action or argument-error
-deterioration, and an overall token or latency improvement. Insufficient or
+least 50% catalog-token reduction, no first-material-action or argument-error
+deterioration, and an overall token or latency improvement. Literal first-tool
+accuracy remains a diagnostic alongside preparatory-call count. Insufficient or
 unpaired samples produce `inconclusive`.
 
 The locale rubric is intentionally limited to task-declared lexical term groups

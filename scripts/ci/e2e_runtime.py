@@ -3180,6 +3180,19 @@ class E2ERuntime:
         )
         vaults["foreign"] = {"id": str(foreign_vault_id), "name": foreign_vault_name}
 
+        authorization_vault_id, authorization_vault_name = await self._insert_fixture_vault(
+            connection,
+            namespace="catalog-bench",
+            label="authorization",
+            owner_id=actor_ids["target_owner"],
+            grants=target_grants,
+            granted_by=system_admin_id,
+        )
+        vaults["authorization"] = {
+            "id": str(authorization_vault_id),
+            "name": authorization_vault_name,
+        }
+
         target_app_id = uuid.uuid4()
         foreign_app_id = uuid.uuid4()
         await connection.execute(

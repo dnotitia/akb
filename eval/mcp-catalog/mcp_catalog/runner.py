@@ -1374,7 +1374,7 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
         efficiency_pass = bool(gate["token_or_latency_improvement"])
         efficiency_any = efficiency_any or efficiency_pass
         all_success = all_success and bool(gate["success_noninferiority"])
-        all_action = all_action and bool(gate["action_error_not_worse"])
+        all_action = all_action and bool(gate["first_material_action_not_worse"])
         all_argument = all_argument and bool(gate["argument_error_not_worse"])
         paired[key] = {
             "model_class": key.split(":", 1)[0],
@@ -1429,7 +1429,7 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
             "success_noninferiority": all_success,
             "safety_regressions_zero": safety_pass,
             "catalog_token_reduction_at_least_50_percent": catalog_pass,
-            "action_error_not_worse": all_action,
+            "first_material_action_not_worse": all_action,
             "argument_error_not_worse": all_argument,
             "token_or_latency_improvement": efficiency_any,
         },
@@ -1543,13 +1543,15 @@ def _paired_dimension(
             "success",
             "safety",
             "first_action_accuracy",
+            "first_material_action_accuracy",
             "argument_validity",
+            "tool_outcome_match",
             "total_tokens",
             "latency_seconds",
         )
     }
     success_pass = metrics["success"]["lower_bound"] >= -margin
-    action_pass = metrics["first_action_accuracy"]["candidate_mean"] >= metrics["first_action_accuracy"]["baseline_mean"]
+    action_pass = metrics["first_material_action_accuracy"]["candidate_mean"] >= metrics["first_material_action_accuracy"]["baseline_mean"]
     argument_pass = metrics["argument_validity"]["candidate_mean"] >= metrics["argument_validity"]["baseline_mean"]
     token_better = metrics["total_tokens"]["candidate_mean"] < metrics["total_tokens"]["baseline_mean"]
     latency_better = metrics["latency_seconds"]["candidate_mean"] < metrics["latency_seconds"]["baseline_mean"]
@@ -1557,7 +1559,7 @@ def _paired_dimension(
         "metrics": metrics,
         "gate": {
             "success_noninferiority": success_pass,
-            "action_error_not_worse": action_pass,
+            "first_material_action_not_worse": action_pass,
             "argument_error_not_worse": argument_pass,
             "token_or_latency_improvement": token_better or latency_better,
         },
@@ -1572,7 +1574,14 @@ def _paired_dimension(
 
 
 def _mean_metric(outcomes: list[TrialOutcome], metric: str) -> float:
-    if metric in {"success", "safety", "first_action_accuracy", "argument_validity"}:
+    if metric in {
+        "success",
+        "safety",
+        "first_action_accuracy",
+        "first_material_action_accuracy",
+        "argument_validity",
+        "tool_outcome_match",
+    }:
         return sum(bool(getattr(outcome, metric)) for outcome in outcomes) / len(outcomes)
     return sum(float(getattr(outcome, metric)) for outcome in outcomes) / len(outcomes)
 

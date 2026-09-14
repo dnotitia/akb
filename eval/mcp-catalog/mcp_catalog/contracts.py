@@ -161,6 +161,22 @@ class ResponseRubric(ContractModel):
         return values
 
 
+class ExpectedMaterialOutcome(ContractModel):
+    logical_operation: str
+    outcome: Literal["success", "permission_denied"]
+    status_code: int | None = Field(default=None, ge=100, le=599)
+    error_code: str | None = None
+
+    @model_validator(mode="after")
+    def validate_expected_outcome(self) -> ExpectedMaterialOutcome:
+        if self.outcome == "permission_denied":
+            if self.status_code != 403 or not self.error_code:
+                raise ValueError("permission_denied outcomes must declare HTTP 403 and an error code")
+        elif self.status_code is not None or self.error_code is not None:
+            raise ValueError("successful outcomes cannot declare an error response")
+        return self
+
+
 class ProviderRouting(ContractModel):
     order: list[Literal["parasail"]] = Field(min_length=1, max_length=1)
     allow_fallbacks: Literal[False] = False
@@ -192,9 +208,14 @@ class TaskManifest(ContractModel):
     pair_id: str
     prompt: str = Field(min_length=1, max_length=4000)
     fixture: FixtureContract
+    allowed_preparatory_operations: list[str] = Field(default_factory=list)
+    allowed_material_operations: list[str] = Field(min_length=1)
     allowed_first_operations: list[str] = Field(min_length=1)
     forbidden_operations: list[str] = Field(default_factory=list)
+    required_attempted_operations: list[str] = Field(default_factory=list)
     required_operations: list[str] = Field(default_factory=list)
+    expected_material_arguments: dict[str, dict[str, JsonValue]] = Field(default_factory=dict)
+    expected_material_outcomes: list[ExpectedMaterialOutcome] = Field(default_factory=list)
     expected_final_state: StateContract
     response_rubric: ResponseRubric = Field(default_factory=ResponseRubric)
 
@@ -212,7 +233,14 @@ class TaskManifest(ContractModel):
             raise ValueError("pair_id must be lowercase kebab-case and 3-64 characters")
         return value
 
-    @field_validator("allowed_first_operations", "forbidden_operations", "required_operations")
+    @field_validator(
+        "allowed_preparatory_operations",
+        "allowed_material_operations",
+        "allowed_first_operations",
+        "forbidden_operations",
+        "required_attempted_operations",
+        "required_operations",
+    )
     @classmethod
     def validate_operations(cls, values: list[str]) -> list[str]:
         if any(not re.fullmatch(r"^[a-z][a-z0-9_]*$", value) for value in values):
@@ -227,9 +255,26 @@ class TaskManifest(ContractModel):
             raise ValueError("stdio_local tasks must run on stdio")
         if set(self.allowed_first_operations) & set(self.forbidden_operations):
             raise ValueError("an operation cannot be both allowed first and forbidden")
+        if set(self.allowed_preparatory_operations) & set(self.allowed_material_operations):
+            raise ValueError("an operation cannot be both preparatory and material")
+        if self.category != "destructive_confirmation" and set(self.allowed_material_operations) & set(self.forbidden_operations):
+            raise ValueError("a material operation cannot be forbidden")
         if set(self.required_operations) & set(self.forbidden_operations):
             raise ValueError("a required operation cannot be forbidden")
-        if self.category == "stdio_local" and set(self.required_operations) != {"file_upload", "image_upload"}:
+        if not set(self.required_attempted_operations) <= set(self.allowed_material_operations):
+            raise ValueError("required attempted operations must be material operations")
+        if not set(self.required_operations) <= set(self.allowed_material_operations):
+            raise ValueError("required operations must be material operations")
+        expected_operations = [item.logical_operation for item in self.expected_material_outcomes]
+        if len(set(expected_operations)) != len(expected_operations):
+            raise ValueError("expected material outcomes must use unique logical operations")
+        if not set(expected_operations) <= set(self.allowed_material_operations):
+            raise ValueError("expected material outcomes must be material operations")
+        if not set(self.expected_material_arguments) <= set(self.allowed_material_operations):
+            raise ValueError("expected material arguments must be material operations")
+        if not set(self.required_attempted_operations) <= set(expected_operations):
+            raise ValueError("every required attempted operation needs an expected material outcome")
+        if self.category == "stdio_local" and not {"file_upload", "image_upload"} <= set(self.required_operations):
             raise ValueError("stdio_local tasks must require both file and image operations")
         if self.category == "destructive_confirmation" and not self.response_rubric.confirmation_terms:
             raise ValueError("destructive confirmation tasks must declare confirmation terms")
@@ -489,9 +534,14 @@ class BenchmarkRunManifest(ContractModel):
         return {
             "category": task.category,
             "fixture": task.fixture.model_dump(mode="json"),
+            "allowed_preparatory_operations": sorted(task.allowed_preparatory_operations),
+            "allowed_material_operations": sorted(task.allowed_material_operations),
             "allowed_first_operations": sorted(task.allowed_first_operations),
             "forbidden_operations": sorted(task.forbidden_operations),
+            "required_attempted_operations": sorted(task.required_attempted_operations),
             "required_operations": sorted(task.required_operations),
+            "expected_material_arguments": task.expected_material_arguments,
+            "expected_material_outcomes": [item.model_dump(mode="json") for item in task.expected_material_outcomes],
             "expected_final_state": task.expected_final_state.model_dump(mode="json"),
             "response_requirements": {
                 "require_non_empty": rubric.require_non_empty,

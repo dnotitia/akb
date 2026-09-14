@@ -57,6 +57,7 @@
     "max_cost_per_trial_usd": 0.1
   },
   "operation_map": {
+    "identity": ["akb_whoami"],
     "list": ["akb_list_vaults", "akb_browse"],
     "read": ["akb_get", "akb_drill_down", "akb_vault_info"],
     "search": ["akb_search", "akb_grep"],

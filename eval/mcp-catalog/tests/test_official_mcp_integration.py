@@ -55,8 +55,9 @@ def test_raw_and_server_arguments_are_separately_recorded() -> None:
                 "locale": "en-US",
                 "pair_id": "raw-server",
                 "prompt": "값을 읽어 줘.",
-            "fixture": {"scenario": "empty", "transports": ["http"]},
-            "allowed_first_operations": ["read"],
+                "fixture": {"scenario": "empty", "transports": ["http"]},
+                "allowed_material_operations": ["read"],
+                "allowed_first_operations": ["read"],
             "expected_final_state": {
                 "probe": {"service": "app", "path": "/state"},
                 "unchanged": ["/items"],
