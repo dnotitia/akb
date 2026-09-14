@@ -304,8 +304,8 @@ an `sr-only` summary, never the only signal.
   They store browser-local account-specific metadata; recent/pinned rows expose
   removal, never resource deletion. Draft rows route through the existing
   recovery flow: new drafts open the composer, edit drafts open the editor.
-  Edit drafts expire after 24 hours; new drafts retain the existing no-expiry
-  contract. Neither list previews draft bodies or adopts unowned legacy drafts.
+  Draft recovery uses the editor's 24-hour boundary or an earlier server-provided
+  attachment expiry. Neither list previews draft bodies or adopts unowned legacy drafts.
   Document Pin sits beside Watch, but never implies a notification subscription.
   Collection Pin belongs in its overflow; following it reveals the collection
   tree and focuses the target, without overwriting the normal tree preference.

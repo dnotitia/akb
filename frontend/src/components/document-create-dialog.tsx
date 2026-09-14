@@ -37,6 +37,7 @@ export function DocumentCreateDialog({
   const [uploading, setUploading] = useState(false);
   const [discardOpen, setDiscardOpen] = useState(false);
   const [draftAssetIds, setDraftAssetIds] = useState<readonly string[]>([]);
+  const [unclaimedAssetIds, setUnclaimedAssetIds] = useState<readonly string[]>([]);
 
   useEffect(() => {
     if (open) return;
@@ -45,6 +46,7 @@ export function DocumentCreateDialog({
     setUploading(false);
     setDiscardOpen(false);
     setDraftAssetIds([]);
+    setUnclaimedAssetIds([]);
   }, [open]);
 
   function requestClose() {
@@ -102,6 +104,7 @@ export function DocumentCreateDialog({
               onCreatingChange={setCreating}
               onUploadingChange={setUploading}
               onAssetIdsChange={setDraftAssetIds}
+              onUnclaimedAssetIdsChange={setUnclaimedAssetIds}
             />
           )}
         </DialogContent>
@@ -123,7 +126,7 @@ export function DocumentCreateDialog({
           // local draft can recover. An explicit discard is the authoritative
           // cleanup path; the server TTL remains the fallback for failures.
           await Promise.allSettled(
-            draftAssetIds.map((assetId) => discardAsset(vault, assetId)),
+            [...new Set([...draftAssetIds, ...unclaimedAssetIds])].map((assetId) => discardAsset(vault, assetId)),
           );
           clearDocumentDraft(userId, vault);
           onOpenChange(false);

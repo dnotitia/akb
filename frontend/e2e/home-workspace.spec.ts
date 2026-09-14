@@ -9,7 +9,7 @@ test("Personal navigation imports favorites and restores a browser draft", async
     localStorage.setItem("akb-vault-favorites", JSON.stringify(["team-id", "revoked-id"]));
     localStorage.setItem("akb.workspaceShortcuts.v1:personal-user", JSON.stringify([{ kind: "collection", vault: "team", path: "guides", title: "Guides" }]));
     localStorage.setItem("akb.recentDocumentViews.v1:personal-user", JSON.stringify([{ vault: "team", path: "guides/a.md", title: "Recently read guide", type: "note", viewedAt: new Date().toISOString() }]));
-    localStorage.setItem("akb:document-draft:account:personal-user:team", JSON.stringify({ version: 1, userId: "personal-user", vault: "team", collection: "guides", title: "A recoverable draft", body: "Unsaved writing remains available.", type: "note", domain: "", summary: "", tags: [], assetIds: [], updatedAt: new Date().toISOString() }));
+    localStorage.setItem("akb:document-draft:account:personal-user:team", JSON.stringify({ version: 2, userId: "personal-user", vault: "team", collection: "guides", title: "A recoverable draft", body: "Unsaved writing remains available.", type: "note", domain: "", summary: "", tags: [], assetIds: [], updatedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 86400000).toISOString() }));
   });
   await page.route("**/health/**", route => route.fulfill({ json: {} }));
   await page.route("**/api/v1/**", route => {

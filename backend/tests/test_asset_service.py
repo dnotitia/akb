@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -127,6 +127,76 @@ def test_asset_urls_accept_case_variants_and_normalize_to_one_uuid() -> None:
 
 
 @pytest.mark.asyncio
+async def test_copy_file_to_attachment_reads_confirmed_file_bytes_into_new_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import asset_service
+
+    vault_id = uuid.uuid4()
+    file_id = uuid.uuid4()
+    body = b"immutable-image-bytes"
+    source = {
+        "id": file_id,
+        "vault_id": vault_id,
+        "kind": "file",
+        "upload_state": "confirmed",
+        "name": "source.png",
+        "collection": "notes",
+        "s3_key": "team/notes/source.png",
+        "mime_type": "image/png",
+    }
+
+    class _Pool:
+        def acquire(self):
+            class _Acquire:
+                async def __aenter__(self):
+                    return object()
+
+                async def __aexit__(self, *_args):
+                    return None
+
+            return _Acquire()
+
+    async def _pool():
+        return _Pool()
+
+    async def _find(_conn, _vault_id, _file_id):
+        return source
+
+    async def _create(**kwargs):
+        assert kwargs["body"] == body
+        assert kwargs["declared_mime"] == "image/png"
+        return {
+            "kind": "attachment",
+            "id": str(uuid.uuid4()),
+            "target": "/api/assets/attachment-id",
+            "url": "/api/assets/attachment-id",
+        }
+
+    monkeypatch.setattr(asset_service, "get_pool", _pool)
+    monkeypatch.setattr(asset_service.vault_files_repo, "find_by_id", _find)
+    monkeypatch.setattr(
+        asset_service.s3_adapter,
+        "head",
+        lambda _key: {"ContentLength": len(body)},
+    )
+    monkeypatch.setattr(asset_service.s3_adapter, "get_bytes", lambda _key: body)
+    monkeypatch.setattr(asset_service, "inspect_image", lambda _body: ("image/png", 1, 1))
+    monkeypatch.setattr(asset_service, "create_image_asset", _create)
+
+    result = await asset_service.copy_file_to_attachment(
+        vault_id=vault_id,
+        vault_name="team",
+        file_id=str(file_id),
+        actor_id="alice",
+    )
+
+    assert result["kind"] == "attachment"
+    assert result["target"] == "/api/assets/attachment-id"
+    assert result["source_file_uri"] == f"akb://team/coll/notes/file/{file_id}"
+
+
+@pytest.mark.asyncio
 async def test_create_asset_decodes_off_loop_and_records_pending_before_s3(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -218,7 +288,10 @@ async def test_create_asset_decodes_off_loop_and_records_pending_before_s3(
         < names.index("finalize")
     )
     assert tx_exit_indexes[0] < names.index("put") < tx_enter_indexes[1]
-    assert result["url"] == f"/api/assets/{result['id']}"
+    assert result["kind"] == "attachment"
+    assert result["target"] == f"/api/assets/{result['id']}"
+    assert result["url"] == result["target"]
+    assert result["unclaimed_expires_at"]
 
 
 @pytest.mark.asyncio
@@ -1278,6 +1351,7 @@ async def test_private_asset_lookup_carries_live_owner_and_revision_scope() -> N
     assert "rev.retain_until > NOW()" in captured["sql"]
     assert captured["args"] == (
         file_id, vault_id, "alice", "notes/weekly.md", "abcdef1",
+        timedelta(hours=vault_files_repo.settings.document_asset_unclaimed_ttl_hours),
     )
 
 

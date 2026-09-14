@@ -97,7 +97,14 @@ describe("MarkdownEditor image insertion", () => {
     expect(validateEditorImage(new File(["png"], "ok.png", { type: "image/png" }))).toBeNull();
   });
 
-  it("rejects the whole invalid batch without offering an impossible partial retry", async () => {
+  it("keeps valid images and reports invalid files in a partial batch", async () => {
+    apiMocks.uploadAsset.mockResolvedValue({
+      id: ASSET_ID,
+      url: `/api/assets/${ASSET_ID}`,
+      name: "first.png",
+      mime_type: "image/png",
+      size_bytes: 5,
+    });
     const { container } = render(
       <MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />,
     );
@@ -109,11 +116,12 @@ describe("MarkdownEditor image insertion", () => {
     });
 
     expect(await screen.findByText(/Choose a PNG/)).toBeVisible();
-    expect(screen.getByText(/No images were uploaded/)).toBeVisible();
+    expect(await screen.findByRole("img", { name: "first" })).toBeVisible();
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(apiMocks.uploadAsset).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
     expect(screen.queryByText(/Choose a PNG/)).toBeNull();
-    expect(apiMocks.uploadAsset).not.toHaveBeenCalled();
+    expect(apiMocks.uploadAsset).toHaveBeenCalledTimes(1);
   });
 
   it("uploads a picked image and serializes its private asset URL", async () => {
@@ -395,8 +403,8 @@ describe("MarkdownEditor image insertion", () => {
     fireEvent.change(container.querySelector('input[type="file"]')!, {
       target: { files },
     });
-    expect(await screen.findByText(/2 images remain/)).toBeVisible();
-    expect(apiMocks.uploadAsset).toHaveBeenCalledTimes(2);
+    expect(await screen.findByText(/1 image remain/)).toBeVisible();
+    expect(apiMocks.uploadAsset).toHaveBeenCalledTimes(3);
 
     expect(screen.getByText("Image upload failed")).toBeVisible();
     expect(screen.getByRole("button", { name: "Choose another" })).toBeVisible();
@@ -406,8 +414,8 @@ describe("MarkdownEditor image insertion", () => {
     expect(apiMocks.uploadAsset.mock.calls.map((call) => call[1])).toEqual([
       files[0],
       files[1],
-      files[1],
       files[2],
+      files[1],
     ]);
   });
 

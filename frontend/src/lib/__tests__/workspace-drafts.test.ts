@@ -4,6 +4,7 @@ import {
   documentEditDraftTabId, listWorkspaceDrafts, loadDocumentDraft,
   saveDocumentDraft, saveDocumentEditDraft, WORKSPACE_DRAFTS_EVENT,
   workspaceDraftHref,
+  DOCUMENT_EDIT_DRAFT_EDITOR_VERSION,
   type DocumentEditDraftInput,
 } from "@/lib/document-draft";
 
@@ -14,7 +15,7 @@ const create = (userId = "alice") => ({
 const edit = (extra: Partial<DocumentEditDraftInput> = {}): DocumentEditDraftInput => ({
   userId: "alice", vault: "team", document: "akb://team/doc/note.md", draftId: "1",
   tabId: documentEditDraftTabId(), baseCommit: "abc", baseTitle: "Note", baseBody: "Before",
-  title: "Edited note", body: "Private edits", assetIds: [], editorVersion: "0.1.0",
+  title: "Edited note", body: "Private edits", assetIds: [], editorVersion: DOCUMENT_EDIT_DRAFT_EDITOR_VERSION,
   markdownProfile: "preserve", ...extra,
 });
 

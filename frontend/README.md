@@ -46,6 +46,12 @@ on both the editor and the rendered view — `javascript:`, `data:`,
 `vbscript:`, and protocol-relative `//host` schemes round-trip to
 `#` so a malicious doc can't embed a clickable XSS.
 
+AKB resource links use their canonical `akb://…/doc|file` target in Markdown. The editor and
+viewer resolve those targets only for the current session, showing an unavailable placeholder
+when access or the resource is gone. Signed download URLs and private image blob URLs never
+enter the document body. Editor image uploads return the server's unclaimed expiry metadata so
+recoverable drafts do not promise a longer attachment lifetime than the configured TTL.
+
 ## Architecture quick map
 
 ```
@@ -93,6 +99,10 @@ Playwright e2e specs live in `e2e/`. Choose `mock` or `real` explicitly:
 - `AKB_FRONTEND_URL=<services.web.origin> pnpm run test:e2e:real` consumes the
   common schema-v2 descriptor. The backend, fixture reset, and process shutdown
   remain owned by the repository runtime.
+- `AKB_FE_E2E_SCENARIO=markdown-reference-adapters` exposes a source-neutral reference
+  fixture in the schema-v2 descriptor. Its discovered state/expiry/failure controls exercise
+  canonical document/file/attachment targets, unavailable resolution, and partial upload
+  recovery through the same mock reset path.
 
 For a manual mock session, run `VITE_AKB_TEST_MODE=mock pnpm run dev --host
 127.0.0.1 --port 4173 --strictPort`. The browser worker exposes readiness and

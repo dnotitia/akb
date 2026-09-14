@@ -18,8 +18,8 @@ type MockDescriptor = {
 
 test.describe("document edit recovery mock contract", () => {
   test.skip(
-    process.env.CRABBOX_RUNTIME_SCENARIO !== "document-edit-recovery",
-    "The recovery fixture is selected by CRABBOX_RUNTIME_SCENARIO",
+    process.env.AKB_FE_E2E_SCENARIO !== "document-edit-recovery",
+    "The recovery fixture is selected by AKB_FE_E2E_SCENARIO",
   );
   test.describe.configure({ mode: "serial" });
 

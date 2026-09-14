@@ -30,6 +30,7 @@ from datetime import UTC, datetime, timedelta
 
 import asyncpg
 
+from app.db.postgres import get_pool
 from app.services import delete_worker
 from app.services._backfill import MAX_RETRIES, next_attempt_delay
 from app.services.document_service import _parse_markdown
@@ -119,6 +120,79 @@ def build_native_file_chunks(
         size_bytes=len(canonical_text.encode("utf-8")),
     )
     return chunk_text_body(canonical_text, metadata_header=header)
+
+
+async def _pending_stats(
+    pool: asyncpg.Pool,
+    namespace_id: uuid.UUID | None = None,
+) -> dict[str, int | str]:
+    """Return the durable derived-indexing queue state for an operator.
+
+    ``abandoned`` is the count that matters and the reason this is reported at
+    all: each one is a Resource revision that spent its whole retry budget and
+    will never be chunked, embedded, or returned by ranked search.  Nothing
+    else says so — the Resource stays readable and greppable, and ``pending``
+    drains to zero exactly as it would have if the work had succeeded.  So
+    ``status`` refuses to say ``ok`` while it is non-zero, even with an empty
+    queue: a backfill that reached 100% having dropped documents is not a
+    finished backfill.
+
+    ``exhausted`` is deliberately separate from terminal ``abandoned``: it is
+    the final claimed attempt while its lease is still in force.  The claim
+    query skips ``retry_count >= MAX_RETRIES``, so a process killed exactly
+    there leaves a row nothing will pick up until ``queue_rescuer`` stamps it
+    terminal — visible here rather than counted as ordinary retrying work.
+    """
+    params: list[object] = [MAX_RETRIES]
+    scope = ""
+    if namespace_id is not None:
+        params.append(namespace_id)
+        scope = "AND namespace_id = $2"
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"""
+            SELECT COUNT(*) FILTER (WHERE completed_at IS NULL)::int AS pending,
+                   COUNT(*) FILTER (
+                       WHERE completed_at IS NULL
+                         AND retry_count > 0
+                         AND retry_count < $1
+                   )::int AS retrying,
+                   COUNT(*) FILTER (
+                       WHERE completed_at IS NULL
+                         AND retry_count >= $1
+                   )::int AS exhausted,
+                   COUNT(*) FILTER (WHERE delivery_outcome = 'abandoned')::int AS abandoned,
+                   COUNT(*) FILTER (WHERE delivery_outcome = 'applied')::int AS applied,
+                   COUNT(*) FILTER (WHERE delivery_outcome = 'superseded')::int AS superseded,
+                   COUNT(*) FILTER (WHERE delivery_outcome = 'deleted')::int AS deleted,
+                   -- Pre-parity rows only; nothing produces 'direct_grep'
+                   -- since text Files took the document-parity path. The
+                   -- counter stays so history is reported, not rewritten.
+                   COUNT(*) FILTER (WHERE delivery_outcome = 'direct_grep')::int AS direct_grep
+              FROM native_invalidation_intents
+             WHERE TRUE {scope}
+            """,
+            *params,
+        )
+    pending = int(row["pending"])
+    exhausted = int(row["exhausted"])
+    abandoned = int(row["abandoned"])
+    return {
+        "pending": pending,
+        "retrying": int(row["retrying"]),
+        "exhausted": exhausted,
+        "abandoned": abandoned,
+        "applied": int(row["applied"]),
+        "superseded": int(row["superseded"]),
+        "deleted": int(row["deleted"]),
+        "direct_grep": int(row["direct_grep"]),
+        "status": "degraded" if exhausted or abandoned else "reconciling" if pending else "ok",
+    }
+
+
+async def pending_stats(namespace_id: uuid.UUID | None = None) -> dict[str, int | str]:
+    """Operator-facing derived-index queue state for the health surfaces."""
+    return await _pending_stats(await get_pool(), namespace_id)
 
 
 class NativeDerivedWorker:
@@ -219,8 +293,9 @@ class NativeDerivedWorker:
         attempt_count = int(intent["retry_count"])
         delay = next_attempt_delay(max(0, attempt_count - 1))
         next_at = datetime.now(UTC) + timedelta(seconds=delay)
+        terminal = attempt_count >= MAX_RETRIES
         async with self.pool.acquire() as conn:
-            if attempt_count >= MAX_RETRIES:
+            if terminal:
                 await conn.execute(
                     """
                     UPDATE native_invalidation_intents
@@ -244,6 +319,56 @@ class NativeDerivedWorker:
                     next_at,
                     type(error).__name__,
                 )
+        if terminal:
+            await self._log_abandonment(intent, error, attempt_count)
+
+    async def _log_abandonment(
+        self, intent: dict, error: Exception, attempts: int,
+    ) -> None:
+        """Say once, loudly, which Resource just stopped being retried.
+
+        ``process_once`` logs the same line for attempt 1 and attempt
+        ``MAX_RETRIES``, so the moment a Resource is given up on reads in a log
+        exactly like the transient failures before it.  The counters on the
+        health surfaces say how MANY were lost; this says WHICH, because a
+        count tells an operator that something is wrong and only the path tells
+        them what to fix.
+
+        Best effort on purpose: the row is already stamped terminal before this
+        runs, so a failed lookup costs a name in a message, never the state.
+        Only the exception CLASS is reported, as in ``last_error`` — an
+        exception message can quote the body that failed to store.
+        """
+        vault_name: str | None = None
+        path: str | None = None
+        try:
+            async with self.pool.acquire() as conn:
+                located = await conn.fetchrow(
+                    """
+                    SELECT v.name AS vault_name, r.current_path
+                      FROM native_resources r
+                      JOIN vaults v ON v.id = r.namespace_id
+                     WHERE r.resource_id = $1
+                    """,
+                    intent["resource_id"],
+                )
+            if located is not None:
+                vault_name = located["vault_name"]
+                path = located["current_path"]
+        except Exception:  # noqa: BLE001 — diagnostics must not mask the failure
+            logger.debug("could not name the abandoned resource", exc_info=True)
+        logger.error(
+            "native derived delivery ABANDONED after %d attempts: this %s will not be "
+            "indexed and ranked search will not return it until a new revision "
+            "supersedes it. vault=%s path=%s resource_id=%s revision_id=%s error=%s",
+            attempts,
+            intent["surface"],
+            vault_name or "<unresolved>",
+            path or "<unresolved>",
+            intent["resource_id"],
+            intent["revision_id"],
+            type(error).__name__,
+        )
 
     async def _head(self, resource_id: uuid.UUID) -> dict | None:
         async with self.pool.acquire() as conn:
@@ -472,33 +597,9 @@ class NativeDerivedWorker:
             logger.warning("native derived delivery failed: %s", type(exc).__name__)
             return 0
 
-    async def pending_stats(self, namespace_id: uuid.UUID | None = None) -> dict[str, int]:
-        params: list[object] = []
-        where = ""
-        if namespace_id is not None:
-            params.append(namespace_id)
-            where = "AND namespace_id = $1"
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                f"""
-                SELECT COUNT(*) FILTER (WHERE completed_at IS NULL)::int AS pending,
-                       COUNT(*) FILTER (WHERE delivery_outcome = 'applied')::int AS applied,
-                       COUNT(*) FILTER (WHERE delivery_outcome = 'superseded')::int AS superseded,
-                       COUNT(*) FILTER (WHERE delivery_outcome = 'deleted')::int AS deleted,
-                       -- Pre-parity rows only; nothing produces 'direct_grep'
-                       -- since text Files took the document-parity path. The
-                       -- counter stays so history is reported, not rewritten.
-                       COUNT(*) FILTER (WHERE delivery_outcome = 'direct_grep')::int AS direct_grep,
-                       COUNT(*) FILTER (WHERE delivery_outcome = 'abandoned')::int AS abandoned,
-                       COUNT(*) FILTER (
-                           WHERE completed_at IS NULL AND retry_count > 0
-                       )::int AS retrying
-                  FROM native_invalidation_intents
-                 WHERE TRUE {where}
-                """,
-                *params,
-            )
-        return dict(row)
+    async def pending_stats(self, namespace_id: uuid.UUID | None = None) -> dict[str, int | str]:
+        """Return queue diagnostics using this worker's pool (tests/operators)."""
+        return await _pending_stats(self.pool, namespace_id)
 
     async def settle(
         self,
@@ -506,7 +607,7 @@ class NativeDerivedWorker:
         namespace_id: uuid.UUID,
         timeout_seconds: float,
         poll_interval_seconds: float = 0.05,
-    ) -> dict[str, int | float]:
+    ) -> dict[str, int | float | str]:
         started = asyncio.get_running_loop().time()
         polls = 0
         while True:

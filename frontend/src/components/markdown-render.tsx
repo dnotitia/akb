@@ -29,7 +29,7 @@
  *     `$$` / `$`.
  */
 import React, { useCallback, useMemo, useState, type ComponentProps } from "react";
-import Markdown, { type Components, type ExtraProps } from "react-markdown";
+import Markdown, { defaultUrlTransform, type Components, type ExtraProps } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
@@ -48,6 +48,12 @@ import "katex/dist/katex.min.css";
 import { AssetImage, type AssetContext } from "@/components/asset-image";
 import { cn, sanitizeLinkUrl } from "@/lib/utils";
 import { parseHeadings, slugify, stripFrontmatter } from "@/lib/markdown";
+import {
+  canonicalAkbMarkdownTarget,
+  classifyAkbMarkdownTarget,
+  useAkbMarkdownTargetResolutions,
+  type AkbMarkdownTargetResolution,
+} from "@/lib/markdown-adapters";
 
 /* ── LaTeX delimiter normalization ────────────────────────────────
    GPT-family models emit \[..\] / \(..\); remark-math only groks the
@@ -438,7 +444,11 @@ function flattenText(children: React.ReactNode): string {
 /* ── Build the full components map ───────────────────────────────── */
 type HeadingProps = ComponentProps<"h1"> & ExtraProps;
 
-function buildComponents(markdown: string, assetContext?: AssetContext): Components {
+function buildComponents(
+  markdown: string,
+  assetContext?: AssetContext,
+  targetResolutions: ReadonlyMap<string, AkbMarkdownTargetResolution> = new Map(),
+): Components {
   // Heading slugs in document order — matches parseHeadings() so the
   // outline's `#slug` anchors line up with the rendered `id`s. The
   // cursor advances once per heading element react-markdown renders,
@@ -575,11 +585,24 @@ function buildComponents(markdown: string, assetContext?: AssetContext): Compone
 
     /* ── Links + media ────────────────────────────────────────── */
     a: ({ node: _node, href, children, ...props }) => {
-      const safe = sanitizeLinkUrl(href);
+      const canonical = typeof href === "string" ? canonicalAkbMarkdownTarget(href) : null;
+      const resolution = canonical ? targetResolutions.get(canonical) : undefined;
+      const ownedTarget = canonical && classifyAkbMarkdownTarget(canonical);
+      const safe = ownedTarget
+        ? resolution?.status === "available" && resolution.runtimeUrl
+          ? resolution.runtimeUrl
+          : "#"
+        : sanitizeLinkUrl(href);
+      const unavailable =
+        !!ownedTarget && (!resolution || resolution.status === "unavailable");
       const external = /^https?:\/\//i.test(safe);
       return (
         <a
           href={safe}
+          data-markdown-target={ownedTarget ? canonical : undefined}
+          data-markdown-resolution={ownedTarget ? resolution?.status ?? "unavailable" : undefined}
+          aria-disabled={unavailable || undefined}
+          title={unavailable ? "Reference unavailable" : undefined}
           {...(external ? { rel: "noopener noreferrer", target: "_blank" } : {})}
           className="text-link underline decoration-link/40 underline-offset-[3px] decoration-1 hover:text-link-hover hover:decoration-link-hover transition-token break-words"
           {...props}
@@ -589,13 +612,24 @@ function buildComponents(markdown: string, assetContext?: AssetContext): Compone
       );
     },
     img: ({ node: _node, src, alt, ...props }) => (
-      <AssetImage
-        src={typeof src === "string" ? src : null}
-        alt={alt}
-        assetContext={assetContext}
-        className="block my-4 rounded-[var(--radius-lg)] border border-border max-w-full h-auto"
-        {...props}
-      />
+      (() => {
+        const rawTarget = typeof src === "string" ? src : "";
+        const canonical = canonicalAkbMarkdownTarget(rawTarget);
+        const resolution = canonical ? targetResolutions.get(canonical) : undefined;
+        return (
+          <AssetImage
+            src={canonical ?? rawTarget}
+            canonicalTarget={canonical ?? rawTarget}
+            runtimeSrc={resolution?.status === "available" ? resolution.runtimeUrl : null}
+            unavailable={resolution?.status === "unavailable"}
+            unavailableLabel="Reference unavailable"
+            alt={alt}
+            assetContext={assetContext}
+            className="block my-4 rounded-[var(--radius-lg)] border border-border max-w-full h-auto"
+            {...props}
+          />
+        );
+      })()
     ),
 
     /* ── Code (inline + fenced) ───────────────────────────────── */
@@ -694,6 +728,10 @@ function buildComponents(markdown: string, assetContext?: AssetContext): Compone
   };
 }
 
+function preserveCanonicalTargetUrl(url: string): string {
+  return canonicalAkbMarkdownTarget(url) ?? defaultUrlTransform(url);
+}
+
 const REMARK_PLUGINS = [remarkGfm, remarkMath];
 const REHYPE_PLUGINS = [rehypeKatex];
 
@@ -742,9 +780,14 @@ export function MarkdownRender({ markdown, className, assetContext }: MarkdownRe
     }
     return undefined;
   }, [assetCommit, assetDocument, assetMode, assetVault, publicationSlug]);
+  const targetResolutions = useAkbMarkdownTargetResolutions(body, {
+    vault: assetVault,
+    document: assetDocument,
+    commit: assetCommit,
+  });
   const components = useMemo(
-    () => buildComponents(body, stableAssetContext),
-    [body, stableAssetContext],
+    () => buildComponents(body, stableAssetContext, targetResolutions),
+    [body, stableAssetContext, targetResolutions],
   );
 
   return (
@@ -752,6 +795,7 @@ export function MarkdownRender({ markdown, className, assetContext }: MarkdownRe
       <Markdown
         remarkPlugins={REMARK_PLUGINS}
         rehypePlugins={REHYPE_PLUGINS}
+        urlTransform={preserveCanonicalTargetUrl}
         components={components}
       >
         {normalized}
