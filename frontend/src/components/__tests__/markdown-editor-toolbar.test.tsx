@@ -19,11 +19,11 @@ describe("MarkdownEditor formatting toolbar", () => {
     expect(screen.getByRole("button", { name: "Paragraph" })).toHaveFocus();
   });
 
-  it("loads multiline code as distinct code lines", () => {
+  it("loads multiline code through the shared Tiptap code block", () => {
     const onChange = vi.fn();
     render(
       <MarkdownEditor
-        value={'```\nline one\nline two\n```'}
+        value={"```\nline one\nline two\n```"}
         vault="team"
         ariaLabel="Document content"
         onChange={onChange}
@@ -33,16 +33,14 @@ describe("MarkdownEditor formatting toolbar", () => {
     const editor = screen.getByRole("textbox", { name: "Document content" });
     const codeBlock = editor.querySelector("pre");
     expect(codeBlock).not.toBeNull();
-    expect(codeBlock?.children).toHaveLength(2);
-    expect(codeBlock?.children[0]).toHaveTextContent("line one");
-    expect(codeBlock?.children[1]).toHaveTextContent("line two");
+    expect(codeBlock).toHaveTextContent(/line one\s+line two/);
   });
 
   it("shows recoverable validation for unsafe link destinations", async () => {
     const user = userEvent.setup();
     render(
       <MarkdownEditor
-        value="Plate docs"
+        value="Markdown docs"
         vault="team"
         ariaLabel="Document content"
         onChange={vi.fn()}
@@ -52,19 +50,23 @@ describe("MarkdownEditor formatting toolbar", () => {
     await user.click(screen.getByRole("button", { name: "Insert link" }));
     await user.type(screen.getByLabelText("URL"), "javascript:alert(1)");
     await user.click(screen.getByRole("button", { name: "Insert link" }));
-    expect(screen.getByRole("alert")).toHaveTextContent(/http\(s\), email, phone/i);
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      /http\(s\), email, phone/i,
+    );
     await waitFor(() => expect(screen.getByLabelText("URL")).toHaveFocus());
   });
 
   it("normalizes common safe links and rejects active-content URLs", () => {
-    expect(normalizeEditorLinkUrl("platejs.org")).toBe("https://platejs.org");
+    expect(normalizeEditorLinkUrl("markdown.example.org")).toBe(
+      "https://markdown.example.org",
+    );
     expect(normalizeEditorLinkUrl("/vault/team")).toBe("/vault/team");
     expect(normalizeEditorLinkUrl("mailto:owner@example.com")).toBe(
       "mailto:owner@example.com",
     );
-    expect(
-      normalizeEditorLinkUrl("akb://team/coll/notes/doc/guide.md/"),
-    ).toBe("akb://team/coll/notes/doc/guide.md");
+    expect(normalizeEditorLinkUrl("akb://team/coll/notes/doc/guide.md/")).toBe(
+      "akb://team/coll/notes/doc/guide.md",
+    );
     expect(normalizeEditorLinkUrl("javascript:alert(1)")).toBeNull();
   });
 
@@ -73,27 +75,30 @@ describe("MarkdownEditor formatting toolbar", () => {
     ["blockquote", "> Terminal quote"],
     ["code", "```\nterminal code\n```"],
     ["table", "| A | B |\n| --- | --- |\n| 1 | 2 |"],
-  ])("does not persist the editor-only trailing paragraph after a %s", async (_name, value) => {
-    const user = userEvent.setup();
-    const onChange = vi.fn();
-    render(
-      <MarkdownEditor
-        value={value}
-        vault="team"
-        ariaLabel="Document content"
-        onChange={onChange}
-      />,
-    );
-    const editor = screen.getByRole("textbox", { name: "Document content" });
-    const trailingParagraph = editor.lastElementChild as HTMLElement;
-    expect(trailingParagraph.tagName).toBe("P");
-    await user.click(trailingParagraph);
-    await user.type(trailingParagraph, "x");
-    await user.keyboard("{Backspace}");
+  ])(
+    "does not persist the editor-only trailing paragraph after a %s",
+    async (_name, value) => {
+      const user = userEvent.setup();
+      const onChange = vi.fn();
+      render(
+        <MarkdownEditor
+          value={value}
+          vault="team"
+          ariaLabel="Document content"
+          onChange={onChange}
+        />,
+      );
+      const editor = screen.getByRole("textbox", { name: "Document content" });
+      const trailingParagraph = editor.lastElementChild as HTMLElement;
+      expect(trailingParagraph.tagName).toBe("P");
+      await user.click(trailingParagraph);
+      await user.type(trailingParagraph, "x");
+      await user.keyboard("{Backspace}");
 
-    await waitFor(() => expect(onChange).toHaveBeenCalled());
-    const latest = onChange.mock.calls.at(-1)?.[0] as string;
-    expect(latest).not.toContain("\u200b");
-    expect(latest).not.toContain("\ufeff");
-  });
+      await waitFor(() => expect(onChange).toHaveBeenCalled());
+      const latest = onChange.mock.calls.at(-1)?.[0] as string;
+      expect(latest).not.toContain("\u200b");
+      expect(latest).not.toContain("\ufeff");
+    },
+  );
 });

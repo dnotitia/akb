@@ -382,7 +382,7 @@ def _acl_filter(
     onto the `must` list — stale points from the non-active Document arm can
     never consume the top-K. Orthogonal to the ACL filter, so it combines with
     either branch (or with no ACL filter at all)."""
-    must = []
+    must: list[qm.Condition] = []
     if vault_ids:
         key, vals = PAYLOAD_VAULT_ID, vault_ids
         must.append(qm.FieldCondition(key=key, match=qm.MatchAny(any=[str(v) for v in vals])))
