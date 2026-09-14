@@ -120,6 +120,19 @@ export function markdownCommands(editor: Editor): MarkdownCommands {
         type: 'image',
         attrs: { target, alt, title: title ?? null },
       }),
+    setLink: href =>
+      editor.chain().focus().extendMarkRange('link').setLink({ href }).run(),
+    insertLink: (text, href) =>
+      editor
+        .chain()
+        .focus()
+        .insertContent({
+          type: 'text',
+          text,
+          marks: [{ type: 'link', attrs: { href } }],
+        })
+        .run(),
+    unsetLink: () => editor.chain().focus().extendMarkRange('link').unsetLink().run(),
     setParagraph: () => editor.commands.setParagraph(),
     toggleHeading: (level: MarkdownHeadingLevel) =>
       editor.commands.toggleHeading({ level }),

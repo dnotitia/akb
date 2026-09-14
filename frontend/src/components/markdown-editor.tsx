@@ -7,7 +7,6 @@ import {
   MarkdownToolbarGroup,
   useMarkdownCommands,
   useMarkdownEditor,
-  useMarkdownState,
   useMarkdownTargetResolutions,
 } from "@akb/markdown-editor/react";
 import { serializeMarkdown } from "@akb/markdown-editor";
@@ -16,7 +15,6 @@ import {
   Columns3,
   CornerDownLeft,
   ImagePlus,
-  Link2,
   Loader2,
   Pencil,
   Replace,
@@ -880,88 +878,13 @@ function EditorToolbar({
   appearance,
   imageInputRef,
 }: EditorToolbarProps) {
-  const editorState = useMarkdownState(editor);
-  const [linkOpen, setLinkOpen] = React.useState(false);
-  const [linkUrl, setLinkUrl] = React.useState("");
-  const [linkText, setLinkText] = React.useState("");
-  const [linkError, setLinkError] = React.useState("");
-  const [referenceQuery, setReferenceQuery] = React.useState("");
-  const [referenceResults, setReferenceResults] = React.useState<
-    Awaited<
-      ReturnType<NonNullable<EditorToolbarProps["searchAdapter"]>["search"]>
-    >
-  >([]);
-  const [referenceSearching, setReferenceSearching] = React.useState(false);
-  const linkSelectionRef = React.useRef<{ from: number; to: number } | null>(
-    null,
-  );
-  const linkUrlInputRef = React.useRef<HTMLInputElement>(null);
-  const linkUrlId = React.useId();
-  const linkTextId = React.useId();
-  const referenceQueryId = React.useId();
-  const linkActive = Boolean(editorState && editor?.isActive("link"));
-
-  const openLinkEditor = () => {
-    if (!editor) return;
-    const { from, to } = editor.state.selection;
-    linkSelectionRef.current = { from, to };
-    setLinkUrl(String(editor.getAttributes("link").href ?? ""));
-    setLinkText(editor.state.doc.textBetween(from, to, " "));
-    setLinkError("");
-    setReferenceQuery("");
-    setReferenceResults([]);
-    setLinkOpen(true);
-  };
-
-  const searchReferences = async () => {
-    const query = referenceQuery.trim();
-    if (!searchAdapter || !query) return;
-    setReferenceSearching(true);
-    try {
-      setReferenceResults(await searchAdapter.search(query));
-    } finally {
-      setReferenceSearching(false);
-    }
-  };
-
-  const applyLink = () => {
-    if (!editor) return;
-    const normalizedUrl = normalizeEditorLinkUrl(linkUrl);
-    if (!normalizedUrl) {
-      setLinkError("Enter an http(s), email, phone, anchor, or relative URL.");
-      requestAnimationFrame(() => linkUrlInputRef.current?.focus());
-      return;
-    }
-    const selection = linkSelectionRef.current;
-    if (selection) invokeCommand(editor, "setTextSelection", selection);
-    const text = linkText.trim() || normalizedUrl;
-    invokeCommand(editor, "focus");
-    if (linkActive) {
-      invokeCommand(editor, "extendMarkRange", "link");
-      invokeCommand(editor, "setLink", { href: normalizedUrl });
-    } else if (selection && selection.from === selection.to) {
-      invokeCommand(editor, "insertContent", {
-        type: "text",
-        text,
-        marks: [{ type: "link", attrs: { href: normalizedUrl } }],
-      });
-    } else invokeCommand(editor, "setLink", { href: normalizedUrl });
-    setLinkOpen(false);
-  };
-
-  const removeCurrentLink = () => {
-    if (!editor) return;
-    if (linkSelectionRef.current)
-      invokeCommand(editor, "setTextSelection", linkSelectionRef.current);
-    invokeCommand(editor, "focus");
-    invokeCommand(editor, "extendMarkRange", "link");
-    invokeCommand(editor, "unsetLink");
-    setLinkOpen(false);
-  };
-
   return (
     <MarkdownToolbar
       editor={editor}
+      link={{
+        normalizeUrl: normalizeEditorLinkUrl,
+        searchAdapter,
+      }}
       className={cn(
         appearance === "canvas"
           ? "bg-surface/95 px-5 py-2 backdrop-blur-sm sm:px-8 lg:px-10"
@@ -971,14 +894,6 @@ function EditorToolbar({
       )}
     >
       <MarkdownToolbarGroup label="Insert">
-        <MarkdownToolbarButton
-          label={linkActive ? "Edit link" : "Insert link"}
-          active={linkActive}
-          disabled={!editor}
-          onClick={openLinkEditor}
-        >
-          <Link2 className="h-4 w-4" />
-        </MarkdownToolbarButton>
         <MarkdownToolbarButton
           label="Insert table"
           disabled={!editor}
@@ -1020,147 +935,6 @@ function EditorToolbar({
           }}
         />
       </MarkdownToolbarGroup>
-      <Dialog open={linkOpen} onOpenChange={setLinkOpen}>
-        <DialogContent
-          className="sm:max-w-md"
-          onCloseAutoFocus={(event) => {
-            event.preventDefault();
-            if (editor && !editor.isDestroyed) editor.commands.focus();
-          }}
-        >
-          <DialogHeader>
-            <DialogTitle>
-              {linkActive ? "Edit link" : "Insert link"}
-            </DialogTitle>
-            <DialogDescription>
-              Add a safe destination and choose the text readers will see.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4">
-            {searchAdapter && (
-              <div className="space-y-2">
-                <Label htmlFor={referenceQueryId}>Search Vault resources</Label>
-                <div className="flex gap-2">
-                  <Input
-                    id={referenceQueryId}
-                    value={referenceQuery}
-                    onChange={(event) => setReferenceQuery(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        event.preventDefault();
-                        void searchReferences();
-                      }
-                    }}
-                    placeholder="Find a document or file"
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => void searchReferences()}
-                    disabled={referenceSearching || !referenceQuery.trim()}
-                  >
-                    {referenceSearching ? "Searching…" : "Search"}
-                  </Button>
-                </div>
-                {referenceResults.length > 0 && (
-                  <div
-                    role="listbox"
-                    aria-label="Vault resource results"
-                    className="max-h-40 overflow-y-auto rounded-[var(--radius-md)] border border-border"
-                  >
-                    {referenceResults.map((result) => (
-                      <button
-                        key={result.id}
-                        type="button"
-                        role="option"
-                        aria-label={`${result.title} (${result.kind ?? "resource"})`}
-                        className="flex w-full flex-col items-start gap-0.5 border-b border-border px-3 py-2 text-left last:border-b-0 hover:bg-surface-hover focus-visible:bg-surface-hover focus-visible:outline-none"
-                        onMouseDown={(event) => event.preventDefault()}
-                        onClick={() => {
-                          setLinkUrl(result.target);
-                          setLinkText(result.title);
-                          setReferenceResults([]);
-                        }}
-                      >
-                        {result.title}
-                        <span className="text-xs text-foreground-muted">
-                          {result.kind ?? "resource"}
-                          {result.snippet ? ` · ${result.snippet}` : ""}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-            <div className="space-y-2">
-              <Label htmlFor={linkUrlId}>URL</Label>
-              <Input
-                ref={linkUrlInputRef}
-                id={linkUrlId}
-                value={linkUrl}
-                onChange={(event) => {
-                  setLinkUrl(event.target.value);
-                  if (linkError) setLinkError("");
-                }}
-                placeholder="https://example.com"
-                inputMode="url"
-                autoComplete="url"
-                aria-invalid={linkError ? true : undefined}
-                aria-describedby={linkError ? `${linkUrlId}-error` : undefined}
-                autoFocus
-              />
-              {linkError && (
-                <p
-                  id={`${linkUrlId}-error`}
-                  role="alert"
-                  className="text-xs text-destructive"
-                >
-                  {linkError}
-                </p>
-              )}
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor={linkTextId}>Text</Label>
-              <Input
-                id={linkTextId}
-                value={linkText}
-                onChange={(event) => setLinkText(event.target.value)}
-                placeholder="Link text"
-              />
-              <p className="text-xs text-foreground-muted">
-                Leave blank to use the destination as the visible text.
-              </p>
-            </div>
-          </div>
-          <DialogFooter className="sm:justify-between">
-            {linkActive ? (
-              <Button
-                type="button"
-                variant="ghost"
-                className="text-destructive"
-                onClick={removeCurrentLink}
-              >
-                Remove link
-              </Button>
-            ) : (
-              <span aria-hidden />
-            )}
-            <div className="flex flex-col-reverse gap-2 sm:flex-row">
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => setLinkOpen(false)}
-              >
-                Cancel
-              </Button>
-              <Button type="button" onClick={applyLink}>
-                {linkActive ? "Save link" : "Insert link"}
-              </Button>
-            </div>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </MarkdownToolbar>
   );
 }

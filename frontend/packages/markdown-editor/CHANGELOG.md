@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0
+
+- Add the shared link command/state contract and accessible React link popup.
+- Preserve selection and editor focus through link insert, update, remove,
+  cancel, and URL validation flows; accept product URL policies and existing
+  search adapters through explicit options.
+
 ## 0.3.0
 
 - Add the shared default Markdown formatting toolbar with active/disabled state,

@@ -106,6 +106,34 @@ export interface MarkdownSearchContext {
   signal?: AbortSignal
 }
 
+/**
+ * Product policy for link destinations. The editor owns when this function is
+ * called; products own any resource-specific canonicalization.
+ */
+export type MarkdownLinkUrlNormalizer = (raw: string) => string | null
+
+export interface MarkdownLinkLabels {
+  insertButton: string
+  editButton: string
+  saveButton: string
+  insertTitle: string
+  editTitle: string
+  description: string
+  url: string
+  text: string
+  textPlaceholder: string
+  textHint: string
+  cancel: string
+  remove: string
+  close: string
+  invalidUrl: string
+  searchLabel: string
+  searchPlaceholder: string
+  searchButton: string
+  searching: string
+  resultsLabel: string
+}
+
 export interface MarkdownTargetResolver {
   resolve(
     target: string,
@@ -146,6 +174,9 @@ export interface MarkdownCommands {
   setMarkdown(markdown: string): boolean
   insertMarkdown(markdown: string): boolean
   insertImage(target: string, alt?: string, title?: string): boolean
+  setLink(href: string): boolean
+  insertLink(text: string, href: string): boolean
+  unsetLink(): boolean
   setParagraph(): boolean
   toggleHeading(level: MarkdownHeadingLevel): boolean
   toggleBold(): boolean
@@ -175,6 +206,12 @@ export interface MarkdownActiveState {
   orderedList: boolean
   blockquote: boolean
   codeBlock: boolean
+  link: boolean
+}
+
+export interface MarkdownLinkState {
+  active: boolean
+  href: string
 }
 
 export interface MarkdownSelectionState {
@@ -187,6 +224,7 @@ export interface MarkdownState {
   isEmpty: boolean
   isEditable: boolean
   active: MarkdownActiveState
+  link: MarkdownLinkState
   canUndo: boolean
   canRedo: boolean
   selection: MarkdownSelectionState
