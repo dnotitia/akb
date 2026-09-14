@@ -16,7 +16,6 @@ services:
       retries: 12
 
   minio:
-    # Use the upstream Quay distribution; Docker Hub no longer serves this image.
     image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     command: ["server", "/data"]
     environment:
