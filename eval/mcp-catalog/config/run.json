@@ -70,7 +70,8 @@
   },
   "credential_profiles": {
     "default": null,
-    "read_only": "MCP_BENCH_READ_ONLY_PAT"
+    "read_only": "MCP_BENCH_READ_ONLY_PAT",
+    "authorization": "MCP_BENCH_AUTHORIZATION_PAT"
   },
   "fixture_scenario": "app-control-plane",
   "locales": ["ko-KR", "en-US"],

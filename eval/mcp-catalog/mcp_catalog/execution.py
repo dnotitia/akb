@@ -1151,7 +1151,9 @@ def material_outcome_matches(
 
     matched = True
     expected_error = False
+    material_attempts: dict[str, int] = defaultdict(int)
     for call in material_calls:
+        material_attempts[call.logical_operation] += 1
         contract = expected.get(call.logical_operation)
         if contract is None:
             matched = False
@@ -1173,6 +1175,11 @@ def material_outcome_matches(
             matched = False
         else:
             expected_error = True
+    if any(
+        material_attempts.get(operation, 0) > limit
+        for operation, limit in task.material_attempt_limits.items()
+    ):
+        matched = False
     if expected and not material_calls:
         matched = False
     return matched, expected_error

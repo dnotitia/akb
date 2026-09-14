@@ -19,6 +19,9 @@ class _CredentialFixture:
         self.revoke_calls: list[tuple[str, str, bool]] = []
         self.reset_calls = 0
 
+    async def discover(self) -> dict[str, object]:
+        return {"actors": {"reader": {"username": "fixture-reader"}}}
+
     async def reset(self) -> None:
         self.reset_calls += 1
 
@@ -82,6 +85,20 @@ async def test_each_reset_refreshes_http_credentials_with_read_only_scope(monkey
         ("fixture-user", "fixture-password", None),
         ("fixture-user", "fixture-password", ["read"]),
     ]
+
+
+@pytest.mark.asyncio
+async def test_authorization_profile_mints_the_seeded_reader_with_both_coarse_scopes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MCP_BENCH_AUTHORIZATION_PAT", raising=False)
+    monkeypatch.setenv("AKB_E2E_PASSWORD", "fixture-password")
+    resolver = _resolver()
+    fixture = _CredentialFixture()
+
+    await resolver.prepare(fixture, ["authorization"])
+
+    assert fixture.mint_calls == [("fixture-reader", "fixture-password", ["read", "write"])]
 
 
 @pytest.mark.asyncio

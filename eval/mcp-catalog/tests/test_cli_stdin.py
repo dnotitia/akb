@@ -52,7 +52,7 @@ def test_run_stdin_reaches_auth_preflight_without_catalog_or_model_calls(tmp_pat
     environment["MCP_BENCH_OPENROUTER_BASE_URL"] = "https://openrouter.ai/api/v1"
     environment[provider_key_env] = "fixture-provider-key"
     environment["AKB_E2E_PAT"] = "fixture-pat"
-    environment.pop("MCP_BENCH_READ_ONLY_PAT", None)
+    environment.pop("MCP_BENCH_AUTHORIZATION_PAT", None)
     output = tmp_path / "run.json"
 
     completed = subprocess.run(
@@ -78,7 +78,7 @@ def test_run_stdin_reaches_auth_preflight_without_catalog_or_model_calls(tmp_pat
 
     assert completed.returncode == 2
     assert "needs_user_input" in completed.stderr
-    assert "MCP_BENCH_READ_ONLY_PAT" in completed.stderr
+    assert "MCP_BENCH_AUTHORIZATION_PAT" in completed.stderr
     assert "No such file" not in completed.stderr
     assert not output.exists()
 

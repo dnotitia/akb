@@ -140,10 +140,12 @@ launcher requires the fixture login values named by its descriptor, which are
 `AKB_E2E_USERNAME` and `AKB_E2E_PASSWORD` by default. Those values let each
 cell mint a fresh runtime PAT after reset. The descriptor advertises
 `AKB_E2E_PAT` as the stdio PAT environment name; the actual PAT value remains
-private to the child process. The manifest's `read_only` profile is
-`MCP_BENCH_READ_ONLY_PAT`; a descriptor without isolated cells may use that
-PAT directly, while the four-cell launcher mints a fresh read-scope PAT from
-the runtime login values.
+private to the child process. The manifest's `authorization` profile is
+`MCP_BENCH_AUTHORIZATION_PAT`; with isolated cells, the launcher mints a fresh
+PAT for the seeded `reader` actor with both coarse read and write scopes. The
+actor's reader ACL, not the coarse scope gate, produces the expected
+`permission_denied` write outcome. The `read_only` profile remains available
+for direct runs that intentionally test coarse-scope refusal.
 
 The provider values belong to the benchmark process, not the serving runtime.
 The following checks fail before catalog or model calls when required values
@@ -202,9 +204,11 @@ uv run --locked --project eval/mcp-catalog \
 Without a provider key or required runtime login/PAT input, `run` exits as
 `needs_user_input` before catalog or model calls. Only environment variable
 names are stored in descriptors. `default` uses the runtime's full-scope PAT;
-`read_only` uses the registered `read` scope. With isolated cells, the login
-path mints fresh credentials after every reset; the runner never reuses a
-stale PAT when no mint path is available.
+`read_only` uses the registered `read` scope. `authorization` uses the
+runtime-seeded reader actor and both coarse scopes so its complete write
+payload reaches vault ACL enforcement. With isolated cells, the login path
+mints fresh credentials after every reset; the runner never reuses a stale PAT
+when no mint path is available.
 
 ## Checkpoints and resume
 

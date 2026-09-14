@@ -151,6 +151,41 @@ async def test_expected_permission_denial_keeps_arguments_valid_and_matches_real
     assert outcome.success is True
 
 
+def test_authorization_retry_fails_the_declared_single_attempt_limit() -> None:
+    _manifest, tasks = _loaded()
+    task = next(task for task in tasks if task.id == "authorization-readonly-b")
+    state = StateObservation(True, 200, {"vaults": [{"name": "catalog-bench-vault-authorization"}]})
+    call = ToolCallRecord(
+        order=1,
+        tool_name="akb_put",
+        logical_operation="create",
+        raw_model_args={"vault": "catalog-bench-vault-authorization", "collection": "", "title": "authorization-probe", "content": "permission probe"},
+        server_args={"vault": "catalog-bench-vault-authorization", "collection": "", "title": "authorization-probe", "content": "permission probe"},
+        raw_args_valid=True,
+        server_args_equal_raw=True,
+        server_status_code=403,
+        server_error_code="permission_denied",
+    )
+    outcome = TrialOutcome(
+        task_id=task.id,
+        category=task.category,
+        locale=task.locale,
+        arm="baseline",
+        model_class="primary",
+        model_id="model",
+        transport="http",
+        final_answer_text="Access is denied; I will not retry.",
+        first_logical_operation="create",
+        tool_calls=[call, call.model_copy(update={"order": 2})],
+        error="permission denied",
+    )
+
+    outcome.finalize(task, state, state)
+
+    assert outcome.tool_outcome_match is False
+    assert outcome.success is False
+
+
 def test_missing_wrong_target_and_bypass_material_attempts_fail() -> None:
     _manifest, tasks = _loaded()
     task = next(task for task in tasks if task.id == "authorization-readonly-b")

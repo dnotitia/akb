@@ -213,6 +213,7 @@ class TaskManifest(ContractModel):
     allowed_first_operations: list[str] = Field(min_length=1)
     forbidden_operations: list[str] = Field(default_factory=list)
     required_attempted_operations: list[str] = Field(default_factory=list)
+    material_attempt_limits: dict[str, int] = Field(default_factory=dict)
     required_operations: list[str] = Field(default_factory=list)
     expected_material_arguments: dict[str, dict[str, JsonValue]] = Field(default_factory=dict)
     expected_material_outcomes: list[ExpectedMaterialOutcome] = Field(default_factory=list)
@@ -263,6 +264,10 @@ class TaskManifest(ContractModel):
             raise ValueError("a required operation cannot be forbidden")
         if not set(self.required_attempted_operations) <= set(self.allowed_material_operations):
             raise ValueError("required attempted operations must be material operations")
+        if any(operation not in self.allowed_material_operations for operation in self.material_attempt_limits):
+            raise ValueError("material attempt limits must be material operations")
+        if any(limit <= 0 for limit in self.material_attempt_limits.values()):
+            raise ValueError("material attempt limits must be positive")
         if not set(self.required_operations) <= set(self.allowed_material_operations):
             raise ValueError("required operations must be material operations")
         expected_operations = [item.logical_operation for item in self.expected_material_outcomes]
@@ -473,8 +478,11 @@ class BenchmarkRunManifest(ContractModel):
             operation
             for task in tasks
             for operation in [
+                *task.allowed_preparatory_operations,
+                *task.allowed_material_operations,
                 *task.allowed_first_operations,
                 *task.forbidden_operations,
+                *task.material_attempt_limits,
                 *task.required_operations,
             ]
             if operation not in self.operation_map and operation != "none"
@@ -539,6 +547,7 @@ class BenchmarkRunManifest(ContractModel):
             "allowed_first_operations": sorted(task.allowed_first_operations),
             "forbidden_operations": sorted(task.forbidden_operations),
             "required_attempted_operations": sorted(task.required_attempted_operations),
+            "material_attempt_limits": dict(sorted(task.material_attempt_limits.items())),
             "required_operations": sorted(task.required_operations),
             "expected_material_arguments": task.expected_material_arguments,
             "expected_material_outcomes": [item.model_dump(mode="json") for item in task.expected_material_outcomes],

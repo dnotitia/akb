@@ -218,8 +218,24 @@ class CredentialResolver:
         return self.token_for(profile)
 
     async def _mint(self, fixture: RuntimeFixture, profile: str) -> None:
-        username, password = self._login_credentials(profile)
-        scopes = ["read"] if profile == "read_only" else None
+        scopes: list[str] | None
+        if profile == "authorization":
+            discovery = await fixture.discover()
+            actors = discovery.get("actors")
+            reader = actors.get("reader") if isinstance(actors, dict) else None
+            username = reader.get("username") if isinstance(reader, dict) else None
+            password = os.environ.get(self.descriptor.password_env, "")
+            if not isinstance(username, str) or not username or not password:
+                raise RuntimeContractError(
+                    "authorization credential fixture does not expose the seeded reader actor",
+                    stage="credential_login",
+                )
+            # The reader ACL is what denies the write; both coarse scopes keep
+            # preparation reads from failing at the MCP scope gate first.
+            scopes = ["read", "write"]
+        else:
+            username, password = self._login_credentials(profile)
+            scopes = ["read"] if profile == "read_only" else None
         token, token_id = await fixture.mint_pat(username, password, scopes=scopes)
         assert self.tokens is not None
         self.tokens[profile] = token
