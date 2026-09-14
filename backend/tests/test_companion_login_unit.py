@@ -25,9 +25,9 @@ def login(monkeypatch):
     public = bff.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo).decode()
     for name, value in dict(auth_mode="sso", keycloak_enabled=True, public_base_url="https://akb.example.com",
                             keycloak_server_url="https://id.example.com", keycloak_realm="akb", keycloak_client_id="akb-web",
-                            keycloak_companion_client_ids_by_origin={"https://reef.example.com": "reef"},
-                            keycloak_companion_login_clients={"reef": CompanionLoginClient(
-                                public_keys={"reef-v1": public}, provider_aliases=["workforce"])}).items():
+                            keycloak_companion_client_ids_by_origin={"https://app.example.com": "example-app"},
+                            keycloak_companion_login_clients={"example-app": CompanionLoginClient(
+                                public_keys={"login-v1": public}, provider_aliases=["workforce"])}).items():
         monkeypatch.setattr(settings, name, value)
     oidc = KeycloakOIDC()
     jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(kc.public_key()))
@@ -41,30 +41,30 @@ def login(monkeypatch):
 
     def tokens(access_changes=None, id_changes=None):
         now = int(time.time())
-        common = dict(iss=settings.keycloak_issuer, sub=subject, sid="session-1", azp="reef",
+        common = dict(iss=settings.keycloak_issuer, sub=subject, sid="session-1", azp="example-app",
                       iat=now, exp=now + 300, identity_provider="workforce")
         claims = {**common, "aud": settings.api_oauth_audience_effective, "typ": "Bearer",
                   "jti": str(uuid.uuid4()), "scope": "openid profile email", "email": f"{subject}@corp.example",
                   "email_verified": True, "preferred_username": f"auth-{subject}", **(access_changes or {})}
         access = jwt.encode(claims, kc, algorithm="RS256", headers={"kid": "oidc-v1"})
         digest = base64.urlsafe_b64encode(hashlib.sha256(access.encode()).digest()[:16]).rstrip(b"=").decode()
-        claims = {**common, "aud": "reef", "nonce": req.nonce, "at_hash": digest, **(id_changes or {})}
+        claims = {**common, "aud": "example-app", "nonce": req.nonce, "at_hash": digest, **(id_changes or {})}
         identity = jwt.encode(claims, kc, algorithm="RS256", headers={"kid": "oidc-v1"})
         return access, identity
 
     def sign(access, identity, changes=None, headers=None, key=None, request=None):
         now = int(time.time())
-        claims = dict(iss="reef", sub="reef", aud=settings.public_base_url + service.ENDPOINT,
+        claims = dict(iss="example-app", sub="example-app", aud=settings.public_base_url + service.ENDPOINT,
                       iat=now, exp=now + 60, jti=str(uuid.uuid4()), request_hash=service.request_hash(request or req, access, identity))
         claims.update(changes or {})
-        return jwt.encode(claims, key or bff, algorithm="RS256", headers={"kid": "reef-v1", **(headers or {})})
+        return jwt.encode(claims, key or bff, algorithm="RS256", headers={"kid": "login-v1", **(headers or {})})
     return req, tokens, sign, consume, subject
 
 
 def test_valid_assertion(login):
     req, tokens, sign, _, _ = login
     access, identity = tokens()
-    assert service.verify_assertion(sign(access, identity), service.request_hash(req, access, identity), req.provider_alias)[0] == "reef"
+    assert service.verify_assertion(sign(access, identity), service.request_hash(req, access, identity), req.provider_alias)[0] == "example-app"
 
 
 @pytest.mark.parametrize("changes", [
@@ -103,8 +103,8 @@ def test_forged_signature_and_provider(login):
     ({"azp": "other"}, {}), ({"identity_provider": "other"}, {}), ({"aud": "wrong"}, {}),
     ({"typ": "ID"}, {}), ({"iss": "https://evil.example"}, {}), ({"exp": 1}, {}),
     ({}, {"sub": "other"}), ({}, {"sid": "other"}), ({}, {"nonce": "wrong"}), ({}, {"at_hash": "wrong"}), ({}, {"at_hash": "é"}),
-    ({}, {"identity_provider": "other"}), ({}, {"azp": "other"}), ({}, {"aud": "akb-web"}), ({}, {"aud": ["reef", "other"]}),
-    ({}, {"exp": 1}), ({}, {"iss": "https://evil.example"}), ({}, {"client_id": "reef"}),
+    ({}, {"identity_provider": "other"}), ({}, {"azp": "other"}), ({}, {"aud": "akb-web"}), ({}, {"aud": ["example-app", "other"]}),
+    ({}, {"exp": 1}), ({}, {"iss": "https://evil.example"}), ({}, {"client_id": "example-app"}),
 ])
 async def test_pair_refused_before_db(login, ac, ic):
     req, tokens, sign, consume, _ = login
@@ -191,7 +191,7 @@ def test_config_registration_is_explicit_and_validated(login):
 
 def test_dotted_provider_alias_matches_existing_catalog(login):
     req, tokens, sign, _, _ = login
-    client = settings.keycloak_companion_login_clients["reef"]
+    client = settings.keycloak_companion_login_clients["example-app"]
     client.provider_aliases = ["workforce.ms"]
     # Validate both startup registration and exact request field using the
     # same provider vocabulary as AKB's existing provider catalog.
@@ -199,4 +199,4 @@ def test_dotted_provider_alias_matches_existing_catalog(login):
     request = service.CompanionLoginRequest.model_validate({**req.model_dump(), "provider_alias": "workforce.ms"})
     access, identity = tokens()
     assertion = sign(access, identity, request=request)
-    assert service.verify_assertion(assertion, service.request_hash(request, access, identity), request.provider_alias)[0] == "reef"
+    assert service.verify_assertion(assertion, service.request_hash(request, access, identity), request.provider_alias)[0] == "example-app"

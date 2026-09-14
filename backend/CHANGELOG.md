@@ -17,7 +17,9 @@ Keycloak access/ID tokens. A short-lived assertion replay table prevents duplica
 the existing public account-projection service owns concurrent adoption,
 pending admissions, account denials and role synchronization. No completion
 receipt or cached login result is stored. Existing bearer/PAT/MCP authority is unchanged;
-no AKB cookie, API token or refresh token is issued. Configuration and rollout:
+no AKB cookie, API token or refresh token is issued. Public configuration examples,
+Helm registration values and the OpenAPI contract support independently developed
+companion applications. Configuration and rollout:
 `docs/designs/keycloak-oidc/companion-login.md`.
 
 ### Every document counter follows the active authority (akb#525)

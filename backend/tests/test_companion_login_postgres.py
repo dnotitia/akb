@@ -1,4 +1,4 @@
-"""Signed BFF completion reuses PR531 account policy against isolated PostgreSQL."""
+"""Signed BFF completion reuses shared account policy against isolated PostgreSQL."""
 import asyncio
 import uuid
 from unittest.mock import AsyncMock
@@ -90,6 +90,6 @@ async def test_assertion_consumed_after_account_failure(pool, completion, monkey
 async def test_expired_at_db_consumption_refused(pool, completion):
     import time
     with pytest.raises(AuthenticationError):
-        await service._consume_assertion("reef", str(uuid.uuid4()), int(time.time()) - 1)
+        await service._consume_assertion("example-app", str(uuid.uuid4()), int(time.time()) - 1)
     async with pool.acquire() as conn:
         assert await conn.fetchval("SELECT COUNT(*) FROM companion_login_assertions") == 0

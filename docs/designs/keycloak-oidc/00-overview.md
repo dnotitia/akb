@@ -242,9 +242,14 @@ the admin session class, which stores no encrypted Keycloak token.
 
 When SSO is configured but browser custody is not ready, login/callback/logout
 fail before issuing state or contacting the token endpoint. SSO never issues,
-stores, or transports an AKB user JWT. Reef and Naut must instead own their
-separate BFF callback/token custody and present their Keycloak access token to
-AKB; that cross-product change remains part of the release gate.
+stores, or transports an AKB user JWT. Companion applications own their
+separate backend-for-frontend (BFF) callback/token custody and present their
+Keycloak access token to AKB. For account linking during their own verified
+login, deployments can opt into
+[companion account completion](companion-login.md). It requires separate BFF
+registration and a signed server request; ordinary bearer resolution does not
+gain account-linking authority. Companion deployments must adopt the new
+contract before enabling this flow for their users.
 
 ## Public capability schema v2
 

@@ -101,9 +101,36 @@ def test_profiles_render_one_coherent_application_stack(
     config = _one(resources, "ConfigMap", "akb-app-config")
     app = yaml.safe_load(config["data"]["app.yaml"])
     assert app["auth_mode"] == ("sso" if wants_sso else "local")
+    assert not app.get("keycloak_companion_client_ids_by_origin")
+    assert not app.get("keycloak_companion_login_clients")
     if wants_sso:
         assert app["keycloak_internal_url"] == "http://keycloak:8080"
         assert backend["spec"]["template"]["spec"]["initContainers"][0]["name"] == ("bootstrap-standalone-sso")
+
+
+def test_companion_registration_reaches_runtime_with_public_key_intact(tmp_path: Path):
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    from app.config import Settings
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public = key.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo).decode()
+    origins = {"https://app.example.com": "example-app"}
+    clients = {"example-app": {"provider_aliases": ["workforce", "local"], "public_keys": {"login-v1": public}}}
+    values = tmp_path / "companion.yaml"
+    values.write_text(yaml.safe_dump({"sso": {
+        "companionClientIdsByOrigin": origins, "companionLoginClients": clients,
+    }}), encoding="utf-8")
+
+    resources = _render("standalone-sso", "--values", str(values))
+    app = yaml.safe_load(_one(resources, "ConfigMap", "akb-app-config")["data"]["app.yaml"])
+    runtime = Settings.model_validate(app)
+    assert runtime.keycloak_companion_client_ids_by_origin == origins
+    client = runtime.keycloak_companion_login_clients["example-app"]
+    assert client.public_keys["login-v1"] == public
+    assert client.provider_aliases == ["workforce", "local"]
+    assert not _names(resources, "Secret")
 
 
 def test_chart_consumes_a_configurable_existing_secret():

@@ -45,6 +45,12 @@ data:
     {{- if .Values.sso.authoritativeEmailDomains }}
     keycloak_authoritative_email_domains_by_provider: {{ .Values.sso.authoritativeEmailDomains | toJson | nindent 6 }}
     {{- end }}
+    {{- if .Values.sso.companionClientIdsByOrigin }}
+    keycloak_companion_client_ids_by_origin: {{ .Values.sso.companionClientIdsByOrigin | toJson | nindent 6 }}
+    {{- end }}
+    {{- if .Values.sso.companionLoginClients }}
+    keycloak_companion_login_clients: {{ .Values.sso.companionLoginClients | toJson | nindent 6 }}
+    {{- end }}
     api_oauth_audience: {{ printf "%s/api" (.Values.global.publicUrl | trimSuffix "/") }}
     keycloak_verify_ssl: true
     {{- if .Values.sso.localRealmLogin.enabled }}

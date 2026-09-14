@@ -129,7 +129,7 @@ async def complete_companion_login(
         raise AuthenticationError()
     await _consume_assertion(client_id, jti, expiry)
     # Use the same public account projection boundary as AKB's own callback:
-    # PR531 owns account transactions, pending admissions, role sync and denials.
+    # It owns account transactions, pending admissions, role sync and denials.
     outcome = await project_verified_principal_with_reason(principal, provider_alias=request.provider_alias)
     user = outcome.user
     if user is None:

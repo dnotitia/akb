@@ -4,12 +4,14 @@ import uuid
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from urllib.parse import quote, urlsplit
+from typing import Literal
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response, Security, status
 from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import ConfigDict, Field, field_validator
 
-from app.api.deps import get_credential_change_user, get_current_user
+from app.api.deps import bearer_auth, get_credential_change_user, get_current_user
 from app.config import settings
 from app.exceptions import (
     AKBError,
@@ -145,8 +147,61 @@ class UpdateProfileRequest(NFCModel):
     email: str | None = None
 
 
-@router.post("/auth/sso/companion/complete", summary="Complete an authenticated companion BFF login")
-async def companion_login_complete(req: CompanionLoginRequest, request: Request):
+class CompanionLoginUser(NFCModel):
+    id: str
+    username: str
+    email: str
+    display_name: str | None
+    is_admin: bool
+
+
+class CompanionLoginResponse(NFCModel):
+    user: CompanionLoginUser
+
+
+class CompanionLoginError(NFCModel):
+    message: str
+    error: str
+    detail: str
+
+
+class CompanionLoginCredentialError(CompanionLoginError):
+    code: Literal["authentication_failed"]
+
+
+class CompanionLoginAccountError(CompanionLoginError):
+    code: Literal["membership_required", "account_suspended"]
+
+
+class CompanionLoginConflictError(CompanionLoginError):
+    code: Literal["identity_conflict"]
+
+
+@router.post(
+    "/auth/sso/companion/complete",
+    summary="Complete an authenticated companion BFF login",
+    response_model=CompanionLoginResponse,
+    responses={
+        401: {"model": CompanionLoginCredentialError, "description": "Missing, invalid or replayed login credentials"},
+        403: {"model": CompanionLoginAccountError, "description": "Account membership required or account suspended"},
+        409: {"model": CompanionLoginConflictError, "description": "External identity conflicts with an AKB account"},
+    },
+    # Document required headers without FastAPI's required-Header validation:
+    # absent or duplicate credentials must still reach the sanitized 401 path.
+    openapi_extra={"parameters": [
+        {"name": "X-AKB-ID-Token", "in": "header", "required": True,
+         "description": "Keycloak ID token from the same verified authorization-code exchange",
+         "schema": {"type": "string"}},
+        {"name": "X-AKB-Login-Assertion", "in": "header", "required": True,
+         "description": "Registered BFF's RS256 signed login assertion bound to this request",
+         "schema": {"type": "string"}},
+    ]},
+)
+async def companion_login_complete(
+    req: CompanionLoginRequest,
+    request: Request,
+    _credentials: HTTPAuthorizationCredentials | None = Security(bearer_auth),
+):
     try:
         # Header multiplicity is rejected rather than allowing proxy/framework
         # disagreement about which credential was authenticated.

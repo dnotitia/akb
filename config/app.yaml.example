@@ -257,8 +257,11 @@ app_credential_overlap_seconds: 300
 # keycloak_authoritative_email_domains_by_provider: {}  # alias -> [domains].
 #                                         # Declares one provider the authority
 #                                         # for its corporate domains on the
-#                                         # BROWSER login path only. A verified
-#                                         # login through a declared alias adopts
+#                                         # verified login-completion paths only
+#                                         # (AKB callback or registered companion
+#                                         # BFF, never ordinary bearer requests).
+#                                         # A verified login through a declared
+#                                         # alias adopts
 #                                         # the active human account carrying that
 #                                         # address, or provisions a fresh one.
 #                                         # Empty (default) keeps today's
@@ -283,7 +286,8 @@ app_credential_overlap_seconds: 300
 #                                         # refused; that would be an authorize loop.
 # sso_local_realm_display_name: "This workspace"  # label shown for that choice
 # keycloak_link_by_email is a deprecated migration marker; omit it. Setting it
-# to true fails canonical startup. Exact pre-binding is the only account-link path.
+# to true fails canonical startup. Use exact pre-binding or the explicit
+# authoritative-provider policy above for verified login completion.
 # Ordinary AKB browser login uses authorization code + PKCE/nonce and a fixed
 # callback derived from public_base_url:
 #   <public_base_url>/api/v1/auth/keycloak/callback
@@ -300,19 +304,19 @@ app_credential_overlap_seconds: 300
 # redirect as `<public_base_url>/admin`.
 #
 # Companion client IDs below are accepted `azp` values for access tokens that
-# Reef/Naut BFFs present to AKB. They do not select AKB's browser callback or
+# companion BFFs present to AKB. They do not select AKB's browser callback or
 # receive an AKB JWT/exchange code; each companion owns its own callback and
 # server-side token custody.
 # keycloak_companion_client_ids_by_origin:
-#   "https://reef.example.com": "reef-web"
+#   "https://app.example.com": "example-app"
 # Explicit account-completion authority is separate and disabled by default.
 # Register only dedicated BFF public keys (never its private key or OIDC secret).
 # keycloak_companion_login_clients: {}
 # keycloak_companion_login_clients:
-#   reef-web:
+#   example-app:
 #     provider_aliases: [workforce]
 #     public_keys:
-#       reef-login-v1: |-
+#       login-v1: |-
 #         -----BEGIN PUBLIC KEY-----
 #         <deployment RSA public key, at least 2048 bits>
 #         -----END PUBLIC KEY-----

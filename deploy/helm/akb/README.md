@@ -67,6 +67,39 @@ helm upgrade --install akb deploy/helm/akb \
 Public origins and the initial product-administrator identity are installation
 inputs. Configure DNS first and replace every example value.
 
+## Companion applications
+
+An SSO deployment can separately register trusted companion backends for API
+access and account completion. Both maps default to empty. Add these public
+settings to your own values file alongside the `standalone-sso` profile:
+
+```yaml
+sso:
+  companionClientIdsByOrigin:
+    "https://app.example.com": "example-app"
+  companionLoginClients:
+    example-app:
+      provider_aliases: [workforce]
+      public_keys:
+        login-v1: |-
+          -----BEGIN PUBLIC KEY-----
+          <RSA SubjectPublicKeyInfo public key, at least 2048 bits>
+          -----END PUBLIC KEY-----
+```
+
+Replace the key placeholder with the companion's public key. The chart renders
+these maps into AKB's `app.yaml`; AKB validates the key material and registration
+at startup. The first map only allows a Keycloak client ID in human API tokens.
+The second explicitly grants account-completion authority to its BFF, subject
+to the selected providers and AKB account policy. It requires an HTTPS
+`global.publicUrl`. Keep the BFF private key and OIDC client credentials in the
+companion's own secret store, outside AKB and Helm values.
+
+The chart does not provision companion Keycloak clients, callbacks, token
+mappers or application sessions. Follow the
+[integration and signing contract](../../../docs/designs/keycloak-oidc/companion-login.md)
+before enabling the companion login flow.
+
 ## Render and inspect
 
 ```bash
