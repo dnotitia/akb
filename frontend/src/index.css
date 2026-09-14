@@ -24,6 +24,7 @@
   /* ── Semantic tokens (light default) ────────────────────────────── */
   --color-background: #f6f7f9;
   --color-surface: #ffffff;
+  --color-navigation: #f0f5f7;
   --color-surface-2: #ebeef2;
   --color-surface-muted: #ebeef2;     /* AKB alias == family surface-2 */
   --color-foreground: #1d1d1f;
@@ -178,6 +179,7 @@
   color-scheme: dark;
   --color-background: #0b0f14;
   --color-surface: #121821;
+  --color-navigation: #0d151e;
   --color-surface-2: #1b2430;
   --color-surface-muted: #1b2430;
   --color-foreground: #e7eaef;
@@ -257,6 +259,15 @@
   --shadow-lg: 0 18px 44px rgba(0, 0, 0, 0.55);
   --shadow-xl: 0 24px 64px rgba(0, 0, 0, 0.6);
 }
+
+/* Vault controls adapt to the remaining work area, not the full viewport. */
+.vault-app-header { container-type: inline-size; container-name: vault-toolbar; }
+@container vault-toolbar (max-width: 700px) {
+  #global-search-trigger { width: 2.25rem; padding-inline: 0; justify-content: center; }
+  #global-search-trigger > span { display: none; }
+  [data-testid="header-indexing-status"] { width: 8rem; }
+}
+.vault-app-header > div { overflow-x: auto; }
 
 /* ── Global ──────────────────────────────────────────────────────── */
 * {
@@ -384,7 +395,7 @@ h1, h2, h3, h4, h5, h6 {
   backdrop-filter: saturate(130%) blur(8px);
   -webkit-backdrop-filter: saturate(130%) blur(8px);
   border-bottom: 1px solid var(--color-border);
-  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.03);
+  box-shadow: none;
 }
 
 /* Gradient brand wordmark */

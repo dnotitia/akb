@@ -1,5 +1,5 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
   ChevronDown,
@@ -7,21 +7,23 @@ import {
   ChevronRight,
   FilePlus,
   FileText,
+  Folder,
   FolderPlus,
   Info,
   Lock,
   MoreHorizontal,
   Paperclip,
-  PanelLeftClose,
+  Pin,
+  PinOff,
   Plus,
   RefreshCw,
-  Search,
   Sparkles,
   Table,
   Trash2,
   Upload,
 } from "lucide-react";
 import { Alert } from "@/components/ui/alert";
+import { RailCollapseButton, RailFilterField, RailFilterToggle, RailIdentity, RailManagement } from "@/components/navigation-rail-controls";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { SkillBadge } from "@/components/ui/skill-badge";
@@ -67,6 +69,8 @@ import {
 } from "@/components/resource-delete-dialog";
 import { ROLE_RANK, type Role } from "@/lib/roles";
 import { documentTitleKey } from "@/lib/document-title-conflict";
+import { useCurrentUser } from "@/contexts/current-user-context";
+import { toggleWorkspaceShortcut, useWorkspaceShortcuts, workspaceShortcutKey } from "@/lib/workspace-shortcuts";
 
 const PAGE_SIZE = 10;
 const TYPEAHEAD_TIMEOUT_MS = 500;
@@ -127,14 +131,18 @@ export function VaultExplorer({
     onRefetchReady?.(refetch);
   }, [onRefetchReady, refetch]);
   const { expanded, toggle, revealAncestorsOf } = useExpandedPaths(vault);
-  const { pathname } = useLocation();
+  const { pathname, search, key: locationKey } = useLocation();
+  const requestedCollection = pathname === `/vault/${encodeURIComponent(vault)}`
+    ? new URLSearchParams(search).get("collection") : null;
   const navigate = useNavigate();
   const [filter, setFilter] = useState("");
   const [kindFilter, setKindFilter] = useState<ResourceKind | "all">("all");
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const filtersId = useId();
+  const activeFilterCount = Number(archiveScope !== "unarchived") + Number(archiveScope !== "archived" && kindFilter !== "all");
   function changeArchiveScope(value: string) {
     setScopeSelection({ vault, scope: value as ArchiveScope });
-    setKindFilter("all");
-    setFilter("");
+    if (value === "archived") setKindFilter("all");
   }
   const [collapsedKindGroups, setCollapsedKindGroups] = useState<Set<string>>(
     () => new Set(),
@@ -230,7 +238,19 @@ export function VaultExplorer({
     setTableCollection(collection);
   }, [rememberMutationTrigger]);
 
-  const activeSig = useMemo(() => activePathFromRoute(pathname, tree), [pathname, tree]);
+  const activeSig = useMemo(() => requestedCollection ? `collection:${requestedCollection}` : activePathFromRoute(pathname, tree), [pathname, tree, requestedCollection]);
+  const activeResourcePath = activeSig?.split(":").slice(1).join(":") ?? "";
+  const collectionContext = requestedCollection || (activeResourcePath.includes("/")
+    ? activeResourcePath.slice(0, activeResourcePath.lastIndexOf("/"))
+    : "");
+
+  useEffect(() => {
+    if (!requestedCollection) return;
+    setFilter("");
+    setKindFilter("all");
+    setScopeSelection({ vault, scope: "unarchived" });
+    revealAncestorsOf(`${requestedCollection}/_`);
+  }, [requestedCollection, vault, locationKey, revealAncestorsOf]);
 
   useEffect(() => {
     if (activeSig) {
@@ -321,6 +341,19 @@ export function VaultExplorer({
   useEffect(() => {
     setCollapsedKindGroups(new Set());
   }, [vault]);
+
+  const revealedLocation = useRef<string | null>(null);
+  useEffect(() => {
+    if (!requestedCollection || loading || revealedLocation.current === locationKey) return;
+    const index = fullRows.findIndex(row => row.sig === `collection:${requestedCollection}`);
+    if (index < 0) return;
+    if (index >= renderLimit) { setRenderLimit(index + 1); return; }
+    const row = listRef.current?.querySelector<HTMLElement>(`[data-sig="${cssEscape(`collection:${requestedCollection}`)}"]`);
+    if (!row) return;
+    row.scrollIntoView?.({ block: "nearest" });
+    row.focus({ preventScroll: true });
+    revealedLocation.current = locationKey;
+  }, [fullRows, requestedCollection, locationKey, loading, renderLimit]);
 
   const toggleKindGroup = useCallback((parentPath: string, kind: ResourceKind) => {
     const key = kindGroupKey(parentPath, kind);
@@ -417,16 +450,21 @@ export function VaultExplorer({
   );
 
   const headBtn =
-    "inline-flex h-7 w-7 items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted hover:bg-surface-hover hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:cursor-default disabled:opacity-50";
+    "inline-flex h-8 w-8 items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted hover:bg-surface-hover hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset disabled:cursor-default disabled:opacity-50";
 
   return (
     <aside
       className="flex flex-col h-full overflow-hidden text-sm bg-surface"
       aria-label={`${vault} collections`}
     >
-      <div className="flex h-10 shrink-0 items-center justify-between border-b border-border px-3">
-        <span className="coord-ink">Collections</span>
-        <div className="flex items-center gap-0.5">
+      <RailIdentity slot="collection-identity-header">
+        <span className="flex min-w-0 flex-1 items-center gap-2 px-2 text-sm font-semibold text-foreground" title={collectionContext || "All collections"}>
+          <Folder className="h-4 w-4 shrink-0 text-link" aria-hidden />
+          <span className="truncate">{collectionContext?.split("/").filter(Boolean).at(-1) || "All collections"}</span>
+        </span>
+        {onCollapse && <RailCollapseButton collapsed={false} label="Collapse collection tree" onClick={onCollapse} />}
+      </RailIdentity>
+      <RailManagement label="Collections" slot="collection-management-row">
           <button
             type="button"
             onClick={() => refetch()}
@@ -437,6 +475,7 @@ export function VaultExplorer({
           >
             <RefreshCw className={loading || refreshing ? "h-3 w-3 animate-spin" : "h-3 w-3"} aria-hidden />
           </button>
+          <RailFilterToggle label="Filter collections" open={filtersOpen} count={activeFilterCount} controls={filtersId} onClick={() => setFiltersOpen(value => !value)} />
           {canWrite && (
             <RootCreateMenu
               triggerClassName={headBtn}
@@ -446,52 +485,25 @@ export function VaultExplorer({
               onCreateCollection={() => openCreate(null)}
             />
           )}
-          {onCollapse && (
-            <button
-              type="button"
-              onClick={onCollapse}
-              title="Collapse tree (⌘\\)"
-              aria-label="Collapse collection tree"
-              aria-expanded={true}
-              className={headBtn}
-            >
-              <PanelLeftClose className="h-4 w-4" aria-hidden />
-            </button>
-          )}
-        </div>
-      </div>
+      </RailManagement>
 
-      <div className="shrink-0 border-b border-border px-2 py-1.5">
+      <div data-slot="collection-filter-row" className="flex min-h-10 shrink-0 flex-col justify-center gap-2 border-b border-border px-2 py-1">
+        <RailFilterField label="Filter resources" value={filter} onChange={setFilter} />
+        <div id={filtersId} hidden={!filtersOpen} className="space-y-2 pb-1">
+        <label className="block space-y-1 text-xs text-foreground-muted"><span>Document state</span>
         <SelectMenu
           value={archiveScope}
           onValueChange={changeArchiveScope}
           aria-label="Collection document state"
-          className="h-8 bg-background px-2 text-xs"
+          className="h-8 bg-background px-2 py-1 text-xs"
           options={[
             { value: "unarchived", label: "Current documents", hint: "Includes drafts; files and tables remain visible" },
             { value: "archived", label: "Archived documents", hint: "Documents only, in their original Collections" },
             { value: "all", label: "All documents", hint: "Includes archived documents, files, and tables" },
           ]}
         />
-      </div>
-
-      {total > 0 && !unsupported && (
-        <div className="shrink-0 border-b border-border px-2 py-1.5">
-          <div className="grid grid-cols-[minmax(0,1fr)_6.5rem] gap-1.5">
-            <div className="relative min-w-0">
-              <Search
-                className="pointer-events-none absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-foreground-muted"
-                aria-hidden
-              />
-              <input
-                type="search"
-                placeholder="Filter resources"
-                value={filter}
-                onChange={(e) => setFilter(e.target.value)}
-                className="h-8 w-full rounded-[var(--radius-md)] border border-border bg-background pl-6 pr-2 text-xs text-foreground placeholder:text-foreground-muted transition-colors focus:border-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                aria-label="Filter resources"
-              />
-            </div>
+        </label>
+        <label className="block space-y-1 text-xs text-foreground-muted"><span>Resource type</span>
             <SelectMenu
               value={archiveScope === "archived" ? "document" : kindFilter}
               onValueChange={(value) =>
@@ -502,9 +514,10 @@ export function VaultExplorer({
               disabled={archiveScope === "archived"}
               className="h-8 bg-background px-2 text-xs"
             />
-          </div>
+        </label>
         </div>
-      )}
+        {activeFilterCount > 0 && <div className="flex items-center justify-between gap-2 pb-1 text-xs text-foreground-muted"><span>{activeFilterCount} active {activeFilterCount === 1 ? "filter" : "filters"}</span><button type="button" onClick={event => { changeArchiveScope("unarchived"); setKindFilter("all"); event.currentTarget.closest('[data-slot="collection-filter-row"]')?.querySelector("input")?.focus(); }} className="rounded-[var(--radius-sm)] text-link focus-visible:ring-2 focus-visible:ring-ring">Reset filters</button></div>}
+      </div>
 
       <div
         ref={listRef}
@@ -512,7 +525,7 @@ export function VaultExplorer({
         aria-label={`${vault} explorer`}
         aria-busy={loading || refreshing || undefined}
         onKeyDown={onKeyDown}
-        className="flex-1 overflow-y-auto"
+        className="min-h-0 flex-1 overflow-y-auto rail-scroll"
       >
         {loading && <VaultExplorerLoading />}
         {showingPreviousScope && (
@@ -800,7 +813,7 @@ const TreeRow = memo(function TreeRow({
           data-sig={sig}
           onClick={() => onToggle(node.path)}
           style={indent}
-          className={`flex min-h-11 min-w-0 flex-1 items-center gap-1.5 py-1.5 pr-1 text-left transition-colors hover:bg-surface-hover focus:bg-surface-hover focus:outline-none cursor-pointer ${
+          className={`flex min-h-9 min-w-0 flex-1 items-center gap-1.5 py-1.5 pr-1 text-left transition-colors hover:bg-surface-hover focus:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring cursor-pointer ${
             isActive ? "bg-surface-selected text-surface-selected-foreground" : ""
           }`}
         >
@@ -831,6 +844,7 @@ const TreeRow = memo(function TreeRow({
         </button>
         {onOpenDetails && (
           <CollectionActionsMenu
+            vault={vault}
             node={node}
             editable={Boolean(canWrite && !isReserved)}
             onOpenDetails={() => onOpenDetails(node)}
@@ -1122,6 +1136,7 @@ function countResourceKinds(nodes: TreeNode[]): Record<ResourceKind, number> {
 }
 
 function CollectionActionsMenu({
+  vault,
   node,
   editable,
   onOpenDetails,
@@ -1131,6 +1146,7 @@ function CollectionActionsMenu({
   onCreateSubCollection,
   onDelete,
 }: {
+  vault: string;
   node: TreeNode;
   editable: boolean;
   onOpenDetails: () => void;
@@ -1140,6 +1156,12 @@ function CollectionActionsMenu({
   onCreateSubCollection?: () => void;
   onDelete?: () => void;
 }) {
+  const user = useCurrentUser();
+  const shortcuts = useWorkspaceShortcuts(user?.user_id);
+  const shortcut = { kind: "collection" as const, vault, path: node.path, title: node.name };
+  const pinned = shortcuts.some(item => workspaceShortcutKey(item) === workspaceShortcutKey(shortcut));
+  const [pinError, setPinError] = useState(false);
+  const PinIcon = pinned ? PinOff : Pin;
   const hasWriteActions = Boolean(
     onCreateDoc || onUploadFile || onCreateTable || onCreateSubCollection || onDelete,
   );
@@ -1153,7 +1175,7 @@ function CollectionActionsMenu({
           type="button"
           title={`Collection actions for ${node.path}`}
           aria-label={`Collection actions for ${node.path}`}
-          className="inline-flex min-h-11 w-8 shrink-0 items-center justify-center text-foreground-muted transition-colors hover:bg-surface-hover hover:text-link focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          className="inline-flex min-h-9 w-8 shrink-0 items-center justify-center text-foreground-muted transition-colors hover:bg-surface-hover hover:text-link focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
         >
           <MoreHorizontal className="h-4 w-4" aria-hidden />
         </button>
@@ -1199,6 +1221,14 @@ function CollectionActionsMenu({
             <Info className="h-4 w-4 text-foreground-muted" aria-hidden />
             {editable ? "View or edit summary" : "View details"}
           </DropdownMenu.Item>
+          {user && <DropdownMenu.Item className={itemClass} onSelect={event => {
+            if (!toggleWorkspaceShortcut(user.user_id, shortcut)) { event.preventDefault(); setPinError(true); }
+            else setPinError(false);
+          }}>
+            <PinIcon className="h-4 w-4 text-foreground-muted" aria-hidden />
+            {pinned ? "Unpin from workspace" : "Pin to workspace"}
+          </DropdownMenu.Item>}
+          {pinError && <p role="alert" className="max-w-56 px-2.5 py-2 text-xs text-destructive">Could not save. Check browser storage or remove a pin (limit 30).</p>}
           {onDelete && (
             <>
               <DropdownMenu.Separator className="my-1 h-px bg-border" />

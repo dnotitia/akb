@@ -27,6 +27,7 @@ import {
 import { isReservedCollection } from "@/lib/skill";
 import { useVaultTree, type TreeNode } from "@/hooks/use-vault-tree";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
+import { useCurrentUser } from "@/contexts/current-user-context";
 import { MarkdownEditorFallback } from "@/components/markdown-editor-fallback";
 import { DocumentTitleConflictNotice } from "@/components/document-title-conflict-notice";
 import { Alert } from "@/components/ui/alert";
@@ -103,7 +104,8 @@ export function DocumentCreateForm({
   onAssetExpirationsChange,
   onUnclaimedAssetIdsChange,
 }: DocumentCreateFormProps) {
-  const restoredDraft = useMemo(() => loadDocumentDraft(vault), [vault]);
+  const userId = useCurrentUser()?.user_id ?? "";
+  const restoredDraft = useMemo(() => loadDocumentDraft(userId, vault), [userId, vault]);
   const restoredDraftExpired = Boolean(
     restoredDraft?.expiresAt && Date.parse(restoredDraft.expiresAt) <= Date.now(),
   );
@@ -200,13 +202,14 @@ export function DocumentCreateForm({
       return;
     }
     if (!isDirty) {
-      clearDocumentDraft(vault);
+      clearDocumentDraft(userId, vault);
       setDraftStatus("idle");
       return;
     }
     setDraftStatus("saving");
     const timer = window.setTimeout(() => {
       const saved = saveDocumentDraft({
+        userId,
         vault,
         title,
         collection,
@@ -221,7 +224,7 @@ export function DocumentCreateForm({
       setDraftStatus(saved ? "saved" : "error");
     }, 300);
     return () => window.clearTimeout(timer);
-  }, [body, bodyAssetExpirations, bodyAssetIds, collection, creating, domain, isDirty, summary, tags, title, type, vault]);
+  }, [body, bodyAssetExpirations, bodyAssetIds, collection, creating, domain, isDirty, summary, tags, title, type, userId, vault]);
 
   useEffect(() => {
     const media = window.matchMedia("(min-width: 1024px)");
@@ -326,7 +329,7 @@ export function DocumentCreateForm({
         setClaimedAssetIds(assetIdsToClaim);
       });
       created = true;
-      clearDocumentDraft(vault);
+      clearDocumentDraft(userId, vault);
       onCreated(result?.path);
     } catch (caught: unknown) {
       const conflict = documentTitleConflictFromError(caught);

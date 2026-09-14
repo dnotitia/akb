@@ -1,7 +1,7 @@
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { HomeRecentUpdates } from "@/components/home-recent-updates";
 import { getRecent, ApiError } from "@/lib/api";
 import { CurrentUserProvider } from "@/contexts/current-user-context";
@@ -16,11 +16,34 @@ function renderFeed(userId = "first") {
 beforeEach(() => { recent.mockReset(); localStorage.clear(); recent.mockResolvedValue({ scope: "all", next_cursor: null, changes: [row("All document")] }); });
 afterEach(cleanup);
 
+function Destination() {
+  const location = useLocation();
+  return <output data-testid="destination">{JSON.stringify({ path: location.pathname, preview: !!location.state?.documentPreview })}</output>;
+}
+
 describe("Home recent updates", () => {
+  it.each([true, false])("offers distinct preview and full Vault routes (preview=%s)", async preview => {
+    render(<MemoryRouter><CurrentUserProvider user={user}><HomeRecentUpdates scope="all" /><Destination /></CurrentUserProvider></MemoryRouter>);
+    await screen.findByText("All document");
+    await userEvent.click(screen.getByRole("link", { name: preview ? "Preview All document" : "Open All document in work vault" }));
+    expect(JSON.parse(screen.getByTestId("destination").textContent!)).toEqual({ path: "/vault/work/doc/All%20document", preview });
+  });
+  it("renders independent fixed-scope columns without tabs or duplicate preview IDs", async () => {
+    recent.mockImplementation(async (_vault, _limit, options) => ({ scope: options?.scope ?? "all", changes: [row("Shared document")], next_cursor: options?.scope === "watching" ? "watch-next" : null }));
+    render(<MemoryRouter><CurrentUserProvider user={user}><HomeRecentUpdates scope="all" /><HomeRecentUpdates scope="watching" /></CurrentUserProvider></MemoryRouter>);
+    await waitFor(() => expect(screen.getAllByText("Shared document")).toHaveLength(2));
+    expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+    const all = screen.getByRole("region", { name: "Recent updates" });
+    const watching = screen.getByRole("region", { name: "Watched documents" });
+    expect(within(all).getByRole("link", { name: "Preview Shared document" }).id).not.toBe(within(watching).getByRole("link", { name: "Preview Shared document" }).id);
+    expect(within(all).queryByRole("button", { name: "Show more" })).not.toBeInTheDocument();
+    await userEvent.click(within(watching).getByRole("button", { name: "Show more" }));
+    expect(recent).toHaveBeenLastCalledWith(undefined, 6, { scope: "watching", cursor: "watch-next" });
+  });
   it("requests Watching on the server and remembers it per account", async () => {
     renderFeed(); await screen.findByText("All document");
     recent.mockResolvedValue({ scope: "watching", next_cursor: null, changes: [row("Watched document")] });
-    await userEvent.click(screen.getByRole("tab", { name: "Watching" }));
+    await userEvent.click(screen.getByRole("tab", { name: "Watched documents" }));
     expect(await screen.findByText("Watched document")).toBeInTheDocument();
     expect(recent).toHaveBeenLastCalledWith(undefined, 6, { scope: "watching", cursor: undefined });
     expect(screen.queryByText("All document")).not.toBeInTheDocument();
@@ -28,7 +51,7 @@ describe("Home recent updates", () => {
     expect(localStorage.getItem("akb.homeRecentScope:first")).toBe("watching");
     expect(screen.queryByText("generated-id.md")).not.toBeInTheDocument();
     cleanup(); recent.mockResolvedValue({ scope: "all", changes: [] }); renderFeed("second");
-    expect(screen.getByRole("tab", { name: "All" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "All documents" })).toHaveAttribute("aria-selected", "true");
   });
 
   it("does not mistake a legacy unfiltered response for Watching", async () => {
@@ -65,7 +88,7 @@ describe("Home recent updates", () => {
     let resolve!: (value: Awaited<ReturnType<typeof getRecent>>) => void;
     recent.mockImplementationOnce(() => new Promise(done => { resolve = done; })); renderFeed();
     recent.mockResolvedValue({ scope: "watching", changes: [row("Current watched")], next_cursor: null });
-    await userEvent.click(screen.getByRole("tab", { name: "Watching" })); await screen.findByText("Current watched");
+    await userEvent.click(screen.getByRole("tab", { name: "Watched documents" })); await screen.findByText("Current watched");
     await act(async () => resolve({ scope: "all", changes: [row("Stale")] }));
     expect(screen.queryByText("Stale")).not.toBeInTheDocument();
     recent.mockResolvedValue({ scope: "watching", changes: [], next_cursor: null });

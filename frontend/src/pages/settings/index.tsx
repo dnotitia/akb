@@ -1,33 +1,13 @@
-import { useEffect, useState, type ComponentType } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import {
-  KeyRound,
-  Bell,
-  Palette,
-  ShieldCheck,
-  UserRound,
-  type LucideProps,
-} from "lucide-react";
-import {
-  getAuthConfig,
-  getMe,
-  listPATs,
-  adminListUsers,
-  type AuthConfig,
-  type AdminUser,
-} from "@/lib/api";
-import {
-  Tabs,
-  TabsContent,
-  TabsList,
-  TabsTrigger,
-} from "@/components/ui/tabs";
-import { PageHeader } from "@/components/ui/page-header";
-import { PageShell } from "@/components/ui/page-shell";
+import { Settings } from "lucide-react";
+import { SETTINGS_SECTIONS as SECTIONS, settingsSection } from "@/lib/settings-sections";
+import { getAuthConfig, getMe, listPATs, adminListUsers, type AuthConfig, type AdminUser } from "@/lib/api";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
-import { RoleBadge } from "@/components/status-badge";
-import { cn } from "@/lib/utils";
+import { SelectMenu } from "@/components/ui/select-menu";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { ProfileSection, type User } from "./profile-section";
 import { TokensSection, type PAT } from "./tokens-section";
 import { PreferencesSection } from "./preferences-section";
@@ -36,33 +16,6 @@ import { NotificationsSection } from "./notifications-section";
 
 type TabId = "profile" | "tokens" | "preferences" | "notifications" | "admin";
 
-const SETTINGS_SECTIONS: Array<{
-  id: Exclude<TabId, "admin">;
-  label: string;
-  description: string;
-  icon: ComponentType<LucideProps>;
-}> = [
-  { id: "notifications", label: "Notifications", description: "Watched documents", icon: Bell },
-  {
-    id: "profile",
-    label: "Profile",
-    description: "Identity and password",
-    icon: UserRound,
-  },
-  {
-    id: "tokens",
-    label: "Agent access",
-    description: "Tokens and connections",
-    icon: KeyRound,
-  },
-  {
-    id: "preferences",
-    label: "Appearance",
-    description: "Theme preference",
-    icon: Palette,
-  },
-];
-
 export default function SettingsPage() {
   const [user, setUser] = useState<User | null>(null);
   const [pats, setPats] = useState<PAT[] | null>(null);
@@ -70,333 +23,115 @@ export default function SettingsPage() {
   const [users, setUsers] = useState<AdminUser[] | null>(null);
   const [usersError, setUsersError] = useState(false);
   const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
-  const [verticalNav, setVerticalNav] = useState(() =>
-    typeof window !== "undefined" ? window.matchMedia("(min-width: 1024px)").matches : false,
-  );
-
   const [searchParams, setSearchParams] = useSearchParams();
+  const [dirty, setDirty] = useState(false);
+  const [navigationBusy, setNavigationBusy] = useState(false);
+  const [pendingTab, setPendingTab] = useState<TabId | null>(null);
+  const returnFocus = useRef<HTMLElement | null>(null);
+  const content = useRef<HTMLDivElement>(null);
+  const sections = SECTIONS.filter(section => section.id !== "admin" || user?.is_admin);
+  const activeTab = settingsSection(searchParams.get("tab"), !!user?.is_admin).id;
 
-  // Name the tab/history entry (tab switching + SR route-change orientation).
-  // Keyed on the raw `?tab=` (the derived activeTab lives past an early return,
-  // so it can't drive a hook).
   useEffect(() => {
-    const tab = searchParams.get("tab") || "profile";
-    const cap = tab.charAt(0).toUpperCase() + tab.slice(1);
-    const prev = document.title;
-    document.title = `Settings · ${cap} · AKB`;
-    return () => {
-      document.title = prev;
-    };
-  }, [searchParams]);
-
+    const previous = document.title;
+    document.title = `${SECTIONS.find(section => section.id === activeTab)?.label} · Settings · AKB`;
+    content.current?.scrollTo?.({ top: 0 });
+    return () => { document.title = previous; };
+  }, [activeTab]);
+  useEffect(() => {
+    if (!dirty && !navigationBusy) return;
+    const protect = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
+    window.addEventListener("beforeunload", protect);
+    return () => window.removeEventListener("beforeunload", protect);
+  }, [dirty, navigationBusy]);
   useEffect(() => {
     let cancelled = false;
-    void getMe()
-      .then((u) => {
-        if (!cancelled) setUser(u);
-      })
-      .catch(() => {
-        location.href = "/auth";
-      });
-    void getAuthConfig().then((config) => {
-      if (!cancelled) setAuthConfig(config);
-    });
-    void loadPATs();
-    return () => {
-      cancelled = true;
-    };
+    void getMe().then(value => { if (!cancelled) setUser(value); }).catch(() => { location.href = "/auth"; });
+    void getAuthConfig().then(value => { if (!cancelled) setAuthConfig(value); }).catch(() => { if (!cancelled) setAuthConfig(null); });
+    return () => { cancelled = true; };
   }, []);
-
-  useEffect(() => {
-    const media = window.matchMedia("(min-width: 1024px)");
-    const syncOrientation = () => setVerticalNav(media.matches);
-    syncOrientation();
-    media.addEventListener("change", syncOrientation);
-    return () => media.removeEventListener("change", syncOrientation);
-  }, []);
-
   async function loadPATs() {
     setPatsError(false);
-    try {
-      const d = await listPATs();
-      setPats(d.tokens || []);
-    } catch {
-      // Leave pats null and flag — the Tokens tab shows a retry instead of a
-      // deceptive "no tokens yet" empty state masking a fetch failure.
-      setPatsError(true);
-    }
+    try { const data = await listPATs(); setPats(data.tokens || []); }
+    catch { setPatsError(true); }
   }
-
   async function loadUsers() {
     setUsersError(false);
-    try {
-      const d = await adminListUsers();
-      setUsers(d.users || []);
-    } catch {
-      // Leave users null and flag — the Admin tab shows a retry instead of a
-      // permanently-stuck "LOADING…".
-      setUsersError(true);
-    }
+    try { const data = await adminListUsers(); setUsers(data.users || []); }
+    catch { setUsersError(true); }
   }
-
-  // Lazy-load the admin roster only when the Admin tab is actually viewed — an
-  // admin landing on Profile/Tokens shouldn't pay the (potentially large)
-  // /admin/users round-trip. Re-runs if a prior load errored and the user
-  // returns to the tab.
   useEffect(() => {
-    if (!user?.is_admin) return;
-    if (searchParams.get("tab") !== "admin") return;
-    // usersError intentionally omitted from deps: an auto-load that errors
-    // must NOT immediately re-fire (storm); recovery is the manual Retry.
-    if (users === null && !usersError) loadUsers();
+    if (activeTab === "tokens" && pats === null && !patsError) void loadPATs();
+    // Retry is explicit; a failed request must not trigger a request loop.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user, searchParams, users]);
-
-  if (!user) return <SettingsPageLoading />;
-
-  // Active tab synced to `?tab=` so Profile/Tokens/etc. are deep-linkable.
-  // `admin` is only a valid value when the viewer is an admin — otherwise
-  // it falls back to the default so non-admins can't land on a blank pane.
-  const allowedTabs: TabId[] = ["profile", "tokens", "preferences", "notifications"];
-  if (user.is_admin) allowedTabs.push("admin");
-  const rawTab = searchParams.get("tab");
-  const activeTab: TabId =
-    rawTab && allowedTabs.includes(rawTab as TabId)
-      ? (rawTab as TabId)
-      : "profile";
-  const localPasswordEnabled =
-    authConfig?.available === true &&
-    (authConfig.auth_mode === "local" || authConfig.auth_mode === "hybrid") &&
-    authConfig.local_auth.enabled;
-  const mcpOauthEnabled =
-    authConfig?.available === true && authConfig.mcp_oauth.enabled;
-
-  const setTab = (v: string) => {
+  }, [activeTab]);
+  useEffect(() => {
+    if (user?.is_admin && activeTab === "admin" && users === null && !usersError) void loadUsers();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, activeTab]);
+  function changeTab(tab: TabId) {
     const next = new URLSearchParams(searchParams);
-    next.set("tab", v);
-    setSearchParams(next, { replace: true });
-  };
-
-  return (
-    <PageShell
-      header={<SettingsPageHeader />}
-      contentWidth="full"
-    >
-      <Tabs
-        value={activeTab}
-        onValueChange={setTab}
-        orientation={verticalNav ? "vertical" : "horizontal"}
-        className="grid items-start gap-5 lg:grid-cols-[16.5rem_minmax(0,1fr)] xl:gap-8 xl:grid-cols-[18rem_minmax(0,1fr)]"
-      >
-        <aside className="min-w-0 lg:sticky lg:top-20 lg:flex lg:min-h-[calc(100vh-14rem)] lg:flex-col lg:rounded-[var(--radius-md)] lg:border lg:border-border lg:bg-surface lg:p-4 lg:shadow-xs xl:p-5">
-          <div className="hidden border-b border-border pb-5 lg:block">
-            <span className="coord-ink">Account</span>
-            <div className="mt-3 flex items-center gap-3">
-              <span
-                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-border-strong bg-surface-selected text-sm font-semibold text-surface-selected-foreground"
-                aria-hidden
-              >
-                {initialsFor(user.display_name?.trim() || user.username)}
-              </span>
-              <div className="min-w-0 flex-1">
-                <p className="truncate text-sm font-semibold text-foreground">
-                  {user.display_name?.trim() || user.username}
-                </p>
-                <p className="mt-0.5 truncate text-xs text-foreground-muted">@{user.username}</p>
-              </div>
-              <RoleBadge role={user.is_admin ? "admin" : "user"} />
-            </div>
-            <p className="mt-3 truncate text-xs text-foreground-muted">{user.email}</p>
-          </div>
-
-          <TabsList
-            aria-label="Account settings"
-            className="flex w-full max-w-full items-stretch gap-1 overflow-x-auto rounded-[var(--radius-lg)] border border-border bg-surface p-2 shadow-sm [scrollbar-width:none] [&::-webkit-scrollbar]:hidden lg:mt-4 lg:flex-col lg:overflow-visible lg:rounded-none lg:border-0 lg:bg-transparent lg:p-0 lg:shadow-none"
-          >
-            {SETTINGS_SECTIONS.map((section) => (
-              <SettingsTab
-                key={section.id}
-                {...section}
-                count={section.id === "tokens" ? pats?.length : undefined}
-              />
-            ))}
-            {user.is_admin && (
-              <SettingsTab
-                id="admin"
-                label="Administration"
-                description="Users and server access"
-                icon={ShieldCheck}
-                count={users?.length}
-              />
-            )}
-          </TabsList>
-
-          <div className="mt-5 hidden items-center gap-2 border-t border-border pt-4 text-xs text-foreground-muted lg:mt-auto lg:flex">
-            <span className="h-2 w-2 shrink-0 rounded-full bg-success" aria-hidden />
-            <span>Signed in as <span className="font-medium text-foreground">@{user.username}</span></span>
-          </div>
-        </aside>
-
-        <div className="min-w-0">
-          <TabsContent value="notifications" className="space-y-6 pt-0"><NotificationsSection /></TabsContent>
-          <TabsContent value="profile" className="space-y-6 pt-0">
-            <ProfileSection
-              user={user}
-              localPasswordEnabled={localPasswordEnabled}
-              localProfileEditingEnabled={localPasswordEnabled}
-              onUserUpdate={(patch) =>
-                setUser((u) => (u ? { ...u, ...patch } : u))
-              }
-            />
-          </TabsContent>
-
-          <TabsContent value="tokens" className="space-y-6 pt-0">
-            <TokensSection
-              pats={pats}
-              patsError={patsError}
-              mcpOauthEnabled={mcpOauthEnabled}
-              onReloadPats={loadPATs}
-            />
-          </TabsContent>
-
-          <TabsContent value="preferences" className="space-y-6 pt-0">
-            <PreferencesSection />
-          </TabsContent>
-
-          {user.is_admin && (
-            <TabsContent value="admin" className="space-y-6 pt-0">
-              <AdminSection
-                user={user}
-                users={users}
-                usersError={usersError}
-                localPasswordEnabled={localPasswordEnabled}
-                onReloadUsers={loadUsers}
-              />
-            </TabsContent>
-          )}
-        </div>
-      </Tabs>
-    </PageShell>
-  );
-}
-
-function SettingsPageHeader() {
-  return (
-    <PageHeader
-      eyebrow="Personal workspace"
-      title="Account settings"
-      subtitle="Manage how you appear, how agents connect, and how AKB looks on this device."
-      className="mb-7"
-    />
-  );
-}
-
-function SettingsPageLoading() {
-  return (
-    <PageShell header={<SettingsPageHeader />} contentWidth="full">
-      <LoadingState
-        label="Loading account settings"
-        className="grid items-start gap-5 lg:grid-cols-[16.5rem_minmax(0,1fr)] xl:gap-8 xl:grid-cols-[18rem_minmax(0,1fr)]"
-      >
-        <aside className="min-w-0 rounded-[var(--radius-md)] border border-border bg-surface p-4 shadow-xs xl:p-5">
-          <div className="border-b border-border pb-5">
-            <Skeleton className="h-3 w-16 rounded-[var(--radius-sm)]" />
-            <div className="mt-3 flex items-center gap-3">
-              <Skeleton className="h-11 w-11 shrink-0 rounded-full" />
-              <div className="min-w-0 flex-1 space-y-2">
-                <Skeleton className="h-4 w-3/4 rounded-[var(--radius-sm)]" />
-                <Skeleton className="h-3 w-1/2 rounded-[var(--radius-sm)]" />
-              </div>
-            </div>
-            <Skeleton className="mt-3 h-3 w-4/5 rounded-[var(--radius-sm)]" />
-          </div>
-          <div className="mt-4 space-y-2">
-            {[0, 1, 2].map((item) => (
-              <div key={item} className="flex items-center gap-3 rounded-[var(--radius-md)] px-3 py-2.5">
-                <Skeleton className="h-8 w-8 shrink-0 rounded-[var(--radius-md)]" />
-                <div className="min-w-0 flex-1 space-y-2">
-                  <Skeleton className="h-3.5 w-2/3 rounded-[var(--radius-sm)]" />
-                  <Skeleton className="h-3 w-4/5 rounded-[var(--radius-sm)]" />
-                </div>
-              </div>
-            ))}
-          </div>
-        </aside>
-
-        <div className="min-w-0 space-y-6">
-          {[0, 1].map((section) => (
-            <section
-              key={section}
-              className="overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm"
-            >
-              <div className="border-b border-border px-5 py-4 sm:px-6">
-                <Skeleton className="h-5 w-36 rounded-[var(--radius-sm)]" />
-                <Skeleton className="mt-2 h-3 w-2/3 rounded-[var(--radius-sm)]" />
-              </div>
-              <div className="grid gap-5 p-5 sm:grid-cols-2 sm:p-6">
-                {[0, 1, 2, 3].map((field) => (
-                  <div key={field} className="space-y-2">
-                    <Skeleton className="h-3 w-24 rounded-[var(--radius-sm)]" />
-                    <Skeleton className="h-10 w-full rounded-[var(--radius-md)]" />
-                  </div>
-                ))}
-              </div>
-            </section>
-          ))}
-        </div>
-      </LoadingState>
-    </PageShell>
-  );
-}
-
-function SettingsTab({
-  id,
-  label,
-  description,
-  icon: Icon,
-  count,
-}: {
-  id: TabId;
-  label: string;
-  description: string;
-  icon: ComponentType<LucideProps>;
-  count?: number;
-}) {
-  return (
-    <TabsTrigger
-      value={id}
-      className={cn(
-        "group relative min-h-11 min-w-max justify-start gap-2.5 px-3 py-2 text-left",
-        "data-[state=active]:bg-surface-selected data-[state=active]:text-surface-selected-foreground data-[state=active]:shadow-none",
-        "lg:w-full lg:min-w-0 lg:rounded-[var(--radius-md)] lg:pl-4 lg:py-2.5",
-      )}
-    >
-      <span
-        className="absolute inset-y-2 left-0 hidden w-0.5 rounded-full bg-primary opacity-0 transition-opacity group-data-[state=active]:opacity-100 lg:block"
-        aria-hidden
-      />
-      <span className="hidden h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-sm)] border border-transparent bg-surface-2 text-foreground-muted transition-token group-data-[state=active]:border-primary/15 group-data-[state=active]:bg-surface group-data-[state=active]:text-primary lg:flex">
-        <Icon className="h-4 w-4" aria-hidden />
-      </span>
-      <span className="min-w-0">
-        <span className="block text-sm font-semibold">{label}</span>
-        <span className="mt-0.5 hidden truncate text-[11px] font-normal text-foreground-muted lg:block">
-          {description}
-        </span>
-      </span>
-      {count !== undefined && (
-        <span className="ml-auto hidden min-w-6 rounded-full bg-surface px-1.5 py-0.5 text-center text-[10px] font-semibold tabular-nums text-foreground-muted ring-1 ring-border lg:inline-block">
-          {count}
-        </span>
-      )}
-    </TabsTrigger>
-  );
-}
-
-function initialsFor(label: string): string {
-  const words = label.trim().split(/\s+/).filter(Boolean);
-  if (words.length > 1) {
-    return `${Array.from(words[0])[0] ?? ""}${Array.from(words[words.length - 1])[0] ?? ""}`;
+    next.set("tab", tab);
+    setSearchParams(next);
   }
-  return Array.from(words[0] ?? "?").slice(0, 2).join("");
+  function requestTab(value: string) {
+    if (navigationBusy) return;
+    const tab = value as TabId;
+    if (tab === activeTab) return;
+    if (dirty) {
+      returnFocus.current = document.activeElement as HTMLElement | null;
+      setPendingTab(tab);
+    } else changeTab(tab);
+  }
+  const localPasswordEnabled = authConfig?.available === true &&
+    (authConfig.auth_mode === "local" || authConfig.auth_mode === "hybrid") && authConfig.local_auth.enabled;
+
+  return <Tabs value={activeTab} onValueChange={requestTab} orientation="vertical" activationMode="manual"
+    data-testid="settings-workspace" className="relative flex h-full min-h-0 flex-col bg-surface lg:-mt-14 lg:h-[calc(100%+3.5rem)] lg:flex-row">
+    <h1 className="sr-only">Account settings</h1>
+    <aside aria-label="Settings navigation" className="shrink-0 border-b border-border bg-surface lg:flex lg:w-[13.75rem] lg:flex-col lg:border-b-0 lg:border-r">
+      <div className="hidden h-14 shrink-0 items-center gap-2 border-b border-border px-4 text-sm font-semibold lg:flex">
+        <Settings className="h-4 w-4 text-link" aria-hidden />Settings
+      </div>
+      <div className="flex items-center gap-3 p-3 lg:hidden">
+        <Settings className="h-4 w-4 shrink-0 text-link" aria-hidden />
+        <SelectMenu value={activeTab} disabled={navigationBusy} aria-label="Settings section" onValueChange={requestTab}
+          options={sections.map(section => ({ value: section.id, label: section.label }))} className="min-w-0" />
+      </div>
+      <TabsList aria-label="Account settings" className="hidden min-h-0 flex-1 flex-col items-stretch justify-start gap-1 overflow-y-auto rounded-none bg-transparent p-2 shadow-none lg:flex rail-scroll">
+        {sections.map(({ id, label, icon: Icon }) => <TabsTrigger key={id} value={id} disabled={navigationBusy}
+          className={`relative min-h-9 shrink-0 justify-start gap-2 rounded-[var(--radius-sm)] px-3 py-2 text-sm font-normal hover:bg-surface-hover data-[state=active]:bg-surface-selected data-[state=active]:font-medium data-[state=active]:text-surface-selected-foreground data-[state=active]:shadow-none ${id === "admin" ? "mt-3 border-t border-border pt-3" : ""}`}>
+          <Icon className="h-4 w-4 shrink-0" aria-hidden /><span>{label}</span>
+        </TabsTrigger>)}
+      </TabsList>
+    </aside>
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col lg:pt-14">
+      <div ref={content} data-slot="settings-content" className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6 xl:p-8 rail-scroll">
+        {!user ? <SettingsLoading /> : <>
+          <TabsContent value="profile" className="pt-0">
+            <ProfileSection user={user} localPasswordEnabled={localPasswordEnabled} localProfileEditingEnabled={localPasswordEnabled}
+              onDirtyChange={setDirty} onUserUpdate={patch => setUser(current => current ? { ...current, ...patch } : current)} />
+          </TabsContent>
+          <TabsContent value="preferences" className="pt-0"><PreferencesSection /></TabsContent>
+          <TabsContent value="notifications" className="pt-0"><NotificationsSection /></TabsContent>
+          <TabsContent value="tokens" className="pt-0">
+            <TokensSection pats={pats} patsError={patsError} mcpOauthEnabled={authConfig?.available === true && authConfig.mcp_oauth.enabled} onReloadPats={loadPATs} onDirtyChange={setDirty} onBusyChange={setNavigationBusy} />
+          </TabsContent>
+          {user.is_admin && <TabsContent value="admin" className="pt-0"><AdminSection user={user} users={users} usersError={usersError} localPasswordEnabled={localPasswordEnabled} onReloadUsers={loadUsers} /></TabsContent>}
+        </>}
+      </div>
+    </div>
+    <ConfirmDialog open={pendingTab !== null} onOpenChange={open => { if (!open) setPendingTab(null); }} returnFocusRef={returnFocus}
+      title={activeTab === "tokens" ? "Have you saved your token?" : "Discard unsaved changes?"} description={activeTab === "tokens" ? "New token secrets cannot be retrieved again. Copy and store them before leaving this section." : "Your profile or password changes have not been saved. Stay here to keep editing, or discard them to switch sections."}
+      confirmLabel={activeTab === "tokens" ? "Leave section" : "Discard changes"} cancelLabel={activeTab === "tokens" ? "Keep token visible" : "Keep editing"} variant="destructive" onConfirm={() => {
+        if (pendingTab) { setDirty(false); changeTab(pendingTab); }
+      }} />
+  </Tabs>;
+}
+
+function SettingsLoading() {
+  return <LoadingState label="Loading account settings" className="max-w-3xl space-y-6">
+    <Skeleton className="h-5 w-36" />
+    <div className="space-y-6 border-t border-border pt-6">{[0, 1, 2].map(item => <div key={item} className="space-y-2"><Skeleton className="h-3 w-24" /><Skeleton className="h-10 w-full max-w-lg" /></div>)}</div>
+  </LoadingState>;
 }
