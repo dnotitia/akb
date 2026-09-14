@@ -1,6 +1,6 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { Check, ChevronDown } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { MenuFilter } from "@/components/ui/menu-filter";
@@ -21,6 +21,9 @@ interface SelectMenuProps {
   placeholder?: string;
   id?: string;
   className?: string;
+  /** Navigation identity controls should not resemble form fields. */
+  variant?: "field" | "navigation";
+  leadingIcon?: ReactNode;
   disabled?: boolean;
   "aria-label"?: string;
   "aria-invalid"?: boolean;
@@ -50,6 +53,8 @@ export function SelectMenu({
   placeholder = "Select…",
   id,
   className,
+  variant = "field",
+  leadingIcon,
   disabled,
   mono,
   searchable = false,
@@ -75,18 +80,22 @@ export function SelectMenu({
         aria-invalid={ariaInvalid || undefined}
         aria-describedby={ariaDescribedby}
         className={cn(
-          "flex h-10 w-full items-center justify-between gap-2 rounded-[var(--radius-md)] border border-border bg-surface px-3 py-2 text-left text-sm text-foreground",
+          "flex h-10 w-full items-center gap-2 text-left text-sm text-foreground",
+          variant === "navigation"
+            ? "rounded-[var(--radius-sm)] border-0 bg-transparent px-2 font-semibold hover:bg-surface-hover data-[state=open]:bg-surface-hover"
+            : "justify-between rounded-[var(--radius-md)] border border-border bg-surface px-3 py-2 data-[state=open]:border-border-strong",
           "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
-          "data-[state=open]:border-border-strong",
           "aria-[invalid=true]:border-destructive aria-[invalid=true]:focus-visible:ring-destructive",
           "disabled:opacity-50 disabled:cursor-not-allowed",
           "cursor-pointer transition-colors duration-150",
           className,
         )}
       >
+        {leadingIcon && <span className="shrink-0 text-link" aria-hidden>{leadingIcon}</span>}
         <TooltipText
           className={cn(
-            "truncate",
+            "min-w-0 truncate",
+            variant === "navigation" && "flex-1",
             mono && "font-mono",
             !current && "text-foreground-muted",
           )}

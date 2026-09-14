@@ -113,6 +113,17 @@ def test_local_proxies_cover_ingress_routes_and_upload_envelope():
         assert "no-cache, no-store, must-revalidate" in text
 
 
+def test_frontend_proxies_vault_health_instead_of_spa_html():
+    import re
+
+    for path in (ROOT / "frontend/nginx.conf", DEMO / "nginx.conf"):
+        config = path.read_text()
+        pattern = re.search(r"location ~ (\S+) \{", config).group(1)
+        for route in ("/health", "/health/vault/shared", "/health/vault/with%20space"):
+            assert re.match(pattern, route), (path, route)
+        assert not re.match(pattern, "/healthcare")
+
+
 def test_demo_state_honors_first_install_input_and_preserves_it(tmp_path):
     state = tmp_path / "state.env"
     token = "akb_test-'quoted $value; not executable"

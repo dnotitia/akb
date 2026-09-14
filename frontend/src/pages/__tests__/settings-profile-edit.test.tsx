@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import SettingsPage from "../settings";
 import * as api from "@/lib/api";
+import { ProfileSection } from "../settings/profile-section";
 
 // Mock the entire api module so the test doesn't touch network. Only
 // the call surface used by the Profile tab matters here; other tabs
@@ -144,5 +145,64 @@ describe("settings — profile edit", () => {
     fireEvent.change(email, { target: { value: "taken@example.com" } });
     fireEvent.click(screen.getByRole("button", { name: /save profile/i }));
     await screen.findByText(/email already in use/i);
+  });
+
+  it("reports profile changes and clears the guard when reverted or unmounted", () => {
+    const onDirtyChange = vi.fn();
+    const { unmount } = render(<ProfileSection user={USER} localPasswordEnabled localProfileEditingEnabled onUserUpdate={vi.fn()} onDirtyChange={onDirtyChange} />);
+    expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+    fireEvent.change(screen.getByLabelText("Display name"), { target: { value: "Changed" } });
+    expect(onDirtyChange).toHaveBeenLastCalledWith(true);
+    const event = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+    fireEvent.change(screen.getByLabelText("Display name"), { target: { value: USER.display_name } });
+    expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+    fireEvent.change(screen.getByLabelText("Email address"), { target: { value: "other@example.com" } });
+    unmount();
+    expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+    const cleanEvent = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(cleanEvent);
+    expect(cleanEvent.defaultPrevented).toBe(false);
+  });
+
+  it("guards password-only work and clears it after a successful password change", async () => {
+    vi.mocked(api.changePassword).mockResolvedValue({ ok: true });
+    const onDirtyChange = vi.fn();
+    render(<ProfileSection user={USER} localPasswordEnabled localProfileEditingEnabled onUserUpdate={vi.fn()} onDirtyChange={onDirtyChange} />);
+    fireEvent.change(screen.getByLabelText("Current password"), { target: { value: "oldpassword" } });
+    expect(onDirtyChange).toHaveBeenLastCalledWith(true);
+    const event = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+    fireEvent.change(screen.getByLabelText("New password"), { target: { value: "newpassword" } });
+    fireEvent.change(screen.getByLabelText("Confirm new password"), { target: { value: "newpassword" } });
+    fireEvent.click(screen.getByRole("button", { name: "Change password" }));
+    await screen.findByText("Password changed");
+    expect(api.changePassword).toHaveBeenCalledWith("oldpassword", "newpassword");
+    expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+    expect(screen.getByLabelText("Current password")).toHaveValue("");
+  });
+
+  it("keeps an unsaved profile guarded after saving the password", async () => {
+    vi.mocked(api.changePassword).mockResolvedValue({ ok: true });
+    const onDirtyChange = vi.fn();
+    render(<ProfileSection user={USER} localPasswordEnabled localProfileEditingEnabled onUserUpdate={vi.fn()} onDirtyChange={onDirtyChange} />);
+    fireEvent.change(screen.getByLabelText("Display name"), { target: { value: "Not saved" } });
+    for (const label of ["Current password", "New password", "Confirm new password"]) {
+      fireEvent.change(screen.getByLabelText(label), { target: { value: "password123" } });
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Change password" }));
+    await screen.findByText("Password changed");
+    expect(onDirtyChange).toHaveBeenLastCalledWith(true);
+  });
+
+  it("keeps the compact profile identity once and omits outer cards", () => {
+    const { container } = render(<ProfileSection user={USER} localPasswordEnabled localProfileEditingEnabled onUserUpdate={vi.fn()} />);
+    expect(screen.getAllByText("@alice")).toHaveLength(1);
+    expect(screen.getByRole("region", { name: "Public profile" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Change password" })).toBeInTheDocument();
+    expect(container.querySelector('[data-slot="panel"]')).toBeNull();
+    expect(screen.getByLabelText("New password")).toHaveAccessibleDescription("Use at least 8 characters.");
   });
 });

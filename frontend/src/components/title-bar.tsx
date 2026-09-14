@@ -23,12 +23,14 @@ export function TitleBar({
   left,
   className,
   showBack = true,
+  breadcrumbClassName,
 }: {
   crumbs: Crumb[];
   right?: ReactNode;
   left?: ReactNode;
   className?: string;
   showBack?: boolean;
+  breadcrumbClassName?: string;
 }) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -71,7 +73,7 @@ export function TitleBar({
         </button>
       )}
       {crumbs.length > 0 && (
-        <nav aria-label="Breadcrumb" className="shrink-0">
+        <nav aria-label="Breadcrumb" className={cn("shrink-0", breadcrumbClassName)}>
           <ol className="flex items-center gap-2">
             {crumbs.map((c, i) => {
               const isLast = i === crumbs.length - 1;

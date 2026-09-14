@@ -162,6 +162,7 @@ describe("existing-document draft storage", () => {
 
   it("keeps a new-document draft expiry at the server attachment boundary", () => {
     expect(saveDocumentDraft({
+      userId: USER,
       vault: VAULT,
       title: "New",
       collection: "notes",
@@ -174,7 +175,7 @@ describe("existing-document draft storage", () => {
       assetExpiresAt: { "asset-1": at(15 * MINUTE) },
     })).toBe(true);
     const stored = JSON.parse(
-      window.localStorage.getItem(documentDraftStorageKey(VAULT)) ?? "{}",
+      window.localStorage.getItem(documentDraftStorageKey(USER, VAULT)) ?? "{}",
     ) as { expiresAt?: string };
     expect(stored.expiresAt).toBe(at(15 * MINUTE));
   });

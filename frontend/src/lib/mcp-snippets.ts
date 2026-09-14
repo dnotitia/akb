@@ -53,14 +53,8 @@ export function mcpInstallSnippets(pat: string): Record<McpAgent, string> {
  */
 export function mcpOAuthSnippets(): Partial<Record<McpAgent, string>> {
   return {
-    // Claude Code's `mcp add` registers the server config; the separate
-    // `mcp login` opens a browser for the OAuth flow. The two-step shape
-    // matches the documented Claude Code UX and produces a clear copy-
-    // and-paste pair the user can run back-to-back.
-    claude: [
-      `claude mcp add --scope user --transport http akb ${MCP_URL}`,
-      `claude mcp login akb`,
-    ].join("\n"),
+    // Register in the terminal; authenticate using /mcp inside Claude Code.
+    claude: `claude mcp add --scope user --transport http akb ${MCP_URL}`,
     cursor: JSON.stringify({ mcpServers: { akb: { url: MCP_URL } } }, null, 2),
     vscode: JSON.stringify({ servers: { akb: { type: "http", url: MCP_URL } } }, null, 2),
   };

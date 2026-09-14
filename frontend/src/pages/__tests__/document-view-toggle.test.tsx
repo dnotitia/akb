@@ -360,7 +360,7 @@ describe("DocumentPage view toggle", () => {
       '"documentPreview":true',
     );
 
-    await user.click(screen.getByRole("button", { name: "Full page" }));
+    await user.click(screen.getByRole("button", { name: "Open document in vault" }));
     expect(screen.getByTestId("location-state")).toHaveTextContent("null");
     expect(screen.getByTestId("location-search")).toHaveTextContent("view=raw");
   });

@@ -18,16 +18,20 @@ export function CodeSnippet({
   className?: string;
 }) {
   const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState(false);
   async function copy() {
     // clipboard is undefined on insecure (plain-HTTP) origins — and AKB ships
     // an `--insecure` snippet, so that deployment shape is real. Guard so a
     // copy never throws an uncaught TypeError with no user feedback.
     try {
-      await navigator.clipboard?.writeText(code);
+      setCopied(false);
+      setCopyError(false);
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
+      await navigator.clipboard.writeText(code);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
-      /* clipboard blocked — user can still select the text manually */
+      setCopyError(true);
     }
   }
   return (
@@ -40,7 +44,7 @@ export function CodeSnippet({
           onClick={copy}
           aria-label={copied ? "Snippet copied" : "Copy snippet"}
           className={cn(
-            "inline-flex items-center gap-1 text-[11px] font-medium cursor-pointer shrink-0 transition-colors rounded-[var(--radius-sm)]",
+            "inline-flex min-h-9 items-center gap-1 px-2 text-xs font-medium cursor-pointer shrink-0 transition-colors rounded-[var(--radius-sm)]",
             "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface-2",
             copied ? "text-success" : "text-foreground-muted hover:text-primary",
           )}
@@ -49,9 +53,10 @@ export function CodeSnippet({
           {copied ? "Copied" : "Copy"}
         </button>
       </div>
-      <pre className="font-mono text-[10px] leading-snug p-2.5 overflow-x-auto bg-surface text-foreground whitespace-pre-wrap break-all">
+      <pre tabIndex={0} aria-label={filename || "Configuration snippet"} className="font-mono text-xs leading-relaxed p-3 overflow-x-auto bg-surface text-foreground whitespace-pre-wrap break-words focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring">
         {code}
       </pre>
+      {copyError && <p role="status" className="border-t border-border px-3 py-2 text-xs text-foreground-muted">Copy was blocked. Select the text above and copy it manually.</p>}
     </div>
   );
 }

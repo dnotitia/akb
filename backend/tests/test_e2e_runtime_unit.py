@@ -1180,7 +1180,7 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
     assert set(compose["services"]) == {"postgres", "minio"}
     assert compose["services"]["postgres"]["image"] == "pgvector/pgvector:pg16"
     assert compose["services"]["minio"]["image"] == (
-        "minio/minio:RELEASE.2025-09-07T16-13-09Z"
+        "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
     )
     assert compose["services"]["postgres"]["ports"] == [
         "${AKB_E2E_POSTGRES_PORT:-15432}:5432"
