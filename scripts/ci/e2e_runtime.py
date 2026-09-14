@@ -2812,6 +2812,7 @@ class E2ERuntime:
         self,
         connection: Any,
         *,
+        password_hash: str,
         system_admin_id: uuid.UUID,
     ) -> None:
         """Add valid restore/fresh installations to the control-plane scenario."""
@@ -2830,6 +2831,34 @@ class E2ERuntime:
             raise ProvisioningFailure("control-plane lifecycle fixture coordinates are unavailable")
         app_uuid = uuid.UUID(target_app_id)
         owner_uuid = uuid.UUID(owner_id)
+        reader_username = f"{namespace}-catalog-reader"
+        reader_id = await self._insert_fixture_user(
+            connection,
+            username=reader_username,
+            password_hash=password_hash,
+            label=f"{namespace}-catalog-reader",
+        )
+        actors["reader"] = {
+            "id": str(reader_id),
+            "username": reader_username,
+            "role": "reader",
+            "vault_role": "reader",
+            "vault_scope": "target",
+        }
+        authorization_vault_id, authorization_vault_name = await self._insert_fixture_vault(
+            connection,
+            namespace="catalog-bench",
+            label="authorization",
+            owner_id=owner_uuid,
+            grants=[(reader_id, "reader")],
+            granted_by=system_admin_id,
+        )
+        vaults = self._fixture_catalog.setdefault("vaults", {})
+        if isinstance(vaults, dict):
+            vaults["authorization"] = {
+                "id": str(authorization_vault_id),
+                "name": authorization_vault_name,
+            }
         restore_release_id = await self._insert_fixture_release(
             connection,
             app_id=app_uuid,
@@ -3179,19 +3208,6 @@ class E2ERuntime:
             granted_by=system_admin_id,
         )
         vaults["foreign"] = {"id": str(foreign_vault_id), "name": foreign_vault_name}
-
-        authorization_vault_id, authorization_vault_name = await self._insert_fixture_vault(
-            connection,
-            namespace="catalog-bench",
-            label="authorization",
-            owner_id=actor_ids["target_owner"],
-            grants=target_grants,
-            granted_by=system_admin_id,
-        )
-        vaults["authorization"] = {
-            "id": str(authorization_vault_id),
-            "name": authorization_vault_name,
-        }
 
         target_app_id = uuid.uuid4()
         foreign_app_id = uuid.uuid4()
@@ -3582,6 +3598,7 @@ class E2ERuntime:
                     )
                     await self._seed_control_plane_installation_lifecycle(
                         connection,
+                        password_hash=password_hash,
                         system_admin_id=system_admin_id,
                     )
                     await self._seed_control_plane_legacy_adoption(
