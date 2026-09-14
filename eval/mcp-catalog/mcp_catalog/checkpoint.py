@@ -123,6 +123,8 @@ class CheckpointDocument(ContractModel):
     header: CheckpointHeader
     spent: CheckpointBudget = Field(default_factory=CheckpointBudget)
     reserved_cost_usd: float = Field(default=0.0, ge=0)
+    reused_trial_count: int = Field(default=0, ge=0)
+    rerun_trial_count: int = Field(default=0, ge=0)
     spent_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     timing: CheckpointTiming = Field(default_factory=CheckpointTiming)
     timing_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -237,6 +239,14 @@ class CheckpointStore:
         if reserved_cost_usd < 0:
             raise CheckpointError("checkpoint reserved cost cannot be negative")
         self.document.reserved_cost_usd = reserved_cost_usd
+        self._write_atomic()
+
+    def set_run_counters(self, *, reused_trials: int, rerun_trials: int) -> None:
+        self._ensure_writable()
+        if reused_trials < 0 or rerun_trials < 0:
+            raise CheckpointError("checkpoint run counters cannot be negative")
+        self.document.reused_trial_count = reused_trials
+        self.document.rerun_trial_count = rerun_trials
         self._write_atomic()
 
     def status_for(self, key: CheckpointKey) -> TrialStatus | None:

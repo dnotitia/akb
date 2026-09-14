@@ -322,6 +322,8 @@ async def test_timeout_cancels_and_joins_sibling_lanes_before_checkpoint_finaliz
     assert artifact["checkpoint"]["record_count"] == artifact["completed_trials"] == len(raw["records"]) == 3
     assert artifact["checkpoint"]["timing"] == raw["timing"]
     assert artifact["budget_used"]["reserved_cost_usd"] == 0
+    for field in ("model_requests", "input_tokens", "output_tokens", "cost_usd", "wall_seconds", "model_work_seconds"):
+        assert artifact["budget_used"][field] == raw["spent"][field]
     assert runner._checkpoint_store is not None
     with pytest.raises(Exception, match="late writes"):
         runner._checkpoint_store.record_trial(

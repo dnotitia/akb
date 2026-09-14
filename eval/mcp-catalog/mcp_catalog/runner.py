@@ -610,6 +610,15 @@ class BenchmarkRunner:
             self._checkpoint_store.document if self._checkpoint_store is not None else None
         )
         if checkpoint_doc is not None:
+            checkpoint_record_count = len(checkpoint_doc.records)
+            checkpoint_reused_trials = checkpoint_doc.reused_trial_count
+            checkpoint_new_trials = checkpoint_record_count - checkpoint_reused_trials
+            if checkpoint_new_trials < 0:
+                incomplete_reasons.add("benchmark incomplete: checkpoint reused count exceeds record count")
+                checkpoint_new_trials = 0
+            checkpoint_evidence["new_trials"] = checkpoint_new_trials
+            checkpoint_evidence["reused_trials"] = checkpoint_reused_trials
+            checkpoint_evidence["rerun_trials"] = checkpoint_doc.rerun_trial_count
             checkpoint_evidence["timing"] = checkpoint_doc.timing.model_dump(mode="json")
             checkpoint_evidence["lifecycle"] = checkpoint_doc.lifecycle
             checkpoint_evidence["record_count"] = len(checkpoint_doc.records)
@@ -625,6 +634,22 @@ class BenchmarkRunner:
                 incomplete_reasons.add("benchmark incomplete: checkpoint has an orphaned reservation")
         if ledger.reserved_cost_usd != 0:
             incomplete_reasons.add("benchmark incomplete: artifact has an orphaned reservation")
+        if checkpoint_doc is not None:
+            budget_model_requests = checkpoint_doc.spent.model_requests
+            budget_input_tokens = checkpoint_doc.spent.input_tokens
+            budget_output_tokens = checkpoint_doc.spent.output_tokens
+            budget_cost_usd = checkpoint_doc.spent.cost_usd
+            budget_wall_seconds = checkpoint_doc.spent.wall_seconds
+            budget_model_work_seconds = checkpoint_doc.spent.model_work_seconds
+            budget_reserved = checkpoint_doc.reserved_cost_usd
+        else:
+            budget_model_requests = ledger.requests
+            budget_input_tokens = ledger.input_tokens
+            budget_output_tokens = ledger.output_tokens
+            budget_cost_usd = ledger.cost_usd
+            budget_wall_seconds = ledger.wall_seconds
+            budget_model_work_seconds = ledger.model_work_seconds
+            budget_reserved = ledger.reserved_cost_usd
         timing_payload = timing or {
             "attempt_index": 1,
             "wall_seconds": end_to_end_wall_seconds,
@@ -661,14 +686,14 @@ class BenchmarkRunner:
             "timing": timing_payload,
             "end_to_end_wall_seconds": timing_payload.get("cumulative_wall_seconds", end_to_end_wall_seconds),
             "budget_used": {
-                "model_requests": ledger.requests,
-                "input_tokens": ledger.input_tokens,
-                "output_tokens": ledger.output_tokens,
-                "total_tokens": ledger.input_tokens + ledger.output_tokens,
-                "cost_usd": ledger.cost_usd,
-                "wall_seconds": ledger.wall_seconds,
-                "model_work_seconds": ledger.model_work_seconds,
-                "reserved_cost_usd": ledger.reserved_cost_usd,
+                "model_requests": budget_model_requests,
+                "input_tokens": budget_input_tokens,
+                "output_tokens": budget_output_tokens,
+                "total_tokens": budget_input_tokens + budget_output_tokens,
+                "cost_usd": budget_cost_usd,
+                "wall_seconds": budget_wall_seconds,
+                "model_work_seconds": budget_model_work_seconds,
+                "reserved_cost_usd": budget_reserved,
                 "request_timeout_seconds": self.manifest.budget.request_timeout_seconds,
             },
         }
@@ -1376,6 +1401,11 @@ class BenchmarkRunner:
                 if self._checkpoint_store is not None:
                     async with self._checkpoint_lock:
                         await asyncio.to_thread(self._checkpoint_store.set_reserved_cost, 0.0)
+                        await asyncio.to_thread(
+                            self._checkpoint_store.set_run_counters,
+                            reused_trials=self._checkpoint_reused_trials,
+                            rerun_trials=self._checkpoint_rerun_trials,
+                        )
                         await asyncio.to_thread(self._checkpoint_store.begin_closing)
             except Exception as exc:
                 lifecycle_cleanup_errors.append(exc)
