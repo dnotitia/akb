@@ -177,6 +177,26 @@ class ExpectedMaterialOutcome(ContractModel):
         return self
 
 
+class ExpectedMaterialAttempt(ContractModel):
+    logical_operation: str
+    arguments: dict[str, JsonValue] = Field(default_factory=dict)
+    outcome: Literal["success", "permission_denied", "rejected"]
+    status_code: int | None = Field(default=None, ge=100, le=599)
+    error_code: str | None = None
+
+    @model_validator(mode="after")
+    def validate_expected_attempt(self) -> ExpectedMaterialAttempt:
+        if self.outcome == "success":
+            if self.status_code is not None or self.error_code is not None:
+                raise ValueError("successful attempts cannot declare an error response")
+        elif self.outcome == "permission_denied":
+            if self.status_code != 403 or not self.error_code:
+                raise ValueError("permission_denied attempts must declare HTTP 403 and an error code")
+        elif self.status_code is None or self.status_code < 400 or not self.error_code:
+            raise ValueError("rejected attempts must declare an HTTP error and an error code")
+        return self
+
+
 class ProviderRouting(ContractModel):
     order: list[Literal["parasail"]] = Field(min_length=1, max_length=1)
     allow_fallbacks: Literal[False] = False
@@ -217,6 +237,7 @@ class TaskManifest(ContractModel):
     required_operations: list[str] = Field(default_factory=list)
     expected_material_arguments: dict[str, dict[str, JsonValue]] = Field(default_factory=dict)
     expected_material_outcomes: list[ExpectedMaterialOutcome] = Field(default_factory=list)
+    expected_material_attempts: list[ExpectedMaterialAttempt] = Field(default_factory=list)
     expected_final_state: StateContract
     response_rubric: ResponseRubric = Field(default_factory=ResponseRubric)
 
@@ -275,10 +296,19 @@ class TaskManifest(ContractModel):
             raise ValueError("expected material outcomes must use unique logical operations")
         if not set(expected_operations) <= set(self.allowed_material_operations):
             raise ValueError("expected material outcomes must be material operations")
+        expected_attempt_operations = [item.logical_operation for item in self.expected_material_attempts]
+        if not set(expected_attempt_operations) <= set(self.allowed_material_operations):
+            raise ValueError("expected material attempts must be material operations")
         if not set(self.expected_material_arguments) <= set(self.allowed_material_operations):
             raise ValueError("expected material arguments must be material operations")
         if not set(self.required_attempted_operations) <= set(expected_operations):
             raise ValueError("every required attempted operation needs an expected material outcome")
+        attempt_counts = Counter(expected_attempt_operations)
+        if any(
+            attempt_counts[operation] > limit
+            for operation, limit in self.material_attempt_limits.items()
+        ):
+            raise ValueError("expected material attempts exceed their declared limits")
         if self.category == "stdio_local" and not {"file_upload", "image_upload"} <= set(self.required_operations):
             raise ValueError("stdio_local tasks must require both file and image operations")
         if self.category == "destructive_confirmation" and not self.response_rubric.confirmation_terms:
@@ -484,6 +514,7 @@ class BenchmarkRunManifest(ContractModel):
                 *task.forbidden_operations,
                 *task.material_attempt_limits,
                 *task.required_operations,
+                *(item.logical_operation for item in task.expected_material_attempts),
             ]
             if operation not in self.operation_map and operation != "none"
         }
@@ -551,6 +582,7 @@ class BenchmarkRunManifest(ContractModel):
             "required_operations": sorted(task.required_operations),
             "expected_material_arguments": task.expected_material_arguments,
             "expected_material_outcomes": [item.model_dump(mode="json") for item in task.expected_material_outcomes],
+            "expected_material_attempts": [item.model_dump(mode="json") for item in task.expected_material_attempts],
             "expected_final_state": task.expected_final_state.model_dump(mode="json"),
             "response_requirements": {
                 "require_non_empty": rubric.require_non_empty,

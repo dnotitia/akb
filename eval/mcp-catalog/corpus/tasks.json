@@ -272,7 +272,12 @@
     "allowed_first_operations": ["create"],
     "forbidden_operations": ["delete"],
     "required_attempted_operations": ["create"],
+    "material_attempt_limits": {"create": 2},
     "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}],
+    "expected_material_attempts": [
+      {"logical_operation": "create", "arguments": {"name": "bad/name"}, "outcome": "rejected", "status_code": 400, "error_code": "invalid_argument"},
+      {"logical_operation": "create", "arguments": {"name": "catalog-bench-recovery"}, "outcome": "success"}
+    ],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
       "must": [{"pointer": "/vaults", "operator": "contains", "value": {"name": "catalog-bench-recovery"}}],
@@ -293,7 +298,12 @@
     "allowed_first_operations": ["create"],
     "forbidden_operations": ["delete"],
     "required_attempted_operations": ["create"],
+    "material_attempt_limits": {"create": 2},
     "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}],
+    "expected_material_attempts": [
+      {"logical_operation": "create", "arguments": {"name": "bad/name"}, "outcome": "rejected", "status_code": 400, "error_code": "invalid_argument"},
+      {"logical_operation": "create", "arguments": {"name": "catalog-bench-recovery"}, "outcome": "success"}
+    ],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
       "must": [{"pointer": "/vaults", "operator": "contains", "value": {"name": "catalog-bench-recovery"}}],
