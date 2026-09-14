@@ -2,6 +2,9 @@ import * as React from "react";
 import { createPortal } from "react-dom";
 import {
   EditorContent,
+  MarkdownToolbar,
+  MarkdownToolbarButton,
+  MarkdownToolbarGroup,
   useMarkdownCommands,
   useMarkdownEditor,
   useMarkdownState,
@@ -9,34 +12,19 @@ import {
 } from "@akb/markdown-editor/react";
 import { serializeMarkdown } from "@akb/markdown-editor";
 import {
-  Bold,
-  Code,
-  Code2,
   Columns2,
   Columns3,
   CornerDownLeft,
-  Heading1,
-  Heading2,
-  Heading3,
   ImagePlus,
-  Italic,
   Link2,
-  List,
-  ListOrdered,
   Loader2,
-  Minus,
-  Pilcrow,
   Pencil,
-  Quote,
-  Redo2,
   Replace,
   RotateCcw,
   Rows2,
   Rows3,
-  Strikethrough,
   Table as TableIcon,
   Trash2,
-  Undo2,
   X,
 } from "lucide-react";
 import { Alert } from "@/components/ui/alert";
@@ -873,44 +861,6 @@ function TableActions({
   );
 }
 
-interface RibbonButtonProps {
-  label: string;
-  active?: boolean;
-  disabled?: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}
-
-function RibbonButton({
-  label,
-  active,
-  disabled,
-  onClick,
-  children,
-}: RibbonButtonProps) {
-  return (
-    <button
-      type="button"
-      aria-label={label}
-      aria-pressed={active}
-      disabled={disabled}
-      tabIndex={-1}
-      data-editor-toolbar-button
-      title={label}
-      onMouseDown={(event) => event.preventDefault()}
-      onClick={onClick}
-      className={cn(
-        "inline-flex h-8 w-8 items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:opacity-50",
-        active && "bg-surface-selected text-surface-selected-foreground",
-      )}
-    >
-      <span aria-hidden="true" className="contents">
-        {children}
-      </span>
-    </button>
-  );
-}
-
 interface EditorToolbarProps {
   editor: MarkdownEditorInstance | null;
   searchAdapter?: ReturnType<typeof createAkbMarkdownAdapters>["search"];
@@ -930,9 +880,7 @@ function EditorToolbar({
   appearance,
   imageInputRef,
 }: EditorToolbarProps) {
-  const state = useMarkdownState(editor);
-  const commands = useMarkdownCommands(editor);
-  const toolbarRef = React.useRef<HTMLDivElement>(null);
+  const editorState = useMarkdownState(editor);
   const [linkOpen, setLinkOpen] = React.useState(false);
   const [linkUrl, setLinkUrl] = React.useState("");
   const [linkText, setLinkText] = React.useState("");
@@ -951,17 +899,7 @@ function EditorToolbar({
   const linkUrlId = React.useId();
   const linkTextId = React.useId();
   const referenceQueryId = React.useId();
-  const active = (name: string, attrs?: Record<string, unknown>) =>
-    Boolean(editor?.isActive(name, attrs));
-  const linkActive = active("link");
-  const toolbarGroupClass =
-    "inline-flex items-center gap-0.5 border-r border-border pr-1.5 last:border-r-0 last:pr-0";
-
-  const setBlock = (level: number) => {
-    if (!editor) return;
-    if (active("heading", { level })) invokeCommand(editor, "setParagraph");
-    else invokeCommand(editor, "toggleHeading", { level: level as 1 | 2 | 3 });
-  };
+  const linkActive = Boolean(editorState && editor?.isActive("link"));
 
   const openLinkEditor = () => {
     if (!editor) return;
@@ -1021,71 +959,10 @@ function EditorToolbar({
     setLinkOpen(false);
   };
 
-  React.useLayoutEffect(() => {
-    const buttons = toolbarRef.current?.querySelectorAll<HTMLButtonElement>(
-      "button[data-editor-toolbar-button]:not(:disabled)",
-    );
-    if (
-      buttons?.length &&
-      !Array.from(buttons).some((button) => button.tabIndex === 0)
-    )
-      buttons[0].tabIndex = 0;
-  });
-
-  const handleToolbarKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (
-      !(event.target instanceof HTMLButtonElement) ||
-      !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)
-    )
-      return;
-    const buttons = Array.from(
-      toolbarRef.current?.querySelectorAll<HTMLButtonElement>(
-        "button[data-editor-toolbar-button]:not(:disabled)",
-      ) ?? [],
-    );
-    if (!buttons.length) return;
-    event.preventDefault();
-    const currentIndex = Math.max(
-      0,
-      buttons.indexOf(event.target as HTMLButtonElement),
-    );
-    const nextIndex =
-      event.key === "Home"
-        ? 0
-        : event.key === "End"
-          ? buttons.length - 1
-          : (currentIndex +
-              (event.key === "ArrowRight" ? 1 : -1) +
-              buttons.length) %
-            buttons.length;
-    buttons.forEach((button) => {
-      button.tabIndex = -1;
-    });
-    buttons[nextIndex].tabIndex = 0;
-    buttons[nextIndex].focus();
-  };
-
   return (
-    <div
-      ref={toolbarRef}
-      contentEditable={false}
-      role="toolbar"
-      aria-label="Text formatting"
-      aria-orientation="horizontal"
-      onFocusCapture={(event) => {
-        if (!(event.target instanceof HTMLButtonElement)) return;
-        const target = event.target;
-        toolbarRef.current
-          ?.querySelectorAll<HTMLButtonElement>(
-            "button[data-editor-toolbar-button]",
-          )
-          .forEach((button) => {
-            button.tabIndex = button === target ? 0 : -1;
-          });
-      }}
-      onKeyDown={handleToolbarKeyDown}
+    <MarkdownToolbar
+      editor={editor}
       className={cn(
-        "sticky top-0 z-10 flex flex-wrap items-center gap-1.5 border-b border-border select-none",
         appearance === "canvas"
           ? "bg-surface/95 px-5 py-2 backdrop-blur-sm sm:px-8 lg:px-10"
           : appearance === "workspace"
@@ -1093,127 +970,16 @@ function EditorToolbar({
             : "rounded-t-[var(--radius-sm)] bg-surface px-2 py-1.5",
       )}
     >
-      <div className={toolbarGroupClass} role="group" aria-label="Block type">
-        <RibbonButton
-          label="Paragraph"
-          active={active("paragraph")}
-          disabled={!editor}
-          onClick={() => editor && invokeCommand(editor, "setParagraph")}
-        >
-          <Pilcrow className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
-          label="Heading 1"
-          active={active("heading", { level: 1 })}
-          disabled={!editor}
-          onClick={() => setBlock(1)}
-        >
-          <Heading1 className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
-          label="Heading 2"
-          active={active("heading", { level: 2 })}
-          disabled={!editor}
-          onClick={() => setBlock(2)}
-        >
-          <Heading2 className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
-          label="Heading 3"
-          active={active("heading", { level: 3 })}
-          disabled={!editor}
-          onClick={() => setBlock(3)}
-        >
-          <Heading3 className="h-4 w-4" />
-        </RibbonButton>
-      </div>
-      <div className={toolbarGroupClass} role="group" aria-label="Marks">
-        <RibbonButton
-          label="Bold"
-          active={active("bold")}
-          disabled={!editor}
-          onClick={() => commands.toggleBold()}
-        >
-          <Bold className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
-          label="Italic"
-          active={active("italic")}
-          disabled={!editor}
-          onClick={() => commands.toggleItalic()}
-        >
-          <Italic className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
-          label="Strikethrough"
-          active={active("strike")}
-          disabled={!editor}
-          onClick={() => editor && invokeCommand(editor, "toggleStrike")}
-        >
-          <Strikethrough className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
-          label="Inline code"
-          active={active("code")}
-          disabled={!editor}
-          onClick={() => editor && invokeCommand(editor, "toggleCode")}
-        >
-          <Code className="h-4 w-4" />
-        </RibbonButton>
-      </div>
-      <div className={toolbarGroupClass} role="group" aria-label="Lists">
-        <RibbonButton
-          label="Bulleted list"
-          active={active("bulletList")}
-          disabled={!editor}
-          onClick={() => commands.toggleBulletList()}
-        >
-          <List className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
-          label="Numbered list"
-          active={active("orderedList")}
-          disabled={!editor}
-          onClick={() => commands.toggleOrderedList()}
-        >
-          <ListOrdered className="h-4 w-4" />
-        </RibbonButton>
-      </div>
-      <div className={toolbarGroupClass} role="group" aria-label="Blocks">
-        <RibbonButton
-          label="Blockquote"
-          active={active("blockquote")}
-          disabled={!editor}
-          onClick={() => editor && invokeCommand(editor, "toggleBlockquote")}
-        >
-          <Quote className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
-          label="Code block"
-          active={active("codeBlock")}
-          disabled={!editor}
-          onClick={() => editor && invokeCommand(editor, "toggleCodeBlock")}
-        >
-          <Code2 className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
-          label="Horizontal rule"
-          disabled={!editor}
-          onClick={() => editor && invokeCommand(editor, "setHorizontalRule")}
-        >
-          <Minus className="h-4 w-4" />
-        </RibbonButton>
-      </div>
-      <div className={toolbarGroupClass} role="group" aria-label="Insert">
-        <RibbonButton
+      <MarkdownToolbarGroup label="Insert">
+        <MarkdownToolbarButton
           label={linkActive ? "Edit link" : "Insert link"}
           active={linkActive}
           disabled={!editor}
           onClick={openLinkEditor}
         >
           <Link2 className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
+        </MarkdownToolbarButton>
+        <MarkdownToolbarButton
           label="Insert table"
           disabled={!editor}
           onClick={() => {
@@ -1228,8 +994,8 @@ function EditorToolbar({
           }}
         >
           <TableIcon className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
+        </MarkdownToolbarButton>
+        <MarkdownToolbarButton
           label={uploadingImage ? "Uploading image" : "Insert image"}
           disabled={!editor || uploadingImage}
           onClick={onOpenImagePicker}
@@ -1239,7 +1005,7 @@ function EditorToolbar({
           ) : (
             <ImagePlus className="h-4 w-4" />
           )}
-        </RibbonButton>
+        </MarkdownToolbarButton>
         <input
           ref={imageInputRef}
           type="file"
@@ -1253,23 +1019,7 @@ function EditorToolbar({
             if (files.length) onChooseImages(files);
           }}
         />
-      </div>
-      <div className={toolbarGroupClass} role="group" aria-label="History">
-        <RibbonButton
-          label="Undo"
-          disabled={!editor || !state?.canUndo}
-          onClick={() => commands.undo()}
-        >
-          <Undo2 className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
-          label="Redo"
-          disabled={!editor || !state?.canRedo}
-          onClick={() => commands.redo()}
-        >
-          <Redo2 className="h-4 w-4" />
-        </RibbonButton>
-      </div>
+      </MarkdownToolbarGroup>
       <Dialog open={linkOpen} onOpenChange={setLinkOpen}>
         <DialogContent
           className="sm:max-w-md"
@@ -1411,7 +1161,7 @@ function EditorToolbar({
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </div>
+    </MarkdownToolbar>
   );
 }
 

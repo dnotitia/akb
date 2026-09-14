@@ -131,6 +131,8 @@ export interface MarkdownSlashContext {
   position: number
 }
 
+export type MarkdownHeadingLevel = 1 | 2 | 3
+
 export interface MarkdownEditorConfig extends MarkdownParseOptions {
   initialMarkdown?: string
   editable?: boolean
@@ -144,13 +146,35 @@ export interface MarkdownCommands {
   setMarkdown(markdown: string): boolean
   insertMarkdown(markdown: string): boolean
   insertImage(target: string, alt?: string, title?: string): boolean
+  setParagraph(): boolean
+  toggleHeading(level: MarkdownHeadingLevel): boolean
   toggleBold(): boolean
   toggleItalic(): boolean
+  toggleStrike(): boolean
+  toggleCode(): boolean
   toggleBulletList(): boolean
   toggleOrderedList(): boolean
+  toggleBlockquote(): boolean
+  toggleCodeBlock(): boolean
+  setHorizontalRule(): boolean
   undo(): boolean
   redo(): boolean
   focus(position?: FocusPosition): boolean
+}
+
+export interface MarkdownActiveState {
+  paragraph: boolean
+  heading1: boolean
+  heading2: boolean
+  heading3: boolean
+  bold: boolean
+  italic: boolean
+  strike: boolean
+  code: boolean
+  bulletList: boolean
+  orderedList: boolean
+  blockquote: boolean
+  codeBlock: boolean
 }
 
 export interface MarkdownSelectionState {
@@ -162,6 +186,7 @@ export interface MarkdownState {
   markdown: string
   isEmpty: boolean
   isEditable: boolean
+  active: MarkdownActiveState
   canUndo: boolean
   canRedo: boolean
   selection: MarkdownSelectionState

@@ -13,6 +13,7 @@ The package is built against the exact Tiptap `3.31.3` package set and React 19.
 import {
   MarkdownEditor,
   MarkdownViewer,
+  MarkdownToolbar,
   canonicalizeMarkdown,
   parseMarkdown,
   serializeMarkdown,
@@ -30,6 +31,24 @@ function Document({ markdown, onChange }) {
     </>
   )
 }
+```
+
+`MarkdownToolbar` owns the default Paragraph, Heading 1–3, bold, italic,
+strikethrough, inline code, list, blockquote, code block, horizontal rule, and
+undo/redo controls. It reads the same editor state and commands as the editor,
+preserves the current selection when a pointer control is pressed, and exposes
+roving keyboard focus. Product-specific controls can be appended as children;
+use `MarkdownToolbarGroup` and `MarkdownToolbarButton` so they participate in
+the same toolbar navigation.
+
+```tsx
+<MarkdownToolbar editor={editor}>
+  <MarkdownToolbarGroup label="Insert">
+    <MarkdownToolbarButton label="Insert link" onClick={openLink}>
+      <LinkIcon aria-hidden />
+    </MarkdownToolbarButton>
+  </MarkdownToolbarGroup>
+</MarkdownToolbar>
 ```
 
 Use `profile="structured"` for CommonMark + GFM structure editing. The default `preserve` profile
