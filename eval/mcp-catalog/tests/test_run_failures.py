@@ -190,6 +190,8 @@ async def test_incomplete_artifact_keeps_completed_trials_budget_and_redaction()
     assert artifact["completed_trials"] == 1
     assert artifact["budget_used"]["model_requests"] == 1
     assert artifact["budget_used"]["total_tokens"] == 5
+    assert artifact["request_timeout_seconds"] == manifest.budget.request_timeout_seconds
+    assert artifact["budget_used"]["request_timeout_seconds"] == manifest.budget.request_timeout_seconds
     assert artifact["runs"]["primary:http"]["partial"] is True
     assert "fixture-marker" not in encoded
     assert "fixture-token" not in encoded

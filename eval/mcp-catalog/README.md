@@ -256,7 +256,9 @@ primary failure stage, records completed trials and `budget_used` in a
 redacted `status=incomplete` artifact, and exits non-zero. Incomplete artifacts
 are not valid `compare` inputs.
 
-Normal HTTP requests use a 30-second timeout. The repository runtime's
+Provider requests use the manifest's preregistered `request_timeout_seconds`
+and are always capped by the remaining monotonic `max_wall_seconds` deadline.
+The timeout is recorded in the manifest and artifact. The repository runtime's
 180-second reset/readiness budget is separate. Failures without model request,
 usage/cost, or state evidence remain incomplete and are written to a failed
 checkpoint; a zero-request arm cannot be a successful baseline. A failure
@@ -265,8 +267,10 @@ unsuccessful trial and is charged, scored, and checkpointed.
 
 Failure evidence distinguishes redacted exception chains, HTTP status, and
 `failure_kind`: `provider`, `output_limit`, `request_limit`,
-`terminal_response`, `tool`, or `budget`. 429 and missing usage/cost are
-provider failures; hidden retries and fallbacks are disabled, and only resume
+`terminal_response`, `tool`, `budget`, `request_timeout`,
+`global_deadline`, or `interrupted`. 429 and missing usage/cost are provider
+failures; timeouts produce incomplete artifacts and failed, resume-eligible
+checkpoint records; hidden retries and fallbacks are disabled, and only resume
 can retry them.
 
 The four cells use separate runtime and Compose namespaces. PostgreSQL/MinIO

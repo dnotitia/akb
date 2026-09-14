@@ -53,6 +53,7 @@
     "max_model_requests": 3000,
     "max_total_cost_usd": 50.0,
     "max_wall_seconds": 10800,
+    "request_timeout_seconds": 300,
     "max_requests_per_trial": 8,
     "max_cost_per_trial_usd": 0.1
   },

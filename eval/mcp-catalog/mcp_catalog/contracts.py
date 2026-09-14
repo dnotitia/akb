@@ -359,6 +359,7 @@ class Budget(ContractModel):
     max_model_requests: int = Field(gt=0)
     max_total_cost_usd: float = Field(gt=0)
     max_wall_seconds: int = Field(gt=0)
+    request_timeout_seconds: int = Field(gt=0)
     max_requests_per_trial: int = Field(gt=0)
     max_cost_per_trial_usd: float = Field(gt=0)
 
@@ -366,6 +367,8 @@ class Budget(ContractModel):
     def validate_limits(self) -> Budget:
         if self.max_requests_per_trial > self.max_model_requests:
             raise ValueError("per-trial request cap cannot exceed global request cap")
+        if self.request_timeout_seconds > self.max_wall_seconds:
+            raise ValueError("request timeout cannot exceed the global wall limit")
         return self
 
 

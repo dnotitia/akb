@@ -59,6 +59,14 @@ class BudgetExceeded(RuntimeError):
     """Raised when a run would exceed its pre-registered finite cap."""
 
 
+class ProviderRequestTimeout(TimeoutError):
+    """A single provider request exceeded its registered timeout."""
+
+
+class GlobalWallDeadlineExceeded(TimeoutError):
+    """The run's monotonic wall deadline expired while work was in flight."""
+
+
 FailureKind = Literal[
     "none",
     "provider",
@@ -67,6 +75,9 @@ FailureKind = Literal[
     "terminal_response",
     "tool",
     "budget",
+    "request_timeout",
+    "global_deadline",
+    "interrupted",
     "unknown",
 ]
 
@@ -75,6 +86,12 @@ def classify_failure(error: str | None, *, result: Any, final_answer: str) -> Fa
     if error is None:
         return "terminal_response" if result is not None and not final_answer.strip() else "none"
     lowered = error.casefold()
+    if "provider request timeout" in lowered:
+        return "request_timeout"
+    if "global wall deadline" in lowered:
+        return "global_deadline"
+    if "benchmark interrupted" in lowered:
+        return "interrupted"
     if any(
         marker in lowered
         for marker in (
@@ -421,6 +438,12 @@ def error_details(error: BaseException) -> tuple[int | None, str | None]:
     )
 
 
+def is_timeout_exception(error: BaseException) -> bool:
+    name = type(error).__name__.casefold()
+    message = str(error).casefold()
+    return isinstance(error, TimeoutError) or "timeout" in name or "timed out" in message
+
+
 def public_result_error(result: Any, secrets: tuple[str, ...]) -> tuple[str | None, str | None]:
     """Extract a domain error from the normal MCP tool-result envelope."""
     value = safe_json(result, secrets)
@@ -603,6 +626,15 @@ class BudgetLedger:
         self.wall_seconds = self.current_wall_seconds()
         return self.wall_seconds
 
+    def remaining_wall_seconds(self) -> float:
+        return max(0.0, self.manifest.budget.max_wall_seconds - self.current_wall_seconds())
+
+    def request_timeout_seconds(self) -> float:
+        remaining = self.remaining_wall_seconds()
+        if remaining <= 0:
+            raise GlobalWallDeadlineExceeded("global wall deadline exceeded")
+        return min(float(self.manifest.budget.request_timeout_seconds), remaining)
+
     async def reserve_trial(self, worst_case_cost_usd: float) -> None:
         async with self._lock:
             budget = self.manifest.budget
@@ -647,6 +679,44 @@ class BudgetLedger:
             self.wall_seconds = next_wall
             self.model_work_seconds = next_model_work
             self.reserved_cost_usd = remaining_reserved
+
+
+async def run_agent_with_deadline(
+    agent: Any,
+    prompt: str,
+    *,
+    toolsets: Any,
+    model_settings: Any,
+    usage_limits: Any,
+    request_timeout_seconds: float,
+    remaining_wall_seconds: float,
+) -> Any:
+    """Run one agent turn under both request and global monotonic deadlines."""
+    if request_timeout_seconds <= 0 or remaining_wall_seconds <= 0:
+        raise GlobalWallDeadlineExceeded("global wall deadline exceeded")
+    effective_timeout = min(request_timeout_seconds, remaining_wall_seconds)
+    settings = dict(model_settings or {})
+    settings["timeout"] = effective_timeout
+    global_deadline = asyncio.timeout(remaining_wall_seconds)
+    try:
+        async with global_deadline:
+            try:
+                async with asyncio.timeout(effective_timeout):
+                    return await agent.run(
+                        prompt,
+                        toolsets=toolsets,
+                        model_settings=cast(Any, settings),
+                        usage_limits=usage_limits,
+                        infer_name=False,
+                    )
+            except TimeoutError as exc:
+                if global_deadline.expired():
+                    raise GlobalWallDeadlineExceeded("global wall deadline exceeded") from exc
+                raise ProviderRequestTimeout("provider request timeout") from exc
+    except TimeoutError as exc:
+        if global_deadline.expired():
+            raise GlobalWallDeadlineExceeded("global wall deadline exceeded") from exc
+        raise
 
 
 class TrialExecutor:
@@ -730,18 +800,30 @@ class TrialExecutor:
                 toolset = create_toolset(client, recorder)
                 async with toolset:
                     agent = Agent(model=self.model, system_prompt=SYSTEM_PROMPT, retries=0)
-                    result = await agent.run(
+                    result = await run_agent_with_deadline(
+                        agent,
                         task.prompt,
                         toolsets=cast(Any, [toolset]),
-                        model_settings=cast(Any, self.model.settings),
+                        model_settings=self.model.settings,
                         usage_limits=UsageLimits(
                             request_limit=self.manifest.budget.max_requests_per_trial,
                             cost_limit=Decimal(str(self.manifest.budget.max_cost_per_trial_usd)),
                         ),
-                        infer_name=False,
+                        request_timeout_seconds=self.ledger.request_timeout_seconds(),
+                        remaining_wall_seconds=self.ledger.remaining_wall_seconds(),
                     )
+            except ProviderRequestTimeout:
+                error = "benchmark incomplete: provider request timeout"
+            except GlobalWallDeadlineExceeded:
+                error = "benchmark incomplete: global wall deadline exceeded"
+            except asyncio.CancelledError:
+                error = "benchmark incomplete: benchmark interrupted"
             except Exception as exc:
-                error = redact_exception(exc, secrets)
+                error = (
+                    "benchmark incomplete: provider request timeout"
+                    if is_timeout_exception(exc)
+                    else redact_exception(exc, secrets)
+                )
             finally:
                 MODEL_RESPONSES.reset(capture_token)
             latency = time.perf_counter() - started
@@ -758,7 +840,10 @@ class TrialExecutor:
                 secrets=secrets,
                 partial_messages=partial_messages,
             )
-            if self.timing_sink is not None and is_provider_wait_failure(outcome.error):
+            if self.timing_sink is not None and (
+                is_provider_wait_failure(outcome.error)
+                or outcome.failure_kind in {"request_timeout", "global_deadline"}
+            ):
                 self.timing_sink("provider_wait", started, started + latency)
             try:
                 await self.ledger.charge(outcome, reserved_cost_usd=reservation)
@@ -793,6 +878,8 @@ async def execute_smoke(
     fixture: RuntimeFixture,
     token: str,
     secrets: tuple[str, ...],
+    request_timeout_seconds: float,
+    remaining_wall_seconds: float,
     timing_sink: Callable[[TimingCategory, float, float], None] | None = None,
 ) -> TrialOutcome:
     """Make one real full-catalog request for the pre-run four-cell gate."""
@@ -824,18 +911,30 @@ async def execute_smoke(
         toolset = create_toolset(client, recorder)
         async with toolset:
             agent = Agent(model=model, system_prompt=SYSTEM_PROMPT, retries=0)
-            result = await agent.run(
+            result = await run_agent_with_deadline(
+                agent,
                 f"{task.prompt}\nAfter the server confirms the operation, provide a concise final response.",
                 toolsets=cast(Any, [toolset]),
-                model_settings=cast(Any, model.settings),
+                model_settings=model.settings,
                 usage_limits=UsageLimits(
                     request_limit=manifest.budget.max_requests_per_trial,
                     cost_limit=Decimal(str(manifest.budget.max_cost_per_trial_usd)),
                 ),
-                infer_name=False,
+                request_timeout_seconds=request_timeout_seconds,
+                remaining_wall_seconds=remaining_wall_seconds,
             )
+    except ProviderRequestTimeout:
+        error = "benchmark incomplete: provider request timeout"
+    except GlobalWallDeadlineExceeded:
+        error = "benchmark incomplete: global wall deadline exceeded"
+    except asyncio.CancelledError:
+        error = "benchmark incomplete: benchmark interrupted"
     except Exception as exc:
-        error = redact_exception(exc, secrets)
+        error = (
+            "benchmark incomplete: provider request timeout"
+            if is_timeout_exception(exc)
+            else redact_exception(exc, secrets)
+        )
     finally:
         MODEL_RESPONSES.reset(capture_token)
     outcome = outcome_from_run(
@@ -851,7 +950,10 @@ async def execute_smoke(
         secrets=secrets,
         partial_messages=partial_messages,
     )
-    if timing_sink is not None and is_provider_wait_failure(outcome.error):
+    if timing_sink is not None and (
+        is_provider_wait_failure(outcome.error)
+        or outcome.failure_kind in {"request_timeout", "global_deadline"}
+    ):
         timing_sink("provider_wait", started, started + (time.perf_counter() - started))
     return outcome
 

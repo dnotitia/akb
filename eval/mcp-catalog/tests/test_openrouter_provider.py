@@ -18,9 +18,11 @@ from mcp_catalog.execution import (
     BudgetExceeded,
     BudgetLedger,
     CURRENT_TRIAL,
+    GlobalWallDeadlineExceeded,
     MODEL_RESPONSES,
     ModelConfigurationError,
     OpenRouterChatModel,
+    ProviderRequestTimeout,
     TrialContext,
     TrialExecutor,
     ToolCallRecorder,
@@ -32,6 +34,7 @@ from mcp_catalog.execution import (
     outcome_from_run,
     validate_routing_evidence,
     worst_case_cost,
+    run_agent_with_deadline,
 )
 from mcp_catalog.checkpoint import valid_completed_outcome
 from mcp_catalog.runtime import StateObservation
@@ -41,6 +44,43 @@ ROOT = Path(__file__).parents[1]
 
 def _model_spec():
     return load_run_manifest(ROOT / "config" / "run.json").models[0]
+
+
+class _NeverReturningAgent:
+    def __init__(self) -> None:
+        self.settings: dict[str, object] | None = None
+
+    async def run(self, _prompt: str, **kwargs: object) -> object:
+        self.settings = kwargs["model_settings"]  # type: ignore[assignment]
+        await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_never_returning_provider_is_bounded_by_request_and_global_deadlines() -> None:
+    agent = _NeverReturningAgent()
+
+    with pytest.raises(ProviderRequestTimeout):
+        await run_agent_with_deadline(
+            agent,
+            "hang",
+            toolsets=[],
+            model_settings={},
+            usage_limits=SimpleNamespace(),
+            request_timeout_seconds=0.01,
+            remaining_wall_seconds=0.2,
+        )
+    assert agent.settings == {"timeout": 0.01}
+
+    with pytest.raises(GlobalWallDeadlineExceeded):
+        await run_agent_with_deadline(
+            agent,
+            "hang",
+            toolsets=[],
+            model_settings={},
+            usage_limits=SimpleNamespace(),
+            request_timeout_seconds=0.2,
+            remaining_wall_seconds=0.01,
+        )
 
 
 def test_build_model_uses_declared_openrouter_environment_and_forces_routing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -470,6 +510,21 @@ async def test_actual_cumulative_wall_guard_blocks_before_provider_call() -> Non
         provider_calls += 1
 
     assert provider_calls == 0
+
+
+def test_request_timeout_is_capped_by_remaining_global_wall() -> None:
+    loaded = load_run_manifest(ROOT / "config" / "run.json")
+    manifest = loaded.model_copy(
+        update={
+            "budget": loaded.budget.model_copy(
+                update={"max_wall_seconds": 10, "request_timeout_seconds": 7}
+            )
+        }
+    )
+    ledger = BudgetLedger(manifest, wall_clock=lambda: 8.5)
+
+    assert ledger.remaining_wall_seconds() == pytest.approx(1.5)
+    assert ledger.request_timeout_seconds() == pytest.approx(1.5)
 
 
 @pytest.mark.asyncio

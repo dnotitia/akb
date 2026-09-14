@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
+import signal
 import sys
 from collections import Counter
 from pathlib import Path
@@ -18,6 +20,7 @@ from .runtime import RuntimeContractError, RuntimeDescriptor
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = PROJECT_ROOT / "config" / "run.json"
 DEFAULT_CORPUS = PROJECT_ROOT / "corpus" / "tasks.json"
+SIGNAL_GRACE_SECONDS = 30.0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -124,11 +127,36 @@ async def run(args: argparse.Namespace) -> int:
         checkpoint_path=getattr(args, "checkpoint", None),
         resume_path=getattr(args, "resume", None),
     )
+    run_task = asyncio.create_task(runner.run(), name="catalog-benchmark-run")
+    signal_received = asyncio.Event()
+
+    def handle_signal() -> None:
+        signal_received.set()
+        if not run_task.done():
+            run_task.cancel()
+
+    loop = asyncio.get_running_loop()
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(signum, handle_signal)
     try:
-        artifact = await runner.run()
+        while not run_task.done():
+            if signal_received.is_set():
+                try:
+                    await asyncio.wait_for(asyncio.shield(run_task), timeout=SIGNAL_GRACE_SECONDS)
+                except asyncio.TimeoutError as exc:
+                    run_task.cancel()
+                    raise RuntimeError("benchmark interrupted; graceful finalization timed out") from exc
+                break
+            await asyncio.sleep(0.1)
+        artifact = await run_task
     except BenchmarkRunFailure as exc:
         write_json(args.output, exc.artifact, exc.secrets)
         raise
+    finally:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError):
+                loop.remove_signal_handler(signum)
     write_json(args.output, artifact, runner.secrets)
     print(
         json.dumps(

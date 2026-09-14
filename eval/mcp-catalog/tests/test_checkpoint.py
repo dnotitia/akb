@@ -217,6 +217,7 @@ def test_checkpoint_timing_is_cumulative_across_resume_attempts(tmp_path: Path) 
     assert resumed.next_timing_attempt_index() == 2
     assert resumed.document.timing.cumulative_wall_seconds == pytest.approx(12.0)
     assert len(resumed.document.timing.attempts) == 1
+    assert resumed.document.timing.active_attempt is None
 
 
 def test_checkpoint_timing_tampering_fails_closed(tmp_path: Path) -> None:

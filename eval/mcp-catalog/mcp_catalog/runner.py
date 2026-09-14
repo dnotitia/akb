@@ -579,6 +579,7 @@ class BenchmarkRunner:
             "locale_counts": dict(sorted(Counter(task.locale for task in self.tasks).items())),
             "source_revision": runtime["source_revision"],
             "protocol_revision": self.manifest.protocol_revision,
+            "request_timeout_seconds": self.manifest.budget.request_timeout_seconds,
             "artifact_versions": artifact_versions,
             "fixture": fixture_evidence,
             "runtime": safe_runtime,
@@ -600,6 +601,7 @@ class BenchmarkRunner:
                 "wall_seconds": ledger.wall_seconds,
                 "model_work_seconds": ledger.model_work_seconds,
                 "reserved_cost_usd": ledger.reserved_cost_usd,
+                "request_timeout_seconds": self.manifest.budget.request_timeout_seconds,
             },
         }
         if failure is not None:
@@ -638,6 +640,7 @@ class BenchmarkRunner:
             "locale_counts": artifact["locale_counts"],
             "source_revision": artifact["source_revision"],
             "protocol_revision": artifact["protocol_revision"],
+            "request_timeout_seconds": artifact["request_timeout_seconds"],
             "artifact_versions": artifact["artifact_versions"],
             "trial_order": [
                 key.model_dump(mode="json")
@@ -787,6 +790,11 @@ class BenchmarkRunner:
                 self._resolver = resolver
                 token = await self._refresh_token(cell_fixture, task.fixture.credential_profile)
                 self._refresh_secrets(resolver)
+                remaining_wall_seconds = ledger.remaining_wall_seconds()
+                request_timeout_seconds = min(
+                    float(self.manifest.budget.request_timeout_seconds),
+                    remaining_wall_seconds,
+                )
                 if self._timing is None:
                     outcome = await execute_smoke(
                         task,
@@ -798,6 +806,8 @@ class BenchmarkRunner:
                         fixture=cell_fixture,
                         token=token,
                         secrets=self.secrets,
+                        request_timeout_seconds=request_timeout_seconds,
+                        remaining_wall_seconds=remaining_wall_seconds,
                         timing_sink=self._timing.record if self._timing is not None else None,
                     )
                 else:
@@ -812,6 +822,8 @@ class BenchmarkRunner:
                             fixture=cell_fixture,
                             token=token,
                             secrets=self.secrets,
+                            request_timeout_seconds=request_timeout_seconds,
+                            remaining_wall_seconds=remaining_wall_seconds,
                             timing_sink=self._timing.record if self._timing is not None else None,
                         )
                 await ledger.charge(outcome, reserved_cost_usd=reservation)
@@ -1076,6 +1088,19 @@ class BenchmarkRunner:
                 for outcome in outcomes
                 if outcome.error and outcome.error.startswith("benchmark incomplete:")
             )
+            termination = next(
+                (
+                    outcome
+                    for outcome in outcomes
+                    if outcome.failure_kind in {"request_timeout", "global_deadline", "interrupted"}
+                ),
+                None,
+            )
+            if termination is not None:
+                raise RuntimeContractError(
+                    termination.error or "benchmark incomplete: model request terminated",
+                    stage="model_request",
+                )
         reports[run_key] = {
             "catalog_keys": sorted(
                 f"{transport}:{profile}"
@@ -1253,6 +1278,11 @@ class BenchmarkRunner:
                         incomplete_reasons=incomplete_reasons,
                         reports=reports,
                     )
+        except asyncio.CancelledError:
+            primary_error = RuntimeContractError(
+                "benchmark interrupted by signal",
+                stage="signal",
+            )
         except Exception as exc:
             primary_error = exc
             if current_stage == "smoke_gate" and self._smoke_gate.get("status") == "in_progress":
