@@ -2,9 +2,14 @@
 
 The worker's job is to make the vault-filter path zero-touch: it backfills
 `vault_id` onto pre-upgrade pgvector points on startup, and search reads
-`is_ready()` to decide whether the vault path is safe yet. These tests lock the
+readiness to decide whether the vault path is safe yet. These tests lock the
 contract that gates that decision — the DB-backed `_process_once` join is
 exercised end-to-end in the e2e suite, not here.
+
+akb#526: readiness must be visible to the SERVING tier, which never runs the
+backfill runner on a split api/worker deployment. `is_ready()` is the
+process-local latch (worker loop + fast path); `is_ready_async()` derives it
+from store state both tiers can see, with a short negative-result cache.
 """
 from __future__ import annotations
 
@@ -15,9 +20,9 @@ from app.services import vault_backfill
 
 @pytest.fixture(autouse=True)
 def _reset_ready(monkeypatch):
-    # `_ready` is module state that latches True for the process; isolate each test.
+    # `_ready` / `_last_check` are module state; isolate each test.
     monkeypatch.setattr(vault_backfill, "_ready", False, raising=False)
-    monkeypatch.setattr(vault_backfill, "_last_ready_refresh", 0.0, raising=False)
+    monkeypatch.setattr(vault_backfill, "_last_check", None, raising=False)
 
 
 def test_is_ready_defaults_false_and_reflects_module_state(monkeypatch):
@@ -126,57 +131,6 @@ async def test_process_once_short_circuits_once_ready(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_api_refresh_observes_worker_completion_from_shared_store(monkeypatch):
-    """A split API process activates without sharing the worker's memory latch."""
-    class _Store:
-        vault_filter_supported = True
-
-    monkeypatch.setattr(vault_backfill, "get_vector_store", lambda: _Store())
-    monkeypatch.setattr(vault_backfill, "_applicable", lambda: True)
-
-    class _Connection:
-        async def fetchval(self, _sql):
-            return False  # no live source point is missing vault_id
-
-    class _Acquire:
-        async def __aenter__(self):
-            return _Connection()
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class _Pool:
-        def acquire(self):
-            return _Acquire()
-
-    async def _pool():
-        return _Pool()
-
-    monkeypatch.setattr(vault_backfill, "get_pool", _pool)
-
-    assert await vault_backfill.refresh_ready(min_interval_secs=0) is True
-    assert vault_backfill.is_ready() is True
-
-
-@pytest.mark.asyncio
-async def test_api_refresh_is_throttled_and_fails_closed(monkeypatch):
-    calls = 0
-
-    async def _not_ready(_store):
-        nonlocal calls
-        calls += 1
-        return False
-
-    monkeypatch.setattr(vault_backfill, "get_vector_store", object)
-    monkeypatch.setattr(vault_backfill, "_readiness_satisfied", _not_ready)
-    monkeypatch.setattr(vault_backfill.time, "monotonic", lambda: 100.0)
-
-    assert await vault_backfill.refresh_ready(min_interval_secs=15) is False
-    assert await vault_backfill.refresh_ready(min_interval_secs=15) is False
-    assert calls == 1
-
-
-@pytest.mark.asyncio
 async def test_pending_stats_shape(monkeypatch):
     """/health consumes this: always carries ready + applicable; null_remaining
     only when the driver exposes the counter."""
@@ -202,3 +156,98 @@ async def test_pending_stats_omits_count_for_drivers_without_counter(monkeypatch
     stats = await vault_backfill.pending_stats()
     assert "null_remaining" not in stats
     assert set(stats) == {"ready", "applicable", "vault_filter_supported"}
+
+
+# ── akb#526: cross-process readiness for the serving tier ──
+
+class _CountedStore:
+    """Driver stand-in with an observable NULL-vault_id count."""
+
+    vault_filter_supported = True
+
+    def __init__(self, pending: int, fail: bool = False):
+        self.pending = pending
+        self.fail = fail
+        self.calls = 0
+
+    async def vault_backfill_pending(self):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("store unreachable")
+        return self.pending
+
+
+@pytest.mark.asyncio
+async def test_is_ready_async_opens_path_without_worker_latch(monkeypatch):
+    """The serving tier never runs the backfill runner, so its `_ready` is
+    False forever. A zero NULL count from the store must still open the path
+    (and latch the local fast path)."""
+    store = _CountedStore(pending=0)
+    monkeypatch.setattr(vault_backfill, "get_vector_store", lambda: store)
+    assert vault_backfill.is_ready() is False
+    assert await vault_backfill.is_ready_async() is True
+    assert vault_backfill.is_ready() is True
+    assert store.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_is_ready_async_caches_negative_outcome(monkeypatch):
+    """A nonzero count stays cached for the TTL: the hot path must not pay a
+    COUNT(*) per search while the backfill is still draining."""
+    store = _CountedStore(pending=5)
+    monkeypatch.setattr(vault_backfill, "get_vector_store", lambda: store)
+    assert await vault_backfill.is_ready_async() is False
+    assert await vault_backfill.is_ready_async() is False
+    assert store.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_is_ready_async_rechecks_after_ttl(monkeypatch):
+    """After the TTL the count is re-read, so the path opens within ~30s of
+    the backfill completing anywhere (any process, any replica)."""
+    store = _CountedStore(pending=5)
+    monkeypatch.setattr(vault_backfill, "get_vector_store", lambda: store)
+    assert await vault_backfill.is_ready_async() is False
+    assert store.calls == 1
+    monkeypatch.setattr(vault_backfill, "_NEGATIVE_TTL_SECS", 0)
+    store.pending = 0
+    assert await vault_backfill.is_ready_async() is True
+    assert store.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_is_ready_async_stays_gated_on_counter_failure(monkeypatch):
+    """A counter failure must not open the path — fail closed, stay cached."""
+    store = _CountedStore(pending=0, fail=True)
+    monkeypatch.setattr(vault_backfill, "get_vector_store", lambda: store)
+    assert await vault_backfill.is_ready_async() is False
+    assert await vault_backfill.is_ready_async() is False
+    assert vault_backfill.is_ready() is False
+    assert store.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_is_ready_async_without_counter_stays_gated(monkeypatch):
+    """A capable driver with no vault_backfill_pending can't prove its points
+    carry vault_id — same fail-closed rule as the worker branch."""
+
+    class _NoCounter:
+        vault_filter_supported = True
+
+    monkeypatch.setattr(vault_backfill, "get_vector_store", lambda: _NoCounter())
+    assert await vault_backfill.is_ready_async() is False
+    assert vault_backfill.is_ready() is False
+
+
+@pytest.mark.asyncio
+async def test_is_ready_async_non_capable_latches_immediately(monkeypatch):
+    """A driver without the vault filter never takes the vault path, so the
+    check is moot — same immediate-latch rule as the worker branch, no store
+    call needed."""
+
+    class _Plain:  # no vault_filter_supported attribute
+        pass
+
+    monkeypatch.setattr(vault_backfill, "get_vector_store", lambda: _Plain())
+    assert await vault_backfill.is_ready_async() is True
+    assert vault_backfill.is_ready() is True

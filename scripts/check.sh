@@ -306,7 +306,14 @@ if command -v detect-secrets-hook >/dev/null 2>&1; then
   # The generated MSW worker also carries an integrity checksum.
   # All pnpm-lock.yaml files are excluded because package integrity hashes
   # (sha512-… base64) are expected high-entropy data, not secrets.
-  git ls-files -z -- . ':!frontend/pnpm-lock.yaml' ':!packages/akb-client/pnpm-lock.yaml' ':!packages/markdown-editor/pnpm-lock.yaml' ':!frontend/public/mockServiceWorker.js' |
+  # backend/CHANGELOG.md is excluded because a baseline entry cannot survive it:
+  # a changelog grows at the TOP, so every release shifts the recorded
+  # line_number and the next run demands the baseline be regenerated. Its one
+  # finding is the local test DSN this repo documents everywhere
+  # (backend/tests/** carry the same string by design), quoted inside a fenced
+  # block that shows how to run a suite. Rewriting a published release note to
+  # satisfy the scanner would be the wrong trade.
+  git ls-files -z -- . ':!frontend/pnpm-lock.yaml' ':!packages/akb-client/pnpm-lock.yaml' ':!packages/markdown-editor/pnpm-lock.yaml' ':!frontend/public/mockServiceWorker.js' ':!backend/CHANGELOG.md' |
     xargs -0 detect-secrets-hook --baseline .secrets.baseline
 else
   echo "  ! detect-secrets not installed — pipx install detect-secrets" >&2

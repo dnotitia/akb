@@ -89,7 +89,26 @@ async def test_synthetic_hybrid_acl_empty_scope_and_timing(local_store, caplog):
     assert "hybrid_timing" in caplog.text
     assert "PRIVATE" not in caplog.text
     assert all(value not in caplog.text for value in vaults + sources)
-    one = await store.hybrid_search(**args, source_ids=[sources[3]])
+    # Merge regression: the active-authority source_type filter from main must
+    # compose with both the vault predicate and this branch's retrieval timeout.
+    store._search_timeout_secs = 60
+    typed = await store.hybrid_search(
+        **args,
+        source_ids=None,
+        vault_ids=[vaults[0]],
+        source_types=["document"],
+    )
+    assert len(typed) == 10
+    assert await store.hybrid_search(
+        **args,
+        source_ids=None,
+        vault_ids=[vaults[0]],
+        source_types=["table"],
+    ) == []
+    store._search_timeout_secs = 30
+    one = await store.hybrid_search(
+        **args, source_ids=[sources[3]], source_types=["document"],
+    )
     assert [str(hit.source_id) for hit in one] == [sources[3]]
     assert await store.hybrid_search(**args, source_ids=[]) == []
     assert await store.hybrid_search(**args, source_ids=None, vault_ids=[]) == []

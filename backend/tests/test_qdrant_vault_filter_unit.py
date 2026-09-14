@@ -12,6 +12,7 @@ from app.services.vector_store.qdrant import (
     PAYLOAD_SOURCE_ID,
     PAYLOAD_VAULT_ID,
     _acl_filter,
+    _validated_source_types,
 )
 
 
@@ -138,6 +139,18 @@ async def test_ensure_collection_indexes_vault_id():
     store._client = fake
     await store.ensure_collection()
     assert PAYLOAD_VAULT_ID in fake.indexes
+
+
+async def test_ensure_collection_indexes_source_type():
+    """`source_type` is a per-search pre-filter (workbench #1069) — it needs
+    the same keyword index as the ACL keys, on new AND pre-existing
+    collections (ensure runs outside the create branch)."""
+    from app.services.vector_store.qdrant import PAYLOAD_SOURCE_TYPE
+    fake = _FakeClient()
+    store = QdrantStore(url="http://x", api_key=None, collection="chunks", dense_dim=4)
+    store._client = fake
+    await store.ensure_collection()
+    assert PAYLOAD_SOURCE_TYPE in fake.indexes
 
 
 # ── #207: client errors → VectorStoreUnavailable (write + search paths) ──
@@ -276,3 +289,44 @@ async def test_ensure_collection_vault_index_programming_error_propagates(exc):
     store._client = _VaultIndexBoom(exc)
     with pytest.raises(type(exc)):
         await store.ensure_collection()
+
+
+# ── workbench #1069: driver-side source_type predicate ──
+
+def test_source_type_filter_ands_onto_acl_branches():
+    from app.services.vector_store.qdrant import PAYLOAD_SOURCE_TYPE
+    fv = _acl_filter(vault_ids=["v1"], source_ids=None, source_types=["native_document"])
+    assert [c.key for c in fv.must] == [PAYLOAD_VAULT_ID, PAYLOAD_SOURCE_TYPE]
+    assert fv.must[1].match.any == ["native_document"]
+    fs = _acl_filter(vault_ids=None, source_ids=["s1"], source_types=["document", "table"])
+    assert [c.key for c in fs.must] == [PAYLOAD_SOURCE_ID, PAYLOAD_SOURCE_TYPE]
+    # No ACL filter + source_types alone still constrains (unscoped admin path).
+    fn = _acl_filter(vault_ids=None, source_ids=None, source_types=["native_document"])
+    assert [c.key for c in fn.must] == [PAYLOAD_SOURCE_TYPE]
+    # Legacy default unchanged.
+    assert _acl_filter(vault_ids=None, source_ids=None) is None
+
+
+def test_source_type_filter_rejects_unknown_discriminator():
+    with pytest.raises(ValueError, match="unknown source_type"):
+        _validated_source_types(["docu ment'] OR '1'='1"])
+
+
+@pytest.mark.asyncio
+async def test_hybrid_search_passes_source_types_to_both_prefetch_legs():
+    from app.services.vector_store.qdrant import PAYLOAD_SOURCE_TYPE
+    fake = _FakeClient()
+    store = _store_with(fake)
+    await store.hybrid_search(
+        query_text="q", query_dense=[0.1, 0.2, 0.3, 0.4],
+        query_sparse_indices=[1, 2], query_sparse_values=[0.5, 0.5],
+        source_ids=None, vault_ids=["v1"], source_types=["native_document", "table"],
+        limit=10, prefetch_per_leg=50,
+    )
+    prefetch = store._client.last_query["prefetch"]
+    assert len(prefetch) == 2
+    for leg in prefetch:
+        keys = [c.key for c in leg.filter.must]
+        assert keys[0] == PAYLOAD_VAULT_ID
+        assert keys[1] == PAYLOAD_SOURCE_TYPE
+        assert leg.filter.must[1].match.any == ["native_document", "table"]

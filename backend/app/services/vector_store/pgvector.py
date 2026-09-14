@@ -824,6 +824,7 @@ class PgvectorStore:
         limit: int,
         prefetch_per_leg: int,
         vault_ids: list[str] | None = None,
+        source_types: list[str] | None = None,
     ) -> list[VectorHit]:
         del query_text  # debug-only on this driver; keep signature parity
         started = time.perf_counter()
@@ -861,6 +862,18 @@ class PgvectorStore:
         else:
             filter_uuids = None
             filter_col = "source_id"  # unused when filter_uuids is None
+        # source_types (workbench #1069) is orthogonal to the ACL filter: it
+        # ANDs with whichever of vault_ids / source_ids is present (or with no
+        # filter at all). Values are driver-owned discriminators, never user
+        # input — validate against the known set so a caller typo fails loud
+        # instead of silently matching nothing.
+        source_type_values: list[str] | None = None
+        if source_types is not None:
+            from app.services.index_service import SOURCE_TYPES
+            unknown = [t for t in source_types if t not in SOURCE_TYPES]
+            if unknown:
+                raise ValueError(f"unknown source_type filter: {unknown!r}")
+            source_type_values = list(source_types)
         pool = await self._pool()
         timings: dict[str, float] = {}
 
@@ -875,6 +888,7 @@ class PgvectorStore:
                         return await self._search_dense(
                             c, query_dense=query_dense,
                             filter_uuids=filter_uuids, filter_col=filter_col,
+                            source_type_values=source_type_values,
                             limit=prefetch_per_leg,
                         )
                     if self._search_timeout_secs == 30.0:
@@ -899,6 +913,7 @@ class PgvectorStore:
                             c, terms=list(query_sparse_indices),
                             weights=list(query_sparse_values),
                             filter_uuids=filter_uuids, filter_col=filter_col,
+                            source_type_values=source_type_values,
                             limit=prefetch_per_leg,
                         )
                     if self._search_timeout_secs == 30.0:
@@ -979,6 +994,7 @@ class PgvectorStore:
         query_dense: list[float],
         filter_uuids: list[uuid.UUID] | None,
         filter_col: str,
+        source_type_values: list[str] | None = None,
         limit: int,
     ) -> list[str]:
         # Binary codec → list[float] passes through directly.
@@ -986,6 +1002,16 @@ class PgvectorStore:
         # sparse-only points (embed API was down when they were indexed)
         # contribute only to the sparse leg, never to the dense KNN.
         # `filter_col` is "source_id" or "vault_id" (literal — see hybrid_search).
+        # `source_type_values`, when present, ANDs an additional
+        # `source_type = ANY(...)` predicate (workbench #1069). The bind slot
+        # is always $4 in the filtered branch and $3 in the unfiltered branch
+        # (params: dense, [uuids,] limit, types) so planner shapes stay stable.
+        type_suffix_filtered = (
+            " AND source_type = ANY($4::text[])" if source_type_values else ""
+        )
+        type_suffix_unfiltered = (
+            " AND source_type = ANY($3::text[])" if source_type_values else ""
+        )
         if filter_uuids:
             # HNSW post-filters: it walks the graph for ~`ef_search` GLOBAL
             # nearest, THEN drops the ones failing the WHERE. With a selective
@@ -1007,11 +1033,12 @@ class PgvectorStore:
                     f"""
                     SELECT chunk_id::text AS chunk_id
                     FROM "{self._schema}".chunks
-                    WHERE {filter_col} = ANY($2::uuid[]) AND dense IS NOT NULL
+                    WHERE {filter_col} = ANY($2::uuid[]) AND dense IS NOT NULL{type_suffix_filtered}
                     ORDER BY dense <=> $1
                     LIMIT $3
                     """,
                     list(query_dense), filter_uuids, int(limit),
+                    *([source_type_values] if source_type_values else []),
                     timeout=self._search_timeout_secs,
                 )
         else:
@@ -1019,11 +1046,12 @@ class PgvectorStore:
                 f"""
                 SELECT chunk_id::text AS chunk_id
                 FROM "{self._schema}".chunks
-                WHERE dense IS NOT NULL
+                WHERE dense IS NOT NULL{type_suffix_unfiltered}
                 ORDER BY dense <=> $1
                 LIMIT $2
                 """,
                 list(query_dense), int(limit),
+                *([source_type_values] if source_type_values else []),
                 timeout=self._search_timeout_secs,
             )
         return [r["chunk_id"] for r in rows]
@@ -1036,40 +1064,96 @@ class PgvectorStore:
         weights: list[float],
         filter_uuids: list[uuid.UUID] | None,
         filter_col: str,
+        source_type_values: list[str] | None = None,
         limit: int,
     ) -> list[str]:
         if not terms:
             return []
 
+        # source_type predicate (workbench #1069), orthogonal to the ACL
+        # filter. In filtered branches it ANDs onto the existing WHERE; in
+        # unfiltered branches it becomes the WHERE. Each branch below spells
+        # its own bind numbering. Values are driver-owned discriminators
+        # (validated in hybrid_search), never user input.
         if self._sparse_shape == "arrays":
             # Two query branches (with/without filter) keep the planner honest —
             # a single SQL with `WHERE $3 IS NULL OR <col> = ANY($3)` confuses
             # ANY-cardinality estimation. `filter_col` is "source_id"/"vault_id"
             # (literal — see hybrid_search), so the interpolation is safe.
             if filter_uuids:
+                if source_type_values:
+                    sql = f"""
+                        WITH q AS (
+                          SELECT unnest($1::bigint[]) AS tid,
+                                 unnest($2::real[])   AS w
+                        ),
+                        cand AS (
+                          SELECT chunk_id, sparse_terms, sparse_weights
+                          FROM "{self._schema}".chunks
+                          WHERE {filter_col} = ANY($3::uuid[])
+                            AND source_type = ANY($5::text[])
+                        )
+                        SELECT c.chunk_id::text AS chunk_id,
+                               SUM(q.w * t.weight) AS score
+                        FROM cand c
+                        CROSS JOIN LATERAL unnest(c.sparse_terms, c.sparse_weights)
+                            AS t(tid, weight)
+                        JOIN q ON q.tid = t.tid
+                        GROUP BY c.chunk_id
+                        ORDER BY score DESC
+                        LIMIT $4
+                    """
+                    rows = await conn.fetch(
+                        sql, list(terms), [float(w) for w in weights],
+                        filter_uuids, int(limit), source_type_values,
+                        timeout=self._search_timeout_secs,
+                    )
+                else:
+                    sql = f"""
+                        WITH q AS (
+                          SELECT unnest($1::bigint[]) AS tid,
+                                 unnest($2::real[])   AS w
+                        ),
+                        cand AS (
+                          SELECT chunk_id, sparse_terms, sparse_weights
+                          FROM "{self._schema}".chunks
+                          WHERE {filter_col} = ANY($3::uuid[])
+                        )
+                        SELECT c.chunk_id::text AS chunk_id,
+                               SUM(q.w * t.weight) AS score
+                        FROM cand c
+                        CROSS JOIN LATERAL unnest(c.sparse_terms, c.sparse_weights)
+                            AS t(tid, weight)
+                        JOIN q ON q.tid = t.tid
+                        GROUP BY c.chunk_id
+                        ORDER BY score DESC
+                        LIMIT $4
+                    """
+                    rows = await conn.fetch(
+                        sql, list(terms), [float(w) for w in weights],
+                        filter_uuids, int(limit),
+                        timeout=self._search_timeout_secs,
+                    )
+            elif source_type_values:
                 sql = f"""
                     WITH q AS (
                       SELECT unnest($1::bigint[]) AS tid,
                              unnest($2::real[])   AS w
-                    ),
-                    cand AS (
-                      SELECT chunk_id, sparse_terms, sparse_weights
-                      FROM "{self._schema}".chunks
-                      WHERE {filter_col} = ANY($3::uuid[])
                     )
                     SELECT c.chunk_id::text AS chunk_id,
                            SUM(q.w * t.weight) AS score
-                    FROM cand c
+                    FROM "{self._schema}".chunks c
                     CROSS JOIN LATERAL unnest(c.sparse_terms, c.sparse_weights)
                         AS t(tid, weight)
                     JOIN q ON q.tid = t.tid
+                    WHERE c.source_type = ANY($4::text[])
                     GROUP BY c.chunk_id
                     ORDER BY score DESC
-                    LIMIT $4
+                    LIMIT $3
                 """
                 rows = await conn.fetch(
-                    sql, list(terms), [float(w) for w in weights],
-                    filter_uuids, int(limit),
+                    sql, list(terms), [float(w) for w in weights], int(limit),
+                    source_type_values,
                     timeout=self._search_timeout_secs,
                 )
             else:
@@ -1112,6 +1196,7 @@ class PgvectorStore:
                           SELECT chunk_id
                           FROM "{self._schema}".chunks
                           WHERE source_id = ANY($3::uuid[])
+                            {"AND source_type = ANY($5::text[])" if source_type_values else ""}
                         )
                         SELECT p.chunk_id::text AS chunk_id,
                                SUM(q.w * p.weight) AS score
@@ -1135,7 +1220,8 @@ class PgvectorStore:
                         FROM "{self._schema}".posting p
                         JOIN q ON q.tid = p.term_id
                         JOIN "{self._schema}".chunks c ON c.chunk_id = p.chunk_id
-                        WHERE c.vault_id = ANY($3::uuid[])
+                        WHERE c.{filter_col} = ANY($3::uuid[])
+                          {"AND c.source_type = ANY($5::text[])" if source_type_values else ""}
                         GROUP BY p.chunk_id
                         ORDER BY score DESC
                         LIMIT $4
@@ -1143,7 +1229,28 @@ class PgvectorStore:
                 rows = await conn.fetch(
                     sql, list(terms), [float(w) for w in weights],
                     filter_uuids, int(limit),
+                    *([source_type_values] if source_type_values else []),
                     timeout=self._search_timeout_secs,
+                )
+            elif source_type_values:
+                sql = f"""
+                    WITH q AS (
+                      SELECT unnest($1::bigint[]) AS tid,
+                             unnest($2::real[])   AS w
+                    )
+                    SELECT p.chunk_id::text AS chunk_id,
+                           SUM(q.w * p.weight) AS score
+                    FROM "{self._schema}".posting p
+                    JOIN q ON q.tid = p.term_id
+                    JOIN "{self._schema}".chunks c ON c.chunk_id = p.chunk_id
+                    WHERE c.source_type = ANY($4::text[])
+                    GROUP BY p.chunk_id
+                    ORDER BY score DESC
+                    LIMIT $3
+                """
+                rows = await conn.fetch(
+                    sql, list(terms), [float(w) for w in weights], int(limit),
+                    source_type_values, timeout=self._search_timeout_secs,
                 )
             else:
                 sql = f"""

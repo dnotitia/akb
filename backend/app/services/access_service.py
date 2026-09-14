@@ -35,6 +35,7 @@ from app.services.access_contributions import (
 )
 from app.services.account_markers import is_retired_recovery_admin_password
 from app.services.account_service import presented_issuer_or_none
+from app.services import document_counters
 from app.services.edge_boundary import edge_scope_sql, vault_uri_prefix
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import vault_uri
@@ -932,6 +933,14 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
 
     vault = await _r("SELECT * FROM vaults WHERE name = $1", vault_name)
     vid = vault["id"]
+    # akb#525: document counters follow the active authority. Legacy `documents`
+    # rows freeze at cutover (native writes never touch that table), so on
+    # `postgres_native` both queries read the native ledger instead. The SQL
+    # lives in `document_counters` with every other counter that had to make
+    # the same choice. Tables/files/collections/edges are
+    # authority-independent and keep their existing queries.
+    doc_count_sql = document_counters.vault_document_count_sql()
+    doc_last_sql = document_counters.vault_last_activity_sql()
     if (
         role_source in ("system_admin", "write_policy_admin_bypass")
         and vault["owner_id"] != uuid.UUID(user_id)
@@ -956,7 +965,7 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
     ) = await asyncio.gather(
         _r("SELECT username, display_name FROM users WHERE id = $1", vault["owner_id"]),
         _q("SELECT COUNT(*) FROM vault_access WHERE vault_id = $1", vid),
-        _q("SELECT COUNT(*) FROM documents WHERE vault_id = $1", vid),
+        _q(doc_count_sql, vid),
         _q("SELECT COUNT(*) FROM vault_tables WHERE vault_id = $1", vid),
         _q(
             "SELECT COUNT(*) FROM vault_files vf WHERE vault_id = $1 AND "
@@ -973,8 +982,7 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
             vault_uri_prefix(vault_name),
         ),
         _r(
-            "SELECT updated_at, created_by FROM documents WHERE vault_id = $1 "
-            "ORDER BY updated_at DESC LIMIT 1",
+            doc_last_sql,
             vid,
         ),
         _q("SELECT 1 FROM vault_external_git WHERE vault_id = $1", vid),

@@ -7,6 +7,155 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Every document counter follows the active authority (akb#525)
+
+`GET /vaults/{vault}/info` learned to read the native ledger on
+`postgres_native`, but it was not the only counter answering from a table the
+native write path never touches, and the other two do not read `documents` at
+all — a grep for the query in the issue does not find them.
+
+`akb_browse` reports each collection's `doc_count` and `last_updated` from the
+denormalised `collections` columns, which only `DocumentRepository.increment_count`
+/ `decrement_count` bump — legacy-write-path-only. On a native installation the
+browse payload therefore carried a frozen count directly above the documents
+contradicting it. Measured on one installation: 25 of 10,344 collections already
+disagreed with the live ledger — 16 reporting documents they no longer hold, one
+reporting zero while holding documents.
+
+The operator corpus inventory (`app/stats`) counted `documents` across the whole
+installation, so it reported the pre-cutover total permanently. Same
+installation: 136,183 catalog rows against 136,188 live native documents, the
+gap widening with every write.
+
+Both now read the authority that holds the documents, alongside the vault-info
+counters, through one `document_counters` module rather than three copies of the
+same branch. The legacy arm is unchanged on all three, and pays no query at all
+— the authority is resolved before the pool is touched. Browsing into a subtree
+scopes the recount to that subtree, since only its collections are rendered
+(unscoped on the 50,850-document vault: 118 ms).
+
+Vault last activity also stops sorting `native_revisions.occurred_at`, which made
+the planner scan the entire append-only revision ledger — every vault's history,
+not the one being asked about. It orders the vault's own resources instead and
+reads the actor off the head revision, which `set_head` keeps in step by writing
+`updated_at` and `head_revision_id` in one statement (verified: 136,188 of
+136,188 live document resources had a head whose `occurred_at` equalled
+`updated_at` and was that resource's newest revision). For a 50,850-document
+vault: 93.7 ms to 60.9 ms, and no longer growing with unrelated vaults' history.
+
+Counting is unchanged in meaning on both arms: archived documents still count
+(native `lifecycle` records deletion, not archival), and a collection's count is
+still its direct children.
+
+### Default archive scope no longer disqualifies the vault path (akb#530)
+
+`archive_scope` defaults to `unarchived`, and the vault-path gate demanded
+`scope == "all"` — so the fast path had no reachable caller. Every ordinary
+search fell back to enumerating candidate source ids, which refuses with the
+bounded-corpus error on any scope above the candidate ceiling. Measured on one
+installation: `?q=…` returned 422 while the identical request with
+`&archive_scope=all` returned 200, with archived documents 154 of 136,183
+(0.11%).
+
+The archived predicate moves from candidate enumeration to hydration, where
+the authoritative status is already parsed: verified Head frontmatter on the
+native arm, `documents.status` on the legacy one. `unarchived` and `all` now
+take the vault path; `archived` deliberately keeps the id path, because it
+selects FOR the rare tail and a vault-path top-K would filter down to nothing.
+
+A hit excluded by scope no longer costs a result slot: the page is refilled
+from the rest of the deduped prefetch pool, and the drop is counted as
+`archive_scope_excluded` in the `hydration_dropped` degradation reason, so a
+genuinely short page (an exhausted pool) names its cause. Applying the
+predicate at hydration also closes the window where a document is archived
+between candidate selection and hydration.
+
+Note for the native arm: the retained legacy `documents` rows are a frozen
+cutover projection and are NOT the archived authority. Measured on the same
+installation, 3 of the 154 rows marked archived there carry `status: draft` in
+their native frontmatter, so filtering on that column would wrongly hide live
+documents.
+
+### Vault info document counters follow the active authority (akb#525)
+
+On `postgres_native` the native document path never writes the legacy
+`documents` catalog, so `document_count` froze at its pre-cutover number
+(and read 0/NULL on fresh vaults) while `last_activity`/`last_active_user`
+went stale. `get_vault_info` now branches on the configured document
+authority: native backends count live `native_resources` document surfaces
+and take last activity from the newest touching `native_revisions` row
+(`occurred_at`/`actor`, aliased to the legacy field names); `bare_git`
+keeps the exact legacy queries. Tables/files/collections/edges are
+authority-independent and unchanged.
+
+### Vault-filter readiness visible to the serving tier (akb#526)
+
+`vault_backfill.is_ready()` was a process-local latch flipped only by the
+backfill runner, which lives in the worker tier — on a split api/worker
+deployment the serving process never ran it, so its copy stayed False for
+life and every native-arm query fell back to id enumeration (and the
+bounded-corpus refusal on large scopes), even with zero NULL `vault_id`
+rows. Search now calls `is_ready_async()`: the local latch on hit, else the
+store's own NULL count — state both tiers can see — with a 30s cache on
+negative outcomes so the hot path stays cheap. A True outcome latches
+locally and is never re-checked; a counter failure stays gated (fail
+closed). When the vault path is wanted but readiness is not established,
+search logs one line (`vault path disabled: readiness not established`)
+instead of surfacing only as an unrelated search refusal downstream.
+
+### Write cap + source_uris hardening (bounded-corpus fix, part 3)
+
+The reference placement (`m1-reference-payload-v1`) enforces the same 10MiB
+write cap the pg-bodystore placement already had (`max_text_bytes`). Without
+it, an unbounded body could enter the corpus and every read path had to assume
+the unbounded case; with it, hydration memory is statically bounded by
+`limit × 10MiB` and larger content has a directed home (File storage +
+projection, with the 413 pointing there).
+
+`source_uris` scope resolution collapses from one SQL OR-clause per URI to a
+single `= ANY(...)` predicate per dimension (vaults, paths-or-ids): request
+SQL text stays constant-size no matter how many URIs arrive. The caller-side
+cap moves from the `NATIVE_SEARCH_MAX_SOURCE_URIS` module constant to the
+`search_max_source_uris` setting (default 200, provisional — documented with
+its derivation path: per-driver IN-list measurement). Over-cap rejections now
+name the recovery (split the request or use a vault scope) instead of a bare
+refusal. The old constant stays as an untouched legacy alias.
+
+### Native candidate filtering reads frontmatter slices, paginated (bounded-corpus fix, part 2)
+
+`_native_document_candidates` no longer selects full `canonical_bytes` rows to
+decide `type`/`tags`/`status` filters. It fetches an 8KiB leading-body slice
+per row (`substring(canonical_bytes ...)`, the same shape the native grep path
+already uses) and parses only the frontmatter envelope — per-resource memory
+is slice-sized regardless of body size. Rows are keyset-paginated by
+`resource_id` (2,000/page, ids only accumulate), so peak memory is page-sized
+rather than scope-sized.
+
+A resource whose envelope opens but never closes inside the slice is excluded
+from candidates AND counted (`unparseable_envelope`, logged as a warning) —
+never filtered on defaults. The aggregate `COUNT(*)` / `SUM(byte_size)` guard
+still runs first on manifest numbers (no body bytes touched), and hydration
+still re-verifies the winners, so the per-row verify step is gone from this
+path without losing integrity.
+
+### Native search takes the vault path (bounded-corpus fix, part 1)
+
+`hybrid_search` accepts an orthogonal `source_types` pre-filter on all five
+vector drivers (pgvector, qdrant, seahorse×3): it ANDs with whichever ACL
+filter (`vault_ids` / `source_ids`) is present and excludes stale points from
+the non-active Document arm driver-side, before the top-K cut. The native arm
+is therefore eligible for the vault-granularity path (`vault_path_eligible`),
+so vault-scoped native search no longer enumerates candidate ids through the
+10,000-resource / 128MiB bounded-corpus gate — the gate stays in place for the
+id-enumeration path only. `_hydrate_hits` keeps its arm-mismatch skip as
+defense in depth.
+
+Hydration drops are now counted by cause (`stale_arm`,
+`unknown_source_type`, `stale_native_file_path`, `hydration_miss`,
+`unuriable_source_type`) and surfaced as a `hydration_dropped:...`
+degradation reason, so `total_matches > 0, returned == 0` can never again
+read as a silent zero-match.
+
 ### Added a personal notification inbox and document watches
 
 Human browser sessions can view effective Vault-access changes and explicitly

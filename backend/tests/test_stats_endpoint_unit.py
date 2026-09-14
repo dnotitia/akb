@@ -663,6 +663,7 @@ def health_app(monkeypatch, tmp_path):
         events_publisher,
         external_git_poller,
         metadata_worker,
+        native_derived_worker,
         native_file_projection,
         queue_rescuer,
         sparse_encoder,
@@ -679,6 +680,7 @@ def health_app(monkeypatch, tmp_path):
     monkeypatch.setattr(vault_backfill, "pending_stats", _async_return({}))
     monkeypatch.setattr(sparse_encoder, "stats_snapshot", _async_return({}))
     monkeypatch.setattr(native_file_projection, "pending_stats", _async_return({}))
+    monkeypatch.setattr(native_derived_worker, "pending_stats", _async_return({}))
     for module in (external_git_poller, asset_gc_worker, metadata_worker, events_publisher):
         monkeypatch.setattr(module, "pending_stats", _async_return({}))
     return main
@@ -733,7 +735,13 @@ async def test_health_surfaces_native_file_projection_exhaustion_as_degraded(hea
 
 
 async def test_vault_health_surfaces_native_file_projection_diagnostics(monkeypatch):
-    from app.services import embed_worker, health as health_service, metadata_worker, native_file_projection
+    from app.services import (
+        embed_worker,
+        health as health_service,
+        metadata_worker,
+        native_derived_worker,
+        native_file_projection,
+    )
 
     vault_id = uuid.uuid4()
     diagnostic = {
@@ -746,10 +754,80 @@ async def test_vault_health_surfaces_native_file_projection_diagnostics(monkeypa
     monkeypatch.setattr(embed_worker, "pending_stats", _async_return({"upsert": {}}))
     monkeypatch.setattr(metadata_worker, "pending_stats", _async_return({}))
     monkeypatch.setattr(native_file_projection, "pending_stats", _async_return(diagnostic))
+    monkeypatch.setattr(native_derived_worker, "pending_stats", _async_return({}))
 
     result = await health_service.vault_health(vault_id)
 
     assert result["native_file_projection"] == diagnostic
+
+
+async def test_health_reports_a_derived_index_abandonment_beside_the_progress(health_app, monkeypatch):
+    """A Resource the indexer gave up on must be countable from `/health`.
+
+    This is the whole of akb#527's second defect. The derived-index queue is
+    the document-level one — one intent per Resource revision — and when it
+    abandons an intent that Resource is permanently absent from ranked search
+    while staying readable and greppable, so nothing else signals the loss.
+    Until this key existed the only trace was `last_error` on a row of an
+    internal queue table, which is how three documents were nearly lost
+    silently: `pending` drains to zero either way, so progress alone reaches
+    100% with documents missing.
+    """
+    from app.services import native_derived_worker
+
+    diagnostic = {
+        "pending": 0,
+        "retrying": 0,
+        "exhausted": 0,
+        "abandoned": 3,
+        "applied": 2_838,
+        "superseded": 0,
+        "deleted": 0,
+        "direct_grep": 0,
+        "status": "degraded",
+    }
+    monkeypatch.setattr(native_derived_worker, "pending_stats", _async_return(diagnostic))
+
+    result = await health_app.health(user=None)
+
+    assert result["native_derived"] == diagnostic
+    # Unauthenticated, like every other backlog counter beside it: an operator
+    # watching indexing progress is the audience, and the count names no vault
+    # and no path — `/health/vault/{name}` is where the scope narrows, behind
+    # the reader gate that already guards vault existence.
+    assert "audit" not in result
+
+
+async def test_vault_health_narrows_the_derived_index_abandonment_to_one_vault(monkeypatch):
+    """The global count raises the question; this is where it gets answered."""
+    from app.services import (
+        embed_worker,
+        health as health_service,
+        metadata_worker,
+        native_derived_worker,
+        native_file_projection,
+    )
+
+    vault_id = uuid.uuid4()
+    diagnostic = {
+        "pending": 0,
+        "retrying": 0,
+        "exhausted": 0,
+        "abandoned": 3,
+        "applied": 41,
+        "superseded": 0,
+        "deleted": 0,
+        "direct_grep": 0,
+        "status": "degraded",
+    }
+    monkeypatch.setattr(embed_worker, "pending_stats", _async_return({"upsert": {}}))
+    monkeypatch.setattr(metadata_worker, "pending_stats", _async_return({}))
+    monkeypatch.setattr(native_file_projection, "pending_stats", _async_return({}))
+    monkeypatch.setattr(native_derived_worker, "pending_stats", _async_return(diagnostic))
+
+    result = await health_service.vault_health(vault_id)
+
+    assert result["native_derived"] == diagnostic
 
 
 # ── the socket itself ────────────────────────────────────────────────────
