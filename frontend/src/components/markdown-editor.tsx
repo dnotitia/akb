@@ -878,12 +878,89 @@ function EditorToolbar({
   appearance,
   imageInputRef,
 }: EditorToolbarProps) {
+  const [referenceQuery, setReferenceQuery] = React.useState("");
+  const [referenceResults, setReferenceResults] = React.useState<
+    Awaited<
+      ReturnType<NonNullable<EditorToolbarProps["searchAdapter"]>["search"]>
+    >
+  >([]);
+  const [referenceSearching, setReferenceSearching] = React.useState(false);
+  const referenceQueryId = React.useId();
+
+  const searchReferences = async () => {
+    const query = referenceQuery.trim();
+    if (!searchAdapter || !query) return;
+    setReferenceSearching(true);
+    try {
+      setReferenceResults(await searchAdapter.search(query));
+    } finally {
+      setReferenceSearching(false);
+    }
+  };
+
   return (
     <MarkdownToolbar
       editor={editor}
       link={{
         normalizeUrl: normalizeEditorLinkUrl,
-        searchAdapter,
+        searchSlot: searchAdapter
+          ? ({ setUrl, setText }) => (
+              <div className="space-y-2">
+                <Label htmlFor={referenceQueryId}>Search Vault resources</Label>
+                <div className="flex gap-2">
+                  <Input
+                    id={referenceQueryId}
+                    value={referenceQuery}
+                    onChange={(event) => setReferenceQuery(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        void searchReferences();
+                      }
+                    }}
+                    placeholder="Find a document or file"
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => void searchReferences()}
+                    disabled={referenceSearching || !referenceQuery.trim()}
+                  >
+                    {referenceSearching ? "Searching…" : "Search"}
+                  </Button>
+                </div>
+                {referenceResults.length > 0 && (
+                  <div
+                    role="listbox"
+                    aria-label="Vault resource results"
+                    className="max-h-40 overflow-y-auto rounded-[var(--radius-md)] border border-border"
+                  >
+                    {referenceResults.map((result) => (
+                      <button
+                        key={result.id}
+                        type="button"
+                        role="option"
+                        aria-label={`${result.title} (${result.kind ?? "resource"})`}
+                        className="flex w-full flex-col items-start gap-0.5 border-b border-border px-3 py-2 text-left last:border-b-0 hover:bg-surface-hover focus-visible:bg-surface-hover focus-visible:outline-none"
+                        onMouseDown={(event) => event.preventDefault()}
+                        onClick={() => {
+                          setUrl(result.target);
+                          setText(result.title);
+                          setReferenceResults([]);
+                        }}
+                      >
+                        {result.title}
+                        <span className="text-xs text-foreground-muted">
+                          {result.kind ?? "resource"}
+                          {result.snippet ? ` · ${result.snippet}` : ""}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )
+          : undefined,
       }}
       className={cn(
         appearance === "canvas"

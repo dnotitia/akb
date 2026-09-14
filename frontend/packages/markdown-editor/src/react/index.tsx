@@ -35,8 +35,6 @@ import type {
   MarkdownLinkLabels,
   MarkdownLinkUrlNormalizer,
   MarkdownProfile,
-  MarkdownSearchResult,
-  MarkdownSearchAdapter,
   MarkdownSlashContext,
   MarkdownState,
   MarkdownTargetResolution,
@@ -401,11 +399,6 @@ const DEFAULT_MARKDOWN_LINK_LABELS: MarkdownLinkLabels = {
   remove: 'Remove link',
   close: 'Close dialog',
   invalidUrl: 'Enter an http(s), email, phone, anchor, or relative URL.',
-  searchLabel: 'Search Vault resources',
-  searchPlaceholder: 'Find a document or file',
-  searchButton: 'Search',
-  searching: 'Searching…',
-  resultsLabel: 'Vault resource results',
 }
 
 const linkInputClass =
@@ -428,10 +421,15 @@ export interface MarkdownLinkPopupProps {
   onOpenChange: (open: boolean) => void
   /** Product-specific canonicalization and URL policy. */
   normalizeUrl?: MarkdownLinkUrlNormalizer
-  /** Existing product search adapters remain a product-provided capability. */
-  searchAdapter?: MarkdownSearchAdapter
+  /** Product-owned search UI; this ticket deliberately does not own search. */
+  searchSlot?: (context: MarkdownLinkSearchSlotProps) => ReactNode
   labels?: Partial<MarkdownLinkLabels>
   className?: string
+}
+
+export interface MarkdownLinkSearchSlotProps {
+  setUrl: (value: string) => void
+  setText: (value: string) => void
 }
 
 /**
@@ -445,7 +443,7 @@ export function MarkdownLinkPopup({
   open,
   onOpenChange,
   normalizeUrl = normalizeMarkdownLinkUrl,
-  searchAdapter,
+  searchSlot,
   labels,
   className,
 }: MarkdownLinkPopupProps) {
@@ -455,17 +453,12 @@ export function MarkdownLinkPopup({
   const snapshotRef = useRef<MarkdownLinkSelectionSnapshot | null>(null)
   const previousOpenRef = useRef(false)
   const closeReasonRef = useRef<'cancel' | 'commit'>('cancel')
-  const searchRequestRef = useRef(0)
   const [snapshot, setSnapshot] = useState<MarkdownLinkSelectionSnapshot | null>(null)
   const [linkUrl, setLinkUrl] = useState('')
   const [linkText, setLinkText] = useState('')
   const [linkError, setLinkError] = useState('')
-  const [referenceQuery, setReferenceQuery] = useState('')
-  const [referenceResults, setReferenceResults] = useState<readonly MarkdownSearchResult[]>([])
-  const [referenceSearching, setReferenceSearching] = useState(false)
   const linkUrlId = useId()
   const linkTextId = useId()
-  const referenceQueryId = useId()
 
   const restoreSelection = useCallback(() => {
     if (!editor || editor.isDestroyed || !snapshotRef.current) return
@@ -490,8 +483,6 @@ export function MarkdownLinkPopup({
       setLinkUrl(snapshot.href)
       setLinkText(snapshot.text)
       setLinkError('')
-      setReferenceQuery('')
-      setReferenceResults([])
       requestAnimationFrame(() => urlInputRef.current?.focus())
     }
 
@@ -512,20 +503,6 @@ export function MarkdownLinkPopup({
       if (reason === 'cancel') restoreSelection()
       else editor.commands.focus()
     })
-  }
-
-  const searchReferences = async () => {
-    const query = referenceQuery.trim()
-    if (!searchAdapter || !query) return
-    const request = searchRequestRef.current + 1
-    searchRequestRef.current = request
-    setReferenceSearching(true)
-    try {
-      const results = await searchAdapter.search(query)
-      if (searchRequestRef.current === request) setReferenceResults(results)
-    } finally {
-      if (searchRequestRef.current === request) setReferenceSearching(false)
-    }
   }
 
   const applyLink = () => {
@@ -596,65 +573,7 @@ export function MarkdownLinkPopup({
             <X className="h-4 w-4" aria-hidden />
           </DialogPrimitive.Close>
           <div className="space-y-4">
-            {searchAdapter && (
-              <div className="space-y-2">
-                <label htmlFor={referenceQueryId} className="text-sm font-medium leading-none">
-                  {copy.searchLabel}
-                </label>
-                <div className="flex gap-2">
-                  <input
-                    id={referenceQueryId}
-                    value={referenceQuery}
-                    onChange={event => setReferenceQuery(event.target.value)}
-                    onKeyDown={event => {
-                      if (event.key === 'Enter') {
-                        event.preventDefault()
-                        void searchReferences()
-                      }
-                    }}
-                    placeholder={copy.searchPlaceholder}
-                    className={linkInputClass}
-                  />
-                  <button
-                    type="button"
-                    className={linkButtonClass}
-                    onClick={() => void searchReferences()}
-                    disabled={referenceSearching || !referenceQuery.trim()}
-                  >
-                    {referenceSearching ? copy.searching : copy.searchButton}
-                  </button>
-                </div>
-                {referenceResults.length > 0 && (
-                  <div
-                    role="listbox"
-                    aria-label={copy.resultsLabel}
-                    className="max-h-40 overflow-y-auto rounded-[var(--radius-md)] border border-border"
-                  >
-                    {referenceResults.map(result => (
-                      <button
-                        key={result.id}
-                        type="button"
-                        role="option"
-                        aria-label={`${result.title} (${result.kind ?? 'resource'})`}
-                        className="flex w-full flex-col items-start gap-0.5 border-b border-border px-3 py-2 text-left last:border-b-0 hover:bg-surface-hover focus-visible:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-                        onMouseDown={event => event.preventDefault()}
-                        onClick={() => {
-                          setLinkUrl(result.target)
-                          setLinkText(result.title)
-                          setReferenceResults([])
-                        }}
-                      >
-                        {result.title}
-                        <span className="text-xs text-foreground-muted">
-                          {result.kind ?? 'resource'}
-                          {result.snippet ? ` · ${result.snippet}` : ''}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
+            {searchSlot?.({ setUrl: setLinkUrl, setText: setLinkText })}
             <div className="space-y-2">
               <label htmlFor={linkUrlId} className="text-sm font-medium leading-none">
                 {copy.url}
@@ -809,7 +728,7 @@ export interface MarkdownToolbarProps {
 export interface MarkdownToolbarLinkOptions {
   disabled?: boolean
   normalizeUrl?: MarkdownLinkUrlNormalizer
-  searchAdapter?: MarkdownSearchAdapter
+  searchSlot?: (context: MarkdownLinkSearchSlotProps) => ReactNode
   labels?: Partial<MarkdownLinkLabels>
   popupClassName?: string
 }
@@ -1053,7 +972,7 @@ export function MarkdownToolbar({
         open={linkOpen}
         onOpenChange={setLinkOpen}
         normalizeUrl={link?.normalizeUrl}
-        searchAdapter={link?.searchAdapter}
+        searchSlot={link?.searchSlot}
         labels={link?.labels}
         className={link?.popupClassName}
       />

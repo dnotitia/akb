@@ -48,7 +48,7 @@ participate in the same toolbar navigation.
   editor={editor}
   link={{
     normalizeUrl: productNormalizeUrl,
-    searchAdapter: productSearchAdapter,
+    searchSlot: ({ setUrl, setText }) => productSearchSlot({ setUrl, setText }),
   }}
 >
   <MarkdownToolbarGroup label="Insert">
@@ -63,8 +63,10 @@ link state. `MarkdownLinkPopup` is also public for consumers that need a
 different toolbar composition. `normalizeUrl` is the product seam for
 canonical targets and link policy; returning `null` leaves the popup open,
 shows the configured error, and keeps focus in the URL field. Search results
-must return canonical `MarkdownSearchResult.target` values, never signed or
-runtime URLs.
+come from the product-owned `searchSlot`, so AKB can preserve its existing
+search UI and adapter behavior without expanding the common package's search
+surface. They must return canonical `MarkdownSearchResult.target` values, never
+signed or runtime URLs.
 
 Use `profile="structured"` for CommonMark + GFM structure editing. The default `preserve` profile
 adds explicit raw HTML/MDX nodes while keeping math and Mermaid fences as semantic nodes. Both
@@ -121,7 +123,7 @@ with a physical OS IME.
 The `0.4.0` public contract adds the shared link command/state contract and
 `MarkdownLinkPopup`. Consumers should provide their existing URL policy through
 `MarkdownToolbar.link.normalizeUrl` and keep resource search in their existing
-`MarkdownSearchAdapter`.
+product-owned `searchSlot`.
 
 The `0.2.0` public contract adds canonical resource targets. Consumers should pin one exact package version, store the
 Markdown returned by `onChange` or `editor.getMarkdown()` as the canonical representation, and

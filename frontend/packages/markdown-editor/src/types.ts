@@ -127,11 +127,6 @@ export interface MarkdownLinkLabels {
   remove: string
   close: string
   invalidUrl: string
-  searchLabel: string
-  searchPlaceholder: string
-  searchButton: string
-  searching: string
-  resultsLabel: string
 }
 
 export interface MarkdownTargetResolver {
