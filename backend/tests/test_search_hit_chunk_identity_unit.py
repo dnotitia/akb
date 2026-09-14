@@ -104,8 +104,9 @@ async def test_hit_carries_the_matched_chunk_section_and_ordinal(monkeypatch):
     connection = _Connection(doc_id, [{"chunk_id": chunk_id, "chunk_index": 4}])
     service = _configure(monkeypatch, connection)
 
-    (result,) = await service._hydrate_hits([_hit(chunk_id, doc_id)])
+    (result,), dropped = await service._hydrate_hits([_hit(chunk_id, doc_id)])
 
+    assert dropped == {}
     assert result.section_path == "# Collector > ## Product-API seam"
     assert result.chunk_index == 4
     # Everything the hit carried before is still there and unchanged.
@@ -132,8 +133,9 @@ async def test_a_missing_chunk_row_leaves_the_ordinal_null(monkeypatch):
     connection = _Connection(doc_id, [])
     service = _configure(monkeypatch, connection)
 
-    (result,) = await service._hydrate_hits([_hit(chunk_id, doc_id)])
+    (result,), dropped = await service._hydrate_hits([_hit(chunk_id, doc_id)])
 
+    assert dropped == {}
     assert result.chunk_index is None
     assert result.section_path == "# Collector > ## Product-API seam"
     assert result.matched_section == "Requests carry an Idempotency-Key."
@@ -144,7 +146,7 @@ async def test_a_driver_chunk_id_that_is_not_a_uuid_is_skipped(monkeypatch):
     connection = _Connection(doc_id, [])
     service = _configure(monkeypatch, connection)
 
-    (result,) = await service._hydrate_hits([_hit("not-a-uuid", doc_id)])
+    (result,), _ = await service._hydrate_hits([_hit("not-a-uuid", doc_id)])
 
     assert result.chunk_index is None
     # No chunk lookup was attempted for an id the query could not cast.
@@ -169,7 +171,7 @@ async def test_the_excerpt_drops_the_heading_context_line(monkeypatch):
         f"[{hit.section_path}]\n{body}"
     )
 
-    (result,) = await service._hydrate_hits([hit])
+    (result,), _ = await service._hydrate_hits([hit])
 
     assert result.matched_section == body[:500]
     assert result.section_path == "# Collector > ## Product-API seam"
@@ -184,7 +186,7 @@ async def test_a_bracketed_body_line_survives_in_the_excerpt(monkeypatch):
     hit = _hit(chunk_id, doc_id)
     hit.content = "[# Some other heading]\nBody text."
 
-    (result,) = await service._hydrate_hits([hit])
+    (result,), _ = await service._hydrate_hits([hit])
 
     assert result.matched_section == "[# Some other heading]\nBody text."
 
@@ -198,7 +200,7 @@ async def test_an_uppercase_driver_chunk_id_still_matches(monkeypatch):
     connection = _Connection(doc_id, [{"chunk_id": str(chunk_id), "chunk_index": 7}])
     service = _configure(monkeypatch, connection)
 
-    (result,) = await service._hydrate_hits([_hit(str(chunk_id).upper(), doc_id)])
+    (result,), _ = await service._hydrate_hits([_hit(str(chunk_id).upper(), doc_id)])
 
     assert result.chunk_index == 7
 
@@ -209,7 +211,7 @@ async def test_a_brace_wrapped_driver_chunk_id_still_matches(monkeypatch):
     connection = _Connection(doc_id, [{"chunk_id": str(chunk_id), "chunk_index": 2}])
     service = _configure(monkeypatch, connection)
 
-    (result,) = await service._hydrate_hits([_hit("{" + str(chunk_id) + "}", doc_id)])
+    (result,), _ = await service._hydrate_hits([_hit("{" + str(chunk_id) + "}", doc_id)])
 
     assert result.chunk_index == 2
 
@@ -223,7 +225,7 @@ async def test_an_empty_section_path_is_reported_as_null(monkeypatch):
     hit = _hit(chunk_id, doc_id)
     hit.section_path = ""
 
-    (result,) = await service._hydrate_hits([hit])
+    (result,), _ = await service._hydrate_hits([hit])
 
     assert result.section_path is None
     assert result.chunk_index == 0

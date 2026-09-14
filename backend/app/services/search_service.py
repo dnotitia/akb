@@ -20,7 +20,7 @@ from typing import Literal
 from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import ValidationError
-from app.services.search_filters import ArchiveScope, collection_predicate, escape_like, metadata_matches, resolve_archive_scope
+from app.services.search_filters import ArchiveScope, collection_predicate, escape_like, metadata_matches, resolve_archive_scope, status_matches
 from app.models.document import SearchResponse, SearchResult
 from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.services import sparse_encoder
@@ -48,7 +48,20 @@ NATIVE_DOCUMENT_SOURCE = "native_document"
 NATIVE_MEASUREMENT_DATABASE = "akb_revision_m1_measurement"
 NATIVE_SEARCH_MAX_CANDIDATE_RESOURCES = 10_000
 NATIVE_SEARCH_MAX_BODY_BYTES = 128 * 1024 * 1024
+# Legacy alias for the caller-supplied `source_uris` scope cap. The live limit
+# is `settings.search_max_source_uris` (configurable, documented there); this
+# constant stays so older imports keep resolving, but nothing reads it anymore.
 NATIVE_SEARCH_MAX_SOURCE_URIS = 200
+# Frontmatter slice for candidate filtering (workbench #1069, part 2): the
+# filter decision needs only the leading frontmatter envelope (`type`/`tags`/
+# `status`), never the body. Reading the first 8KiB bounds per-resource memory
+# regardless of body size; a resource whose envelope does not close inside the
+# slice is classified "unparseable" (counted, never silently dropped).
+NATIVE_CANDIDATE_FRONTMATTER_SLICE_BYTES = 8 * 1024
+# Candidate pagination: filter loop pages through scope rows keyset-ordered by
+# resource_id, so peak memory is page-sized, not scope-sized. Page of 2,000 ×
+# 8KiB slices ≈ 16MiB worst case per page, GC'd before the next page.
+NATIVE_CANDIDATE_PAGE_SIZE = 2_000
 
 
 def active_document_source_type(
@@ -368,17 +381,37 @@ def vault_path_eligible(
     Phase 2) instead of enumerating source ids. Requires: the flag on, a driver
     whose `vault_filter_supported` is True (it stores vault_id and filters on it),
     and NO doc-level narrowing filter (those still need per-resource source_ids).
-    When False, the existing source_ids path runs unchanged."""
+    When False, the existing source_ids path runs unchanged.
+
+    The vector-store vault filter now ALSO constrains source_type (workbench
+    #1069: the caller passes `source_types` alongside `vault_ids`), so the
+    native arm is eligible too — stale legacy Document points are excluded
+    driver-side before the top-K is cut and can no longer suppress valid
+    native hits. `_hydrate_hits` keeps its arm-mismatch skip as defense in
+    depth."""
     return (
         settings.vault_filter_enabled
         and supports_vault_filter(get_vector_store())
-        # The vector-store vault filter cannot yet constrain source_type.
-        # Under the native arm, stale legacy Document points could consume the
-        # complete top-K before hydration drops them, suppressing valid native
-        # hits. Use the source-id path until the driver accepts that predicate.
-        and _configured_document_source_type() == LEGACY_DOCUMENT_SOURCE
         and not (collection or doc_type or tags or source_uris)
     )
+
+
+def archive_scope_allows_vault_path(scope: ArchiveScope) -> bool:
+    """Whether `scope` can be served by the VAULT path, with the archived
+    predicate applied at hydration instead of by candidate enumeration.
+
+    `unarchived` (the DEFAULT) and `all` can. Requiring `all` here is what
+    disqualified every ordinary search from the fast path (akb#530): archive
+    scope is unlike `collection` / `doc_type` / `tags`, which a caller opts
+    into — it is set on every request nobody customised, so treating it as a
+    narrowing filter meant the fast path had no reachable caller at all.
+
+    `archived` cannot, and stays on the id path. It selects FOR a set that was
+    0.11% of the measured corpus, so a vault-path top-K would be almost
+    entirely non-matching and hydration would filter the page down to nothing.
+    Enumerating ids is the right tool for narrowing to a rare set; it is the
+    wrong one for excluding it."""
+    return scope != "archived"
 
 
 def clamp_search_limit(limit: int) -> int:
@@ -434,11 +467,80 @@ def _verified_native_metadata(row) -> dict:
     return metadata
 
 
+# Matches a complete leading frontmatter envelope: an opening `---` line, then
+# a closing `---` line. `re.DOTALL` so the envelope may span lines; `\Z`-safe
+# via `$` with MULTILINE. Only the envelope presence is tested here — full
+# YAML parsing still goes through `_parse_markdown` on the slice.
+_FRONTMATTER_ENVELOPE_RE = re.compile(r"\A---[ \t]*\r?\n.*?\r?\n---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
+
+
+def _slice_has_complete_frontmatter(slice_text: str) -> bool:
+    """Whether a body slice contains a complete leading frontmatter envelope.
+
+    A body without a leading `---` line has no envelope to complete (plain
+    Markdown: metadata defaults apply). Only a body that OPENS an envelope
+    but never closes it inside the slice is "incomplete" — its filter fields
+    may lie beyond the slice, so the caller must count it as unparseable
+    rather than filter it on defaults.
+    """
+    if not slice_text.startswith("---"):
+        return True
+    return _FRONTMATTER_ENVELOPE_RE.match(slice_text) is not None
+
+
 def _verify_native_body(row) -> None:
     """Verify one native body without interpreting File bytes as Markdown."""
     from app.services.native_payload_verification import verify_native_head_body
 
     verify_native_head_body(row)
+
+
+def _filtered_native_metadata(row) -> dict | None:
+    """Parse filter metadata from a frontmatter slice on a worker thread.
+
+    Returns the metadata dict, or None when the slice holds an INCOMPLETE
+    envelope (opens `---` but never closes inside the slice): the filter
+    fields may lie beyond the slice, so the caller must exclude + count the
+    resource rather than filter it on defaults. A body with no leading `---`
+    parses normally (plain Markdown: defaults apply).
+
+    The slice is byte-cut (`substring(bytes ...)`), so it can end mid-codepoint
+    on multibyte text. The trailing incomplete sequence (at most 3 bytes for
+    UTF-8) is trimmed before decoding — only a cut inside the first 8KiB+1
+    bytes triggers this, and dropping ≤3 tail bytes cannot hide a complete
+    envelope close. A body that is genuinely non-UTF-8 still returns None.
+    """
+    from app.services.document_service import _parse_markdown
+
+    raw = bytes(row["body_slice"])
+    text = _decode_slice_prefix(raw)
+    if text is None:
+        return None
+    if not _slice_has_complete_frontmatter(text):
+        return None
+    metadata, _ = _parse_markdown(text)
+    return metadata
+
+
+def _decode_slice_prefix(raw: bytes) -> str | None:
+    """Decode a byte-cut slice, trimming a trailing partial codepoint.
+
+    Tries strict decode first (the common case: cut landed on a character
+    boundary). On failure, drops up to 3 trailing bytes (the max length of an
+    incomplete UTF-8 sequence) and retries — progressively, so a body ending
+    in genuinely invalid bytes still returns None instead of silently
+    decoding past the corruption.
+    """
+    try:
+        return raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        pass
+    for cut in (1, 2, 3):
+        try:
+            return raw[:-cut].decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            continue
+    return None
 
 
 class SearchService:
@@ -457,7 +559,7 @@ class SearchService:
         archive_scope: ArchiveScope | None = None,
         source_uris: list[str] | None,
         doc_types: list[str] | None = None,
-    ) -> list[str]:
+    ) -> tuple[list[str], dict[str, int]]:
         conditions = ["r.surface = 'document'", "r.lifecycle = 'live'"]
         params: list = []
         if vaults:
@@ -481,35 +583,56 @@ class SearchService:
                 f"OR v.owner_id = ${index} OR v.public_access IN ('reader', 'writer'))"
             )
         if source_uris:
-            if len(source_uris) > NATIVE_SEARCH_MAX_SOURCE_URIS:
+            max_uris = settings.search_max_source_uris
+            if len(source_uris) > max_uris:
                 raise ValidationError(
-                    f"native search accepts at most {NATIVE_SEARCH_MAX_SOURCE_URIS} source URIs"
+                    f"native search accepts at most {max_uris} source URIs "
+                    f"(got {len(source_uris)}); split the request or use a "
+                    "vault scope instead"
                 )
-            source_clauses: list[str] = []
+            # Pairwise scope match via unnested (vault, identifier) rows: the SQL
+            # text stays constant-size no matter how many URIs arrive (only the
+            # bind arrays grow). Each pair matches exactly the way the old
+            # per-URI OR expansion did — vault AND (path OR id) PER PAIR — so
+            # no cross-pairing: vault A can never match vault B's identifier.
+            # (A naive `v.name = ANY($1) AND ident = ANY($2)` WOULD cross-match
+            # and pollute the scope across vaults.) Non-doc URIs are skipped,
+            # so every identifier here is a doc path-or-id by construction.
+            uri_pairs: list[tuple[str, str]] = []
             for uri in source_uris:
                 parsed = parse_uri(uri)
                 if parsed is None or parsed.kind != "doc" or not parsed.identifier:
                     continue
-                params.extend([parsed.vault, parsed.identifier])
-                source_clauses.append(
-                    f"(v.name = ${len(params) - 1} AND "
-                    f"(r.current_path = ${len(params)} OR r.resource_id::text = ${len(params)}))"
-                )
-            if not source_clauses:
-                return []
-            conditions.append("(" + " OR ".join(source_clauses) + ")")
+                uri_pairs.append((parsed.vault, parsed.identifier))
+            if not uri_pairs:
+                return [], {}
+            params.extend([
+                [v for v, _ in uri_pairs],
+                [i for _, i in uri_pairs],
+            ])
+            pair_idx = len(params) - 1
+            ident_idx = len(params)
+            conditions.append(
+                f"((v.name, r.current_path) IN ("
+                f"SELECT * FROM unnest(${pair_idx}::text[], ${ident_idx}::text[])) OR "
+                f"(v.name, r.resource_id::text) IN ("
+                f"SELECT * FROM unnest(${pair_idx}::text[], ${ident_idx}::text[])))"
+            )
 
         joins = """
               FROM native_resources r
               JOIN vaults v ON v.id = r.namespace_id
               JOIN native_revisions nr
                 ON nr.resource_id = r.resource_id
-               AND nr.revision_id = r.head_revision_id
+                AND nr.revision_id = r.head_revision_id
               JOIN native_payload_manifests pm
                 ON pm.payload_manifest_id = nr.payload_manifest_id
               JOIN m1_reference_payloads p ON p.payload_id = pm.private_locator
         """
         where_sql = " AND ".join(conditions)
+        # The aggregate guard reads manifest numbers only — no body bytes are
+        # touched, so an oversized scope is rejected before asyncpg
+        # materializes anything (same shape as the grep guard).
         async with conn.transaction(isolation="repeatable_read", readonly=True):
             scope = await conn.fetchrow(
                 f"""
@@ -527,27 +650,64 @@ class SearchService:
                 raise ValidationError(
                     "native search scope exceeds the bounded candidate corpus"
                 )
-            rows = await conn.fetch(
-                f"""
-            SELECT r.resource_id, r.current_path, v.name AS vault_name,
-                   p.payload_id, p.namespace_id, p.content_profile, p.digest,
-                   p.byte_size, p.encoding, p.selected_placement,
-                   p.verification_profile, p.canonical_bytes
-              {joins}
-             WHERE {where_sql}
-             ORDER BY r.resource_id
-                """,
-                *params,
+            # Slice + paginate (workbench #1069, part 2): filter 판정 needs only
+            # the leading frontmatter envelope, so fetch an 8KiB prefix per row
+            # instead of the full body, keyset-paged by resource_id so peak
+            # memory is page-sized rather than scope-sized. `byte_size` still
+            # comes along so the per-row slice can be sanity-checked.
+            candidates: list[str] = []
+            filter_stats: dict[str, int] = {}
+            last_seen: str | None = None
+            while True:
+                page_params = list(params)
+                page_where = where_sql
+                if last_seen is not None:
+                    page_params.append(last_seen)
+                    page_where = f"{where_sql} AND r.resource_id > ${len(page_params)}::uuid"
+                rows = await conn.fetch(
+                    f"""
+                SELECT r.resource_id, r.current_path, v.name AS vault_name,
+                       p.byte_size, p.digest, p.encoding,
+                       p.selected_placement, p.verification_profile,
+                       substring(
+                           p.canonical_bytes FROM 1
+                           FOR {NATIVE_CANDIDATE_FRONTMATTER_SLICE_BYTES + 1}
+                       ) AS body_slice
+                  {joins}
+                 WHERE {page_where}
+                 ORDER BY r.resource_id
+                 LIMIT {NATIVE_CANDIDATE_PAGE_SIZE}
+                    """,
+                    *page_params,
+                )
+                if not rows:
+                    break
+                for row in rows:
+                    last_seen = str(row["resource_id"])
+                    metadata = await asyncio.to_thread(
+                        _filtered_native_metadata, row
+                    )
+                    if metadata is None:
+                        # Envelope opens but never closes inside the slice:
+                        # filter fields may lie beyond it. Exclude + count,
+                        # never filter on defaults.
+                        filter_stats["unparseable_envelope"] = (
+                            filter_stats.get("unparseable_envelope", 0) + 1
+                        )
+                        continue
+                    if doc_type and (metadata.get("type") or "note") != doc_type:
+                        continue
+                    if not metadata_matches(metadata, doc_types, tags, include_archived, archive_scope):
+                        continue
+                    candidates.append(str(row["resource_id"]))
+                if len(rows) < NATIVE_CANDIDATE_PAGE_SIZE:
+                    break
+        if filter_stats:
+            logger.warning(
+                "native candidates: %d unparseable envelope(s) excluded: %s",
+                sum(filter_stats.values()), filter_stats,
             )
-        candidates: list[str] = []
-        for row in rows:
-            metadata = await asyncio.to_thread(_verified_native_metadata, row)
-            if doc_type and (metadata.get("type") or "note") != doc_type:
-                continue
-            if not metadata_matches(metadata, doc_types, tags, include_archived, archive_scope):
-                continue
-            candidates.append(str(row["resource_id"]))
-        return candidates
+        return candidates, filter_stats
 
     async def search(
         self,
@@ -577,9 +737,11 @@ class SearchService:
         include_archived = scope != "unarchived"
         if mode != "hybrid":
             raise ValidationError("unsupported search mode")
-        if source_uris and len(source_uris) > NATIVE_SEARCH_MAX_SOURCE_URIS:
+        if source_uris and len(source_uris) > settings.search_max_source_uris:
             raise ValidationError(
-                f"search accepts at most {NATIVE_SEARCH_MAX_SOURCE_URIS} source URIs"
+                f"search accepts at most {settings.search_max_source_uris} source URIs "
+                f"(got {len(source_uris)}); split the request or use a "
+                "vault scope instead"
             )
 
         document_source = _configured_document_source_type()
@@ -635,13 +797,38 @@ class SearchService:
         # AKB is purely per-vault, so this is correctness-equivalent. Otherwise
         # the existing SOURCE_IDS path runs UNCHANGED (flag off / other driver /
         # any doc-level filter present).
-        # `is_ready()` additionally gates on the auto-backfill: until every
-        # pre-upgrade pgvector point carries its vault_id, fall back to the
-        # source-id path so a user can't miss their own un-backfilled docs.
+        # Readiness is cross-process (akb#526): the backfill runner lives in the
+        # worker tier, so the serving tier must derive it from store state it
+        # can see (NULL-vault_id count, briefly cached) rather than from a
+        # process-local latch the worker flips in its own copy.
         from app.services import vault_backfill
-        use_vault_path = not (doc_types or source_type or scope != "all") and vault_path_eligible(
-            collection=collection, doc_type=doc_type, tags=tags, source_uris=source_uris,
-        ) and vault_backfill.is_ready()
+        # Archive scope is the one doc-level narrowing that is NOT opt-in: it
+        # defaults to `unarchived`, so requiring `scope == "all"` here
+        # disqualified EVERY ordinary search from the vault path and sent it to
+        # the id-enumeration fallback — which refuses with the bounded-corpus
+        # error on any scope above the candidate ceiling (akb#530). The
+        # archived predicate moves to hydration, where the AUTHORITATIVE status
+        # is already parsed for free: verified native frontmatter on the native
+        # arm, `documents.status` on the legacy one.
+        #
+        # `archived` deliberately stays on the id path. It asks FOR the ~0.1%
+        # tail, so a vault-path top-K would be almost entirely non-matching and
+        # hydration would filter the page down to nothing. Narrowing to a rare
+        # set is what id enumeration is for; excluding one is not.
+        vault_path_wanted = (
+            not (doc_types or source_type)
+            and archive_scope_allows_vault_path(scope)
+            and vault_path_eligible(
+                collection=collection, doc_type=doc_type, tags=tags, source_uris=source_uris,
+            )
+        )
+        vault_ready = vault_backfill.is_ready() or await vault_backfill.is_ready_async()
+        if vault_path_wanted and not vault_ready:
+            # One line on the serving side naming the disabled path (akb#526):
+            # without it this surfaces only as an unrelated search refusal
+            # downstream (bounded-corpus 422 on large scopes).
+            logger.info("vault path disabled: readiness not established")
+        use_vault_path = vault_path_wanted and vault_ready
 
         if use_vault_path:
             async with pool.acquire() as conn:
@@ -737,7 +924,7 @@ class SearchService:
                 if source_type in {"file", "table"}:
                     candidate_source_ids = []
                 elif document_source == NATIVE_DOCUMENT_SOURCE:
-                    candidate_source_ids = await self._native_document_candidates(
+                    candidate_source_ids, _filter_stats = await self._native_document_candidates(
                         conn,
                         user_uuid=user_uuid,
                         is_admin=is_admin,
@@ -826,11 +1013,17 @@ class SearchService:
 
         # Hybrid (dense + BM25 sparse) via the configured driver. Returns [] on any vector-store
         # failure — PG is the source of truth, the index is rebuildable.
+        #
+        # source_types (workbench #1069): constrain the driver-side pre-filter
+        # to the active Document arm (+ table/file, which have no second arm)
+        # so stale points from the non-active arm can never consume the top-K.
+        # `_hydrate_hits` keeps its arm-mismatch skip as defense in depth.
         hits, degraded_reason = await self._run_vector_search(
             query_text=query,
             query_embedding=query_embedding,
             candidate_source_ids=candidate_source_ids,
             candidate_vault_ids=candidate_vault_ids,
+            source_types=[document_source, "table", "file", SOURCE_NATIVE_FILE],
             limit=target_unique * 3,
         )
 
@@ -874,12 +1067,36 @@ class SearchService:
         if rerank_enabled and len(unique_hits) > 1:
             unique_hits = await self._apply_rerank(query, unique_hits)
 
-        unique_hits = unique_hits[:limit]
-
         # Post-search metadata join — one fetch per source_type, merged back
         # in the driver-returned order. Keeps document results fully
         # backward-compatible (doc_id == source_id) while adding table/file.
-        results = await self._hydrate_hits(unique_hits)
+        # `dropped` counts hits lost between retrieval and hydration by cause
+        # (workbench #1069 G3): any non-empty drop set marks the response
+        # degraded so `total_matches > 0, returned == 0` can never again read
+        # as a silent zero-match.
+        #
+        # The page is the first `limit` deduped hits; `spare` is the rest of
+        # the prefetch pool. Hydration can drop rows — archive scope (akb#530),
+        # a stale head, a deleted source — so refill from `spare` rather than
+        # return a short page whenever the pool left headroom. At the measured
+        # archived density (0.11%) the loop body essentially never runs, so the
+        # common case still pays exactly one hydration round trip. Each pass
+        # consumes at least one spare hit, so it terminates; when the pool is
+        # exhausted the page really is short and `dropped` names the cause.
+        page, spare = unique_hits[:limit], unique_hits[limit:]
+        results, dropped = await self._hydrate_hits(page, archive_scope=scope)
+        while len(results) < limit and spare:
+            take, spare = spare[: limit - len(results)], spare[limit - len(results):]
+            more, more_dropped = await self._hydrate_hits(take, archive_scope=scope)
+            results.extend(more)
+            for cause, count in more_dropped.items():
+                dropped[cause] = dropped.get(cause, 0) + count
+        results = results[:limit]
+        hydrate_reason = (
+            f"hydration_dropped:{','.join(f'{k}={v}' for k, v in sorted(dropped.items()))}" if dropped else None
+        )
+        if hydrate_reason is not None and degraded_reason is None:
+            degraded_reason = hydrate_reason
         returned = len(results)
         hint = (
             "Prefetch pool was capped; the corpus may contain more matches than reported. "
@@ -1005,17 +1222,31 @@ class SearchService:
 
         return doc_ids, table_ids, file_ids
 
-    async def _hydrate_hits(self, hits: list) -> list[SearchResult]:
+    async def _hydrate_hits(
+        self, hits: list, *, archive_scope: ArchiveScope = "all",
+    ) -> tuple[list[SearchResult], dict[str, int]]:
         from app.services.index_service import SOURCE_TYPES
         by_type: dict[str, list[str]] = {t: [] for t in SOURCE_TYPES}
         document_source = _configured_document_source_type()
         unknown_types: set[str] = set()
+        # Hydration-drop accounting (workbench #1069 G3): every hit that enters
+        # this method but leaves as no result is counted by cause, so a
+        # `total_matches > 0, returned == 0` response can say WHERE the hits
+        # went instead of reading as a silent zero-match. Keys are stable
+        # diagnostic strings (not user-facing copy).
+        dropped: dict[str, int] = {}
         for h in hits:
             if h.source_type in {LEGACY_DOCUMENT_SOURCE, NATIVE_DOCUMENT_SOURCE} and h.source_type != document_source:
                 # A selected backend has exactly one Document authority. Old
-                # vector points from the other arm are never hydrated.
+                # vector points from the other arm are never hydrated. With the
+                # driver-side `source_types` predicate (workbench #1069) these
+                # should no longer arrive; the skip stays as defense in depth
+                # and the counter proves it (stays zero when the predicate
+                # works, goes non-zero if a driver ignores it).
+                dropped["stale_arm"] = dropped.get("stale_arm", 0) + 1
                 continue
             if h.source_type not in by_type:
+                dropped["unknown_source_type"] = dropped.get("unknown_source_type", 0) + 1
                 unknown_types.add(h.source_type)
                 continue
             if h.source_id:
@@ -1212,6 +1443,7 @@ class SearchService:
                             "hydrate: stale native File path skipped for %s",
                             r["resource_id"],
                         )
+                        dropped["stale_native_file_path"] = dropped.get("stale_native_file_path", 0) + 1
                         continue
                     meta[(SOURCE_NATIVE_FILE, str(r["resource_id"]))] = {
                         "vault": r["vault_name"],
@@ -1350,6 +1582,29 @@ class SearchService:
             key = (h.source_type, h.source_id)
             m = meta.get(key)
             if not m:
+                # The hit survived retrieval but its source row is gone or stale
+                # (deleted between retrieval and hydration, or a derived chunk
+                # whose head moved). Count it — this is the workbench #1069
+                # `total_matches=30, returned=0` shape, and it must never again
+                # read as a silent zero-match.
+                dropped["hydration_miss"] = dropped.get("hydration_miss", 0) + 1
+                continue
+            # Archive scope (akb#530). `m["status"]` is the AUTHORITY for this
+            # arm and it is already in hand: the native branch parsed it out of
+            # the verified Head body, the legacy branch selected `d.status`.
+            # Applying it here is what lets the default `unarchived` request
+            # take the vault path instead of enumerating candidate ids.
+            #
+            # Table and File carry no document status; `status_matches(None, …)`
+            # keeps them under `unarchived`/`all` and excludes them under
+            # `archived`, which is exactly what the candidate-side branches do.
+            #
+            # Unconditional, not vault-path-only: on the id path the same
+            # predicate already ran during candidate selection, so this is
+            # idempotent — and it closes the window where a document is
+            # archived between candidate selection and hydration.
+            if not status_matches(m.get("status"), archive_scope):
+                dropped["archive_scope_excluded"] = dropped.get("archive_scope_excluded", 0) + 1
                 continue
             # Build the canonical 0.3.0 URI per resource type. Doc URIs
             # derive the collection from `path` automatically (path
@@ -1361,6 +1616,7 @@ class SearchService:
             elif h.source_type in {"file", SOURCE_NATIVE_FILE}:
                 uri = file_uri(m["vault"], h.source_id, collection=m.get("collection"))
             else:
+                dropped["unuriable_source_type"] = dropped.get("unuriable_source_type", 0) + 1
                 continue
             results.append(
                 SearchResult(
@@ -1393,7 +1649,9 @@ class SearchService:
                     chunk_index=_chunk_index_of(h, chunk_indexes),
                 )
             )
-        return results
+        if dropped:
+            logger.warning("hydrate: dropped %d hit(s): %s", sum(dropped.values()), dropped)
+        return results, dropped
 
     async def _apply_rerank(self, query: str, hits: list) -> list:
         """Rescore `hits` with the configured reranker. On any rerank
@@ -1419,6 +1677,7 @@ class SearchService:
         query_embedding: list[float] | None,
         candidate_source_ids: list[str] | None,
         candidate_vault_ids: list[str] | None = None,
+        source_types: list[str] | None = None,
         limit: int,
     ) -> tuple[list, str | None]:
         """Hybrid search over the vector store.
@@ -1470,6 +1729,7 @@ class SearchService:
                 query_sparse_values=sparse_vals,
                 source_ids=candidate_source_ids,
                 vault_ids=candidate_vault_ids,
+                source_types=source_types,
                 limit=limit,
                 prefetch_per_leg=prefetch_per_leg,
             )

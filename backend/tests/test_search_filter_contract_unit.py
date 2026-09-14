@@ -228,3 +228,80 @@ async def test_native_exact_and_regex_options_affect_results(monkeypatch, patter
     monkeypatch.setattr(service, "_head_bodies", AsyncMock(return_value=[body]))
     response = await service.grep_public(pattern, user_id=uuid.UUID(int=1), regex=regex, case_sensitive=case_sensitive)
     assert response["total_matches"] == count
+
+
+class VaultPathConnection(CandidateConnection):
+    """Answers the VAULT-path queries: the admin lookup and the accessible
+    vault-id resolution. Inherits the candidate queries so a test can assert
+    which of the two paths a request actually took."""
+
+    async def fetch(self, query, *params):
+        self.queries.append((query, params))
+        if "FROM vaults v WHERE" in query or "FROM vaults WHERE name" in query:
+            return [{"id": uuid.UUID(int=7)}]
+        return await super().fetch(query, *params)
+
+
+def _vault_path_service(monkeypatch, conn):
+    """A service whose vault path is available: flag on, capable driver,
+    backfill readiness established."""
+    from app.config import settings
+    from app.services import vault_backfill
+
+    class _Capable:
+        vault_filter_supported = True
+
+    monkeypatch.setattr(settings, "vault_filter_enabled", True, raising=False)
+    monkeypatch.setattr(ss, "get_vector_store", lambda: _Capable())
+    monkeypatch.setattr(vault_backfill, "is_ready", lambda: True)
+    monkeypatch.setattr(ss, "get_pool", AsyncMock(return_value=Pool(conn)))
+    monkeypatch.setattr(ss, "generate_embeddings", AsyncMock(return_value=[[0.1]]))
+    monkeypatch.setattr(ss, "_configured_document_source_type", lambda: ss.LEGACY_DOCUMENT_SOURCE)
+    return ss.SearchService()
+
+
+@pytest.mark.parametrize("kwargs", [
+    {},                                 # the DEFAULT request — no archive_scope at all
+    {"archive_scope": "unarchived"},    # the same scope, stated explicitly
+    {"archive_scope": "all"},           # the only scope that reached it before akb#530
+])
+async def test_default_archive_scope_reaches_the_vault_path(monkeypatch, kwargs):
+    """akb#530: archive scope defaults to `unarchived`, so gating the vault
+    path on `scope == "all"` left the fast path with no reachable caller — every
+    ordinary search fell back to enumerating candidate source ids, which refuses
+    with the bounded-corpus error on a large scope. The default must now filter
+    by VAULT id and enumerate nothing."""
+    conn = VaultPathConnection()
+    service = _vault_path_service(monkeypatch, conn)
+    vector = AsyncMock(return_value=([], None))
+    monkeypatch.setattr(service, "_run_vector_search", vector)
+
+    await service.search("x", vault="mine", user_id=str(uuid.UUID(int=1)), limit=5, **kwargs)
+
+    assert vector.call_args.kwargs["candidate_vault_ids"] == [str(uuid.UUID(int=7))]
+    assert vector.call_args.kwargs["candidate_source_ids"] is None
+    # No candidate enumeration happened — that is the query the bounded-corpus
+    # guard sits in front of.
+    assert not any("FROM documents d" in q for q, _ in conn.queries)
+
+
+async def test_archived_scope_still_enumerates_candidates(monkeypatch):
+    """`archived` selects FOR the rare tail, so it deliberately keeps the
+    id-enumeration path: a vault-path top-K would be almost entirely
+    non-matching and hydration would filter the page down to nothing."""
+    conn = VaultPathConnection()
+    service = _vault_path_service(monkeypatch, conn)
+    vector = AsyncMock(return_value=([], None))
+    monkeypatch.setattr(service, "_run_vector_search", vector)
+
+    await service.search("x", vault="mine", user_id=str(uuid.UUID(int=1)), archive_scope="archived", limit=5)
+
+    assert vector.call_args.kwargs["candidate_source_ids"] == [str(uuid.UUID(int=30))]
+    assert vector.call_args.kwargs["candidate_vault_ids"] is None
+    assert any("d.status = 'archived'" in q for q, _ in conn.queries)
+
+
+def test_archive_scope_allows_vault_path_admits_default_and_all_only():
+    assert ss.archive_scope_allows_vault_path("unarchived") is True
+    assert ss.archive_scope_allows_vault_path("all") is True
+    assert ss.archive_scope_allows_vault_path("archived") is False

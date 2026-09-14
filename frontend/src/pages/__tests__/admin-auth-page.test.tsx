@@ -259,6 +259,8 @@ describe("AdminPage mode boundary", () => {
     await user.clear(await screen.findByLabelText("Alias"));
     await user.type(screen.getByLabelText("Alias"), "partners");
     await user.type(screen.getByLabelText("Button label"), "Partner SSO");
+    await user.click(screen.getByLabelText("Provider type"));
+    await user.click(await screen.findByRole("menuitemradio", { name: /keycloak-oidc/ }));
     await user.type(screen.getByLabelText("Upstream issuer"), "https://id.example.com/realms/partners/");
     await user.type(screen.getByLabelText("Client ID"), "akb-partners");
     await user.type(screen.getByLabelText("Client secret"), "one-time-input");
@@ -266,12 +268,80 @@ describe("AdminPage mode boundary", () => {
 
     await waitFor(() => {
       expect(configureAdminSsoProvider).toHaveBeenCalledWith("partners", {
-        provider_type: "oidc",
+        provider_type: "keycloak-oidc",
         display_name: "Partner SSO",
         issuer: "https://id.example.com/realms/partners",
         discovery_url: "https://id.example.com/realms/partners/.well-known/openid-configuration",
         client_id: "akb-partners",
         client_secret: "one-time-input", // pragma: allowlist secret
+      });
+    });
+  });
+
+  it("refuses to save when no supported provider type is chosen", async () => {
+    vi.mocked(getAdminAuthConfig).mockResolvedValue(ssoConfig);
+    vi.mocked(getAdminSession).mockResolvedValue({
+      schema_version: 1,
+      auth_mode: "sso",
+      user: {
+        id: "11111111-1111-1111-1111-111111111111",
+        username: "admin",
+        email: "admin@example.com",
+        display_name: "Admin",
+        is_admin: true,
+      },
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.type(await screen.findByLabelText("Alias"), "unsupported-kind");
+    await user.type(screen.getByLabelText("Button label"), "Unsupported Kind");
+    await user.type(screen.getByLabelText("Upstream issuer"), "https://id.example.com/realms/unsupported");
+    await user.type(screen.getByLabelText("Client ID"), "akb-unsupported");
+    await user.click(screen.getByRole("button", { name: /Save disabled configuration/i }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /Choose a provider type this installation supports/,
+    );
+    expect(configureAdminSsoProvider).not.toHaveBeenCalled();
+  });
+
+  it("sends an explicit discovery URL when the upstream document lives elsewhere", async () => {
+    vi.mocked(getAdminAuthConfig).mockResolvedValue(ssoConfig);
+    vi.mocked(getAdminSession).mockResolvedValue({
+      schema_version: 1,
+      auth_mode: "sso",
+      user: {
+        id: "11111111-1111-1111-1111-111111111111",
+        username: "admin",
+        email: "admin@example.com",
+        display_name: "Admin",
+        is_admin: true,
+      },
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.type(await screen.findByLabelText("Alias"), "custom-discovery");
+    await user.type(screen.getByLabelText("Button label"), "Custom Discovery");
+    await user.click(screen.getByLabelText("Provider type"));
+    await user.click(await screen.findByRole("menuitemradio", { name: /^oidc/ }));
+    await user.type(screen.getByLabelText("Upstream issuer"), "https://id.example.com/tenant");
+    await user.click(screen.getByText("Advanced: discovery URL"));
+    await user.type(
+      screen.getByLabelText("Discovery URL"),
+      "https://discovery.example.com/tenant/.well-known/openid-configuration",
+    );
+    await user.type(screen.getByLabelText("Client ID"), "akb-custom");
+    await user.click(screen.getByRole("button", { name: /Save disabled configuration/i }));
+
+    await waitFor(() => {
+      expect(configureAdminSsoProvider).toHaveBeenCalledWith("custom-discovery", {
+        provider_type: "oidc",
+        display_name: "Custom Discovery",
+        issuer: "https://id.example.com/tenant",
+        discovery_url: "https://discovery.example.com/tenant/.well-known/openid-configuration",
+        client_id: "akb-custom",
       });
     });
   });
@@ -294,6 +364,8 @@ describe("AdminPage mode boundary", () => {
 
     await user.type(await screen.findByLabelText("Alias"), "entra-dn");
     await user.type(screen.getByLabelText("Button label"), "Microsoft Teams");
+    await user.click(screen.getByLabelText("Provider type"));
+    await user.click(await screen.findByRole("menuitemradio", { name: /^oidc/ }));
     await user.type(
       screen.getByLabelText("Upstream issuer"),
       "https://login.microsoftonline.com/ade9ac17-851e-48d0-ba36-ed99a8d8c07e/v2.0",

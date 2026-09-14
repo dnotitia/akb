@@ -50,7 +50,7 @@ from app.repositories.native_revision_repo import (
     NativeRevisionSelectorAmbiguousError,
 )
 from app.repositories.vault_repo import VaultRepository
-from app.services import skill_policy
+from app.services import document_counters, skill_policy
 from app.services.document_service import (
     EditError,
     DocumentService,
@@ -1313,9 +1313,23 @@ class NativeDocumentService(DocumentService):
 
         items: list[BrowseItem] = []
         if show_docs:
+            # akb#525: `collections.doc_count` / `.last_updated` are
+            # denormalised counters bumped by the LEGACY write path only
+            # (`DocumentRepository.increment_count`). Reading them here put a
+            # frozen count beside the very documents it was contradicting —
+            # both in one browse payload. Recount from the authority that
+            # actually holds the documents; a collection missing from the map
+            # holds none directly, which is a true zero, so it must not fall
+            # back to the stored column.
+            native_totals = await document_counters.collection_document_totals(
+                pool, vault_id, prefix=prefix,
+            )
             for row in await collection_repo.list_by_vault(vault_id):
                 if prefix and not row["path"].startswith(prefix + "/"):
                     continue
+                doc_count, last_updated = row["doc_count"], row["last_updated"]
+                if native_totals is not None:
+                    doc_count, last_updated = native_totals.get(row["path"], (0, None))
                 items.append(
                     BrowseItem(
                         name=row["name"],
@@ -1323,8 +1337,8 @@ class NativeDocumentService(DocumentService):
                         type="collection",
                         uri=coll_uri(vault, row["path"]),
                         summary=row["summary"],
-                        doc_count=row["doc_count"],
-                        last_updated=row["last_updated"],
+                        doc_count=doc_count,
+                        last_updated=last_updated,
                     )
                 )
             items.extend(
