@@ -124,6 +124,7 @@ def test_punycode_expansion_past_dns_limit_is_rejected() -> None:
         ("user@sub.example.com", None),
         ("user@other.com", None),
         ("not-an-email", None),
+        ("user@outside.example@example.com", None),
         ("user@", None),
         ("@example.com", None),
         ("user@münchen.de", "xn--mnchen-3ya.de"),

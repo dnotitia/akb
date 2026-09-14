@@ -611,3 +611,104 @@ async def test_collision_after_provision_insert_adopts_on_authority(pool, monkey
     assert resolved["newly_provisioned"] is False
     row = await _binding(pool, subject)
     assert row is not None and row["user_id"] == winner_id
+
+
+async def test_periodic_approval_and_browser_adoption_share_identity_lock(pool, monkeypatch):
+    """An exact approval cannot slip between the browser lookup and adoption."""
+    from app.services import account_service, auth_service
+
+    monkeypatch.setattr(account_service, "get_pool", auth_service.get_pool)
+    monkeypatch.setattr(settings, "auth_mode", "sso")
+    monkeypatch.setattr(settings, "keycloak_enabled", True)
+    monkeypatch.setattr(settings, "keycloak_server_url", "https://id.example.com")
+    monkeypatch.setattr(settings, "keycloak_realm", "akb")
+    email = f"auth-approval-{uuid.uuid4().hex[:8]}@{_DOMAIN}"
+    subject = f"approval-{uuid.uuid4().hex}"
+    user_id = await _insert_unbound_user(pool, email)
+    original_adopt = auth_service._adopt_authoritative_user
+    adopting = asyncio.Event()
+    release = asyncio.Event()
+    browser_pid = None
+
+    async def pause_adopt(conn, *args):
+        nonlocal browser_pid
+        browser_pid = conn.get_server_pid()
+        adopting.set()
+        await release.wait()
+        return await original_adopt(conn, *args)
+
+    monkeypatch.setattr(auth_service, "_adopt_authoritative_user", pause_adopt)
+    tasks = []
+    try:
+        async with asyncio.timeout(10):
+            tasks.append(asyncio.create_task(auth_service._resolve_or_provision_keycloak_user(
+                _claims(subject, email), provider_alias=_ALIAS
+            )))
+            await adopting.wait()
+            tasks.append(asyncio.create_task(account_service.ensure_human_external_identity(
+                issuer=_ISSUER, subject=subject, email=email, display_name=None,
+                existing_user_id=str(user_id), actor_id="auth-periodic-approval", adopt_unbound_email=False,
+            )))
+            async with pool.acquire() as observer:
+                while not await observer.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity"
+                    " WHERE $1::integer = ANY(pg_blocking_pids(pid)))", browser_pid,
+                ):
+                    # Without a shared lock approval finishes while browser
+                    # adoption is paused, which reproduces the original race.
+                    assert not tasks[1].done(), "approval bypassed browser identity lock"
+                    await asyncio.sleep(0.01)
+            release.set()
+            browser, approved = await asyncio.gather(*tasks)
+    finally:
+        release.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert browser["user_id"] == user_id
+    assert approved["user_id"] == str(user_id)
+    assert (await _binding(pool, subject))["user_id"] == user_id
+    assert len(await _events(pool, str(user_id), "auth.user_adopted")) == 1
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM external_identities WHERE user_id=$1", user_id
+        ) == 1
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM pending_admissions WHERE issuer=$1 AND subject=$2", _ISSUER, subject
+        ) == 0
+
+
+async def test_adoption_preserves_mixed_case_legacy_email_account(pool):
+    from app.services.auth_service import _resolve_or_provision_keycloak_user
+
+    email = f"auth-case-{uuid.uuid4().hex[:8]}@{_DOMAIN}"
+    user_id = await _insert_unbound_user(pool, email.upper())
+    subject = f"case-{uuid.uuid4().hex}"
+    resolved = await _resolve_or_provision_keycloak_user(_claims(subject, email), provider_alias=_ALIAS)
+
+    assert resolved["user_id"] == user_id
+    assert resolved["newly_provisioned"] is False
+    assert (await _binding(pool, subject))["user_id"] == user_id
+    async with pool.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM users WHERE lower(email)=$1", email) == 1
+
+
+async def test_ambiguous_email_case_variants_require_explicit_approval(pool):
+    from app.services.auth_service import _resolve_or_provision_keycloak_user
+
+    email = f"auth-case-conflict-{uuid.uuid4().hex[:8]}@{_DOMAIN}"
+    user_ids = [await _insert_unbound_user(pool, email), await _insert_unbound_user(pool, email.upper())]
+    subject = f"case-conflict-{uuid.uuid4().hex}"
+    with pytest.raises(ExternalIdentityConflictError):
+        await _resolve_or_provision_keycloak_user(_claims(subject, email), provider_alias=_ALIAS)
+
+    assert await _binding(pool, subject) is None
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM users WHERE id=ANY($1::uuid[]) AND auth_provider='local'", user_ids
+        ) == 2
+        assert await conn.fetchval(
+            "SELECT count(*) FROM pending_admissions WHERE issuer=$1 AND subject=$2", _ISSUER, subject
+        ) == 1

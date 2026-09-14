@@ -476,10 +476,10 @@ def _authority_domain_of(email: str, domains: tuple[str, ...]) -> str | None:
     inheritance. The half is IDNA-encoded before comparison so a declared
     punycode domain matches the Unicode address a directory asserts
     (``münchen.de`` ↔ ``xn--mnchen-3ya.de``); a half that cannot encode
-    matches nothing. A malformed address (no ``@``, empty halves) matches
-    nothing — the caller's email-presence check reports it.
+    matches nothing. A malformed address (not exactly one ``@``, empty halves)
+    cannot grant domain authority.
     """
-    if "@" not in email:
+    if email.count("@") != 1:
         return None
     local, _, raw_domain = email.rpartition("@")
     if not local or not raw_domain:
@@ -499,8 +499,8 @@ async def _adopt_authoritative_user(conn, issuer: str, subject: str, claims: dic
     this domain, so the address is directory-owned rather than user-chosen.
     Every guard below is load-bearing:
 
-    - verified email per the existing setting (checked by the caller before
-      the domain lookup; re-asserted here so the helper is safe standalone);
+    - verified email per the existing setting, checked before looking up
+      an adoption target;
     - active human target (a suspended account must not be revived by
       signing in);
     - no existing binding for this issuer on the target (the schema is
@@ -525,18 +525,24 @@ async def _adopt_authoritative_user(conn, issuer: str, subject: str, claims: dic
         raise AuthenticationError("Identity provider has not verified this email address")
     display_name = _optional_external_string(claims, "name") or _optional_external_string(claims, "preferred_username")
     async with conn.transaction():
-        target = await conn.fetchrow(
+        targets = await conn.fetch(
             """
             SELECT id, username, email, display_name, is_admin,
                    tokens_revoked_before, auth_provider,
                    account_status, account_kind, is_recovery_admin
-              FROM users WHERE email = $1
+              FROM users WHERE lower(email) = $1
+             ORDER BY id
                FOR UPDATE
             """,
             email,
         )
-        if target is None:
+        if not targets:
             return None
+        # Legacy local registration preserved email casing; TEXT UNIQUE can
+        # contain multiple case variants. Never choose one implicitly.
+        if len(targets) != 1:
+            raise ExternalIdentityConflictError()
+        target = targets[0]
         if target["account_status"] != "active":
             raise AccountSuspendedError()
         if target["account_kind"] != "human":
@@ -642,13 +648,10 @@ async def _resolve_or_provision_keycloak_user(claims: dict, *, provider_alias: s
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # The browser authority path serializes concurrent logins for one
-        # claimed address on the row they will all read: the adopt helper
-        # runs inside this transaction, and the address advisory lock plus
-        # SELECT ... FOR UPDATE keep two adopts from interleaving (different
-        # subjects, same email) into a double bind. Off the authority path
-        # the address is untrusted input — never a lock key — so the
-        # subject key applies there instead.
+        # Share the exact-identity lock with administrative/periodic approval.
+        # Authority logins additionally serialize on the claimed address so
+        # different subjects cannot adopt the same account concurrently.
+        # All browser paths acquire subject, then address, then user-row locks.
         async with conn.transaction():
             pre_email = (_optional_external_string(claims, "email") or "").strip().lower()
             if provider_alias is not None:
@@ -657,14 +660,15 @@ async def _resolve_or_provision_keycloak_user(claims: dict, *, provider_alias: s
                 )
             else:
                 pre_domain = None
-            if pre_email and pre_domain is not None:
-                lock_key = f"external-identity-authority:{len(pre_email)}:{pre_email}"
-            else:
-                lock_key = f"external-identity:{len(issuer)}:{issuer}{subject}"
             await conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                lock_key,
+                f"external-identity:{len(issuer)}:{issuer}{subject}",
             )
+            if pre_email and pre_domain is not None:
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    f"external-identity-authority:{len(pre_email)}:{pre_email}",
+                )
             bound = await _bound_external_user(conn, issuer, subject)
             if bound is not None:
                 refreshed = await _refresh_bound_external_user(conn, bound, claims)

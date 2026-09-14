@@ -2,7 +2,7 @@
 status: proposal
 stage: planning
 created: 2026-09-12
-updated: 2026-09-12
+updated: 2026-09-14
 issue: dnotitia/akb#529
 ---
 
@@ -20,10 +20,10 @@ email unique constraint and the person is refused with
 `ExternalIdentityConflictError` instead.
 
 The governing records are
-[Workspace Account Governance](../accepted/2026-07-10-workspace-account-governance/README.md)
+[Workspace Account Governance](../../accepted/2026-07-10-workspace-account-governance/README.md)
 (exact `(issuer, subject)` binding; email is mutable profile data, never an
 identity key) and the
-[Generic OIDC Provider](../accepted/2026-08-28-generic-oidc-provider/README.md)
+[Generic OIDC Provider](../../accepted/2026-08-28-generic-oidc-provider/README.md)
 reaffirmation that email never adopts an existing account. The refusal is
 correct as a default and wrong as an absolute: where a single corporate
 directory is the authority for its own domain, the only party that could assert
@@ -72,24 +72,36 @@ Scope is deliberately narrow:
   `keycloak` at adoption, which disables local-password login for that
   account by the existing rule.
 - **Concurrency.** The whole unbound-identity path runs inside one
-  transaction holding an advisory lock: address-keyed on the authority path
-  (concurrent logins for one address serialize on the row they read),
-  subject-keyed elsewhere (the address is untrusted input off the authority
-  path and is never a lock key). The adopt INSERT uses a savepoint so a
+  transaction holding the same subject-keyed advisory lock used by exact
+  administrative approval. Authority logins additionally acquire an
+  address-keyed lock before reading the user row. The order is always subject,
+  address, user row; off the authority path the address is untrusted and never
+  a lock key. Periodic approval and browser login for the same identity
+  serialize and both return the existing account. The adopt INSERT uses a savepoint so a
   lost race rolls back only the INSERT and returns the winner's binding;
   the provision collision handler re-checks authority before refusing.
-  Two simultaneous adopts of one address converge to one binding; the loser
-  is refused with `identity_conflict` rather than double-binding.
+  Two simultaneous callbacks for the same subject both resolve to the same
+  account and emit one adoption event. Different subjects asserting one
+  address converge to one binding; the loser is refused with
+  `identity_conflict` rather than double-binding. Refused account mutations
+  roll back to a savepoint; the pending arrival commits before the refusal
+  is returned.
 - **`disabled` stays disabled.** The authority overrides `invite_only` and the
   collision branch of `open` for declared domains only. It never admits
   anything when enrollment is `disabled`.
-- **Exact match on domains, IDNA-aware both sides.** Lowercase, strip one
-  trailing dot, IDNA-encode, exact equality only — no subdomain inheritance.
+- **Exact match on domains, IDNA-aware both sides.** Configured domains are
+  lowercased, stripped of one trailing dot, and IDNA-encoded. Asserted domains
+  are lowercased and IDNA-encoded; comparison is exact, with no subdomain
+  inheritance. Addresses without exactly one `@` and nonempty halves cannot
+  grant domain authority.
   Declared and asserted halves are both encoded before comparison, so a
   punycode declaration matches the Unicode address a directory asserts.
   The `local` alias can never carry domains (fail-closed at config load).
-- **Four adoption guards** (account ambiguity is impossible — `users.email` is
-  unique): `email_verified` per the existing setting; target is an active human
+- **Adoption guards.** Email lookup ignores case to preserve legacy local
+  accounts, whose stored addresses were not always lowercased. If multiple
+  accounts differ only by email casing, automatic adoption refuses and leaves
+  a pending record for explicit approval. `email_verified` follows the
+  existing setting; the target must be an active human
   account (suspended must not be revived by signing in); target has no binding
   for this issuer yet (`external_identities` is unique on `(issuer, subject)`,
   not on `(issuer, user_id)` — a code check); target is not the recovery admin
@@ -132,8 +144,10 @@ unknown-key rejection inherited from the existing config contract.
   of `identity_conflict`.
 - Guards: unverified email refused; suspended account refused (and stays
   suspended); already-bound-for-issuer refused; recovery admin refused.
-- Concurrency: two simultaneous adopts of the same email converge to one
-  binding (advisory-lock pattern per the existing ensure path).
+- Concurrency: simultaneous callbacks for the same subject both succeed with
+  one binding and adoption event; different subjects for the same address
+  yield one binding and one refusal. Tests observe PostgreSQL lock blocking
+  with bounded timeouts.
 - Events: adopt emits `auth.user_adopted` (distinct from
   `auth.user_provisioned`) with admin legibility; provision path unchanged.
 - PAT regression: pre-existing PATs resolve before and after adoption; no
