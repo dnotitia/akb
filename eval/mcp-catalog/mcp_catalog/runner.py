@@ -67,6 +67,28 @@ class BenchmarkRunFailure(RuntimeError):
         super().__init__(message)
 
 
+def _normalize_task_group_error(error: Exception) -> Exception:
+    """Expose the concrete staged failure hidden by a TaskGroup exception group."""
+    leaves: list[BaseException] = []
+
+    def collect(current: BaseException) -> None:
+        if isinstance(current, BaseExceptionGroup):
+            for child in current.exceptions:
+                collect(child)
+        else:
+            leaves.append(current)
+
+    collect(error)
+    exceptions = [item for item in leaves if isinstance(item, Exception)]
+    for candidate in exceptions:
+        if getattr(candidate, "stage", None) == "model_request":
+            return candidate
+        message = str(candidate).casefold()
+        if "provider request timeout" in message or "global wall deadline" in message:
+            return candidate
+    return exceptions[0] if exceptions else error
+
+
 def _exception_stage(error: BaseException, fallback: str) -> str:
     stage = getattr(error, "stage", None)
     return stage if isinstance(stage, str) and stage else fallback
@@ -462,13 +484,29 @@ class BenchmarkRunner:
         smoke_gate: dict[str, Any] | None = None,
         checkpoint_snapshot: CheckpointDocument | None = None,
     ) -> dict[str, Any]:
+        snapshot_trials: dict[str, list[TrialOutcome]] = defaultdict(list)
+        snapshot_statuses: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        if checkpoint_snapshot is not None:
+            for record in checkpoint_snapshot.records.values():
+                run_key = f"{record.key.model_class}:{record.key.transport}"
+                snapshot_trials[run_key].append(record.outcome)
+                snapshot_statuses[run_key].append(
+                    {
+                        "task_id": record.key.task_id,
+                        "repeat_index": record.key.repeat_index,
+                        "status": record.status,
+                    }
+                )
+            source_trials: Mapping[str, list[TrialOutcome]] = snapshot_trials
+        else:
+            source_trials = self._completed_trials
         quality_reasons: list[str] = []
         trial_error_reasons: list[str] = []
-        for outcomes in self._completed_trials.values():
+        for outcomes in source_trials.values():
             if reason := zero_evidence_failure_reason(outcomes):
                 incomplete_reasons.add(reason)
                 quality_reasons.append(reason)
-        for run_key, outcomes in self._completed_trials.items():
+        for run_key, outcomes in source_trials.items():
             for outcome in outcomes:
                 if outcome.error and not valid_completed_outcome(outcome):
                     reason = (
@@ -478,7 +516,8 @@ class BenchmarkRunner:
                     incomplete_reasons.add(reason)
                     trial_error_reasons.append(reason)
         all_reports: dict[str, Any] = {}
-        for key, outcomes in sorted(self._completed_trials.items()):
+        for key in sorted(set(source_trials) | set(reports)):
+            outcomes = source_trials.get(key, [])
             ordered = self._ordered_outcomes(outcomes)
             existing = reports.get(key, {})
             existing = existing if isinstance(existing, dict) else {}
@@ -486,12 +525,13 @@ class BenchmarkRunner:
                 "catalog_keys": existing.get("catalog_keys", []),
                 "report": existing.get("report"),
                 "trials": [safe_json(outcome.model_dump(mode="json"), self.secrets) for outcome in ordered],
+                "statuses": sorted(snapshot_statuses.get(key, []), key=lambda item: (item["task_id"], item["repeat_index"])),
                 "summary": summarize_outcomes(ordered),
                 "locale_metrics": summarize_outcomes_by_locale(ordered),
                 "partial": bool(existing.get("partial", False)) or failure is not None,
             }
-        completed_trials = sum(len(outcomes) for outcomes in self._completed_trials.values())
-        all_outcomes = [outcome for outcomes in self._completed_trials.values() for outcome in outcomes]
+        completed_trials = sum(len(outcomes) for outcomes in source_trials.values())
+        all_outcomes = [outcome for outcomes in source_trials.values() for outcome in outcomes]
         expected_trials = sum(
             1
             for model_spec in self.manifest.models
@@ -551,11 +591,19 @@ class BenchmarkRunner:
             "new_trials": self._checkpoint_new_trials,
             "reused_trials": self._checkpoint_reused_trials,
             "rerun_trials": self._checkpoint_rerun_trials,
-            "valid_completed_trials": sum(
-                1
-                for outcomes in self._completed_trials.values()
-                for outcome in outcomes
-                if valid_completed_outcome(outcome)
+            "valid_completed_trials": (
+                sum(
+                    1
+                    for record in checkpoint_snapshot.records.values()
+                    if record.status == "completed" and valid_completed_outcome(record.outcome)
+                )
+                if checkpoint_snapshot is not None
+                else sum(
+                    1
+                    for outcomes in self._completed_trials.values()
+                    for outcome in outcomes
+                    if valid_completed_outcome(outcome)
+                )
             ),
         }
         checkpoint_doc = checkpoint_snapshot or (
@@ -647,6 +695,7 @@ class BenchmarkRunner:
             trials = report.get("trials", []) if isinstance(report, dict) else []
             hash_runs[key] = {
                 "trials": trials,
+                "statuses": report.get("statuses", []) if isinstance(report, dict) else [],
                 "summary": report.get("summary", {}) if isinstance(report, dict) else {},
             }
         hash_input = {
@@ -1307,7 +1356,7 @@ class BenchmarkRunner:
                 stage="signal",
             )
         except Exception as exc:
-            primary_error = exc
+            primary_error = _normalize_task_group_error(exc)
             if current_stage == "smoke_gate" and self._smoke_gate.get("status") == "in_progress":
                 self._smoke_gate["status"] = "failed"
                 if self._checkpoint_store is not None:

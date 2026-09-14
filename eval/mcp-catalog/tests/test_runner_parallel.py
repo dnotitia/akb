@@ -277,6 +277,15 @@ async def test_timeout_cancels_and_joins_sibling_lanes_before_checkpoint_finaliz
         try:
             await asyncio.sleep(0.2)
         except asyncio.CancelledError:
+            if run_key in {"primary:stdio", "lightweight:http"}:
+                task = tasks_for_repeat[0]
+                sibling = _outcome(
+                    task,
+                    executor.model_spec,
+                    executor.transport,
+                    repeat_indices[task.id],
+                ).model_copy(update={"locale": task.locale})
+                await checkpoint_sink(sibling, "completed")
             settled.append(run_key)
             raise
         return _ParallelReport(
@@ -302,14 +311,15 @@ async def test_timeout_cancels_and_joins_sibling_lanes_before_checkpoint_finaliz
 
     raw = json.loads(checkpoint.read_text(encoding="utf-8"))
     artifact = raised.value.artifact
+    assert artifact["failure_stage"] == "model_request"
     assert len(settled) == 3
     assert raw["lifecycle"] == "finalized"
     assert raw["timing"]["active_attempt"] is None
     assert len(raw["timing"]["attempts"]) == 1
-    assert len(raw["records"]) == 1
+    assert len(raw["records"]) == 3
     assert raw["reserved_cost_usd"] == 0
     assert artifact["checkpoint"]["lifecycle"] == "finalized"
-    assert artifact["checkpoint"]["record_count"] == artifact["completed_trials"] == len(raw["records"])
+    assert artifact["checkpoint"]["record_count"] == artifact["completed_trials"] == len(raw["records"]) == 3
     assert artifact["checkpoint"]["timing"] == raw["timing"]
     assert artifact["budget_used"]["reserved_cost_usd"] == 0
     assert runner._checkpoint_store is not None

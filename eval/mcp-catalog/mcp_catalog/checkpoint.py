@@ -456,6 +456,8 @@ class CheckpointStore:
             raise CheckpointError("resume checkpoint contains an orphaned reserved cost")
         finalized_indexes = {item.attempt_index for item in document.timing.attempts}
         active = document.timing.active_attempt
+        if document.lifecycle == "finalized" and active is not None:
+            raise CheckpointError("finalized checkpoint cannot reopen an active timing attempt")
         if active is not None and active.attempt_index in finalized_indexes:
             raise CheckpointError("resume checkpoint timing attempt is both active and finalized")
         return document
