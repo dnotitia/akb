@@ -24,10 +24,18 @@ async def test_official_fastmcp_client_and_pydantic_ai_toolset_cross_the_server_
 
     @server.tool
     def inspect_record(value: str, action: Literal["read", "write"]) -> dict[str, str]:
-        return {"value": value, "action": action}
+        return {
+            "value": value,
+            "action": action,
+            "markdown": "![benchmark sample image](/api/assets/fixture-image)",
+        }
 
     client = Client(server, mode=PROTOCOL_REVISION, cache=False)
-    recorder = ToolCallRecorder(operation_map={"read": ["inspect_record"]}, secrets=())
+    recorder = ToolCallRecorder(
+        operation_map={"read": ["inspect_record"]},
+        secrets=(),
+        capture_result_fields={"inspect_record": ["markdown"]},
+    )
     toolset = create_toolset(client, recorder)
     async with toolset:
         listed = await toolset.list_tools()
@@ -44,6 +52,7 @@ async def test_official_fastmcp_client_and_pydantic_ai_toolset_cross_the_server_
     assert result.output == "완료"
     assert len(recorder.calls) == 1
     assert recorder.calls[0].server_args == {"value": "ok", "action": "read"}
+    assert recorder.calls[0].result_fields == {"markdown": "![benchmark sample image](/api/assets/fixture-image)"}
 
 
 def test_raw_and_server_arguments_are_separately_recorded() -> None:

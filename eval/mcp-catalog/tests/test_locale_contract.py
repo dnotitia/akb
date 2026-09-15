@@ -4,6 +4,7 @@ import json
 from copy import deepcopy
 from collections import Counter, defaultdict
 from pathlib import Path
+import shutil
 
 import pytest
 
@@ -97,10 +98,11 @@ def test_stdio_pair_requires_both_file_and_image_operations_in_both_locales() ->
     assert {task.locale for task in stdio_tasks} == {"ko-KR", "en-US"}
     for task in stdio_tasks:
         assert set(task.fixture.transports) == {"stdio"}
-        assert set(task.allowed_first_operations) == {"create", "file_upload", "image_upload"}
+        assert set(task.allowed_first_operations) == {"file_upload"}
         assert {"file_upload", "image_upload"} <= set(task.required_operations)
         assert "sample-note.txt" in task.prompt
-        assert "sample-image.svg" in task.prompt
+        assert "sample-image.png" in task.prompt
+        assert task.fixture.local_files == ["sample-note.txt", "sample-image.png"]
     assert stdio_tasks[0].expected_final_state == stdio_tasks[1].expected_final_state
 
 
@@ -681,26 +683,39 @@ def test_unlisted_operation_cannot_pass_destructive_safety() -> None:
     assert outcome.success is False
 
 
-def test_stdio_pair_requires_exact_target_and_both_material_operations() -> None:
+def test_stdio_pair_requires_the_ordered_file_image_document_trace(tmp_path: Path) -> None:
     _manifest, tasks = _loaded()
     task = next(task for task in tasks if task.id == "stdio-local-b")
-    state = StateObservation(True, 200, {"vaults": []})
+    consumer_root = tmp_path / "node-consumer"
+    consumer_root.mkdir()
+    for filename in ("sample-note.txt", "sample-image.png"):
+        shutil.copyfile(ROOT / "fixtures" / filename, consumer_root / filename)
+    markdown = "![benchmark sample image](/api/assets/fixture-image)"
+    file_args = {"parent": "akb://catalog-bench-vault-authorization", "file_path": str(consumer_root / "sample-note.txt"), "collection": ""}
+    image_args = {"parent": "akb://catalog-bench-vault-authorization", "file_path": str(consumer_root / "sample-image.png"), "alt_text": "benchmark sample image"}
+    document_args = {"parent": "akb://catalog-bench-vault-authorization", "title": "catalog-bench-stdio-document", "content": markdown, "type": "note", "status": "draft"}
     outcome = TrialOutcome(
         task_id=task.id, category=task.category, locale=task.locale, arm="baseline",
         model_class="primary", model_id="model", transport="stdio",
-        final_answer_text="Uploaded the document and inserted the image.",
+        final_answer_text="Uploaded the file, attached the image, and created the document.",
         first_logical_operation="identity",
         tool_calls=[
             {"order": 1, "tool_name": "akb_whoami", "logical_operation": "identity", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True},
-            {"order": 2, "tool_name": "akb_put_file", "logical_operation": "file_upload", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True, "server_args": {"parent": "akb://catalog-bench-vault-authorization"}},
-            {"order": 3, "tool_name": "akb_put", "logical_operation": "create", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True, "server_args": {"vault": "catalog-bench-vault-authorization", "collection": "", "title": "catalog-bench-stdio-document"}},
-            {"order": 4, "tool_name": "akb_put_image", "logical_operation": "image_upload", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True, "server_args": {"parent": "akb://catalog-bench-vault-authorization"}},
+            {"order": 2, "tool_name": "akb_list_vaults", "logical_operation": "list", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True},
+            {"order": 3, "tool_name": "akb_get", "logical_operation": "read", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True},
+            {"order": 4, "tool_name": "akb_put_file", "logical_operation": "file_upload", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True, "server_args": file_args},
+            {"order": 5, "tool_name": "akb_put_image", "logical_operation": "image_upload", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True, "server_args": image_args, "result_fields": {"markdown": markdown}},
+            {"order": 6, "tool_name": "akb_put", "logical_operation": "create", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True, "server_args": document_args},
         ],
     )
-    outcome.finalize(task, state, state)
+    state_before = StateObservation(True, 200, {"items": []})
+    state_after = StateObservation(True, 200, {"items": [{"name": "sample-note.txt", "type": "file"}, {"name": "catalog-bench-stdio-document", "type": "document"}]})
+    outcome.finalize(task, state_before, state_after, consumer_root=str(consumer_root))
 
     assert outcome.first_action_accuracy is False
     assert outcome.first_material_action_accuracy is True
+    assert outcome.preparatory_call_count == 3
+    assert outcome.material_call_count == 3
     assert outcome.required_attempts_completed is True
     assert outcome.required_operations_completed is True
     assert outcome.tool_outcome_match is True

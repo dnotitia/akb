@@ -59,6 +59,10 @@ class _ListedToolset:
                 parameters_json_schema={"properties": {"public_access": {"default": "none"}}},
             ),
             ToolDefinition(
+                name="akb_put_file",
+                parameters_json_schema={"properties": {"collection": {"default": ""}}},
+            ),
+            ToolDefinition(
                 name="akb_put",
                 parameters_json_schema={
                     "properties": {"type": {"default": "note"}, "status": {"default": "draft"}}
@@ -81,6 +85,10 @@ async def test_public_tool_definition_schemas_drive_server_argument_defaults() -
     assert canonicalize_arguments(
         {"name": VAULT}, schemas["akb_create_vault"]
     ) == {"name": VAULT, "public_access": "none"}
+    assert canonicalize_arguments(
+        {"parent": "akb://catalog-bench-multi", "file_path": "sample-note.txt"},
+        schemas["akb_put_file"],
+    ) == {"parent": "akb://catalog-bench-multi", "file_path": "sample-note.txt", "collection": ""}
     assert canonicalize_arguments(
         {"vault": VAULT, "collection": COLLECTION, "title": TITLE, "content": CONTENT},
         schemas["akb_put"],

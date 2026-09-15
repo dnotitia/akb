@@ -124,6 +124,7 @@ class FixtureContract(ContractModel):
     scenario: str = Field(min_length=1, max_length=100)
     credential_profile: str = Field(default="default", pattern=r"^[a-z][a-z0-9_-]{0,31}$")
     transports: list[Transport] = Field(default_factory=default_transports)
+    local_files: list[str] = Field(default_factory=list)
 
     @field_validator("transports")
     @classmethod
@@ -131,6 +132,22 @@ class FixtureContract(ContractModel):
         if not values or len(set(values)) != len(values):
             raise ValueError("fixture transports must contain at least one unique transport")
         return values
+
+    @field_validator("local_files")
+    @classmethod
+    def validate_local_files(cls, values: list[str]) -> list[str]:
+        if len(set(values)) != len(values) or any(
+            re.fullmatch(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", name) is None or name in {".", ".."}
+            for name in values
+        ):
+            raise ValueError("fixture local_files must contain unique file names")
+        return values
+
+    @model_validator(mode="after")
+    def validate_local_file_transport(self) -> FixtureContract:
+        if self.local_files and "stdio" not in self.transports:
+            raise ValueError("fixture local_files require the stdio transport")
+        return self
 
 
 class ResponseRubric(ContractModel):
@@ -181,6 +198,7 @@ class ExpectedMaterialAttempt(ContractModel):
     logical_operation: str
     tool_name: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z][A-Za-z0-9_.-]*$")
     arguments: dict[str, JsonValue] = Field(default_factory=dict)
+    local_file_arguments: dict[str, str] = Field(default_factory=dict)
     outcome: Literal["success", "permission_denied", "rejected"]
     status_code: int | None = Field(default=None, ge=100, le=599)
     error_code: str | None = None
@@ -195,6 +213,32 @@ class ExpectedMaterialAttempt(ContractModel):
                 raise ValueError("permission_denied attempts must declare the stable error code and optional HTTP 403")
         elif (self.status_code is not None and self.status_code < 400) or not self.error_code:
             raise ValueError("rejected attempts must declare the stable error code and optional HTTP error")
+        return self
+
+    @field_validator("local_file_arguments")
+    @classmethod
+    def validate_local_file_arguments(cls, values: dict[str, str]) -> dict[str, str]:
+        if any(
+            re.fullmatch(r"^[A-Za-z][A-Za-z0-9_]*$", argument) is None
+            or re.fullmatch(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", filename) is None
+            or filename in {".", ".."}
+            for argument, filename in values.items()
+        ):
+            raise ValueError("local file arguments must map fields to file names")
+        return values
+
+
+class ExpectedResultBinding(ContractModel):
+    source_attempt: int = Field(ge=1)
+    source_field: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
+    target_attempt: int = Field(ge=1)
+    target_argument: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
+    relation: Literal["equals", "contains"] = "contains"
+
+    @model_validator(mode="after")
+    def validate_binding_order(self) -> ExpectedResultBinding:
+        if self.source_attempt >= self.target_attempt:
+            raise ValueError("material result bindings must reference an earlier attempt")
         return self
 
 
@@ -232,6 +276,7 @@ class TaskManifest(ContractModel):
     expected_material_arguments: dict[str, dict[str, JsonValue]] = Field(default_factory=dict)
     expected_material_outcomes: list[ExpectedMaterialOutcome] = Field(default_factory=list)
     expected_material_attempts: list[ExpectedMaterialAttempt] = Field(default_factory=list)
+    expected_result_bindings: list[ExpectedResultBinding] = Field(default_factory=list, max_length=8)
     expected_final_state: StateContract
     response_rubric: ResponseRubric = Field(default_factory=ResponseRubric)
 
@@ -293,6 +338,31 @@ class TaskManifest(ContractModel):
         expected_attempt_operations = [item.logical_operation for item in self.expected_material_attempts]
         if not set(expected_attempt_operations) <= set(self.allowed_material_operations):
             raise ValueError("expected material attempts must be material operations")
+        if self.fixture.local_files and not self.expected_material_attempts:
+            raise ValueError("fixture local_files require expected material attempts")
+        for attempt in self.expected_material_attempts:
+            if set(attempt.local_file_arguments) & set(attempt.arguments):
+                raise ValueError("local file arguments cannot also have static expected values")
+            if not set(attempt.local_file_arguments.values()) <= set(self.fixture.local_files):
+                raise ValueError("expected local file arguments must reference declared fixture files")
+        attempted_local_files = [
+            filename
+            for attempt in self.expected_material_attempts
+            for filename in attempt.local_file_arguments.values()
+        ]
+        if Counter(attempted_local_files) != Counter(self.fixture.local_files):
+            raise ValueError("every fixture local file must be used by exactly one expected material attempt")
+        binding_targets: set[tuple[int, str]] = set()
+        for binding in self.expected_result_bindings:
+            if binding.target_attempt > len(self.expected_material_attempts) or binding.source_attempt > len(self.expected_material_attempts):
+                raise ValueError("material result binding attempt is outside the expected attempt sequence")
+            target = self.expected_material_attempts[binding.target_attempt - 1]
+            if binding.target_argument in target.arguments or binding.target_argument in target.local_file_arguments:
+                raise ValueError("bound target arguments cannot also have static expected values")
+            target_key = (binding.target_attempt, binding.target_argument)
+            if target_key in binding_targets:
+                raise ValueError("material result binding targets must be unique")
+            binding_targets.add(target_key)
         if not set(self.expected_material_arguments) <= set(self.allowed_material_operations):
             raise ValueError("expected material arguments must be material operations")
         if not set(self.required_attempted_operations) <= set(expected_operations):
@@ -591,6 +661,7 @@ class BenchmarkRunManifest(ContractModel):
             "expected_material_arguments": task.expected_material_arguments,
             "expected_material_outcomes": [item.model_dump(mode="json") for item in task.expected_material_outcomes],
             "expected_material_attempts": [item.model_dump(mode="json") for item in task.expected_material_attempts],
+            "expected_result_bindings": [item.model_dump(mode="json") for item in task.expected_result_bindings],
             "expected_final_state": task.expected_final_state.model_dump(mode="json"),
             "response_requirements": {
                 "require_non_empty": rubric.require_non_empty,

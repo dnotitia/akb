@@ -303,10 +303,17 @@ categories sum to the actual elapsed wall time. Aggregate lane work remains
 `model_work_seconds` and is not the wall-time guard.
 
 The `stdio_local` pair intentionally tests both proxy-local capabilities in
-both locales. Each task uploads `sample-note.txt` as a document and inserts
-`sample-image.svg` into that document, and the scorer requires successful
-`file_upload` and `image_upload` operations. Locale is therefore not confounded
-with the file-versus-image operation.
+both locales. Each stdio child provisions `sample-note.txt` and a decoder-valid
+`sample-image.png` into its declared consumer root. The task uploads the note as
+an independent root file, uploads the image with a fixed alt text, and creates
+`catalog-bench-stdio-document` containing the exact Markdown returned by the
+image upload. The scorer requires that ordered file → image → document trace,
+checks that both local source paths resolve to the declared consumer-root
+fixtures, and binds the structured upload result to the later document content.
+An authenticated browse probe must find both the file and document in the
+pre-existing vault; uncommitted image cleanup remains available if document
+creation fails. Locale is therefore not confounded with the file-versus-image
+operation.
 
 ## Evidence and comparison
 
@@ -318,7 +325,8 @@ Each run artifact includes:
   tool count, canonical catalog hash, UTF-8 byte count, and four-token estimate;
 - model class/id/version/settings, Pydantic Evals report, raw model arguments,
   server-facing arguments, literal first tool, material action, preparatory
-  call count, tool outcome/status, usage, latency, and cost;
+  call count, tool outcome/status, only the bounded structured result fields
+  declared by cross-call bindings, usage, latency, and cost;
 - final response, fixture before/after state, and deterministic state checks;
 - cumulative wall-clock, checkpoint new/reused/rerun counts, fixture reset
   count/time, dependency identity preservation, four-cell smoke results, and

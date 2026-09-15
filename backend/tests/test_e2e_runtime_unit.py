@@ -15,6 +15,7 @@ from pathlib import Path
 import httpx
 import pytest
 import yaml
+from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CI_DIR = REPO_ROOT / "scripts" / "ci"
@@ -57,6 +58,16 @@ COMPOSE_FILE = CI_DIR / "dependency-compose.yaml"
 BOOTSTRAP = CI_DIR / "ubuntu_e2e_bootstrap.sh"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "e2e.yml"
 LOCAL_CANONICAL_RUNNER = REPO_ROOT / "scripts" / "run_canonical_e2e.sh"
+
+
+def test_stdio_sample_image_fixture_is_a_small_decodable_png() -> None:
+    path = REPO_ROOT / "eval" / "mcp-catalog" / "fixtures" / "sample-image.png"
+
+    assert path.stat().st_size <= 64 * 1024
+    with Image.open(path) as image:
+        assert image.format == "PNG"
+        image.load()
+        assert image.size == (400, 400)
 
 
 def make_config(tmp_path: Path, *, mode: str = "serve") -> RuntimeConfig:

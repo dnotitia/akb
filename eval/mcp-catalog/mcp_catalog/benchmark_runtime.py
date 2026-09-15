@@ -17,6 +17,8 @@ import tempfile
 from pathlib import Path
 from typing import Literal, cast
 
+from .contracts import load_task_corpus
+
 
 LOGGER = logging.getLogger("akb.mcp_catalog_runtime")
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -228,12 +230,52 @@ class BenchmarkCellSupervisor:
             }
         return first
 
+    def provision_stdio_fixtures(self, cells: list[BenchmarkCellProcess]) -> None:
+        tasks = load_task_corpus(self.config.checkout / "eval" / "mcp-catalog" / "corpus" / "tasks.json")
+        local_files = sorted(
+            {
+                filename
+                for task in tasks
+                if "stdio" in task.fixture.transports
+                for filename in task.fixture.local_files
+            }
+        )
+        if not local_files:
+            return
+        fixtures_root = (self.config.checkout / "eval" / "mcp-catalog" / "fixtures").resolve(strict=True)
+        runtime_root = self.config.runtime_root.resolve(strict=True)
+        stdio_cells = 0
+        for cell in cells:
+            services = cell.descriptor.get("services")
+            service = services.get("stdio") if isinstance(services, dict) else None
+            if service is None:
+                continue
+            if not isinstance(service, dict) or not isinstance(service.get("consumer_root"), str):
+                raise RuntimeError(f"stdio cell {cell.key} has no declared consumer_root")
+            cell_root = (runtime_root / "cells" / cell.key.replace(":", "-")).resolve(strict=True)
+            consumer_root = Path(service["consumer_root"]).expanduser().resolve(strict=True)
+            if consumer_root == cell_root or not consumer_root.is_relative_to(cell_root):
+                raise RuntimeError(f"stdio cell {cell.key} consumer_root escaped its private runtime")
+            if not consumer_root.is_dir():
+                raise RuntimeError(f"stdio cell {cell.key} consumer_root is not a directory")
+            for filename in local_files:
+                source = (fixtures_root / filename).resolve(strict=True)
+                target = consumer_root / filename
+                if not source.is_relative_to(fixtures_root) or not source.is_file() or target.is_symlink():
+                    raise RuntimeError(f"stdio fixture {filename} is not a safe regular file")
+                shutil.copyfile(source, target)
+                os.chmod(target, 0o600)
+            stdio_cells += 1
+        if stdio_cells == 0:
+            raise RuntimeError("benchmark local fixtures require at least one stdio consumer")
+
     async def run(self) -> int:
         try:
             self.config.runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(self.config.runtime_root, 0o700)
             (self.config.runtime_root / "logs").mkdir(parents=True, exist_ok=True, mode=0o700)
             cells = await self._start_cells()
+            self.provision_stdio_fixtures(cells)
             print(json.dumps(self.descriptor(cells), separators=(",", ":"), ensure_ascii=False), flush=True)
             stop_task = asyncio.create_task(self._stop_event.wait(), name="benchmark-stop")
             wait_tasks = {

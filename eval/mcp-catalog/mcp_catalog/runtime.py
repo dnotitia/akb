@@ -459,11 +459,46 @@ class RuntimeFixture:
             return StateObservation(False, response.status_code, error="state probe returned non-JSON content")
         return StateObservation(True, response.status_code, payload=payload)
 
+    @property
+    def stdio_consumer_root(self) -> Path | None:
+        service = self.descriptor.stdio_service
+        if service is None:
+            return None
+        root_raw = _non_empty_string(service.get("consumer_root"), "stdio consumer root")
+        try:
+            root = Path(root_raw).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
+            raise RuntimeContractError("stdio consumer root is unavailable", stage="fixture_paths") from None
+        if not root.is_dir():
+            raise RuntimeContractError("stdio consumer root is not a directory", stage="fixture_paths")
+        return root
+
+    def local_file_paths(self, filenames: list[str]) -> dict[str, Path]:
+        if not filenames:
+            return {}
+        root = self.stdio_consumer_root
+        if root is None:
+            raise RuntimeContractError("local fixture files require stdio", stage="fixture_paths")
+        paths: dict[str, Path] = {}
+        for filename in filenames:
+            if not filename or Path(filename).name != filename or filename in {".", ".."}:
+                raise RuntimeContractError("local fixture file name is invalid", stage="fixture_paths")
+            candidate = root / filename
+            try:
+                resolved = candidate.resolve(strict=True)
+            except (OSError, RuntimeError):
+                raise RuntimeContractError("local fixture file is missing", stage="fixture_paths") from None
+            if candidate.is_symlink() or not resolved.is_relative_to(root) or not resolved.is_file():
+                raise RuntimeContractError("local fixture file is outside the consumer root", stage="fixture_paths")
+            paths[filename] = resolved
+        return paths
+
     def stdio_command(self, token: str) -> tuple[str, list[str], dict[str, str]]:
         service = self.descriptor.stdio_service
         if service is None:
             raise RuntimeContractError("runtime descriptor does not provide stdio")
-        root = Path(_non_empty_string(service.get("consumer_root"), "stdio consumer root"))
+        root = self.stdio_consumer_root
+        assert root is not None
         executable = _non_empty_string(service.get("executable"), "stdio executable")
         executable_path = Path(executable)
         candidates = [

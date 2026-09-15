@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -135,6 +136,35 @@ def test_launcher_aggregates_exact_cell_descriptors_and_provider_names(tmp_path:
     assert aggregated["credentials"]["openrouter_base_url_env"] == OPENROUTER_BASE_URL_ENV
     assert aggregated["credentials"]["openrouter_provider_key_env"] == OPENROUTER_PROVIDER_KEY_ENV
     assert aggregated["evidence"]["benchmark_cells"]
+
+
+def test_launcher_provisions_declared_fixtures_into_each_stdio_consumer_root(tmp_path: Path) -> None:
+    config = replace(make_config(tmp_path), checkout=ROOT.parents[1])
+    supervisor = BenchmarkCellSupervisor(config)
+    cells: list[BenchmarkCellProcess] = []
+    consumer_roots: list[Path] = []
+    for key in BENCHMARK_CELL_KEYS:
+        descriptor = _base_descriptor()
+        if key.endswith(":stdio"):
+            consumer_root = config.runtime_root / "cells" / key.replace(":", "-") / "node-consumer"
+            consumer_root.mkdir(parents=True)
+            descriptor["services"]["stdio"] = {
+                "transport": "stdio",
+                "executable": "akb-mcp",
+                "consumer_root": str(consumer_root),
+                "environment": {},
+            }
+            consumer_roots.append(consumer_root)
+        cells.append(BenchmarkCellProcess(key, object(), descriptor))  # type: ignore[arg-type]
+
+    supervisor.provision_stdio_fixtures(cells)
+
+    for consumer_root in consumer_roots:
+        assert (consumer_root / "sample-note.txt").read_bytes() == (
+            config.checkout / "eval" / "mcp-catalog" / "fixtures" / "sample-note.txt"
+        ).read_bytes()
+        assert (consumer_root / "sample-image.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert len(consumer_roots) == 2
 
 
 @pytest.mark.asyncio

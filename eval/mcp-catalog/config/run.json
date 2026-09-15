@@ -67,7 +67,8 @@
     "delete": ["akb_delete", "akb_delete_vault", "akb_delete_collection", "akb_delete_file"],
     "grant": ["akb_grant", "akb_revoke"],
     "file_upload": ["akb_put_file"],
-    "image_upload": ["akb_put_image"]
+    "image_upload": ["akb_put_image"],
+    "cleanup": ["akb_discard_image"]
   },
   "credential_profiles": {
     "default": null,

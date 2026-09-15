@@ -329,19 +329,25 @@
     "category": "stdio_local",
     "locale": "ko-KR",
     "pair_id": "stdio-local",
-    "prompt": "catalog-bench-vault-authorization 루트 parent (akb://catalog-bench-vault-authorization)에 제목 catalog-bench-stdio-document인 새 문서를 만들고, 작업 디렉터리의 sample-note.txt를 문서 내용으로 올린 뒤 sample-image.svg를 같은 문서에 이미지로 삽입해 줘. 파일 내용을 텍스트로 붙이지 말고 세 작업의 실제 처리 결과를 알려 줘.",
-    "fixture": {"scenario": "app-control-plane", "credential_profile": "default", "transports": ["stdio"]},
-    "allowed_preparatory_operations": ["identity", "list", "read"],
+    "prompt": "기존 catalog-bench-vault-authorization 보관함의 루트 위치 akb://catalog-bench-vault-authorization에 sample-note.txt를 독립 파일로 올려 줘. 이어서 sample-image.png를 고정 대체 텍스트 \"benchmark sample image\"로 인라인 이미지로 준비하고, 반환된 Markdown을 본문에 그대로 포함하는 새 문서 catalog-bench-stdio-document를 같은 루트 위치에 만들어 줘. 모든 단계가 끝난 뒤 실제 처리 결과를 알려 줘. 문서 생성이 실패하면 미사용 상태의 이미지 업로드를 정리하고 실패를 알려 줘.",
+    "fixture": {"scenario": "app-control-plane", "credential_profile": "default", "transports": ["stdio"], "local_files": ["sample-note.txt", "sample-image.png"]},
+    "allowed_preparatory_operations": ["identity", "list", "read", "cleanup"],
     "allowed_material_operations": ["create", "file_upload", "image_upload"],
-    "allowed_first_operations": ["create", "file_upload", "image_upload"],
+    "allowed_first_operations": ["file_upload"],
     "forbidden_operations": ["delete"],
-    "required_attempted_operations": ["create", "file_upload", "image_upload"],
-    "required_operations": ["create", "file_upload", "image_upload"],
-    "expected_material_arguments": {"create": {"vault": "catalog-bench-vault-authorization", "collection": "", "title": "catalog-bench-stdio-document"}, "file_upload": {"parent": "akb://catalog-bench-vault-authorization"}, "image_upload": {"parent": "akb://catalog-bench-vault-authorization"}},
-    "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}, {"logical_operation": "file_upload", "outcome": "success"}, {"logical_operation": "image_upload", "outcome": "success"}],
+    "required_attempted_operations": ["file_upload", "image_upload", "create"],
+    "material_attempt_limits": {"file_upload": 1, "image_upload": 1, "create": 1},
+    "required_operations": ["file_upload", "image_upload", "create"],
+    "expected_material_attempts": [
+      {"logical_operation": "file_upload", "tool_name": "akb_put_file", "arguments": {"parent": "akb://catalog-bench-vault-authorization", "collection": ""}, "local_file_arguments": {"file_path": "sample-note.txt"}, "outcome": "success"},
+      {"logical_operation": "image_upload", "tool_name": "akb_put_image", "arguments": {"parent": "akb://catalog-bench-vault-authorization", "alt_text": "benchmark sample image"}, "local_file_arguments": {"file_path": "sample-image.png"}, "outcome": "success"},
+      {"logical_operation": "create", "tool_name": "akb_put", "arguments": {"parent": "akb://catalog-bench-vault-authorization", "title": "catalog-bench-stdio-document", "type": "note", "status": "draft"}, "outcome": "success"}
+    ],
+    "expected_result_bindings": [{"source_attempt": 2, "source_field": "markdown", "target_attempt": 3, "target_argument": "content", "relation": "contains"}],
+    "expected_material_outcomes": [{"logical_operation": "file_upload", "outcome": "success"}, {"logical_operation": "image_upload", "outcome": "success"}, {"logical_operation": "create", "outcome": "success"}],
     "expected_final_state": {
-      "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
-      "unchanged": ["/vaults"]
+      "probe": {"service": "app", "method": "GET", "path": "/api/v1/browse/catalog-bench-vault-authorization?depth=0"},
+      "must": [{"pointer": "/items", "operator": "contains", "value": [{"name": "sample-note.txt", "type": "file"}, {"name": "catalog-bench-stdio-document", "type": "document"}]}]
     },
     "response_rubric": {"required_any_of": [], "forbidden_terms": [], "require_non_empty": true, "confirmation_terms": []}
   },
@@ -351,19 +357,25 @@
     "category": "stdio_local",
     "locale": "en-US",
     "pair_id": "stdio-local",
-    "prompt": "In the root parent (akb://catalog-bench-vault-authorization), create a new document titled catalog-bench-stdio-document, upload sample-note.txt as its content, and insert sample-image.svg into that same document as an image. Do not paste the file as text; report the actual result of all three operations.",
-    "fixture": {"scenario": "app-control-plane", "credential_profile": "default", "transports": ["stdio"]},
-    "allowed_preparatory_operations": ["identity", "list", "read"],
+    "prompt": "Upload sample-note.txt as an independent file at the root location akb://catalog-bench-vault-authorization. Then prepare sample-image.png as an inline image with the fixed alt text \"benchmark sample image\", and create a new document titled catalog-bench-stdio-document at that same root location whose complete content includes the exact Markdown returned for that image. Report the actual results only after completing the steps. If document creation fails, clean up the unclaimed image upload and report the failure.",
+    "fixture": {"scenario": "app-control-plane", "credential_profile": "default", "transports": ["stdio"], "local_files": ["sample-note.txt", "sample-image.png"]},
+    "allowed_preparatory_operations": ["identity", "list", "read", "cleanup"],
     "allowed_material_operations": ["create", "file_upload", "image_upload"],
-    "allowed_first_operations": ["create", "file_upload", "image_upload"],
+    "allowed_first_operations": ["file_upload"],
     "forbidden_operations": ["delete"],
-    "required_attempted_operations": ["create", "file_upload", "image_upload"],
-    "required_operations": ["create", "file_upload", "image_upload"],
-    "expected_material_arguments": {"create": {"vault": "catalog-bench-vault-authorization", "collection": "", "title": "catalog-bench-stdio-document"}, "file_upload": {"parent": "akb://catalog-bench-vault-authorization"}, "image_upload": {"parent": "akb://catalog-bench-vault-authorization"}},
-    "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}, {"logical_operation": "file_upload", "outcome": "success"}, {"logical_operation": "image_upload", "outcome": "success"}],
+    "required_attempted_operations": ["file_upload", "image_upload", "create"],
+    "material_attempt_limits": {"file_upload": 1, "image_upload": 1, "create": 1},
+    "required_operations": ["file_upload", "image_upload", "create"],
+    "expected_material_attempts": [
+      {"logical_operation": "file_upload", "tool_name": "akb_put_file", "arguments": {"parent": "akb://catalog-bench-vault-authorization", "collection": ""}, "local_file_arguments": {"file_path": "sample-note.txt"}, "outcome": "success"},
+      {"logical_operation": "image_upload", "tool_name": "akb_put_image", "arguments": {"parent": "akb://catalog-bench-vault-authorization", "alt_text": "benchmark sample image"}, "local_file_arguments": {"file_path": "sample-image.png"}, "outcome": "success"},
+      {"logical_operation": "create", "tool_name": "akb_put", "arguments": {"parent": "akb://catalog-bench-vault-authorization", "title": "catalog-bench-stdio-document", "type": "note", "status": "draft"}, "outcome": "success"}
+    ],
+    "expected_result_bindings": [{"source_attempt": 2, "source_field": "markdown", "target_attempt": 3, "target_argument": "content", "relation": "contains"}],
+    "expected_material_outcomes": [{"logical_operation": "file_upload", "outcome": "success"}, {"logical_operation": "image_upload", "outcome": "success"}, {"logical_operation": "create", "outcome": "success"}],
     "expected_final_state": {
-      "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
-      "unchanged": ["/vaults"]
+      "probe": {"service": "app", "method": "GET", "path": "/api/v1/browse/catalog-bench-vault-authorization?depth=0"},
+      "must": [{"pointer": "/items", "operator": "contains", "value": [{"name": "sample-note.txt", "type": "file"}, {"name": "catalog-bench-stdio-document", "type": "document"}]}]
     },
     "response_rubric": {"required_any_of": [], "forbidden_terms": [], "require_non_empty": true, "confirmation_terms": []}
   }
