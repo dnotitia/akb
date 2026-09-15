@@ -307,7 +307,14 @@ def multipart_part(key: str, upload_id: str, part_number: int, body: bytes) -> s
     return str(r["ETag"])
 
 
-def multipart_complete(key: str, upload_id: str, parts: list[dict[str, Any]]) -> dict[str, Any]:
+def multipart_complete(key: str, upload_id: str, parts: list[dict[str, Any]]) -> None:
+    """Publish the parts as one object.
+
+    Returns nothing on purpose. Reading the object back afterwards was a
+    round trip whose result no caller used, and a failure in it would have
+    reported the completed upload as missing — answering an error, and
+    aborting an upload that no longer exists, for bytes that are stored.
+    """
     try:
         client().complete_multipart_upload(
             Bucket=settings.s3_bucket, Key=key, UploadId=upload_id,
@@ -315,7 +322,6 @@ def multipart_complete(key: str, upload_id: str, parts: list[dict[str, Any]]) ->
         )
     except ClientError as e:
         raise StorageError(wrap_error(e, f"finish write {key}").message) from e
-    return head(key)
 
 
 def multipart_abort(key: str, upload_id: str) -> None:

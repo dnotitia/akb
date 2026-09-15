@@ -109,8 +109,13 @@ async def test_live_login_search_filters_and_vault_isolation():
                 parsed = urlparse(upload["upload_url"])
                 assert parsed.path.startswith("/api/v1/files/upload/"), upload["upload_url"]
                 assert not parsed.query, "a capability carries no signature"
-                if parsed.hostname is not None:
-                    assert parsed.hostname in {"localhost", "127.0.0.1"}
+                # Absolute, not merely well-shaped. The published SDK does a
+                # bare `fetch(upload_url)` under Node, where a relative URL
+                # raises before any request is made — so an origin-less URL
+                # is a broken contract, not a cosmetic one. This assertion
+                # was relaxed when the capability landed; it is the only
+                # thing that fails when `public_base_url` is unset.
+                assert parsed.hostname in {"localhost", "127.0.0.1"}, upload["upload_url"]
                 uploaded = await client.put(upload["upload_url"], content=b"DeploymentNeedle", headers={"Content-Type": "text/plain"})
                 assert uploaded.is_success
                 file_id = upload["uri"].rsplit("/", 1)[1]

@@ -31,6 +31,7 @@ class _FakeStore:
         self.objects: dict[str, bytes] = {}
         self.types: dict[str, str] = {}
         self.parts: dict[str, list[bytes]] = {}
+        self.etags: dict[str, list[str]] = {}
         self.aborted: list[tuple[str, str]] = []
         self.completed: list[str] = []
         self.put_calls = 0
@@ -47,6 +48,7 @@ class _FakeStore:
         self.created += 1
         upload_id = f"u{self.created}"
         self.parts[upload_id] = []
+        self.etags[upload_id] = []
         self.types[key] = content_type
         return upload_id
 
@@ -55,15 +57,24 @@ class _FakeStore:
             raise RuntimeError("object store refused the part")
         assert part_number == len(self.parts[upload_id]) + 1, "parts must be sequential"
         self.parts[upload_id].append(bytes(body))
-        return f'"etag-{part_number}"'
+        etag = f'"etag-{hashlib.md5(body).hexdigest()}"'  # noqa: S324 — a stand-in, not a digest we trust
+        self.etags[upload_id].append(etag)
+        return etag
 
     def multipart_complete(self, key, upload_id, parts):
+        # A real store checks both of these and answers InvalidPart. The
+        # fake used to reassemble by upload order and ignore the ETags
+        # entirely, which let a part handler that returned no ETag at all
+        # pass every test in this file.
         assert [p["PartNumber"] for p in parts] == list(
             range(1, len(self.parts[upload_id]) + 1)
         )
+        assert [p["ETag"] for p in parts] == self.etags[upload_id], (
+            f"ETags do not match the parts that were uploaded: "
+            f"{[p['ETag'] for p in parts]} vs {self.etags[upload_id]}"
+        )
         self.objects[key] = b"".join(self.parts[upload_id])
         self.completed.append(upload_id)
-        return {"ContentLength": len(self.objects[key])}
 
     def multipart_abort(self, key, upload_id):
         self.aborted.append((key, upload_id))
@@ -355,9 +366,18 @@ class _Conn:
         self.row = row
         self.queries: list[tuple] = []
 
+    def transaction(self):
+        return _Context(self)
+
     async def fetchrow(self, sql, *params):
         self.queries.append((sql, params))
         return self.row
+
+    async def fetchval(self, *_args):
+        return None
+
+    async def execute(self, *_args):
+        return None
 
 
 class _Pool:
@@ -588,8 +608,11 @@ async def test_the_stored_type_is_the_grants_not_the_clients_header(monkeypatch)
     async def _grant(_token):
         return {"object_key": _KEY, "mime_type": "image/png"}
 
-    async def _store(key, chunks, *, content_type, max_bytes):
-        seen.update(key=key, content_type=content_type, max_bytes=max_bytes)
+    async def _store(key, chunks, *, content_type, max_bytes, declared_bytes=None):
+        seen.update(
+            key=key, content_type=content_type,
+            max_bytes=max_bytes, declared_bytes=declared_bytes,
+        )
         return sum([len(c) async for c in chunks])
 
     monkeypatch.setattr(route_mod.file_service, "resolve_write_capability", _grant)
@@ -602,4 +625,131 @@ async def test_the_stored_type_is_the_grants_not_the_clients_header(monkeypatch)
     )
 
     assert response.status_code == 200
-    assert seen == {"key": _KEY, "content_type": "image/png", "max_bytes": 4096}
+    # The declared length is carried through, not consumed by the route: the
+    # streaming counter is what can disagree with it.
+    assert seen == {
+        "key": _KEY, "content_type": "image/png",
+        "max_bytes": 4096, "declared_bytes": 3,
+    }
+
+
+# --- what a review's surviving mutations showed these tests were not doing ---
+
+async def test_a_short_body_is_refused_and_stores_nothing(monkeypatch):
+    """A presigned PUT could not be short.
+
+    The object store held the sender to its own Content-Length and stored
+    nothing when the body ran out early. Moving the bytes into this service
+    moved that guarantee too, and it has to be restated: a truncated upload
+    that is stored gets its truncation certified as the File's hash at
+    `confirm`, which is data loss that looks like success."""
+    store = _FakeStore()
+    _install(monkeypatch, store, part_size=1024)
+
+    with pytest.raises(AKBError) as exc:
+        await fs.store_object_stream(
+            _KEY, _stream(b"only ten!!"), content_type="application/octet-stream",
+            max_bytes=1 << 30, declared_bytes=1000,
+        )
+
+    assert exc.value.status_code == 400
+    assert _KEY not in store.objects
+
+
+async def test_a_short_multipart_body_is_refused_before_completing(monkeypatch):
+    """Same contract once the body is large enough to have opened one."""
+    store = _FakeStore()
+    _install(monkeypatch, store, part_size=1024)
+
+    with pytest.raises(AKBError):
+        await fs.store_object_stream(
+            _KEY, _stream(os.urandom(4096), chunk=1024),
+            content_type="application/octet-stream",
+            max_bytes=1 << 30, declared_bytes=1 << 20,
+        )
+
+    assert _KEY not in store.objects
+    assert store.completed == []
+    assert await _settled(lambda: store.aborted == [(_KEY, "u1")]), store.aborted
+
+
+async def test_a_body_matching_its_declared_length_is_stored(monkeypatch):
+    """The check must not reject the ordinary case, including no header."""
+    body = os.urandom(3000)
+    for declared in (len(body), None):
+        store = _FakeStore()
+        _install(monkeypatch, store, part_size=1024)
+        await fs.store_object_stream(
+            _KEY, _stream(body, chunk=512),
+            content_type="application/octet-stream",
+            max_bytes=1 << 30, declared_bytes=declared,
+        )
+        assert store.objects[_KEY] == body, declared
+
+
+async def test_the_part_etags_the_store_returned_are_the_ones_completed(monkeypatch):
+    """Completing with anything else is `InvalidPart` on a real store.
+
+    The fake used to reassemble by upload order and ignore ETags entirely,
+    so a part call that returned no ETag at all passed every test here."""
+    store = _FakeStore()
+    _install(monkeypatch, store, part_size=1024)
+
+    await fs.store_object_stream(
+        _KEY, _stream(os.urandom(4096), chunk=1024),
+        content_type="application/octet-stream", max_bytes=1 << 30,
+    )
+
+    assert len(store.etags["u1"]) == 4
+    assert all(e.startswith('"etag-') for e in store.etags["u1"])
+    assert len(set(store.etags["u1"])) == 4, "distinct parts, distinct ETags"
+
+
+async def test_the_grant_names_the_key_the_reservation_actually_took(monkeypatch):
+    """The capability must name the key that was reserved, not the one that
+    was preferred.
+
+    They differ exactly when the content-addressed key is unavailable — it is
+    live in another vault, or a delayed delete still owns it — and the
+    reservation falls back to a fresh random key. A capability issued for the
+    preferred key in that case would authorize a PUT onto somebody else's
+    object. Nothing else in this suite distinguishes the two."""
+    service, pool = await _service(monkeypatch)
+    issued: list[dict] = []
+    attempts = {"n": 0}
+
+    async def allowed(*_args, **_kwargs):
+        return True
+
+    async def first_key_taken(_conn, *, vault_id, s3_key):
+        # The preferred (content-addressed) key is refused once; the fresh
+        # random key that follows is accepted.
+        attempts["n"] += 1
+        return attempts["n"] > 1
+
+    async def inserted(_conn, **kwargs):
+        return kwargs["file_id"]
+
+    async def _issue(_conn, **kwargs):
+        issued.append(kwargs)
+        return "T" * 43
+
+    monkeypatch.setattr(fs, "lock_vault_for_child_write", allowed)
+    monkeypatch.setattr(
+        fs.vault_files_repo, "s3_key_available_for_registration", first_key_taken,
+    )
+    monkeypatch.setattr(fs.vault_files_repo, "insert_or_adopt", inserted)
+    monkeypatch.setattr(fs, "_issue_write_capability", _issue)
+    monkeypatch.setattr(fs.s3_adapter, "ensure_bucket", lambda _bucket: None)
+
+    content_hash = "a" * 64
+    await service.initiate_upload(
+        "team", uuid.uuid4(), "", "report.bin",
+        actor_id="tester", content_hash=content_hash,
+    )
+
+    preferred = fs._s3_key("team", "", "report.bin", content_hash=content_hash)
+    granted = issued[0]["object_key"]
+    assert attempts["n"] == 2, "the preferred key must have been refused once"
+    assert granted != preferred, "the grant must not name the key that was refused"
+    assert granted.endswith("_report.bin")
