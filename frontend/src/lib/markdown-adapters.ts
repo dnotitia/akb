@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import type { MarkdownSearchContext } from "@akb/markdown-editor";
 import {
   copyFileToAttachment,
   getAttachmentMetadata,
@@ -288,13 +289,17 @@ export function createAkbMarkdownAdapters(defaults: AkbMarkdownUploadContext) {
       },
     },
     search: {
-      async search(query: string) {
-        const response = await searchDocs(query, defaults.vault, 20);
+      async search(query: string, context?: MarkdownSearchContext) {
+        const vault = context?.vault ?? defaults.vault;
+        const response = await searchDocs(query, vault, 20, {}, { signal: context?.signal });
+        if (response.degraded) throw new Error("Search results are temporarily unavailable.");
         return response.results
           .map((result) => {
             const target = typeof result?.uri === "string" ? canonicalAkbMarkdownTarget(result.uri) : null;
             if (!target) return null;
             const kind = classifyAkbMarkdownTarget(target);
+            const parsed = parseUri(target);
+            if ((kind !== "document" && kind !== "file") || parsed?.vault !== vault) return null;
             return {
               id: target,
               title: typeof result.title === "string" ? result.title : target,

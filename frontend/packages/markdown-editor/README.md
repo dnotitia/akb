@@ -2,9 +2,9 @@
 
 `@akb/markdown-editor` is the product-neutral Tiptap Markdown core shared by AKB and Reef.
 It owns the document schema, Markdown parsing/serialization, editor/viewer surfaces, commands,
-state hooks, the default formatting/link controls, and the conformance contract. Products still
-own storage, permissions, and product-specific URL policy; search remains an adapter supplied by
-the consumer.
+state hooks, the default formatting/link controls, shared document/file search UI, and the
+conformance contract. Products still own storage, permissions, search adapters and context, copy,
+and product-specific URL policy.
 
 The package is built against the exact Tiptap `3.31.3` package set and React 19.
 
@@ -48,7 +48,13 @@ participate in the same toolbar navigation.
   editor={editor}
   link={{
     normalizeUrl: productNormalizeUrl,
-    searchSlot: ({ setUrl, setText }) => productSearchSlot({ setUrl, setText }),
+    searchAdapter: productSearchAdapter,
+    searchContext: { vault: activeVault },
+    searchLabels: {
+      inputLabel: 'Search Vault resources',
+      empty: 'No matching documents or files found.',
+    },
+    searchClassName: 'space-y-2',
   }}
 >
   <MarkdownToolbarGroup label="Insert">
@@ -62,11 +68,17 @@ participate in the same toolbar navigation.
 link state. `MarkdownLinkPopup` is also public for consumers that need a
 different toolbar composition. `normalizeUrl` is the product seam for
 canonical targets and link policy; returning `null` leaves the popup open,
-shows the configured error, and keeps focus in the URL field. Search results
-come from the product-owned `searchSlot`, so AKB can preserve its existing
-search UI and adapter behavior without expanding the common package's search
-surface. They must return canonical `MarkdownSearchResult.target` values, never
-signed or runtime URLs.
+shows the configured error, and keeps focus in the URL field. Provide a
+`MarkdownSearchAdapter` to enable shared document/file search. The popup calls
+`search(query, context)` as the query changes, passing the product context and
+an `AbortSignal`; cancellation, popup close, query changes, and context changes
+discard late results. Loading, empty, and error states are distinct. Candidates
+can be selected with the pointer or ArrowUp/ArrowDown + Enter; selection fills
+the existing link text and URL fields, and the popup's existing Apply action
+performs the Markdown edit. Product-specific text is provided through
+`searchLabels`, and `searchClassName` can tune the search region within the
+product's design system. Search results must return canonical
+`MarkdownSearchResult.target` values, never signed or runtime URLs.
 
 Use `profile="structured"` for CommonMark + GFM structure editing. The default `preserve` profile
 adds explicit raw HTML/MDX nodes while keeping math and Mermaid fences as semantic nodes. Both
@@ -120,10 +132,15 @@ with a physical OS IME.
 
 ## Versioning
 
+The `0.5.0` public contract adds common document/file search UI to
+`MarkdownToolbar.link`, including `searchAdapter`, `searchContext`,
+`searchLabels`, and `searchClassName`. It removes the former `searchSlot` API;
+products provide a `MarkdownSearchAdapter` and context instead of implementing
+search controls inside the popup. Consumers continue to provide their URL
+policy through `MarkdownToolbar.link.normalizeUrl`.
+
 The `0.4.0` public contract adds the shared link command/state contract and
-`MarkdownLinkPopup`. Consumers should provide their existing URL policy through
-`MarkdownToolbar.link.normalizeUrl` and keep resource search in their existing
-product-owned `searchSlot`.
+`MarkdownLinkPopup`.
 
 The `0.2.0` public contract adds canonical resource targets. Consumers should pin one exact package version, store the
 Markdown returned by `onChange` or `editor.getMarkdown()` as the canonical representation, and

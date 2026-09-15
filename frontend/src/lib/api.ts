@@ -1989,11 +1989,17 @@ function appendSearchOptions(p: URLSearchParams, options: SearchOptions, literal
   } else if (options.source_type) p.set("source_type", options.source_type);
 }
 
-export const searchDocs = (query: string, vaults?: string[] | string, limit = 10, options: SearchOptions = {}) => {
+export const searchDocs = (
+  query: string,
+  vaults?: string[] | string,
+  limit = 10,
+  options: SearchOptions = {},
+  requestOptions: Pick<RequestInit, "signal"> = {},
+) => {
   const p = new URLSearchParams({ q: query, limit: String(limit) });
   for (const v of vaultScopeParams(vaults)) p.append("vault", v);
   appendSearchOptions(p, options, false);
-  return api<SearchResponse>(`/search?${p}`);
+  return api<SearchResponse>(`/search?${p}`, requestOptions);
 };
 
 export interface GrepMatch {

@@ -27,6 +27,9 @@ import { createMarkdownExtensions } from '../extensions.js'
 import { extractMarkdownTargets, markdownCommands } from '../core.js'
 import { normalizeMarkdownLinkUrl } from '../link.js'
 import { resolveMarkdownTargets } from '../adapters.js'
+import { MarkdownLinkSearch } from './markdown-link-search.js'
+import type { MarkdownLinkSearchLabels } from './markdown-link-search.js'
+export type { MarkdownLinkSearchLabels } from './markdown-link-search.js'
 import type {
   MarkdownAdapters,
   MarkdownCommands,
@@ -35,6 +38,8 @@ import type {
   MarkdownLinkLabels,
   MarkdownLinkUrlNormalizer,
   MarkdownProfile,
+  MarkdownSearchAdapter,
+  MarkdownSearchContext,
   MarkdownSlashContext,
   MarkdownState,
   MarkdownTargetResolution,
@@ -421,15 +426,13 @@ export interface MarkdownLinkPopupProps {
   onOpenChange: (open: boolean) => void
   /** Product-specific canonicalization and URL policy. */
   normalizeUrl?: MarkdownLinkUrlNormalizer
-  /** Product-owned search UI; this ticket deliberately does not own search. */
-  searchSlot?: (context: MarkdownLinkSearchSlotProps) => ReactNode
+  /** Product-owned search and authorization context; the popup supplies signal. */
+  searchAdapter?: MarkdownSearchAdapter
+  searchContext?: Omit<MarkdownSearchContext, 'signal'>
+  searchLabels?: Partial<MarkdownLinkSearchLabels>
+  searchClassName?: string
   labels?: Partial<MarkdownLinkLabels>
   className?: string
-}
-
-export interface MarkdownLinkSearchSlotProps {
-  setUrl: (value: string) => void
-  setText: (value: string) => void
 }
 
 /**
@@ -443,13 +446,17 @@ export function MarkdownLinkPopup({
   open,
   onOpenChange,
   normalizeUrl = normalizeMarkdownLinkUrl,
-  searchSlot,
+  searchAdapter,
+  searchContext,
+  searchLabels,
+  searchClassName,
   labels,
   className,
 }: MarkdownLinkPopupProps) {
   const copy = { ...DEFAULT_MARKDOWN_LINK_LABELS, ...labels }
   const commands = useMarkdownCommands(editor)
   const urlInputRef = useRef<HTMLInputElement>(null)
+  const searchInputRef = useRef<HTMLInputElement>(null)
   const snapshotRef = useRef<MarkdownLinkSelectionSnapshot | null>(null)
   const previousOpenRef = useRef(false)
   const closeReasonRef = useRef<'cancel' | 'commit'>('cancel')
@@ -459,6 +466,10 @@ export function MarkdownLinkPopup({
   const [linkError, setLinkError] = useState('')
   const linkUrlId = useId()
   const linkTextId = useId()
+
+  const focusPopupInput = useCallback(() => {
+    (searchAdapter ? searchInputRef.current : urlInputRef.current)?.focus()
+  }, [searchAdapter])
 
   const restoreSelection = useCallback(() => {
     if (!editor || editor.isDestroyed || !snapshotRef.current) return
@@ -483,7 +494,7 @@ export function MarkdownLinkPopup({
       setLinkUrl(snapshot.href)
       setLinkText(snapshot.text)
       setLinkError('')
-      requestAnimationFrame(() => urlInputRef.current?.focus())
+      requestAnimationFrame(focusPopupInput)
     }
 
     if (!open && previousOpenRef.current && closeReasonRef.current === 'cancel') {
@@ -491,7 +502,7 @@ export function MarkdownLinkPopup({
     }
 
     previousOpenRef.current = open
-  }, [editor, open, restoreSelection])
+  }, [editor, focusPopupInput, open, restoreSelection])
 
   const closePopup = (reason: 'cancel' | 'commit') => {
     closeReasonRef.current = reason
@@ -545,7 +556,7 @@ export function MarkdownLinkPopup({
           data-markdown-link-popup
           onOpenAutoFocus={event => {
             event.preventDefault()
-            requestAnimationFrame(() => urlInputRef.current?.focus())
+            requestAnimationFrame(focusPopupInput)
           }}
           onCloseAutoFocus={event => {
             event.preventDefault()
@@ -573,7 +584,22 @@ export function MarkdownLinkPopup({
             <X className="h-4 w-4" aria-hidden />
           </DialogPrimitive.Close>
           <div className="space-y-4">
-            {searchSlot?.({ setUrl: setLinkUrl, setText: setLinkText })}
+            {searchAdapter && open && (
+              <MarkdownLinkSearch
+                adapter={searchAdapter}
+                context={searchContext}
+                labels={searchLabels}
+                className={searchClassName}
+                inputRef={searchInputRef}
+                onSelect={(result) => {
+                  setLinkUrl(result.target)
+                  const selection = snapshotRef.current
+                  if (selection && !selection.active && selection.from === selection.to) {
+                    setLinkText(result.title)
+                  }
+                }}
+              />
+            )}
             <div className="space-y-2">
               <label htmlFor={linkUrlId} className="text-sm font-medium leading-none">
                 {copy.url}
@@ -728,7 +754,10 @@ export interface MarkdownToolbarProps {
 export interface MarkdownToolbarLinkOptions {
   disabled?: boolean
   normalizeUrl?: MarkdownLinkUrlNormalizer
-  searchSlot?: (context: MarkdownLinkSearchSlotProps) => ReactNode
+  searchAdapter?: MarkdownSearchAdapter
+  searchContext?: Omit<MarkdownSearchContext, 'signal'>
+  searchLabels?: Partial<MarkdownLinkSearchLabels>
+  searchClassName?: string
   labels?: Partial<MarkdownLinkLabels>
   popupClassName?: string
 }
@@ -972,7 +1001,10 @@ export function MarkdownToolbar({
         open={linkOpen}
         onOpenChange={setLinkOpen}
         normalizeUrl={link?.normalizeUrl}
-        searchSlot={link?.searchSlot}
+        searchAdapter={link?.searchAdapter}
+        searchContext={link?.searchContext}
+        searchLabels={link?.searchLabels}
+        searchClassName={link?.searchClassName}
         labels={link?.labels}
         className={link?.popupClassName}
       />

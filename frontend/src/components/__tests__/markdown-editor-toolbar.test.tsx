@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MarkdownEditor } from "@/components/markdown-editor";
 import { normalizeEditorLinkUrl } from "@/lib/editor-link";
+import * as api from "@/lib/api";
 
 describe("MarkdownEditor formatting toolbar", () => {
   it("uses one tab stop and arrow keys to move through toolbar controls", async () => {
@@ -77,6 +78,37 @@ describe("MarkdownEditor formatting toolbar", () => {
       /http\(s\), email, phone/i,
     );
     await waitFor(() => expect(screen.getByLabelText("URL")).toHaveFocus());
+  });
+
+  it("connects the shared search UI to the current vault through the AKB adapter", async () => {
+    const user = userEvent.setup();
+    const response: Awaited<ReturnType<typeof api.searchDocs>> = {
+      query: "diagram",
+      total: 0,
+      returned: 0,
+      total_matches: 0,
+      results: [],
+    };
+    const searchDocs = vi.spyOn(api, "searchDocs").mockResolvedValue(response);
+
+    try {
+      render(<MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />);
+      await user.click(screen.getByRole("button", { name: "Insert link" }));
+      const search = screen.getByRole("combobox", { name: "Search Vault resources" });
+      fireEvent.change(search, { target: { value: "diagram" } });
+
+      expect(await screen.findByText("No matching documents or files found.")).toBeVisible();
+      expect(searchDocs).toHaveBeenCalledWith(
+        "diagram",
+        "team",
+        20,
+        {},
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+      await user.click(screen.getByRole("button", { name: "Cancel" }));
+    } finally {
+      searchDocs.mockRestore();
+    }
   });
 
   it("normalizes common safe links and rejects active-content URLs", () => {

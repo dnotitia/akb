@@ -9,7 +9,7 @@
 //   - Forces handlers to match the wire shape — a typo in a field
 //     name surfaces here, not in production.
 
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { setupServer } from "msw/node";
 import { http, HttpResponse } from "msw";
 
@@ -70,6 +70,26 @@ describe("search response contract — returned vs total_matches (PR #39)", () =
     // this test pins that the call resolves rather than throwing.
     expect(resp.returned).toBeUndefined();
     expect(resp.total_matches).toBeUndefined();
+  });
+
+  it("forwards the adapter AbortSignal to the authenticated fetch", async () => {
+    const controller = new AbortController();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ query: "guide", total: 0, results: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    try {
+      await searchDocs("guide", "team", 20, {}, { signal: controller.signal });
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining("/api/v1/search?q=guide&limit=20&vault=team"),
+        expect.objectContaining({ signal: controller.signal, credentials: "same-origin" }),
+      );
+    } finally {
+      fetchMock.mockRestore();
+    }
   });
 });
 
