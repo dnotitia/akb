@@ -7,7 +7,7 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
-### Safe local account lifecycle
+### Safe account lifecycle
 
 Add identity-bound account lifecycle preview, paginated deletion blockers,
 local session revocation, and password-confirmed self-deletion endpoints.
@@ -25,8 +25,14 @@ rejects alternate UUID spellings of the acting account. Self-service mutations
 are disabled by default: enable `account_self_service_enabled` only after all
 JWT issuers and verifiers are upgraded and the cleanup worker heartbeat is
 healthy. Install the migration before serving new JWTs; old issuers must be
-drained because their claimless tokens are rejected after a generation bump. SSO
-self-service remains unsupported. See the
+drained because their claimless tokens are rejected after a generation bump.
+
+SSO users can end all ordinary AKB browser sessions while keeping IdP sessions and
+PATs. Migration 103 fences in-flight login callbacks. SSO accounts have a managed-
+account notice instead of self-deletion. Optional `sso_account_sync_enabled` polling
+suspends AKB accounts when the configured Keycloak broker disables/deletes them,
+revoking PATs/browser handles while preserving Vaults and identity bindings. Polling
+is eventual and suspend-only; failures do not mutate accounts. See the
 [implementation and rollout design](../docs/design/accepted/2026-09-15-account-self-service-lifecycle/README.md).
 
 ### Every document counter follows the active authority (akb#525)

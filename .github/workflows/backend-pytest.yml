@@ -237,6 +237,8 @@ jobs:
           tests/test_recovery_admin_provisioning_postgres.py
           tests/test_local_session_generation_postgres.py
           tests/test_account_self_lifecycle_postgres.py
+          tests/test_sso_account_lifecycle_postgres.py
+          tests/test_sso_account_sync_postgres.py
           tests/test_admin_auth_postgres.py
           tests/test_sso_identity_migration_postgres.py
           tests/test_pending_admission_postgres.py

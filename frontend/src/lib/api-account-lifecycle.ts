@@ -28,7 +28,7 @@ async function request(path: string, snapshot: AuthSessionSnapshot, body?: unkno
     const response = await authenticatedFetch(`/api/v1/my/account/${path}`, {
       signal: controller.signal,
       method: body === undefined ? "GET" : "POST", cache: "no-store",
-      headers: { "Content-Type": "application/json", ...(snapshot.token ? { Authorization: `Bearer ${snapshot.token}` } : {}) },
+      headers: { "Content-Type": "application/json", ...(snapshot.token ? { Authorization: `Bearer ${snapshot.token}` } : {}), ...(body !== undefined && snapshot.mode === "sso" && snapshot.csrfToken ? { "X-AKB-CSRF": snapshot.csrfToken } : {}) },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     }, { unauthorized: "preserve-session" });
     const payload: unknown = await response.json().catch(() => null);

@@ -40,6 +40,16 @@ def _require_carrier(user: AuthenticatedUser) -> None:
         raise AKBError("Account self-service is unavailable for this session.", 403, code=reason)
 
 
+def _session_reason(user: AuthenticatedUser) -> str | None:
+    if settings.local_human_auth_enabled:
+        return _carrier_reason(user)
+    if user.auth_method != "browser_session" or user.account_kind != "human":
+        return "human_session_required"
+    if not settings.account_self_service_enabled:
+        return "rollout_not_enabled"
+    return None
+
+
 async def _worker_ready(conn) -> bool:
     return bool(await conn.fetchval("""SELECT EXISTS(SELECT 1 FROM account_deletion_worker_state
         WHERE singleton AND last_seen_at > clock_timestamp()-interval '60 seconds')"""))
@@ -80,10 +90,12 @@ async def lifecycle(user: AuthenticatedUser) -> dict:
     async with pool.acquire() as conn:
         async with conn.transaction(isolation="repeatable_read", readonly=True):
             row = await _read_user(conn, uuid.UUID(user.user_id))
-            reason = _carrier_reason(user)
-            if not reason and (row["auth_provider"] != "local" or row["account_kind"] != "human"):
+            reason = _session_reason(user)
+            expected_provider = "local" if settings.local_human_auth_enabled else "keycloak"
+            if not reason and (row["auth_provider"] != expected_provider or row["account_kind"] != "human"):
                 reason = "managed_account"
-            deletion_reason = reason or (None if await _worker_ready(conn) else "cleanup_unavailable")
+            deletion_reason = ("managed_account" if not settings.local_human_auth_enabled else
+                               reason or (None if await _worker_ready(conn) else "cleanup_unavailable"))
             blockers = await _blockers(conn, row) if not deletion_reason else []
             effects = {
                 "active_pats_revoked": await conn.fetchval("""SELECT count(*) FROM tokens WHERE user_id=$1
@@ -93,7 +105,9 @@ async def lifecycle(user: AuthenticatedUser) -> dict:
             }
     return {
         "schema_version": 1, "user_id": str(row["id"]), "username": row["username"],
-        "revoke_sessions": {"supported": reason is None, "scope": "local_sessions", "includes_current": True,
+        "revoke_sessions": {"supported": reason is None,
+                            "scope": "local_sessions" if settings.local_human_auth_enabled else "sso_browser_sessions",
+                            "includes_current": True,
                             "affects_pats": False, "reason": reason},
         "deletion": {"supported": deletion_reason is None, "allowed": deletion_reason is None and not blockers,
                      "reason": deletion_reason, "confirmation": "username_and_current_password",
@@ -116,6 +130,15 @@ async def deletion_blockers(user: AuthenticatedUser, *, cursor: uuid.UUID | None
 
 async def revoke_sessions(user: AuthenticatedUser, expected_user_id: uuid.UUID) -> dict:
     uid = _identity(user, expected_user_id)
+    if not settings.local_human_auth_enabled:
+        reason = _session_reason(user)
+        if reason:
+            raise AKBError("Account session management is unavailable.", 403, code=reason)
+        from app.services.sso_browser_session_service import revoke_all_sso_browser_sessions
+        cutoff = await revoke_all_sso_browser_sessions(user)
+        # Do not clear cookies here: a delayed Set-Cookie could erase a newer
+        # login in another tab. Revoked handles are inert; the next login replaces them.
+        return {"user_id": str(uid), "revoked_before": cutoff.isoformat()}
     _require_carrier(user)
     pool = await get_pool()
     async with pool.acquire() as conn:

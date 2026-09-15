@@ -507,3 +507,11 @@ notification_retention_days: 90
 # Enable after the session-generation backend rollout is complete on every pod.
 # Account deletion also requires the cleanup worker heartbeat to be healthy.
 account_self_service_enabled: false
+
+# Optional Keycloak-owned account disable/delete detection (read-only management
+# client needs realm and user read access). Checks 25 existing identities per tick;
+# detection latency includes a full paginated sweep and upstream availability.
+# Suspends AKB access and revokes AKB PAT/browser sessions, preserving all Vaults.
+# Never automatically reactivates accounts or logs out other Keycloak clients.
+sso_account_sync_enabled: false
+sso_account_sync_interval_secs: 30

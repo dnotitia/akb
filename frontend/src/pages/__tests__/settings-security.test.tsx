@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { SecuritySection } from "../settings/security-section";
 import { configureAuthTransport, getToken, setToken } from "@/lib/api";
@@ -9,13 +9,14 @@ const user = { user_id: "a", username: "alice", email: "a@x.test", display_name:
 const preview = { schema_version: 1, user_id: "a", username: "alice", revoke_sessions: { supported: true, scope: "local_sessions", includes_current: true, affects_pats: false, reason: null }, deletion: { supported: true, allowed: true, reason: null, confirmation: "username_and_current_password", blockers: [], effects: { active_pats_revoked: 2, shared_publications_preserved: 1 } } };
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 const fetchMock = vi.fn();
+function CurrentLocation() { return <output data-testid="location">{useLocation().pathname}{useLocation().search}</output>; }
 function mount() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  render(<QueryClientProvider client={client}><MemoryRouter><SecuritySection user={user} onBusyChange={vi.fn()} /></MemoryRouter></QueryClientProvider>);
+  render(<QueryClientProvider client={client}><MemoryRouter><CurrentLocation /><SecuritySection user={user} onBusyChange={vi.fn()} /></MemoryRouter></QueryClientProvider>);
   return client;
 }
 beforeEach(() => { configureAuthTransport("local"); setToken("token-a"); fetchMock.mockReset(); fetchMock.mockImplementation(() => Promise.resolve(json(preview))); vi.stubGlobal("fetch", fetchMock); });
-afterEach(() => { cleanup(); setToken(null); configureAuthTransport(null); vi.unstubAllGlobals(); });
+afterEach(() => { document.cookie = "akb_dev_sso_csrf=; Max-Age=0; path=/"; cleanup(); setToken(null); configureAuthTransport(null); vi.unstubAllGlobals(); });
 const posts = () => fetchMock.mock.calls.filter(c => c[1]?.method === "POST");
 
 it("requires a current password and exact username before deleting", async () => {
@@ -93,11 +94,12 @@ it.each(["network", "malformed", "unauthorized"])("keeps an honest unconfirmed r
   expect(getToken()).toBe("token-a"); expect(client.getQueryData(["private"])).toBe("data"); expect(posts()).toHaveLength(1);
 });
 
-it("keeps organization-managed lifecycle actions unavailable", async () => {
+it("hides account deletion for organization-managed accounts", async () => {
   fetchMock.mockImplementation(() => Promise.resolve(json({ ...preview, revoke_sessions: { ...preview.revoke_sessions, supported: false, reason: "managed_account" }, deletion: { ...preview.deletion, supported: false, allowed: false, reason: "managed_account" } })));
   mount(); await screen.findAllByText(/Your organization manages this account/);
   expect(screen.getByRole("button", { name: "Sign out all sessions" })).toBeDisabled();
-  expect(screen.getByRole("button", { name: "Review account deletion" })).toBeDisabled();
+  expect(screen.queryByRole("button", { name: "Review account deletion" })).not.toBeInTheDocument();
+  expect(screen.queryByText("Danger zone")).not.toBeInTheDocument();
   expect(posts()).toHaveLength(0);
 });
 
@@ -137,4 +139,77 @@ it("offers reauthentication inside the deletion dialog after a 401", async () =>
   await screen.findByText(/Your session could not be verified/);
   expect(screen.getByRole("dialog").querySelector("button")?.textContent).toBe("Sign in again");
   expect(getToken()).toBe("token-a");
+});
+
+
+it("revokes SSO browser sessions with explicit scope, preserves managed account UI and makes no logout call", async () => {
+  configureAuthTransport("sso");
+  document.cookie = "akb_dev_sso_csrf=fixture-csrf; path=/";
+  fetchMock.mockImplementation(() => Promise.resolve(json({ ...preview,
+    revoke_sessions: { ...preview.revoke_sessions, scope: "sso_browser_sessions" },
+    deletion: { ...preview.deletion, supported: false, allowed: false, reason: "managed_account" },
+  })));
+  const client = mount();
+  client.setQueryData(["private"], "cached-data");
+  await waitFor(() => expect(screen.getByRole("button", { name: "Sign out all sessions" })).toBeEnabled());
+  expect(screen.queryByText("Danger zone")).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Review account deletion" })).not.toBeInTheDocument();
+  expect(screen.getByText(/organization or Keycloak administrator/)).toBeInTheDocument();
+  expect(screen.getByText(/identity provider \(SSO\) session and personal access tokens/)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Sign out all sessions" }));
+  expect(screen.getByRole("dialog")).toHaveTextContent("all your AKB browser sessions, including this device");
+  expect(screen.getByRole("dialog")).toHaveTextContent("account and Vault data are preserved");
+  fetchMock.mockImplementation(() => Promise.resolve(json({ user_id: "a", revoked_before: "2026-09-15T00:00:00Z" })));
+  const buttons = screen.getAllByRole("button", { name: "Sign out all sessions" });
+  fireEvent.click(buttons[buttons.length - 1]);
+  await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("/auth?reason=sso-sessions-revoked"));
+  expect(posts()).toHaveLength(1);
+  expect(posts()[0][0]).toBe("/api/v1/my/account/session-revocations");
+  expect(new Headers(posts()[0][1].headers).get("X-AKB-CSRF")).toBe("fixture-csrf");
+  expect(new Headers(posts()[0][1].headers).has("Authorization")).toBe(false);
+  expect(client.getQueryData(["private"])).toBeUndefined();
+  expect(fetchMock.mock.calls.some(([url]) => String(url).includes("logout"))).toBe(false);
+  document.cookie = "akb_dev_sso_csrf=; Max-Age=0; path=/";
+});
+
+it("keeps SSO account deletion hidden before an unavailable capability response", async () => {
+  configureAuthTransport("sso");
+  fetchMock.mockImplementation(() => Promise.resolve(new Response("Not found", { status: 404 })));
+  mount();
+  expect(screen.queryByText("Danger zone")).not.toBeInTheDocument();
+  await screen.findByText(/does not support this action/);
+  expect(screen.queryByRole("button", { name: "Review account deletion" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Sign out all sessions" })).toBeDisabled();
+});
+
+it("does not execute an SSO revocation scope with a local credential", async () => {
+  fetchMock.mockImplementation(() => Promise.resolve(json({ ...preview, revoke_sessions: { ...preview.revoke_sessions, scope: "sso_browser_sessions" } })));
+  mount();
+  await screen.findByText(/does not currently support this action/);
+  expect(screen.getByRole("button", { name: "Sign out all sessions" })).toBeDisabled();
+  expect(posts()).toHaveLength(0);
+});
+
+
+it("keeps a newer SSO login and its cache when an old revocation response arrives", async () => {
+  configureAuthTransport("sso");
+  document.cookie = "akb_dev_sso_csrf=first-session; path=/";
+  fetchMock.mockImplementation(() => Promise.resolve(json({ ...preview,
+    revoke_sessions: { ...preview.revoke_sessions, scope: "sso_browser_sessions" },
+    deletion: { ...preview.deletion, supported: false, allowed: false, reason: "managed_account" },
+  })));
+  const client = mount();
+  await waitFor(() => expect(screen.getByRole("button", { name: "Sign out all sessions" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Sign out all sessions" }));
+  let resolve!: (response: Response) => void;
+  fetchMock.mockImplementation(() => new Promise<Response>(r => { resolve = r; }));
+  const buttons = screen.getAllByRole("button", { name: "Sign out all sessions" });
+  fireEvent.click(buttons[buttons.length - 1]);
+  document.cookie = "akb_dev_sso_csrf=new-session; path=/";
+  client.setQueryData(["replacement-session"], "new-data");
+  resolve(json({ user_id: "a", revoked_before: "2026-09-15T00:00:00Z" }));
+  await screen.findByText(/Your sign-in session changed/);
+  expect(screen.getByTestId("location")).not.toHaveTextContent("/auth");
+  expect(client.getQueryData(["replacement-session"])).toBe("new-data");
+  expect(document.cookie).toContain("akb_dev_sso_csrf=new-session");
 });

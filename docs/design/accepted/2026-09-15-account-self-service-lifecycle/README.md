@@ -6,7 +6,7 @@ updated: 2026-09-15
 baseline: 30968585
 ---
 
-# Local account self-service lifecycle
+# Account self-service lifecycle
 
 ## Problem and scope
 
@@ -15,29 +15,32 @@ the current account. The previous self-delete endpoint cascaded through owned
 vaults. A confirmation screen needs a server contract that reports ownership
 blockers and enforces them again when deletion commits.
 
-This change supports local human accounts. SSO accounts require a separate
-identity-provider logout, reauthentication, and reprovisioning policy and remain
-unsupported. Personal access tokens (PATs) survive session revocation but are
-removed when the account is deleted.
+Local human accounts can revoke sessions and delete their account. SSO users can
+revoke their ordinary AKB browser sessions; account lifecycle is owned by the
+organization's Keycloak administrator. SSO users see a managed-account notice,
+without a self-delete action. Personal access tokens (PATs) survive user-requested
+session revocation but are removed by local account deletion or administrative
+account suspension.
 
 ## API contract
 
 All paths below are relative to `/api/v1`. Mutations require an active local
-human JWT and `account_self_service_enabled: true`. PATs and service credentials
-cannot perform these mutations. GET responses use `Cache-Control: no-store`.
+human JWT or (for SSO browser revocation only) a CSRF-verified browser session,
+and `account_self_service_enabled: true`. PATs and service credentials cannot
+perform these mutations. GET responses use `Cache-Control: no-store`.
 
 | Endpoint | Contract |
 | --- | --- |
 | `GET /my/account/lifecycle` | Versioned identity, capabilities, deletion blockers and effects |
 | `GET /my/account/deletion-blockers` | Owned vaults, including archived vaults; UUID cursor, default limit 20, maximum 100 |
-| `POST /my/account/session-revocations` | Requires `expected_user_id`; ends all local login sessions, including the caller |
+| `POST /my/account/session-revocations` | Requires `expected_user_id`; ends all local login sessions or ordinary SSO browser sessions, including the caller |
 | `POST /my/account/deletion` | Requires `expected_user_id`, `confirm_username`, and `current_password` |
 | `DELETE /my/account` | Retired; returns 410 with `account_deletion_contract_required` |
 
 Preview schema version 1 includes:
 
 - `user_id` and `username` to bind the displayed account to the operation.
-- `revoke_sessions`: `supported`, `scope: local_sessions`, `includes_current`,
+- `revoke_sessions`: `supported`, `scope: local_sessions` or `sso_browser_sessions`, `includes_current`,
   `affects_pats`, and an optional explanatory `reason`.
 - `deletion`: `supported`, `allowed`, `reason`,
   `confirmation: username_and_current_password`, structured `blockers`, and
@@ -137,7 +140,8 @@ It explains that session revocation also signs out the current session while PAT
 remain active. The danger zone shows deletion effects and owned-vault links.
 Deletion proceeds through impact/password review and exact username confirmation.
 
-Each operation captures an authentication snapshot and pins its request credential.
+Each operation captures an authentication snapshot and pins its request credential
+(including the readable SSO CSRF cookie and header).
 A response from an earlier account or session cannot clear a newer session. Only a
 validated successful receipt clears the matching credential and private caches.
 
@@ -151,7 +155,8 @@ preserves cancellation focus and navigation protection during submission.
 
 1. Apply migration 101 and its cutoff trigger before new JWT issuers accept traffic.
    Apply migration 102 and deploy the API and cleanup worker.
-2. Replace or drain all old issuers and verifiers. Their claimless tokens are
+2. Apply migration 103 before new SSO login flows or account synchronization run.
+   Replace or drain all old issuers and verifiers. Their claimless tokens are
    rejected by new verifiers once an account's generation exceeds zero; the trigger
    protects revocation but does not guarantee seamless mixed-version login. Old
    processes also retain the retired self-delete endpoint. The default Kubernetes
@@ -179,3 +184,62 @@ No component version bump or deployment is included in this change.
   then reauthentication and account deletion invalidate both JWT and PAT.
 - `scripts/check.sh` runs the repository static, SDK, frontend and secret checks.
   See [the runtime guide](../../../../scripts/ci/README.md) for the isolated E2E gate.
+
+
+## SSO browser revocation and organization-owned accounts
+
+User-requested SSO logout deletes all ordinary AKB browser handles for that user.
+It does not terminate the separate product-admin session, IdP sessions, raw OAuth
+access tokens, PATs, or other applications. A deliberate new SSO login remains
+possible. Refresh and ID-token ciphertext disappears with the revoked handles;
+AKB does not issue an IdP-wide logout request.
+
+Migration 103 adds a database sequence and per-user logout fences. Login starts
+receive a server-stored sequence alongside their existing nonce/PKCE state. All-
+session logout advances the sequence under the same user advisory lock used by
+session creation. A callback from a login started before that fence is rejected,
+including legacy callbacks without a sequence. Concurrent refresh cannot recreate
+a deleted handle. Deploy all callback handlers before enabling this capability.
+
+The success response deliberately does not clear cookies: a delayed Set-Cookie
+could erase a newer login in another tab. Revoked cookies are inert, and a new
+login replaces them. The frontend detects readable CSRF-cookie changes, pins its
+captured CSRF header, and only clears matching local caches after a verified receipt.
+
+### Keycloak administrator changes
+
+An opt-in `sso_account_sync_enabled` worker observes existing human accounts whose
+external identity belongs to the configured broker issuer. The management adapter
+checks that the realm is live and enabled, then reads each exact subject. Only an
+authoritative disabled user or missing subject causes AKB suspension. Outages,
+permission errors, malformed responses and authority/binding changes preserve the
+current account state and appear in authenticated `/health.sso_account_sync`.
+
+Suspension uses the existing transaction: mark the AKB user suspended, delete PATs
+and ordinary/product-admin browser handles, and schedule token-role cleanup. Keep
+users, identity bindings, Vault ownership and content. Retaining the suspended
+binding prevents automatic reprovisioning from silently restoring access.
+Keycloak logout notifications alone do not prove account disablement and therefore
+do not suspend accounts or delete PATs.
+
+Configuration defaults:
+
+```yaml
+account_self_service_enabled: false
+sso_account_sync_enabled: false
+sso_account_sync_interval_secs: 30
+```
+
+The worker needs the configured direct Keycloak management connection with realm
+and user read permissions. It reads at most 25 identities per tick. Detection is
+**eventual**, not immediate: a full population sweep spans multiple intervals, and
+an outage delays it further. Health reports the latest page, freshness and error
+state. For urgent revocation, an AKB administrator can suspend the account directly.
+
+Synchronization is suspend-only. Re-enabling a Keycloak user does not automatically
+activate its AKB account or recreate PATs. After explicit AKB reactivation, existing
+raw Keycloak access tokens that are still valid can authenticate again; deleted
+browser handles and PATs stay invalid. If an upstream brokered provider disables a
+user while the broker's own user remains enabled, this worker cannot infer that
+change: the organization must propagate the decision to its Keycloak broker or
+suspend the account in AKB.

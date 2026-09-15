@@ -354,6 +354,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "100_native_revision_cutover_file_applied_path.py",  # record the native path each cutover File was published at
         "101_local_session_generation.py",  # monotonic local session revocation
         "102_account_self_lifecycle.py",  # independent deletion cleanup and confirmation budget
+        "103_sso_account_lifecycle.py",  # SSO browser logout and managed account sync
     ):
         if filename in applied:
             continue

@@ -15,9 +15,9 @@ import type { User } from "./profile-section";
 
 function reasonText(reason: string | null | undefined): string {
   switch (reason) {
-    case "managed_account": return "Your organization manages this account. Contact your administrator for account or session changes.";
+    case "managed_account": return "Your organization manages this account through SSO. Contact your organization or Keycloak administrator for account changes.";
     case "recovery_admin_protected": return "This recovery administrator account cannot be deleted.";
-    case "human_session_required": return "Sign in with a local account to manage account security.";
+    case "human_session_required": return "Sign in through your account's browser login to manage account security.";
     case "local_auth_disabled": return "Local account management is disabled by your organization's sign-in policy.";
     case "credential_change_required": return "Change your issued password before managing account security.";
     case "cleanup_unavailable": return "Account deletion is temporarily unavailable. Try again later.";
@@ -77,7 +77,7 @@ export function SecuritySection({ user, onBusyChange }: { user: User; onBusyChan
       }
       setPreview({ data, snapshot });
       if (openReview) setStep("review");
-      if (data.deletion.blockers.some(b => b.code === "owned_vaults")) {
+      if (data.deletion.supported && data.deletion.blockers.some(b => b.code === "owned_vaults")) {
         const page = await getDeletionBlockers(snapshot);
         if (mounted.current && sequence === readSequence.current && isCurrentAuthSession(snapshot) && page.user_id === user.user_id) setVaults(page);
       }
@@ -108,8 +108,18 @@ export function SecuritySection({ user, onBusyChange }: { user: User; onBusyChan
     return () => { window.removeEventListener("storage", invalidate); window.removeEventListener("focus", invalidate); };
   }, [preview]);
 
-  const canRevoke = !!preview && preview.data.revoke_sessions.supported && preview.data.revoke_sessions.scope === "local_sessions" && preview.data.revoke_sessions.includes_current && !preview.data.revoke_sessions.affects_pats;
-  const canDelete = !!preview && preview.data.deletion.supported && preview.data.deletion.allowed && preview.data.deletion.blockers.length === 0 && preview.data.deletion.confirmation === "username_and_current_password";
+  const ssoSession = authSessionSnapshot().mode === "sso" || user.auth_method === "browser_session";
+  const managedAccount = ssoSession || preview?.data.deletion.reason === "managed_account";
+  const canRevoke = !!preview && preview.data.revoke_sessions.supported &&
+    preview.data.revoke_sessions.scope === (preview.snapshot.mode === "sso" ? "sso_browser_sessions" : "local_sessions") &&
+    preview.data.revoke_sessions.includes_current && !preview.data.revoke_sessions.affects_pats;
+  const sessionDescription = ssoSession
+    ? "Sign out all your AKB browser sessions, including this device. You can sign in again with SSO."
+    : "Sign out all supported local login sessions, including this device. You will need to sign in again.";
+  const sessionExclusions = ssoSession
+    ? "Your identity provider (SSO) session and personal access tokens (PATs) remain active. Your account and Vault data are preserved."
+    : "Personal access tokens (PATs) and agent connections remain active.";
+  const canDelete = !managedAccount && !!preview && preview.data.deletion.supported && preview.data.deletion.allowed && preview.data.deletion.blockers.length === 0 && preview.data.deletion.confirmation === "username_and_current_password";
   function close() { if (!busyRef.current) { setStep("none"); setPassword(""); } }
   async function execute(kind: "sessions" | "delete") {
     if (busyRef.current || !preview || (kind === "sessions" ? !canRevoke : !canDelete || !password)) return;
@@ -130,7 +140,11 @@ export function SecuritySection({ user, onBusyChange }: { user: User; onBusyChan
       await queryClient.cancelQueries();
       if (!isCurrentAuthSession(snapshot)) return;
       queryClient.clear();
-      if (clearCompletedAccountSession(snapshot)) { completed = true; navigate(`/auth?reason=${kind === "sessions" ? "sessions-revoked" : "account-deleted"}`, { replace: true }); }
+      if (clearCompletedAccountSession(snapshot)) {
+        completed = true;
+        const reason = kind === "delete" ? "account-deleted" : data.revoke_sessions.scope === "sso_browser_sessions" ? "sso-sessions-revoked" : "sessions-revoked";
+        navigate(`/auth?reason=${reason}`, { replace: true });
+      }
     } catch (e) {
       if (!mounted.current || !isCurrentAuthSession(snapshot)) return;
       setError(failureText(e));
@@ -182,9 +196,9 @@ export function SecuritySection({ user, onBusyChange }: { user: User; onBusyChan
     {loading && <p role="status" className="text-sm text-foreground-muted">Checking account security…</p>}
     {busy && <p role="status" className="text-sm text-foreground-muted">Working… Keep this page open while we verify the result.</p>}
     {!loading && !preview && <div className="flex flex-wrap gap-2"><Button variant="outline" disabled={busy} onClick={() => { setError(""); void refresh(); }}>Check account status</Button>{needsSignIn && <Button variant="outline" disabled={busy} onClick={() => void signInAgain()}>Sign in again</Button>}</div>}
-    <Panel><PanelHeader label="Login sessions" /><div className="space-y-3 p-4 text-sm"><p>Sign out all supported local login sessions, including this device. You will need to sign in again.</p><p className="text-foreground-muted">Personal access tokens (PATs) and agent connections remain active.</p>{preview && !canRevoke && <Alert variant="info">{reasonText(preview.data.revoke_sessions.reason)}</Alert>}<Button variant="outline" disabled={busy || loading || !canRevoke} onClick={() => { returnFocus.current = document.activeElement as HTMLElement; setError(""); setStep("sessions"); }}>Sign out all sessions</Button></div></Panel>
-    <Panel><PanelHeader label={<span className="flex items-center gap-2 text-destructive"><TriangleAlert className="h-4 w-4" aria-hidden />Danger zone</span>} /><div className="space-y-3 p-4 text-sm"><h3 className="font-semibold">Delete account</h3><p>This permanently deletes your account and personal access tokens. This cannot be undone. Shared vault content and publication links remain available.</p>{preview && !preview.data.deletion.supported && <Alert variant="info">{reasonText(preview.data.deletion.reason)}</Alert>}{preview?.data.deletion.blockers.map(b => <Alert key={b.code} variant="warning">{blockerText(b.code, b.count)}</Alert>)}{vaults && <ul className="space-y-2">{vaults.owned_vaults.map(v => <li key={v.id} className="break-words"><Link className="text-link hover:underline" to={`/vault/${encodeURIComponent(v.name)}/settings`}>{v.name} — manage ownership</Link></li>)}</ul>}{vaults?.next_cursor && <Button variant="outline" disabled={busy} onClick={() => void moreVaults()}>Show more owned vaults</Button>}<Button variant="destructive" disabled={busy || loading || !preview?.data.deletion.supported} onClick={() => { returnFocus.current = document.activeElement as HTMLElement; setError(""); setPassword(""); void refresh(true); }}>Review account deletion</Button></div></Panel>
-    <ConfirmDialog open={step === "sessions"} onOpenChange={open => { if (!open) close(); }} returnFocusRef={returnFocus} title="Sign out all sessions?" description="This includes your current local login. Personal access tokens and agent connections remain active. You will need to sign in again." variant="destructive" confirmLabel="Sign out all sessions" busy={busy} onConfirm={() => execute("sessions")} />
+    <Panel><PanelHeader label="Login sessions" /><div className="space-y-3 p-4 text-sm"><p>{sessionDescription}</p><p className="text-foreground-muted">{sessionExclusions}</p>{preview && !canRevoke && <Alert variant="info">{reasonText(preview.data.revoke_sessions.reason)}</Alert>}<Button variant="outline" disabled={busy || loading || !canRevoke} onClick={() => { returnFocus.current = document.activeElement as HTMLElement; setError(""); setStep("sessions"); }}>Sign out all sessions</Button></div></Panel>
+    {managedAccount ? <Panel><PanelHeader label="Managed account" /><div className="space-y-3 p-4 text-sm"><p>{reasonText("managed_account")}</p><p className="text-foreground-muted">Signing out keeps your account and Vault data available for your next SSO sign-in.</p></div></Panel> : <Panel><PanelHeader label={<span className="flex items-center gap-2 text-destructive"><TriangleAlert className="h-4 w-4" aria-hidden />Danger zone</span>} /><div className="space-y-3 p-4 text-sm"><h3 className="font-semibold">Delete account</h3><p>This permanently deletes your account and personal access tokens. This cannot be undone. Shared vault content and publication links remain available.</p>{preview && !preview.data.deletion.supported && <Alert variant="info">{reasonText(preview.data.deletion.reason)}</Alert>}{preview?.data.deletion.blockers.map(b => <Alert key={b.code} variant="warning">{blockerText(b.code, b.count)}</Alert>)}{vaults && <ul className="space-y-2">{vaults.owned_vaults.map(v => <li key={v.id} className="break-words"><Link className="text-link hover:underline" to={`/vault/${encodeURIComponent(v.name)}/settings`}>{v.name} — manage ownership</Link></li>)}</ul>}{vaults?.next_cursor && <Button variant="outline" disabled={busy} onClick={() => void moreVaults()}>Show more owned vaults</Button>}<Button variant="destructive" disabled={busy || loading || !preview?.data.deletion.supported} onClick={() => { returnFocus.current = document.activeElement as HTMLElement; setError(""); setPassword(""); void refresh(true); }}>Review account deletion</Button></div></Panel>}
+    <ConfirmDialog open={step === "sessions"} onOpenChange={open => { if (!open) close(); }} returnFocusRef={returnFocus} title="Sign out all sessions?" description={`${sessionDescription} ${sessionExclusions}`} variant="destructive" confirmLabel="Sign out all sessions" busy={busy} onConfirm={() => execute("sessions")} />
     <Dialog open={step === "review"} onOpenChange={open => { if (!open) close(); }}><DialogContent onCloseAutoFocus={event => { if (step !== "delete") { event.preventDefault(); returnFocus.current?.focus(); } }}><DialogHeader><DialogTitle>Review account deletion</DialogTitle><DialogDescription>Review the impact on {user.username} before continuing. This action cannot be undone.</DialogDescription></DialogHeader><div className="space-y-3 text-sm">{feedback}{needsSignIn && <Button variant="outline" disabled={busy} onClick={() => void signInAgain()}>Sign in again</Button>}{preview && <><p>Personal access tokens to delete: {effects?.active_pats_revoked ?? "Unavailable"}</p><p>Shared publication links preserved: {effects?.shared_publications_preserved ?? "Unavailable"}</p>{preview.data.deletion.blockers.map(b => <Alert key={b.code} variant="warning">{blockerText(b.code, b.count)}</Alert>)}</>}{!preview && <Button variant="outline" disabled={loading || busy} onClick={() => { setError(""); void refresh(); }}>Check account status</Button>}<Label htmlFor="account-current-password">Current password</Label><Input id="account-current-password" type="password" autoComplete="current-password" value={password} disabled={busy || loading || !canDelete} onChange={e => setPassword(e.target.value)} /></div><DialogFooter><Button variant="outline" onClick={close} disabled={busy} autoFocus>Cancel</Button><Button variant="destructive" disabled={busy || loading || !canDelete || !password} onClick={() => setStep("delete")}>Continue to confirmation</Button></DialogFooter></DialogContent></Dialog>
     <ConfirmDialog open={step === "delete"} onOpenChange={open => { if (!open && !busyRef.current) { setStep(current => current === "delete" ? "none" : current); setPassword(""); } }} returnFocusRef={returnFocus} title="Permanently delete account?" description="Your account and personal access tokens will be deleted. Shared vault content and publication links will be preserved." variant="destructive" confirmationText={user.username} confirmationLabel="Type your username to confirm" confirmLabel="Permanently delete account" busy={busy} onConfirm={() => execute("delete")} />
   </section>;

@@ -563,6 +563,8 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
             result["rbac"] = {"error": str(e)}
         from app.services.account_deletion_worker import pending_stats as account_cleanup_stats
         result["account_deletion_cleanup"] = await _safe(account_cleanup_stats)
+        from app.services.sso_account_sync import pending_stats as sso_account_sync_stats
+        result["sso_account_sync"] = await _safe(sso_account_sync_stats)
         result["audit"] = audit_log.stats()
         result["tool_usage"] = tool_usage.stats()
 
