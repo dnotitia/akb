@@ -31,6 +31,46 @@ class _SmokeFixture:
         self.reset_calls += 1
 
 
+def _smoke_outcome(
+    task,
+    model_spec,
+    transport: str,
+    *,
+    model_id: str | None = None,
+    successful_mcp_tool_calls: int = 1,
+    follow_up_terminal_response: bool = True,
+) -> TrialOutcome:
+    return TrialOutcome(
+        task_id=task.id,
+        category=task.category,
+        arm="baseline",
+        model_class=model_spec.class_name,
+        model_id=model_id or model_spec.model_id,
+        transport=transport,
+        final_answer_text="OK",
+        successful_mcp_tool_calls=successful_mcp_tool_calls,
+        follow_up_terminal_response=follow_up_terminal_response,
+        input_tokens=10,
+        output_tokens=2,
+        total_tokens=12,
+        model_requests=2,
+        cost_usd=0.00001,
+        provider_evidence=[
+            {
+                "model": model_spec.model_id,
+                "routing": {
+                    "endpoints": {"available": [{"provider": "OpenInference", "selected": True}]}
+                },
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001},
+            }
+        ],
+        provider_cost_usd=0.00001,
+        cost_source="provider_response",
+        routing_observed=True,
+        routing_valid=True,
+    )
+
+
 @pytest.mark.asyncio
 async def test_smoke_gate_executes_all_model_transport_cells(monkeypatch: pytest.MonkeyPatch) -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
@@ -43,35 +83,7 @@ async def test_smoke_gate_executes_all_model_transport_cells(monkeypatch: pytest
 
     async def smoke(task, *, model_spec, transport, **_kwargs):
         calls.append((model_spec.class_name, transport))
-        return TrialOutcome(
-            task_id=task.id,
-            category=task.category,
-            arm="baseline",
-            model_class=model_spec.class_name,
-            model_id=model_spec.model_id,
-            transport=transport,
-            final_answer_text="OK",
-            successful_mcp_tool_calls=1,
-            follow_up_terminal_response=True,
-            input_tokens=10,
-            output_tokens=2,
-            total_tokens=12,
-            model_requests=2,
-            cost_usd=0.00001,
-            provider_evidence=[
-                {
-                    "model": model_spec.model_id,
-                    "routing": {
-                        "endpoints": {"available": [{"provider": "OpenInference", "selected": True}]}
-                    },
-                    "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001},
-                }
-            ],
-            provider_cost_usd=0.00001,
-            cost_source="provider_response",
-            routing_observed=True,
-            routing_valid=True,
-        )
+        return _smoke_outcome(task, model_spec, transport)
 
     monkeypatch.setattr(runner_module, "execute_smoke", smoke)
     result = await runner._run_smoke_gate(
@@ -109,34 +121,11 @@ async def test_smoke_gate_rejects_outcome_for_a_different_requested_model(
     monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
 
     async def mismatched_smoke(task, *, model_spec, transport, **_kwargs):
-        return TrialOutcome(
-            task_id=task.id,
-            category=task.category,
-            arm="baseline",
-            model_class=model_spec.class_name,
+        return _smoke_outcome(
+            task,
+            model_spec,
+            transport,
             model_id="unregistered/model",
-            transport=transport,
-            final_answer_text="OK",
-            successful_mcp_tool_calls=1,
-            follow_up_terminal_response=True,
-            input_tokens=10,
-            output_tokens=2,
-            total_tokens=12,
-            model_requests=2,
-            cost_usd=0.00001,
-            provider_evidence=[
-                {
-                    "model": model_spec.model_id,
-                    "routing": {
-                        "endpoints": {"available": [{"provider": "OpenInference", "selected": True}]}
-                    },
-                    "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001},
-                }
-            ],
-            provider_cost_usd=0.00001,
-            cost_source="provider_response",
-            routing_observed=True,
-            routing_valid=True,
         )
 
     monkeypatch.setattr(runner_module, "execute_smoke", mismatched_smoke)
@@ -157,32 +146,12 @@ async def test_smoke_gate_blocks_when_cell_has_no_successful_mcp_call(monkeypatc
     monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
 
     async def failed_smoke(task, *, model_spec, transport, **_kwargs):
-        return TrialOutcome(
-            task_id=task.id,
-            category=task.category,
-            arm="baseline",
-            model_class=model_spec.class_name,
-            model_id=model_spec.model_id,
-            transport=transport,
-            final_answer_text="OK",
-            input_tokens=10,
-            output_tokens=2,
-            total_tokens=12,
-            model_requests=2,
-            cost_usd=0.00001,
-            provider_evidence=[
-                {
-                    "model": model_spec.model_id,
-                    "routing": {
-                        "endpoints": {"available": [{"provider": "OpenInference", "selected": True}]}
-                    },
-                    "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001},
-                }
-            ],
-            provider_cost_usd=0.00001,
-            cost_source="provider_response",
-            routing_observed=True,
-            routing_valid=True,
+        return _smoke_outcome(
+            task,
+            model_spec,
+            transport,
+            successful_mcp_tool_calls=0,
+            follow_up_terminal_response=False,
         )
 
     monkeypatch.setattr(runner_module, "execute_smoke", failed_smoke)
