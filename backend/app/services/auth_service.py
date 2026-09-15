@@ -507,12 +507,14 @@ async def _adopt_authoritative_user(conn, issuer: str, subject: str, claims: dic
       unique on (issuer, subject), not on (issuer, user_id));
     - never the recovery admin (break-glass is not claimable by assertion).
 
-    Runs inside the caller's transaction (address advisory lock +
-    ``SELECT ... FOR UPDATE`` on the target), so concurrent adopts of one
-    address converge instead of double-binding. Uses SAVEPOINTs, never a
-    nested transaction: the INSERT is the only statement allowed to fail,
-    and its savepoint rolls back just that statement so the race fallback
-    below can still read.
+    Runs inside the caller's transaction (subject + address advisory locks
+    plus ``SELECT ... FOR UPDATE`` on the target), so concurrent adopts of
+    one address converge instead of double-binding. Uses SAVEPOINTs, never
+    a nested transaction: the binding INSERT is the only statement allowed
+    to fail, and its savepoint rolls back just that statement so the race
+    fallback below can still read. The ``UPDATE users`` runs only after the
+    INSERT succeeds, so a lost race never leaves a provider flip without
+    its binding.
 
     Returns the resolved user, or None when no account holds the address
     (the caller falls through to the mode's provision path). Emits
@@ -562,17 +564,6 @@ async def _adopt_authoritative_user(conn, issuer: str, subject: str, claims: dic
         if has_issuer_binding:
             raise ExternalIdentityConflictError()
         prior_provider = target["auth_provider"]
-        await conn.execute(
-            """
-            UPDATE users
-               SET auth_provider = 'keycloak',
-                   display_name = COALESCE($2, display_name),
-                   updated_at = NOW()
-             WHERE id = $1
-            """,
-            target["id"],
-            display_name,
-        )
         try:
             async with conn.transaction():
                 await conn.execute(
@@ -596,6 +587,20 @@ async def _adopt_authoritative_user(conn, issuer: str, subject: str, claims: dic
                 raise ExternalIdentityConflictError() from None
             refreshed = await _refresh_bound_external_user(conn, bound, claims)
             return _resolved_external_user(refreshed, newly_provisioned=False)
+        # The binding is written: only now flip the provider. A lost race
+        # above returns before reaching here, so a provider flip without
+        # its binding cannot commit.
+        await conn.execute(
+            """
+            UPDATE users
+               SET auth_provider = 'keycloak',
+                   display_name = COALESCE($2, display_name),
+                   updated_at = NOW()
+             WHERE id = $1
+            """,
+            target["id"],
+            display_name,
+        )
         await emit_event(
             conn,
             "auth.user_adopted",

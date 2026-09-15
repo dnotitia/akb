@@ -106,18 +106,22 @@ describe("AKB Markdown target adapter", () => {
     apiMocks.searchDocs.mockResolvedValue({
       results: [
         { uri: DOCUMENT, title: "Guide", matched_section: "body" },
+        { uri: FILE, title: "Diagram", matched_section: "illustration" },
+        { uri: "akb://other/coll/private/doc/guide.md", title: "Other vault" },
         { uri: "https://example.test/nope", title: "External" },
+        { uri: "https://signed.example/file?expires=60", title: "Runtime URL" },
       ],
     });
     const adapters = createAkbMarkdownAdapters({ vault: "team" });
     const file = new File(["bytes"], "diagram.png", { type: "image/png" });
+    const controller = new AbortController();
 
     await expect(adapters.upload.upload(file)).resolves.toMatchObject({
       kind: "attachment",
       target: ATTACHMENT,
       expiresAt: "2026-09-10T00:00:00.000Z",
     });
-    await expect(adapters.search.search("guide")).resolves.toEqual([
+    await expect(adapters.search.search("guide", { vault: "team", signal: controller.signal })).resolves.toEqual([
       {
         id: DOCUMENT,
         title: "Guide",
@@ -125,7 +129,24 @@ describe("AKB Markdown target adapter", () => {
         target: DOCUMENT,
         kind: "document",
       },
+      {
+        id: FILE,
+        title: "Diagram",
+        snippet: "illustration",
+        target: FILE,
+        kind: "file",
+      },
     ]);
     expect(apiMocks.uploadAsset.mock.calls[0]?.[0]).toBe("team");
+    expect(apiMocks.searchDocs).toHaveBeenCalledWith("guide", "team", 20, {}, { signal: controller.signal });
+  });
+
+  it("does not present degraded retrieval as a genuine empty result", async () => {
+    apiMocks.searchDocs.mockResolvedValue({ degraded: true, results: [] });
+    const adapters = createAkbMarkdownAdapters({ vault: "team" });
+
+    await expect(adapters.search.search("guide", { vault: "team" })).rejects.toThrow(
+      "Search results are temporarily unavailable.",
+    );
   });
 });

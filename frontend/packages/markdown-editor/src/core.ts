@@ -6,6 +6,7 @@ import type {
   MarkdownCommands,
   MarkdownDocument,
   MarkdownEditorConfig,
+  MarkdownHeadingLevel,
   MarkdownParseOptions,
   MarkdownTarget,
   MarkdownTargetKind,
@@ -30,6 +31,28 @@ export function serializeMarkdown(
   options: MarkdownParseOptions = {},
 ): string {
   return managerFor(options).serialize(document)
+}
+
+/**
+ * Serialize the current editor document without persisting the empty paragraph
+ * that Tiptap keeps after a terminal atomic block for keyboard continuation.
+ */
+export function serializeEditorMarkdown(
+  editor: Editor,
+  options: MarkdownParseOptions = {},
+): string {
+  const document = editor.getJSON()
+  const content = document.content
+  const last = content?.at(-1)
+  if (
+    content &&
+    content.length > 1 &&
+    last?.type === 'paragraph' &&
+    (!last.content || last.content.length === 0)
+  ) {
+    document.content = content.slice(0, -1)
+  }
+  return serializeMarkdown(document, options)
 }
 
 export function canonicalizeMarkdown(
@@ -119,10 +142,31 @@ export function markdownCommands(editor: Editor): MarkdownCommands {
         type: 'image',
         attrs: { target, alt, title: title ?? null },
       }),
+    setLink: href =>
+      editor.chain().focus().extendMarkRange('link').setLink({ href }).run(),
+    insertLink: (text, href) =>
+      editor
+        .chain()
+        .focus()
+        .insertContent({
+          type: 'text',
+          text,
+          marks: [{ type: 'link', attrs: { href } }],
+        })
+        .run(),
+    unsetLink: () => editor.chain().focus().extendMarkRange('link').unsetLink().run(),
+    setParagraph: () => editor.commands.setParagraph(),
+    toggleHeading: (level: MarkdownHeadingLevel) =>
+      editor.commands.toggleHeading({ level }),
     toggleBold: () => editor.commands.toggleBold(),
     toggleItalic: () => editor.commands.toggleItalic(),
+    toggleStrike: () => editor.commands.toggleStrike(),
+    toggleCode: () => editor.commands.toggleCode(),
     toggleBulletList: () => editor.commands.toggleBulletList(),
     toggleOrderedList: () => editor.commands.toggleOrderedList(),
+    toggleBlockquote: () => editor.commands.toggleBlockquote(),
+    toggleCodeBlock: () => editor.commands.toggleCodeBlock(),
+    setHorizontalRule: () => editor.commands.setHorizontalRule(),
     undo: () => editor.commands.undo(),
     redo: () => editor.commands.redo(),
     focus: position => editor.commands.focus(position),

@@ -43,7 +43,12 @@ test("Personal navigation imports favorites and restores a browser draft", async
   await page.screenshot({ path: testInfo.outputPath("personal-sidebar.png"), fullPage: true });
   await sidebar.getByRole("link", { name: "A recoverable draft" }).click();
   await expect(page.getByPlaceholder("Document title", { exact: true })).toHaveValue("A recoverable draft");
-  await expect(page.getByText("Unsaved writing remains available.", { exact: true })).toBeVisible();
+  const visibleBodyEditor = page
+    .getByTestId("markdown-editor")
+    .locator('[data-markdown-mode-panel="wysiwyg"] .ProseMirror');
+  await expect(
+    visibleBodyEditor.getByText("Unsaved writing remains available.", { exact: true }),
+  ).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath("restored-draft.png"), fullPage: true });
 });
 
@@ -90,7 +95,8 @@ for (const width of [2560, 1440, 768, 375]) for (const dark of [false, true]) {
     await expect(viewed.getByRole("link")).toHaveCount(4);
     await expect(directory.getByRole("heading", { level: 3 })).toHaveCount(4);
     await expect(directory.getByText("Documents", { exact: true }).first()).toBeVisible();
-    await expect(page.getByRole("button", { name: "Hide connection guide" })).toBeVisible();
+    await expect(page.getByTestId("home-connection-invitation")).toHaveAttribute("data-expanded", String(width >= 1024));
+    await expect(page.getByRole("button", { name: "Connect an agent", exact: true })).toBeVisible();
     await expect(page.getByRole("tablist", { name: "Recent updates scope" })).toHaveCount(0);
     await expect(page.getByRole("heading", { name: "Watched documents", exact: true })).toBeVisible();
     const homePaper = await page.locator("#main").evaluate(element => getComputedStyle(element.closest(".min-h-screen")!).backgroundColor);
@@ -144,7 +150,12 @@ for (const width of [2560, 1440, 768, 375]) for (const dark of [false, true]) {
     } else expect(fourth.y).toBeGreaterThan(first.y);
     expect((await viewed.boundingBox())!.y).toBeLessThan((await directory.boundingBox())!.y);
     await page.screenshot({ path: testInfo.outputPath("home-workspace.png"), fullPage: true });
-    await page.getByRole("button", { name: "Set up a connection" }).click();
+    const connectionLauncher = page.getByRole("button", { name: "Connect an agent", exact: true });
+    if (width >= 1024) {
+      await page.getByRole("button", { name: "Minimize connection guide" }).click();
+      await expect(connectionLauncher).toBeFocused();
+    }
+    await connectionLauncher.click();
     const connection = page.getByRole("dialog", { name: "Connect an agent" });
     await expect(connection.getByLabel("AI tool", { exact: true })).toBeVisible();
     await connection.getByLabel("Access token", { exact: true }).click();
@@ -155,10 +166,8 @@ for (const width of [2560, 1440, 768, 375]) for (const dark of [false, true]) {
     await page.screenshot({ path: testInfo.outputPath("connection-setup.png"), fullPage: true });
     await page.keyboard.press("Escape");
     await expect(connection).not.toBeVisible();
-    await page.getByRole("button", { name: "Hide connection guide" }).click();
-    await expect(page.getByRole("button", { name: "Show connection guide" })).toBeFocused();
-    await page.getByRole("button", { name: "Show connection guide" }).click();
-    await expect(page.getByRole("button", { name: "Hide connection guide" })).toBeFocused();
+    await expect(connectionLauncher).toBeFocused();
+    await expect(page.getByTestId("home-connection-invitation")).toHaveAttribute("data-expanded", "false");
     await page.addInitScript(() => {
       const key = "akb.recentDocumentViews.v1:workspace-user";
       const views = JSON.parse(localStorage.getItem(key) || "[]");
@@ -206,6 +215,19 @@ for (const width of [2560, 1440, 768, 375]) for (const dark of [false, true]) {
       expect((await page.locator("#workspace-navigation").boundingBox())!.y).toBe(96);
       await page.getByRole("button", { name: "Expand sidebar", exact: true }).click();
       await expect(page.getByTestId("app-sidebar")).toHaveAttribute("data-compact", "false");
+      if (width < 1920) {
+        // Expanded workspace navigation leaves too little reading space for
+        // two inline rails, so vault navigation becomes a dismissible drawer.
+        const navigationTrigger = page.getByRole("button", { name: "Open vault navigation", exact: true });
+        await expect(navigationTrigger).toBeVisible();
+        await navigationTrigger.click();
+        await expect(vaultList).toBeVisible();
+        await page.keyboard.press("Escape");
+        await expect(vaultList).toBeHidden();
+        await expect(navigationTrigger).toBeFocused();
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+        return;
+      }
       await expect.poll(async () => (await vaultList.boundingBox())!.x).toBe(208);
       await page.getByRole("button", { name: "Collapse sidebar", exact: true }).click();
       await expect.poll(async () => (await vaultList.boundingBox())!.x).toBe(56);
@@ -219,7 +241,8 @@ for (const width of [2560, 1440, 768, 375]) for (const dark of [false, true]) {
       await page.keyboard.press("Escape");
       const identity = (await page.locator('[data-slot="vault-identity-header"]').boundingBox())!;
       expect((await vaultList.getByRole("button", { name: "New vault", exact: true }).boundingBox())!.y).toBeGreaterThanOrEqual(identity.y + identity.height);
-      await page.getByRole("button", { name: "Show collection tree", exact: true }).click();
+      await page.getByRole("button", { name: "Collapse collections", exact: true }).click();
+      await page.getByRole("button", { name: "Expand collections", exact: true }).click();
       const nav = page.locator("#vault-workspace-navigation");
       const bounds = (await nav.boundingBox())!;
       expect(bounds.y).toBe(0);
@@ -235,7 +258,7 @@ for (const width of [2560, 1440, 768, 375]) for (const dark of [false, true]) {
       await page.mouse.up();
       await expect.poll(async () => (await page.getByRole("separator", { name: "Resize tree panel" }).boundingBox())!.x).toBeGreaterThan(handle.x + 20);
       await page.screenshot({ path: testInfo.outputPath("vault-full-height-navigation.png"), fullPage: true });
-      const titleRow = page.locator('nav[aria-label="Breadcrumb"]').locator("..");
+      const titleRow = page.getByRole("navigation", { name: "Vault sections", exact: true });
       const titleBottom = (await titleRow.boundingBox())!;
       for (const selector of ['[data-slot="vault-management-row"]', '[data-slot="collection-management-row"]']) {
         const row = (await page.locator(selector).boundingBox())!;

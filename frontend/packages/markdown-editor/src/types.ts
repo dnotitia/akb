@@ -106,6 +106,29 @@ export interface MarkdownSearchContext {
   signal?: AbortSignal
 }
 
+/**
+ * Product policy for link destinations. The editor owns when this function is
+ * called; products own any resource-specific canonicalization.
+ */
+export type MarkdownLinkUrlNormalizer = (raw: string) => string | null
+
+export interface MarkdownLinkLabels {
+  insertButton: string
+  editButton: string
+  saveButton: string
+  insertTitle: string
+  editTitle: string
+  description: string
+  url: string
+  text: string
+  textPlaceholder: string
+  textHint: string
+  cancel: string
+  remove: string
+  close: string
+  invalidUrl: string
+}
+
 export interface MarkdownTargetResolver {
   resolve(
     target: string,
@@ -131,6 +154,8 @@ export interface MarkdownSlashContext {
   position: number
 }
 
+export type MarkdownHeadingLevel = 1 | 2 | 3
+
 export interface MarkdownEditorConfig extends MarkdownParseOptions {
   initialMarkdown?: string
   editable?: boolean
@@ -144,13 +169,44 @@ export interface MarkdownCommands {
   setMarkdown(markdown: string): boolean
   insertMarkdown(markdown: string): boolean
   insertImage(target: string, alt?: string, title?: string): boolean
+  setLink(href: string): boolean
+  insertLink(text: string, href: string): boolean
+  unsetLink(): boolean
+  setParagraph(): boolean
+  toggleHeading(level: MarkdownHeadingLevel): boolean
   toggleBold(): boolean
   toggleItalic(): boolean
+  toggleStrike(): boolean
+  toggleCode(): boolean
   toggleBulletList(): boolean
   toggleOrderedList(): boolean
+  toggleBlockquote(): boolean
+  toggleCodeBlock(): boolean
+  setHorizontalRule(): boolean
   undo(): boolean
   redo(): boolean
   focus(position?: FocusPosition): boolean
+}
+
+export interface MarkdownActiveState {
+  paragraph: boolean
+  heading1: boolean
+  heading2: boolean
+  heading3: boolean
+  bold: boolean
+  italic: boolean
+  strike: boolean
+  code: boolean
+  bulletList: boolean
+  orderedList: boolean
+  blockquote: boolean
+  codeBlock: boolean
+  link: boolean
+}
+
+export interface MarkdownLinkState {
+  active: boolean
+  href: string
 }
 
 export interface MarkdownSelectionState {
@@ -162,6 +218,8 @@ export interface MarkdownState {
   markdown: string
   isEmpty: boolean
   isEditable: boolean
+  active: MarkdownActiveState
+  link: MarkdownLinkState
   canUndo: boolean
   canRedo: boolean
   selection: MarkdownSelectionState

@@ -60,6 +60,7 @@ type FixtureState = {
     document_uri?: string;
   };
   document?: FixtureDocument;
+  created_documents?: Array<FixtureDocument & { path: string; uri: string }>;
   refetch_generation?: number;
   expire_draft_generation?: number;
   faults?: { save?: number; upload?: number };
@@ -116,6 +117,11 @@ function documentForState(): typeof baseDocument {
   return remote
     ? { ...template, ...remote }
     : { ...template };
+}
+
+function documentForPath(path: string): typeof baseDocument {
+  const created = fixtureState.created_documents?.find((document) => document.path === path);
+  return created ? { ...baseDocument, ...created } : documentForState();
 }
 
 function isDocumentScenario(): boolean {
@@ -293,7 +299,7 @@ const handlers = [
       member_count: 1,
       owner_display_name: "JY Kim",
       collection_count: 1,
-      document_count: 1,
+      document_count: 1 + (fixtureState.created_documents?.length ?? 0),
       table_count: 0,
       file_count: 0,
       edge_count: 0,
@@ -310,6 +316,11 @@ const handlers = [
       items: [
         { type: "collection", name: "notes", path: "notes", doc_count: 1 },
         { type: "document", name: documentForState().title, path: documentForState().path },
+        ...(fixtureState.created_documents ?? []).map((document) => ({
+          type: "document",
+          name: document.title,
+          path: document.path,
+        })),
       ],
     });
   }),
@@ -328,7 +339,38 @@ const handlers = [
         });
       }
     }
-    return HttpResponse.json(documentForState());
+    const path = decodeURIComponent(new URL(request.url).pathname.split("/documents/fixture/")[1] || "");
+    return HttpResponse.json(documentForPath(path));
+  }),
+  http.post(`${API}/documents`, async ({ request }) => {
+    await syncPublicReset();
+    if (!isDocumentScenario()) {
+      return HttpResponse.json({ error: "document_fixture_unavailable" }, { status: 404 });
+    }
+    const body = await jsonBody(request);
+    try {
+      const response = await fetch("/__akb_mock__/fixture/create-document", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({ error: "fixture_create_failed" }));
+        return HttpResponse.json(error, { status: response.status });
+      }
+      const created = await response.json() as { document: FixtureDocument & { path: string; uri: string } };
+      return HttpResponse.json({
+        kind: "document_write",
+        uri: created.document.uri,
+        vault: "fixture",
+        path: created.document.path,
+        current_commit: created.document.current_commit,
+        commit_hash: created.document.current_commit,
+        action: "created",
+      }, { status: 201 });
+    } catch {
+      return HttpResponse.json({ error: "fixture_create_failed" }, { status: 503 });
+    }
   }),
   http.patch(/\/api\/v1\/documents\/fixture\/.+$/, async ({ request }) => {
     await syncPublicReset();
@@ -373,9 +415,10 @@ const handlers = [
       return HttpResponse.json({ error: "fixture_commit_failed" }, { status: 503 });
     }
   }),
-  http.get(/\/api\/v1\/history\/fixture\/.+$/, async () => {
+  http.get(/\/api\/v1\/history\/fixture\/.+$/, async ({ request }) => {
     await syncPublicReset();
-    const document = documentForState();
+    const path = decodeURIComponent(new URL(request.url).pathname.split("/history/fixture/")[1] || "");
+    const document = documentForPath(path);
     return HttpResponse.json({
       kind: "document_history",
       uri: document.uri || baseDocument.uri,
@@ -390,9 +433,10 @@ const handlers = [
       ],
     });
   }),
-  http.get(`${API}/relations`, async () => {
+  http.get(`${API}/relations`, async ({ request }) => {
     await syncPublicReset();
-    return HttpResponse.json({ uri: documentForState().uri, relations: [] });
+    const requestedUri = new URL(request.url).searchParams.get("uri");
+    return HttpResponse.json({ uri: requestedUri || documentForState().uri, relations: [] });
   }),
   http.post(`${API}/assets/fixture`, async ({ request }) => {
     await syncPublicReset();

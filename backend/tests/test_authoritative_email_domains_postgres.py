@@ -195,6 +195,53 @@ async def test_invite_only_adopts_on_declared_domain(pool):
     # test_adopt_clears_a_prior_pending_admission below).
 
 
+async def test_adopt_guard_refuses_before_any_write_without_flip(pool):
+    """The issuer-binding guard refuses before any write, leaving no flip.
+
+    Pre-bind the TARGET to this issuer (not the subject): the guard raises
+    before the UPDATE, so the target keeps its prior provider, gains no
+    binding, emits no adopt event, and the arrival is kept for approval.
+    """
+    from app.services.auth_service import _resolve_or_provision_keycloak_user
+
+    email = f"auth-flip-{uuid.uuid4().hex[:8]}@{_DOMAIN}"
+    target_id = await _insert_unbound_user(pool, email)
+    subject = f"flip-{uuid.uuid4().hex}"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO external_identities (user_id, issuer, subject, email_snapshot)"
+            " VALUES ($1, $2, $3, $4)",
+            target_id,
+            _ISSUER,
+            f"flip-existing-{uuid.uuid4().hex}",
+            email,
+        )
+
+    # The target already carries a binding for this issuer, so the adopt
+    # guard refuses before any write: no flip, no new binding. The arrival
+    # IS recorded (failed adopts keep the note): pending == 1.
+    with pytest.raises(ExternalIdentityConflictError):
+        await _resolve_or_provision_keycloak_user(
+            _claims(subject, email), provider_alias=_ALIAS
+        )
+    async with pool.acquire() as conn:
+        assert await conn.fetchval("SELECT auth_provider FROM users WHERE id = $1", target_id) == "local"
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM external_identities WHERE user_id = $1 AND subject = $2",
+            target_id,
+            subject,
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM events WHERE kind = 'auth.user_adopted' AND actor_id = $1",
+            str(target_id),
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM pending_admissions WHERE issuer = $1 AND subject = $2",
+            _ISSUER,
+            subject,
+        ) == 1
+
+
 async def test_adopt_clears_a_prior_pending_admission(pool):
     from app.services.auth_service import _resolve_or_provision_keycloak_user
 

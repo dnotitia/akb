@@ -1,10 +1,12 @@
-import { render, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, waitFor, within } from '@testing-library/react'
 import { userEvent } from '@testing-library/user-event'
-import { useState } from 'react'
-import { describe, expect, it } from 'vitest'
+import { useEffect, useState } from 'react'
+import { describe, expect, it, vi } from 'vitest'
 
 import {
+  EditorContent,
   MarkdownEditor,
+  MarkdownEditingSurface,
   MarkdownViewer,
   useMarkdownCommands,
   useMarkdownEditor,
@@ -83,6 +85,159 @@ describe('React surfaces', () => {
     await waitFor(() => expect(container.querySelector('.ProseMirror')).toHaveTextContent('처음'))
     await userEvent.setup().click(getByRole('button', { name: 'update' }))
     await waitFor(() => expect(container.querySelector('.ProseMirror')).toHaveTextContent('외부 갱신'))
+  })
+
+  it('preserves selection and undo history across an unchanged mode roundtrip', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    let activeEditor: ReturnType<typeof useMarkdownEditor> = null
+
+    function ControlledSurface() {
+      const [markdown, setMarkdown] = useState('One two')
+      const editor = useMarkdownEditor({
+        initialMarkdown: 'One two',
+        onChange: (next, editor) => {
+          onChange(next, editor)
+          setMarkdown(next)
+        },
+      })
+      useEffect(() => {
+        activeEditor = editor
+      }, [editor])
+
+      return (
+        <MarkdownEditingSurface
+          editor={editor}
+          markdown={markdown}
+          onSourceChange={next => setMarkdown(next)}
+          toolbar={<button type="button">Formatting tool</button>}
+        >
+          {editor ? <EditorContent editor={editor} /> : null}
+        </MarkdownEditingSurface>
+      )
+    }
+
+    const { container } = render(<ControlledSurface />)
+    const view = within(container)
+    await waitFor(() => expect(activeEditor?.view).toBeTruthy())
+
+    const editor = activeEditor!
+    await act(async () => {
+      editor.commands.setTextSelection({ from: 2, to: 5 })
+      editor.commands.insertContent('!')
+    })
+    const before = {
+      from: editor.state.selection.from,
+      to: editor.state.selection.to,
+    }
+    const markdownBefore = editor.getMarkdown()
+    const changeCountBefore = onChange.mock.calls.length
+    expect(editor.can().undo()).toBe(true)
+
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    expect(view.getByRole('textbox', { name: 'Markdown source' })).toHaveValue(markdownBefore)
+    await user.click(view.getByRole('button', { name: 'WYSIWYG' }))
+
+    expect(editor.state.selection).toMatchObject(before)
+    expect(editor.can().undo()).toBe(true)
+    expect(onChange).toHaveBeenCalledTimes(changeCountBefore)
+
+    await act(async () => {
+      editor.commands.undo()
+    })
+    expect(editor.getMarkdown()).not.toBe(markdownBefore)
+  })
+
+  it('edits the same Markdown draft in Source and reflects external values and readOnly', async () => {
+    const user = userEvent.setup()
+    const onSlash = vi.fn()
+    const sourceChanges = vi.fn()
+    let activeEditor: ReturnType<typeof useMarkdownEditor> = null
+
+    function ControlledSurface() {
+      const [markdown, setMarkdown] = useState('# Original')
+      const [readOnly, setReadOnly] = useState(false)
+      const editor = useMarkdownEditor({
+        initialMarkdown: '# Original',
+        editable: !readOnly,
+        onChange: setMarkdown,
+        onSlash,
+      })
+      useEffect(() => {
+        activeEditor = editor
+      }, [editor])
+
+      return (
+        <>
+          <button type="button" onClick={() => setMarkdown('**External body**')}>
+            Set external body
+          </button>
+          <button type="button" onClick={() => setReadOnly(value => !value)}>
+            Toggle read only
+          </button>
+          <output data-testid="markdown-value">{markdown}</output>
+          <MarkdownEditingSurface
+            editor={editor}
+            markdown={markdown}
+            readOnly={readOnly}
+            onSourceChange={(next, editor) => {
+              sourceChanges(next, editor)
+              setMarkdown(next)
+            }}
+            sourceLabel="Markdown source"
+            toolbar={<button type="button">Formatting tool</button>}
+          >
+            {editor ? <EditorContent editor={editor} /> : null}
+          </MarkdownEditingSurface>
+        </>
+      )
+    }
+
+    const { container } = render(<ControlledSurface />)
+    const view = within(container)
+    await waitFor(() => expect(activeEditor?.view).toBeTruthy())
+    const editor = activeEditor!
+
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    const source = view.getByRole('textbox', { name: 'Markdown source' })
+    expect(source).toHaveValue('# Original')
+    expect(view.queryByRole('button', { name: 'Formatting tool' })).not.toBeInTheDocument()
+    await user.type(source, '/')
+    expect(onSlash).not.toHaveBeenCalled()
+    const editedMarkdown = '## Edited\n\n![diagram](/api/assets/00000000-0000-4000-8000-000000000001)\n\n<!-- keep -->'
+    fireEvent.compositionStart(source)
+    fireEvent.change(source, { target: { value: editedMarkdown } })
+    fireEvent.compositionEnd(source, { data: 'keep' })
+    expect(source).toHaveValue(editedMarkdown)
+
+    expect(sourceChanges).toHaveBeenLastCalledWith(
+      editedMarkdown,
+      editor,
+    )
+    expect(onSlash).not.toHaveBeenCalled()
+    expect(view.getByTestId('markdown-value')).toHaveTextContent('<!-- keep -->')
+
+    await user.click(view.getByRole('button', { name: 'WYSIWYG' }))
+    expect(editor).toBe(activeEditor)
+    expect(container.querySelector('h2')).toHaveTextContent('Edited')
+    expect(container.querySelector('img')).toHaveAttribute(
+      'data-markdown-target',
+      '/api/assets/00000000-0000-4000-8000-000000000001',
+    )
+    expect(editor.getMarkdown()).toContain('<!-- keep -->')
+
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    await user.click(view.getByRole('button', { name: 'Set external body' }))
+    expect(view.getByRole('textbox', { name: 'Markdown source' })).toHaveValue('**External body**')
+    await user.click(view.getByRole('button', { name: 'Toggle read only' }))
+    const readOnlySource = view.getByRole('textbox', { name: 'Markdown source' })
+    expect(readOnlySource).toHaveProperty('readOnly', true)
+    await user.click(view.getByRole('button', { name: 'WYSIWYG' }))
+    await waitFor(() =>
+      expect(container.querySelector('.ProseMirror')).toHaveAttribute('contenteditable', 'false'),
+    )
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    expect(view.getByRole('textbox', { name: 'Markdown source' })).toHaveProperty('readOnly', true)
   })
 
   it('applies runtime URLs without changing the canonical image target', async () => {

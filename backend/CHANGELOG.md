@@ -197,6 +197,20 @@ Every `tools/call` now leaves one line on the `akb.mcp.response` logger with
 the tool name, the serialised response size in bytes and the call duration, so
 payload cost is measurable per tool without a schema change.
 
+### Reduced pgvector posting lookup overhead
+
+Fresh pgvector stores use covering indexes for sparse weights and resource
+scope lookups. Existing indexes are left unchanged at startup; an optional
+concurrent-index maintenance script supports posting-store upgrades. Search
+logs now separate embedding, candidate selection, retrieval, reranking and
+hydration, with pgvector leg and pool-wait timings that omit query/result data.
+Explicitly empty pgvector scopes return no results instead of scanning the
+whole index. Source-ID-filtered sparse retrieval materializes its authorized
+chunk set before joining common posting lists, bounding the join without
+changing BM25 terms or scores; wide vault filters retain the direct join. Local
+synthetic benchmarks and real-pgvector tests check ranking and scope parity; see
+`docs/designs/search-performance.md` for limitations.
+
 ### Applied search filters before result limits
 
 REST search now supports repeated document types and explicit resource kinds.

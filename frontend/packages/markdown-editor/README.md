@@ -2,8 +2,9 @@
 
 `@akb/markdown-editor` is the product-neutral Tiptap Markdown core shared by AKB and Reef.
 It owns the document schema, Markdown parsing/serialization, editor/viewer surfaces, commands,
-state hooks, and the conformance contract. It does not own product UI, storage, search, uploads,
-permissions, product-specific UI, or collaboration.
+state hooks, the default formatting/link controls, shared document/file search UI, and the
+conformance contract. Products still own storage, permissions, search adapters and context, copy,
+and product-specific URL policy.
 
 The package is built against the exact Tiptap `3.31.3` package set and React 19.
 
@@ -12,9 +13,12 @@ The package is built against the exact Tiptap `3.31.3` package set and React 19.
 ```tsx
 import {
   MarkdownEditor,
+  MarkdownEditingSurface,
   MarkdownViewer,
+  MarkdownToolbar,
   canonicalizeMarkdown,
   parseMarkdown,
+  serializeEditorMarkdown,
   serializeMarkdown,
   useMarkdownCommands,
   useMarkdownState,
@@ -31,6 +35,104 @@ function Document({ markdown, onChange }) {
   )
 }
 ```
+
+`MarkdownEditor` includes a `WYSIWYG` / `Source` switch for the same Markdown
+draft. Source opens from the current editor body, and Source edits emit raw
+Markdown through `onChange`; the shared editor stays mounted, and formatting,
+link search, and slash handlers remain attached to the WYSIWYG surface.
+`serializeEditorMarkdown(editor, { profile: 'preserve' })` reads the current
+editor body and omits the terminal empty paragraph that Tiptap keeps as an
+editing caret after an atomic block.
+
+Products with a custom editor instance and toolbar can compose the same public
+surface from the `/react` entry point:
+
+```tsx
+import {
+  EditorContent,
+  MarkdownEditingSurface,
+  MarkdownToolbar,
+  useMarkdownEditor,
+} from '@akb/markdown-editor/react'
+
+function ProductEditor({ markdown, onChange, readOnly }) {
+  const editor = useMarkdownEditor({
+    initialMarkdown: markdown,
+    editable: !readOnly,
+    onChange,
+  })
+
+  return (
+    <MarkdownEditingSurface
+      editor={editor}
+      markdown={markdown}
+      readOnly={readOnly}
+      toolbar={<MarkdownToolbar editor={editor} />}
+      onSourceChange={onChange}
+      modeLabels={{ group: 'Editor mode', source: 'Source' }}
+    >
+      <EditorContent editor={editor} />
+    </MarkdownEditingSurface>
+  )
+}
+```
+
+`MarkdownEditingSurface` owns mode switching, source input, external-value
+synchronization, and focus handoff. Its `toolbar` slot appears only in
+WYSIWYG mode; `modeLabels`, `sourceClassName`, and the source label props adapt
+copy, theme, and accessible names. `modeSwitchDisabled` can lock mode changes
+during an active product operation such as an upload. The optional
+`onWysiwygDragOverCapture` / `onWysiwygDropCapture` handlers attach product
+drag-and-drop behavior to the visual editor and its toolbar without affecting
+Source input. `onMarkdownApplied` is an optional product hook for schema-specific
+normalization after external or Source Markdown is applied. Products continue
+to own persistence, draft/OCC behavior, and asset-reference policy.
+
+`MarkdownToolbar` owns the default Paragraph, Heading 1–3, bold, italic,
+strikethrough, inline code, list, blockquote, code block, horizontal rule,
+link, and undo/redo controls. It reads the same editor state and commands as
+the editor, preserves the current selection while the link popup receives
+focus, restores the selection on cancel, validates before mutating, and
+exposes roving keyboard focus. Product-specific controls can be appended as
+children; use `MarkdownToolbarGroup` and `MarkdownToolbarButton` so they
+participate in the same toolbar navigation.
+
+```tsx
+<MarkdownToolbar
+  editor={editor}
+  link={{
+    normalizeUrl: productNormalizeUrl,
+    searchAdapter: productSearchAdapter,
+    searchContext: { vault: activeVault },
+    searchLabels: {
+      inputLabel: 'Search Vault resources',
+      empty: 'No matching documents or files found.',
+    },
+    searchClassName: 'space-y-2',
+  }}
+>
+  <MarkdownToolbarGroup label="Insert">
+    {/* Product-specific table/upload controls can stay here. */}
+  </MarkdownToolbarGroup>
+</MarkdownToolbar>
+```
+
+`MarkdownCommands` exposes `setLink`, `insertLink`, and `unsetLink`, while
+`MarkdownState.active.link` and `MarkdownState.link.href` expose the current
+link state. `MarkdownLinkPopup` is also public for consumers that need a
+different toolbar composition. `normalizeUrl` is the product seam for
+canonical targets and link policy; returning `null` leaves the popup open,
+shows the configured error, and keeps focus in the URL field. Provide a
+`MarkdownSearchAdapter` to enable shared document/file search. The popup calls
+`search(query, context)` as the query changes, passing the product context and
+an `AbortSignal`; cancellation, popup close, query changes, and context changes
+discard late results. Loading, empty, and error states are distinct. Candidates
+can be selected with the pointer or ArrowUp/ArrowDown + Enter; selection fills
+the existing link text and URL fields, and the popup's existing Apply action
+performs the Markdown edit. Product-specific text is provided through
+`searchLabels`, and `searchClassName` can tune the search region within the
+product's design system. Search results must return canonical
+`MarkdownSearchResult.target` values, never signed or runtime URLs.
 
 Use `profile="structured"` for CommonMark + GFM structure editing. The default `preserve` profile
 adds explicit raw HTML/MDX nodes while keeping math and Mermaid fences as semantic nodes. Both
@@ -83,6 +185,16 @@ directory outside this package. The scripted composition check is not a substitu
 with a physical OS IME.
 
 ## Versioning
+
+The `0.5.0` public contract adds common document/file search UI to
+`MarkdownToolbar.link`, including `searchAdapter`, `searchContext`,
+`searchLabels`, and `searchClassName`. It removes the former `searchSlot` API;
+products provide a `MarkdownSearchAdapter` and context instead of implementing
+search controls inside the popup. Consumers continue to provide their URL
+policy through `MarkdownToolbar.link.normalizeUrl`.
+
+The `0.4.0` public contract adds the shared link command/state contract and
+`MarkdownLinkPopup`.
 
 The `0.2.0` public contract adds canonical resource targets. Consumers should pin one exact package version, store the
 Markdown returned by `onChange` or `editor.getMarkdown()` as the canonical representation, and

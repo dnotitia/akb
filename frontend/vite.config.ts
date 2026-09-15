@@ -26,6 +26,16 @@ type MockFixtureDocument = {
   updated_at: string;
 };
 
+type MockCreatedDocument = MockFixtureDocument & {
+  path: string;
+  uri: string;
+  collection: string;
+  type: string;
+  summary?: string | null;
+  domain?: string | null;
+  tags: string[];
+};
+
 type MockFixtureAsset = {
   id: string;
   filename: string;
@@ -35,6 +45,7 @@ type MockFixtureAsset = {
 
 type MockFixtureState = {
   remote_document: MockFixtureDocument | null;
+  created_documents: MockCreatedDocument[];
   refetch_generation: number;
   expire_draft_generation: number;
   faults: { save: number; upload: number };
@@ -63,6 +74,7 @@ function createMockFixtureState(): MockFixtureState {
     : [];
   return {
     remote_document: null,
+    created_documents: [],
     refetch_generation: 0,
     expire_draft_generation: 0,
     faults: { save: 0, upload: 0 },
@@ -117,6 +129,7 @@ function fixtureStateSnapshot() {
       actors: ["editor-a", "editor-b"],
     },
     document,
+    created_documents: mockFixtureState.created_documents,
     refetch_generation: mockFixtureState.refetch_generation,
     expire_draft_generation: mockFixtureState.expire_draft_generation,
     faults: mockFixtureState.faults,
@@ -324,6 +337,42 @@ function mockControlPlugin(): Plugin {
         }
         if (pathname === "/__akb_mock__/fixture/state" && request.method === "GET") {
           response.end(JSON.stringify(fixtureStateSnapshot()));
+          return;
+        }
+        if (pathname === "/__akb_mock__/fixture/create-document" && request.method === "POST") {
+          void readJsonBody(request).then((body) => {
+            const title = typeof body.title === "string" ? body.title.trim() : "Untitled document";
+            const collection = typeof body.collection === "string" ? body.collection.trim() : "";
+            const slug = title
+              .normalize("NFC")
+              .toLowerCase()
+              .replace(/[^a-z0-9]+/g, "-")
+              .replace(/^-+|-+$/g, "") || "untitled";
+            const path = collection ? `${collection}/${slug}.md` : `${slug}.md`;
+            const uri = collection
+              ? `akb://fixture/coll/${collection}/doc/${slug}.md`
+              : `akb://fixture/doc/${slug}.md`;
+            const document: MockCreatedDocument = {
+              ...mockDocumentFromBody(body),
+              path,
+              uri,
+              collection,
+              type: typeof body.type === "string" ? body.type : "note",
+              summary: typeof body.summary === "string" ? body.summary : null,
+              domain: typeof body.domain === "string" ? body.domain : null,
+              tags: Array.isArray(body.tags)
+                ? body.tags.filter((tag): tag is string => typeof tag === "string")
+                : [],
+            };
+            mockFixtureState.created_documents.push(document);
+            const referencedAssetIds = typeof body.content === "string"
+              ? new Set([...body.content.matchAll(/\/api\/assets\/([A-Za-z0-9-]+)/g)].map((match) => match[1]))
+              : new Set<string>();
+            for (const asset of mockFixtureState.assets) {
+              if (asset.status === "unclaimed" && referencedAssetIds.has(asset.id)) asset.status = "claimed";
+            }
+            response.end(JSON.stringify({ status: "ready", document }));
+          });
           return;
         }
         if (pathname === "/__akb_mock__/fixture/remote-revision" && request.method === "POST") {

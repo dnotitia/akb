@@ -2,41 +2,32 @@ import * as React from "react";
 import { createPortal } from "react-dom";
 import {
   EditorContent,
+  MarkdownEditingSurface,
+  MarkdownToolbar,
+  MarkdownToolbarButton,
+  MarkdownToolbarGroup,
   useMarkdownCommands,
   useMarkdownEditor,
-  useMarkdownState,
   useMarkdownTargetResolutions,
+  type MarkdownLinkSearchLabels,
 } from "@akb/markdown-editor/react";
-import { serializeMarkdown } from "@akb/markdown-editor";
 import {
-  Bold,
-  Code,
-  Code2,
+  extractMarkdownTargets,
+  serializeEditorMarkdown,
+} from "@akb/markdown-editor";
+import {
   Columns2,
   Columns3,
   CornerDownLeft,
-  Heading1,
-  Heading2,
-  Heading3,
   ImagePlus,
-  Italic,
-  Link2,
-  List,
-  ListOrdered,
   Loader2,
-  Minus,
-  Pilcrow,
   Pencil,
-  Quote,
-  Redo2,
   Replace,
   RotateCcw,
   Rows2,
   Rows3,
-  Strikethrough,
   Table as TableIcon,
   Trash2,
-  Undo2,
   X,
 } from "lucide-react";
 import { Alert } from "@/components/ui/alert";
@@ -83,31 +74,6 @@ function invokeCommand(
   return command ? Reflect.apply(command, editor.commands, args) : false;
 }
 
-function isEmptyParagraph(
-  node: { type?: string; content?: unknown[] } | undefined,
-): boolean {
-  return (
-    node?.type === "paragraph" && (!node.content || node.content.length === 0)
-  );
-}
-
-/**
- * Tiptap keeps an editor-only paragraph after atomic terminal blocks. The
- * shared serializer owns the Markdown format, so only remove that sentinel
- * from the value sent to the product persistence contract.
- */
-function serializeEditorMarkdown(editor: MarkdownEditorInstance): string {
-  const document = editor.getJSON();
-  if (
-    document.content &&
-    document.content.length > 1 &&
-    isEmptyParagraph(document.content.at(-1))
-  ) {
-    document.content = document.content.slice(0, -1);
-  }
-  return serializeMarkdown(document, { profile: "preserve" });
-}
-
 function imageAssetIds(editor: MarkdownEditorInstance): string[] {
   const ids = new Set<string>();
 
@@ -134,6 +100,16 @@ function imageAssetIds(editor: MarkdownEditorInstance): string[] {
   };
 
   visit(editor.getJSON());
+  return [...ids];
+}
+
+function imageAssetIdsFromMarkdown(markdown: string): string[] {
+  const ids = new Set<string>();
+  for (const target of extractMarkdownTargets(markdown)) {
+    if (target.kind !== "attachment") continue;
+    const id = assetIdFromUrl(target.target);
+    if (id) ids.add(id);
+  }
   return [...ids];
 }
 
@@ -873,47 +849,10 @@ function TableActions({
   );
 }
 
-interface RibbonButtonProps {
-  label: string;
-  active?: boolean;
-  disabled?: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}
-
-function RibbonButton({
-  label,
-  active,
-  disabled,
-  onClick,
-  children,
-}: RibbonButtonProps) {
-  return (
-    <button
-      type="button"
-      aria-label={label}
-      aria-pressed={active}
-      disabled={disabled}
-      tabIndex={-1}
-      data-editor-toolbar-button
-      title={label}
-      onMouseDown={(event) => event.preventDefault()}
-      onClick={onClick}
-      className={cn(
-        "inline-flex h-8 w-8 items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:opacity-50",
-        active && "bg-surface-selected text-surface-selected-foreground",
-      )}
-    >
-      <span aria-hidden="true" className="contents">
-        {children}
-      </span>
-    </button>
-  );
-}
-
 interface EditorToolbarProps {
   editor: MarkdownEditorInstance | null;
   searchAdapter?: ReturnType<typeof createAkbMarkdownAdapters>["search"];
+  vault: string;
   uploadingImage: boolean;
   onChooseImages: (files: File[]) => void;
   onOpenImagePicker: () => void;
@@ -924,168 +863,23 @@ interface EditorToolbarProps {
 function EditorToolbar({
   editor,
   searchAdapter,
+  vault,
   uploadingImage,
   onChooseImages,
   onOpenImagePicker,
   appearance,
   imageInputRef,
 }: EditorToolbarProps) {
-  const state = useMarkdownState(editor);
-  const commands = useMarkdownCommands(editor);
-  const toolbarRef = React.useRef<HTMLDivElement>(null);
-  const [linkOpen, setLinkOpen] = React.useState(false);
-  const [linkUrl, setLinkUrl] = React.useState("");
-  const [linkText, setLinkText] = React.useState("");
-  const [linkError, setLinkError] = React.useState("");
-  const [referenceQuery, setReferenceQuery] = React.useState("");
-  const [referenceResults, setReferenceResults] = React.useState<
-    Awaited<
-      ReturnType<NonNullable<EditorToolbarProps["searchAdapter"]>["search"]>
-    >
-  >([]);
-  const [referenceSearching, setReferenceSearching] = React.useState(false);
-  const linkSelectionRef = React.useRef<{ from: number; to: number } | null>(
-    null,
-  );
-  const linkUrlInputRef = React.useRef<HTMLInputElement>(null);
-  const linkUrlId = React.useId();
-  const linkTextId = React.useId();
-  const referenceQueryId = React.useId();
-  const active = (name: string, attrs?: Record<string, unknown>) =>
-    Boolean(editor?.isActive(name, attrs));
-  const linkActive = active("link");
-  const toolbarGroupClass =
-    "inline-flex items-center gap-0.5 border-r border-border pr-1.5 last:border-r-0 last:pr-0";
-
-  const setBlock = (level: number) => {
-    if (!editor) return;
-    if (active("heading", { level })) invokeCommand(editor, "setParagraph");
-    else invokeCommand(editor, "toggleHeading", { level: level as 1 | 2 | 3 });
-  };
-
-  const openLinkEditor = () => {
-    if (!editor) return;
-    const { from, to } = editor.state.selection;
-    linkSelectionRef.current = { from, to };
-    setLinkUrl(String(editor.getAttributes("link").href ?? ""));
-    setLinkText(editor.state.doc.textBetween(from, to, " "));
-    setLinkError("");
-    setReferenceQuery("");
-    setReferenceResults([]);
-    setLinkOpen(true);
-  };
-
-  const searchReferences = async () => {
-    const query = referenceQuery.trim();
-    if (!searchAdapter || !query) return;
-    setReferenceSearching(true);
-    try {
-      setReferenceResults(await searchAdapter.search(query));
-    } finally {
-      setReferenceSearching(false);
-    }
-  };
-
-  const applyLink = () => {
-    if (!editor) return;
-    const normalizedUrl = normalizeEditorLinkUrl(linkUrl);
-    if (!normalizedUrl) {
-      setLinkError("Enter an http(s), email, phone, anchor, or relative URL.");
-      requestAnimationFrame(() => linkUrlInputRef.current?.focus());
-      return;
-    }
-    const selection = linkSelectionRef.current;
-    if (selection) invokeCommand(editor, "setTextSelection", selection);
-    const text = linkText.trim() || normalizedUrl;
-    invokeCommand(editor, "focus");
-    if (linkActive) {
-      invokeCommand(editor, "extendMarkRange", "link");
-      invokeCommand(editor, "setLink", { href: normalizedUrl });
-    } else if (selection && selection.from === selection.to) {
-      invokeCommand(editor, "insertContent", {
-        type: "text",
-        text,
-        marks: [{ type: "link", attrs: { href: normalizedUrl } }],
-      });
-    } else invokeCommand(editor, "setLink", { href: normalizedUrl });
-    setLinkOpen(false);
-  };
-
-  const removeCurrentLink = () => {
-    if (!editor) return;
-    if (linkSelectionRef.current)
-      invokeCommand(editor, "setTextSelection", linkSelectionRef.current);
-    invokeCommand(editor, "focus");
-    invokeCommand(editor, "extendMarkRange", "link");
-    invokeCommand(editor, "unsetLink");
-    setLinkOpen(false);
-  };
-
-  React.useLayoutEffect(() => {
-    const buttons = toolbarRef.current?.querySelectorAll<HTMLButtonElement>(
-      "button[data-editor-toolbar-button]:not(:disabled)",
-    );
-    if (
-      buttons?.length &&
-      !Array.from(buttons).some((button) => button.tabIndex === 0)
-    )
-      buttons[0].tabIndex = 0;
-  });
-
-  const handleToolbarKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (
-      !(event.target instanceof HTMLButtonElement) ||
-      !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)
-    )
-      return;
-    const buttons = Array.from(
-      toolbarRef.current?.querySelectorAll<HTMLButtonElement>(
-        "button[data-editor-toolbar-button]:not(:disabled)",
-      ) ?? [],
-    );
-    if (!buttons.length) return;
-    event.preventDefault();
-    const currentIndex = Math.max(
-      0,
-      buttons.indexOf(event.target as HTMLButtonElement),
-    );
-    const nextIndex =
-      event.key === "Home"
-        ? 0
-        : event.key === "End"
-          ? buttons.length - 1
-          : (currentIndex +
-              (event.key === "ArrowRight" ? 1 : -1) +
-              buttons.length) %
-            buttons.length;
-    buttons.forEach((button) => {
-      button.tabIndex = -1;
-    });
-    buttons[nextIndex].tabIndex = 0;
-    buttons[nextIndex].focus();
-  };
-
   return (
-    <div
-      ref={toolbarRef}
-      contentEditable={false}
-      role="toolbar"
-      aria-label="Text formatting"
-      aria-orientation="horizontal"
-      onFocusCapture={(event) => {
-        if (!(event.target instanceof HTMLButtonElement)) return;
-        const target = event.target;
-        toolbarRef.current
-          ?.querySelectorAll<HTMLButtonElement>(
-            "button[data-editor-toolbar-button]",
-          )
-          .forEach((button) => {
-            button.tabIndex = button === target ? 0 : -1;
-          });
+    <MarkdownToolbar
+      editor={editor}
+      link={{
+        normalizeUrl: normalizeEditorLinkUrl,
+        searchAdapter,
+        searchContext: { vault },
+        searchLabels: AKB_MARKDOWN_SEARCH_LABELS,
       }}
-      onKeyDown={handleToolbarKeyDown}
       className={cn(
-        "sticky top-0 z-10 flex flex-wrap items-center gap-1.5 border-b border-border select-none",
         appearance === "canvas"
           ? "bg-surface/95 px-5 py-2 backdrop-blur-sm sm:px-8 lg:px-10"
           : appearance === "workspace"
@@ -1093,127 +887,8 @@ function EditorToolbar({
             : "rounded-t-[var(--radius-sm)] bg-surface px-2 py-1.5",
       )}
     >
-      <div className={toolbarGroupClass} role="group" aria-label="Block type">
-        <RibbonButton
-          label="Paragraph"
-          active={active("paragraph")}
-          disabled={!editor}
-          onClick={() => editor && invokeCommand(editor, "setParagraph")}
-        >
-          <Pilcrow className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
-          label="Heading 1"
-          active={active("heading", { level: 1 })}
-          disabled={!editor}
-          onClick={() => setBlock(1)}
-        >
-          <Heading1 className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
-          label="Heading 2"
-          active={active("heading", { level: 2 })}
-          disabled={!editor}
-          onClick={() => setBlock(2)}
-        >
-          <Heading2 className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
-          label="Heading 3"
-          active={active("heading", { level: 3 })}
-          disabled={!editor}
-          onClick={() => setBlock(3)}
-        >
-          <Heading3 className="h-4 w-4" />
-        </RibbonButton>
-      </div>
-      <div className={toolbarGroupClass} role="group" aria-label="Marks">
-        <RibbonButton
-          label="Bold"
-          active={active("bold")}
-          disabled={!editor}
-          onClick={() => commands.toggleBold()}
-        >
-          <Bold className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
-          label="Italic"
-          active={active("italic")}
-          disabled={!editor}
-          onClick={() => commands.toggleItalic()}
-        >
-          <Italic className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
-          label="Strikethrough"
-          active={active("strike")}
-          disabled={!editor}
-          onClick={() => editor && invokeCommand(editor, "toggleStrike")}
-        >
-          <Strikethrough className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
-          label="Inline code"
-          active={active("code")}
-          disabled={!editor}
-          onClick={() => editor && invokeCommand(editor, "toggleCode")}
-        >
-          <Code className="h-4 w-4" />
-        </RibbonButton>
-      </div>
-      <div className={toolbarGroupClass} role="group" aria-label="Lists">
-        <RibbonButton
-          label="Bulleted list"
-          active={active("bulletList")}
-          disabled={!editor}
-          onClick={() => commands.toggleBulletList()}
-        >
-          <List className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
-          label="Numbered list"
-          active={active("orderedList")}
-          disabled={!editor}
-          onClick={() => commands.toggleOrderedList()}
-        >
-          <ListOrdered className="h-4 w-4" />
-        </RibbonButton>
-      </div>
-      <div className={toolbarGroupClass} role="group" aria-label="Blocks">
-        <RibbonButton
-          label="Blockquote"
-          active={active("blockquote")}
-          disabled={!editor}
-          onClick={() => editor && invokeCommand(editor, "toggleBlockquote")}
-        >
-          <Quote className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
-          label="Code block"
-          active={active("codeBlock")}
-          disabled={!editor}
-          onClick={() => editor && invokeCommand(editor, "toggleCodeBlock")}
-        >
-          <Code2 className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
-          label="Horizontal rule"
-          disabled={!editor}
-          onClick={() => editor && invokeCommand(editor, "setHorizontalRule")}
-        >
-          <Minus className="h-4 w-4" />
-        </RibbonButton>
-      </div>
-      <div className={toolbarGroupClass} role="group" aria-label="Insert">
-        <RibbonButton
-          label={linkActive ? "Edit link" : "Insert link"}
-          active={linkActive}
-          disabled={!editor}
-          onClick={openLinkEditor}
-        >
-          <Link2 className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
+      <MarkdownToolbarGroup label="Insert">
+        <MarkdownToolbarButton
           label="Insert table"
           disabled={!editor}
           onClick={() => {
@@ -1228,8 +903,8 @@ function EditorToolbar({
           }}
         >
           <TableIcon className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
+        </MarkdownToolbarButton>
+        <MarkdownToolbarButton
           label={uploadingImage ? "Uploading image" : "Insert image"}
           disabled={!editor || uploadingImage}
           onClick={onOpenImagePicker}
@@ -1239,7 +914,7 @@ function EditorToolbar({
           ) : (
             <ImagePlus className="h-4 w-4" />
           )}
-        </RibbonButton>
+        </MarkdownToolbarButton>
         <input
           ref={imageInputRef}
           type="file"
@@ -1253,167 +928,23 @@ function EditorToolbar({
             if (files.length) onChooseImages(files);
           }}
         />
-      </div>
-      <div className={toolbarGroupClass} role="group" aria-label="History">
-        <RibbonButton
-          label="Undo"
-          disabled={!editor || !state?.canUndo}
-          onClick={() => commands.undo()}
-        >
-          <Undo2 className="h-4 w-4" />
-        </RibbonButton>
-        <RibbonButton
-          label="Redo"
-          disabled={!editor || !state?.canRedo}
-          onClick={() => commands.redo()}
-        >
-          <Redo2 className="h-4 w-4" />
-        </RibbonButton>
-      </div>
-      <Dialog open={linkOpen} onOpenChange={setLinkOpen}>
-        <DialogContent
-          className="sm:max-w-md"
-          onCloseAutoFocus={(event) => {
-            event.preventDefault();
-            if (editor && !editor.isDestroyed) editor.commands.focus();
-          }}
-        >
-          <DialogHeader>
-            <DialogTitle>
-              {linkActive ? "Edit link" : "Insert link"}
-            </DialogTitle>
-            <DialogDescription>
-              Add a safe destination and choose the text readers will see.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4">
-            {searchAdapter && (
-              <div className="space-y-2">
-                <Label htmlFor={referenceQueryId}>Search Vault resources</Label>
-                <div className="flex gap-2">
-                  <Input
-                    id={referenceQueryId}
-                    value={referenceQuery}
-                    onChange={(event) => setReferenceQuery(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        event.preventDefault();
-                        void searchReferences();
-                      }
-                    }}
-                    placeholder="Find a document or file"
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => void searchReferences()}
-                    disabled={referenceSearching || !referenceQuery.trim()}
-                  >
-                    {referenceSearching ? "Searching…" : "Search"}
-                  </Button>
-                </div>
-                {referenceResults.length > 0 && (
-                  <div
-                    role="listbox"
-                    aria-label="Vault resource results"
-                    className="max-h-40 overflow-y-auto rounded-[var(--radius-md)] border border-border"
-                  >
-                    {referenceResults.map((result) => (
-                      <button
-                        key={result.id}
-                        type="button"
-                        role="option"
-                        aria-label={`${result.title} (${result.kind ?? "resource"})`}
-                        className="flex w-full flex-col items-start gap-0.5 border-b border-border px-3 py-2 text-left last:border-b-0 hover:bg-surface-hover focus-visible:bg-surface-hover focus-visible:outline-none"
-                        onMouseDown={(event) => event.preventDefault()}
-                        onClick={() => {
-                          setLinkUrl(result.target);
-                          setLinkText(result.title);
-                          setReferenceResults([]);
-                        }}
-                      >
-                        {result.title}
-                        <span className="text-xs text-foreground-muted">
-                          {result.kind ?? "resource"}
-                          {result.snippet ? ` · ${result.snippet}` : ""}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-            <div className="space-y-2">
-              <Label htmlFor={linkUrlId}>URL</Label>
-              <Input
-                ref={linkUrlInputRef}
-                id={linkUrlId}
-                value={linkUrl}
-                onChange={(event) => {
-                  setLinkUrl(event.target.value);
-                  if (linkError) setLinkError("");
-                }}
-                placeholder="https://example.com"
-                inputMode="url"
-                autoComplete="url"
-                aria-invalid={linkError ? true : undefined}
-                aria-describedby={linkError ? `${linkUrlId}-error` : undefined}
-                autoFocus
-              />
-              {linkError && (
-                <p
-                  id={`${linkUrlId}-error`}
-                  role="alert"
-                  className="text-xs text-destructive"
-                >
-                  {linkError}
-                </p>
-              )}
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor={linkTextId}>Text</Label>
-              <Input
-                id={linkTextId}
-                value={linkText}
-                onChange={(event) => setLinkText(event.target.value)}
-                placeholder="Link text"
-              />
-              <p className="text-xs text-foreground-muted">
-                Leave blank to use the destination as the visible text.
-              </p>
-            </div>
-          </div>
-          <DialogFooter className="sm:justify-between">
-            {linkActive ? (
-              <Button
-                type="button"
-                variant="ghost"
-                className="text-destructive"
-                onClick={removeCurrentLink}
-              >
-                Remove link
-              </Button>
-            ) : (
-              <span aria-hidden />
-            )}
-            <div className="flex flex-col-reverse gap-2 sm:flex-row">
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => setLinkOpen(false)}
-              >
-                Cancel
-              </Button>
-              <Button type="button" onClick={applyLink}>
-                {linkActive ? "Save link" : "Insert link"}
-              </Button>
-            </div>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-    </div>
+      </MarkdownToolbarGroup>
+    </MarkdownToolbar>
   );
 }
+
+const AKB_MARKDOWN_SEARCH_LABELS: Partial<MarkdownLinkSearchLabels> = {
+  inputLabel: "Search Vault resources",
+  inputPlaceholder: "Find a document or file",
+  searching: "Searching…",
+  empty: "No matching documents or files found.",
+  error: "Unable to search resources. Check your access and try again.",
+  retry: "Retry search",
+  results: "Vault resource results",
+  document: "Document",
+  file: "File",
+  resource: "Resource",
+};
 
 function transferredImages(transfer: DataTransfer): File[] {
   return Array.from(transfer.files ?? []).filter((file) =>
@@ -1529,7 +1060,16 @@ export function MarkdownEditor({
   );
   const handleChange = React.useCallback(
     (_: string, editor: MarkdownEditorInstance) => {
-      onChange?.(serializeEditorMarkdown(editor), imageAssetIds(editor));
+      onChange?.(
+        serializeEditorMarkdown(editor, { profile: "preserve" }),
+        imageAssetIds(editor),
+      );
+    },
+    [onChange],
+  );
+  const handleSourceChange = React.useCallback(
+    (markdown: string) => {
+      onChange?.(markdown, imageAssetIdsFromMarkdown(markdown));
     },
     [onChange],
   );
@@ -1624,17 +1164,18 @@ export function MarkdownEditor({
 
   React.useEffect(() => {
     if (!editor) return;
-    editor.setEditable(!readOnly, false);
     normalizeTopLevelImages(editor);
     ensureTrailingParagraph(editor);
     if (autoFocus && !readOnly)
       requestAnimationFrame(() => editor.commands.focus());
   }, [autoFocus, editor, readOnly]);
-  React.useEffect(() => {
-    if (!editor || editor.getMarkdown() === value) return;
-    editor.commands.setContent(value, { contentType: "markdown" });
-    ensureTrailingParagraph(editor);
-  }, [editor, value]);
+  const handleMarkdownApplied = React.useCallback(
+    (currentEditor: MarkdownEditorInstance) => {
+      normalizeTopLevelImages(currentEditor);
+      ensureTrailingParagraph(currentEditor);
+    },
+    [],
+  );
   useTargetResolutionDom(
     rootRef,
     editor,
@@ -1825,6 +1366,14 @@ export function MarkdownEditor({
         : "border border-border bg-surface px-5 py-4 hover:border-foreground-muted focus-within:border-primary focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2 focus-within:ring-offset-background transition-colors",
     className,
   );
+  const sourceClassName = cn(
+    "min-h-96 w-full resize-y font-mono text-sm leading-6 text-foreground placeholder:text-foreground-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
+    appearance === "canvas"
+      ? "border-0 bg-transparent px-5 py-6 sm:px-8 lg:px-10"
+      : appearance === "workspace"
+        ? "border-0 bg-transparent px-4 py-4"
+        : "border border-border bg-surface px-5 py-4 transition-colors",
+  );
   React.useLayoutEffect(() => {
     const content = editorContentElement(rootRef.current);
     if (!content) return;
@@ -1852,161 +1401,177 @@ export function MarkdownEditor({
       ref={rootRef}
       data-testid="markdown-editor"
       className="relative min-w-0"
-      onDragOverCapture={handleImageDragOver}
-      onDropCapture={handleImageDrop}
     >
-      {!readOnly && editor && (
-        <EditorToolbar
-          editor={editor}
-          searchAdapter={adapters.search}
-          uploadingImage={uploadingImage}
-          onChooseImages={(files) => {
-            const replacementPosition =
-              replacementPositionRef.current ?? undefined;
-            replacementPositionRef.current = null;
-            void uploadImages(files, replacementPosition);
-          }}
-          onOpenImagePicker={() => {
-            replacementPositionRef.current = null;
-            imageInputRef.current?.click();
-          }}
-          appearance={appearance}
-          imageInputRef={imageInputRef}
-        />
-      )}
-      {uploadingImage && (
-        <Alert
-          variant="info"
-          title="Uploading image"
-          className="border-x border-t-0"
-        >
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <span className="truncate">{uploadingName}</span>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => uploadControllerRef.current?.abort()}
-            >
-              <X className="h-3.5 w-3.5" aria-hidden />
-              Cancel upload
-            </Button>
-          </div>
-        </Alert>
-      )}
-      {!uploadingImage && uploadFailure && (
-        <Alert
-          variant={uploadFailure.kind === "queued" ? "warning" : "destructive"}
-          title={
-            uploadFailure.kind === "queued"
-              ? "Images waiting to upload"
-              : "Image upload failed"
-          }
-          className="border-x border-t-0"
-        >
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <span className="min-w-0 flex-1">
-              {uploadFailure.message}
-              {uploadFailure.files.length > 0
-                ? ` ${uploadFailure.files.length} image${uploadFailure.files.length === 1 ? "" : "s"} remain in this batch.`
-                : ""}
-            </span>
-            <div className="flex flex-wrap items-center gap-1.5">
-              {uploadFailure.retryable && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() =>
-                    void uploadImages(
-                      uploadFailure.files,
-                      uploadFailure.replacementPosition,
-                    )
-                  }
-                >
-                  <RotateCcw className="h-3.5 w-3.5" aria-hidden />
-                  {uploadFailure.kind === "queued" ? "Upload" : "Retry"}
-                </Button>
-              )}
+      <MarkdownEditingSurface
+        editor={editor}
+        markdown={value}
+        onSourceChange={handleSourceChange}
+        onMarkdownApplied={handleMarkdownApplied}
+        readOnly={readOnly}
+        modeSwitchDisabled={uploadingImage}
+        onWysiwygDragOverCapture={handleImageDragOver}
+        onWysiwygDropCapture={handleImageDrop}
+        toolbar={
+          !readOnly && editor ? (
+            <EditorToolbar
+              editor={editor}
+              searchAdapter={adapters.search}
+              vault={vault}
+              uploadingImage={uploadingImage}
+              onChooseImages={(files) => {
+                const replacementPosition =
+                  replacementPositionRef.current ?? undefined;
+                replacementPositionRef.current = null;
+                void uploadImages(files, replacementPosition);
+              }}
+              onOpenImagePicker={() => {
+                replacementPositionRef.current = null;
+                imageInputRef.current?.click();
+              }}
+              appearance={appearance}
+              imageInputRef={imageInputRef}
+            />
+          ) : null
+        }
+        sourceAriaLabel={ariaLabel}
+        sourceAriaLabelledby={ariaLabelledby}
+        sourceRequired={required}
+        sourceClassName={sourceClassName}
+      >
+        {uploadingImage && (
+          <Alert
+            variant="info"
+            title="Uploading image"
+            className="border-x border-t-0"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="truncate">{uploadingName}</span>
               <Button
                 type="button"
                 variant="outline"
                 size="sm"
-                onClick={() => {
-                  replacementPositionRef.current =
-                    uploadFailure.replacementPosition ?? null;
-                  imageInputRef.current?.click();
-                }}
+                onClick={() => uploadControllerRef.current?.abort()}
               >
-                <ImagePlus className="h-3.5 w-3.5" aria-hidden />
-                Choose another
-              </Button>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                onClick={() => setUploadFailure(null)}
-              >
-                Dismiss
+                <X className="h-3.5 w-3.5" aria-hidden />
+                Cancel upload
               </Button>
             </div>
-          </div>
-        </Alert>
-      )}
-      <div
-        className="relative min-w-0"
-        onPasteCapture={(event) => {
-          if (readOnly) return;
-          const files = transferredImages(event.clipboardData);
-          if (!files.length) return;
-          if (!isStandaloneImageClipboard(event.clipboardData)) return;
-          event.preventDefault();
-          event.stopPropagation();
-          if (uploadInFlightRef.current)
-            deferredImageFilesRef.current.push(...files);
-          else void uploadImages(files);
-        }}
-      >
-        {editor ? (
-          <EditorContent editor={editor} />
-        ) : (
-          <div
-            role="status"
-            aria-live="polite"
-            className="min-h-96 bg-surface-2 p-5 text-sm text-foreground-muted"
-          >
-            Loading editor…
-          </div>
+          </Alert>
         )}
-        {editor &&
-          imageHosts.map((host, index) =>
-            createPortal(
-              <ImageControls
-                key={`${host.target}-${index}`}
-                editor={editor}
-                image={host.image}
-                target={host.target}
-                alt={host.alt}
-                onReplace={(position) => {
-                  replacementPositionRef.current = position;
-                  imageInputRef.current?.click();
-                }}
-              />,
-              host.host,
-            ),
+        {!uploadingImage && uploadFailure && (
+          <Alert
+            variant={uploadFailure.kind === "queued" ? "warning" : "destructive"}
+            title={
+              uploadFailure.kind === "queued"
+                ? "Images waiting to upload"
+                : "Image upload failed"
+            }
+            className="border-x border-t-0"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <span className="min-w-0 flex-1">
+                {uploadFailure.message}
+                {uploadFailure.files.length > 0
+                  ? ` ${uploadFailure.files.length} image${uploadFailure.files.length === 1 ? "" : "s"} remain in this batch.`
+                  : ""}
+              </span>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {uploadFailure.retryable && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() =>
+                      void uploadImages(
+                        uploadFailure.files,
+                        uploadFailure.replacementPosition,
+                      )
+                    }
+                  >
+                    <RotateCcw className="h-3.5 w-3.5" aria-hidden />
+                    {uploadFailure.kind === "queued" ? "Upload" : "Retry"}
+                  </Button>
+                )}
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    replacementPositionRef.current =
+                      uploadFailure.replacementPosition ?? null;
+                    imageInputRef.current?.click();
+                  }}
+                >
+                  <ImagePlus className="h-3.5 w-3.5" aria-hidden />
+                  Choose another
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setUploadFailure(null)}
+                >
+                  Dismiss
+                </Button>
+              </div>
+            </div>
+          </Alert>
+        )}
+        <div
+          className="relative min-w-0"
+          onPasteCapture={(event) => {
+            if (readOnly) return;
+            const files = transferredImages(event.clipboardData);
+            if (!files.length) return;
+            if (!isStandaloneImageClipboard(event.clipboardData)) return;
+            event.preventDefault();
+            event.stopPropagation();
+            if (uploadInFlightRef.current)
+              deferredImageFilesRef.current.push(...files);
+            else void uploadImages(files);
+          }}
+        >
+          {editor ? (
+            <EditorContent editor={editor} />
+          ) : (
+            <div
+              role="status"
+              aria-live="polite"
+              className="min-h-96 bg-surface-2 p-5 text-sm text-foreground-muted"
+            >
+              Loading editor…
+            </div>
           )}
-        {editor &&
-          tableHosts.map((host, index) =>
-            createPortal(
-              <TableActions
-                key={`table-${index}`}
-                editor={editor}
-                table={host.table}
-              />,
-              host.host,
-            ),
-          )}
-      </div>
+          {editor &&
+            imageHosts.map((host, index) =>
+              createPortal(
+                <ImageControls
+                  key={`${host.target}-${index}`}
+                  editor={editor}
+                  image={host.image}
+                  target={host.target}
+                  alt={host.alt}
+                  onReplace={(position) => {
+                    replacementPositionRef.current = position;
+                    imageInputRef.current?.click();
+                  }}
+                />,
+                host.host,
+              ),
+            )}
+          {editor &&
+            tableHosts.map((host, index) =>
+              createPortal(
+                <TableActions
+                  key={`table-${index}`}
+                  editor={editor}
+                  table={host.table}
+                />,
+                host.host,
+              ),
+            )}
+        </div>
+      </MarkdownEditingSurface>
     </div>
   );
 }
