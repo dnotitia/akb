@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Add the shared WYSIWYG / Markdown Source editing surface. It keeps one editor
+  mounted across mode switches, preserves unchanged selection and undo state,
+  and reports Source edits through the existing Markdown change contract.
+- Export `serializeEditorMarkdown` so products can persist the same canonical
+  Markdown body that the Source surface synchronizes.
+
 ## 0.5.0
 
 - Move document/file search UI, async states, result selection, and cancellation

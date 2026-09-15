@@ -43,7 +43,12 @@ test("Personal navigation imports favorites and restores a browser draft", async
   await page.screenshot({ path: testInfo.outputPath("personal-sidebar.png"), fullPage: true });
   await sidebar.getByRole("link", { name: "A recoverable draft" }).click();
   await expect(page.getByPlaceholder("Document title", { exact: true })).toHaveValue("A recoverable draft");
-  await expect(page.getByText("Unsaved writing remains available.", { exact: true })).toBeVisible();
+  const visibleBodyEditor = page
+    .getByTestId("markdown-editor")
+    .locator('[data-markdown-mode-panel="wysiwyg"] .ProseMirror');
+  await expect(
+    visibleBodyEditor.getByText("Unsaved writing remains available.", { exact: true }),
+  ).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath("restored-draft.png"), fullPage: true });
 });
 
