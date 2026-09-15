@@ -2,6 +2,7 @@ import { Editor, type JSONContent } from '@tiptap/core'
 import { MarkdownManager } from '@tiptap/markdown'
 
 import { createMarkdownExtensions } from './extensions.js'
+import { markdownTableCommands } from './table.js'
 import type {
   MarkdownCommands,
   MarkdownDocument,
@@ -134,6 +135,7 @@ export function createMarkdownEditor(options: MarkdownEditorConfig = {}): Editor
 
 export function markdownCommands(editor: Editor): MarkdownCommands {
   return {
+    ...markdownTableCommands(editor),
     setMarkdown: markdown => editor.commands.setContent(markdown, { contentType: 'markdown' }),
     insertMarkdown: markdown =>
       editor.commands.insertContent(markdown, { contentType: 'markdown' }),

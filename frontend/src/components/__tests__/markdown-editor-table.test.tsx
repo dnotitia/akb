@@ -28,8 +28,7 @@ describe("MarkdownEditor table interactions", () => {
     expect(editor.lastElementChild?.tagName).toBe("P");
   });
 
-  it("moves focus below the table without a pointer-only escape", async () => {
-    const user = userEvent.setup();
+  it("does not guess a table target when no cell is selected", () => {
     render(
       <MarkdownEditor
         value={TABLE_MARKDOWN}
@@ -39,63 +38,31 @@ describe("MarkdownEditor table interactions", () => {
       />,
     );
 
-    await user.click(screen.getByRole("button", { name: "Continue below" }));
-    await waitFor(() =>
-      expect(screen.getByRole("textbox", { name: "Document content" })).toHaveFocus(),
-    );
+    expect(screen.getByRole("button", { name: "Continue below" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Delete table" })).toBeDisabled();
     expect(
       screen.getByRole("textbox", { name: "Document content" }).lastElementChild?.tagName,
     ).toBe("P");
   });
 
-  it("adds rows and columns from the table-local toolbar", async () => {
-    const user = userEvent.setup();
-    render(
-      <MarkdownEditor value={TABLE_MARKDOWN} vault="team" onChange={vi.fn()} />,
-    );
+  it("keeps row and column commands disabled outside a selected cell", () => {
+    render(<MarkdownEditor value={TABLE_MARKDOWN} vault="team" onChange={vi.fn()} />);
 
     const table = screen.getByRole("table", { name: "Editable table" });
-    const tableActions = within(table).getByRole("toolbar", { name: "Table actions" });
+    const actions = within(table).getByRole("toolbar", { name: "Table actions" });
     expect(within(table).getAllByRole("row")).toHaveLength(2);
     expect(within(table).getAllByRole("columnheader")).toHaveLength(2);
-
-    await user.click(within(tableActions).getByRole("button", { name: "Row" }));
     expect(
-      within(screen.getByRole("table", { name: "Editable table" })).getAllByRole("row"),
-    ).toHaveLength(3);
-
-    const updatedTable = screen.getByRole("table", { name: "Editable table" });
-    await user.click(
-      within(updatedTable).getByRole("button", { name: "Column" }),
-    );
+      within(actions).getByRole("button", { name: "Add row after selected row" }),
+    ).toBeDisabled();
     expect(
-      within(screen.getByRole("table", { name: "Editable table" }))
-        .getAllByRole("row")[0]
-        .querySelectorAll("th, td"),
-    ).toHaveLength(3);
+      within(actions).getByRole("button", { name: "Add column right of selected column" }),
+    ).toBeDisabled();
+    expect(within(actions).getByRole("button", { name: "Remove selected row" })).toBeDisabled();
+    expect(within(actions).getByRole("button", { name: "Remove selected column" })).toBeDisabled();
   });
 
-  it("removes the selected row and column without deleting the whole table", async () => {
-    const user = userEvent.setup();
-    render(
-      <MarkdownEditor value={TABLE_MARKDOWN} vault="team" onChange={vi.fn()} />,
-    );
-
-    await user.click(screen.getByText("Search"));
-    await user.click(screen.getByRole("button", { name: "Remove row" }));
-    expect(
-      within(screen.getByRole("table", { name: "Editable table" })).getAllByRole("row"),
-    ).toHaveLength(1);
-
-    await user.click(screen.getByText("Search"));
-    await user.click(screen.getByRole("button", { name: "Remove column" }));
-    const remainingTable = screen.getByRole("table", { name: "Editable table" });
-    expect(remainingTable.querySelectorAll("th, td")).toHaveLength(1);
-    expect(screen.getByRole("button", { name: "Delete table" })).toBeVisible();
-  });
-
-  it("deletes the entire table and restores an editable cursor target", async () => {
-    const user = userEvent.setup();
+  it("does not delete the table when there is no valid selected cell", async () => {
     const onChange = vi.fn();
     render(
       <MarkdownEditor
@@ -106,27 +73,43 @@ describe("MarkdownEditor table interactions", () => {
       />,
     );
 
-    await user.click(screen.getByRole("button", { name: "Delete table" }));
-
-    expect(screen.queryByRole("table", { name: "Editable table" })).toBeNull();
-    await waitFor(() =>
-      expect(screen.getByRole("textbox", { name: "Document content" })).toHaveFocus(),
-    );
-    await waitFor(() =>
-      expect(onChange.mock.calls.some(([markdown]) => !markdown.includes("| Service"))).toBe(true),
-    );
-    expect(
-      screen.getByRole("textbox", { name: "Document content" }).lastElementChild?.tagName,
-    ).toBe("P");
+    await waitFor(() => expect(onChange).toHaveBeenCalled());
+    const initialChangeCount = onChange.mock.calls.length;
+    expect(screen.getByRole("button", { name: "Delete table" })).toBeDisabled();
+    expect(screen.getByRole("table", { name: "Editable table" })).toBeInTheDocument();
+    expect(onChange).toHaveBeenCalledTimes(initialChangeCount);
   });
 
   it("does not expose editing actions in read-only mode", () => {
-    render(
-      <MarkdownEditor value={TABLE_MARKDOWN} vault="team" readOnly />,
-    );
+    render(<MarkdownEditor value={TABLE_MARKDOWN} vault="team" readOnly />);
 
     expect(screen.getByRole("table", { name: "Table" })).toBeVisible();
     expect(screen.queryByRole("toolbar", { name: "Table actions" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Delete table" })).toBeNull();
+  });
+
+  it("uses the shared table insertion control in the AKB author surface", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(
+      <MarkdownEditor
+        value="before"
+        vault="team"
+        ariaLabel="Document content"
+        onChange={onChange}
+      />,
+    );
+
+    expect(screen.getAllByRole("button", { name: "Insert table" })).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "Insert table" }));
+
+    expect(screen.getByRole("table", { name: "Editable table" })).toBeVisible();
+    await waitFor(() =>
+      expect(
+        onChange.mock.calls.some(([markdown]) =>
+          markdown.includes("| --- | --- | --- |"),
+        ),
+      ).toBe(true),
+    );
   });
 });

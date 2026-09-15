@@ -19,6 +19,7 @@ import {
   Quote,
   Redo2,
   Strikethrough,
+  Table,
   Undo2,
   X,
 } from 'lucide-react'
@@ -30,6 +31,10 @@ import { resolveMarkdownTargets } from '../adapters.js'
 import { MarkdownLinkSearch } from './markdown-link-search.js'
 import type { MarkdownLinkSearchLabels } from './markdown-link-search.js'
 export type { MarkdownLinkSearchLabels } from './markdown-link-search.js'
+import { MarkdownTableControls, DEFAULT_MARKDOWN_TABLE_LABELS } from './markdown-table.js'
+import type { MarkdownTableLabels, MarkdownTableOptions } from './markdown-table.js'
+export type { MarkdownTableLabels, MarkdownTableOptions } from './markdown-table.js'
+import { markdownTableState } from '../table.js'
 import type {
   MarkdownAdapters,
   MarkdownCommands,
@@ -90,6 +95,13 @@ export function useMarkdownCommands(editor: Editor | null): MarkdownCommands {
             setLink: () => false,
             insertLink: () => false,
             unsetLink: () => false,
+            insertTable: () => false,
+            addTableRowAfter: () => false,
+            addTableColumnAfter: () => false,
+            deleteTableRow: () => false,
+            deleteTableColumn: () => false,
+            deleteTable: () => false,
+            continueBelowTable: () => false,
             setParagraph: () => false,
             toggleHeading: () => false,
             toggleBold: () => false,
@@ -114,6 +126,7 @@ function readState(editor: Editor): MarkdownState {
     markdown: editor.getMarkdown(),
     isEmpty: editor.isEmpty,
     isEditable: editor.isEditable,
+    table: markdownTableState(editor),
     active: {
       paragraph: editor.isActive('paragraph'),
       heading1: editor.isActive('heading', { level: 1 }),
@@ -314,6 +327,7 @@ export interface MarkdownEditingSurfaceProps extends Omit<ComponentPropsWithoutR
   readOnly?: boolean
   modeSwitchDisabled?: boolean
   toolbar?: ReactNode
+  table?: MarkdownTableOptions
   sourcePlaceholder?: string
   sourceLabel?: string
   sourceAriaLabel?: string
@@ -340,6 +354,7 @@ export function MarkdownEditingSurface({
   readOnly = false,
   modeSwitchDisabled = false,
   toolbar,
+  table,
   sourcePlaceholder = 'Write Markdown source…',
   sourceLabel,
   sourceAriaLabel,
@@ -496,6 +511,7 @@ export function MarkdownEditingSurface({
           }
         />
       </div>
+      <MarkdownTableControls editor={editor} readOnly={readOnly} options={table} />
     </div>
   )
 }
@@ -962,6 +978,7 @@ export interface MarkdownToolbarProps {
   className?: string
   'aria-label'?: string
   link?: MarkdownToolbarLinkOptions
+  table?: MarkdownTableOptions
 }
 
 export interface MarkdownToolbarLinkOptions {
@@ -986,6 +1003,7 @@ export function MarkdownToolbar({
   className,
   'aria-label': ariaLabel = 'Text formatting',
   link,
+  table,
 }: MarkdownToolbarProps) {
   const state = useMarkdownState(editor)
   const commands = useMarkdownCommands(editor)
@@ -994,6 +1012,7 @@ export function MarkdownToolbar({
   const editable = Boolean(editor && state?.isEditable)
   const active = state?.active
   const linkLabels = { ...DEFAULT_MARKDOWN_LINK_LABELS, ...link?.labels }
+  const tableLabels: MarkdownTableLabels = { ...DEFAULT_MARKDOWN_TABLE_LABELS, ...table?.labels }
   const linkDisabled = !editable || link?.disabled === true
 
   useLayoutEffect(() => {
@@ -1183,6 +1202,13 @@ export function MarkdownToolbar({
         </MarkdownToolbarButton>
       </MarkdownToolbarGroup>
       <MarkdownToolbarGroup label="Insert">
+        <MarkdownToolbarButton
+          label={tableLabels.insertTable}
+          disabled={!editable || !state?.table.canInsert}
+          onClick={() => commands.insertTable()}
+        >
+          <Table className="h-4 w-4" />
+        </MarkdownToolbarButton>
         <MarkdownToolbarButton
           label={active?.link ? linkLabels.editButton : linkLabels.insertButton}
           active={Boolean(active?.link)}
