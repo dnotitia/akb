@@ -71,6 +71,38 @@ describe('React surfaces', () => {
     await waitFor(() => expect(getByTestId('hook-state')).toHaveTextContent('명령'))
   })
 
+  it('keeps runtime link attributes out of the canonical Markdown model', async () => {
+    const target = 'akb://fixture/doc/available.md'
+    const markdown = `[Available document](${target})`
+    const onChange = vi.fn()
+    let activeEditor: ReturnType<typeof useMarkdownEditor> = null
+
+    function LinkSurface() {
+      const editor = useMarkdownEditor({ initialMarkdown: markdown, onChange })
+      useEffect(() => {
+        activeEditor = editor
+      }, [editor])
+      return editor ? <EditorContent editor={editor} /> : null
+    }
+
+    const { container } = render(<LinkSurface />)
+    await waitFor(() => expect(activeEditor?.view).toBeTruthy())
+    const link = container.querySelector<HTMLAnchorElement>('.ProseMirror a[href]')!
+
+    await act(async () => {
+      link.setAttribute('data-markdown-target', target)
+      link.setAttribute('data-markdown-resolution', 'pending')
+      link.setAttribute('aria-disabled', 'true')
+      link.setAttribute('href', '#')
+      await new Promise(resolve => setTimeout(resolve, 20))
+    })
+
+    expect(link).toHaveAttribute('href', '#')
+    expect(link).toHaveAttribute('data-markdown-resolution', 'pending')
+    expect(activeEditor!.getMarkdown()).toBe(markdown)
+    expect(onChange).not.toHaveBeenCalled()
+  })
+
   it('supports controlled Markdown updates without replacing an unchanged editor', async () => {
     function Controlled() {
       const [markdown, setMarkdown] = useState('처음')

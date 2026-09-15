@@ -10,6 +10,8 @@
 - Normalize parsed top-level images and retain an editable paragraph in the
   shared editing surface; image removal leaves the referenced bytes to the
   product's attachment policy.
+- Ignore product-owned runtime link attributes in the editable DOM so target
+  resolution does not turn into Markdown document changes.
 
 ## 0.6.0
 

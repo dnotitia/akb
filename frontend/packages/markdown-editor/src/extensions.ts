@@ -4,6 +4,7 @@ import {
   type AnyExtension,
   type MarkdownToken,
 } from '@tiptap/core'
+import { Link } from '@tiptap/extension-link'
 import { Mathematics } from '@tiptap/extension-mathematics'
 import { Markdown } from '@tiptap/markdown'
 import StarterKit from '@tiptap/starter-kit'
@@ -95,6 +96,40 @@ export const MarkdownImage = Node.create({
 
 const rawBlockStart = /^(?:<!--|<!\[CDATA\[|<>|<\/?[A-Za-z][A-Za-z0-9:._-]*(?:[\s/>]|$))/
 const rawInlineStart = /^(?:<!--[\s\S]*?-->|<>|<\/>|<\/?[A-Za-z][A-Za-z0-9:._-]*(?:\s[^<>]*?)?\/?>)/
+
+const RUNTIME_LINK_ATTRIBUTES = new Set([
+  'aria-disabled',
+  'aria-label',
+  'data-markdown-resolution',
+  'data-markdown-target',
+  'href',
+  'title',
+])
+
+/**
+ * Product adapters add runtime-only link attributes to the editable DOM. Keep
+ * those writes out of ProseMirror's document parser; the mark model and
+ * Markdown continue to own the canonical href.
+ */
+const MarkdownLink = Link.extend({
+  addMarkView() {
+    return ({ HTMLAttributes }) => {
+      const dom = document.createElement('a')
+      for (const [name, value] of Object.entries(HTMLAttributes)) {
+        if (value === null || value === undefined || value === false) continue
+        dom.setAttribute(name, value === true ? '' : String(value))
+      }
+
+      return {
+        dom,
+        contentDOM: dom,
+        ignoreMutation: mutation =>
+          mutation.type === 'attributes' &&
+          RUNTIME_LINK_ATTRIBUTES.has(mutation.attributeName ?? ''),
+      }
+    }
+  },
+})
 
 function classifyRaw(source: string): RawMarkdownKind {
   const tagName = source.match(/^<([A-Za-z][A-Za-z0-9:._-]*)/)?.[1]
@@ -307,8 +342,9 @@ export function createMarkdownExtensions({
       // AKB/consumer adapters resolve these durable references to a runtime
       // URL after parsing. `akb` is only accepted as a data scheme here; no
       // adapter or network behavior belongs in the shared schema.
-      link: { protocols: ['akb'] },
+      link: false,
     }),
+    MarkdownLink.configure({ protocols: ['akb'] }),
     MarkdownImage,
     Table.configure({ resizable: false }),
     TableRow,

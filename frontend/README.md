@@ -99,6 +99,9 @@ Playwright e2e specs live in `e2e/`. Choose `mock` or `real` explicitly:
 - `AKB_FRONTEND_URL=<services.web.origin> pnpm run test:e2e:real` consumes the
   common schema-v2 descriptor. The backend, fixture reset, and process shutdown
   remain owned by the repository runtime.
+- `AKB_FE_E2E_BROWSER_CHANNEL=chrome` runs the existing Playwright project in
+  installed stable Chrome instead of Playwright's pinned Chromium. Use it when
+  reproducing a browser-version-specific regression.
 - `AKB_FE_E2E_SCENARIO=markdown-reference-adapters` exposes a source-neutral reference
   fixture in the schema-v2 descriptor. Its discovered state/expiry/failure controls exercise
   canonical document/file/attachment targets, unavailable resolution, and partial upload

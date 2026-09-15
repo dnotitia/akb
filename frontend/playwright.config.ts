@@ -13,6 +13,7 @@ const baseURL = mockMode
   ? "http://127.0.0.1:4173"
   : process.env.AKB_FRONTEND_URL!;
 const recoveryScenario = process.env.AKB_FE_E2E_SCENARIO === "document-edit-recovery";
+const browserChannel = process.env.AKB_FE_E2E_BROWSER_CHANNEL;
 
 // Mock mode owns its Vite webServer and browser MSW worker. Real mode consumes
 // the already-ready frontend origin from the repository runtime descriptor.
@@ -48,7 +49,10 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      use: { ...devices["Desktop Chrome"] },
+      use: {
+        ...devices["Desktop Chrome"],
+        ...(browserChannel ? { channel: browserChannel } : {}),
+      },
     },
   ],
 });
