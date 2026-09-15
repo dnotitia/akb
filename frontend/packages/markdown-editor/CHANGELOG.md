@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0
+
+- Move document/file search UI, async states, result selection, and cancellation
+  into the shared link popup and toolbar.
+- Replace the product-owned `searchSlot` with `searchAdapter`, `searchContext`,
+  and product-provided search labels and styling.
+
 ## 0.4.0
 
 - Add the shared link command/state contract and accessible React link popup.
