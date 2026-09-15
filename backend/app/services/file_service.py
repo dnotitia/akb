@@ -15,7 +15,11 @@ This module is the file-domain layer over those primitives.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import logging
+import re
+import secrets
 import uuid
 from typing import Iterator
 from urllib.parse import quote
@@ -97,6 +101,20 @@ def content_disposition_attachment(filename: str) -> str:
     return f'attachment; filename="{ascii_safe}"; filename*=UTF-8\'\'{utf8_encoded}'
 
 
+def content_disposition_inline(filename: str) -> str:
+    """Same escaping, but naming the file without forcing a save.
+
+    A preview needs the browser to render the bytes; it still wants the real
+    name for the save dialog a reader may reach for afterwards."""
+    ascii_safe = (
+        filename.encode("ascii", "replace")
+        .decode("ascii")
+        .translate({ord(c): None for c in '"\r\n'})
+    )
+    utf8_encoded = quote(filename, safe="")
+    return f'inline; filename="{ascii_safe}"; filename*=UTF-8\'\'{utf8_encoded}'
+
+
 # ── Top-level S3 helpers (thin wrappers around s3_adapter) ───────
 
 
@@ -135,10 +153,13 @@ def iter_object_chunks(
     chunk_size: int = _S3_STREAM_CHUNK_SIZE,
     *,
     max_bytes: int | None = None,
+    byte_range: str | None = None,
 ) -> Iterator[bytes]:
     """Stream an object with an optional hard bound on transferred bytes."""
     transferred = 0
-    gen = s3_adapter.iter_chunks(s3_key, chunk_size=chunk_size)
+    gen = s3_adapter.iter_chunks(
+        s3_key, chunk_size=chunk_size, byte_range=byte_range,
+    )
     try:
         for chunk in gen:
             transferred += len(chunk)
@@ -261,6 +282,32 @@ def _replacement_final_key(
 def _file_version(row: dict) -> str | None:
     """Return the opaque optimistic-concurrency token exposed to callers."""
     return row.get("storage_version") or row.get("etag")
+
+
+def _new_capability_token() -> str:
+    """256 bits of URL-safe randomness. The token IS the capability, so it is
+    never stored — only its digest is, the same way a password would be."""
+    return base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+
+
+# What `_new_capability_token` produces: base64url, no padding. Anything else
+# is not a token this service issued, and must be refused before it reaches
+# `.encode("ascii")` — which raises on non-ASCII input, and an unauthenticated
+# route that raises lets anyone write tracebacks into the log.
+_CAPABILITY_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+
+
+def _is_capability_token_shaped(token: str | None) -> bool:
+    return bool(token) and bool(_CAPABILITY_TOKEN_RE.fullmatch(token or ""))
+
+
+def _capability_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+
+def _capability_url(token: str) -> str:
+    base = (settings.public_base_url or "").rstrip("/")
+    return f"{base}/api/v1/files/download/{token}"
 
 
 def _file_envelope(row: dict, vault_name: str) -> dict:
@@ -980,11 +1027,26 @@ class FileService:
             "version": storage_version or etag,
         }
 
-    async def get_download_url(self, vault_id: uuid.UUID, file_id: str) -> dict:
-        """Return a presigned GET URL for direct download from S3."""
+    async def get_download_url(
+        self, vault_id: uuid.UUID, file_id: str, *, actor_id: str | None = None,
+    ) -> dict:
+        """Issue a capability URL for these bytes.
+
+        The URL names this service and an opaque token — never the object
+        store's endpoint, bucket or key. A holder still GETs it with no
+        Authorization header, which is what every non-browser consumer is
+        written against.
+
+        `actor_id` is recorded with the grant. Nothing enforces it, but a
+        capability is a bearer credential and who was handed one is the only
+        thing left to record: the fetch no longer reaches the object store, so
+        its access log no longer sees any of this."""
         if self._measurement is not None:
             return await self._measurement.get_download_url(vault_id, file_id)
+        token = _new_capability_token()
         pool = await get_pool()
+        # One connection for both reads and the grant. Splitting them made a
+        # plain GET take two round-trips through the pool for no gain.
         async with pool.acquire() as conn:
             row = await vault_files_repo.find_by_id(
                 conn, vault_id, uuid.UUID(file_id),
@@ -995,29 +1057,27 @@ class FileService:
                 or row.get("upload_state") != "confirmed"
             ):
                 raise NotFoundError("File", file_id)
+            await conn.execute(
+                """
+                INSERT INTO m1_file_transfer_intents (
+                    id, file_id, vault_id, method, token_digest, expires_at,
+                    actor_id
+                ) VALUES (
+                    $1, $2, $3, 'GET', $4,
+                    NOW() + ($5 * INTERVAL '1 second'), $6
+                )
+                """,
+                uuid.uuid4(), uuid.UUID(file_id), vault_id,
+                _capability_digest(token), _PRESIGN_DOWNLOAD_TTL, actor_id,
+            )
 
-        # Override stored Content-Type with DB value so browsers inline
-        # render correctly even when the object was uploaded with a
-        # generic octet-stream (legacy proxy versions < 0.5.1).
-        ct = row["mime_type"] if (
-            row["mime_type"] and row["mime_type"] != "application/octet-stream"
-        ) else None
-        presigned_url = s3_adapter.presign_get(
-            row["s3_key"], ttl=_PRESIGN_DOWNLOAD_TTL,
-            response_content_type=ct,
-        )
-
-        # `get_download_url` is called by the HTTP route that the proxy
-        # invokes after parsing the URI client-side; the returned dict is
-        # consumed by the proxy, not the end user. We still surface the
-        # URI for symmetry with confirm_upload.
         return {
             "kind": "file",
             "name": row["name"],
             # Carried so a caller never has to parse the storage locator out of
             # `download_url` to learn where the File lives.
             "collection": row["collection"],
-            "download_url": presigned_url.url,
+            "download_url": _capability_url(token),
             "mime_type": row["mime_type"],
             "size_bytes": row["size_bytes"],
             "content_hash": row["content_hash"],
@@ -1025,7 +1085,7 @@ class FileService:
             "etag": row["etag"],
             "storage_version": row["storage_version"],
             "version": _file_version(row),
-            "expires_in": presigned_url.expires_in,
+            "expires_in": _PRESIGN_DOWNLOAD_TTL,
         }
 
     async def get_file(
@@ -1057,6 +1117,41 @@ class FileService:
         ):
             raise NotFoundError("File", file_id)
         return _file_envelope(row, vault_name)
+
+    async def resolve_download_capability(self, token: str) -> dict:
+        """Resolve a download capability to the File row it grants.
+
+        Looked up by digest and checked for expiry, but NOT single-use: a
+        browser fetches the same URL for the preview, again on a reload, and
+        once more for the download control. A presigned URL behaved the same
+        way inside its lifetime, and callers are written against that.
+
+        Every rejection is the same 404 — an expired token, a token that was
+        never issued, and a File that has since been deleted must not be
+        distinguishable from one another."""
+        if not _is_capability_token_shaped(token):
+            raise NotFoundError("File", "capability")
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            grant = await conn.fetchrow(
+                """
+                SELECT file_id, vault_id FROM m1_file_transfer_intents
+                 WHERE token_digest = $1 AND method = 'GET' AND expires_at > NOW()
+                """,
+                _capability_digest(token),
+            )
+            if grant is None:
+                raise NotFoundError("File", "capability")
+            row = await vault_files_repo.find_by_id(
+                conn, grant["vault_id"], grant["file_id"],
+            )
+        if (
+            not row
+            or row.get("kind") != "file"
+            or row.get("upload_state") != "confirmed"
+        ):
+            raise NotFoundError("File", "capability")
+        return row
 
     async def list_files(
         self,

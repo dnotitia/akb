@@ -1,8 +1,10 @@
 """REST API routes for vault file storage (S3-backed)."""
 
 import asyncio
+import re
 
 from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi.responses import StreamingResponse
 
 from app.api.bounded_body import read_bounded_body
 from app.api.deps import get_current_user
@@ -10,15 +12,25 @@ from app.api.file_write_context import (
     resolve_file_write_context as _resolve_file_write_context,
 )
 from app.config import settings
+from app.exceptions import AKBError
 from app.models.file import BodyPlacementObservation
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
-from app.services.file_service import FileService
-from app.util.text import to_nfc
+from app.services.file_service import (
+    FileService,
+    content_disposition_inline,
+    head_object,
+    iter_object_chunks,
+)
+from app.services.raw_mime_policy import is_inert_raw_mime
+from app.util.text import normalize_content_type, to_nfc
 
 router = APIRouter()
 file_service = FileService()
 _measurement_transfer_slots = asyncio.Semaphore(2)
+# Bounded like its sibling above. botocore's shared pool is 10 connections
+# and a stream holds one for the whole object.
+_download_capability_slots = asyncio.Semaphore(4)
 
 
 @router.api_route("/files/transfer/{token}", methods=["PUT", "GET"], include_in_schema=False)
@@ -173,6 +185,126 @@ async def confirm_file_replace(
     )
 
 
+_SINGLE_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+
+
+def _parse_single_range(header: str | None, size: int) -> tuple[int, int] | None:
+    """Resolve one `bytes=` range against a known size, or None.
+
+    Only the single-range form is honoured. Multipart ranges need a
+    multipart/byteranges body, no browser asks for them here, and answering
+    200 to a range we do not understand is the correct fallback."""
+    if not header or size <= 0:
+        return None
+    m = _SINGLE_RANGE_RE.match(header.strip())
+    if not m:
+        return None
+    raw_start, raw_end = m.group(1), m.group(2)
+    if raw_start == "" and raw_end == "":
+        return None
+    if raw_start == "":
+        # `bytes=-N` — the final N bytes.
+        length = int(raw_end)
+        if length <= 0:
+            return None
+        start, end = max(0, size - length), size - 1
+    else:
+        start = int(raw_start)
+        end = int(raw_end) if raw_end else size - 1
+        if start >= size or end < start:
+            return None
+        end = min(end, size - 1)
+    return start, end
+
+
+@router.api_route(
+    "/files/download/{token}", methods=["GET"], include_in_schema=False,
+)
+async def download_by_capability(token: str, request: Request):
+    """Serve File bytes to a holder of a download capability.
+
+    No user-token dependency: the short-lived capability is the authorization,
+    exactly as a presigned signature was. The public contract is the
+    `download_url` field, not this path, so it stays out of the schema."""
+    row = await file_service.resolve_download_capability(token)
+    mime = normalize_content_type(row["mime_type"])
+    headers = {
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "private, no-store",
+        "Content-Disposition": content_disposition_inline(
+            row["name"] or "download",
+        ),
+    }
+    if not is_inert_raw_mime(mime):
+        # Fail CLOSED. These bytes were uploaded by someone; a type we cannot
+        # prove inert must not run as a document in this origin.
+        headers["Content-Security-Policy"] = "sandbox allow-same-origin"
+
+    if request.method == "HEAD":
+        # Defensive, and measured: FastAPI's APIRoute does NOT add HEAD to a
+        # GET route (unlike Starlette's plain Route), so nothing reaches this
+        # today. It matters if HEAD is ever added to `methods`, because
+        # StreamingResponse has no HEAD branch — it would drain the whole
+        # object to send no body at all. Answer from what we already know.
+        headers["Content-Length"] = str(row["size_bytes"] or 0)
+        headers["Accept-Ranges"] = "bytes"
+        return Response(status_code=200, media_type=mime, headers=headers)
+
+    # Serving bytes through this process replaces what used to be a direct
+    # browser→store transfer with no application involvement. That had a
+    # perfect implicit limit; this needs an explicit one, or a handful of
+    # multi-gigabyte reads starve every other request sharing anyio's thread
+    # limiter — the same tokens every sync route handler draws from.
+    #
+    # The slot is held for the transfer, not for this function: a
+    # StreamingResponse has barely started when we return. Releasing in the
+    # generator's `finally` covers a client that disconnects mid-stream too,
+    # which a response-completion hook does not.
+    loop = asyncio.get_running_loop()
+    await _download_capability_slots.acquire()
+
+    # HEAD the object before committing a 200: a missing object becomes a clean
+    # 502 rather than a silently truncated body. It also gives us the real
+    # size — the DB figure can drift from what is stored.
+    try:
+        meta = await asyncio.to_thread(head_object, row["s3_key"])
+    except Exception as exc:  # noqa: BLE001 — any storage failure is a 502 here
+        _download_capability_slots.release()
+        raise AKBError("File content is temporarily unavailable", status_code=502) from exc
+    stored_size = meta.get("ContentLength")
+    size = stored_size if isinstance(stored_size, int) else 0
+
+    # The object store answered ranges directly before this route existed, and
+    # the largest stored File is multi-gigabyte: losing resume would mean a
+    # download that fails at 90% starts over. Honour a single range here.
+    span = _parse_single_range(request.headers.get("range"), size)
+    status, byte_range = 200, None
+    if span is not None:
+        start, end = span
+        status, byte_range = 206, f"bytes={start}-{end}"
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+        headers["Content-Length"] = str(end - start + 1)
+    elif size:
+        # Taken from the object, not the row, so a drift cannot truncate the
+        # wire. Without it every response is chunked and the browser shows no
+        # progress at all — which the presigned path did not do.
+        headers["Content-Length"] = str(size)
+    if size:
+        headers["Accept-Ranges"] = "bytes"
+
+    def _bounded_chunks():
+        # Runs in anyio's threadpool, so the release must be marshalled back:
+        # `asyncio.Semaphore.release` is not thread-safe.
+        try:
+            yield from iter_object_chunks(row["s3_key"], byte_range=byte_range)
+        finally:
+            loop.call_soon_threadsafe(_download_capability_slots.release)
+
+    return StreamingResponse(
+        _bounded_chunks(), status_code=status, media_type=mime, headers=headers,
+    )
+
+
 @router.get("/files/{vault}/{file_id}/download", summary="Get download URL")
 async def get_download_url(
     vault: str,
@@ -180,7 +312,9 @@ async def get_download_url(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     access = await check_vault_access(user.user_id, vault, required_role="reader")
-    return await file_service.get_download_url(access["vault_id"], file_id)
+    return await file_service.get_download_url(
+        access["vault_id"], file_id, actor_id=user.username,
+    )
 
 
 @router.get("/files/{vault}", summary="List files in vault storage")

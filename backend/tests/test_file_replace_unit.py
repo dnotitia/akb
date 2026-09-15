@@ -274,8 +274,24 @@ async def test_upload_response_reports_actual_signing_lifetime(monkeypatch):
     assert result["expires_in"] == 234
 
 
-async def test_download_response_reports_actual_signing_lifetime(monkeypatch):
-    service, _pool = await _service(monkeypatch)
+async def test_download_reports_the_capability_lifetime_and_never_signs(monkeypatch):
+    """`expires_in` must equal how long the URL actually works.
+
+    A presigned URL could have its life cut short by the S3 session's own
+    expiry, so the response had to report the shortened figure. A capability's
+    life is the row this call writes, so the two cannot drift — but the
+    contract a caller reads is unchanged, and one consumer treats
+    `expires_in <= 0` as already-expired.
+
+    The stronger assertion here is the negative one: a download must not reach
+    the object store at all. That is the whole point of the change."""
+    service, pool = await _service(monkeypatch)
+    written: list[tuple] = []
+
+    async def _execute(*args):
+        written.append(args)
+
+    monkeypatch.setattr(pool.conn, "execute", _execute)
 
     async def find(*_args):
         return {**_row(), "upload_state": "confirmed", "hash_algorithm": "sha256"}
@@ -283,11 +299,23 @@ async def test_download_response_reports_actual_signing_lifetime(monkeypatch):
     monkeypatch.setattr(fs.vault_files_repo, "find_by_id", find)
     monkeypatch.setattr(
         fs.s3_adapter, "presign_get",
-        lambda *_args, **_kwargs: fs.s3_adapter.PresignedURL("https://download.test", 345),
+        lambda *_a, **_k: pytest.fail("a download must not be signed against the store"),
     )
+
     result = await service.get_download_url(_row()["vault_id"], str(_row()["id"]))
-    assert result["download_url"] == "https://download.test"
-    assert result["expires_in"] == 345
+
+    assert result["expires_in"] == fs._PRESIGN_DOWNLOAD_TTL
+    assert result["expires_in"] > 0
+    # The lifetime written to the grant is the one reported back. Asserted by
+    # meaning rather than by position — the parameter list grows.
+    assert written, "a grant must be recorded"
+    sql, *params = written[0]
+    assert "INSERT INTO m1_file_transfer_intents" in sql
+    assert result["expires_in"] in params
+    # No locator, no signature — only this service and an opaque token.
+    assert "/api/v1/files/download/" in result["download_url"]
+    for leaked in ("X-Amz-", "akb-files", "?"):
+        assert leaked not in result["download_url"], leaked
 
 
 async def test_confirm_replace_switches_metadata_only_after_locked_recheck(monkeypatch):
