@@ -146,6 +146,27 @@ def normalize_collection_path(path: str | None, *, allow_empty: bool = True) -> 
     return "/".join(parts)
 
 
+# RFC 9110 token characters on both halves of a media type. Anything else —
+# a bare word, a path, an empty string — is not a media type.
+_CONTENT_TYPE_RE = re.compile(
+    r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+/[A-Za-z0-9!#$%&'*+.^_`|~-]+$"
+)
+GENERIC_CONTENT_TYPE = "application/octet-stream"
+
+
+def normalize_content_type(value: str | None) -> str:
+    """Reduce a declared media type to a bare, lowercased ``type/subtype``.
+
+    Parameters are dropped rather than carried along. Nothing downstream reads
+    them, but every set that classifies a type is keyed on the bare form — so a
+    value that carries one misses those sets, and the same bytes end up treated
+    differently depending on how the type happened to be spelled. A value that
+    is not a media type at all becomes the generic binary type instead of
+    travelling onward as itself."""
+    bare = (value or "").split(";", 1)[0].strip().lower()
+    return bare if _CONTENT_TYPE_RE.fullmatch(bare) else GENERIC_CONTENT_TYPE
+
+
 def validate_file_name(name: str) -> str:
     """Require the File identity component to be one logical path segment."""
     if not isinstance(name, str) or not name:

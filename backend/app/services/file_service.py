@@ -319,6 +319,7 @@ async def _discard_replacement_objects(*s3_keys: str) -> None:
 
 
 from app.util.text import normalize_collection_path as _normalize_collection_path  # noqa: E402
+from app.util.text import normalize_content_type as _normalize_content_type  # noqa: E402
 
 
 async def _delete_file_publications(conn, vault_id: uuid.UUID, file_id: str) -> None:
@@ -391,6 +392,7 @@ class FileService:
         were stored under. Omitting `content_hash` preserves the historical
         behaviour exactly: a random key, and one new row per call.
         """
+        mime_type = _normalize_content_type(mime_type)
         if content_hash is not None and not is_sha256_hex(content_hash):
             raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
         # Ahead of the backend split: the measurement facade normalizes the
@@ -542,7 +544,9 @@ class FileService:
         s3_adapter.ensure_bucket(self._bucket)
         replacement_id = uuid.uuid4()
         staging_key = _replacement_staging_key(vault_name, fid, replacement_id)
-        upload_mime_type = mime_type or row.get("mime_type") or "application/octet-stream"
+        upload_mime_type = _normalize_content_type(
+            mime_type or row.get("mime_type")
+        )
         upload_url = s3_adapter.presign_put(
             staging_key,
             content_type=upload_mime_type,
@@ -654,7 +658,9 @@ class FileService:
             raise ConflictError("Uploaded replacement file hash mismatch")
 
         size_bytes = final_meta["ContentLength"]
-        mime_type = final_meta.get("ContentType") or row.get("mime_type") or "application/octet-stream"
+        mime_type = _normalize_content_type(
+            final_meta.get("ContentType") or row.get("mime_type")
+        )
         etag = (final_meta.get("ETag") or "").strip('"') or None
         storage_version = final_meta.get("VersionId")
         previous_content_hash: str | None = None
