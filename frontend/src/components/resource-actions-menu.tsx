@@ -1,4 +1,5 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import type { ReactNode, Ref } from "react";
 import { Archive, ArchiveRestore, FolderInput, MoreHorizontal, Share2, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -18,6 +19,12 @@ interface ResourceActionsMenuProps {
   className?: string;
   side?: "top" | "right" | "bottom" | "left";
   align?: "start" | "center" | "end";
+  /** Reading/personal actions, before location and lifecycle mutations. */
+  children?: ReactNode;
+  onCloseAutoFocus?: (event: Event) => void;
+  /** Compact reading toolbar appearance; other resource menus stay unchanged. */
+  readerControl?: boolean;
+  triggerRef?: Ref<HTMLButtonElement>;
 }
 
 /** Shared overflow action for document, file, and table resources.
@@ -41,33 +48,43 @@ export function ResourceActionsMenu({
   className,
   side = "bottom",
   align = "end",
+  children,
+  onCloseAutoFocus,
+  readerControl = false,
+  triggerRef,
 }: ResourceActionsMenuProps) {
   const showMoveAction = Boolean(moveLabel && (onMove || moveDisabledReason));
   const showPublishAction = Boolean(publishLabel && onPublish);
   const showDeleteAction = Boolean(deleteLabel && onDelete);
-  if (!showMoveAction && !showPublishAction && !showDeleteAction && !archiveAction) return null;
+  if (!children && !showMoveAction && !showPublishAction && !showDeleteAction && !archiveAction) return null;
 
   return (
     <DropdownMenu.Root>
       <DropdownMenu.Trigger asChild>
         <Button
+          ref={triggerRef}
           type="button"
           variant="ghost"
           size="icon"
           aria-label={`Actions for ${resourceName}`}
           title={`Actions for ${resourceName}`}
-          className={cn("shrink-0", className)}
+          data-reader-control={readerControl || undefined}
+          data-reader-icon={readerControl || undefined}
+          className={cn("shrink-0", readerControl && "text-foreground-muted hover:text-foreground data-[state=open]:bg-surface-selected data-[state=open]:text-surface-selected-foreground", className)}
         >
           <MoreHorizontal className="h-4 w-4" aria-hidden />
         </Button>
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
         <DropdownMenu.Content
+          onCloseAutoFocus={onCloseAutoFocus}
           side={side}
           align={align}
           sideOffset={4}
           className="z-[var(--z-popover)] min-w-48 overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
         >
+          {children}
+          {children && (showMoveAction || showPublishAction || showDeleteAction || archiveAction) && <DropdownMenu.Separator className="my-1 h-px bg-border" />}
           {showMoveAction && (
             <DropdownMenu.Item
               aria-disabled={moveDisabledReason ? true : undefined}

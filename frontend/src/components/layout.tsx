@@ -1,7 +1,7 @@
 import { Link, Outlet, Navigate, useLocation } from "react-router-dom";
-import { useEffect, useLayoutEffect, useState, type CSSProperties } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Boxes, House, type LucideIcon } from "lucide-react";
+import { Boxes, House, PanelLeftOpen, PanelLeftClose, type LucideIcon } from "lucide-react";
 import {
   clearPrivateAssetCache,
   getAuthConfig,
@@ -18,8 +18,11 @@ import { NotificationBell } from "@/components/notification-bell";
 import { AppSidebar } from "@/components/app-sidebar";
 import { AppPageLocation } from "@/components/app-page-location";
 import { appRouteBoundaryForPath } from "@/app-route-contract";
+import { Button } from "@/components/ui/button";
+import type { VaultNavigationControl } from "@/components/vault-shell";
 import { CurrentUserProvider } from "@/contexts/current-user-context";
-import { useAccessibleIndexingHealth } from "@/hooks/use-accessible-indexing-health";
+import { ResourceLocationProvider } from "@/contexts/resource-location-context";
+import { SearchStatusProvider } from "@/hooks/use-search-status";
 import { InlineLoadingState, LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 
@@ -46,7 +49,12 @@ export function Layout() {
     | { status: "unauthenticated"; user: null }
   >({ status: "checking", user: null });
   const [revalidating, setRevalidating] = useState(false);
+  const [accessRevision, setAccessRevision] = useState(0);
   const [vaultNavigationWidth, setVaultNavigationWidth] = useState(0);
+  const [vaultNavigationControl, setVaultNavigationControl] = useState<VaultNavigationControl | null>(null);
+  const searchControlsRef = useRef<HTMLDivElement>(null);
+  const accountControlsRef = useRef<HTMLDivElement>(null);
+  const [minimumVaultWorkspaceWidth, setMinimumVaultWorkspaceWidth] = useState(656);
   const [vaultSidebarCollapsed, setVaultSidebarCollapsed] = useState(true);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try {
@@ -108,6 +116,7 @@ export function Layout() {
           queryClient.clear();
         }
         setSession({ status: "authenticated", user: verified });
+        setAccessRevision(revision => revision + 1);
       } catch (error) {
         if (disposed || (error instanceof Error && error.name === "DeferredSessionError")) return;
         queryClient.clear();
@@ -130,11 +139,13 @@ export function Layout() {
     };
 
     window.addEventListener("focus", revalidateForegroundIdentity);
+    window.addEventListener("akb:revalidate-access", revalidateForegroundIdentity);
     window.addEventListener("storage", onStorage);
     document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
       disposed = true;
       window.removeEventListener("focus", revalidateForegroundIdentity);
+      window.removeEventListener("akb:revalidate-access", revalidateForegroundIdentity);
       window.removeEventListener("storage", onStorage);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
@@ -145,10 +156,23 @@ export function Layout() {
   const isSettingsWorkspace = location.pathname === "/settings";
   const viewportLocked = wide || isSearchWorkspace || isSettingsWorkspace;
   const sidebarCompact = wide ? vaultSidebarCollapsed : sidebarCollapsed;
-  const { data: indexingStatus } = useAccessibleIndexingHealth(
-    session.status === "authenticated",
-    activeUser?.user_id,
-  );
+
+  useLayoutEffect(() => {
+    const search = searchControlsRef.current;
+    const account = accountControlsRef.current;
+    if (!wide || !search || !account) return;
+    const measure = () => {
+      const rem = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+      // Keep a readable location trail, measured search/indexing/
+      // identity controls, outer insets and the optional drawer trigger.
+      setMinimumVaultWorkspaceWidth(search.getBoundingClientRect().width + account.getBoundingClientRect().width + 21.25 * rem);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(search);
+    observer.observe(account);
+    return () => observer.disconnect();
+  }, [wide, session.status]);
 
   function setSidebarCompact(compact: boolean) {
     if (wide) {
@@ -190,6 +214,9 @@ export function Layout() {
       : "min-h-screen flex flex-col bg-background text-foreground";
 
   return (
+    <SearchStatusProvider identity={activeFingerprint!} enabled={!revalidating}>
+    <CurrentUserProvider user={session.user} checking={revalidating} revision={accessRevision}>
+    <ResourceLocationProvider identity={activeFingerprint!} checking={revalidating} revision={accessRevision}>
     <div className={`${rootClass} [--workspace-gutter:1rem] sm:[--workspace-gutter:1.5rem] lg:[--workspace-gutter:2rem] xl:[--workspace-gutter:3rem] 2xl:[--workspace-gutter:9rem] ${sidebarCompact ? "lg:pl-14" : "lg:pl-52"}`} style={{ "--vault-navigation-width": `${wide ? vaultNavigationWidth : isSettingsWorkspace ? 220 : 0}px` } as CSSProperties} aria-busy={revalidating || undefined}>
       {revalidating && (
         <InlineLoadingState
@@ -219,16 +246,22 @@ export function Layout() {
               <Logo
                 size={28}
                 wordmark
-                subtitle
                 variant="header"
               />
             </Link>
           </div>
 
-          <div className="flex min-w-0 flex-1 items-center pr-3 lg:pl-5">
+          <div className="flex h-full min-w-0 flex-1 items-center pr-3 lg:pl-5">
+            {wide && vaultNavigationControl && <Button id="vault-navigation-trigger" variant="ghost" size="icon"
+              className="mr-2 hidden h-9 w-9 shrink-0 lg:inline-flex"
+              aria-label={vaultNavigationControl.open ? "Close vault navigation" : "Open vault navigation"}
+              aria-expanded={vaultNavigationControl.open} aria-controls="vault-workspace-navigation"
+              onClick={vaultNavigationControl.onToggle}>
+              {vaultNavigationControl.open ? <PanelLeftClose className="h-4 w-4" aria-hidden /> : <PanelLeftOpen className="h-4 w-4" aria-hidden />}
+            </Button>}
             <AppPageLocation isAdmin={session.user.is_admin} />
-            <div className="ml-auto flex min-w-0 items-center gap-2">
-              <HeaderIndexingStatus status={indexingStatus} />
+            <div ref={searchControlsRef} className="ml-auto flex min-w-0 flex-1 items-center gap-2 lg:flex-none lg:pl-3">
+              <HeaderIndexingStatus />
               {/* This is a real global-search surface, not a shortcut to /search.
                   Advanced mode and vault/type filters remain on the full page. */}
               <CurrentUserProvider user={session.user}>
@@ -256,7 +289,7 @@ export function Layout() {
               />
             </nav>
 
-            <div className="ml-2 flex shrink-0 items-center justify-end gap-2 border-l border-border pl-2 lg:min-w-28">
+            <div ref={accountControlsRef} className="ml-2 flex shrink-0 items-center justify-end gap-2 border-l border-border pl-2 lg:min-w-28">
               <CurrentUserProvider user={session.user}>
                 <NotificationBell key={session.user.user_id} />
               </CurrentUserProvider>
@@ -294,18 +327,18 @@ export function Layout() {
             }
           >
             {viewportLocked ? (
-              <CurrentUserProvider user={session.user}>
+              <CurrentUserProvider user={session.user} checking={revalidating} revision={accessRevision}>
                 <ErrorBoundary resetKeys={[location.pathname, location.search]}>
-                  <Outlet context={{ indexingStatus, setVaultNavigationWidth }} />
+                  <Outlet context={{ setVaultNavigationWidth, setVaultNavigationControl, minimumVaultWorkspaceWidth }} />
                 </ErrorBoundary>
               </CurrentUserProvider>
             ) : (
               <div className="w-full px-[var(--workspace-gutter)] py-8">
-                <CurrentUserProvider user={session.user}>
+                <CurrentUserProvider user={session.user} checking={revalidating} revision={accessRevision}>
                   <ErrorBoundary
                     resetKeys={[location.pathname, location.search]}
                   >
-                    <Outlet context={{ indexingStatus }} />
+                    <Outlet />
                   </ErrorBoundary>
                 </CurrentUserProvider>
               </div>
@@ -325,6 +358,9 @@ export function Layout() {
         </div>
       </div>
     </div>
+    </ResourceLocationProvider>
+    </CurrentUserProvider>
+    </SearchStatusProvider>
   );
 }
 
@@ -335,7 +371,7 @@ function AppShellLoading({ compact }: { compact: boolean }) {
         <header className="app-header shrink-0">
           <div className="flex h-14 w-full items-center">
             <div className="flex shrink-0 items-center px-3 lg:hidden">
-              <Logo size={28} wordmark subtitle variant="header" />
+              <Logo size={28} wordmark variant="header" />
             </div>
             <div className="ml-auto flex min-w-0 items-center gap-3 pr-3">
               <Skeleton className="hidden h-8 w-44 rounded-[var(--radius-md)] sm:block" />

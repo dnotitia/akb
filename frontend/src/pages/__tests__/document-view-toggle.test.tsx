@@ -1,14 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import { Link, MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { VaultRefreshProvider } from "@/contexts/vault-refresh-context";
 import { CurrentUserProvider } from "@/contexts/current-user-context";
 import DocumentPage from "@/pages/document";
 import { readRecentDocumentViews } from "@/lib/recent-document-views";
+import { listDocumentEditDrafts } from "@/lib/document-draft";
+import { ResourceNavigationProvider, useResourceNavigation } from "@/contexts/resource-navigation-context";
 
 const editorAssetIds = vi.hoisted(() => ({ value: [] as readonly string[] }));
+const editorCallbacks = vi.hoisted(() => ({
+  onUploadingChange: undefined as ((uploading: boolean) => void) | undefined,
+  preserveUploadsOnUnmount: false,
+}));
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
@@ -22,6 +28,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
     getRelations: vi.fn(),
     deleteDocument: vi.fn(),
     publishDoc: vi.fn(),
+    createPublication: vi.fn(),
     unpublishDoc: vi.fn(),
     updateDocument: vi.fn(),
     browseVault: vi.fn(),
@@ -34,17 +41,25 @@ vi.mock("@/components/markdown-editor", () => ({
     value,
       onChange,
       ariaLabel,
+      onUploadingChange,
+      preserveUploadsOnUnmount,
     }: {
       value: string;
       onChange?: (value: string, assetIds?: readonly string[]) => void;
       ariaLabel?: string;
-  }) => (
+      onUploadingChange?: (uploading: boolean) => void;
+      preserveUploadsOnUnmount?: boolean;
+  }) => {
+    editorCallbacks.onUploadingChange = onUploadingChange;
+    editorCallbacks.preserveUploadsOnUnmount = preserveUploadsOnUnmount ?? false;
+    return (
     <textarea
       aria-label={ariaLabel}
       defaultValue={value}
       onChange={(event) => onChange?.(event.currentTarget.value, editorAssetIds.value)}
     />
-  ),
+    );
+  },
 }));
 
 import {
@@ -52,6 +67,7 @@ import {
   DocumentRevisionApiError,
   discardAsset,
   deleteDocument,
+  createPublication,
   getDocument,
   getDocumentDiff,
   getDocumentHistoryWithFallback,
@@ -182,22 +198,37 @@ function LocationProbe() {
   );
 }
 
-function renderAt(url: string) {
+function GuardedSearchLink() {
+  const { requestNavigation } = useResourceNavigation();
+  return <Link to="/vault/v/search" onClick={(event) => { if (!requestNavigation("/vault/v/search")) event.preventDefault(); }}>Search destination</Link>;
+}
+
+function renderAt(url: string, withNavigation = false) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return { ...render(
+  const contents = (access: { user?: typeof CURRENT_USER; checking?: boolean; revision?: number } = {}) => (
     <QueryClientProvider client={qc}>
       <MemoryRouter initialEntries={[url]}>
-        <CurrentUserProvider user={CURRENT_USER}>
+        <CurrentUserProvider user={access.user ?? CURRENT_USER} checking={access.checking} revision={access.revision}>
           <VaultRefreshProvider refetchVaults={vi.fn()} refetchTree={vi.fn()}>
+            <ResourceNavigationProvider>
+            {withNavigation && <GuardedSearchLink />}
             <Routes>
               <Route path="/vault/:name/doc/:id" element={<DocumentPage />} />
+              <Route path="/vault/:name/search" element={<div>Vault search destination</div>} />
             </Routes>
+            </ResourceNavigationProvider>
           </VaultRefreshProvider>
         </CurrentUserProvider>
         <LocationProbe />
       </MemoryRouter>
-    </QueryClientProvider>,
-  ), queryClient: qc };
+    </QueryClientProvider>
+  );
+  const rendered = render(contents());
+  return {
+    ...rendered,
+    queryClient: qc,
+    rerenderAccess: (access: Parameters<typeof contents>[0]) => rendered.rerender(contents(access)),
+  };
 }
 
 function renderPreviewAt(url: string) {
@@ -242,11 +273,14 @@ beforeEach(() => {
   discardAssetMock.mockReset();
   discardAssetMock.mockResolvedValue(undefined);
   deleteDocumentMock.mockReset();
+  vi.mocked(createPublication).mockReset();
   getDocumentDiffMock.mockReset();
   getDocumentHistoryMock.mockReset();
   getVaultInfoMock.mockReset();
   getRelationsMock.mockReset();
   editorAssetIds.value = [];
+  editorCallbacks.onUploadingChange = undefined;
+  editorCallbacks.preserveUploadsOnUnmount = false;
   updateDocumentMock.mockReset();
   browseVaultMock.mockReset();
   moveDocumentMock.mockReset();
@@ -304,18 +338,194 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("DocumentPage resource navigation", () => {
+  it("lets a clean editor follow a Vault link directly", async () => {
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    renderAt("/vault/v/doc/notes%2Fhello.md?view=edit", true);
+    await screen.findByRole("textbox", { name: "Document title" });
+    await userEvent.click(screen.getByRole("link", { name: "Search destination" }));
+    expect(await screen.findByText("Vault search destination")).toBeVisible();
+    expect(screen.queryByRole("dialog", { name: "Leave this document?" })).not.toBeInTheDocument();
+  });
+
+  it("keeps dirty edits on cancel, then leaves with the existing local draft and uploaded assets intact", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    renderAt("/vault/v/doc/notes%2Fhello.md?view=edit", true);
+    const body = await screen.findByRole("textbox", { name: "Document body (markdown)" });
+    editorAssetIds.value = ["draft-image"];
+    await user.type(body, "\nUnsaved note");
+    await user.click(screen.getByRole("link", { name: "Search destination" }));
+    let dialog = await screen.findByRole("dialog", { name: "Leave this document?" });
+    expect(dialog).toHaveTextContent("Your changes have not been saved to the Vault");
+    expect(dialog).toHaveTextContent("recovery depends on browser storage");
+    expect(within(dialog).getByRole("button", { name: "Keep editing" })).toHaveFocus();
+    await user.click(within(dialog).getByRole("button", { name: "Keep editing" }));
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Document title" })).toHaveFocus());
+    expect(body).toHaveValue(`${SAMPLE_CONTENT}\nUnsaved note`);
+    expect(screen.getByTestId("location-search")).toHaveTextContent("view=edit");
+    await user.click(screen.getByRole("link", { name: "Search destination" }));
+    dialog = await screen.findByRole("dialog", { name: "Leave this document?" });
+    expect(editorCallbacks.preserveUploadsOnUnmount).toBe(true);
+    await user.click(within(dialog).getByRole("button", { name: "Leave document" }));
+    expect(await screen.findByText("Vault search destination")).toBeVisible();
+    expect(listDocumentEditDrafts(CURRENT_USER.user_id, "v", "v:notes/hello.md")).toEqual([
+      expect.objectContaining({ body: `${SAMPLE_CONTENT}\nUnsaved note`, assetIds: ["draft-image"] }),
+    ]);
+    expect(updateDocumentMock).not.toHaveBeenCalled();
+    expect(discardAssetMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves uploaded assets on confirmed departure even when local draft storage fails", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    renderAt("/vault/v/doc/notes%2Fhello.md?view=edit", true);
+    const body = await screen.findByRole("textbox", { name: "Document body (markdown)" });
+    const storage = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new Error("Storage full"); });
+    try {
+      editorAssetIds.value = ["draft-image"];
+      await user.type(body, "\nUnsaved note");
+      await screen.findByText("Could not save this draft locally; it remains only in this tab.");
+      await user.click(screen.getByRole("link", { name: "Search destination" }));
+      const dialog = await screen.findByRole("dialog", { name: "Leave this document?" });
+      expect(dialog).toHaveTextContent("this browser could not save a local draft");
+      expect(dialog).toHaveTextContent("these changes may be lost");
+      expect(editorCallbacks.preserveUploadsOnUnmount).toBe(true);
+      await user.click(within(dialog).getByRole("button", { name: "Leave document" }));
+      expect(await screen.findByText("Vault search destination")).toBeVisible();
+      expect(discardAssetMock).not.toHaveBeenCalled();
+    } finally {
+      storage.mockRestore();
+    }
+  });
+
+  it("blocks departure during an image upload while Keep editing remains available", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    renderAt("/vault/v/doc/notes%2Fhello.md?view=edit", true);
+    await screen.findByRole("textbox", { name: "Document body (markdown)" });
+    act(() => editorCallbacks.onUploadingChange?.(true));
+    await user.click(screen.getByRole("link", { name: "Search destination" }));
+    const dialog = await screen.findByRole("dialog", { name: "Leave this document?" });
+    expect(dialog).toHaveTextContent("An image is still uploading");
+    expect(within(dialog).getByRole("button", { name: "Leave document" })).toBeDisabled();
+    expect(within(dialog).getByRole("button", { name: "Keep editing" })).toBeEnabled();
+    await user.click(within(dialog).getByRole("button", { name: "Keep editing" }));
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Document title" })).toHaveFocus());
+    act(() => editorCallbacks.onUploadingChange?.(false));
+    await user.click(screen.getByRole("link", { name: "Search destination" }));
+    expect(await screen.findByText("Vault search destination")).toBeVisible();
+  });
+
+  it("waits for an in-flight save before enabling Leave document", async () => {
+    const user = userEvent.setup();
+    let finishSave!: (result: { current_commit: string }) => void;
+    updateDocumentMock.mockImplementation(() => new Promise((resolve) => { finishSave = resolve; }));
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    renderAt("/vault/v/doc/notes%2Fhello.md?view=edit", true);
+    await user.type(await screen.findByRole("textbox", { name: "Document title" }), " updated");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(updateDocumentMock).toHaveBeenCalledOnce());
+    await user.click(screen.getByRole("link", { name: "Search destination" }));
+    const dialog = await screen.findByRole("dialog", { name: "Leave this document?" });
+    expect(dialog).toHaveTextContent("Your document is still saving");
+    expect(within(dialog).getByRole("button", { name: "Leave document" })).toBeDisabled();
+    expect(within(dialog).getByRole("button", { name: "Keep editing" })).toBeEnabled();
+    await act(async () => { finishSave({ current_commit: UPDATED_COMMIT }); });
+    await waitFor(() => expect(within(dialog).getByRole("button", { name: "Leave document" })).toBeEnabled());
+    await user.click(within(dialog).getByRole("button", { name: "Leave document" }));
+    expect(await screen.findByText("Vault search destination")).toBeVisible();
+  });
+
+  it("keeps navigation confirmation available when access revalidation removes document data", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    const rendered = renderAt("/vault/v/doc/notes%2Fhello.md?view=edit", true);
+    await user.type(await screen.findByRole("textbox", { name: "Document title" }), " unsaved");
+    rendered.rerenderAccess({ checking: true, revision: 1 });
+    expect(screen.queryByRole("textbox", { name: "Document title" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("link", { name: "Search destination" }));
+    let dialog = await screen.findByRole("dialog", { name: "Leave this document?" });
+    await user.click(within(dialog).getByRole("button", { name: "Keep editing" }));
+    expect(screen.getByTestId("location-search")).toHaveTextContent("view=edit");
+    getDocumentMock.mockRejectedValue(new ApiError("Access denied", 403, {}));
+    rendered.rerenderAccess({ checking: false, revision: 1 });
+    await screen.findByText("Access denied");
+    await user.click(screen.getByRole("link", { name: "Search destination" }));
+    dialog = await screen.findByRole("dialog", { name: "Leave this document?" });
+    await user.click(within(dialog).getByRole("button", { name: "Leave document" }));
+    expect(await screen.findByText("Vault search destination")).toBeVisible();
+    expect(updateDocumentMock).not.toHaveBeenCalled();
+  });
+
+  it("clears the previous account's navigation guard and pending prompt on account switch", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    const rendered = renderAt("/vault/v/doc/notes%2Fhello.md?view=edit", true);
+    await user.type(await screen.findByRole("textbox", { name: "Document title" }), " unsaved");
+    await user.click(screen.getByRole("link", { name: "Search destination" }));
+    await screen.findByRole("dialog", { name: "Leave this document?" });
+    rendered.rerenderAccess({ user: { ...CURRENT_USER, user_id: "another-account" } });
+    const title = await screen.findByRole("textbox", { name: "Document title" });
+    expect(title).toHaveValue("DocTitle");
+    expect(screen.queryByRole("dialog", { name: "Leave this document?" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("link", { name: "Search destination" }));
+    expect(await screen.findByText("Vault search destination")).toBeVisible();
+  });
+});
+
 describe("DocumentPage view toggle", () => {
+  it("discloses publication options from the toolbar without creating a public link", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+    const publish = await screen.findByRole("button", { name: "Publish" });
+    await waitFor(() => expect(publish).not.toHaveAttribute("aria-disabled", "true"));
+    await user.click(publish);
+    const dialog = screen.getByRole("dialog", { name: "Publish document" });
+    expect(within(dialog).getByText(/without signing in/)).toBeVisible();
+    expect(createPublication).not.toHaveBeenCalled();
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(publish).toHaveFocus());
+    expect(createPublication).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ role: "reader" }, "", "Writer access or higher is required to publish."],
+    [{ role: "owner", is_archived: true }, "", "Restore this Vault before managing public links."],
+    [{ role: "writer", is_external_git: true }, "", "External Git vaults are read-only."],
+    [{ role: "owner" }, "?view=diff&commit=abcdef1234567", "Open the latest document to manage public links."],
+  ])("keeps publishing restrictions visible for %j %s", async (vault, query, reason) => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue(vault);
+    renderAt(`/vault/v/doc/notes%2Fhello.md${query}`);
+    const publish = await screen.findByRole("button", { name: "Publish" });
+    await waitFor(() => expect(publish).toHaveAccessibleDescription(reason));
+    expect(publish).toHaveAttribute("aria-disabled", "true");
+    await user.click(publish);
+    expect(screen.queryByRole("dialog", { name: "Publish document" })).not.toBeInTheDocument();
+    expect(createPublication).not.toHaveBeenCalled();
+  });
+
+  it("does not conflate guide editing permissions with publication permissions", async () => {
+    getDocumentMock.mockResolvedValue(makeDoc({ path: "overview/vault-skill.md" }));
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    renderPreviewAt("/vault/v/doc/overview%2Fvault-skill.md");
+    const publish = await screen.findByRole("button", { name: "Publish" });
+    await waitFor(() => expect(publish).not.toHaveAttribute("aria-disabled", "true"));
+    expect(screen.queryByRole("button", { name: "Edit" })).not.toBeInTheDocument();
+  });
+
   it("keeps the human title primary and moves file identifiers into technical details", async () => {
     const user = userEvent.setup();
     renderAt("/vault/v/doc/notes%2Fhello.md");
 
     const heading = await screen.findByRole("heading", { level: 1, name: "DocTitle" });
-    const header = heading.closest("header");
-    expect(header).not.toBeNull();
-    expect(within(header as HTMLElement).queryByText("hello.md")).not.toBeInTheDocument();
-    expect(screen.getAllByText("notes").length).toBeGreaterThan(0);
+    expect(heading).toHaveClass("sr-only");
+    expect(screen.queryByText("hello.md")).not.toBeVisible();
 
-    await user.click(screen.getByRole("button", { name: "Open document panel" }));
+    await user.click(screen.getByRole("button", { name: "Actions for DocTitle" }));
+    await user.click(screen.getByRole("menuitem", { name: "Document info" }));
     await user.click(screen.getByText("Technical details"));
     expect(screen.getByText("hello.md")).toBeInTheDocument();
     expect(screen.getByText("notes/hello.md")).toBeInTheDocument();
@@ -367,10 +577,8 @@ describe("DocumentPage view toggle", () => {
 
   it("links a preview back to its Vault overview", async () => {
     renderPreviewAt("/vault/v/doc/notes%2Fhello.md");
-
-    expect(
-      await screen.findByRole("link", { name: "Open v Vault overview" }),
-    ).toHaveAttribute("href", "/vault/v");
+    expect(await screen.findByRole("link", { name: "v" })).toHaveAttribute("href", "/vault/v");
+    expect(screen.queryByRole("navigation", { name: "Vault sections" })).not.toBeInTheDocument();
   });
 
   it("keeps the Vault guide readable inside a search preview", async () => {
@@ -397,15 +605,12 @@ describe("DocumentPage view toggle", () => {
     const heading = await screen.findByRole("heading", { level: 1, name: "DocTitle" });
     expect(screen.getByRole("region", { name: "Document workspace" })).toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Document content" })).toBeInTheDocument();
-    expect(screen.getAllByText("abcdef1").length).toBeGreaterThan(0);
-    expect(
-      within(heading.closest("header") as HTMLElement).queryByText(
-        "akb://v/coll/notes/doc/hello.md",
-      ),
-    ).not.toBeInTheDocument();
+    expect(heading).toHaveClass("sr-only");
+    expect(document.querySelectorAll('[data-slot="resource-command-row"]')).toHaveLength(1);
 
     const article = screen.getByRole("article");
-    expect(article).toHaveClass("w-full", "p-2", "sm:p-3");
+    expect(article).toHaveClass("w-full", "min-h-full");
+    expect(article).not.toHaveClass("p-2", "sm:p-3");
     expect(article).not.toHaveClass("max-w-6xl");
     expect(article.querySelector(".document-reading-flow")).toBeInTheDocument();
     const documentViewTabs = screen.getByRole("tablist", { name: "Document view" });
@@ -415,23 +620,29 @@ describe("DocumentPage view toggle", () => {
     ).toBeInTheDocument();
     const copyMarkdown = screen.getByRole("button", { name: "Copy markdown" });
     expect(copyMarkdown).toBeVisible();
-    expect(copyMarkdown.nextElementSibling).toBe(documentViewTabs);
+    const documentActions = screen.getByRole("group", { name: "Document actions" });
+    expect(documentViewTabs.nextElementSibling).toBe(documentActions);
+    expect(documentActions).toContainElement(copyMarkdown);
+    const information = screen.getByRole("group", { name: "Publishing and more options" });
+    expect(information).toContainElement(screen.getByRole("button", { name: "Publish" }));
+    expect(screen.queryByRole("button", { name: "Open document info" })).not.toBeInTheDocument();
+    expect(information).toContainElement(screen.getByRole("button", { name: "Actions for DocTitle" }));
     expect(document.getElementById("document-reading-canvas")).not.toHaveClass(
       "lg:pr-80",
       "xl:pr-88",
     );
 
     const details = document.getElementById("document-details-panel") as HTMLElement;
-    const detailsToggle = screen.getByRole("button", { name: "Open document panel" });
+    const detailsToggle = screen.getByRole("button", { name: "Actions for DocTitle" });
     expect(details).toHaveAttribute("aria-hidden", "true");
     expect(details).toHaveClass("translate-x-full");
     expect(detailsToggle).toHaveAttribute("aria-expanded", "false");
 
     await user.click(detailsToggle);
+    await user.click(screen.getByRole("menuitem", { name: "Document info" }));
     expect(details).toHaveAttribute("aria-hidden", "false");
     expect(details).toHaveClass("translate-x-0");
-    expect(detailsToggle).toHaveAttribute("aria-expanded", "true");
-    expect(detailsToggle).toHaveAccessibleName("Hide document panel");
+    expect(detailsToggle).toHaveAttribute("aria-expanded", "false");
     expect(details).toHaveClass("lg:w-96");
 
     const detailViews = screen.getByRole("tablist", { name: "Document detail views" });
@@ -453,7 +664,8 @@ describe("DocumentPage view toggle", () => {
     expect(details).toHaveAttribute("aria-hidden", "true");
     await waitFor(() => expect(detailsToggle).toHaveFocus());
 
-    await user.click(screen.getByRole("button", { name: "History" }));
+    await user.click(await screen.findByRole("button", { name: "Actions for DocTitle" }));
+    await user.click(screen.getByRole("menuitem", { name: "History" }));
     expect(details).toHaveAttribute("aria-hidden", "false");
     expect(screen.getByRole("tab", { name: /^History/ })).toHaveAttribute(
       "aria-selected",
@@ -463,6 +675,31 @@ describe("DocumentPage view toggle", () => {
     await user.keyboard("{Escape}");
     expect(details).toHaveAttribute("aria-hidden", "true");
     await waitFor(() => expect(detailsToggle).toHaveFocus());
+  });
+
+  it("transfers focus for inspector selections and restores Actions for other menu dismissals", async () => {
+    const user = userEvent.setup();
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+    const actions = await screen.findByRole("button", { name: "Actions for DocTitle" });
+    await user.click(actions);
+    await user.click(screen.getByRole("menuitem", { name: "Document info" }));
+    const close = screen.getByRole("button", { name: "Close document panel" });
+    await waitFor(() => expect(close).toHaveFocus());
+
+    await user.click(actions);
+    await user.click(screen.getByRole("menuitem", { name: "Table of contents" }));
+    expect(screen.getByRole("tab", { name: /^Outline/ })).toHaveAttribute("aria-selected", "true");
+    await waitFor(() => expect(close).toHaveFocus());
+
+    await user.click(actions);
+    await user.click(screen.getByRole("menuitemradio", { name: "Wide" }));
+    await waitFor(() => expect(actions).toHaveFocus());
+    expect(close).toBeVisible();
+
+    await user.click(actions);
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(actions).toHaveFocus());
+    expect(close).toBeVisible();
   });
 
   it("renders Markdown by default", async () => {
@@ -484,13 +721,16 @@ describe("DocumentPage view toggle", () => {
     renderAt("/vault/v/doc/notes%2Fhello.md");
 
     const edit = await screen.findByRole("button", { name: "Edit" });
-    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
+    expect(edit).toHaveAttribute("data-reader-icon");
+    expect(edit).toHaveTextContent("");
+    expect(edit).not.toHaveClass("bg-primary", "shadow-sm");
+    expect(screen.getAllByRole("tab").map((tab) => tab.getAttribute("aria-label") || tab.textContent)).toEqual([
       "Rendered",
       "Raw",
     ]);
 
     await user.click(edit);
-    expect(await screen.findByText("Editing document")).toBeInTheDocument();
+    expect(await screen.findByText("No changes")).toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: "Document title" })).toHaveValue("DocTitle");
     expect(screen.queryByRole("tablist", { name: "Document view" })).not.toBeInTheDocument();
 
@@ -554,21 +794,21 @@ describe("DocumentPage view toggle", () => {
     );
     renderAt("/vault/v/doc/notes%2Fhello.md");
 
-    const summary = await screen.findByRole("note", { name: "Document summary" });
-    expect(summary).toHaveClass("hidden", "lg:flex", "flex-1", "border-l");
-    expect(summary).toHaveTextContent("Summary");
+    const summary = await screen.findByRole("button", { name: "Read document summary" });
     expect(summary).toHaveTextContent(
       "A concise orientation to the document before the full body begins.",
     );
     const statistics = screen.getByLabelText("Document statistics: 3 lines, 20 Bytes");
     const copyMarkdown = screen.getByRole("button", { name: "Copy markdown" });
-    expect(summary.parentElement).toContainElement(statistics);
-    expect(summary.parentElement?.nextElementSibling).toBe(copyMarkdown);
+    expect(summary.closest('[data-slot="resource-command-row"]')).toContainElement(statistics);
+    expect(summary.closest('[data-slot="resource-command-row"]')).toContainElement(copyMarkdown);
     expect(screen.queryByRole("region", { name: "Document summary" })).not.toBeInTheDocument();
     expect(document.getElementById("document-details-panel")).toHaveAttribute(
       "aria-hidden",
       "true",
     );
+    await userEvent.setup().click(summary);
+    expect(await screen.findByRole("dialog", { name: "Document summary" })).toHaveTextContent("A concise orientation");
   });
 
   it("omits the reading summary when the backend does not provide one", async () => {
@@ -619,7 +859,9 @@ describe("DocumentPage view toggle", () => {
 
     renderAt("/vault/v/doc/notes%2Fhello.md");
 
-    await userEvent.setup().click(await screen.findByRole("button", { name: "Open document panel" }));
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Actions for DocTitle" }));
+    await user.click(screen.getByRole("menuitem", { name: "Document info" }));
     const relationsTab = await screen.findByRole("tab", { name: /^Relations/ });
     expect(relationsTab).toHaveTextContent(/^Relations1$/);
     expect(relationsTab).not.toHaveTextContent("2");
@@ -663,7 +905,8 @@ describe("DocumentPage view toggle", () => {
     });
     renderAt("/vault/v/doc/notes%2Fhello.md");
 
-    await user.click(await screen.findByRole("button", { name: "History" }));
+    await user.click(await screen.findByRole("button", { name: "Actions for DocTitle" }));
+    await user.click(screen.getByRole("menuitem", { name: "History" }));
     const changes = await screen.findByRole("button", {
       name: "View changes in version abcdef1",
     });
@@ -710,7 +953,8 @@ describe("DocumentPage view toggle", () => {
     });
     renderPreviewAt("/vault/v/doc/notes%2Fhello.md");
 
-    await user.click(await screen.findByRole("button", { name: "History" }));
+    await user.click(await screen.findByRole("button", { name: "Actions for DocTitle" }));
+    await user.click(screen.getByRole("menuitem", { name: "History" }));
     await user.click(await screen.findByRole("button", {
       name: "View changes in version abcdef1",
     }));
@@ -793,7 +1037,7 @@ describe("DocumentPage view toggle", () => {
 
     await screen.findByTestId("doc-raw");
     const copy = screen.getByRole("button", { name: /copy markdown/i });
-    expect(copy).toHaveTextContent("Copy");
+    expect(copy).toHaveAccessibleName("Copy markdown");
 
     // Direct .click() avoids userEvent's clipboard-aware setup, which
     // installs its own ClipboardStubImpl and shadows our writeText spy.
@@ -803,10 +1047,9 @@ describe("DocumentPage view toggle", () => {
       expect(writeText).toHaveBeenCalledWith(SAMPLE_CONTENT);
     });
 
-    // Same button element (React reuses the node); after copy its visible text
-    // flips to COPIED and its aria-label flips to "Markdown copied".
+    // Same button element; a check icon and accessible name confirm success.
     await waitFor(() => {
-      expect(copy).toHaveTextContent("Copied");
+      expect(copy).toHaveAccessibleName("Markdown copied");
     });
     expect(copy).toHaveAccessibleName(/markdown copied/i);
   });
@@ -841,7 +1084,7 @@ describe("DocumentPage view toggle", () => {
     });
     await user.clear(editor);
     await user.type(editor, "Updated from pinned HEAD");
-    await user.click(screen.getByRole("button", { name: "Save" }));
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
 
     await waitFor(() =>
       expect(updateDocumentMock).toHaveBeenCalledWith(
@@ -914,7 +1157,7 @@ describe("DocumentPage view toggle", () => {
       content: "Server changed body",
       current_commit: "server-commit",
     });
-    await user.click(screen.getByRole("button", { name: "Save" }));
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
 
     expect(await screen.findByText("This document changed on the server")).toBeInTheDocument();
     expect(screen.getByText("Original base")).toBeInTheDocument();
@@ -930,7 +1173,7 @@ describe("DocumentPage view toggle", () => {
     expect(discardAssetMock).not.toHaveBeenCalled();
 
     await user.click(screen.getByRole("button", { name: "Apply draft to latest" }));
-    await user.click(screen.getByRole("button", { name: "Save" }));
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
 
     await waitFor(() =>
       expect(updateDocumentMock).toHaveBeenLastCalledWith(
@@ -955,7 +1198,7 @@ describe("DocumentPage view toggle", () => {
     await user.clear(editor);
     await user.type(editor, "Offline draft body");
     await screen.findByText("Draft saved locally");
-    await user.click(screen.getByRole("button", { name: "Save" }));
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
     expect(await screen.findByText("Your local draft is preserved. Retry when the server is available.")).toBeInTheDocument();
 
     first.unmount();
@@ -1047,7 +1290,7 @@ describe("DocumentPage view toggle", () => {
     await user.type(title, "API contract");
     await user.clear(body);
     await user.type(body, "Updated contract body");
-    await user.click(screen.getByRole("button", { name: "Save" }));
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
 
     await waitFor(() =>
       expect(updateDocumentMock).toHaveBeenCalledWith(
@@ -1094,7 +1337,7 @@ describe("DocumentPage view toggle", () => {
       await screen.findByText("“API contract” already exists here"),
     ).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "Save" }));
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
     expect(updateDocumentMock).not.toHaveBeenCalled();
     expect(await screen.findByText("This document already exists")).toBeInTheDocument();
 
@@ -1152,7 +1395,7 @@ describe("DocumentPage view toggle", () => {
     const title = screen.getByRole("textbox", { name: "Document title" });
     await user.clear(title);
     await user.type(title, "API contract");
-    await user.click(screen.getByRole("button", { name: "Save" }));
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
 
     expect(
       await screen.findByText("“API contract” already exists here"),

@@ -4,6 +4,8 @@ import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { VaultRefreshProvider } from "@/contexts/vault-refresh-context";
+import { CurrentUserProvider } from "@/contexts/current-user-context";
+import { ResourceLocationProvider, useResourceLocation } from "@/contexts/resource-location-context";
 import TablePage from "@/pages/table";
 
 vi.mock("@/lib/api", () => {
@@ -35,12 +37,14 @@ vi.mock("@/lib/api", () => {
 });
 
 import {
+  createPublication,
   deleteVaultTableRow,
   getVaultTableRow,
   getVaultInfo,
   insertVaultTableRow,
   listVaultTableRows,
   listVaultTables,
+  previewTablePublicationQuery,
   updateVaultTableRow,
   TableRowConflictError,
 } from "@/lib/api";
@@ -54,6 +58,11 @@ const deleteRowMock = deleteVaultTableRow as unknown as ReturnType<typeof vi.fn>
 const getRowMock = getVaultTableRow as unknown as ReturnType<typeof vi.fn>;
 const rowId = "6ab163e8-6ea4-4d20-8765-bf912716384c";
 
+function LocationProbe() {
+  const location = useResourceLocation();
+  return <output data-testid="resource-location">{location ? JSON.stringify(location) : "No resource"}</output>;
+}
+
 function renderTable(
   refetchTree = vi.fn(),
   initialEntry = "/vault/ops/table/incidents",
@@ -61,19 +70,28 @@ function renderTable(
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: 0 } },
   });
-  return {
-    refetchTree,
-    ...render(
+  const content = (revision = 0, checking = false) => (
       <QueryClientProvider client={queryClient}>
         <MemoryRouter initialEntries={[initialEntry]}>
           <VaultRefreshProvider refetchVaults={vi.fn()} refetchTree={refetchTree}>
-            <Routes>
-              <Route path="/vault/:name/table/:table" element={<TablePage />} />
-            </Routes>
+            <CurrentUserProvider user={null} revision={revision} checking={checking}>
+              <ResourceLocationProvider identity="test-account" revision={revision} checking={checking}>
+                <LocationProbe />
+                <Routes>
+                  <Route path="/vault/:name/table/:table" element={<TablePage />} />
+                </Routes>
+              </ResourceLocationProvider>
+            </CurrentUserProvider>
           </VaultRefreshProvider>
         </MemoryRouter>
-      </QueryClientProvider>,
-    ),
+      </QueryClientProvider>
+  );
+  const view = render(content());
+  return {
+    refetchTree,
+    ...view,
+    beginAccessCheck: () => view.rerender(content(0, true)),
+    reverifyAccess: () => view.rerender(content(1)),
   };
 }
 
@@ -88,6 +106,7 @@ beforeEach(() => {
   listTablesMock.mockResolvedValue({
     items: [{
       name: "incidents",
+      collection: "operations",
       description: "Operational incidents",
       row_count: 1,
       columns: [
@@ -120,6 +139,125 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("table row management", () => {
+  it.each(["checking", "failed", "catalog failure"])("blocks an open publication draft during %s access verification", async (state) => {
+    vaultInfoMock.mockResolvedValue({ role: "writer", is_archived: false, is_external_git: false });
+    vi.mocked(previewTablePublicationQuery).mockResolvedValue({ kind: "table_query", columns: ["title"], items: [{ title: "API outage" }], total: 1 });
+    const user = userEvent.setup();
+    const { beginAccessCheck, reverifyAccess } = renderTable();
+    await user.click(await screen.findByRole("button", { name: "Actions for incidents" }));
+    await user.click(screen.getByRole("menuitem", { name: "Publish table" }));
+    const dialog = screen.getByRole("dialog", { name: "Publish table" });
+    const title = within(dialog).getByLabelText("Public title");
+    await user.clear(title);
+    await user.type(title, "Incident summary");
+    await user.click(within(dialog).getByRole("button", { name: "Preview query" }));
+    const publish = within(dialog).getByRole("button", { name: "Publish live table" });
+    await waitFor(() => expect(publish).toBeEnabled());
+    beginAccessCheck();
+    if (state !== "checking") {
+      if (state === "failed") vaultInfoMock.mockRejectedValue(new Error("Access denied"));
+      else listTablesMock.mockRejectedValue(new Error("Catalog unavailable"));
+      reverifyAccess();
+      await within(dialog).findByText(/could not be verified/);
+    }
+    expect(title).toHaveValue("Incident summary");
+    expect(publish).toBeDisabled();
+    expect(within(dialog).getByRole("button", { name: "Refresh preview" })).toBeDisabled();
+    // Submit-time validation must also reject keyboard/programmatic submission.
+    fireEvent.submit(publish.closest("form")!);
+    expect(createPublication).not.toHaveBeenCalled();
+  });
+
+  it("uses resolved location and one command row while preserving schema disclosure", async () => {
+    vaultInfoMock.mockResolvedValue({ role: "writer", is_archived: false, is_external_git: false });
+    const user = userEvent.setup();
+    const { container } = renderTable();
+    await screen.findByRole("button", { name: "Add row" });
+    expect(screen.getByTestId("resource-location")).toHaveTextContent(JSON.stringify({
+      vault: "ops", title: "incidents", kind: "Table", collectionPath: "operations",
+    }));
+    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+    expect(screen.getByRole("heading", { level: 1 })).toHaveClass("sr-only");
+    expect(container.querySelectorAll('[data-slot="resource-command-row"]')).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Filters" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Schema" }));
+    const schema = screen.getByRole("complementary", { name: "Table schema" });
+    expect(within(schema).getByText("Operational incidents")).toBeInTheDocument();
+    expect(within(schema).getByRole("heading", { name: "Column dictionary" })).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Schema" })).toHaveFocus());
+  });
+
+  it("does not publish a resolved table label when the catalog request fails", async () => {
+    vaultInfoMock.mockResolvedValue({ role: "reader", is_archived: false, is_external_git: false });
+    listTablesMock.mockRejectedValue(new Error("Access denied"));
+    renderTable();
+    await screen.findByRole("button", { name: "Schema" });
+    expect(screen.getByTestId("resource-location")).toHaveTextContent("No resource");
+    expect(screen.queryByRole("heading", { name: "incidents" })).not.toBeInTheDocument();
+  });
+
+  it("preserves an open row draft through same-account access revalidation", async () => {
+    vaultInfoMock.mockResolvedValue({ role: "writer", is_archived: false, is_external_git: false });
+    const user = userEvent.setup();
+    const { beginAccessCheck, reverifyAccess } = renderTable();
+    await user.click(await screen.findByRole("button", { name: "Add row" }));
+    await user.type(screen.getByLabelText("title"), "Draft to retain");
+    beginAccessCheck();
+    expect(screen.getByTestId("resource-location")).toHaveTextContent("No resource");
+    expect(screen.getByLabelText("title")).toHaveValue("Draft to retain");
+    reverifyAccess();
+    const dialog = await screen.findByRole("dialog", { name: "Add row" });
+    expect(within(dialog).getByLabelText("title")).toHaveValue("Draft to retain");
+    expect(insertRowMock).not.toHaveBeenCalled();
+  });
+
+  it("blocks a pending row deletion until foreground access has been verified", async () => {
+    vaultInfoMock.mockResolvedValue({ role: "writer", is_archived: false, is_external_git: false });
+    const user = userEvent.setup();
+    const { beginAccessCheck } = renderTable();
+    await user.click(await screen.findByRole("button", { name: "Actions for row 1" }));
+    await user.click(screen.getByRole("menuitem", { name: "Delete row" }));
+    beginAccessCheck();
+    await user.click(screen.getByRole("button", { name: "Delete row" }));
+    expect(await screen.findByText("Permissions are being refreshed. Row changes will be available once access is verified.", { selector: '[role="alert"] *' })).toBeInTheDocument();
+    expect(deleteRowMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps mutations unavailable after a failed permission refresh and supports retry", async () => {
+    vaultInfoMock.mockResolvedValue({ role: "admin", is_archived: false, is_external_git: false });
+    const user = userEvent.setup();
+    const { beginAccessCheck, reverifyAccess } = renderTable();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Add row" })).toBeEnabled());
+    beginAccessCheck();
+    vaultInfoMock.mockRejectedValue(new Error("Access denied"));
+    reverifyAccess();
+    await screen.findByText("Permissions could not be verified. Retry before making changes.");
+    expect(screen.getByRole("button", { name: "Add row" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Actions for row 1" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Actions for incidents/ })).not.toBeInTheDocument();
+    vaultInfoMock.mockResolvedValue({ role: "writer", is_archived: false, is_external_git: false });
+    await user.click(screen.getByRole("button", { name: "Retry permissions" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Add row" })).toBeEnabled());
+  });
+
+  it("retains a row draft without submitting it after permission refresh fails", async () => {
+    vaultInfoMock.mockResolvedValue({ role: "writer", is_archived: false, is_external_git: false });
+    const user = userEvent.setup();
+    const { beginAccessCheck, reverifyAccess } = renderTable();
+    await user.click(await screen.findByRole("button", { name: "Add row" }));
+    await user.type(screen.getByLabelText("title"), "Draft to retain");
+    beginAccessCheck();
+    vaultInfoMock.mockRejectedValue(new Error("Access denied"));
+    reverifyAccess();
+    await screen.findByText("Permissions could not be verified. Retry before making changes.");
+    const dialog = screen.getByRole("dialog", { name: "Add row" });
+    await user.click(within(dialog).getByRole("button", { name: "Add row" }));
+    await waitFor(() => expect(within(dialog).getByRole("alert")).toHaveTextContent("Permissions could not be verified"));
+    expect(within(dialog).getByLabelText("title")).toHaveValue("Draft to retain");
+    expect(insertRowMock).not.toHaveBeenCalled();
+  });
+
   it("lets a writer add, edit, and delete a row through structured controls", async () => {
     vaultInfoMock.mockResolvedValue({ role: "writer", is_archived: false, is_external_git: false });
     const user = userEvent.setup();

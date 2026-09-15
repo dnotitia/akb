@@ -54,8 +54,10 @@ for (const width of [1920, 1440, 375]) for (const dark of [false, true]) {
     await expect(preview).toBeVisible();
     await expect(preview.getByRole("button", { name: "Open document in vault" })).toBeVisible();
     expect(writes).toEqual([]);
-    await preview.getByRole("button", { name: "Unwatch", exact: true }).click();
-    await expect(preview.getByRole("button", { name: "Watch", exact: true })).toBeVisible();
+    await preview.getByRole("button", { name: "Actions for Watched operating guide" }).click();
+    await page.getByRole("menuitemcheckbox", { name: "Unwatch", exact: true }).click();
+    await expect(page.getByRole("menuitemcheckbox", { name: "Watch", exact: true })).toBeVisible();
+    await page.keyboard.press("Escape");
     await page.keyboard.press("Escape");
     await expect(preview).toHaveCount(0);
     await expect(page).toHaveURL(/\/$/);

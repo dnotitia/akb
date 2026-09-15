@@ -49,10 +49,10 @@ for (const dark of [false, true]) test(`Vault navigation rails ${dark ? "dark" :
   await collections.getByRole("button", { name: "Clear filter resources" }).click();
   await expect(collections.getByRole("searchbox")).toBeFocused();
   const vaultToggle = page.getByRole("button", { name: "Minimize vault list to a rail" });
-  const treeToggle = page.getByRole("button", { name: "Collapse collection tree" });
+  const treeToggle = page.getByRole("button", { name: "Collapse collections" });
   expect(await vaultToggle.locator("svg").getAttribute("class")).toBe(await treeToggle.locator("svg").getAttribute("class"));
   await treeToggle.click();
-  await page.getByRole("button", { name: "Show collection tree" }).click();
+  await page.getByRole("button", { name: "Expand collections" }).click();
   await expect(collections).toBeVisible();
   await vaultToggle.click();
   await page.getByRole("button", { name: "Expand vault list" }).click();

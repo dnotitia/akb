@@ -24,6 +24,7 @@ interface ConfirmDialogProps {
   variant?: Variant;
   onConfirm: () => void | Promise<void>;
   busy?: boolean;
+  confirmDisabled?: boolean;
   confirmationText?: string;
   confirmationLabel?: string;
   returnFocusRef?: RefObject<HTMLElement | null>;
@@ -39,6 +40,7 @@ export function ConfirmDialog({
   variant = "default",
   onConfirm,
   busy = false,
+  confirmDisabled = false,
   confirmationText,
   confirmationLabel = "Type the name to confirm permanent deletion",
   returnFocusRef,
@@ -126,7 +128,7 @@ export function ConfirmDialog({
             type="button"
             variant={variant === "destructive" ? "destructive" : "default"}
             onClick={handleConfirm}
-            disabled={isBusy || !confirmationMatches}
+            disabled={isBusy || confirmDisabled || !confirmationMatches}
             autoFocus={variant !== "destructive"}
           >
             {isBusy ? "Working…" : confirmLabel}
