@@ -40,7 +40,7 @@ def test_registered_manifest_and_corpus_cover_every_category() -> None:
             output_price=model.output_cost_per_million_usd,
         )["provider"]
         assert provider["order"] == ["parasail"]
-        assert provider["allow_fallbacks"] is False
+        assert provider["allow_fallbacks"] is True
         assert provider["require_parameters"] is True
         assert "models" not in provider
     assert (manifest.models[0].input_cost_per_million_usd, manifest.models[0].output_cost_per_million_usd) == (0.14, 0.28)
@@ -53,15 +53,15 @@ def test_manifest_rejects_provider_or_price_drift() -> None:
     raw = load_run_manifest(ROOT / "config" / "run.json").model_dump(mode="json")
     raw["models"][0]["input_cost_per_million_usd"] = 0.15
 
-    with pytest.raises(ValueError, match="pricing snapshot"):
+    with pytest.raises(ValueError, match="price ceiling"):
         BenchmarkRunManifest.model_validate(raw)
 
     raw["models"][0]["input_cost_per_million_usd"] = 0.14
-    raw["models"][0]["routing"]["allow_fallbacks"] = True
+    raw["models"][0]["routing"]["allow_fallbacks"] = False
     with pytest.raises(ValueError):
         BenchmarkRunManifest.model_validate(raw)
 
-    raw["models"][0]["routing"]["allow_fallbacks"] = False
+    raw["models"][0]["routing"]["allow_fallbacks"] = True
     raw["models"][0]["settings"]["max_tokens"] = 2048
     with pytest.raises(ValueError, match="output limits"):
         BenchmarkRunManifest.model_validate(raw)

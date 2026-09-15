@@ -949,9 +949,21 @@ class BenchmarkRunner:
                     await ledger.release_trial(reservation)
 
             assert outcome is not None
-            valid = valid_smoke_outcome(outcome)
+            identity_matches = (
+                outcome.model_class == model_spec.class_name
+                and outcome.model_id == model_spec.model_id
+                and outcome.transport == transport
+                and all(
+                    item.get("model") == model_spec.model_id
+                    for item in outcome.provider_evidence
+                )
+            )
+            valid = identity_matches and valid_smoke_outcome(outcome)
             if not valid and outcome.error is None:
-                if outcome.successful_mcp_tool_calls == 0:
+                if not identity_matches:
+                    outcome.error = "smoke gate outcome did not match the requested model and transport"
+                    outcome.failure_kind = "provider"
+                elif outcome.successful_mcp_tool_calls == 0:
                     outcome.error = "smoke gate did not observe a successful MCP tool call"
                     outcome.failure_kind = "tool"
                 else:

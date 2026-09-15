@@ -1230,11 +1230,13 @@ def validate_routing_evidence(evidence: list[dict[str, Any]], model_spec: ModelS
             for endpoint in available
             if isinstance(endpoint, dict) and endpoint.get("selected") is True
         ] if isinstance(available, list) else []
-        if not selected:
+        if (
+            len(selected) != 1
+            or not isinstance(selected[0], str)
+            or not selected[0].strip()
+        ):
             return observed, False
         observed = True
-        if any(str(provider).casefold().split("/", 1)[0] != "parasail" for provider in selected):
-            return observed, False
     return observed, True
 
 

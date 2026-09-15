@@ -16,7 +16,7 @@ CONTRACT_SCHEMA_VERSION = 1
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_BASE_URL_ENV = "MCP_BENCH_OPENROUTER_BASE_URL"
 OPENROUTER_PROVIDER_KEY_ENV = "MCP_BENCH_OPENROUTER_API_KEY"
-OPENROUTER_PRICES = {
+OPENROUTER_PRICE_CEILINGS = {
     "deepseek/deepseek-v4-flash-0731": (0.14, 0.28),
     "qwen/qwen3.8-27b": (0.24, 2.20),
 }
@@ -199,21 +199,14 @@ class ExpectedMaterialAttempt(ContractModel):
 
 class ProviderRouting(ContractModel):
     order: list[Literal["parasail"]] = Field(min_length=1, max_length=1)
-    allow_fallbacks: Literal[False] = False
+    allow_fallbacks: Literal[True] = True
     require_parameters: Literal[True] = True
-
-    @field_validator("order")
-    @classmethod
-    def pin_parasail(cls, values: list[Literal["parasail"]]) -> list[Literal["parasail"]]:
-        if values != ["parasail"]:
-            raise ValueError("OpenRouter routing must pin the parasail upstream")
-        return values
 
     def request_body(self, *, input_price: float, output_price: float) -> dict[str, JsonValue]:
         return {
             "provider": {
                 "order": ["parasail"],
-                "allow_fallbacks": False,
+                "allow_fallbacks": True,
                 "require_parameters": True,
                 "max_price": {"prompt": input_price, "completion": output_price},
             }
@@ -342,9 +335,9 @@ class ModelSpec(ContractModel):
             raise ValueError(f"{self.class_name} model/version must be pinned to {expected_model}")
         if self.base_url_env != OPENROUTER_BASE_URL_ENV or self.provider_key_env != OPENROUTER_PROVIDER_KEY_ENV:
             raise ValueError("OpenRouter model credentials must use the declared environment names")
-        expected_prices = OPENROUTER_PRICES[self.model_id]
+        expected_prices = OPENROUTER_PRICE_CEILINGS[self.model_id]
         if (self.input_cost_per_million_usd, self.output_cost_per_million_usd) != expected_prices:
-            raise ValueError(f"pricing snapshot for {self.model_id} does not match the pinned Parasail prices")
+            raise ValueError(f"price ceiling for {self.model_id} does not match the registered model contract")
         if set(self.settings) != {"temperature", "max_tokens"}:
             raise ValueError("model settings must contain only temperature and max_tokens")
         max_tokens = self.settings.get("max_tokens")

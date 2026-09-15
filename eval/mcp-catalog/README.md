@@ -64,17 +64,22 @@ argument-validity evidence; defaults do not relax required or non-default
 fields.
 
 The models are fixed to `deepseek/deepseek-v4-flash-0731` and
-`qwen/qwen3.8-27b`. Both requests use only the OpenRouter `parasail` upstream.
-Request bodies force `allow_fallbacks=false`, `require_parameters=true`, and
-the registered per-model `max_price`; no `models` fallback array is sent.
-PydanticAI's inferred OpenAI strict-tool flag is disabled for the
-OpenRouter/Parasail path. The complete 44-tool definition is retained.
+`qwen/qwen3.8-27b`. Requests prefer the OpenRouter `parasail` upstream but set
+`allow_fallbacks=true`; they also require full parameter support and apply the
+registered per-model `max_price` ceiling. No `models` fallback array is sent,
+so fallback can change only the upstream, never the requested model ID. A
+response is accepted only when its model ID, actual selected provider, response
+usage/cost, and terminal routed outcome are present and valid. The artifact
+retains the selected provider evidence per response. PydanticAI's inferred
+OpenAI strict-tool flag is disabled for the OpenRouter route. The complete
+44-tool definition is retained.
 
-Registered prices are input/output `$0.14/$0.28` and `$0.24/$2.20` per million
-tokens. The total hard cost cap is `$50`. Each trial reserves `$0.10` before
-starting, and the manifest's trial/smoke reservation total is `$36.40`, below
-the hard cap. Input, output, and total tokens remain evidence and secondary
-metrics; they are not an independent cumulative token gate. Both models use
+Registered model-specific input/output max-price ceilings are `$0.14/$0.28`
+and `$0.24/$2.20` per million tokens. They are not pinned to one upstream.
+The total hard cost cap is `$50`. Each trial reserves `$0.10` before starting,
+and the manifest's trial/smoke reservation total is `$36.40`, below the hard
+cap. Input, output, and total tokens remain evidence and secondary metrics;
+they are not an independent cumulative token gate. Both models use
 `max_tokens=8,192` to allow the full catalog and terminal response.
 `budget_used.wall_seconds` is cumulative elapsed wall-clock, not the sum of
 parallel lane durations. Lane work is recorded separately as
@@ -249,11 +254,13 @@ resume cannot bypass the `$50` cap.
 Before a paid full run, each arm executes the four smoke cells. Each smoke
 cell sends a real request with the complete unfiltered toolset, performs at
 least one successful MCP call, receives a follow-up terminal response, and
-records positive usage plus Parasail routing evidence. Any pre-response
-failure, zero usage, token limit, tool-call failure, or missing terminal
-response blocks the full trial set. Smoke validates the minimal multi-turn
-provider/tool contract; it is not token calibration. Passing smoke checkpoints
-may be reused.
+records positive provider-response usage/cost, the requested model ID, and
+exactly one selected upstream provider. The upstream need not be Parasail;
+missing or ambiguous selected-provider evidence is invalid. Any pre-response
+failure, zero usage, model mismatch, token limit, tool-call failure, or missing
+terminal response blocks the full trial set. Smoke validates the minimal
+multi-turn provider/tool contract; it is not token calibration. Passing smoke
+checkpoints may be reused.
 
 Each trial waits for both declared app/fixture health responses to report
 `status=ready` and for the declared fixture scenario to match before state

@@ -96,7 +96,7 @@ def test_build_model_uses_declared_openrouter_environment_and_forces_routing(mon
     assert settings["extra_body"] == {
         "provider": {
             "order": ["parasail"],
-            "allow_fallbacks": False,
+            "allow_fallbacks": True,
             "require_parameters": True,
             "max_price": {"prompt": 0.14, "completion": 0.28},
         }
@@ -186,7 +186,7 @@ async def test_pydantic_ai_wire_request_preserves_openrouter_extra_body(monkeypa
     kwargs = request.await_args.kwargs
     assert kwargs["extra_body"]["provider"] == {
         "order": ["parasail"],
-        "allow_fallbacks": False,
+        "allow_fallbacks": True,
         "require_parameters": True,
         "max_price": {"prompt": 0.14, "completion": 0.28},
     }
@@ -232,8 +232,18 @@ def test_openrouter_response_evidence_preserves_provider_usage_and_routing() -> 
     assert details["openrouter_usage"]["prompt_tokens"] == 10
 
 
-def test_outcome_records_provider_cost_usage_and_route_from_model_response() -> None:
+def test_preferred_upstream_fallback_preserves_model_usage_cost_and_selected_route() -> None:
     spec = _model_spec()
+    provider_request = spec.routing.request_body(
+        input_price=spec.input_cost_per_million_usd,
+        output_price=spec.output_cost_per_million_usd,
+    )["provider"]
+    assert provider_request == {
+        "order": ["parasail"],
+        "allow_fallbacks": True,
+        "require_parameters": True,
+        "max_price": {"prompt": 0.14, "completion": 0.28},
+    }
     response = ChatCompletion.model_validate(
         {
             "id": "response-1",
@@ -242,7 +252,7 @@ def test_outcome_records_provider_cost_usage_and_route_from_model_response() -> 
             "model": spec.model_id,
             "object": "chat.completion",
             "openrouter_metadata": {
-                "endpoints": {"available": [{"provider": "Parasail", "selected": True}]},
+                "endpoints": {"available": [{"provider": "OpenInference", "selected": True}]},
             },
             "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cost": 0.00000196},
         }
@@ -286,8 +296,12 @@ def test_outcome_records_provider_cost_usage_and_route_from_model_response() -> 
     assert outcome.provider_cost_usd == pytest.approx(0.00000196)
     assert outcome.cost_source == "provider_response"
     assert outcome.routing_observed and outcome.routing_valid
+    assert outcome.provider_evidence[0]["routing"]["endpoints"]["available"] == [
+        {"provider": "OpenInference", "selected": True}
+    ]
     assert outcome.input_tokens == 10 and outcome.output_tokens == 2
     assert outcome.error is None
+    assert has_measured_evidence(outcome)
 
 
 def _partial_provider_message(spec, *, include_cost: bool = True) -> ModelResponse:
@@ -570,17 +584,37 @@ async def test_trial_does_not_create_a_provider_client_after_budget_reservation_
     assert outcome.failure_kind == "budget"
 
 
-def test_routing_evidence_accepts_only_the_registered_model_and_upstream() -> None:
+def test_routing_evidence_requires_the_requested_model_and_one_selected_provider() -> None:
     spec = _model_spec()
-    evidence = [
+    fallback_evidence = [
         {
             "model": spec.model_id,
-            "routing": {"endpoints": {"available": [{"provider": "Parasail", "selected": True}]}},
+            "routing": {"endpoints": {"available": [{"provider": "OpenInference", "selected": True}]}},
         }
     ]
 
-    assert validate_routing_evidence(evidence, spec) == (True, True)
+    assert validate_routing_evidence(fallback_evidence, spec) == (True, True)
     assert validate_routing_evidence(
-        [{"model": spec.model_id, "routing": {"endpoints": {"available": [{"provider": "OpenAI", "selected": True}]}}}],
+        [{"model": "unregistered/model", "routing": fallback_evidence[0]["routing"]}],
         spec,
-    ) == (True, False)
+    ) == (False, False)
+    assert validate_routing_evidence(
+        [{"model": spec.model_id, "routing": {"endpoints": {"available": [{"provider": "OpenInference", "selected": False}]}}}],
+        spec,
+    ) == (False, False)
+    assert validate_routing_evidence(
+        [
+            {
+                "model": spec.model_id,
+                "routing": {
+                    "endpoints": {
+                        "available": [
+                            {"provider": "OpenInference", "selected": True},
+                            {"provider": "Parasail", "selected": True},
+                        ]
+                    }
+                },
+            }
+        ],
+        spec,
+    ) == (False, False)

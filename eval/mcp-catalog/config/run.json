@@ -13,7 +13,7 @@
       "version": "deepseek/deepseek-v4-flash-0731",
       "base_url_env": "MCP_BENCH_OPENROUTER_BASE_URL",
       "provider_key_env": "MCP_BENCH_OPENROUTER_API_KEY",
-      "routing": {"order": ["parasail"], "allow_fallbacks": false, "require_parameters": true},
+      "routing": {"order": ["parasail"], "allow_fallbacks": true, "require_parameters": true},
       "settings": {"temperature": 0.0, "max_tokens": 8192},
       "input_cost_per_million_usd": 0.14,
       "output_cost_per_million_usd": 0.28
@@ -25,7 +25,7 @@
       "version": "qwen/qwen3.8-27b",
       "base_url_env": "MCP_BENCH_OPENROUTER_BASE_URL",
       "provider_key_env": "MCP_BENCH_OPENROUTER_API_KEY",
-      "routing": {"order": ["parasail"], "allow_fallbacks": false, "require_parameters": true},
+      "routing": {"order": ["parasail"], "allow_fallbacks": true, "require_parameters": true},
       "settings": {"temperature": 0.0, "max_tokens": 8192},
       "input_cost_per_million_usd": 0.24,
       "output_cost_per_million_usd": 2.2
