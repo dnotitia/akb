@@ -2,7 +2,7 @@
 
 `@akb/markdown-editor` is the product-neutral Tiptap Markdown core shared by AKB and Reef.
 It owns the document schema, Markdown parsing/serialization, editor/viewer surfaces, commands,
-state hooks, the default formatting/link controls, shared document/file search UI, and the
+state hooks, the default formatting/link/table controls, shared document/file search UI, and the
 conformance contract. Products still own storage, permissions, search adapters and context, copy,
 and product-specific URL policy.
 
@@ -16,6 +16,7 @@ import {
   MarkdownEditingSurface,
   MarkdownViewer,
   MarkdownToolbar,
+  type MarkdownTableOptions,
   canonicalizeMarkdown,
   parseMarkdown,
   serializeEditorMarkdown,
@@ -52,10 +53,15 @@ import {
   EditorContent,
   MarkdownEditingSurface,
   MarkdownToolbar,
+  type MarkdownTableOptions,
   useMarkdownEditor,
 } from '@akb/markdown-editor/react'
 
 function ProductEditor({ markdown, onChange, readOnly }) {
+  const tableOptions: MarkdownTableOptions = {
+    labels: { insertTable: 'Insert a data table' },
+    tableClassName: 'min-w-[36rem]',
+  }
   const editor = useMarkdownEditor({
     initialMarkdown: markdown,
     editable: !readOnly,
@@ -67,7 +73,8 @@ function ProductEditor({ markdown, onChange, readOnly }) {
       editor={editor}
       markdown={markdown}
       readOnly={readOnly}
-      toolbar={<MarkdownToolbar editor={editor} />}
+      table={tableOptions}
+      toolbar={<MarkdownToolbar editor={editor} table={tableOptions} />}
       onSourceChange={onChange}
       modeLabels={{ group: 'Editor mode', source: 'Source' }}
     >
@@ -88,14 +95,22 @@ Source input. `onMarkdownApplied` is an optional product hook for schema-specifi
 normalization after external or Source Markdown is applied. Products continue
 to own persistence, draft/OCC behavior, and asset-reference policy.
 
+`MarkdownToolbar` provides the shared table insertion control. Passing the same
+`MarkdownTableOptions` to the toolbar and editing surface adapts table labels
+and styling. The editing surface attaches a menu to each table; its row and
+column commands use the currently selected cell in that table, and commands for
+other tables stay disabled. “Continue below” focuses the paragraph immediately
+after that table, creating one before the next block when needed. Table deletion
+leaves an editable cursor position and is part of the editor undo history.
+
 `MarkdownToolbar` owns the default Paragraph, Heading 1–3, bold, italic,
 strikethrough, inline code, list, blockquote, code block, horizontal rule,
-link, and undo/redo controls. It reads the same editor state and commands as
-the editor, preserves the current selection while the link popup receives
-focus, restores the selection on cancel, validates before mutating, and
-exposes roving keyboard focus. Product-specific controls can be appended as
-children; use `MarkdownToolbarGroup` and `MarkdownToolbarButton` so they
-participate in the same toolbar navigation.
+table insertion, link, and undo/redo controls. It reads the same editor state
+and commands as the editor, preserves the current selection while the link
+popup receives focus, restores the selection on cancel, validates before
+mutating, and exposes roving keyboard focus. Product-specific controls can be
+appended as children; use `MarkdownToolbarGroup` and `MarkdownToolbarButton` so
+they participate in the same toolbar navigation.
 
 ```tsx
 <MarkdownToolbar
@@ -112,10 +127,18 @@ participate in the same toolbar navigation.
   }}
 >
   <MarkdownToolbarGroup label="Insert">
-    {/* Product-specific table/upload controls can stay here. */}
+    {/* Product-specific upload controls can stay here. */}
   </MarkdownToolbarGroup>
 </MarkdownToolbar>
 ```
+
+`MarkdownCommands` exposes `insertTable`, `addTableRowAfter`,
+`addTableColumnAfter`, `deleteTableRow`, `deleteTableColumn`, `deleteTable`, and
+`continueBelowTable`, alongside the Markdown and link commands. Each table
+operation returns `false` when the editor is read-only, the selection is not in
+a table, or the operation cannot run safely. `MarkdownState.table` reports the
+active table and command availability. The editing surface’s table menu invokes
+these public commands without moving selection to a default cell.
 
 `MarkdownCommands` exposes `setLink`, `insertLink`, and `unsetLink`, while
 `MarkdownState.active.link` and `MarkdownState.link.href` expose the current
@@ -185,6 +208,23 @@ directory outside this package. The scripted composition check is not a substitu
 with a physical OS IME.
 
 ## Versioning
+
+The `0.6.0` public contract adds shared GFM table insertion, selection-aware
+row/column commands, table-local controls, and continuation immediately below
+the selected table. `MarkdownTableOptions` lets products provide labels and
+styling. It also includes the shared WYSIWYG / Markdown Source surface and
+`serializeEditorMarkdown`.
+
+For a Git consumer, pin both the full commit SHA and the package subdirectory:
+
+```sh
+pnpm add 'git+https://github.com/dnotitia/akb.git#<full-40-character-sha>&path:/frontend/packages/markdown-editor'
+```
+
+The Git dependency runs `prepare` to build its public `dist` exports. With pnpm
+11, add the exact resolved package selector reported by pnpm to the consumer's
+`allowBuilds` map in `pnpm-workspace.yaml`, then commit that configuration and
+the lockfile. Keep this approval scoped to this package.
 
 The `0.5.0` public contract adds common document/file search UI to
 `MarkdownToolbar.link`, including `searchAdapter`, `searchContext`,

@@ -16,18 +16,11 @@ import {
   serializeEditorMarkdown,
 } from "@akb/markdown-editor";
 import {
-  Columns2,
-  Columns3,
-  CornerDownLeft,
   ImagePlus,
   Loader2,
   Pencil,
   Replace,
   RotateCcw,
-  Rows2,
-  Rows3,
-  Table as TableIcon,
-  Trash2,
   X,
 } from "lucide-react";
 import { Alert } from "@/components/ui/alert";
@@ -466,100 +459,6 @@ function useImageHosts(
   return hosts;
 }
 
-interface TableHost {
-  table: HTMLTableElement;
-  host: HTMLDivElement;
-}
-
-function useTableHosts(
-  rootRef: React.RefObject<HTMLDivElement | null>,
-  editor: MarkdownEditorInstance | null,
-  readOnly: boolean,
-): TableHost[] {
-  const [hosts, setHosts] = React.useState<TableHost[]>([]);
-  const hostsRef = React.useRef<TableHost[]>([]);
-
-  React.useLayoutEffect(() => {
-    const hostRoot = rootRef.current;
-    if (!hostRoot || !editor) return;
-
-    const sync = () => {
-      const root = editorContentElement(hostRoot);
-      if (!root) return;
-      const next: TableHost[] = [];
-      root.querySelectorAll<HTMLTableElement>("table").forEach((table) => {
-        table.classList.add(
-          "!table",
-          "w-full",
-          "min-w-[36rem]",
-          "border-collapse",
-          "border",
-          "border-border",
-          "text-sm",
-        );
-        table.setAttribute("aria-label", readOnly ? "Table" : "Editable table");
-        const existingCaption = [...table.children].find(
-          (child) =>
-            child instanceof HTMLTableCaptionElement &&
-            child.dataset.markdownTableCaption === "true",
-        ) as HTMLTableCaptionElement | undefined;
-        if (readOnly) {
-          existingCaption?.remove();
-          return;
-        }
-
-        const caption =
-          existingCaption ?? window.document.createElement("caption");
-        caption.dataset.markdownTableCaption = "true";
-        caption.contentEditable = "false";
-        caption.className =
-          "caption-top border-b border-border bg-surface-2 px-2 py-1.5 text-left";
-        if (!existingCaption) table.prepend(caption);
-        let host = [...caption.children].find(
-          (child) =>
-            child instanceof HTMLDivElement &&
-            child.dataset.markdownTableControls === "true",
-        ) as HTMLDivElement | undefined;
-        if (!host) {
-          host = window.document.createElement("div");
-          host.dataset.markdownTableControls = "true";
-          caption.append(host);
-        }
-        next.push({ table, host });
-      });
-
-      const nextHosts = new Set(next.map((entry) => entry.host));
-      for (const current of hostsRef.current) {
-        if (!nextHosts.has(current.host)) current.host.remove();
-      }
-      const unchanged =
-        next.length === hostsRef.current.length &&
-        next.every(
-          (entry, index) => entry.table === hostsRef.current[index]?.table,
-        );
-      hostsRef.current = next;
-      if (!unchanged) setHosts(next);
-    };
-
-    sync();
-    editor.on("transaction", sync);
-    const observer =
-      typeof MutationObserver === "undefined"
-        ? null
-        : new MutationObserver(sync);
-    observer?.observe(hostRoot, { childList: true, subtree: true });
-
-    return () => {
-      editor.off("transaction", sync);
-      observer?.disconnect();
-      for (const current of hostsRef.current) current.host.remove();
-      hostsRef.current = [];
-    };
-  }, [editor, readOnly, rootRef]);
-
-  return hosts;
-}
-
 function imagePosition(
   editor: MarkdownEditorInstance,
   image: HTMLImageElement,
@@ -724,131 +623,6 @@ function ImageControls({
   );
 }
 
-function tableCellPosition(
-  editor: MarkdownEditorInstance,
-  table: HTMLTableElement,
-): number | null {
-  const cell = table.querySelector<HTMLElement>("th, td");
-  if (!cell) return null;
-  try {
-    return editor.view.posAtDOM(cell, 0);
-  } catch {
-    return null;
-  }
-}
-
-function TableActions({
-  editor,
-  table,
-}: {
-  editor: MarkdownEditorInstance;
-  table: HTMLTableElement;
-}) {
-  const runInTable = (command: () => boolean) => {
-    const position = tableCellPosition(editor, table);
-    if (position === null) return;
-    invokeCommand(editor, "setTextSelection", position);
-    invokeCommand(editor, "focus");
-    command();
-    ensureTrailingParagraph(editor);
-  };
-
-  return (
-    <div className="flex min-w-max items-center justify-between gap-3">
-      <span className="inline-flex items-center gap-1.5 px-1 text-xs font-medium text-foreground-muted">
-        <TableIcon className="h-3.5 w-3.5" aria-hidden />
-        Table
-      </span>
-      <div
-        className="flex items-center gap-1"
-        role="toolbar"
-        aria-label="Table actions"
-      >
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="h-8 px-2"
-          title="Add row to the end"
-          onMouseDown={(event) => event.preventDefault()}
-          onClick={() => runInTable(() => invokeCommand(editor, "addRowAfter"))}
-        >
-          <Rows3 className="h-3.5 w-3.5" aria-hidden />
-          Row
-        </Button>
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="h-8 px-2"
-          title="Add column to the end"
-          onMouseDown={(event) => event.preventDefault()}
-          onClick={() =>
-            runInTable(() => invokeCommand(editor, "addColumnAfter"))
-          }
-        >
-          <Columns3 className="h-3.5 w-3.5" aria-hidden />
-          Column
-        </Button>
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="h-8 px-2"
-          title="Remove the selected row"
-          onMouseDown={(event) => event.preventDefault()}
-          onClick={() => runInTable(() => invokeCommand(editor, "deleteRow"))}
-        >
-          <Rows2 className="h-3.5 w-3.5" aria-hidden />
-          Remove row
-        </Button>
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="h-8 px-2"
-          title="Remove the selected column"
-          onMouseDown={(event) => event.preventDefault()}
-          onClick={() =>
-            runInTable(() => invokeCommand(editor, "deleteColumn"))
-          }
-        >
-          <Columns2 className="h-3.5 w-3.5" aria-hidden />
-          Remove column
-        </Button>
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="h-8 px-2"
-          title="Move the cursor to a paragraph below this table"
-          onMouseDown={(event) => event.preventDefault()}
-          onClick={() => {
-            ensureTrailingParagraph(editor);
-            invokeCommand(editor, "focus", "end");
-          }}
-        >
-          <CornerDownLeft className="h-3.5 w-3.5" aria-hidden />
-          Continue below
-        </Button>
-        <span className="mx-0.5 h-4 w-px bg-border" aria-hidden />
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          aria-label="Delete table"
-          title="Delete table (you can undo this action)"
-          className="h-8 w-8 text-foreground-muted hover:bg-destructive/10 hover:text-destructive"
-          onMouseDown={(event) => event.preventDefault()}
-          onClick={() => runInTable(() => invokeCommand(editor, "deleteTable"))}
-        >
-          <Trash2 className="h-3.5 w-3.5" aria-hidden />
-        </Button>
-      </div>
-    </div>
-  );
-}
-
 interface EditorToolbarProps {
   editor: MarkdownEditorInstance | null;
   searchAdapter?: ReturnType<typeof createAkbMarkdownAdapters>["search"];
@@ -859,6 +633,22 @@ interface EditorToolbarProps {
   appearance: "framed" | "canvas" | "workspace";
   imageInputRef: React.RefObject<HTMLInputElement | null>;
 }
+
+const AKB_MARKDOWN_TABLE_OPTIONS = {
+  labels: {
+    editableTable: "Editable table",
+    readOnlyTable: "Table",
+    actions: "Table actions",
+    insertTable: "Insert table",
+    addRow: "Add row after selected row",
+    addColumn: "Add column right of selected column",
+    removeRow: "Remove selected row",
+    removeColumn: "Remove selected column",
+    continueBelow: "Continue below",
+    deleteTable: "Delete table",
+  },
+  tableClassName: "!table",
+};
 
 function EditorToolbar({
   editor,
@@ -879,6 +669,7 @@ function EditorToolbar({
         searchContext: { vault },
         searchLabels: AKB_MARKDOWN_SEARCH_LABELS,
       }}
+      table={AKB_MARKDOWN_TABLE_OPTIONS}
       className={cn(
         appearance === "canvas"
           ? "bg-surface/95 px-5 py-2 backdrop-blur-sm sm:px-8 lg:px-10"
@@ -887,23 +678,7 @@ function EditorToolbar({
             : "rounded-t-[var(--radius-sm)] bg-surface px-2 py-1.5",
       )}
     >
-      <MarkdownToolbarGroup label="Insert">
-        <MarkdownToolbarButton
-          label="Insert table"
-          disabled={!editor}
-          onClick={() => {
-            if (editor) {
-              invokeCommand(editor, "focus");
-              invokeCommand(editor, "insertTable", {
-                rows: 3,
-                cols: 3,
-                withHeaderRow: true,
-              });
-            }
-          }}
-        >
-          <TableIcon className="h-4 w-4" />
-        </MarkdownToolbarButton>
+      <MarkdownToolbarGroup label="Attachments">
         <MarkdownToolbarButton
           label={uploadingImage ? "Uploading image" : "Insert image"}
           disabled={!editor || uploadingImage}
@@ -1184,7 +959,6 @@ export function MarkdownEditor({
   );
   usePrivateImageSources(rootRef, editor, vault, document, commit);
   const imageHosts = useImageHosts(rootRef, editor, readOnly);
-  const tableHosts = useTableHosts(rootRef, editor, readOnly);
 
   const uploadImages = React.useCallback(
     async (files: File[], replacementPosition?: number) => {
@@ -1408,6 +1182,7 @@ export function MarkdownEditor({
         onSourceChange={handleSourceChange}
         onMarkdownApplied={handleMarkdownApplied}
         readOnly={readOnly}
+        table={AKB_MARKDOWN_TABLE_OPTIONS}
         modeSwitchDisabled={uploadingImage}
         onWysiwygDragOverCapture={handleImageDragOver}
         onWysiwygDropCapture={handleImageDrop}
@@ -1555,17 +1330,6 @@ export function MarkdownEditor({
                     replacementPositionRef.current = position;
                     imageInputRef.current?.click();
                   }}
-                />,
-                host.host,
-              ),
-            )}
-          {editor &&
-            tableHosts.map((host, index) =>
-              createPortal(
-                <TableActions
-                  key={`table-${index}`}
-                  editor={editor}
-                  table={host.table}
                 />,
                 host.host,
               ),

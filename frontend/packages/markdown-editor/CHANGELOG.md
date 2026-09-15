@@ -1,12 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
 
 - Add the shared WYSIWYG / Markdown Source editing surface. It keeps one editor
   mounted across mode switches, preserves unchanged selection and undo state,
   and reports Source edits through the existing Markdown change contract.
 - Export `serializeEditorMarkdown` so products can persist the same canonical
   Markdown body that the Source surface synchronizes.
+- Add public table commands and command state for GFM insertion, selected-cell
+  row/column edits, table deletion, and continuing in the paragraph below a
+  specific table.
+- Add the common toolbar insertion control and table-local editing controls to
+  `MarkdownEditingSurface`, with product-provided labels and styling.
+- Keep table edits, undo, and Markdown serialization on the existing schema and
+  editor history so headers, cell contents, and row/column order round-trip.
 
 ## 0.5.0
 

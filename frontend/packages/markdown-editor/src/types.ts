@@ -1,5 +1,8 @@
 import type { Editor, EditorOptions, FocusPosition, JSONContent } from '@tiptap/core'
 import type { MarkdownExtensionOptions } from '@tiptap/markdown'
+import type { MarkdownTableCommands, MarkdownTableState } from './table.js'
+
+export type { MarkdownTableInsertionOptions, MarkdownTableState } from './table.js'
 
 export type MarkdownProfile = 'structured' | 'preserve'
 
@@ -165,7 +168,7 @@ export interface MarkdownEditorConfig extends MarkdownParseOptions {
   onSlash?: (context: MarkdownSlashContext) => void
 }
 
-export interface MarkdownCommands {
+export interface MarkdownCommands extends MarkdownTableCommands {
   setMarkdown(markdown: string): boolean
   insertMarkdown(markdown: string): boolean
   insertImage(target: string, alt?: string, title?: string): boolean
@@ -218,6 +221,7 @@ export interface MarkdownState {
   markdown: string
   isEmpty: boolean
   isEditable: boolean
+  table: MarkdownTableState
   active: MarkdownActiveState
   link: MarkdownLinkState
   canUndo: boolean
