@@ -2,9 +2,7 @@
 
 This document is the source of truth for AKB's endpoint-driven E2E suites, the
 isolated repository-owned runtime used by hosted CI, and the optional clean
-Ubuntu 24.04 host bootstrap. It describes repository behavior only; an
-external launcher may invoke the same entrypoints but is not part of this
-runtime contract.
+Ubuntu 24.04 host bootstrap. It describes repository behavior only.
 
 ## Three layers
 
@@ -99,8 +97,10 @@ uv run --locked --extra dev --project backend python -m pytest \
 The descriptor must come from `scripts/ci/e2e_runtime.py serve` or the
 Ubuntu bootstrap. The fixture consumes the descriptor's app/fixture origins,
 health and reset operations, discovery-declared credential environment names,
-and the existing `empty` reset contract. It does not create another backend,
-database, port topology, or credential fixture.
+and the existing `empty` reset contract. A normal descriptor does not create
+another backend, database, port topology, or credential fixture. The native
+catalog benchmark launcher is documented in `eval/mcp-catalog/README.md` and
+composes this runtime through its CLI and descriptor contract.
 
 ### 2. Repository-owned isolated runtime
 
@@ -121,7 +121,7 @@ The topology is deliberately small:
 | embedding stub | Ubuntu host process | `127.0.0.1:8888` | deterministic `/v1/embeddings` responses |
 | backend | Ubuntu host process | `127.0.0.1:8000` | AKB application under test |
 | frontend (`--with-frontend`) | Ubuntu host process | `127.0.0.1:3000` by default | existing Vite SPA and per-run backend proxy |
-| fixture control | supervisor-owned in-process app | `127.0.0.1:8889` | health, discovery, and empty reset |
+| fixture control | supervisor-owned in-process app | `127.0.0.1:8889` | health, discovery, and in-place scenario reset |
 | MCP pytest behavior suite | Ubuntu host process | no public listener | authenticated MCP product scenarios through the official Python SDK |
 | curated suite runner | Ubuntu host process | no public listener | curated shell gate and count semantics |
 
@@ -148,8 +148,16 @@ The supervisor has two modes:
   the existing frontend package's `pnpm run dev` contract on `--frontend-port`
   (default `3000`), with its `/api` and `/mcp` proxy pointed at this run's
   backend origin. The fixture's
-  `POST /reset` performs a safe empty reset and waits for backend readiness
-  again; the frontend process remains owned by the same serve lifecycle.
+  `POST /reset` performs an in-place scenario reset: it preserves the
+  PostgreSQL/MinIO containers, Compose network/volumes, and managed backend,
+  embedding, and stdio process identities while clearing application rows,
+  objects, and Git fixture data, then waits for backend readiness again; the
+  frontend process remains owned by the same serve lifecycle.
+
+The native catalog benchmark launcher is separate from this generic runtime;
+its interface and descriptor composition are documented in
+`eval/mcp-catalog/README.md`. The generic runtime itself has no model or
+benchmark-topology knowledge.
 
 Each invocation also selects one explicit capability profile. The default
 `tool-only` profile starts only the HTTP backend, PAT fixture, and shared
@@ -179,6 +187,13 @@ and `app-control-plane`; callers must pass the selected scenario when mapping
 a runtime command. Both `gate` and `serve` require
 `AKB_E2E_USERNAME` and `AKB_E2E_PASSWORD` to be present before the supervisor
 starts; the runtime does not generate or persist those values.
+
+The runtime source identity uses `AKB_E2E_SOURCE_REVISION` first when it is
+present. It must be a lowercase 40-hex Git SHA. When the variable is absent,
+the supervisor uses `git rev-parse HEAD` from a real checkout. A raw checkout
+without `.git` must receive the explicit variable; missing or invalid input
+fails preparation as `blocked_runtime_config`, and `unknown` is never emitted
+as the source revision.
 
 For a selected transport profile the supervisor mints one candidate-bound PAT
 in memory, passes it to the real proxy only as the `AKB_PAT` child environment
@@ -363,8 +378,7 @@ bash scripts/ci/ubuntu_e2e_bootstrap.sh serve \
 ```
 
 Both commands end in the same supervisor used by hosted CI. The `serve`
-descriptor can be consumed by a caller that needs the app and fixture URLs;
-the runtime itself remains unaware of that caller's orchestration protocol.
+descriptor can be consumed by a client that needs the app and fixture URLs.
 When no `--runtime-root` is supplied, the bootstrap creates a private
 `/tmp/akb-e2e-bootstrap.XXXXXX` root. Child processes and dependency resources
 are cleaned on exit, while that root and its logs remain caller-owned for
@@ -387,6 +401,10 @@ When changing this area, preserve all of the following:
 - the optional frontend process uses an explicit `--with-frontend` flag, an
   isolated `--frontend-port`, and the run's backend origin for Vite proxying;
 - descriptor stdout stays parseable as one schema v2 JSON line; and
+- fixture reset keeps PostgreSQL/MinIO dependency identities stable and
+  publishes the reset count, duration, and preservation evidence; and
+- the catalog benchmark's four cell runtimes remain isolated, with parallel
+  cells and serial mutable-state trials inside each cell; and
 - runtime state stays private and outside the checkout.
 
 Run the focused runtime tests and the static checks described in the
