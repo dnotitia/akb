@@ -37,12 +37,14 @@ vi.mock("@/lib/api", () => {
 });
 
 import {
+  createPublication,
   deleteVaultTableRow,
   getVaultTableRow,
   getVaultInfo,
   insertVaultTableRow,
   listVaultTableRows,
   listVaultTables,
+  previewTablePublicationQuery,
   updateVaultTableRow,
   TableRowConflictError,
 } from "@/lib/api";
@@ -137,6 +139,35 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("table row management", () => {
+  it.each(["checking", "failed", "catalog failure"])("blocks an open publication draft during %s access verification", async (state) => {
+    vaultInfoMock.mockResolvedValue({ role: "writer", is_archived: false, is_external_git: false });
+    vi.mocked(previewTablePublicationQuery).mockResolvedValue({ kind: "table_query", columns: ["title"], items: [{ title: "API outage" }], total: 1 });
+    const user = userEvent.setup();
+    const { beginAccessCheck, reverifyAccess } = renderTable();
+    await user.click(await screen.findByRole("button", { name: "Actions for incidents" }));
+    await user.click(screen.getByRole("menuitem", { name: "Publish table" }));
+    const dialog = screen.getByRole("dialog", { name: "Publish table" });
+    const title = within(dialog).getByLabelText("Public title");
+    await user.clear(title);
+    await user.type(title, "Incident summary");
+    await user.click(within(dialog).getByRole("button", { name: "Preview query" }));
+    const publish = within(dialog).getByRole("button", { name: "Publish live table" });
+    await waitFor(() => expect(publish).toBeEnabled());
+    beginAccessCheck();
+    if (state !== "checking") {
+      if (state === "failed") vaultInfoMock.mockRejectedValue(new Error("Access denied"));
+      else listTablesMock.mockRejectedValue(new Error("Catalog unavailable"));
+      reverifyAccess();
+      await within(dialog).findByText(/could not be verified/);
+    }
+    expect(title).toHaveValue("Incident summary");
+    expect(publish).toBeDisabled();
+    expect(within(dialog).getByRole("button", { name: "Refresh preview" })).toBeDisabled();
+    // Submit-time validation must also reject keyboard/programmatic submission.
+    fireEvent.submit(publish.closest("form")!);
+    expect(createPublication).not.toHaveBeenCalled();
+  });
+
   it("uses resolved location and one command row while preserving schema disclosure", async () => {
     vaultInfoMock.mockResolvedValue({ role: "writer", is_archived: false, is_external_git: false });
     const user = userEvent.setup();

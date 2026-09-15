@@ -138,7 +138,9 @@ function ConnectionInvitation({ userId, eligible, oauthEnabled, onTokenCreated }
         Keep the floating UI viewport-owned without changing page animations. */}
     {createPortal(<aside ref={regionRef} aria-label="Connect your AI tools" aria-hidden={suspended || undefined} inert={suspended}
       data-testid="home-connection-invitation" data-expanded={expanded}
-      className="fixed bottom-[calc(1rem+env(safe-area-inset-bottom))] right-[calc(1rem+env(safe-area-inset-right))] z-[var(--z-sticky)] max-w-[calc(100vw-2rem)] sm:bottom-[calc(1.5rem+env(safe-area-inset-bottom))] sm:right-[calc(1.5rem+env(safe-area-inset-right))]"
+      // Visibility is an accessibility boundary, not an animation. Even a 1ms
+      // reduced-motion transition can swallow focus restoration on dialog close.
+      className="fixed bottom-[calc(1rem+env(safe-area-inset-bottom))] right-[calc(1rem+env(safe-area-inset-right))] z-[var(--z-sticky)] max-w-[calc(100vw-2rem)] transition-none sm:bottom-[calc(1.5rem+env(safe-area-inset-bottom))] sm:right-[calc(1.5rem+env(safe-area-inset-right))]"
       style={{ visibility: suspended ? "hidden" : undefined }}>
       {expanded ? <div className="w-76 max-w-full rounded-[var(--radius-md)] border border-border-strong bg-surface p-4 text-foreground shadow-md">
         <div className="flex items-start gap-2">

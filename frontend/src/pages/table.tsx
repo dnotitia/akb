@@ -714,6 +714,7 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
         vault={vault!}
         table={table!}
         columns={info?.columns || []}
+        restriction={writeRestriction ?? (catalogQuery.isError || !info ? "Table columns could not be verified. Retry before publishing." : null)}
         onPublished={setPublished}
       />
       <TableFilterDialog

@@ -1,5 +1,9 @@
 import { expect, test, type Page } from "@playwright/test";
 
+// The real-mode CI runtime runs these browser-owned HTTP fixtures. MSW owns
+// responses in mock mode and would bypass page.route's authenticated fixtures.
+test.skip(process.env.AKB_FE_E2E_MODE === "mock", "Uses isolated authenticated HTTP fixtures.");
+
 async function fixture(page: Page, dark = false) {
   const state = { legacy: false, vaults: 20, tokens: 0, summaries: 0, details: 0, authGate: null as Promise<void> | null };
   await page.addInitScript(({ dark }) => {
@@ -43,7 +47,6 @@ async function fixture(page: Page, dark = false) {
 
 for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
   test(`Home summary and connection ${width}px ${dark ? "dark" : "light"}`, async ({ page }, testInfo) => {
-    test.skip(process.env.AKB_FE_E2E_MODE === "mock", "Uses isolated authenticated HTTP fixtures.");
     await page.setViewportSize({ width, height: width === 768 ? 375 : 1000 });
     await page.emulateMedia({ reducedMotion: "reduce" });
     const state = await fixture(page, dark);

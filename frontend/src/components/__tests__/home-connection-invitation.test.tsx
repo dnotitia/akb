@@ -94,6 +94,7 @@ describe("Home connection invitation", () => {
     render(invitation());
     expect(region()).toHaveAttribute("data-expanded", "false");
     expect(region().className).toContain("env(safe-area-inset-bottom)");
+    expect(region()).toHaveClass("transition-none");
     act(() => { desktop = true; mediaListeners.forEach(listener => listener()); });
     expect(region()).toHaveAttribute("data-expanded", "true");
     act(() => { desktop = false; mediaListeners.forEach(listener => listener()); });
