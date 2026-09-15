@@ -22,14 +22,14 @@ describe("App page location", () => {
 
   it.each([
     ["", "Overview"], ["/members", "Members"], ["/settings", "Settings"],
-    ["/publications", "Publish"], ["/graph", "Graph"], ["/search", "Search"],
+    ["/publications", "Public links"], ["/graph", "Graph"], ["/search", "Search"],
     ["/activity", "Activity"], ["/doc/new", "New document"],
     ["/doc/d-12345678", "Document"], ["/table/data", "Table"], ["/file/uuid", "File"],
-  ])("labels Vault section %s and links back without exposing IDs", (tail, label) => {
+  ])("keeps named Vault section %s in the top location trail", (tail, label) => {
     render(<MemoryRouter initialEntries={[`/vault/%ED%8C%80%20Vault${tail}`]}><AppPageLocation /></MemoryRouter>);
     const location = screen.getByRole("navigation", { name: "Current page" });
     expect(within(location).getByRole("link", { name: "팀 Vault" })).toHaveAttribute("href", "/vault/%ED%8C%80%20Vault");
     expect(within(location).getByText(label)).toHaveAttribute("aria-current", "page");
-    expect(location).not.toHaveTextContent("d-12345678");
+    expect(screen.queryByRole("navigation", { name: "Vault sections" })).not.toBeInTheDocument();
   });
 });

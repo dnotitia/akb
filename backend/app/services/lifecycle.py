@@ -45,6 +45,7 @@ from app.services.revision_backend import (
     selected_document_revision_backend,
 )
 from app.services.sso_callback_urls import is_backchannel_logout_uri
+from app.services.search_capabilities import metadata_enabled
 from app.services.role_sync import RoleSync, get_role_sync, set_role_sync
 from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
 from app.services.vector_store import get_vector_store
@@ -340,7 +341,8 @@ def start_workers(*, include_api_local: bool = True) -> None:
     # External-Git mirrors are a Bare-Git subsystem. The feature kill-switch
     # still gates it within that mode, while PostgreSQL Native composes no
     # mirror poller because its vault storage has no Git write authority.
-    bare_git_selected = selected_document_revision_backend() == "bare_git"
+    selected_backend = selected_document_revision_backend()
+    bare_git_selected = selected_backend == "bare_git"
     if bare_git_selected and settings.external_git_enabled:
         external_git_poller.start()
     # Auto-backfill vault_id onto pre-upgrade pgvector points (issue #189
@@ -402,9 +404,7 @@ def start_workers(*, include_api_local: bool = True) -> None:
             "metadata_worker disabled (external_git_enabled=false; it only "
             "fills metadata on external_git mirror imports)"
         )
-    elif settings.llm_base_url and (
-        settings.llm_api_key or settings.model_api_governance_mode == "platform_hard"
-    ):
+    elif metadata_enabled(settings, selected_backend):
         metadata_worker.start()
         started.append("metadata_worker")
     else:

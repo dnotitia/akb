@@ -1,8 +1,9 @@
 """REST API routes for vault access management."""
 
+from datetime import datetime
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import ConfigDict, Field, SecretStr
 
 from app.api.deps import get_current_user
@@ -60,6 +61,7 @@ from app.services.admission_service import (
 )
 from app.util.text import NFCModel
 from app.services import audit_log
+from app.services.workspace_summary import MAX_SAFE_COUNT, get_workspace_summary
 
 
 def _require_admin(user: AuthenticatedUser) -> None:
@@ -228,6 +230,27 @@ class IssueRecoveryAdminCredentialResponse(NFCModel):
 @router.get("/my/vaults", summary="List vaults accessible to me")
 async def my_vaults(user: AuthenticatedUser = Depends(get_current_user)):
     return {"vaults": await list_accessible_vaults(user.user_id)}
+
+
+class WorkspaceSummaryResponse(NFCModel):
+    version: Literal[1]
+    scope: Literal["accessible"]
+    observed_at: datetime
+    vault_count: int | None = Field(default=None, ge=0, le=MAX_SAFE_COUNT)
+    document_count: int | None = Field(default=None, ge=0, le=MAX_SAFE_COUNT)
+    table_count: int | None = Field(default=None, ge=0, le=MAX_SAFE_COUNT)
+    file_count: int | None = Field(default=None, ge=0, le=MAX_SAFE_COUNT)
+
+
+@router.get(
+    "/my/workspace-summary",
+    summary="Count resources across vaults accessible to me",
+    response_model=WorkspaceSummaryResponse,
+    response_model_exclude_none=True,
+)
+async def workspace_summary(response: Response, user: AuthenticatedUser = Depends(get_current_user)):
+    response.headers["Cache-Control"] = "private, no-store"
+    return await get_workspace_summary(user.user_id)
 
 
 @router.get("/vaults/{vault}/info", summary="Get vault details")

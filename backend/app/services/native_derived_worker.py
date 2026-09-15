@@ -195,6 +195,42 @@ async def pending_stats(namespace_id: uuid.UUID | None = None) -> dict[str, int 
     return await _pending_stats(await get_pool(), namespace_id)
 
 
+async def _current_head_stats(pool: asyncpg.Pool, namespace_id: uuid.UUID) -> dict[str, int]:
+    """Count only intents for the current Head, including deletion Heads.
+
+    The historical ledger remains available through ``pending_stats``. Its
+    abandoned revisions must not become permanent current-resource warnings.
+    Require both namespace keys as well as the Resource and Head revision keys.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT COUNT(*) FILTER (WHERE i.completed_at IS NULL) AS pending,
+                   COUNT(*) FILTER (
+                       WHERE i.completed_at IS NULL
+                         AND i.retry_count > 0 AND i.retry_count < $1
+                   ) AS retrying,
+                   COUNT(*) FILTER (
+                       WHERE i.completed_at IS NULL AND i.retry_count >= $1
+                   ) AS exhausted,
+                   COUNT(*) FILTER (WHERE i.delivery_outcome = 'abandoned') AS abandoned
+              FROM native_invalidation_intents i
+              JOIN native_resources r
+                ON r.namespace_id = i.namespace_id
+               AND r.resource_id = i.resource_id
+               AND r.head_revision_id = i.revision_id
+             WHERE i.namespace_id = $2
+            """,
+            MAX_RETRIES, namespace_id,
+        )
+    return {key: int(row[key]) for key in ("pending", "retrying", "exhausted", "abandoned")}
+
+
+async def current_head_stats(namespace_id: uuid.UUID) -> dict[str, int]:
+    """Vault-scoped current preparation observations for versioned health."""
+    return await _current_head_stats(await get_pool(), namespace_id)
+
+
 class NativeDerivedWorker:
     """One-batch native invalidation consumer with durable retry state."""
 

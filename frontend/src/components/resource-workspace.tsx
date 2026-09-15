@@ -7,14 +7,19 @@ import { cn } from "@/lib/utils";
 export function ResourceWorkspace({
   label,
   children,
+  variant = "framed",
 }: {
   label: string;
   children: ReactNode;
+  variant?: "framed" | "reading";
 }) {
   return (
     <section
       aria-label={label}
-      className="flex h-full min-h-0 flex-col overflow-hidden bg-background fade-in"
+      className={cn(
+        "flex h-full min-h-0 flex-col overflow-hidden",
+        variant === "reading" ? "bg-surface" : "bg-background fade-in",
+      )}
     >
       {children}
     </section>
@@ -57,9 +62,18 @@ export function ResourceWorkspaceHeader({
   );
 }
 
-export function ResourceCanvas({ children }: { children: ReactNode }) {
+export function ResourceCanvas({
+  children,
+  variant = "framed",
+}: {
+  children: ReactNode;
+  variant?: "framed" | "reading";
+}) {
   return (
-    <main className="h-full overflow-hidden bg-background p-2 sm:p-3">
+    <main className={cn(
+      "h-full overflow-hidden",
+      variant === "reading" ? "bg-surface" : "bg-background p-2 sm:p-3",
+    )}>
       <div className="flex h-full min-h-0 flex-col">{children}</div>
     </main>
   );

@@ -268,8 +268,16 @@ function useViewerResources(
         const wrapper = window.document.createElement("div");
         wrapper.className =
           "akb-md-table my-5 overflow-x-auto rounded-[var(--radius-lg)] border border-border";
+        wrapper.tabIndex = 0;
+        wrapper.setAttribute("role", "region");
+        wrapper.setAttribute("aria-label", "Scrollable table");
         table.replaceWith(wrapper);
         wrapper.append(table);
+      });
+      root.querySelectorAll<HTMLElement>("pre").forEach((block) => {
+        block.tabIndex = 0;
+        block.setAttribute("role", "region");
+        block.setAttribute("aria-label", "Scrollable code block");
       });
     };
 

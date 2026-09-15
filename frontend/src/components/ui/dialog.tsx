@@ -1,9 +1,20 @@
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
-import { forwardRef, type ComponentPropsWithoutRef, type HTMLAttributes } from "react";
+import { forwardRef, useLayoutEffect, useState, type ComponentPropsWithoutRef, type HTMLAttributes } from "react";
 import { cn } from "@/lib/utils";
+import { registerModal } from "@/lib/modal-visibility";
 
-const Dialog = DialogPrimitive.Root;
+function Dialog({ open, defaultOpen = false, onOpenChange, modal = true, ...props }: ComponentPropsWithoutRef<typeof DialogPrimitive.Root>) {
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(defaultOpen);
+  const resolvedOpen = open ?? uncontrolledOpen;
+  useLayoutEffect(() => {
+    if (resolvedOpen && modal) return registerModal();
+  }, [resolvedOpen, modal]);
+  return <DialogPrimitive.Root {...props} open={resolvedOpen} modal={modal} onOpenChange={next => {
+    if (open === undefined) setUncontrolledOpen(next);
+    onOpenChange?.(next);
+  }} />;
+}
 const DialogTrigger = DialogPrimitive.Trigger;
 const DialogPortal = DialogPrimitive.Portal;
 const DialogClose = DialogPrimitive.Close;

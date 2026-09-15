@@ -853,59 +853,62 @@ async def explain_vault_access(
     }
 
 
-async def list_accessible_vaults(user_id: str) -> list[dict]:
-    """List all vaults the user has access to, with their role."""
-    pool = await get_pool()
+async def list_accessible_vaults(user_id: str, *, conn=None) -> list[dict]:
+    """List all readable vaults; an optional connection keeps aggregate reads
+    on the same snapshot as this directory's authoritative access policy."""
+    if conn is None:
+        pool = await get_pool()
+        async with pool.acquire() as connection:
+            return await list_accessible_vaults(user_id, conn=connection)
     uid = uuid.UUID(user_id)
 
-    async with pool.acquire() as conn:
-        # System admin sees all vaults
-        is_admin = await conn.fetchval("SELECT is_admin FROM users WHERE id = $1", uid)
+    # Read the current account role, rather than trusting a possibly older JWT.
+    is_admin = await conn.fetchval("SELECT is_admin FROM users WHERE id = $1", uid)
 
-        # P0 S3 (design §5.1a): explicit LEFT JOIN on the 1:1
-        # vault_write_policy sidecar in both branches — a vault has at
-        # most one policy row (vault_id is its PK) so this never fans out
-        # rows. NULL (no match) reads as ungoverned, same convention as
-        # `get_vault_info`.
-        if is_admin:
-            rows = await conn.fetch(
-                """
-                SELECT v.id, v.name, v.description, v.status, v.created_at,
-                       COALESCE(CASE WHEN v.owner_id = $1 THEN 'owner' END, 'admin') as role,
-                       vwp.managed_by
-                FROM vaults v
-                LEFT JOIN vault_write_policy vwp ON v.id = vwp.vault_id
-                ORDER BY v.name
-                """,
-                uid,
-            )
-        else:
-            rows = await conn.fetch(
-                """
-                SELECT v.id, v.name, v.description, v.status, v.created_at,
-                       COALESCE(va.role, CASE WHEN v.owner_id = $1 THEN 'owner' WHEN v.public_access != 'none' THEN v.public_access END) as role,
-                       vwp.managed_by
-                FROM vaults v
-                LEFT JOIN vault_access va ON v.id = va.vault_id AND va.user_id = $1
-                LEFT JOIN vault_write_policy vwp ON v.id = vwp.vault_id
-                WHERE v.owner_id = $1 OR va.user_id = $1 OR v.public_access != 'none'
-                ORDER BY v.name
-                """,
-                uid,
-            )
+    # P0 S3 (design §5.1a): explicit LEFT JOIN on the 1:1
+    # vault_write_policy sidecar in both branches — a vault has at
+    # most one policy row (vault_id is its PK) so this never fans out
+    # rows. NULL (no match) reads as ungoverned, same convention as
+    # `get_vault_info`.
+    if is_admin:
+        rows = await conn.fetch(
+            """
+            SELECT v.id, v.name, v.description, v.status, v.created_at,
+                   COALESCE(CASE WHEN v.owner_id = $1 THEN 'owner' END, 'admin') as role,
+                   vwp.managed_by
+            FROM vaults v
+            LEFT JOIN vault_write_policy vwp ON v.id = vwp.vault_id
+            ORDER BY v.name
+            """,
+            uid,
+        )
+    else:
+        rows = await conn.fetch(
+            """
+            SELECT v.id, v.name, v.description, v.status, v.created_at,
+                   COALESCE(va.role, CASE WHEN v.owner_id = $1 THEN 'owner' WHEN v.public_access != 'none' THEN v.public_access END) as role,
+                   vwp.managed_by
+            FROM vaults v
+            LEFT JOIN vault_access va ON v.id = va.vault_id AND va.user_id = $1
+            LEFT JOIN vault_write_policy vwp ON v.id = vwp.vault_id
+            WHERE v.owner_id = $1 OR va.user_id = $1 OR v.public_access != 'none'
+            ORDER BY v.name
+            """,
+            uid,
+        )
 
-        return [
-            {
-                "id": str(r["id"]),
-                "name": r["name"],
-                "description": r["description"],
-                "status": r["status"],
-                "role": r["role"],
-                "managed_by": r["managed_by"],
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-            }
-            for r in rows
-        ]
+    return [
+        {
+            "id": str(r["id"]),
+            "name": r["name"],
+            "description": r["description"],
+            "status": r["status"],
+            "role": r["role"],
+            "managed_by": r["managed_by"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        }
+        for r in rows
+    ]
 
 
 # ── Vault info ───────────────────────────────────────────────

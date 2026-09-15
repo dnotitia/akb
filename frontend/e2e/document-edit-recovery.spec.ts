@@ -107,7 +107,7 @@ test.describe("document edit recovery mock contract", () => {
     await operate(request, recovery.operations!.refetch);
     await expect(editor).toContainText("Local draft before another editor saves");
 
-    await page.getByRole("button", { name: "Save" }).click();
+    await page.getByRole("button", { name: "Save changes" }).click();
     const conflict = page
       .getByRole("alert")
       .filter({ hasText: "This document changed on the server" });
@@ -154,8 +154,8 @@ test.describe("document edit recovery mock contract", () => {
     );
 
     await page.getByRole("button", { name: "Apply draft to latest" }).click();
-    await page.getByRole("button", { name: "Save" }).click();
-    await expect(page.getByRole("button", { name: "Save" })).toHaveCount(0);
+    await page.getByRole("button", { name: "Save changes" }).click();
+    await expect(page.getByRole("button", { name: "Save changes" })).toHaveCount(0);
     await expect(page.getByText("This document changed on the server")).toHaveCount(0);
   });
 
@@ -169,7 +169,7 @@ test.describe("document edit recovery mock contract", () => {
     await editor.fill("Draft retained after a retryable server failure");
     await expect(page.getByText("Draft saved locally")).toBeVisible();
     await operate(request, recovery.operations!.retryable_save_failure);
-    await page.getByRole("button", { name: "Save" }).click();
+    await page.getByRole("button", { name: "Save changes" }).click();
     await expect(page.getByText("The server hit an error while saving. Please retry.")).toBeVisible();
 
     await page.reload();
@@ -190,7 +190,7 @@ test.describe("document edit recovery mock contract", () => {
     await page.getByRole("button", { name: "Retry" }).click();
     await expect(page.getByRole("button", { name: /Remove image: recovery/ })).toBeVisible();
 
-    await page.getByRole("button", { name: "Save" }).click();
+    await page.getByRole("button", { name: "Save changes" }).click();
     await expect(page.getByText("This document changed on the server")).toHaveCount(0);
     await expect
       .poll(
@@ -210,12 +210,15 @@ test.describe("document edit recovery mock contract", () => {
     const draftTitle = "AC7-TITLE-248";
     const markerOne = "AC7-ORIGINAL-ONE-248";
     const markerTwo = "AC7-ORIGINAL-TWO-248";
-    const draftBody = `${markerOne}\n\n${markerTwo}\n`;
+    const draftBody = `${markerOne} ${markerTwo}`;
     const recovery = await fixture(request);
     await page.goto(recovery.identity!.start_url!);
     await page.getByRole("textbox", { name: "Document title" }).fill(draftTitle);
     const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
     await editor.fill(draftBody);
+    // Filling a contenteditable retains the first block's heading type.
+    // Select Paragraph explicitly so the expected clipboard value is prose.
+    await page.getByRole("button", { name: "Paragraph", exact: true }).click();
     await expect(page.getByText("Draft saved locally")).toBeVisible();
     await operate(request, recovery.operations!.expire_draft);
     await page.waitForTimeout(500);

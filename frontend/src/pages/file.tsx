@@ -1,27 +1,22 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
-  Clock3,
   Download,
-  Eye,
-  File,
-  FolderTree,
+  Info,
   RefreshCw,
-  UserRound,
 } from "lucide-react";
 import {
   FilePreviewBody,
 } from "@/components/file-viewer";
 import {
   ResourceCanvas,
-  ResourceContextBar,
-  ResourceViewerFrame,
   ResourceWorkspace,
-  ResourceWorkspaceHeader,
 } from "@/components/resource-workspace";
+import { ResourceCommandRow } from "@/components/resource-command-row";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TooltipText } from "@/components/ui/tooltip-text";
@@ -30,6 +25,8 @@ import { ResourceDeleteDialog } from "@/components/resource-delete-dialog";
 import { PublicationSuccessBanner } from "@/components/publication-success-banner";
 import { PublishOptionsDialog } from "@/components/publish-options-dialog";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
+import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
+import { usePublishResourceLocation } from "@/contexts/resource-location-context";
 import {
   authenticatedFetch,
   deleteVaultFile,
@@ -64,6 +61,13 @@ interface FileAccess {
 }
 
 export default function FilePage() {
+  const { name: vault, id: fileId } = useParams<{ name: string; id: string }>();
+  const user = useCurrentUser();
+  const { checking, revision } = useAccessVerification();
+  return <FilePageContent key={`${user?.user_id ?? ""}:${revision}:${vault}:${fileId}`} accessChecking={checking} />;
+}
+
+function FilePageContent({ accessChecking }: { accessChecking: boolean }) {
   const { name: vault, id: fileId } = useParams<{ name: string; id: string }>();
   const navigate = useNavigate();
   const { refetchTree } = useVaultRefresh();
@@ -113,7 +117,8 @@ export default function FilePage() {
         return response.json().catch(() => null);
       })
       .then((data) => {
-        if (cancelled || !data) return;
+        if (cancelled) return;
+        if (!data) throw new Error("The file list could not be read.");
         const found = (data.items || []).find(
           (item: FileInfo) => parseFileUri(item.uri)?.id === fileId,
         );
@@ -157,7 +162,7 @@ export default function FilePage() {
     void loadPreview();
   }, [loadPreview]);
 
-  const displayName = info?.name || access?.name || fileId || "File";
+  const displayName = info?.name || access?.name || "File";
   const mime = effectiveFileMime(
     info?.mime_type || access?.mime_type || "",
     displayName,
@@ -165,37 +170,47 @@ export default function FilePage() {
   const kind = filePreviewKind(mime);
   const kindLabel = kind.charAt(0).toUpperCase() + kind.slice(1);
   const size = info?.size_bytes ?? access?.size_bytes;
-  const creator = useMemo(() => readableCreator(info?.created_by), [info?.created_by]);
+  const creator = readableCreator(info?.created_by);
+  const resolved = Boolean(info && vault && !infoLoading && !loadError && !accessChecking);
+  usePublishResourceLocation(
+    resolved ? { vault: vault!, title: info!.name, kind: "File", collectionPath: info!.collection } : null,
+  );
 
-  if (infoLoading && !info && !access) {
+  if (accessChecking || infoLoading) {
     return <FilePageLoading />;
   }
 
   return (
-    <ResourceWorkspace label="File workspace">
-      <ResourceWorkspaceHeader
-        icon={File}
-        iconTone="file"
-        title={displayName}
-        subtitle={
+    <ResourceWorkspace label="File workspace" variant="reading">
+      <h1 className="sr-only">{loadError ? "File unavailable" : displayName}</h1>
+      <ResourceCommandRow
+        meta={resolved ? (
           <>
-            File <span aria-hidden>·</span>{" "}
-            <span className="font-medium text-foreground">{vault}</span>
+            <Badge variant="outline">{kindLabel}</Badge>
+            {size !== undefined && (
+              <span className="whitespace-nowrap tabular-nums">{formatFileSize(size)}</span>
+            )}
+            {info?.description && (
+              <TooltipText tip={info.description} className="hidden min-w-0 truncate xl:block">
+                {info.description}
+              </TooltipText>
+            )}
           </>
-        }
-        meta={<Badge variant="outline">{kindLabel}</Badge>}
-        actions={
+        ) : undefined}
+      >
+        {resolved && (
           <>
             {access?.download_url ? (
-              <Button asChild size="sm">
+              <Button asChild size="sm" className="min-h-11 sm:min-h-0">
                 <a
                   href={access.download_url}
                   target="_blank"
                   rel="noreferrer"
                   download={displayName}
+                  aria-label="Download file"
                 >
                   <Download className="h-4 w-4" aria-hidden />
-                  <span className="hidden sm:inline">Download</span>
+                  Download
                 </a>
               </Button>
             ) : (
@@ -203,13 +218,34 @@ export default function FilePage() {
                 type="button"
                 variant="outline"
                 size="sm"
+                className="min-h-11 sm:min-h-0"
                 loading={previewLoading}
                 onClick={() => void loadPreview()}
               >
                 {!previewLoading && <RefreshCw className="h-4 w-4" aria-hidden />}
-                <span className="hidden sm:inline">Retry preview</span>
+                Retry preview
               </Button>
             )}
+            <Dialog>
+              <DialogTrigger asChild>
+                <Button type="button" variant="ghost" size="sm" className="min-h-11 sm:min-h-0">
+                  <Info className="h-4 w-4" aria-hidden />
+                  Info
+                </Button>
+              </DialogTrigger>
+              <DialogContent aria-describedby={undefined}>
+                <DialogTitle>File info</DialogTitle>
+                <dl className="space-y-3 text-sm">
+                  <FileMetadata label="Name" value={displayName} />
+                  {info?.description && <FileMetadata label="Description" value={info.description} />}
+                  {info?.collection && <FileMetadata label="Collection" value={info.collection} />}
+                  {mime && <FileMetadata label="Format" value={mime} />}
+                  {size !== undefined && <FileMetadata label="Size" value={formatFileSize(size)} />}
+                  {creator && <FileMetadata label="Uploaded by" value={creator} />}
+                  {info?.created_at && <FileMetadata label="Created" value={timeAgo(info.created_at)} />}
+                </dl>
+              </DialogContent>
+            </Dialog>
             {canDelete && (
               <ResourceActionsMenu
                 resourceName={displayName}
@@ -220,8 +256,8 @@ export default function FilePage() {
               />
             )}
           </>
-        }
-      />
+        )}
+      </ResourceCommandRow>
 
       {published && (
         <PublicationSuccessBanner
@@ -233,64 +269,15 @@ export default function FilePage() {
       )}
 
       <div className="relative min-h-0 flex-1 overflow-hidden">
-        <ResourceCanvas>
+        <ResourceCanvas variant="reading">
           {loadError && !info ? (
-            <div className="mx-auto w-full max-w-2xl pt-6">
+            <div className="mx-auto w-full max-w-2xl p-4 sm:p-6">
               <Alert variant="destructive" title="File unavailable">
                 {loadError}
               </Alert>
             </div>
           ) : (
-            <>
-              <ResourceContextBar
-                trailing={
-                  info?.created_at ? (
-                    <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
-                      <Clock3 className="h-3.5 w-3.5" aria-hidden />
-                      {timeAgo(info.created_at)}
-                    </span>
-                  ) : undefined
-                }
-              >
-                <div className="flex min-w-0 items-center gap-2 text-xs text-foreground-muted">
-                  <FolderTree className="h-3.5 w-3.5 shrink-0 text-link" aria-hidden />
-                  <span className="truncate">
-                    <span className="font-medium text-foreground">
-                      {info?.collection || "Root"}
-                    </span>
-                    <span aria-hidden> / </span>
-                    <span className="font-mono">{displayName}</span>
-                  </span>
-                  {creator && (
-                    <span className="hidden shrink-0 items-center gap-1.5 border-l border-border pl-3 xl:inline-flex">
-                      <UserRound className="h-3.5 w-3.5" aria-hidden />
-                      <span className="font-medium text-foreground">{creator}</span>
-                    </span>
-                  )}
-                </div>
-              </ResourceContextBar>
-
-              <ResourceViewerFrame
-                icon={Eye}
-                label="File preview"
-                meta={
-                  <>
-                    {info?.description && (
-                      <TooltipText
-                        tip={info.description}
-                        className="hidden max-w-80 truncate xl:inline-block"
-                      >
-                        {info.description}
-                      </TooltipText>
-                    )}
-                    <span className="hidden font-mono lg:inline">{mime || "Unknown format"}</span>
-                    {size !== undefined && (
-                      <span className="whitespace-nowrap tabular-nums">{formatFileSize(size)}</span>
-                    )}
-                  </>
-                }
-                bodyClassName="overflow-auto"
-              >
+            <section aria-label="File preview" className="min-h-0 flex-1 overflow-auto">
                 {previewLoading ? (
                   <FilePreviewLoading />
                 ) : previewError || !access?.download_url ? (
@@ -319,8 +306,7 @@ export default function FilePage() {
                     name={displayName}
                   />
                 )}
-              </ResourceViewerFrame>
-            </>
+            </section>
           )}
         </ResourceCanvas>
       </div>
@@ -354,26 +340,16 @@ function FilePageLoading() {
   return (
     <LoadingState
       label="Loading file"
-      className="flex h-full min-h-0 flex-col overflow-hidden bg-background"
+      className="flex h-full min-h-0 flex-col overflow-hidden bg-surface"
     >
       <div className="flex h-full min-h-0 flex-col overflow-hidden">
-        <header className="flex h-16 shrink-0 items-center gap-3 border-b border-border bg-surface px-3 sm:px-4 lg:px-5">
-          <Skeleton className="hidden h-9 w-9 shrink-0 rounded-[var(--radius-md)] sm:block" />
-          <div className="min-w-0 flex-1 space-y-2">
-            <Skeleton className="h-5 w-2/3 max-w-56 rounded-[var(--radius-sm)]" />
-            <Skeleton className="h-3 w-1/2 max-w-36 rounded-[var(--radius-sm)]" />
-          </div>
-          <Skeleton className="h-8 w-24 rounded-[var(--radius-md)]" />
+        <header className="flex min-h-14 shrink-0 items-center gap-3 border-b border-border px-3 sm:h-10 sm:min-h-10 sm:px-4 lg:px-5">
+          <Skeleton className="h-6 w-24 rounded-[var(--radius-sm)]" />
+          <Skeleton className="hidden h-4 w-24 rounded-[var(--radius-sm)] sm:block" />
+          <Skeleton className="ml-auto h-8 w-24 rounded-[var(--radius-md)]" />
         </header>
-        <div className="flex min-h-0 flex-1 flex-col overflow-hidden p-2 sm:p-3">
-          <Skeleton className="mb-3 h-11 w-full rounded-[var(--radius-lg)]" />
-          <div className="flex min-h-80 flex-1 flex-col overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface">
-            <div className="flex h-11 shrink-0 items-center gap-3 border-b border-border bg-surface-2/60 px-3">
-              <Skeleton className="h-4 w-28 rounded-[var(--radius-sm)]" />
-              <Skeleton className="ml-auto h-3 w-32 rounded-[var(--radius-sm)]" />
-            </div>
-            <FilePreviewLoading />
-          </div>
+        <div className="min-h-0 flex-1 p-4 sm:p-6">
+          <Skeleton className="h-full min-h-56 w-full rounded-[var(--radius-md)]" />
         </div>
       </div>
     </LoadingState>
@@ -392,4 +368,13 @@ function readableCreator(value?: string): string | null {
   if (!value) return null;
   if (/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(value)) return null;
   return value;
+}
+
+function FileMetadata({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <dt className="text-xs text-foreground-muted">{label}</dt>
+      <dd className="mt-1 break-words text-foreground">{value}</dd>
+    </div>
+  );
 }

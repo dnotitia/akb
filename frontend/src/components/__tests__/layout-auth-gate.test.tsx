@@ -11,7 +11,6 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Layout } from "../layout";
 import * as api from "@/lib/api";
-import { useAccessibleIndexingHealth } from "@/hooks/use-accessible-indexing-health";
 
 // Mock api so getToken() can be flipped between tests, and the health
 // hook's network call never fires. UserMenu (rendered by Layout) calls
@@ -24,14 +23,11 @@ vi.mock("@/lib/api", () => ({
   searchDocs: vi.fn(),
   logoutOrdinarySession: vi.fn(),
   clearPrivateAssetCache: vi.fn(),
+  authenticatedFetch: vi.fn(async () => new Response(JSON.stringify({ vaults: [] }), { status: 200 })),
 }));
 
 vi.mock("@/hooks/use-health", () => ({
   useHealth: () => ({ data: undefined, isLoading: false, error: null }),
-}));
-
-vi.mock("@/hooks/use-accessible-indexing-health", () => ({
-  useAccessibleIndexingHealth: vi.fn(),
 }));
 
 vi.mock("@/hooks/use-measured-height", () => ({
@@ -63,10 +59,6 @@ describe("Layout — auth gate", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     localStorage.clear();
-    vi.mocked(useAccessibleIndexingHealth).mockReturnValue({
-      data: null,
-      error: null,
-    });
     vi.mocked(api.getAuthConfig).mockResolvedValue({
       available: true,
       schema_version: 2,
@@ -138,17 +130,6 @@ describe("Layout — auth gate", () => {
   });
 
   it("keeps accessible indexing status immediately before global search", async () => {
-    vi.mocked(useAccessibleIndexingHealth).mockReturnValue({
-      data: {
-        vaultCount: 2,
-        checkedVaultCount: 2,
-        pending: 7,
-        abandoned: 0,
-        indexed: 42,
-        incomplete: false,
-      },
-      error: null,
-    });
     vi.mocked(api.getToken).mockReturnValue("fake-jwt");
 
     renderAt("/");
@@ -156,7 +137,9 @@ describe("Layout — auth gate", () => {
     expect(await screen.findByTestId("home")).toBeTruthy();
     const status = screen.getByTestId("header-indexing-status");
     const search = screen.getByRole("button", { name: "Search knowledge" });
-    expect(status).toHaveTextContent("7 indexing");
+    expect(status).toHaveAttribute("role", "status");
+    expect(within(status).queryByRole("button")).toBeNull();
+    expect(status).toBeEmptyDOMElement();
     expect(
       status.compareDocumentPosition(search) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();

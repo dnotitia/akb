@@ -454,7 +454,7 @@ export function VaultExplorer({
 
   return (
     <aside
-      className="flex flex-col h-full overflow-hidden text-sm bg-surface"
+      className="flex min-h-0 flex-col h-full overflow-hidden text-sm bg-surface"
       aria-label={`${vault} collections`}
     >
       <RailIdentity slot="collection-identity-header">
@@ -462,7 +462,7 @@ export function VaultExplorer({
           <Folder className="h-4 w-4 shrink-0 text-link" aria-hidden />
           <span className="truncate">{collectionContext?.split("/").filter(Boolean).at(-1) || "All collections"}</span>
         </span>
-        {onCollapse && <RailCollapseButton collapsed={false} label="Collapse collection tree" onClick={onCollapse} />}
+        {onCollapse && <RailCollapseButton collapsed={false} label="Collapse collections" onClick={onCollapse} />}
       </RailIdentity>
       <RailManagement label="Collections" slot="collection-management-row">
           <button

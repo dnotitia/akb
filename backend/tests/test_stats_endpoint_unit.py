@@ -665,6 +665,7 @@ def health_app(monkeypatch, tmp_path):
         metadata_worker,
         native_derived_worker,
         native_file_projection,
+        notification_worker,
         queue_rescuer,
         sparse_encoder,
         vault_backfill,
@@ -681,7 +682,7 @@ def health_app(monkeypatch, tmp_path):
     monkeypatch.setattr(sparse_encoder, "stats_snapshot", _async_return({}))
     monkeypatch.setattr(native_file_projection, "pending_stats", _async_return({}))
     monkeypatch.setattr(native_derived_worker, "pending_stats", _async_return({}))
-    for module in (external_git_poller, asset_gc_worker, metadata_worker, events_publisher):
+    for module in (external_git_poller, asset_gc_worker, metadata_worker, events_publisher, notification_worker):
         monkeypatch.setattr(module, "pending_stats", _async_return({}))
     return main
 
@@ -755,6 +756,7 @@ async def test_vault_health_surfaces_native_file_projection_diagnostics(monkeypa
     monkeypatch.setattr(metadata_worker, "pending_stats", _async_return({}))
     monkeypatch.setattr(native_file_projection, "pending_stats", _async_return(diagnostic))
     monkeypatch.setattr(native_derived_worker, "pending_stats", _async_return({}))
+    monkeypatch.setattr(native_derived_worker, "current_head_stats", _async_return({}))
 
     result = await health_service.vault_health(vault_id)
 
@@ -824,6 +826,7 @@ async def test_vault_health_narrows_the_derived_index_abandonment_to_one_vault(m
     monkeypatch.setattr(metadata_worker, "pending_stats", _async_return({}))
     monkeypatch.setattr(native_file_projection, "pending_stats", _async_return({}))
     monkeypatch.setattr(native_derived_worker, "pending_stats", _async_return(diagnostic))
+    monkeypatch.setattr(native_derived_worker, "current_head_stats", _async_return({}))
 
     result = await health_service.vault_health(vault_id)
 
