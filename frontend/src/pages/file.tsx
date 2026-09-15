@@ -41,7 +41,6 @@ import {
   filePreviewKind,
   formatFileSize,
 } from "@/lib/file-preview";
-import { parseFileUri } from "@/lib/uri";
 import { canEdit } from "@/lib/roles";
 import { timeAgo } from "@/lib/utils";
 
@@ -105,20 +104,24 @@ export default function FilePage() {
     setLoadError("");
     setInfoLoading(true);
 
-    authenticatedFetch(`/api/v1/files/${encodeURIComponent(vault)}`)
+    // Resolve the File by id. This used to read the vault listing and search
+    // the page that came back, so any File outside that window reported itself
+    // as missing however reachable it actually was.
+    authenticatedFetch(
+      `/api/v1/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}`,
+    )
       .then(async (response) => {
+        if (response.status === 404) {
+          throw new Error("File not found in vault.");
+        }
         if (!response.ok) {
-          throw new Error(`Couldn't load the file list (${response.status}).`);
+          throw new Error(`Couldn't load the file (${response.status}).`);
         }
         return response.json().catch(() => null);
       })
       .then((data) => {
         if (cancelled || !data) return;
-        const found = (data.items || []).find(
-          (item: FileInfo) => parseFileUri(item.uri)?.id === fileId,
-        );
-        if (found) setInfo(found);
-        else setLoadError("File not found in vault.");
+        setInfo(data as FileInfo);
       })
       .catch((error) => {
         if (!cancelled) setLoadError(error instanceof Error ? error.message : String(error));

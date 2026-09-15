@@ -263,6 +263,30 @@ def _file_version(row: dict) -> str | None:
     return row.get("storage_version") or row.get("etag")
 
 
+def _file_envelope(row: dict, vault_name: str) -> dict:
+    """The File metadata envelope, shared by the list and single-File reads.
+
+    Both must emit the same shape: a caller that resolves a File by id has to
+    see exactly what it would have seen had that File been inside the listing
+    window."""
+    return {
+        "kind": "file",
+        "uri": file_uri(vault_name, str(row["id"]), collection=row["collection"]),
+        "collection": row["collection"],
+        "name": row["name"],
+        "mime_type": row["mime_type"],
+        "size_bytes": row["size_bytes"],
+        "content_hash": row["content_hash"],
+        "hash_algorithm": row["hash_algorithm"],
+        "etag": row["etag"],
+        "storage_version": row["storage_version"],
+        "version": _file_version(row),
+        "description": row["description"],
+        "created_by": row["created_by"],
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+    }
+
+
 def _check_file_preconditions(
     row: dict,
     *,
@@ -984,6 +1008,9 @@ class FileService:
         return {
             "kind": "file",
             "name": row["name"],
+            # Carried so a caller never has to parse the storage locator out of
+            # `download_url` to learn where the File lives.
+            "collection": row["collection"],
             "download_url": presigned_url.url,
             "mime_type": row["mime_type"],
             "size_bytes": row["size_bytes"],
@@ -994,6 +1021,34 @@ class FileService:
             "version": _file_version(row),
             "expires_in": presigned_url.expires_in,
         }
+
+    async def get_file(
+        self, vault_id: uuid.UUID, vault_name: str, file_id: str,
+    ) -> dict:
+        """Return one confirmed File's metadata by id.
+
+        Resolving a File used to be possible only by listing the vault and
+        searching the page that came back, so a File outside that window could
+        not be opened at all. This read is by primary key: it does not depend
+        on how many Files the vault holds, nor on where this one sorts."""
+        if self._measurement is not None:
+            return await self._measurement.get_file(vault_id, vault_name, file_id)
+        try:
+            fid = uuid.UUID(file_id)
+        except (ValueError, AttributeError) as exc:
+            raise NotFoundError("File", file_id) from exc
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await vault_files_repo.find_by_id(conn, vault_id, fid)
+        # An attachment or a still-pending upload is not a readable File here,
+        # and must not be distinguishable from one that does not exist.
+        if (
+            not row
+            or row.get("kind") != "file"
+            or row.get("upload_state") != "confirmed"
+        ):
+            raise NotFoundError("File", file_id)
+        return _file_envelope(row, vault_name)
 
     async def list_files(
         self,
@@ -1034,25 +1089,7 @@ class FileService:
                         collection_id=cid_row["id"], scoped=True, limit=limit,
                     )
 
-        return [
-            {
-                "kind": "file",
-                "uri": file_uri(vault_name, str(r["id"]), collection=r["collection"]),
-                "collection": r["collection"],
-                "name": r["name"],
-                "mime_type": r["mime_type"],
-                "size_bytes": r["size_bytes"],
-                "content_hash": r["content_hash"],
-                "hash_algorithm": r["hash_algorithm"],
-                "etag": r["etag"],
-                "storage_version": r["storage_version"],
-                "version": _file_version(r),
-                "description": r["description"],
-                "created_by": r["created_by"],
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-            }
-            for r in rows
-        ]
+        return [_file_envelope(r, vault_name) for r in rows]
 
     async def delete(
         self,
