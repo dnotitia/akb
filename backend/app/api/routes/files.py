@@ -225,6 +225,20 @@ async def get_body_placements(
     return await file_service.namespace_placement_observation(access["vault_id"], vault)
 
 
+@router.get("/files/{vault}/{file_id}", summary="Get one file's metadata")
+async def get_file(
+    vault: str,
+    file_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Resolve one File by id.
+
+    Registered AFTER the literal `/files/{vault}/body-placements` route so that
+    path keeps matching itself rather than being read as a file id."""
+    access = await check_vault_access(user.user_id, vault, required_role="reader")
+    return await file_service.get_file(access["vault_id"], vault, file_id)
+
+
 @router.delete("/files/{vault}/{file_id}", summary="Delete a file")
 async def delete_file(
     vault: str,

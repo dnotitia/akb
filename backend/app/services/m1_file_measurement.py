@@ -478,6 +478,21 @@ class MeasurementFileService:
             "expires_in": TRANSFER_TTL_SECONDS,
         }
 
+    async def get_file(
+        self, vault_id: uuid.UUID, vault_name: str, file_id: str,
+    ) -> dict:
+        """Single-File read for the measurement lane, same envelope as list."""
+        try:
+            fid = uuid.UUID(file_id)
+        except (ValueError, AttributeError):
+            raise ValidationError("file_id must be a UUID") from None
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await vault_files_repo.find_measurement_by_id(conn, vault_id, fid)
+        if row is None:
+            raise NotFoundError("File", file_id)
+        return await self._response(row, vault_name=vault_name)
+
     async def list_files(
         self, vault_id: uuid.UUID, vault_name: str, collection: str | None, limit: int,
     ) -> list[dict]:
