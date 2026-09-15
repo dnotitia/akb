@@ -89,16 +89,23 @@ test.describe("document edit recovery mock contract", () => {
     request,
   }) => {
     const recovery = await fixture(request);
-    const wysiwygMarkdown = "Draft from WYSIWYG";
+    const wysiwygHeadingText = "Draft from WYSIWYG";
+    const sourceMarkdown = `# ${wysiwygHeadingText}`;
     const editedMarkdown = "## Source revision\n\n- [x] same draft\n\n<!-- preserved -->";
     await page.goto(recovery.identity!.start_url!);
 
     const wysiwyg = page.getByRole("textbox", { name: "Document body (markdown)" });
-    await wysiwyg.fill(wysiwygMarkdown);
+    await expect(
+      wysiwyg.getByRole("heading", { level: 1, name: "Recovery document", exact: true }),
+    ).toBeVisible();
+    await wysiwyg.fill(wysiwygHeadingText);
+    await expect(
+      wysiwyg.getByRole("heading", { level: 1, name: wysiwygHeadingText, exact: true }),
+    ).toBeVisible();
     await page.getByRole("button", { name: "Source" }).click();
     const source = page.getByRole("textbox", { name: "Document body (markdown)" });
     await expect(source).toBeVisible();
-    await expect(source).toHaveValue(wysiwygMarkdown);
+    await expect(source).toHaveValue(sourceMarkdown);
     await source.fill(editedMarkdown);
     await expect(page.getByText("Draft saved locally")).toBeVisible();
     await expect(page.getByRole("toolbar", { name: "Text formatting" })).toHaveCount(0);
