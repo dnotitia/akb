@@ -223,14 +223,27 @@ def get_bytes(key: str) -> bytes:
         raise StorageError(wrap_error(e, f"read {key}").message) from e
 
 
-def iter_chunks(key: str, chunk_size: int = _STREAM_CHUNK_SIZE) -> Iterator[bytes]:
+def iter_chunks(
+    key: str,
+    chunk_size: int = _STREAM_CHUNK_SIZE,
+    *,
+    byte_range: str | None = None,
+) -> Iterator[bytes]:
     """Sync generator yielding S3 object bytes. FastAPI's
     StreamingResponse iterates it in a thread pool so the boto3 blocking
     I/O doesn't stall the event loop. A failure mid-stream truncates
     the response (headers are already sent), so we log and re-raise as
-    StorageError to surface the cause."""
+    StorageError to surface the cause.
+
+    ``byte_range`` is passed through verbatim as the S3 ``Range`` parameter
+    (``bytes=start-end``). Serving a range through this process is what keeps
+    a resumable download resumable once the client no longer talks to the
+    store directly."""
+    params: dict[str, Any] = {"Bucket": settings.s3_bucket, "Key": key}
+    if byte_range:
+        params["Range"] = byte_range
     try:
-        obj = client().get_object(Bucket=settings.s3_bucket, Key=key)
+        obj = client().get_object(**params)
     except ClientError as e:
         raise StorageError(wrap_error(e, f"read {key}").message) from e
     body = obj["Body"]

@@ -47,6 +47,10 @@ from app.util.text import NFCModel
 from app.services import audit_log, file_service, publication_service
 from app.services import publication_rate_limit as pub_rl
 from app.services.access_service import check_vault_access
+from app.services.raw_mime_policy import (
+    RAW_INLINE_IMAGE_PREFIX,
+    is_inert_raw_mime,
+)
 from app.services.auth_service import AuthenticatedUser
 from app.services.publication_service import (
     PublicationError,
@@ -759,31 +763,10 @@ _RAW_PREVIEWABLE_MIMES = {
 # origin, streamed, view-counted) instead of a presigned S3 URL so the vault
 # name embedded in the S3 key never leaks and the view stays revocable. (F4)
 _RAW_INLINE_BINARY_MIMES = {"application/pdf"}
-_RAW_INLINE_IMAGE_PREFIX = "image/"
-# Provably-inert types served WITHOUT a CSP sandbox: raster images, PDF, and
-# plain/CSV/markdown text. Everything else /raw serves (text/html, xml, js, any
-# future active-document mime) is sandboxed by default — fail closed.
-_RAW_INERT_MIMES = {
-    "application/pdf",
-    "text/plain",
-    "text/csv",
-    "text/markdown",
-}
-# image/svg+xml is an image by MIME but an ACTIVE document — it can carry
-# <script> that runs same-origin on direct navigation. It must NOT ride the
-# generic image/ inert exemption; keep it sandboxed like HTML.
-_RAW_ACTIVE_IMAGE_MIMES = {"image/svg+xml", "image/svg"}
-
-
-def _is_inert_raw_mime(mime: str) -> bool:
-    """True when a /raw body can be served without a CSP sandbox — a raster
-    image, PDF, or plain text. SVG is explicitly excluded (scriptable), so it
-    falls through to the sandboxed default even though it starts with image/."""
-    if mime in _RAW_ACTIVE_IMAGE_MIMES:
-        return False
-    if mime.startswith(_RAW_INLINE_IMAGE_PREFIX):
-        return True
-    return mime in _RAW_INERT_MIMES
+# The inert/active split lives in `raw_mime_policy`: more than one route serves
+# stored bytes to a browser, and they must answer that question identically.
+_RAW_INLINE_IMAGE_PREFIX = RAW_INLINE_IMAGE_PREFIX
+_is_inert_raw_mime = is_inert_raw_mime
 
 
 @router.get(

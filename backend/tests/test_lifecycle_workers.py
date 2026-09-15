@@ -58,6 +58,13 @@ def _stub_workers(monkeypatch, lifecycle, started: list[str]) -> None:
     # would asyncio.create_task off a running loop); stub it so this test stays
     # loop-free and exercises only the external_git gate.
     monkeypatch.setattr(lifecycle.tool_usage, "start", rec("tool_usage_maintenance"))
+    # The transfer-capability reaper is likewise unconditional now: both file
+    # lanes write grants to that table and it is the only thing that expires
+    # them. Same reason as tool_usage — a real start would create a task off a
+    # running loop, and these tests are deliberately loop-free.
+    monkeypatch.setattr(
+        lifecycle.m1_file_transfer_reaper, "start", rec("m1_file_transfer_reaper"),
+    )
 
 
 def _settings(

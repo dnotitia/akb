@@ -140,6 +140,38 @@ def _is_native_text(mime_type: str, data: bytes) -> bool:
     return True
 
 
+async def reap_transfer_intents(conn=None) -> int:
+    """Delete one bounded batch of expired transfer capabilities.
+
+    Deliberately not a method. It reads no instance state, and the lane that
+    now also writes to this table — download capabilities on the `s3_current`
+    driver — cannot construct a `MeasurementFileService` at all: that
+    constructor refuses unless measurement mode is on. Leaving the work on the
+    class is what made the reaper unreachable for every configuration that
+    actually ships."""
+    if conn is not None:
+        result = await conn.execute(
+            """
+            WITH expired AS (
+                SELECT id
+                  FROM m1_file_transfer_intents
+                 WHERE expires_at <= NOW()
+                 ORDER BY expires_at, id
+                 LIMIT $1
+                 FOR UPDATE SKIP LOCKED
+            )
+            DELETE FROM m1_file_transfer_intents AS intent
+             USING expired
+             WHERE intent.id = expired.id
+            """,
+            TRANSFER_REAP_BATCH_SIZE,
+        )
+        return int(result.rsplit(" ", 1)[-1])
+    pool = await get_pool()
+    async with pool.acquire() as acquired:
+        return await reap_transfer_intents(acquired)
+
+
 def _token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("ascii")).hexdigest()
 
@@ -184,28 +216,8 @@ class MeasurementFileService:
         return f"{self._base_url}/api/v1/files/transfer/{token}"
 
     async def reap_transfer_intents(self, conn=None) -> int:
-        """Delete one bounded batch of expired tokens and staging bodies."""
-        if conn is not None:
-            result = await conn.execute(
-                """
-                WITH expired AS (
-                    SELECT id
-                      FROM m1_file_transfer_intents
-                     WHERE expires_at <= NOW()
-                     ORDER BY expires_at, id
-                     LIMIT $1
-                     FOR UPDATE SKIP LOCKED
-                )
-                DELETE FROM m1_file_transfer_intents AS intent
-                 USING expired
-                 WHERE intent.id = expired.id
-                """,
-                TRANSFER_REAP_BATCH_SIZE,
-            )
-            return int(result.rsplit(" ", 1)[-1])
-        pool = await get_pool()
-        async with pool.acquire() as acquired:
-            return await self.reap_transfer_intents(acquired)
+        """Kept as a method for existing callers; the work is module-level."""
+        return await reap_transfer_intents(conn)
 
     async def initiate_upload(
         self, *, vault_name: str, vault_id: uuid.UUID, collection: str,
