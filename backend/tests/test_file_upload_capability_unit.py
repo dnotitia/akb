@@ -242,6 +242,62 @@ async def test_a_failed_part_abandons_the_multipart(monkeypatch):
     assert _KEY not in store.objects
 
 
+async def test_a_failure_on_the_very_first_part_still_abandons(monkeypatch):
+    """`upload_id` is assigned by the call that creates the upload, one line
+    before the part that fails — so this is the narrowest window in which the
+    abort path can be handed nothing to abort."""
+    store = _FakeStore(fail_part=1)
+    _install(monkeypatch, store, part_size=1024)
+
+    with pytest.raises(RuntimeError, match="refused the part"):
+        await fs.store_object_stream(
+            _KEY, _stream(os.urandom(4096), chunk=1024),
+            content_type="application/octet-stream", max_bytes=1 << 30,
+        )
+
+    assert store.created == 1
+    assert await _settled(lambda: store.aborted == [(_KEY, "u1")]), store.aborted
+
+
+async def test_a_failure_to_open_the_upload_has_nothing_to_abandon(monkeypatch):
+    """Nothing was created, so nothing may be aborted — an abort with no
+    upload id would be a call against another upload or an error of its own."""
+    store = _FakeStore()
+    _install(monkeypatch, store, part_size=1024)
+    monkeypatch.setattr(
+        fs.s3_adapter, "multipart_create",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("cannot open upload")),
+    )
+
+    with pytest.raises(RuntimeError, match="cannot open upload"):
+        await fs.store_object_stream(
+            _KEY, _stream(os.urandom(4096), chunk=1024),
+            content_type="application/octet-stream", max_bytes=1 << 30,
+        )
+
+    assert not await _settled(lambda: bool(store.aborted), timeout=0.3)
+
+
+async def test_a_failure_to_complete_abandons_the_parts(monkeypatch):
+    """Every part landed and the object still does not exist. Those parts are
+    charged for until something abandons them."""
+    store = _FakeStore()
+    _install(monkeypatch, store, part_size=1024)
+    monkeypatch.setattr(
+        fs.s3_adapter, "multipart_complete",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("cannot complete")),
+    )
+
+    with pytest.raises(RuntimeError, match="cannot complete"):
+        await fs.store_object_stream(
+            _KEY, _stream(os.urandom(4096), chunk=1024),
+            content_type="application/octet-stream", max_bytes=1 << 30,
+        )
+
+    assert _KEY not in store.objects
+    assert await _settled(lambda: store.aborted == [(_KEY, "u1")]), store.aborted
+
+
 async def test_a_cancelled_upload_still_abandons_the_multipart(monkeypatch):
     """Cancellation is the common case, not the exotic one — a browser tab
     closed mid-upload raises it — and it is the case an awaited cleanup
