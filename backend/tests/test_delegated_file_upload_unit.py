@@ -339,6 +339,9 @@ async def test_action_limited_replace_forwards_pins_and_delegated_actor(monkeypa
         "vault_name": "team",
         "vault_id": vault_id,
         "file_id": "f-1",
+        # The replacement's upload capability records who was handed it, the
+        # same way the create path and the download grant do.
+        "actor_id": "alice",
         "content_hash": digest,
         "mime_type": None,
         "expected_content_hash": expected,
