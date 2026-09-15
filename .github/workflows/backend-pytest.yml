@@ -229,6 +229,14 @@ jobs:
           tests/test_publication_path_claim_guard_unit.py
           tests/test_external_git_cascade_unit.py
           tests/test_file_idempotent_upload_unit.py
+          # The write-capability resolver belongs here for a reason a review
+          # found the hard way: every other test of it hands it a canned row
+          # from a fake connection, so its SQL was only ever checked by
+          # grepping the text. Turning the JOIN into a LEFT JOIN, or moving
+          # the expiry predicate a century into the past, left all of those
+          # green while the resolver answered for a deleted File and an
+          # expired grant. Only a real database can tell those apart.
+          tests/test_file_capability_resolution_pg.py
           tests/test_app_registry_migration_unit.py
           tests/test_app_identity_postgres.py
           tests/test_app_inventory_postgres.py
