@@ -89,6 +89,7 @@ async def upload_by_capability(token: str, request: Request):
     # absent or wrong — but honouring it here saves transferring bytes that
     # are going to be refused.
     declared = request.headers.get("content-length")
+    declared_size: int | None = None
     if declared is not None:
         try:
             declared_size = int(declared)
@@ -110,6 +111,7 @@ async def upload_by_capability(token: str, request: Request):
             request.stream(),
             content_type=grant["mime_type"],
             max_bytes=max_bytes,
+            declared_bytes=declared_size,
         )
     # No ETag header: the presigned PUT returned the object store's and no
     # caller read it. AKB certifies these bytes at `confirm`, from the stored

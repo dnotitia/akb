@@ -127,7 +127,7 @@ Edge cases (forced create on a fuzzy false-positive, forced replace despite hash
 
 ### Step 5 — Upload raw (when applicable)
 
-Skip when `raw_upload == false`. Otherwise: `akb_put_file(vault="{vault_name}", file_path={local_file_path}, collection="corpus-raw", description={provisional_title})`. Capture `file_id` and `s3_key` from the response; compose `Raw URI = akb://{vault_name}/file/{file_id}`. If `local_file_path` was a temp file (URL download), delete it after the upload succeeds: `Bash(rm -f {local_file_path})`.
+Skip when `raw_upload == false`. Otherwise: `akb_put_file(vault="{vault_name}", file_path={local_file_path}, collection="corpus-raw", description={provisional_title})`. Capture `file_id` from the response; compose `Raw URI = akb://{vault_name}/file/{file_id}`. If `local_file_path` was a temp file (URL download), delete it after the upload succeeds: `Bash(rm -f {local_file_path})`.
 
 ### Step 6 — Compose and write summary
 

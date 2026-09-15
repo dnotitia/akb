@@ -27,6 +27,8 @@ import uuid
 from typing import Any, AsyncIterator, Iterator
 from urllib.parse import quote
 
+import anyio
+
 from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError
@@ -363,6 +365,7 @@ async def store_object_stream(
     *,
     content_type: str,
     max_bytes: int,
+    declared_bytes: int | None = None,
 ) -> int:
     """Write a request body of unknown length to one key; return its size.
 
@@ -409,6 +412,16 @@ async def store_object_stream(
             buf.extend(chunk)
             if len(buf) >= part_size:
                 await _send_part()
+        # A presigned PUT could not be short: the object store held the
+        # sender to its own Content-Length and stored nothing when the body
+        # ran out early. That guarantee moved into this service along with
+        # the bytes, so it has to be restated here — otherwise a truncated
+        # upload is stored, and `confirm_upload` certifies the truncation as
+        # the File's hash.
+        if declared_bytes is not None and received != declared_bytes:
+            raise AKBError(
+                "Upload body did not match its declared length", status_code=400,
+            )
         if upload_id is None:
             # Never grew past one part. A zero-byte body stores a zero-byte
             # object, which is what a presigned PUT of the same body did.
@@ -428,23 +441,23 @@ async def store_object_stream(
         # listing shows and nothing garbage-collects, so it has to be
         # abandoned explicitly.
         if upload_id is not None:
-            _abandon_multipart(object_key, upload_id)
+            await _abandon_multipart(object_key, upload_id)
         raise
 
 
-def _abandon_multipart(object_key: str, upload_id: str) -> None:
-    """Abandon a multipart upload without waiting for the result.
+async def _abandon_multipart(object_key: str, upload_id: str) -> None:
+    """Abandon a multipart upload, even while being cancelled.
 
-    Deliberately not awaited. The exception that brings us here is most often
-    the cancellation raised when a client disconnects mid-body, and awaiting
-    anything inside a cancelled scope raises again immediately — so an
-    `await`ed cleanup would be skipped in exactly the case it exists for.
-    `multipart_abort` returns nothing and logs its own failures, so there is
-    nothing to wait for.
+    The exception that brings us here is most often the cancellation raised
+    when a client disconnects mid-body, and handlers run under anyio, whose
+    cancellation is level-triggered: a plain `await` here raises again before
+    the cleanup can run — measured, and only once the default executor is
+    warm, which in a serving process it always is. A shield is what lets an
+    ordinary awaited call finish inside that scope, so the abort stays
+    ordered and its failure stays observable.
     """
-    asyncio.get_running_loop().run_in_executor(
-        None, s3_adapter.multipart_abort, object_key, upload_id,
-    )
+    with anyio.CancelScope(shield=True):
+        await asyncio.to_thread(s3_adapter.multipart_abort, object_key, upload_id)
 
 
 def _file_envelope(row: dict, vault_name: str) -> dict:
@@ -663,8 +676,8 @@ class FileService:
         file_id = stored_id
 
         logger.info(
-            "Presigned upload URL for %s/%s (file_id=%s, collection=%s, deduplicated=%s)",
-            vault_name, s3_key, file_id, collection_path or "<root>", deduplicated,
+            "Upload reserved for %s (file_id=%s, collection=%s, deduplicated=%s)",
+            vault_name, file_id, collection_path or "<root>", deduplicated,
         )
         return {
             "kind": "file",
