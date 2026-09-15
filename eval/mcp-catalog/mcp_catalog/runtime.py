@@ -340,8 +340,15 @@ class RuntimeFixture:
                     message = "fixture reset request timed out" if isinstance(exc, httpx.TimeoutException) else "fixture reset request failed"
                     raise RuntimeContractError(message, stage="fixture_reset") from exc
                 if response.status_code != 200:
+                    detail = ""
+                    try:
+                        payload = response.json()
+                        if isinstance(payload, dict) and isinstance(payload.get("detail"), str):
+                            detail = f": {payload['detail'][:1000]}"
+                    except ValueError:
+                        pass
                     raise RuntimeContractError(
-                        f"fixture reset returned HTTP {response.status_code}",
+                        f"fixture reset returned HTTP {response.status_code}{detail}",
                         stage="fixture_reset",
                     )
                 try:

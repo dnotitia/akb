@@ -1796,8 +1796,21 @@ class E2ERuntime:
                 )
             finally:
                 await connection.close()
-        except Exception:
-            raise ProvisioningFailure("PostgreSQL in-place fixture reset failed") from None
+        except Exception as exc:
+            sqlstate = getattr(exc, "sqlstate", None)
+            detail = f"{type(exc).__name__}"
+            if sqlstate:
+                detail += f" sqlstate={sqlstate}"
+            message = str(exc)
+            for private in self._fixture_private_values:
+                if private:
+                    message = message.replace(private, "[REDACTED]")
+            if message:
+                detail += f": {message[:1000]}"
+            LOGGER.error("PostgreSQL in-place fixture reset failed: %s", detail)
+            raise ProvisioningFailure(
+                f"PostgreSQL in-place fixture reset failed: {detail}"
+            ) from None
 
     def _clear_minio_objects(self) -> None:
         """Delete scenario objects without deleting the MinIO bucket or volume."""
@@ -2181,6 +2194,10 @@ class E2ERuntime:
         grants: list[tuple[uuid.UUID, str]],
         granted_by: uuid.UUID,
     ) -> tuple[uuid.UUID, str]:
+        if any(role == "owner" for _user_id, role in grants):
+            raise ProvisioningFailure(
+                "fixture vault owner access must be represented by owner_id, not vault_access"
+            )
         vault_id = uuid.uuid4()
         name = f"{namespace}-vault-{label}"
         await connection.execute(
@@ -2397,7 +2414,7 @@ class E2ERuntime:
                 }
             ]
         )
-        target_grants = [(owner_id, "owner")]
+        target_grants: list[tuple[uuid.UUID, str]] = []
         installations: list[dict[str, object]] = []
         tables: list[dict[str, object]] = []
         for target_index in range(13):
@@ -2869,7 +2886,7 @@ class E2ERuntime:
             app_id=app_uuid,
             version="4.0.0",
         )
-        grants = [(owner_uuid, "owner")]
+        grants: list[tuple[uuid.UUID, str]] = []
         restore_vault_id, restore_vault_name = await self._insert_fixture_vault(
             connection,
             namespace=namespace,
@@ -3010,7 +3027,7 @@ class E2ERuntime:
             namespace=namespace,
             label="legacy-adoption",
             owner_id=owner_uuid,
-            grants=[(owner_uuid, "owner")],
+            grants=[],
             granted_by=system_admin_id,
         )
         physical = f"vt_{re.sub(r'[^a-z0-9]', '_', vault_name.lower())}__{table_name}"
@@ -3169,7 +3186,6 @@ class E2ERuntime:
             }
 
         target_grants = [
-            (actor_ids["target_owner"], "owner"),
             (actor_ids["target_admin"], "admin"),
             (actor_ids["reader"], "reader"),
             (actor_ids["writer"], "writer"),
@@ -3204,7 +3220,7 @@ class E2ERuntime:
             namespace=namespace,
             label="foreign",
             owner_id=actor_ids["foreign_admin"],
-            grants=[(actor_ids["foreign_admin"], "owner")],
+            grants=[],
             granted_by=system_admin_id,
         )
         vaults["foreign"] = {"id": str(foreign_vault_id), "name": foreign_vault_name}

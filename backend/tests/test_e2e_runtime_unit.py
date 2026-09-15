@@ -8,6 +8,8 @@ import json
 import stat
 import subprocess
 import sys
+import uuid
+from types import SimpleNamespace
 from pathlib import Path
 
 import httpx
@@ -24,6 +26,7 @@ from e2e_runtime import (  # noqa: E402
     CredentialNames,
     E2ERuntime,
     ManagedProcess,
+    ProvisioningFailure,
     SOURCE_REVISION_ENV,
     RuntimeConfig,
     _parse_args,
@@ -65,6 +68,63 @@ def make_config(tmp_path: Path, *, mode: str = "serve") -> RuntimeConfig:
         compose_project="akb-e2e-unit",
         credentials=CredentialNames("TEST_USERNAME_ENV", "TEST_PASSWORD_ENV"),
     )
+
+
+@pytest.mark.asyncio
+async def test_postgres_reset_preserves_diagnostic_and_recovers_on_next_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = E2ERuntime(make_config(tmp_path))
+    monkeypatch.setenv("TEST_USERNAME_ENV", "fixture-user")
+    monkeypatch.setenv("TEST_PASSWORD_ENV", "fixture-password")
+    state = {"fail_once": True, "execute_calls": 0, "close_calls": 0}
+
+    class Connection:
+        async def execute(self, *_args: object) -> None:
+            state["execute_calls"] += 1
+            if state["fail_once"]:
+                state["fail_once"] = False
+                raise RuntimeError("deadlock detected while truncating fixture")
+
+        async def close(self) -> None:
+            state["close_calls"] += 1
+
+    connection = Connection()
+
+    async def connect(**_kwargs: object) -> Connection:
+        return connection
+
+    monkeypatch.setitem(sys.modules, "asyncpg", SimpleNamespace(connect=connect))
+
+    with pytest.raises(ProvisioningFailure, match="deadlock detected while truncating fixture"):
+        await runtime._reset_postgres_in_place()
+    await runtime._reset_postgres_in_place()
+
+    assert state["execute_calls"] == 4
+    assert state["close_calls"] == 2
+
+
+@pytest.mark.asyncio
+async def test_fixture_vault_rejects_owner_access_grants_before_writing(tmp_path: Path) -> None:
+    runtime = E2ERuntime(make_config(tmp_path))
+    executed: list[object] = []
+
+    class Connection:
+        async def execute(self, *args: object) -> None:
+            executed.append(args)
+
+    with pytest.raises(ProvisioningFailure, match="owner_id"):
+        await runtime._insert_fixture_vault(
+            Connection(),
+            namespace="fixture",
+            label="owner-grant",
+            owner_id=uuid.uuid4(),
+            grants=[(uuid.uuid4(), "owner")],
+            granted_by=uuid.uuid4(),
+        )
+
+    assert executed == []
 
 
 def test_descriptor_is_schema_v2_and_never_contains_credential_values(tmp_path, monkeypatch):

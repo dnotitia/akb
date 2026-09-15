@@ -94,7 +94,10 @@ def create_app(runtime: FixtureRuntime) -> FastAPI:
                 status_code=422,
                 detail="reset scenario does not match the running runtime",
             )
-        await runtime.reset_scenario()
+        try:
+            await runtime.reset_scenario()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
         return {"status": "ready", "scenario": runtime.scenario}
 
     @app.post("/control")
