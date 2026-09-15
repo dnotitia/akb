@@ -61,8 +61,9 @@ def _smoke_outcome(
                 "routing": {
                     "endpoints": {"available": [{"provider": "OpenInference", "selected": True}]}
                 },
-                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001},
+                "usage": {"prompt_tokens": 5, "completion_tokens": 1, "cost": 0.000005},
             }
+            for _ in range(2)
         ],
         provider_cost_usd=0.00001,
         cost_source="provider_response",
@@ -129,6 +130,29 @@ async def test_smoke_gate_rejects_outcome_for_a_different_requested_model(
         )
 
     monkeypatch.setattr(runner_module, "execute_smoke", mismatched_smoke)
+
+    with pytest.raises(RuntimeContractError, match="smoke gate cell"):
+        await runner._run_smoke_gate(
+            fixture=_SmokeFixture(),
+            resolver=_SmokeResolver(),
+            ledger=BudgetLedger(manifest),
+        )
+
+
+@pytest.mark.asyncio
+async def test_smoke_gate_requires_provider_evidence_for_each_model_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    runner = BenchmarkRunner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
+    monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
+
+    async def missing_terminal_request_evidence(task, *, model_spec, transport, **_kwargs):
+        outcome = _smoke_outcome(task, model_spec, transport)
+        return outcome.model_copy(update={"provider_evidence": outcome.provider_evidence[:1]})
+
+    monkeypatch.setattr(runner_module, "execute_smoke", missing_terminal_request_evidence)
 
     with pytest.raises(RuntimeContractError, match="smoke gate cell"):
         await runner._run_smoke_gate(

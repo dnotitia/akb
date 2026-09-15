@@ -13,6 +13,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import RequestUsage, RunUsage
 
+import mcp_catalog.execution as execution_module
 from mcp_catalog.contracts import OPENROUTER_BASE_URL, load_run_manifest, load_task_corpus
 from mcp_catalog.execution import (
     BudgetExceeded,
@@ -486,6 +487,44 @@ async def test_over_trial_cost_is_recorded_and_blocks_followup_provider_reservat
     await ledger.release_trial(0.01)
     with pytest.raises(BudgetExceeded, match="max_cost_per_trial_usd"):
         await ledger.reserve_trial(0.01)
+
+
+@pytest.mark.asyncio
+async def test_model_request_guard_blocks_followup_calls_after_restored_budget_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    spec = manifest.models[0]
+    model = OpenRouterChatModel(
+        spec.model_id,
+        provider=OpenAIProvider(
+            base_url=OPENROUTER_BASE_URL,
+            **{"api_" + "key": "fixture-provider-key"},
+        ),
+    )
+    request = AsyncMock()
+    monkeypatch.setattr(model, "_completions_create", request)
+    ledger = BudgetLedger(manifest)
+    ledger.restore(
+        model_requests=0,
+        input_tokens=0,
+        output_tokens=0,
+        cost_usd=0.0,
+        wall_seconds=0.0,
+        budget_failure="max_cost_per_trial_usd exceeded",
+    )
+    guard_token = execution_module.PROVIDER_REQUEST_GUARD.set(ledger.assert_provider_request_allowed)
+    try:
+        with pytest.raises(BudgetExceeded, match="max_cost_per_trial_usd"):
+            await model.request(
+                [ModelRequest(parts=[UserPromptPart("hello")])],
+                model.settings,
+                ModelRequestParameters(),
+            )
+    finally:
+        execution_module.PROVIDER_REQUEST_GUARD.reset(guard_token)
+
+    request.assert_not_awaited()
 
 
 @pytest.mark.asyncio

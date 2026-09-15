@@ -49,6 +49,10 @@ MODEL_RESPONSES: contextvars.ContextVar[list[ModelResponse] | None] = contextvar
     "mcp_catalog_model_responses",
     default=None,
 )
+PROVIDER_REQUEST_GUARD: contextvars.ContextVar[Callable[[], Awaitable[None]] | None] = contextvars.ContextVar(
+    "mcp_catalog_provider_request_guard",
+    default=None,
+)
 
 
 class ModelConfigurationError(ValueError):
@@ -145,6 +149,9 @@ class OpenRouterChatModel(OpenAIChatModel):
     """PydanticAI's OpenAI-compatible model with OpenRouter response evidence."""
 
     async def request(self, messages: list[Any], model_settings: Any, model_request_parameters: Any) -> ModelResponse:
+        guard = PROVIDER_REQUEST_GUARD.get()
+        if guard is not None:
+            await guard()
         response = await super().request(messages, model_settings, model_request_parameters)
         captured = MODEL_RESPONSES.get()
         if captured is not None:
@@ -673,6 +680,13 @@ class BudgetLedger:
                 raise BudgetExceeded("trial cost reservation accounting is inconsistent")
             self.reserved_cost_usd -= reserved_cost_usd
 
+    async def assert_provider_request_allowed(self) -> None:
+        async with self._lock:
+            if self._budget_failure is not None:
+                raise BudgetExceeded(
+                    f"{self._budget_failure}; no further provider requests are allowed"
+                )
+
     async def release_all_reservations(self) -> float:
         async with self._lock:
             released = self.reserved_cost_usd
@@ -723,6 +737,7 @@ async def run_agent_with_deadline(
     usage_limits: Any,
     request_timeout_seconds: float,
     remaining_wall_seconds: float,
+    request_guard: Callable[[], Awaitable[None]] | None = None,
 ) -> Any:
     """Run one agent turn under both request and global monotonic deadlines."""
     if request_timeout_seconds <= 0 or remaining_wall_seconds <= 0:
@@ -730,6 +745,7 @@ async def run_agent_with_deadline(
     effective_timeout = min(request_timeout_seconds, remaining_wall_seconds)
     settings = dict(model_settings or {})
     settings["timeout"] = effective_timeout
+    guard_token = PROVIDER_REQUEST_GUARD.set(request_guard)
     global_deadline = asyncio.timeout(remaining_wall_seconds)
     try:
         async with global_deadline:
@@ -750,6 +766,8 @@ async def run_agent_with_deadline(
         if global_deadline.expired():
             raise GlobalWallDeadlineExceeded("global wall deadline exceeded") from exc
         raise
+    finally:
+        PROVIDER_REQUEST_GUARD.reset(guard_token)
 
 
 class TrialExecutor:
@@ -845,6 +863,7 @@ class TrialExecutor:
                         ),
                         request_timeout_seconds=self.ledger.request_timeout_seconds(),
                         remaining_wall_seconds=self.ledger.remaining_wall_seconds(),
+                        request_guard=self.ledger.assert_provider_request_allowed,
                     )
             except ProviderRequestTimeout:
                 error = "benchmark incomplete: provider request timeout"
@@ -914,6 +933,7 @@ async def execute_smoke(
     secrets: tuple[str, ...],
     request_timeout_seconds: float,
     remaining_wall_seconds: float,
+    request_guard: Callable[[], Awaitable[None]] | None = None,
     timing_sink: Callable[[TimingCategory, float, float], None] | None = None,
 ) -> TrialOutcome:
     """Make one real full-catalog request for the pre-run four-cell gate."""
@@ -955,9 +975,10 @@ async def execute_smoke(
                     request_limit=manifest.budget.max_requests_per_trial,
                     cost_limit=Decimal(str(manifest.budget.max_cost_per_trial_usd)),
                 ),
-                request_timeout_seconds=request_timeout_seconds,
-                remaining_wall_seconds=remaining_wall_seconds,
-            )
+                    request_timeout_seconds=request_timeout_seconds,
+                    remaining_wall_seconds=remaining_wall_seconds,
+                    request_guard=request_guard,
+                )
     except ProviderRequestTimeout:
         error = "benchmark incomplete: provider request timeout"
     except GlobalWallDeadlineExceeded:

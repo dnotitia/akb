@@ -328,6 +328,15 @@ def test_smoke_checkpoint_requires_a_successful_call_and_follow_up_response(tmp_
                 "successful_mcp_tool_calls": 1,
                 "follow_up_terminal_response": True,
                 "model_requests": 2,
+                "provider_evidence": [
+                    {
+                        "model": model_id,
+                        "routing": {"endpoints": {"available": [{"provider": "parasail", "selected": True}]}},
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 1, "cost": 0.000005},
+                    }
+                    for _ in range(2)
+                ],
+                "provider_cost_usd": 0.00001,
             }
         )
         store.record_smoke_cell(cell, smoke, status="completed")

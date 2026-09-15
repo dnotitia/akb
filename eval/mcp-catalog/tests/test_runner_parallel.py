@@ -116,8 +116,9 @@ def _outcome(task, model_spec, transport, repeat_index: int) -> TrialOutcome:
             {
                 "model": model_spec.model_id,
                 "routing": {"endpoints": {"available": [{"provider": "parasail", "selected": True}]}},
-                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001},
+                "usage": {"prompt_tokens": 5, "completion_tokens": 1, "cost": 0.000005},
             }
+            for _ in range(2)
         ],
         provider_cost_usd=0.00001,
         cost_source="provider_response",

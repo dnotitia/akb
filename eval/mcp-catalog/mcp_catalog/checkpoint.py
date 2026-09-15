@@ -177,6 +177,12 @@ def valid_smoke_outcome(outcome: TrialOutcome) -> bool:
     return (
         outcome.error is None
         and valid_completed_outcome(outcome)
+        and len(outcome.provider_evidence) == outcome.model_requests
+        and all(item.get("model") == outcome.model_id for item in outcome.provider_evidence)
+        and all(
+            isinstance(item.get("usage"), dict) and item["usage"].get("cost") is not None
+            for item in outcome.provider_evidence
+        )
         and outcome.successful_mcp_tool_calls > 0
         and outcome.model_requests >= 2
         and outcome.follow_up_terminal_response

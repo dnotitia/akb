@@ -904,6 +904,7 @@ class BenchmarkRunner:
                         secrets=self.secrets,
                         request_timeout_seconds=request_timeout_seconds,
                         remaining_wall_seconds=remaining_wall_seconds,
+                        request_guard=ledger.assert_provider_request_allowed,
                         timing_sink=self._timing.record if self._timing is not None else None,
                     )
                 else:
@@ -920,6 +921,7 @@ class BenchmarkRunner:
                             secrets=self.secrets,
                             request_timeout_seconds=request_timeout_seconds,
                             remaining_wall_seconds=remaining_wall_seconds,
+                            request_guard=ledger.assert_provider_request_allowed,
                             timing_sink=self._timing.record if self._timing is not None else None,
                         )
                 await ledger.charge(outcome, reserved_cost_usd=reservation)
