@@ -1399,6 +1399,7 @@ class E2ERuntime:
 
         app_config = {
             "auth_mode": "local",
+            "account_self_service_enabled": True,
             "jwt_algorithm": "RS256",
             "local_session_private_key_path": str(local_key_dir / "private.pem"),
             "local_session_jwks_path": str(local_key_dir / "jwks.json"),

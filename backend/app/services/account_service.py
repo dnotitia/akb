@@ -518,8 +518,9 @@ async def adopt_current_admin_as_service(
                            auth_provider = 'service',
                            password_hash = $2,
                            is_recovery_admin = false,
+                           session_generation = session_generation + CASE WHEN account_kind = 'human' THEN 1 ELSE 0 END,
                            tokens_revoked_before = CASE
-                               WHEN account_kind = 'human' THEN NOW()
+                               WHEN account_kind = 'human' THEN GREATEST(tokens_revoked_before, clock_timestamp())
                                ELSE tokens_revoked_before
                            END,
                            updated_at = NOW()

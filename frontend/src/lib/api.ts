@@ -187,6 +187,36 @@ export function getToken(): string | null {
   return _token;
 }
 
+export type AuthSessionSnapshot = Readonly<{ generation: number; token: string | null; mode: AuthMode | null }>;
+
+export function authSessionSnapshot(): AuthSessionSnapshot {
+  const token = getToken();
+  return { generation: _authSessionGeneration, token, mode: _authMode };
+}
+
+export function isCurrentAuthSession(snapshot: AuthSessionSnapshot): boolean {
+  const current = authSessionSnapshot();
+  return current.generation === snapshot.generation && current.token === snapshot.token && current.mode === snapshot.mode;
+}
+
+let lifecycleAttempt: { snapshot: AuthSessionSnapshot } | null = null;
+export function beginAccountLifecycle(snapshot: AuthSessionSnapshot): () => void {
+  if (!isCurrentAuthSession(snapshot) || lifecycleAttempt) {
+    throw new ApiError("Your session changed. Review this action again.", 409, { code: "account_identity_changed" });
+  }
+  const attempt = { snapshot };
+  lifecycleAttempt = attempt;
+  return () => { if (lifecycleAttempt === attempt) lifecycleAttempt = null; };
+}
+
+export function clearCompletedAccountSession(snapshot: AuthSessionSnapshot): boolean {
+  if (!isCurrentAuthSession(snapshot)) return false;
+  clearPrivateAssetCache();
+  clearLegacySsoSession();
+  setToken(null);
+  return true;
+}
+
 function ssoCsrfCookieName(): string {
   return window.location.protocol === "https:"
     ? "__Host-akb_sso_csrf"
@@ -271,16 +301,21 @@ export async function authenticatedFetch(
   }
   const requestMethod = init?.method || (input instanceof Request ? input.method : "GET");
   const requestHeaders = init?.headers || (input instanceof Request ? input.headers : undefined);
+  const requestSession = authSessionSnapshot();
   const res = await fetch(input, {
     ...init,
     credentials: "same-origin",
     headers: withAuthCarrier(requestHeaders, requestMethod),
   });
   if (res.status === 401) {
-    if (unauthorized !== "preserve-session") {
+    const deferred = !isCurrentAuthSession(requestSession) ||
+      (lifecycleAttempt !== null && lifecycleAttempt.snapshot.generation === requestSession.generation);
+    if (unauthorized !== "preserve-session" && !deferred) {
       expireUnauthorizedSession(unauthorized === "expire-and-redirect");
     }
-    throw new Error("Unauthorized");
+    const error = new ApiError("Unauthorized", 401, null);
+    if (deferred) error.name = "DeferredSessionError";
+    throw error;
   }
   return res;
 }
@@ -295,7 +330,7 @@ async function throwJsonApiError(res: Response): Promise<never> {
       body.detail,
     );
   }
-  throw new Error(body.error || body.detail || `${res.status} ${res.statusText}`);
+  throw new ApiError(typeof body?.error === "string" ? body.error : typeof body?.detail === "string" ? body.detail : `${res.status} ${res.statusText}`, res.status, body?.detail ?? null);
 }
 
 async function api<T>(

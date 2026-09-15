@@ -7,6 +7,28 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Safe local account lifecycle
+
+Add identity-bound account lifecycle preview, paginated deletion blockers,
+local session revocation, and password-confirmed self-deletion endpoints.
+Deletion blocks owned vaults (including archived vaults), protected recovery
+accounts, and the last eligible local administrator. Account deletion is atomic;
+shared publications survive and PostgreSQL role cleanup retries from an
+independent durable outbox. Local JWT revocation uses a monotonic generation.
+Migration 101 also fences legacy cutoff-only revocation with a database trigger,
+so old processes cannot leave new-generation sessions valid after revocation.
+Deletion password confirmation uses the same NFC normalization as login.
+
+**Compatibility:** `DELETE /my/account` now returns 410; clients must use the
+new preview and `POST /my/account/deletion` contract. Administrator deletion
+rejects alternate UUID spellings of the acting account. Self-service mutations
+are disabled by default: enable `account_self_service_enabled` only after all
+JWT issuers and verifiers are upgraded and the cleanup worker heartbeat is
+healthy. Install the migration before serving new JWTs; old issuers must be
+drained because their claimless tokens are rejected after a generation bump. SSO
+self-service remains unsupported. See the
+[implementation and rollout design](../docs/design/accepted/2026-09-15-account-self-service-lifecycle/README.md).
+
 ### Every document counter follows the active authority (akb#525)
 
 `GET /vaults/{vault}/info` learned to read the native ledger on

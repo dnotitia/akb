@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, getRecent } from "@/lib/api";
+import { getRecent } from "@/lib/api";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -17,6 +17,6 @@ describe("recent feed transport", () => {
   });
   it("does not classify a server outage as missing support", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ detail: "Unavailable" }), { status: 503 })));
-    await expect(getRecent()).rejects.not.toBeInstanceOf(ApiError);
+    await expect(getRecent()).rejects.toMatchObject({ status: 503, message: "Unavailable" });
   });
 });

@@ -14,7 +14,9 @@ import { PreferencesSection } from "./preferences-section";
 import { AdminSection } from "./admin-section";
 import { NotificationsSection } from "./notifications-section";
 
-type TabId = "profile" | "tokens" | "preferences" | "notifications" | "admin";
+import { SecuritySection } from "./security-section";
+
+type TabId = "security" | "profile" | "tokens" | "preferences" | "notifications" | "admin";
 
 export default function SettingsPage() {
   const [user, setUser] = useState<User | null>(null);
@@ -112,6 +114,7 @@ export default function SettingsPage() {
             <ProfileSection user={user} localPasswordEnabled={localPasswordEnabled} localProfileEditingEnabled={localPasswordEnabled}
               onDirtyChange={setDirty} onUserUpdate={patch => setUser(current => current ? { ...current, ...patch } : current)} />
           </TabsContent>
+          <TabsContent value="security" className="pt-0"><SecuritySection key={user.user_id} user={user} onBusyChange={setNavigationBusy} /></TabsContent>
           <TabsContent value="preferences" className="pt-0"><PreferencesSection /></TabsContent>
           <TabsContent value="notifications" className="pt-0"><NotificationsSection /></TabsContent>
           <TabsContent value="tokens" className="pt-0">

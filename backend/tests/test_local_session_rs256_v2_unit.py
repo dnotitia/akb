@@ -368,3 +368,40 @@ def test_cli_generates_keyset_without_rendering_private_material(tmp_path, capsy
     captured = capsys.readouterr()
     assert "already exists" in captured.err
     assert private_text not in captured.err
+
+
+@pytest.mark.parametrize("generation", [None, True, False, -1, 1.0, "1", [], {}])
+def test_generation_claim_rejects_non_integer_and_negative(configured_keyset, generation):
+    from app.services.auth_verifier_profiles import verify_local_session_rs256_v2
+    from app.services.local_session_keys import get_local_session_keyset
+
+    keyset = get_local_session_keyset()
+    token = _mint(keyset.private_key, kid=keyset.active_kid,
+                  claim_overrides={"session_generation": generation})
+    assert verify_local_session_rs256_v2(token) is None
+
+
+@pytest.mark.parametrize("generation", [0, 1, 100000])
+def test_generation_claim_roundtrip(configured_keyset, generation):
+    from app.services.auth_service import create_jwt, decode_jwt
+
+    token = create_jwt(str(uuid.uuid4()), "alice", session_generation=generation)
+    assert decode_jwt(token)["session_generation"] == generation
+
+
+@pytest.mark.parametrize("claims,generation,cutoff,accepted", [
+    ({"iat": 100}, 0, 100, True),
+    ({"iat": 100}, 0, 101, False),
+    ({"iat": 1000}, 1, 0, False),
+    ({"iat": 100, "session_generation": 0}, 0, 101, True),
+    ({"iat": 1000, "session_generation": 1}, 2, 0, False),
+    ({"iat": 100, "session_generation": 2}, 2, 1000, True),
+    ({"iat": 1000, "session_generation": 3}, 2, 0, False),
+    ({"iat": 1000, "session_generation": True}, 1, 0, False),
+])
+def test_generation_projection_and_legacy_cutover(claims, generation, cutoff, accepted):
+    from app.services.auth_service import local_session_generation_matches
+
+    assert local_session_generation_matches(
+        claims, generation=generation, revoked_epoch_ceil=cutoff,
+    ) is accepted

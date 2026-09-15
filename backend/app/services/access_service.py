@@ -1998,6 +1998,13 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
 # ── Destructive: user self-delete ──────────────────────────
 
 
+async def delete_other_user_account(user_id: str, *, actor_id: str) -> dict:
+    """The administrator route may never select its own account, in any UUID spelling."""
+    if uuid.UUID(user_id) == uuid.UUID(actor_id):
+        raise ConflictError("Use POST /my/account/deletion to delete your own account", code="self_delete_required")
+    return await delete_user_account(user_id)
+
+
 async def delete_user_account(user_id: str) -> dict:
     """Delete the caller's account and everything they solely own.
 

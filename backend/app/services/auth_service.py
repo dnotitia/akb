@@ -15,6 +15,8 @@ import secrets
 import uuid
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
+from collections.abc import Mapping
+from typing import Any
 
 import asyncpg
 import bcrypt
@@ -134,14 +136,17 @@ def create_jwt(
     username: str,
     *,
     not_before: datetime | None = None,
+    session_generation: int = 0,
 ) -> str:
     """Encode a JWT for ``user_id``.
 
-    ``not_before`` lets a caller pin the ``iat`` claim past a known
-    revocation cutoff so a token issued in the same second as a
-    revoke is born already valid (otherwise the iat-second comparison
-    during local-session account projection would reject it for up to 1s).
+    Production callers must supply the current generation while holding
+    the user's row lock; the default is for a newly created account only.
+    ``not_before`` remains a compatibility option for explicit time bounds.
+    Generation-based issuance needs no future-dated ``iat`` or ``nbf``.
     """
+    if type(session_generation) is not int or session_generation < 0:
+        raise ValueError("session_generation must be a non-negative integer")
     now = datetime.now(timezone.utc)
     iat = now if not_before is None or not_before <= now else not_before
     from app.services.local_session_keys import (
@@ -161,6 +166,7 @@ def create_jwt(
         "jti": str(uuid.uuid4()),
         "profile": LOCAL_SESSION_RS256_V2,
         "token_use": "session",
+        "session_generation": session_generation,
     }
     return jwt.encode(
         payload,
@@ -306,7 +312,7 @@ async def login(username: str, password: str) -> dict:
             row = await conn.fetchrow(
                 """
                 SELECT id, username, email, password_hash, display_name, is_admin,
-                       tokens_revoked_before, auth_provider,
+                       tokens_revoked_before, session_generation, auth_provider,
                        account_status, account_kind
                   FROM users WHERE username = $1 OR email = $1
                    FOR SHARE
@@ -323,15 +329,13 @@ async def login(username: str, password: str) -> dict:
             if not row or not await verify_password_async(password, row["password_hash"]):
                 raise AuthenticationError("Invalid credentials")
 
-            # Push iat past the revocation cutoff so a login in the same
-            # whole second as a revoke (admin reset, change_password) still
-            # yields a usable token. Local-session projection compares against
-            # CEIL(epoch) so the safe boundary is cutoff + 1s rounded up.
-            not_before = row["tokens_revoked_before"] + timedelta(seconds=1)
+            # FOR SHARE serializes issuance with revocation's row UPDATE.
+            # Generation is authoritative, so freshly issued JWTs need no
+            # future iat/nbf to escape the legacy whole-second cutoff.
             token = create_jwt(
                 str(row["id"]),
                 row["username"],
-                not_before=not_before,
+                session_generation=row["session_generation"],
             )
             return {
                 "token": token,
@@ -1280,7 +1284,7 @@ async def _revoke_sessions_in_conn(
     actor_id: str,
     reason: str,
 ) -> datetime:
-    """Bump tokens_revoked_before and emit auth.sessions_revoked.
+    """Advance the local session generation and emit auth.sessions_revoked.
 
     Caller MUST be inside ``async with conn.transaction()`` so the cutoff
     and the audit event commit atomically with whatever wrapping write
@@ -1289,7 +1293,8 @@ async def _revoke_sessions_in_conn(
     row = await conn.fetchrow(
         """
         UPDATE users
-           SET tokens_revoked_before = NOW(),
+           SET session_generation = session_generation + 1,
+               tokens_revoked_before = GREATEST(tokens_revoked_before, clock_timestamp()),
                updated_at = NOW()
          WHERE id = $1
      RETURNING tokens_revoked_before
@@ -1319,10 +1324,9 @@ async def revoke_all_sessions(
 ) -> datetime:
     """Invalidate every JWT issued to ``user_id`` before the call.
 
-    Returns the cutoff timestamp. Any JWT with ``iat`` strictly less than
-    this is rejected during local-session account projection. The caller's
-    own JWT is invalidated too — the response is the last action that token
-    can take.
+    Returns the monotonic audit cutoff timestamp for compatibility. Tokens
+    from any earlier generation (including claimless legacy sessions) are
+    rejected. The caller's current JWT is invalidated too.
 
     PATs are intentionally NOT touched. Mixing them would surprise
     pipelines that store a PAT and never expect "I changed my password"
@@ -1505,20 +1509,35 @@ async def resolve_token(authorization: str) -> AuthenticatedUser | None:
     return await resolve_rest_user_authorization(authorization)
 
 
+def local_session_generation_matches(
+    claims: Mapping[str, Any], *, generation: int, revoked_epoch_ceil: int,
+) -> bool:
+    """Accept pre-migration sessions only until this account first revokes.
+
+    A present generation is an exact integer, never bool/string/float. Its
+    equality with the stored counter is authoritative even across clock skew.
+    Migration 101's cutoff trigger also advances it for legacy revokers that
+    only update tokens_revoked_before; deploy that fence before new issuers.
+    """
+    if "session_generation" not in claims:
+        return generation == 0 and int(claims["iat"]) >= revoked_epoch_ceil
+    claimed = claims["session_generation"]
+    return type(claimed) is int and claimed >= 0 and claimed == generation
+
+
 async def _project_local_session_principal(
     principal: VerifiedPrincipal,
     *,
     for_credential_change: bool = False,
 ) -> AuthenticatedUser | None:
     """Project a verified local session onto its active AKB account."""
-    iat = principal.claims["iat"]
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow(
                 """
                 SELECT id, username, email, display_name, is_admin,
-                       credential_change_required,
+                       credential_change_required, session_generation,
                        CEIL(EXTRACT(EPOCH FROM tokens_revoked_before))::bigint
                            AS revoked_epoch_ceil
                   FROM users
@@ -1530,22 +1549,11 @@ async def _project_local_session_principal(
             if not row:
                 return None
 
-            # Server-side JWT revocation. The user can void every token
-            # they have by setting tokens_revoked_before = NOW(); any JWT
-            # whose iat predates that cutoff fails here even though the
-            # signature is valid and exp has not passed. This is the only
-            # mechanism to invalidate one leaked or stale session. Replacing
-            # the local-session verification keyset is the installation-wide
-            # forced-reauth mechanism, but is intentionally not a per-user
-            # revocation tool.
-            #
-            # JWT iat is whole-second (RFC 7519). tokens_revoked_before is
-            # sub-second TIMESTAMPTZ. To make same-second writes safe we
-            # compare against CEIL(epoch) — a revoke at 100.5s yields
-            # revoked_epoch_ceil=101, so any iat≤100 fails (rejected) and
-            # iat≥101 passes (post-sleep re-login). Without CEIL, a JWT
-            # issued in the same second as revoke would survive.
-            if int(iat) < int(row["revoked_epoch_ceil"]):
+            if not local_session_generation_matches(
+                principal.claims,
+                generation=row["session_generation"],
+                revoked_epoch_ceil=row["revoked_epoch_ceil"],
+            ):
                 return None
 
             # A credential this account was handed, and has not replaced,

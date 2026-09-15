@@ -1339,6 +1339,9 @@ class Settings(BaseModel):
     # DDL online; this timer is the belt-and-suspenders that catches
     # any silent hook failure (logged + counted in metrics_snapshot
     # but otherwise not auto-recovered). Set to 0 to disable.
+    # Enable only after every local-session issuer/verifier supports generation claims.
+    account_self_service_enabled: bool = False
+
     role_sync_reconcile_interval_secs: int = 3600
 
     # Event stream — optional Redis Streams fanout. PG outbox (`events`

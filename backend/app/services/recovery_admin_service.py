@@ -646,7 +646,8 @@ async def retire_local_recovery_admin(
                            -- The tombstone is not a credential anyone was
                            -- handed, so there is nothing left to replace.
                            credential_change_required = false,
-                           tokens_revoked_before = NOW(),
+                           tokens_revoked_before = GREATEST(tokens_revoked_before, clock_timestamp()),
+                           session_generation = session_generation + 1,
                            updated_at = NOW()
                      WHERE id = $1
                  RETURNING id, username, email, is_admin, is_recovery_admin,

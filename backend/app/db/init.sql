@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS users (
     -- before the user explicitly revokes valid until natural expiry.
     -- Set to NOW() via POST /auth/revoke-all-sessions, admin force-logout,
     -- and automatically inside change_password.
+    session_generation BIGINT NOT NULL DEFAULT 0 CHECK (session_generation >= 0),
     tokens_revoked_before TIMESTAMPTZ NOT NULL DEFAULT TIMESTAMPTZ '1970-01-01 00:00:00+00',
     -- How the account authenticates. 'local' = bcrypt password (the
     -- baseline). 'keycloak' = projected from a fully verified external
@@ -959,3 +960,52 @@ CREATE TABLE IF NOT EXISTS notification_subscriptions (
  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(user_id,resource_id)
 );
 CREATE INDEX IF NOT EXISTS notification_subscriptions_resource ON notification_subscriptions(resource_id);
+
+-- Account self-service: deletion jobs intentionally have no user/token FK.
+
+CREATE TABLE IF NOT EXISTS account_deletion_cleanup (
+    role_kind TEXT NOT NULL CHECK(role_kind IN ('user','token')),
+    resource_id UUID NOT NULL,
+    requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ,
+    last_error_code TEXT,
+    PRIMARY KEY(role_kind,resource_id)
+);
+CREATE INDEX IF NOT EXISTS account_deletion_cleanup_pending
+    ON account_deletion_cleanup(next_attempt_at) WHERE completed_at IS NULL;
+CREATE TABLE IF NOT EXISTS account_deletion_worker_state (
+    singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK(singleton),
+    last_seen_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS account_lifecycle_attempts (
+    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    window_start TIMESTAMPTZ NOT NULL,
+    attempts INTEGER NOT NULL
+);
+
+-- Keep legacy cutoff-only revokers compatible with generation-based sessions.
+CREATE OR REPLACE FUNCTION fence_local_session_cutoff() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.session_generation = OLD.session_generation THEN
+        NEW.session_generation := OLD.session_generation + 1;
+    END IF;
+    NEW.tokens_revoked_before := GREATEST(OLD.tokens_revoked_before, NEW.tokens_revoked_before);
+    RETURN NEW;
+END;
+$$;
+-- init.sql also runs before pending migrations on existing installations.
+-- Leave old schemas untouched until migration 101 atomically adds the column
+-- and the trigger; concurrent legacy revokers must not see a partial fence.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid='users'::regclass
+               AND attname='session_generation' AND NOT attisdropped) THEN
+        CREATE OR REPLACE TRIGGER users_local_session_cutoff_fence
+            BEFORE UPDATE OF tokens_revoked_before ON users
+            FOR EACH ROW EXECUTE FUNCTION fence_local_session_cutoff();
+    END IF;
+END;
+$$;

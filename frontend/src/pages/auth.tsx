@@ -47,6 +47,8 @@ export default function AuthPage() {
   // person back here with a reason instead, and this is where that reason
   // becomes a sentence. Unknown values fall through to the generic line rather
   // than being echoed, so the query string cannot put text on the screen.
+  const lifecycleReason = new URLSearchParams(window.location.search).get("reason");
+  const lifecycleNotice = lifecycleReason === "sessions-revoked" ? "Your local login sessions have been signed out. Personal access tokens remain active." : lifecycleReason === "account-deleted" ? "Your account deletion request completed." : lifecycleReason === "session-unverified" ? "Sign in again to verify your account. The previous action could not be confirmed." : null;
   const ssoError = new URLSearchParams(window.location.search).get("sso_error") ?? "";
   const [loading, setLoading] = useState(false);
   // Unknown until the versioned public policy is validated. No UI capability
@@ -262,6 +264,7 @@ export default function AuthPage() {
               </Alert>
             )}
 
+            {lifecycleNotice && <Alert variant="info">{lifecycleNotice}</Alert>}
             {ssoError && (
               <Alert variant="destructive" id="auth-sso-error">
                 {ssoError === "membership_required"
