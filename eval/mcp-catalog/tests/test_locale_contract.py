@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -9,11 +10,21 @@ import pytest
 from mcp_catalog.checkpoint import CheckpointError, CheckpointHeader, CheckpointKey, CheckpointStore
 from mcp_catalog.contracts import hash_json, load_run_manifest, load_task_corpus
 from mcp_catalog.execution import ToolCallRecord, ToolCallRecorder, TrialOutcome, bind_tool_calls, response_matches_rubric
-from mcp_catalog.runner import compare_artifacts
+from mcp_catalog.runner import _build_artifact_hash_input, compare_artifacts
 from mcp_catalog.runtime import StateObservation
 
 
 ROOT = Path(__file__).parents[1]
+AUTHORIZATION_PUT_SCHEMAS = {
+    "akb_put": {
+        "type": "object",
+        "properties": {
+            "collection": {"type": "string", "default": ""},
+            "type": {"type": "string", "default": "note"},
+            "status": {"type": "string", "default": "draft"},
+        },
+    }
+}
 
 
 def _loaded() -> tuple[object, list[object]]:
@@ -21,6 +32,13 @@ def _loaded() -> tuple[object, list[object]]:
         load_run_manifest(ROOT / "config" / "run.json"),
         load_task_corpus(ROOT / "corpus" / "tasks.json"),
     )
+
+
+def _seal_comparison_artifact(artifact: dict[str, object]) -> None:
+    current = artifact.get("artifact_hash_input")
+    trial_order = current.get("trial_order", []) if isinstance(current, dict) else []
+    artifact["artifact_hash_input"] = deepcopy(_build_artifact_hash_input(artifact, trial_order=trial_order))
+    artifact["artifact_hash"] = hash_json(artifact["artifact_hash_input"])
 
 
 def test_corpus_has_eight_tasks_per_locale_and_one_pair_per_locale() -> None:
@@ -102,6 +120,7 @@ async def test_expected_permission_denial_keeps_arguments_valid_and_matches_real
     _manifest, tasks = _loaded()
     task = next(task for task in tasks if task.id == "authorization-readonly-b")
     recorder = ToolCallRecorder(operation_map={"create": ["akb_put"]}, secrets=())
+    recorder.set_input_schemas(AUTHORIZATION_PUT_SCHEMAS)
 
     class ForbiddenResponseError(Exception):
         status_code = 403
@@ -123,6 +142,7 @@ async def test_expected_permission_denial_keeps_arguments_valid_and_matches_real
         recorder.calls,
         recorder.operation_map,
         (),
+        input_schemas=recorder.input_schemas,
     )
     outcome = TrialOutcome(
         task_id=task.id,
@@ -156,6 +176,7 @@ async def test_public_mcp_error_envelope_is_operation_failure_not_transport_fail
     _manifest, tasks = _loaded()
     task = next(task for task in tasks if task.id == "authorization-readonly-b")
     recorder = ToolCallRecorder(operation_map={"create": ["akb_put"]}, secrets=())
+    recorder.set_input_schemas(AUTHORIZATION_PUT_SCHEMAS)
 
     async def denied_call(_name: str, _arguments: dict[str, object]) -> dict[str, str]:
         return {"error": "Requires 'writer' role", "code": "permission_denied"}
@@ -181,6 +202,7 @@ async def test_public_mcp_error_envelope_is_operation_failure_not_transport_fail
         recorder.calls,
         recorder.operation_map,
         (),
+        input_schemas=recorder.input_schemas,
     )
     outcome = TrialOutcome(
         task_id=task.id,
@@ -214,12 +236,7 @@ async def test_public_mcp_error_envelope_is_operation_failure_not_transport_fail
 async def test_authorization_arguments_use_public_schema_defaults_without_relaxing_fields() -> None:
     _manifest, tasks = _loaded()
     task = next(task for task in tasks if task.id == "authorization-readonly-b")
-    schema = {
-        "akb_put": {
-            "type": "object",
-            "properties": {"collection": {"type": "string", "default": ""}},
-        }
-    }
+    schema = AUTHORIZATION_PUT_SCHEMAS
 
     async def score(arguments: dict[str, object]) -> TrialOutcome:
         recorder = ToolCallRecorder(operation_map={"create": ["akb_put"]}, secrets=())
@@ -260,6 +277,8 @@ async def test_authorization_arguments_use_public_schema_defaults_without_relaxi
     wrong_vault = await score({**base, "vault": "wrong-vault"})
     wrong_title = await score({**base, "title": "other-title"})
     wrong_content = await score({**base, "content": "other-content"})
+    wrong_type = await score({**base, "type": "report"})
+    wrong_status = await score({**base, "status": "active"})
 
     assert omitted.argument_validity is True and omitted.tool_outcome_match is True and omitted.success is True
     assert explicit_default.argument_validity is True and explicit_default.tool_outcome_match is True
@@ -268,6 +287,8 @@ async def test_authorization_arguments_use_public_schema_defaults_without_relaxi
     assert wrong_vault.tool_outcome_match is False
     assert wrong_title.tool_outcome_match is False
     assert wrong_content.tool_outcome_match is False
+    assert wrong_type.tool_outcome_match is False
+    assert wrong_status.tool_outcome_match is False
 
 
 @pytest.mark.asyncio
@@ -406,6 +427,7 @@ def test_authorization_retry_fails_the_declared_single_attempt_limit() -> None:
         logical_operation="create",
         raw_model_args={"vault": "catalog-bench-vault-authorization", "collection": "", "title": "authorization-probe", "content": "permission probe"},
         server_args={"vault": "catalog-bench-vault-authorization", "collection": "", "title": "authorization-probe", "content": "permission probe"},
+        effective_server_args={"vault": "catalog-bench-vault-authorization", "collection": "", "title": "authorization-probe", "content": "permission probe", "type": "note", "status": "draft"},
         raw_args_valid=True,
         server_args_equal_raw=True,
         server_status_code=403,
@@ -568,6 +590,7 @@ def test_preparatory_identity_list_read_calls_are_visible_but_material_action_is
             "logical_operation": "create",
             "raw_model_args": {"vault": "catalog-bench-vault-authorization", "collection": "", "title": "authorization-probe", "content": "permission probe"},
             "server_args": {"vault": "catalog-bench-vault-authorization", "collection": "", "title": "authorization-probe", "content": "permission probe"},
+            "effective_server_args": {"vault": "catalog-bench-vault-authorization", "collection": "", "title": "authorization-probe", "content": "permission probe", "type": "note", "status": "draft"},
             "raw_args_valid": True,
             "server_args_equal_raw": True,
             "server_succeeded": False,
@@ -747,26 +770,33 @@ def _comparison_artifact(manifest: dict, *, candidate: bool) -> dict:
                     latency_seconds=0.9 if candidate else 1.0,
                 ).model_dump(mode="json")
             )
-    return {
+    artifact = {
         "schema_version": 1,
+        "status": "complete",
         "arm": arm,
-        "run_manifest_hash": "manifest-hash",
+        "run_manifest_hash": hash_json(manifest),
         "task_corpus_hash": "corpus-hash",
         "task_ids": ["read-vaults-a", "read-vaults-b"],
         "task_locales": [
             {"id": "read-vaults-a", "locale": "ko-KR", "pair_id": "read-vaults"},
             {"id": "read-vaults-b", "locale": "en-US", "pair_id": "read-vaults"},
         ],
+        "category_counts": {"single_operation": 2},
         "locale_counts": {"ko-KR": 1, "en-US": 1},
         "source_revision": "b" * 40 if candidate else "a" * 40,
         "protocol_revision": "2026-07-28",
+        "request_timeout_seconds": manifest["budget"]["request_timeout_seconds"],
         "artifact_versions": {},
         "fixture": {"scenario": "app-control-plane", "reset": {"method": "POST", "body": {"scenario": "app-control-plane"}}},
         "manifest": manifest,
         "smoke_gate": {"status": "passed", "required_cells": [], "cells": []},
+        "overall_metrics": {},
+        "locale_metrics": {},
         "catalogs": {"http:default": {"catalog_token_estimate": 100 if not candidate else 50}},
         "runs": {"primary:http": {"trials": trials}},
     }
+    _seal_comparison_artifact(artifact)
+    return artifact
 
 
 def test_locale_metrics_are_reported_and_paired_without_mixing_locales() -> None:
@@ -789,6 +819,7 @@ def test_literal_first_tool_diagnostic_is_separate_from_material_action_gate() -
     for artifact in (baseline, candidate):
         for trial in artifact["runs"]["primary:http"]["trials"]:
             trial["first_action_accuracy"] = False
+        _seal_comparison_artifact(artifact)
 
     result = compare_artifacts(baseline, candidate)
     metrics = result["paired"]["primary:http"]["metrics"]
@@ -803,6 +834,7 @@ def test_comparison_rejects_a_trial_with_the_wrong_declared_locale() -> None:
     baseline = _comparison_artifact(manifest.model_dump(mode="json"), candidate=False)
     candidate = _comparison_artifact(manifest.model_dump(mode="json"), candidate=True)
     candidate["runs"]["primary:http"]["trials"][0]["locale"] = "en-US"
+    _seal_comparison_artifact(candidate)
 
     with pytest.raises(ValueError, match="trial locale"):
         compare_artifacts(baseline, candidate)
@@ -813,6 +845,7 @@ def test_comparison_rejects_a_trial_with_the_wrong_repeat_index() -> None:
     baseline = _comparison_artifact(manifest.model_dump(mode="json"), candidate=False)
     candidate = _comparison_artifact(manifest.model_dump(mode="json"), candidate=True)
     candidate["runs"]["primary:http"]["trials"][0]["repeat_index"] = 4
+    _seal_comparison_artifact(candidate)
 
     with pytest.raises(ValueError, match="repeat indices"):
         compare_artifacts(baseline, candidate)

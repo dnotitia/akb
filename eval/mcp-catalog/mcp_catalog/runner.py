@@ -715,37 +715,8 @@ class BenchmarkRunner:
                 "cleanup_errors": [],
             }
         safe_artifact = safe_json(artifact, self.secrets)
-        hash_runs: dict[str, Any] = {}
-        for key, report in sorted(all_reports.items()):
-            trials = report.get("trials", []) if isinstance(report, dict) else []
-            hash_runs[key] = {
-                "trials": trials,
-                "statuses": report.get("statuses", []) if isinstance(report, dict) else [],
-                "summary": report.get("summary", {}) if isinstance(report, dict) else {},
-            }
-        hash_input = {
-            "schema_version": 1,
-            "arm": self.arm,
-            "run_manifest_hash": artifact["run_manifest_hash"],
-            "task_corpus_hash": artifact["task_corpus_hash"],
-            "task_ids": artifact["task_ids"],
-            "task_locales": artifact["task_locales"],
-            "category_counts": artifact["category_counts"],
-            "locale_counts": artifact["locale_counts"],
-            "source_revision": artifact["source_revision"],
-            "protocol_revision": artifact["protocol_revision"],
-            "request_timeout_seconds": artifact["request_timeout_seconds"],
-            "artifact_versions": artifact["artifact_versions"],
-            "trial_order": [
-                key.model_dump(mode="json")
-                for key in self._planned_keys(runtime["source_revision"]).values()
-            ],
-            "catalogs": artifact["catalogs"],
-            "runs": hash_runs,
-            "overall_metrics": artifact["overall_metrics"],
-            "locale_metrics": artifact["locale_metrics"],
-            "smoke_gate_status": (smoke_gate or self._smoke_gate).get("status"),
-        }
+        trial_order = [key.model_dump(mode="json") for key in self._planned_keys(runtime["source_revision"]).values()]
+        hash_input = _build_artifact_hash_input(artifact, trial_order=trial_order)
         safe_hash_input = safe_json(hash_input, self.secrets)
         assert isinstance(safe_artifact, dict)
         safe_artifact["artifact_hash_input"] = safe_hash_input
@@ -1828,6 +1799,52 @@ def _category_safety_regressions(base_runs: dict[str, Any], cand_runs: dict[str,
     return count
 
 
+def _build_artifact_hash_input(artifact: dict[str, Any], *, trial_order: list[dict[str, Any]]) -> dict[str, Any]:
+    runs = artifact["runs"]
+    fixture = artifact["fixture"]
+    reset = fixture["reset"]
+    smoke_gate = artifact["smoke_gate"]
+    if not isinstance(runs, dict) or not isinstance(fixture, dict) or not isinstance(reset, dict):
+        raise ValueError("artifact result fields are invalid")
+    hash_runs: dict[str, Any] = {}
+    for key, report in sorted(runs.items()):
+        if not isinstance(report, dict):
+            raise ValueError("artifact run is invalid")
+        hash_runs[key] = {
+            "trials": report.get("trials", []),
+            "statuses": report.get("statuses", []),
+            "summary": report.get("summary", {}),
+        }
+    if not isinstance(smoke_gate, dict):
+        raise ValueError("artifact smoke gate is invalid")
+    return {
+        "schema_version": artifact["schema_version"],
+        "status": artifact.get("status", "complete"),
+        "arm": artifact["arm"],
+        "run_manifest_hash": artifact["run_manifest_hash"],
+        "task_corpus_hash": artifact["task_corpus_hash"],
+        "task_ids": artifact["task_ids"],
+        "task_locales": artifact["task_locales"],
+        "category_counts": artifact["category_counts"],
+        "locale_counts": artifact["locale_counts"],
+        "source_revision": artifact["source_revision"],
+        "protocol_revision": artifact["protocol_revision"],
+        "request_timeout_seconds": artifact["request_timeout_seconds"],
+        "artifact_versions": artifact["artifact_versions"],
+        "trial_order": trial_order,
+        "fixture_contract": {
+            "scenario": fixture.get("scenario"),
+            "reset_method": reset.get("method"),
+            "reset_body": reset.get("body"),
+        },
+        "catalogs": artifact["catalogs"],
+        "runs": hash_runs,
+        "overall_metrics": artifact["overall_metrics"],
+        "locale_metrics": artifact["locale_metrics"],
+        "smoke_gate_status": smoke_gate.get("status"),
+    }
+
+
 def _validate_artifact_pair(baseline: dict[str, Any], candidate: dict[str, Any]) -> None:
     for artifact, expected_arm in ((baseline, "baseline"), (candidate, "candidate")):
         if artifact.get("schema_version") != 1 or artifact.get("arm") != expected_arm:
@@ -1839,9 +1856,24 @@ def _validate_artifact_pair(baseline: dict[str, Any], candidate: dict[str, Any])
             raise ValueError(f"{expected_arm} artifact is missing a passing four-cell smoke gate")
         hash_input = artifact.get("artifact_hash_input")
         artifact_hash = artifact.get("artifact_hash")
-        if hash_input is not None or artifact_hash is not None:
-            if not isinstance(hash_input, dict) or not isinstance(artifact_hash, str) or hash_json(hash_input) != artifact_hash:
-                raise ValueError(f"invalid {expected_arm} artifact hash")
+        if not isinstance(hash_input, dict) or not isinstance(artifact_hash, str):
+            raise ValueError(f"missing {expected_arm} artifact hash")
+        manifest = artifact.get("manifest")
+        trial_order = hash_input.get("trial_order")
+        if not isinstance(trial_order, list):
+            raise ValueError(f"invalid {expected_arm} artifact hash")
+        try:
+            expected_hash_input = _build_artifact_hash_input(artifact, trial_order=trial_order)
+            valid_hash = hash_json(hash_input) == artifact_hash
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(f"invalid {expected_arm} artifact hash") from None
+        if (
+            not isinstance(manifest, dict)
+            or hash_json(manifest) != artifact.get("run_manifest_hash")
+            or expected_hash_input != hash_input
+            or not valid_hash
+        ):
+            raise ValueError(f"invalid {expected_arm} artifact hash")
     for key in (
         "run_manifest_hash",
         "task_corpus_hash",

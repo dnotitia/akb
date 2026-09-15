@@ -165,6 +165,17 @@ def test_benchmark_cell_descriptors_are_explicit_and_non_nested() -> None:
         RuntimeDescriptor.from_dict(nested)
 
 
+def test_benchmark_cells_must_share_the_aggregate_scenario() -> None:
+    raw = descriptor_dict()
+    cell = descriptor_dict()
+    cell["scenario"] = "app-control-plane"
+    cell["services"]["fixture"]["reset"]["body"]["scenario"] = "app-control-plane"
+    raw["benchmark_cells"] = {"primary:http": cell}
+
+    with pytest.raises(RuntimeContractError, match="cell scenario"):
+        RuntimeDescriptor.from_dict(raw)
+
+
 def test_descriptor_rejects_cross_origin_reset() -> None:
     raw = descriptor_dict()
     raw["services"]["fixture"]["reset"]["url"] = "http://other.invalid/reset"

@@ -3,9 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic_ai.mcp import ToolDefinition
 
 from mcp_catalog.contracts import load_run_manifest, load_task_corpus, source_blind_violations_for
-from mcp_catalog.execution import ToolCallRecord, TrialOutcome, canonicalize_arguments
+from mcp_catalog.execution import (
+    ToolCallRecord,
+    TrialOutcome,
+    canonicalize_arguments,
+    capture_tool_input_schemas,
+)
 from mcp_catalog.runtime import StateObservation
 
 
@@ -45,11 +51,47 @@ PUBLIC_INPUT_SCHEMAS = {
 }
 
 
+class _ListedToolset:
+    async def list_tools(self) -> list[ToolDefinition]:
+        return [
+            ToolDefinition(
+                name="akb_create_vault",
+                parameters_json_schema={"properties": {"public_access": {"default": "none"}}},
+            ),
+            ToolDefinition(
+                name="akb_put",
+                parameters_json_schema={
+                    "properties": {"type": {"default": "note"}, "status": {"default": "draft"}}
+                },
+            ),
+        ]
+
+
 def _multistep_tasks():
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
     manifest.validate_tasks(tasks)
     return manifest, [task for task in tasks if task.pair_id == "multi-step"]
+
+
+@pytest.mark.asyncio
+async def test_public_tool_definition_schemas_drive_server_argument_defaults() -> None:
+    schemas = await capture_tool_input_schemas(_ListedToolset())
+
+    assert canonicalize_arguments(
+        {"name": VAULT}, schemas["akb_create_vault"]
+    ) == {"name": VAULT, "public_access": "none"}
+    assert canonicalize_arguments(
+        {"vault": VAULT, "collection": COLLECTION, "title": TITLE, "content": CONTENT},
+        schemas["akb_put"],
+    ) == {
+        "vault": VAULT,
+        "collection": COLLECTION,
+        "title": TITLE,
+        "content": CONTENT,
+        "type": "note",
+        "status": "draft",
+    }
 
 
 def _call(
@@ -142,20 +184,7 @@ def test_only_the_exact_three_call_trace_completes_the_multistep_task() -> None:
 
 def test_explicit_public_defaults_match_the_same_canonical_attempt_contract() -> None:
     _manifest, tasks = _multistep_tasks()
-    calls = _exact_calls()
-    calls[0] = _call(1, "akb_create_vault", {"name": VAULT, "public_access": "none"})
-    calls[2] = _call(
-        3,
-        "akb_put",
-        {
-            "vault": VAULT,
-            "collection": COLLECTION,
-            "title": TITLE,
-            "content": CONTENT,
-            "type": "note",
-            "status": "draft",
-        },
-    )
+    calls = [_call(order, tool_name, args) for order, (tool_name, args) in enumerate(EXPECTED_ATTEMPTS, 1)]
 
     outcome = _score(tasks[0], calls)
 

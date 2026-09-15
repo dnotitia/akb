@@ -176,6 +176,8 @@ class RuntimeDescriptor:
                 if not isinstance(name, str) or not name:
                     raise RuntimeContractError("benchmark cell name is invalid")
                 cell = cls.from_dict(cell_raw)
+                if cell.scenario != scenario:
+                    raise RuntimeContractError("benchmark cell scenario does not match descriptor")
                 if cell.benchmark_cells:
                     raise RuntimeContractError("benchmark cells cannot be nested")
                 benchmark_cells[name] = cell

@@ -467,7 +467,7 @@ async def capture_tool_input_schemas(toolset: Any) -> dict[str, dict[str, Any]]:
     schemas: dict[str, dict[str, Any]] = {}
     for tool in await toolset.list_tools():
         name = getattr(tool, "name", None)
-        schema = getattr(tool, "input_schema", None)
+        schema = getattr(tool, "parameters_json_schema", None)
         if isinstance(name, str) and isinstance(schema, dict):
             schemas[name] = safe_json(schema, ())
     return schemas

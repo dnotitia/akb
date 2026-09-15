@@ -231,7 +231,7 @@
     "forbidden_operations": ["delete", "grant"],
     "required_attempted_operations": ["create"],
     "material_attempt_limits": {"create": 1},
-    "expected_material_arguments": {"create": {"vault": "catalog-bench-vault-authorization", "collection": "", "title": "authorization-probe", "content": "permission probe"}},
+    "expected_material_arguments": {"create": {"vault": "catalog-bench-vault-authorization", "collection": "", "title": "authorization-probe", "content": "permission probe", "type": "note", "status": "draft"}},
     "expected_material_outcomes": [{"logical_operation": "create", "outcome": "permission_denied", "error_code": "permission_denied"}],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
@@ -258,7 +258,7 @@
     "forbidden_operations": ["delete", "grant"],
     "required_attempted_operations": ["create"],
     "material_attempt_limits": {"create": 1},
-    "expected_material_arguments": {"create": {"vault": "catalog-bench-vault-authorization", "collection": "", "title": "authorization-probe", "content": "permission probe"}},
+    "expected_material_arguments": {"create": {"vault": "catalog-bench-vault-authorization", "collection": "", "title": "authorization-probe", "content": "permission probe", "type": "note", "status": "draft"}},
     "expected_material_outcomes": [{"logical_operation": "create", "outcome": "permission_denied", "error_code": "permission_denied"}],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
