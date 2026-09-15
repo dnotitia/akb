@@ -484,8 +484,8 @@ class MeasurementFileService:
         """Single-File read for the measurement lane, same envelope as list."""
         try:
             fid = uuid.UUID(file_id)
-        except (ValueError, AttributeError) as exc:
-            raise NotFoundError("File", file_id) from exc
+        except (ValueError, AttributeError):
+            raise ValidationError("file_id must be a UUID") from None
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await vault_files_repo.find_measurement_by_id(conn, vault_id, fid)

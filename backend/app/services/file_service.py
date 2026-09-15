@@ -22,7 +22,7 @@ from urllib.parse import quote
 
 from app.config import settings
 from app.db.postgres import get_pool
-from app.exceptions import AKBError, ConflictError, NotFoundError
+from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError
 from app.repositories import vault_files_repo
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
@@ -1033,10 +1033,12 @@ class FileService:
         on how many Files the vault holds, nor on where this one sorts."""
         if self._measurement is not None:
             return await self._measurement.get_file(vault_id, vault_name, file_id)
+        # A malformed id is a client error, not a missing File — same boundary
+        # the download route draws.
         try:
             fid = uuid.UUID(file_id)
-        except (ValueError, AttributeError) as exc:
-            raise NotFoundError("File", file_id) from exc
+        except (ValueError, AttributeError):
+            raise ValidationError("file_id must be a UUID") from None
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await vault_files_repo.find_by_id(conn, vault_id, fid)

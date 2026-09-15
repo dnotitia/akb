@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 import pytest
 from starlette.routing import Match
 
+from app.exceptions import ValidationError
+from app.services import file_service as fs
 from app.services.file_service import _file_envelope
 
 
@@ -76,6 +78,19 @@ def test_envelope_covers_what_a_file_view_renders():
         "mime_type", "size_bytes", "created_by", "created_at",
     }
     assert required <= env.keys(), sorted(required - env.keys())
+
+
+# ── malformed input ─────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_malformed_id_is_a_client_error_not_a_missing_file(monkeypatch):
+    """A non-UUID is the caller's mistake, and the download route already says
+    so. Answering 404 here instead would conflate "you typed it wrong" with
+    "it is not here", and the two want different fixes."""
+    monkeypatch.setattr(fs, "measurement_enabled", lambda: False)
+    service = fs.FileService()
+    with pytest.raises(ValidationError):
+        await service.get_file(uuid.uuid4(), "dbt", "not-a-uuid")
 
 
 # ── routing ─────────────────────────────────────────────────────────
