@@ -84,6 +84,41 @@ test.describe("document edit recovery mock contract", () => {
     await reset(request);
   });
 
+  test("round-trips Source through WYSIWYG and saves the same Markdown draft", async ({
+    page,
+    request,
+  }) => {
+    const recovery = await fixture(request);
+    const wysiwygMarkdown = "Draft from WYSIWYG";
+    const editedMarkdown = "## Source revision\n\n- [x] same draft\n\n<!-- preserved -->";
+    await page.goto(recovery.identity!.start_url!);
+
+    const wysiwyg = page.getByRole("textbox", { name: "Document body (markdown)" });
+    await wysiwyg.fill(wysiwygMarkdown);
+    await page.getByRole("button", { name: "Source" }).click();
+    const source = page.getByRole("textbox", { name: "Document body (markdown)" });
+    await expect(source).toBeVisible();
+    await expect(source).toHaveValue(wysiwygMarkdown);
+    await source.fill(editedMarkdown);
+    await expect(page.getByText("Draft saved locally")).toBeVisible();
+    await expect(page.getByRole("toolbar", { name: "Text formatting" })).toHaveCount(0);
+
+    await page.getByRole("button", { name: "WYSIWYG" }).click();
+    const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
+    await expect(editor).toContainText("Source revision");
+    await expect(editor).toContainText("same draft");
+    await page.getByRole("button", { name: "Save" }).click();
+    await expect(page.getByRole("button", { name: "Save" })).toHaveCount(0);
+
+    await page.getByRole("button", { name: "Edit" }).click();
+    await page.getByRole("button", { name: "Source" }).click();
+    await expect(
+      page.getByRole("textbox", { name: "Document body (markdown)" }),
+    ).toHaveValue(editedMarkdown);
+    const state = await operate(request, recovery.operations!.state);
+    expect(state.document.content).toBe(editedMarkdown);
+  });
+
   test("keeps a dirty body through refetch and exposes a three-way OCC conflict", async ({
     page,
     request,
@@ -95,9 +130,10 @@ test.describe("document edit recovery mock contract", () => {
     });
     const recovery = await fixture(request);
     await page.goto(recovery.identity!.start_url!);
-    const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
-    await expect(editor).toBeVisible();
-    await editor.fill("Local draft before another editor saves");
+    await page.getByRole("button", { name: "Source" }).click();
+    const source = page.getByRole("textbox", { name: "Document body (markdown)" });
+    await expect(source).toBeVisible();
+    await source.fill("Local draft before another editor saves");
 
     await operate(request, recovery.operations!.remote_revision, {
       actor: "editor-b",
@@ -105,8 +141,11 @@ test.describe("document edit recovery mock contract", () => {
       content: "Remote editor body",
     });
     await operate(request, recovery.operations!.refetch);
-    await expect(editor).toContainText("Local draft before another editor saves");
+    await expect(source).toHaveValue("Local draft before another editor saves");
 
+    await page.getByRole("button", { name: "WYSIWYG" }).click();
+    const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
+    await expect(editor).toContainText("Local draft before another editor saves");
     await page.getByRole("button", { name: "Save" }).click();
     const conflict = page
       .getByRole("alert")
@@ -165,8 +204,9 @@ test.describe("document edit recovery mock contract", () => {
   }) => {
     const recovery = await fixture(request);
     await page.goto(recovery.identity!.start_url!);
-    const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
-    await editor.fill("Draft retained after a retryable server failure");
+    await page.getByRole("button", { name: "Source" }).click();
+    const source = page.getByRole("textbox", { name: "Document body (markdown)" });
+    await source.fill("Draft retained after a retryable server failure");
     await expect(page.getByText("Draft saved locally")).toBeVisible();
     await operate(request, recovery.operations!.retryable_save_failure);
     await page.getByRole("button", { name: "Save" }).click();
@@ -174,6 +214,7 @@ test.describe("document edit recovery mock contract", () => {
 
     await page.reload();
     await expect(page.getByText("Local draft restored")).toBeVisible();
+    const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
     await expect(editor).toContainText("Draft retained after a retryable server failure");
 
     const input = page.locator('input[type="file"]');
@@ -214,6 +255,7 @@ test.describe("document edit recovery mock contract", () => {
     const recovery = await fixture(request);
     await page.goto(recovery.identity!.start_url!);
     await page.getByRole("textbox", { name: "Document title" }).fill(draftTitle);
+    await page.getByRole("button", { name: "Source" }).click();
     const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
     await editor.fill(draftBody);
     await expect(page.getByText("Draft saved locally")).toBeVisible();

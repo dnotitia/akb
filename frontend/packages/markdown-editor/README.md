@@ -13,10 +13,12 @@ The package is built against the exact Tiptap `3.31.3` package set and React 19.
 ```tsx
 import {
   MarkdownEditor,
+  MarkdownEditingSurface,
   MarkdownViewer,
   MarkdownToolbar,
   canonicalizeMarkdown,
   parseMarkdown,
+  serializeEditorMarkdown,
   serializeMarkdown,
   useMarkdownCommands,
   useMarkdownState,
@@ -33,6 +35,58 @@ function Document({ markdown, onChange }) {
   )
 }
 ```
+
+`MarkdownEditor` includes a `WYSIWYG` / `Source` switch for the same Markdown
+draft. Source opens from the current editor body, and Source edits emit raw
+Markdown through `onChange`; the shared editor stays mounted, and formatting,
+link search, and slash handlers remain attached to the WYSIWYG surface.
+`serializeEditorMarkdown(editor, { profile: 'preserve' })` reads the current
+editor body and omits the terminal empty paragraph that Tiptap keeps as an
+editing caret after an atomic block.
+
+Products with a custom editor instance and toolbar can compose the same public
+surface from the `/react` entry point:
+
+```tsx
+import {
+  EditorContent,
+  MarkdownEditingSurface,
+  MarkdownToolbar,
+  useMarkdownEditor,
+} from '@akb/markdown-editor/react'
+
+function ProductEditor({ markdown, onChange, readOnly }) {
+  const editor = useMarkdownEditor({
+    initialMarkdown: markdown,
+    editable: !readOnly,
+    onChange,
+  })
+
+  return (
+    <MarkdownEditingSurface
+      editor={editor}
+      markdown={markdown}
+      readOnly={readOnly}
+      toolbar={<MarkdownToolbar editor={editor} />}
+      onSourceChange={onChange}
+      modeLabels={{ group: 'Editor mode', source: 'Source' }}
+    >
+      <EditorContent editor={editor} />
+    </MarkdownEditingSurface>
+  )
+}
+```
+
+`MarkdownEditingSurface` owns mode switching, source input, external-value
+synchronization, and focus handoff. Its `toolbar` slot appears only in
+WYSIWYG mode; `modeLabels`, `sourceClassName`, and the source label props adapt
+copy, theme, and accessible names. `modeSwitchDisabled` can lock mode changes
+during an active product operation such as an upload. The optional
+`onWysiwygDragOverCapture` / `onWysiwygDropCapture` handlers attach product
+drag-and-drop behavior to the visual editor and its toolbar without affecting
+Source input. `onMarkdownApplied` is an optional product hook for schema-specific
+normalization after external or Source Markdown is applied. Products continue
+to own persistence, draft/OCC behavior, and asset-reference policy.
 
 `MarkdownToolbar` owns the default Paragraph, Heading 1–3, bold, italic,
 strikethrough, inline code, list, blockquote, code block, horizontal rule,

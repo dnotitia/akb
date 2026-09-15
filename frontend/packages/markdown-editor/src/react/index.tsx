@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import type { ComponentPropsWithoutRef, ReactNode } from 'react'
+import type { ComponentPropsWithoutRef, DragEventHandler, ReactNode } from 'react'
 import * as DialogPrimitive from '@radix-ui/react-dialog'
 import { EditorContent, useEditor } from '@tiptap/react'
 import type { Editor } from '@tiptap/core'
@@ -24,7 +24,7 @@ import {
 } from 'lucide-react'
 
 import { createMarkdownExtensions } from '../extensions.js'
-import { extractMarkdownTargets, markdownCommands } from '../core.js'
+import { extractMarkdownTargets, markdownCommands, serializeEditorMarkdown } from '../core.js'
 import { normalizeMarkdownLinkUrl } from '../link.js'
 import { resolveMarkdownTargets } from '../adapters.js'
 import { MarkdownLinkSearch } from './markdown-link-search.js'
@@ -289,9 +289,221 @@ function MarkdownSurface({
   )
 }
 
+export type MarkdownEditorMode = 'wysiwyg' | 'source'
+
+export interface MarkdownEditingSurfaceLabels {
+  group: string
+  wysiwyg: string
+  source: string
+  sourceField: string
+}
+
+const DEFAULT_EDITING_SURFACE_LABELS: MarkdownEditingSurfaceLabels = {
+  group: 'Editor mode',
+  wysiwyg: 'WYSIWYG',
+  source: 'Source',
+  sourceField: 'Markdown source',
+}
+
+export interface MarkdownEditingSurfaceProps extends Omit<ComponentPropsWithoutRef<'div'>, 'onChange'> {
+  editor: Editor | null
+  markdown: string
+  profile?: MarkdownProfile
+  onSourceChange?: (markdown: string, editor: Editor) => void
+  onMarkdownApplied?: (editor: Editor) => void
+  readOnly?: boolean
+  modeSwitchDisabled?: boolean
+  toolbar?: ReactNode
+  sourcePlaceholder?: string
+  sourceLabel?: string
+  sourceAriaLabel?: string
+  sourceAriaLabelledby?: string
+  sourceRequired?: boolean
+  sourceClassName?: string
+  modeLabels?: Partial<MarkdownEditingSurfaceLabels>
+  onWysiwygDragOverCapture?: DragEventHandler<HTMLDivElement>
+  onWysiwygDropCapture?: DragEventHandler<HTMLDivElement>
+  children?: ReactNode
+}
+
+/**
+ * Keep one editor mounted while the same draft moves between visual and
+ * Markdown editing. The consumer owns persistence and adapters; this surface
+ * owns mode switching, source synchronization, focus, and the shared source UI.
+ */
+export function MarkdownEditingSurface({
+  editor,
+  markdown,
+  profile = 'preserve',
+  onSourceChange,
+  onMarkdownApplied,
+  readOnly = false,
+  modeSwitchDisabled = false,
+  toolbar,
+  sourcePlaceholder = 'Write Markdown source…',
+  sourceLabel,
+  sourceAriaLabel,
+  sourceAriaLabelledby,
+  sourceRequired = false,
+  sourceClassName,
+  modeLabels,
+  onWysiwygDragOverCapture,
+  onWysiwygDropCapture,
+  children,
+  className,
+  ...props
+}: MarkdownEditingSurfaceProps) {
+  const labels = { ...DEFAULT_EDITING_SURFACE_LABELS, ...modeLabels }
+  const [mode, setMode] = useState<MarkdownEditorMode>('wysiwyg')
+  const [source, setSource] = useState(markdown)
+  const sourceRef = useRef(markdown)
+  const sourceDirtyRef = useRef(false)
+  const lastMarkdownRef = useRef(markdown)
+  const previousModeRef = useRef(mode)
+  const sourceInputRef = useRef<HTMLTextAreaElement>(null)
+  const sourceInputId = useId()
+  const sourceInputLabelId = `${sourceInputId}-label`
+  const resolvedSourceLabel = sourceLabel ?? labels.sourceField
+
+  useLayoutEffect(() => {
+    if (sourceDirtyRef.current) return
+    sourceRef.current = markdown
+    setSource(markdown)
+  }, [markdown])
+
+  useLayoutEffect(() => {
+    const externalValueChanged = markdown !== lastMarkdownRef.current
+    lastMarkdownRef.current = markdown
+    if (!editor || (mode === 'source' && sourceDirtyRef.current)) return
+
+    if (externalValueChanged && editor.getMarkdown() !== markdown) {
+      editor.commands.setContent(markdown, {
+        contentType: 'markdown',
+        emitUpdate: false,
+      })
+      onMarkdownApplied?.(editor)
+    }
+  }, [editor, markdown, mode, onMarkdownApplied])
+
+  useEffect(() => {
+    if (editor && editor.isEditable !== !readOnly) editor.setEditable(!readOnly, false)
+  }, [editor, readOnly])
+
+  useEffect(() => {
+    if (previousModeRef.current === mode) return
+    previousModeRef.current = mode
+
+    if (mode === 'source') sourceInputRef.current?.focus()
+    else editor?.commands.focus()
+  }, [editor, mode])
+
+  const selectMode = (nextMode: MarkdownEditorMode) => {
+    if (!editor || nextMode === mode) return
+
+    if (nextMode === 'source') {
+      const editorMarkdown = serializeEditorMarkdown(editor, { profile })
+      sourceRef.current = editorMarkdown
+      sourceDirtyRef.current = false
+      setSource(editorMarkdown)
+    } else {
+      const sourceMarkdown = sourceRef.current
+      if (sourceDirtyRef.current && editor.getMarkdown() !== sourceMarkdown) {
+        editor.commands.setContent(sourceMarkdown, {
+          contentType: 'markdown',
+          emitUpdate: false,
+        })
+        onMarkdownApplied?.(editor)
+      }
+      sourceDirtyRef.current = false
+    }
+
+    setMode(nextMode)
+  }
+
+  const modeButton = (target: MarkdownEditorMode, label: string) => (
+    <button
+      type="button"
+      aria-pressed={mode === target}
+      disabled={!editor || modeSwitchDisabled}
+      onClick={() => selectMode(target)}
+      className={joinClasses(
+        'inline-flex h-8 items-center justify-center rounded-[var(--radius-sm)] px-3 text-sm font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:cursor-not-allowed disabled:opacity-50',
+        mode === target
+          ? 'bg-surface-selected text-surface-selected-foreground'
+          : 'text-foreground-muted hover:bg-surface-hover hover:text-foreground',
+      )}
+    >
+      {label}
+    </button>
+  )
+
+  return (
+    <div
+      {...props}
+      className={joinClasses('min-w-0', className)}
+      data-markdown-mode={mode}
+    >
+      <div className="flex justify-end border-b border-border bg-surface px-2 py-1.5">
+        <div
+          role="group"
+          aria-label={labels.group}
+          className="inline-flex items-center gap-0.5 rounded-[var(--radius-md)] bg-surface-2 p-0.5"
+          data-markdown-mode-toggle
+        >
+          {modeButton('wysiwyg', labels.wysiwyg)}
+          {modeButton('source', labels.source)}
+        </div>
+      </div>
+
+      <div
+        hidden={mode !== 'wysiwyg'}
+        data-markdown-mode-panel="wysiwyg"
+        onDragOverCapture={onWysiwygDragOverCapture}
+        onDropCapture={onWysiwygDropCapture}
+      >
+        {mode === 'wysiwyg' ? toolbar : null}
+        {children}
+      </div>
+
+      <div hidden={mode !== 'source'} data-markdown-mode-panel="source">
+        <label id={sourceInputLabelId} htmlFor={sourceInputId} className="sr-only">
+          {resolvedSourceLabel}
+        </label>
+        <textarea
+          ref={sourceInputRef}
+          id={sourceInputId}
+          aria-label={sourceAriaLabel}
+          aria-labelledby={
+            sourceAriaLabelledby
+              ? `${sourceAriaLabelledby} ${sourceInputLabelId}`
+              : undefined
+          }
+          aria-required={sourceRequired || undefined}
+          readOnly={readOnly}
+          spellCheck={false}
+          placeholder={sourcePlaceholder}
+          value={source}
+          onChange={event => {
+            const next = event.currentTarget.value
+            sourceRef.current = next
+            sourceDirtyRef.current = true
+            setSource(next)
+            if (editor && !readOnly) onSourceChange?.(next, editor)
+          }}
+          className={
+            sourceClassName ??
+            'min-h-96 w-full resize-y border-0 bg-surface px-4 py-4 font-mono text-sm leading-6 text-foreground placeholder:text-foreground-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring focus-visible:ring-offset-0'
+          }
+        />
+      </div>
+    </div>
+  )
+}
+
 export interface MarkdownEditorProps extends Omit<MarkdownSurfaceProps, 'editor' | 'editable'> {
   markdown: string
   profile?: MarkdownProfile
+  readOnly?: boolean
   onChange?: MarkdownEditorConfig['onChange']
   onSlash?: (context: MarkdownSlashContext) => void
   adapters?: MarkdownAdapters
@@ -301,6 +513,7 @@ export interface MarkdownEditorProps extends Omit<MarkdownSurfaceProps, 'editor'
 export function MarkdownEditor({
   markdown,
   profile = 'preserve',
+  readOnly = false,
   onChange,
   onSlash,
   adapters,
@@ -310,7 +523,7 @@ export function MarkdownEditor({
   const editor = useMarkdownEditor({
     initialMarkdown: markdown,
     profile,
-    editable: true,
+    editable: !readOnly,
     onChange,
     onSlash,
   })
@@ -320,22 +533,22 @@ export function MarkdownEditor({
     resolverContext,
   )
 
-  useEffect(() => {
-    if (!editor || editor.getMarkdown() === markdown) {
-      return
-    }
-
-    editor.commands.setContent(markdown, { contentType: 'markdown' })
-  }, [editor, markdown])
-
   return (
-    <MarkdownSurface
+    <MarkdownEditingSurface
       {...props}
       editor={editor}
-      editable
-      resolutions={resolutions}
-      resolvingTargets={Boolean(adapters?.targetResolver)}
-    />
+      markdown={markdown}
+      profile={profile}
+      readOnly={readOnly}
+      onSourceChange={(next, sourceEditor) => onChange?.(next, sourceEditor)}
+    >
+      <MarkdownSurface
+        editor={editor}
+        editable={!readOnly}
+        resolutions={resolutions}
+        resolvingTargets={Boolean(adapters?.targetResolver)}
+      />
+    </MarkdownEditingSurface>
   )
 }
 

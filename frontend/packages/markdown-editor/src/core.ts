@@ -33,6 +33,28 @@ export function serializeMarkdown(
   return managerFor(options).serialize(document)
 }
 
+/**
+ * Serialize the current editor document without persisting the empty paragraph
+ * that Tiptap keeps after a terminal atomic block for keyboard continuation.
+ */
+export function serializeEditorMarkdown(
+  editor: Editor,
+  options: MarkdownParseOptions = {},
+): string {
+  const document = editor.getJSON()
+  const content = document.content
+  const last = content?.at(-1)
+  if (
+    content &&
+    content.length > 1 &&
+    last?.type === 'paragraph' &&
+    (!last.content || last.content.length === 0)
+  ) {
+    document.content = content.slice(0, -1)
+  }
+  return serializeMarkdown(document, options)
+}
+
 export function canonicalizeMarkdown(
   markdown: string,
   options: MarkdownParseOptions = {},

@@ -2,6 +2,7 @@ import * as React from "react";
 import { createPortal } from "react-dom";
 import {
   EditorContent,
+  MarkdownEditingSurface,
   MarkdownToolbar,
   MarkdownToolbarButton,
   MarkdownToolbarGroup,
@@ -10,7 +11,10 @@ import {
   useMarkdownTargetResolutions,
   type MarkdownLinkSearchLabels,
 } from "@akb/markdown-editor/react";
-import { serializeMarkdown } from "@akb/markdown-editor";
+import {
+  extractMarkdownTargets,
+  serializeEditorMarkdown,
+} from "@akb/markdown-editor";
 import {
   Columns2,
   Columns3,
@@ -70,31 +74,6 @@ function invokeCommand(
   return command ? Reflect.apply(command, editor.commands, args) : false;
 }
 
-function isEmptyParagraph(
-  node: { type?: string; content?: unknown[] } | undefined,
-): boolean {
-  return (
-    node?.type === "paragraph" && (!node.content || node.content.length === 0)
-  );
-}
-
-/**
- * Tiptap keeps an editor-only paragraph after atomic terminal blocks. The
- * shared serializer owns the Markdown format, so only remove that sentinel
- * from the value sent to the product persistence contract.
- */
-function serializeEditorMarkdown(editor: MarkdownEditorInstance): string {
-  const document = editor.getJSON();
-  if (
-    document.content &&
-    document.content.length > 1 &&
-    isEmptyParagraph(document.content.at(-1))
-  ) {
-    document.content = document.content.slice(0, -1);
-  }
-  return serializeMarkdown(document, { profile: "preserve" });
-}
-
 function imageAssetIds(editor: MarkdownEditorInstance): string[] {
   const ids = new Set<string>();
 
@@ -121,6 +100,16 @@ function imageAssetIds(editor: MarkdownEditorInstance): string[] {
   };
 
   visit(editor.getJSON());
+  return [...ids];
+}
+
+function imageAssetIdsFromMarkdown(markdown: string): string[] {
+  const ids = new Set<string>();
+  for (const target of extractMarkdownTargets(markdown)) {
+    if (target.kind !== "attachment") continue;
+    const id = assetIdFromUrl(target.target);
+    if (id) ids.add(id);
+  }
   return [...ids];
 }
 
@@ -1071,7 +1060,16 @@ export function MarkdownEditor({
   );
   const handleChange = React.useCallback(
     (_: string, editor: MarkdownEditorInstance) => {
-      onChange?.(serializeEditorMarkdown(editor), imageAssetIds(editor));
+      onChange?.(
+        serializeEditorMarkdown(editor, { profile: "preserve" }),
+        imageAssetIds(editor),
+      );
+    },
+    [onChange],
+  );
+  const handleSourceChange = React.useCallback(
+    (markdown: string) => {
+      onChange?.(markdown, imageAssetIdsFromMarkdown(markdown));
     },
     [onChange],
   );
@@ -1166,17 +1164,18 @@ export function MarkdownEditor({
 
   React.useEffect(() => {
     if (!editor) return;
-    editor.setEditable(!readOnly, false);
     normalizeTopLevelImages(editor);
     ensureTrailingParagraph(editor);
     if (autoFocus && !readOnly)
       requestAnimationFrame(() => editor.commands.focus());
   }, [autoFocus, editor, readOnly]);
-  React.useEffect(() => {
-    if (!editor || editor.getMarkdown() === value) return;
-    editor.commands.setContent(value, { contentType: "markdown" });
-    ensureTrailingParagraph(editor);
-  }, [editor, value]);
+  const handleMarkdownApplied = React.useCallback(
+    (currentEditor: MarkdownEditorInstance) => {
+      normalizeTopLevelImages(currentEditor);
+      ensureTrailingParagraph(currentEditor);
+    },
+    [],
+  );
   useTargetResolutionDom(
     rootRef,
     editor,
@@ -1367,6 +1366,14 @@ export function MarkdownEditor({
         : "border border-border bg-surface px-5 py-4 hover:border-foreground-muted focus-within:border-primary focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2 focus-within:ring-offset-background transition-colors",
     className,
   );
+  const sourceClassName = cn(
+    "min-h-96 w-full resize-y font-mono text-sm leading-6 text-foreground placeholder:text-foreground-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
+    appearance === "canvas"
+      ? "border-0 bg-transparent px-5 py-6 sm:px-8 lg:px-10"
+      : appearance === "workspace"
+        ? "border-0 bg-transparent px-4 py-4"
+        : "border border-border bg-surface px-5 py-4 transition-colors",
+  );
   React.useLayoutEffect(() => {
     const content = editorContentElement(rootRef.current);
     if (!content) return;
@@ -1394,162 +1401,177 @@ export function MarkdownEditor({
       ref={rootRef}
       data-testid="markdown-editor"
       className="relative min-w-0"
-      onDragOverCapture={handleImageDragOver}
-      onDropCapture={handleImageDrop}
     >
-      {!readOnly && editor && (
-        <EditorToolbar
-          editor={editor}
-          searchAdapter={adapters.search}
-          vault={vault}
-          uploadingImage={uploadingImage}
-          onChooseImages={(files) => {
-            const replacementPosition =
-              replacementPositionRef.current ?? undefined;
-            replacementPositionRef.current = null;
-            void uploadImages(files, replacementPosition);
-          }}
-          onOpenImagePicker={() => {
-            replacementPositionRef.current = null;
-            imageInputRef.current?.click();
-          }}
-          appearance={appearance}
-          imageInputRef={imageInputRef}
-        />
-      )}
-      {uploadingImage && (
-        <Alert
-          variant="info"
-          title="Uploading image"
-          className="border-x border-t-0"
-        >
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <span className="truncate">{uploadingName}</span>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => uploadControllerRef.current?.abort()}
-            >
-              <X className="h-3.5 w-3.5" aria-hidden />
-              Cancel upload
-            </Button>
-          </div>
-        </Alert>
-      )}
-      {!uploadingImage && uploadFailure && (
-        <Alert
-          variant={uploadFailure.kind === "queued" ? "warning" : "destructive"}
-          title={
-            uploadFailure.kind === "queued"
-              ? "Images waiting to upload"
-              : "Image upload failed"
-          }
-          className="border-x border-t-0"
-        >
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <span className="min-w-0 flex-1">
-              {uploadFailure.message}
-              {uploadFailure.files.length > 0
-                ? ` ${uploadFailure.files.length} image${uploadFailure.files.length === 1 ? "" : "s"} remain in this batch.`
-                : ""}
-            </span>
-            <div className="flex flex-wrap items-center gap-1.5">
-              {uploadFailure.retryable && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() =>
-                    void uploadImages(
-                      uploadFailure.files,
-                      uploadFailure.replacementPosition,
-                    )
-                  }
-                >
-                  <RotateCcw className="h-3.5 w-3.5" aria-hidden />
-                  {uploadFailure.kind === "queued" ? "Upload" : "Retry"}
-                </Button>
-              )}
+      <MarkdownEditingSurface
+        editor={editor}
+        markdown={value}
+        onSourceChange={handleSourceChange}
+        onMarkdownApplied={handleMarkdownApplied}
+        readOnly={readOnly}
+        modeSwitchDisabled={uploadingImage}
+        onWysiwygDragOverCapture={handleImageDragOver}
+        onWysiwygDropCapture={handleImageDrop}
+        toolbar={
+          !readOnly && editor ? (
+            <EditorToolbar
+              editor={editor}
+              searchAdapter={adapters.search}
+              vault={vault}
+              uploadingImage={uploadingImage}
+              onChooseImages={(files) => {
+                const replacementPosition =
+                  replacementPositionRef.current ?? undefined;
+                replacementPositionRef.current = null;
+                void uploadImages(files, replacementPosition);
+              }}
+              onOpenImagePicker={() => {
+                replacementPositionRef.current = null;
+                imageInputRef.current?.click();
+              }}
+              appearance={appearance}
+              imageInputRef={imageInputRef}
+            />
+          ) : null
+        }
+        sourceAriaLabel={ariaLabel}
+        sourceAriaLabelledby={ariaLabelledby}
+        sourceRequired={required}
+        sourceClassName={sourceClassName}
+      >
+        {uploadingImage && (
+          <Alert
+            variant="info"
+            title="Uploading image"
+            className="border-x border-t-0"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="truncate">{uploadingName}</span>
               <Button
                 type="button"
                 variant="outline"
                 size="sm"
-                onClick={() => {
-                  replacementPositionRef.current =
-                    uploadFailure.replacementPosition ?? null;
-                  imageInputRef.current?.click();
-                }}
+                onClick={() => uploadControllerRef.current?.abort()}
               >
-                <ImagePlus className="h-3.5 w-3.5" aria-hidden />
-                Choose another
-              </Button>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                onClick={() => setUploadFailure(null)}
-              >
-                Dismiss
+                <X className="h-3.5 w-3.5" aria-hidden />
+                Cancel upload
               </Button>
             </div>
-          </div>
-        </Alert>
-      )}
-      <div
-        className="relative min-w-0"
-        onPasteCapture={(event) => {
-          if (readOnly) return;
-          const files = transferredImages(event.clipboardData);
-          if (!files.length) return;
-          if (!isStandaloneImageClipboard(event.clipboardData)) return;
-          event.preventDefault();
-          event.stopPropagation();
-          if (uploadInFlightRef.current)
-            deferredImageFilesRef.current.push(...files);
-          else void uploadImages(files);
-        }}
-      >
-        {editor ? (
-          <EditorContent editor={editor} />
-        ) : (
-          <div
-            role="status"
-            aria-live="polite"
-            className="min-h-96 bg-surface-2 p-5 text-sm text-foreground-muted"
-          >
-            Loading editor…
-          </div>
+          </Alert>
         )}
-        {editor &&
-          imageHosts.map((host, index) =>
-            createPortal(
-              <ImageControls
-                key={`${host.target}-${index}`}
-                editor={editor}
-                image={host.image}
-                target={host.target}
-                alt={host.alt}
-                onReplace={(position) => {
-                  replacementPositionRef.current = position;
-                  imageInputRef.current?.click();
-                }}
-              />,
-              host.host,
-            ),
+        {!uploadingImage && uploadFailure && (
+          <Alert
+            variant={uploadFailure.kind === "queued" ? "warning" : "destructive"}
+            title={
+              uploadFailure.kind === "queued"
+                ? "Images waiting to upload"
+                : "Image upload failed"
+            }
+            className="border-x border-t-0"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <span className="min-w-0 flex-1">
+                {uploadFailure.message}
+                {uploadFailure.files.length > 0
+                  ? ` ${uploadFailure.files.length} image${uploadFailure.files.length === 1 ? "" : "s"} remain in this batch.`
+                  : ""}
+              </span>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {uploadFailure.retryable && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() =>
+                      void uploadImages(
+                        uploadFailure.files,
+                        uploadFailure.replacementPosition,
+                      )
+                    }
+                  >
+                    <RotateCcw className="h-3.5 w-3.5" aria-hidden />
+                    {uploadFailure.kind === "queued" ? "Upload" : "Retry"}
+                  </Button>
+                )}
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    replacementPositionRef.current =
+                      uploadFailure.replacementPosition ?? null;
+                    imageInputRef.current?.click();
+                  }}
+                >
+                  <ImagePlus className="h-3.5 w-3.5" aria-hidden />
+                  Choose another
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setUploadFailure(null)}
+                >
+                  Dismiss
+                </Button>
+              </div>
+            </div>
+          </Alert>
+        )}
+        <div
+          className="relative min-w-0"
+          onPasteCapture={(event) => {
+            if (readOnly) return;
+            const files = transferredImages(event.clipboardData);
+            if (!files.length) return;
+            if (!isStandaloneImageClipboard(event.clipboardData)) return;
+            event.preventDefault();
+            event.stopPropagation();
+            if (uploadInFlightRef.current)
+              deferredImageFilesRef.current.push(...files);
+            else void uploadImages(files);
+          }}
+        >
+          {editor ? (
+            <EditorContent editor={editor} />
+          ) : (
+            <div
+              role="status"
+              aria-live="polite"
+              className="min-h-96 bg-surface-2 p-5 text-sm text-foreground-muted"
+            >
+              Loading editor…
+            </div>
           )}
-        {editor &&
-          tableHosts.map((host, index) =>
-            createPortal(
-              <TableActions
-                key={`table-${index}`}
-                editor={editor}
-                table={host.table}
-              />,
-              host.host,
-            ),
-          )}
-      </div>
+          {editor &&
+            imageHosts.map((host, index) =>
+              createPortal(
+                <ImageControls
+                  key={`${host.target}-${index}`}
+                  editor={editor}
+                  image={host.image}
+                  target={host.target}
+                  alt={host.alt}
+                  onReplace={(position) => {
+                    replacementPositionRef.current = position;
+                    imageInputRef.current?.click();
+                  }}
+                />,
+                host.host,
+              ),
+            )}
+          {editor &&
+            tableHosts.map((host, index) =>
+              createPortal(
+                <TableActions
+                  key={`table-${index}`}
+                  editor={editor}
+                  table={host.table}
+                />,
+                host.host,
+              ),
+            )}
+        </div>
+      </MarkdownEditingSurface>
     </div>
   );
 }
