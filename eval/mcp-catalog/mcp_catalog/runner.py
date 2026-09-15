@@ -880,6 +880,7 @@ class BenchmarkRunner:
                     stage="smoke_gate",
                 ) from exc
 
+            request_guard = ledger.new_provider_request_guard()
             settled = False
             try:
                 await cell_fixture.reset()
@@ -904,7 +905,7 @@ class BenchmarkRunner:
                         secrets=self.secrets,
                         request_timeout_seconds=request_timeout_seconds,
                         remaining_wall_seconds=remaining_wall_seconds,
-                        request_guard=ledger.assert_provider_request_allowed,
+                        request_guard=request_guard,
                         timing_sink=self._timing.record if self._timing is not None else None,
                     )
                 else:
@@ -921,10 +922,14 @@ class BenchmarkRunner:
                             secrets=self.secrets,
                             request_timeout_seconds=request_timeout_seconds,
                             remaining_wall_seconds=remaining_wall_seconds,
-                            request_guard=ledger.assert_provider_request_allowed,
+                            request_guard=request_guard,
                             timing_sink=self._timing.record if self._timing is not None else None,
                         )
-                await ledger.charge(outcome, reserved_cost_usd=reservation)
+                await ledger.charge(
+                    outcome,
+                    reserved_cost_usd=reservation,
+                    request_admissions=request_guard.requests,
+                )
                 settled = True
             except Exception as exc:
                 with_context = exc if isinstance(exc, RuntimeContractError) else RuntimeContractError(

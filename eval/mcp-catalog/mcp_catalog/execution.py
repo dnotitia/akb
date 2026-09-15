@@ -661,6 +661,9 @@ class BudgetLedger:
             raise GlobalWallDeadlineExceeded("global wall deadline exceeded")
         return min(float(self.manifest.budget.request_timeout_seconds), remaining)
 
+    def new_provider_request_guard(self) -> ProviderRequestGuard:
+        return ProviderRequestGuard(self)
+
     async def reserve_trial(self, worst_case_cost_usd: float) -> None:
         async with self._lock:
             budget = self.manifest.budget
@@ -680,12 +683,17 @@ class BudgetLedger:
                 raise BudgetExceeded("trial cost reservation accounting is inconsistent")
             self.reserved_cost_usd -= reserved_cost_usd
 
-    async def assert_provider_request_allowed(self) -> None:
+    async def admit_provider_request(self, requests_for_trial: int) -> None:
         async with self._lock:
             if self._budget_failure is not None:
-                raise BudgetExceeded(
-                    f"{self._budget_failure}; no further provider requests are allowed"
-                )
+                raise BudgetExceeded(f"benchmark incomplete: {self._budget_failure}")
+            if requests_for_trial >= self.manifest.budget.max_requests_per_trial:
+                self._budget_failure = "max_requests_per_trial exceeded"
+                raise BudgetExceeded(f"benchmark incomplete: {self._budget_failure}")
+            if self.requests >= self.manifest.budget.max_model_requests:
+                self._budget_failure = "max_model_requests exceeded"
+                raise BudgetExceeded(f"benchmark incomplete: {self._budget_failure}")
+            self.requests += 1
 
     async def release_all_reservations(self) -> float:
         async with self._lock:
@@ -693,9 +701,18 @@ class BudgetLedger:
             self.reserved_cost_usd = 0.0
             return released
 
-    async def charge(self, outcome: TrialOutcome, *, reserved_cost_usd: float = 0.0) -> None:
+    async def charge(
+        self,
+        outcome: TrialOutcome,
+        *,
+        reserved_cost_usd: float = 0.0,
+        request_admissions: int = 0,
+    ) -> None:
         async with self._lock:
-            next_requests = self.requests + outcome.model_requests
+            if request_admissions < 0 or request_admissions > self.requests:
+                raise BudgetExceeded("provider request accounting is inconsistent")
+            trial_requests = max(outcome.model_requests, request_admissions)
+            next_requests = self.requests + max(0, outcome.model_requests - request_admissions)
             next_input = self.input_tokens + outcome.input_tokens
             next_output = self.output_tokens + outcome.output_tokens
             next_cost = float(Decimal(str(self.cost_usd)) + Decimal(str(outcome.cost_usd)))
@@ -705,7 +722,7 @@ class BudgetLedger:
             )
             budget = self.manifest.budget
             failure: str | None = None
-            if outcome.model_requests > budget.max_requests_per_trial:
+            if trial_requests > budget.max_requests_per_trial:
                 failure = "max_requests_per_trial exceeded"
             elif outcome.cost_usd > budget.max_cost_per_trial_usd:
                 failure = "max_cost_per_trial_usd exceeded"
@@ -726,6 +743,16 @@ class BudgetLedger:
                 self._budget_failure = failure
                 raise BudgetExceeded(failure)
             self.reserved_cost_usd = remaining_reserved
+
+
+@dataclass(slots=True)
+class ProviderRequestGuard:
+    ledger: BudgetLedger
+    requests: int = 0
+
+    async def __call__(self) -> None:
+        await self.ledger.admit_provider_request(self.requests)
+        self.requests += 1
 
 
 async def run_agent_with_deadline(
@@ -827,6 +854,7 @@ class TrialExecutor:
             self._record_outcome(outcome)
             return outcome
         settled = False
+        request_guard = self.ledger.new_provider_request_guard()
         try:
             partial_messages: list[ModelResponse] = []
             capture_token = MODEL_RESPONSES.set(partial_messages)
@@ -863,7 +891,7 @@ class TrialExecutor:
                         ),
                         request_timeout_seconds=self.ledger.request_timeout_seconds(),
                         remaining_wall_seconds=self.ledger.remaining_wall_seconds(),
-                        request_guard=self.ledger.assert_provider_request_allowed,
+                        request_guard=request_guard,
                     )
             except ProviderRequestTimeout:
                 error = "benchmark incomplete: provider request timeout"
@@ -892,6 +920,7 @@ class TrialExecutor:
                 latency=latency,
                 secrets=secrets,
                 partial_messages=partial_messages,
+                request_count=request_guard.requests,
             )
             if self.timing_sink is not None and (
                 is_provider_wait_failure(outcome.error)
@@ -899,7 +928,11 @@ class TrialExecutor:
             ):
                 self.timing_sink("provider_wait", started, started + latency)
             try:
-                await self.ledger.charge(outcome, reserved_cost_usd=reservation)
+                await self.ledger.charge(
+                    outcome,
+                    reserved_cost_usd=reservation,
+                    request_admissions=request_guard.requests,
+                )
             except BudgetExceeded as exc:
                 outcome.error = f"benchmark incomplete: {exc}"
                 outcome.failure_kind = "budget"
@@ -933,7 +966,7 @@ async def execute_smoke(
     secrets: tuple[str, ...],
     request_timeout_seconds: float,
     remaining_wall_seconds: float,
-    request_guard: Callable[[], Awaitable[None]] | None = None,
+    request_guard: ProviderRequestGuard | None = None,
     timing_sink: Callable[[TimingCategory, float, float], None] | None = None,
 ) -> TrialOutcome:
     """Make one real full-catalog request for the pre-run four-cell gate."""
@@ -975,10 +1008,10 @@ async def execute_smoke(
                     request_limit=manifest.budget.max_requests_per_trial,
                     cost_limit=Decimal(str(manifest.budget.max_cost_per_trial_usd)),
                 ),
-                    request_timeout_seconds=request_timeout_seconds,
-                    remaining_wall_seconds=remaining_wall_seconds,
-                    request_guard=request_guard,
-                )
+                request_timeout_seconds=request_timeout_seconds,
+                remaining_wall_seconds=remaining_wall_seconds,
+                request_guard=request_guard,
+            )
     except ProviderRequestTimeout:
         error = "benchmark incomplete: provider request timeout"
     except GlobalWallDeadlineExceeded:
@@ -1005,6 +1038,7 @@ async def execute_smoke(
         latency=time.perf_counter() - started,
         secrets=secrets,
         partial_messages=partial_messages,
+        request_count=request_guard.requests if request_guard is not None else None,
     )
     if timing_sink is not None and (
         is_provider_wait_failure(outcome.error)
@@ -1078,6 +1112,7 @@ def outcome_from_run(
     latency: float,
     secrets: tuple[str, ...],
     partial_messages: list[ModelResponse] | None = None,
+    request_count: int | None = None,
 ) -> TrialOutcome:
     raw_calls: list[tuple[str, Any]] = []
     provider_evidence: list[dict[str, Any]] = []
@@ -1104,6 +1139,8 @@ def outcome_from_run(
         output_tokens = raw_output
     if not requests:
         requests = len(provider_evidence)
+    if request_count is not None:
+        requests = max(requests, request_count)
     provider_cost = provider_response_cost(provider_evidence)
     cost = provider_cost if provider_cost is not None else estimate_cost(model_spec, input_tokens, output_tokens)
     cost_source = "provider_response" if provider_cost is not None else "registered_price_snapshot"

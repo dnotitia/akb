@@ -490,6 +490,21 @@ async def test_over_trial_cost_is_recorded_and_blocks_followup_provider_reservat
 
 
 @pytest.mark.asyncio
+async def test_provider_request_admission_enforces_global_request_limit() -> None:
+    registered = load_run_manifest(ROOT / "config" / "run.json")
+    budget = registered.budget.model_copy(update={"max_model_requests": 1})
+    manifest = registered.model_copy(update={"budget": budget})
+    ledger = BudgetLedger(manifest)
+    guard = ledger.new_provider_request_guard()
+
+    await guard()
+    with pytest.raises(BudgetExceeded, match="max_model_requests"):
+        await guard()
+
+    assert ledger.requests == 1
+
+
+@pytest.mark.asyncio
 async def test_model_request_guard_blocks_followup_calls_after_restored_budget_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -513,7 +528,7 @@ async def test_model_request_guard_blocks_followup_calls_after_restored_budget_f
         wall_seconds=0.0,
         budget_failure="max_cost_per_trial_usd exceeded",
     )
-    guard_token = execution_module.PROVIDER_REQUEST_GUARD.set(ledger.assert_provider_request_allowed)
+    guard_token = execution_module.PROVIDER_REQUEST_GUARD.set(ledger.new_provider_request_guard())
     try:
         with pytest.raises(BudgetExceeded, match="max_cost_per_trial_usd"):
             await model.request(
