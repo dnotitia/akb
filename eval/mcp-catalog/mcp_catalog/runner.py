@@ -1269,6 +1269,7 @@ class BenchmarkRunner:
                 cost_usd=spent.cost_usd,
                 wall_seconds=spent.wall_seconds,
                 model_work_seconds=spent.model_work_seconds,
+                budget_failure=self._checkpoint_store.budget_failure_reason(),
             )
             initial_timing = self._timing_snapshot()
             assert initial_timing is not None

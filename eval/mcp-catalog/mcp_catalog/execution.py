@@ -614,6 +614,7 @@ class BudgetLedger:
         cost_usd: float,
         wall_seconds: float,
         model_work_seconds: float = 0.0,
+        budget_failure: str | None = None,
     ) -> None:
         """Restore already-spent usage from a checkpoint before new calls."""
 
@@ -632,6 +633,7 @@ class BudgetLedger:
         self.cost_usd = cost_usd
         self.wall_seconds = wall_seconds
         self.model_work_seconds = model_work_seconds
+        self._budget_failure = budget_failure
 
     def current_wall_seconds(self) -> float:
         observed = self.wall_clock() if self.wall_clock is not None else self.wall_seconds

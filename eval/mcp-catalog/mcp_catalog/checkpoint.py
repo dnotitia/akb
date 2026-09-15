@@ -253,6 +253,20 @@ class CheckpointStore:
         record = self.document.records.get(checkpoint_key_digest(key))
         return record.status if record is not None else None
 
+    def budget_failure_reason(self) -> str | None:
+        outcomes = (
+            *(record.outcome for record in self.document.records.values() if record.status != "completed"),
+            *(record.outcome for record in self.document.smoke_gate.values() if record.status != "completed"),
+        )
+        return next(
+            (
+                outcome.error or "a prior checkpoint outcome exceeded the registered budget"
+                for outcome in outcomes
+                if outcome.failure_kind == "budget"
+            ),
+            None,
+        )
+
     def completed_outcome_for(self, key: CheckpointKey) -> TrialOutcome | None:
         record = self.document.records.get(checkpoint_key_digest(key))
         if record is None or record.status != "completed":

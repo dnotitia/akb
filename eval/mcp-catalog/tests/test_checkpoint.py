@@ -12,7 +12,7 @@ from mcp_catalog.checkpoint import (
     CheckpointStore,
 )
 from mcp_catalog.contracts import hash_json, load_run_manifest, load_task_corpus
-from mcp_catalog.execution import TrialOutcome
+from mcp_catalog.execution import BudgetExceeded, BudgetLedger, TrialOutcome
 
 ROOT = Path(__file__).parents[1]
 
@@ -111,6 +111,41 @@ def test_trial_checkpoint_is_atomic_redacted_and_reusable(tmp_path: Path) -> Non
     reused = resumed.completed_outcome_for(key)
     assert reused is not None
     assert resumed.document.spent.model_requests == 1
+
+
+@pytest.mark.parametrize("record_as_smoke", [False, True])
+@pytest.mark.asyncio
+async def test_checkpoint_restores_terminal_budget_failure(
+    tmp_path: Path,
+    record_as_smoke: bool,
+) -> None:
+    path = tmp_path / ("smoke.json" if record_as_smoke else "trial.json")
+    store, key = _store(path)
+    outcome = _outcome(key, error="benchmark incomplete: max_cost_per_trial_usd exceeded").model_copy(
+        update={"failure_kind": "budget"}
+    )
+    if record_as_smoke:
+        store.record_smoke_cell("primary:http", outcome, status="failed")
+    else:
+        store.record_trial(key, outcome, status="failed")
+
+    resumed, _ = _store(path, resume=True)
+
+    budget_failure = resumed.budget_failure_reason()
+    assert budget_failure == "benchmark incomplete: max_cost_per_trial_usd exceeded"
+    manifest, _tasks, _header, _key, _expected = _inputs()
+    ledger = BudgetLedger(manifest)
+    ledger.restore(
+        model_requests=resumed.document.spent.model_requests,
+        input_tokens=resumed.document.spent.input_tokens,
+        output_tokens=resumed.document.spent.output_tokens,
+        cost_usd=resumed.document.spent.cost_usd,
+        wall_seconds=resumed.document.spent.wall_seconds,
+        model_work_seconds=resumed.document.spent.model_work_seconds,
+        budget_failure=budget_failure,
+    )
+    with pytest.raises(BudgetExceeded, match="max_cost_per_trial_usd"):
+        await ledger.reserve_trial(manifest.budget.max_cost_per_trial_usd)
 
 
 def test_resume_fails_closed_for_header_mismatch_corruption_and_secret(tmp_path: Path) -> None:
