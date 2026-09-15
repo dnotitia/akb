@@ -2,8 +2,9 @@
 
 `@akb/markdown-editor` is the product-neutral Tiptap Markdown core shared by AKB and Reef.
 It owns the document schema, Markdown parsing/serialization, editor/viewer surfaces, commands,
-state hooks, and the conformance contract. It does not own product UI, storage, search, uploads,
-permissions, product-specific UI, or collaboration.
+state hooks, the default formatting/link controls, and the conformance contract. Products still
+own storage, permissions, and product-specific URL policy; search remains an adapter supplied by
+the consumer.
 
 The package is built against the exact Tiptap `3.31.3` package set and React 19.
 
@@ -34,22 +35,38 @@ function Document({ markdown, onChange }) {
 ```
 
 `MarkdownToolbar` owns the default Paragraph, Heading 1–3, bold, italic,
-strikethrough, inline code, list, blockquote, code block, horizontal rule, and
-undo/redo controls. It reads the same editor state and commands as the editor,
-preserves the current selection when a pointer control is pressed, and exposes
-roving keyboard focus. Product-specific controls can be appended as children;
-use `MarkdownToolbarGroup` and `MarkdownToolbarButton` so they participate in
-the same toolbar navigation.
+strikethrough, inline code, list, blockquote, code block, horizontal rule,
+link, and undo/redo controls. It reads the same editor state and commands as
+the editor, preserves the current selection while the link popup receives
+focus, restores the selection on cancel, validates before mutating, and
+exposes roving keyboard focus. Product-specific controls can be appended as
+children; use `MarkdownToolbarGroup` and `MarkdownToolbarButton` so they
+participate in the same toolbar navigation.
 
 ```tsx
-<MarkdownToolbar editor={editor}>
+<MarkdownToolbar
+  editor={editor}
+  link={{
+    normalizeUrl: productNormalizeUrl,
+    searchSlot: ({ setUrl, setText }) => productSearchSlot({ setUrl, setText }),
+  }}
+>
   <MarkdownToolbarGroup label="Insert">
-    <MarkdownToolbarButton label="Insert link" onClick={openLink}>
-      <LinkIcon aria-hidden />
-    </MarkdownToolbarButton>
+    {/* Product-specific table/upload controls can stay here. */}
   </MarkdownToolbarGroup>
 </MarkdownToolbar>
 ```
+
+`MarkdownCommands` exposes `setLink`, `insertLink`, and `unsetLink`, while
+`MarkdownState.active.link` and `MarkdownState.link.href` expose the current
+link state. `MarkdownLinkPopup` is also public for consumers that need a
+different toolbar composition. `normalizeUrl` is the product seam for
+canonical targets and link policy; returning `null` leaves the popup open,
+shows the configured error, and keeps focus in the URL field. Search results
+come from the product-owned `searchSlot`, so AKB can preserve its existing
+search UI and adapter behavior without expanding the common package's search
+surface. They must return canonical `MarkdownSearchResult.target` values, never
+signed or runtime URLs.
 
 Use `profile="structured"` for CommonMark + GFM structure editing. The default `preserve` profile
 adds explicit raw HTML/MDX nodes while keeping math and Mermaid fences as semantic nodes. Both
@@ -102,6 +119,11 @@ directory outside this package. The scripted composition check is not a substitu
 with a physical OS IME.
 
 ## Versioning
+
+The `0.4.0` public contract adds the shared link command/state contract and
+`MarkdownLinkPopup`. Consumers should provide their existing URL policy through
+`MarkdownToolbar.link.normalizeUrl` and keep resource search in their existing
+product-owned `searchSlot`.
 
 The `0.2.0` public contract adds canonical resource targets. Consumers should pin one exact package version, store the
 Markdown returned by `onChange` or `editor.getMarkdown()` as the canonical representation, and

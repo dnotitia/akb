@@ -1,5 +1,6 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ComponentPropsWithoutRef, ReactNode } from 'react'
+import * as DialogPrimitive from '@radix-ui/react-dialog'
 import { EditorContent, useEditor } from '@tiptap/react'
 import type { Editor } from '@tiptap/core'
 import {
@@ -10,6 +11,7 @@ import {
   Heading2,
   Heading3,
   Italic,
+  Link2,
   List,
   ListOrdered,
   Minus,
@@ -18,16 +20,20 @@ import {
   Redo2,
   Strikethrough,
   Undo2,
+  X,
 } from 'lucide-react'
 
 import { createMarkdownExtensions } from '../extensions.js'
 import { extractMarkdownTargets, markdownCommands } from '../core.js'
+import { normalizeMarkdownLinkUrl } from '../link.js'
 import { resolveMarkdownTargets } from '../adapters.js'
 import type {
   MarkdownAdapters,
   MarkdownCommands,
   MarkdownEditorConfig,
   MarkdownHeadingLevel,
+  MarkdownLinkLabels,
+  MarkdownLinkUrlNormalizer,
   MarkdownProfile,
   MarkdownSlashContext,
   MarkdownState,
@@ -76,6 +82,9 @@ export function useMarkdownCommands(editor: Editor | null): MarkdownCommands {
             setMarkdown: () => false,
             insertMarkdown: () => false,
             insertImage: () => false,
+            setLink: () => false,
+            insertLink: () => false,
+            unsetLink: () => false,
             setParagraph: () => false,
             toggleHeading: () => false,
             toggleBold: () => false,
@@ -113,6 +122,11 @@ function readState(editor: Editor): MarkdownState {
       orderedList: editor.isActive('orderedList'),
       blockquote: editor.isActive('blockquote'),
       codeBlock: editor.isActive('codeBlock'),
+      link: editor.isActive('link'),
+    },
+    link: {
+      active: editor.isActive('link'),
+      href: String(editor.getAttributes('link').href ?? ''),
     },
     canUndo: editor.can().undo(),
     canRedo: editor.can().redo(),
@@ -370,6 +384,270 @@ function joinClasses(...classes: Array<string | undefined>): string {
   return classes.filter(Boolean).join(' ')
 }
 
+const DEFAULT_MARKDOWN_LINK_LABELS: MarkdownLinkLabels = {
+  insertButton: 'Insert link',
+  editButton: 'Edit link',
+  saveButton: 'Save link',
+  insertTitle: 'Insert link',
+  editTitle: 'Edit link',
+  description: 'Add a safe destination and choose the text readers will see.',
+  url: 'URL',
+  text: 'Text',
+  textPlaceholder: 'Link text',
+  textHint: 'Leave blank to use the destination as the visible text.',
+  cancel: 'Cancel',
+  remove: 'Remove link',
+  close: 'Close dialog',
+  invalidUrl: 'Enter an http(s), email, phone, anchor, or relative URL.',
+}
+
+const linkInputClass =
+  'flex h-10 w-full rounded-[var(--radius-md)] border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-foreground-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface aria-[invalid=true]:border-destructive aria-[invalid=true]:focus-visible:ring-destructive'
+
+const linkButtonClass =
+  'inline-flex h-9 items-center justify-center gap-2 rounded-[var(--radius-md)] border border-border px-4 text-sm font-medium text-foreground transition-token hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:cursor-not-allowed disabled:opacity-50'
+
+interface MarkdownLinkSelectionSnapshot {
+  from: number
+  to: number
+  href: string
+  active: boolean
+  text: string
+}
+
+export interface MarkdownLinkPopupProps {
+  editor: Editor | null
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  /** Product-specific canonicalization and URL policy. */
+  normalizeUrl?: MarkdownLinkUrlNormalizer
+  /** Product-owned search UI; this ticket deliberately does not own search. */
+  searchSlot?: (context: MarkdownLinkSearchSlotProps) => ReactNode
+  labels?: Partial<MarkdownLinkLabels>
+  className?: string
+}
+
+export interface MarkdownLinkSearchSlotProps {
+  setUrl: (value: string) => void
+  setText: (value: string) => void
+}
+
+/**
+ * Shared link editor. It snapshots the editor selection before focus leaves the
+ * document, and restores that snapshot for every cancel/error path. Applying,
+ * editing, and removing a link are routed through the public command contract;
+ * consumers never need to assemble Tiptap commands themselves.
+ */
+export function MarkdownLinkPopup({
+  editor,
+  open,
+  onOpenChange,
+  normalizeUrl = normalizeMarkdownLinkUrl,
+  searchSlot,
+  labels,
+  className,
+}: MarkdownLinkPopupProps) {
+  const copy = { ...DEFAULT_MARKDOWN_LINK_LABELS, ...labels }
+  const commands = useMarkdownCommands(editor)
+  const urlInputRef = useRef<HTMLInputElement>(null)
+  const snapshotRef = useRef<MarkdownLinkSelectionSnapshot | null>(null)
+  const previousOpenRef = useRef(false)
+  const closeReasonRef = useRef<'cancel' | 'commit'>('cancel')
+  const [snapshot, setSnapshot] = useState<MarkdownLinkSelectionSnapshot | null>(null)
+  const [linkUrl, setLinkUrl] = useState('')
+  const [linkText, setLinkText] = useState('')
+  const [linkError, setLinkError] = useState('')
+  const linkUrlId = useId()
+  const linkTextId = useId()
+
+  const restoreSelection = useCallback(() => {
+    if (!editor || editor.isDestroyed || !snapshotRef.current) return
+    const { from, to } = snapshotRef.current
+    editor.commands.setTextSelection({ from, to })
+    editor.commands.focus()
+  }, [editor])
+
+  useEffect(() => {
+    if (open && !previousOpenRef.current && editor && !editor.isDestroyed) {
+      const { from, to } = editor.state.selection
+      const snapshot = {
+        from,
+        to,
+        href: String(editor.getAttributes('link').href ?? ''),
+        active: editor.isActive('link'),
+        text: editor.state.doc.textBetween(from, to, ' '),
+      } satisfies MarkdownLinkSelectionSnapshot
+      snapshotRef.current = snapshot
+      setSnapshot(snapshot)
+      closeReasonRef.current = 'cancel'
+      setLinkUrl(snapshot.href)
+      setLinkText(snapshot.text)
+      setLinkError('')
+      requestAnimationFrame(() => urlInputRef.current?.focus())
+    }
+
+    if (!open && previousOpenRef.current && closeReasonRef.current === 'cancel') {
+      restoreSelection()
+    }
+
+    previousOpenRef.current = open
+  }, [editor, open, restoreSelection])
+
+  const closePopup = (reason: 'cancel' | 'commit') => {
+    closeReasonRef.current = reason
+    if (reason === 'cancel') restoreSelection()
+    setSnapshot(null)
+    onOpenChange(false)
+    requestAnimationFrame(() => {
+      if (!editor || editor.isDestroyed) return
+      if (reason === 'cancel') restoreSelection()
+      else editor.commands.focus()
+    })
+  }
+
+  const applyLink = () => {
+    const snapshot = snapshotRef.current
+    if (!editor || editor.isDestroyed || !snapshot || !editor.isEditable) return
+
+    const normalizedUrl = normalizeUrl(linkUrl)
+    if (!normalizedUrl) {
+      setLinkError(copy.invalidUrl)
+      requestAnimationFrame(() => urlInputRef.current?.focus())
+      return
+    }
+
+    restoreSelection()
+    const applied = snapshot.active
+      ? commands.setLink(normalizedUrl)
+      : snapshot.from === snapshot.to
+        ? commands.insertLink(linkText.trim() || normalizedUrl, normalizedUrl)
+        : commands.setLink(normalizedUrl)
+    if (!applied) return
+    closePopup('commit')
+  }
+
+  const removeLink = () => {
+    if (!editor || editor.isDestroyed || !snapshotRef.current || !editor.isEditable) return
+    restoreSelection()
+    if (!commands.unsetLink()) return
+    closePopup('commit')
+  }
+
+  return (
+    <DialogPrimitive.Root open={open} onOpenChange={next => (next ? onOpenChange(true) : closePopup('cancel'))}>
+      <DialogPrimitive.Portal>
+        <DialogPrimitive.Overlay className="fixed inset-0 z-[var(--z-overlay)] bg-black/50" />
+        <DialogPrimitive.Content
+          className={joinClasses(
+            'fixed left-1/2 top-1/2 z-[var(--z-modal)] grid max-h-[calc(100dvh-2rem)] w-[calc(100%-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 gap-4 overflow-y-auto rounded-[var(--radius-xl)] border border-border bg-surface p-6 text-foreground shadow-lg focus:outline-none',
+            className,
+          )}
+          data-markdown-link-popup
+          onOpenAutoFocus={event => {
+            event.preventDefault()
+            requestAnimationFrame(() => urlInputRef.current?.focus())
+          }}
+          onCloseAutoFocus={event => {
+            event.preventDefault()
+            if (closeReasonRef.current === 'cancel') restoreSelection()
+            else if (editor && !editor.isDestroyed) editor.commands.focus()
+          }}
+        >
+          <div className="flex flex-col gap-1.5 text-left">
+            <DialogPrimitive.Title className="text-lg font-semibold tracking-tight">
+              {snapshot?.active ? copy.editTitle : copy.insertTitle}
+            </DialogPrimitive.Title>
+            <DialogPrimitive.Description className="text-sm text-foreground-muted">
+              {copy.description}
+            </DialogPrimitive.Description>
+          </div>
+          <DialogPrimitive.Close
+            type="button"
+            aria-label={copy.close}
+            className="absolute right-2 top-2 inline-flex h-9 w-9 items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+            onClick={event => {
+              event.preventDefault()
+              closePopup('cancel')
+            }}
+          >
+            <X className="h-4 w-4" aria-hidden />
+          </DialogPrimitive.Close>
+          <div className="space-y-4">
+            {searchSlot?.({ setUrl: setLinkUrl, setText: setLinkText })}
+            <div className="space-y-2">
+              <label htmlFor={linkUrlId} className="text-sm font-medium leading-none">
+                {copy.url}
+              </label>
+              <input
+                ref={urlInputRef}
+                id={linkUrlId}
+                value={linkUrl}
+                onChange={event => {
+                  setLinkUrl(event.target.value)
+                  if (linkError) setLinkError('')
+                }}
+                placeholder="https://example.com"
+                inputMode="url"
+                autoComplete="url"
+                aria-invalid={linkError ? true : undefined}
+                aria-describedby={linkError ? `${linkUrlId}-error` : undefined}
+                className={linkInputClass}
+                autoFocus
+              />
+              {linkError && (
+                <p id={`${linkUrlId}-error`} role="alert" className="text-xs text-destructive">
+                  {linkError}
+                </p>
+              )}
+            </div>
+            <div className="space-y-2">
+              <label htmlFor={linkTextId} className="text-sm font-medium leading-none">
+                {copy.text}
+              </label>
+              <input
+                id={linkTextId}
+                value={linkText}
+                onChange={event => setLinkText(event.target.value)}
+                placeholder={copy.textPlaceholder}
+                readOnly={Boolean(snapshot?.active) || snapshot?.from !== snapshot?.to}
+                className={linkInputClass}
+              />
+              <p className="text-xs text-foreground-muted">{copy.textHint}</p>
+            </div>
+          </div>
+          <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between">
+            {snapshot?.active ? (
+              <button
+                type="button"
+                className="inline-flex h-9 items-center justify-center rounded-[var(--radius-md)] px-3 text-sm font-medium text-destructive transition-token hover:bg-destructive/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                onClick={removeLink}
+                disabled={!editor?.isEditable}
+              >
+                {copy.remove}
+              </button>
+            ) : (
+              <span aria-hidden />
+            )}
+            <div className="flex flex-col-reverse gap-2 sm:flex-row">
+              <button type="button" className={linkButtonClass} onClick={() => closePopup('cancel')}>
+                {copy.cancel}
+              </button>
+              <button
+                type="button"
+                className="inline-flex h-9 items-center justify-center gap-2 rounded-[var(--radius-md)] border border-primary bg-primary px-4 text-sm font-medium text-primary-foreground shadow-sm transition-token hover:bg-primary/90 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={applyLink}
+                disabled={!editor?.isEditable}
+              >
+                {snapshot?.active ? copy.saveButton : copy.insertButton}
+              </button>
+            </div>
+          </div>
+        </DialogPrimitive.Content>
+      </DialogPrimitive.Portal>
+    </DialogPrimitive.Root>
+  )
+}
+
 export interface MarkdownToolbarButtonProps
   extends Omit<ComponentPropsWithoutRef<'button'>, 'children' | 'onClick' | 'type'> {
   label: string
@@ -444,6 +722,15 @@ export interface MarkdownToolbarProps {
   children?: ReactNode
   className?: string
   'aria-label'?: string
+  link?: MarkdownToolbarLinkOptions
+}
+
+export interface MarkdownToolbarLinkOptions {
+  disabled?: boolean
+  normalizeUrl?: MarkdownLinkUrlNormalizer
+  searchSlot?: (context: MarkdownLinkSearchSlotProps) => ReactNode
+  labels?: Partial<MarkdownLinkLabels>
+  popupClassName?: string
 }
 
 /**
@@ -456,12 +743,16 @@ export function MarkdownToolbar({
   children,
   className,
   'aria-label': ariaLabel = 'Text formatting',
+  link,
 }: MarkdownToolbarProps) {
   const state = useMarkdownState(editor)
   const commands = useMarkdownCommands(editor)
   const toolbarRef = useRef<HTMLDivElement>(null)
+  const [linkOpen, setLinkOpen] = useState(false)
   const editable = Boolean(editor && state?.isEditable)
   const active = state?.active
+  const linkLabels = { ...DEFAULT_MARKDOWN_LINK_LABELS, ...link?.labels }
+  const linkDisabled = !editable || link?.disabled === true
 
   useLayoutEffect(() => {
     const buttons = toolbarRef.current?.querySelectorAll<HTMLButtonElement>(
@@ -649,6 +940,16 @@ export function MarkdownToolbar({
           <Minus className="h-4 w-4" />
         </MarkdownToolbarButton>
       </MarkdownToolbarGroup>
+      <MarkdownToolbarGroup label="Insert">
+        <MarkdownToolbarButton
+          label={active?.link ? linkLabels.editButton : linkLabels.insertButton}
+          active={Boolean(active?.link)}
+          disabled={linkDisabled}
+          onClick={() => setLinkOpen(true)}
+        >
+          <Link2 className="h-4 w-4" />
+        </MarkdownToolbarButton>
+      </MarkdownToolbarGroup>
       <MarkdownToolbarGroup label="History">
         <MarkdownToolbarButton
           label="Undo"
@@ -666,6 +967,15 @@ export function MarkdownToolbar({
         </MarkdownToolbarButton>
       </MarkdownToolbarGroup>
       {children}
+      <MarkdownLinkPopup
+        editor={editor}
+        open={linkOpen}
+        onOpenChange={setLinkOpen}
+        normalizeUrl={link?.normalizeUrl}
+        searchSlot={link?.searchSlot}
+        labels={link?.labels}
+        className={link?.popupClassName}
+      />
     </div>
   )
 }

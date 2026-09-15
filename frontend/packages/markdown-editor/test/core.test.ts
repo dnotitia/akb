@@ -220,4 +220,26 @@ describe('Markdown conformance core', () => {
     expect(commands.toggleHeading(2)).toBe(true)
     expect(editor.getMarkdown()).toContain('## text')
   })
+
+  it('applies, updates, removes, and undoes links through the shared commands', () => {
+    const editor = createMarkdownEditor({ initialMarkdown: 'text' })
+    editors.push(editor)
+    const commands = markdownCommands(editor)
+
+    editor.commands.setTextSelection({ from: 1, to: 5 })
+    expect(commands.setLink('https://old.example')).toBe(true)
+    expect(editor.getMarkdown()).toBe('[text](https://old.example)')
+    expect(editor.getAttributes('link').target).toBe('_blank')
+
+    expect(commands.setLink('https://new.example')).toBe(true)
+    expect(editor.getMarkdown()).toBe('[text](https://new.example)')
+    expect(editor.getAttributes('link').target).toBe('_blank')
+
+    expect(commands.unsetLink()).toBe(true)
+    expect(editor.getMarkdown()).toBe('text')
+    expect(commands.undo()).toBe(true)
+    expect(editor.getMarkdown()).toBe('[text](https://new.example)')
+    expect(commands.redo()).toBe(true)
+    expect(editor.getMarkdown()).toBe('text')
+  })
 })
