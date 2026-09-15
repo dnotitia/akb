@@ -84,6 +84,81 @@ test.describe("document edit recovery mock contract", () => {
     await reset(request);
   });
 
+  test("round-trips Source through WYSIWYG and saves the same Markdown draft", async ({
+    page,
+    request,
+  }) => {
+    const recovery = await fixture(request);
+    const wysiwygHeadingText = "Draft from WYSIWYG";
+    const sourceMarkdown = `# ${wysiwygHeadingText}`;
+    const editedMarkdown = "## Source revision\n\n- [x] same draft\n\n<!-- preserved -->";
+    await page.goto(recovery.identity!.start_url!);
+
+    const wysiwyg = page.getByRole("textbox", { name: "Document body (markdown)" });
+    await expect(
+      wysiwyg.getByRole("heading", { level: 1, name: "Recovery document", exact: true }),
+    ).toBeVisible();
+    await wysiwyg.fill(wysiwygHeadingText);
+    await expect(
+      wysiwyg.getByRole("heading", { level: 1, name: wysiwygHeadingText, exact: true }),
+    ).toBeVisible();
+    await page.getByRole("button", { name: "Source" }).click();
+    const source = page.getByRole("textbox", { name: "Document body (markdown)" });
+    await expect(source).toBeVisible();
+    await expect(source).toHaveValue(sourceMarkdown);
+    await source.fill(editedMarkdown);
+    await expect(page.getByText("Draft saved locally")).toBeVisible();
+    await expect(page.getByRole("toolbar", { name: "Text formatting" })).toHaveCount(0);
+
+    await page.getByRole("button", { name: "WYSIWYG" }).click();
+    const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
+    await expect(editor).toContainText("Source revision");
+    await expect(editor).toContainText("same draft");
+    await page.getByRole("button", { name: "Save" }).click();
+    await expect(page.getByRole("button", { name: "Save" })).toHaveCount(0);
+
+    await page.getByRole("button", { name: "Edit" }).click();
+    await page.getByRole("button", { name: "Source" }).click();
+    await expect(
+      page.getByRole("textbox", { name: "Document body (markdown)" }),
+    ).toHaveValue(editedMarkdown);
+    const state = await operate(request, recovery.operations!.state);
+    expect(state.document.content).toBe(editedMarkdown);
+  });
+
+  test("creates a Source draft and reopens the saved document", async ({ page, request }) => {
+    const recovery = await fixture(request);
+    const title = "Source created note";
+    const sourceMarkdown = "## Created from Source\n\n- [x] persisted\n\n<!-- fixture preservation -->";
+    await page.goto("/vault/fixture/doc/new?collection=notes");
+    await expect(page.getByRole("heading", { name: "New document" })).toBeVisible();
+    await page.getByRole("textbox", { name: "Title *" }).fill(title);
+    await page.getByRole("button", { name: "Source", exact: true }).click();
+
+    const source = page.getByRole("textbox", { name: /Markdown source/ });
+    await source.fill(sourceMarkdown);
+    await expect(source).toHaveValue(sourceMarkdown);
+    await expect(page.getByRole("toolbar", { name: "Text formatting" })).toHaveCount(0);
+
+    await page.getByRole("button", { name: "WYSIWYG" }).click();
+    await expect(page.getByRole("textbox", { name: /Content/ })).toContainText("Created from Source");
+    await page.getByRole("button", { name: "Create document" }).click();
+    await expect(page.getByRole("heading", { name: title })).toBeVisible();
+    await expect(page.getByText("persisted", { exact: true })).toBeVisible();
+
+    await page.getByRole("button", { name: "Edit" }).click();
+    await page.getByRole("button", { name: "Source", exact: true }).click();
+    await expect(
+      page.getByRole("textbox", { name: "Document body (markdown)" }),
+    ).toHaveValue(sourceMarkdown);
+    const state = await operate(request, recovery.operations!.state);
+    expect(state.created_documents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ title, content: sourceMarkdown, path: "notes/source-created-note.md" }),
+      ]),
+    );
+  });
+
   test("keeps a dirty body through refetch and exposes a three-way OCC conflict", async ({
     page,
     request,
@@ -95,9 +170,10 @@ test.describe("document edit recovery mock contract", () => {
     });
     const recovery = await fixture(request);
     await page.goto(recovery.identity!.start_url!);
-    const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
-    await expect(editor).toBeVisible();
-    await editor.fill("Local draft before another editor saves");
+    await page.getByRole("button", { name: "Source" }).click();
+    const source = page.getByRole("textbox", { name: "Document body (markdown)" });
+    await expect(source).toBeVisible();
+    await source.fill("Local draft before another editor saves");
 
     await operate(request, recovery.operations!.remote_revision, {
       actor: "editor-b",
@@ -105,8 +181,11 @@ test.describe("document edit recovery mock contract", () => {
       content: "Remote editor body",
     });
     await operate(request, recovery.operations!.refetch);
-    await expect(editor).toContainText("Local draft before another editor saves");
+    await expect(source).toHaveValue("Local draft before another editor saves");
 
+    await page.getByRole("button", { name: "WYSIWYG" }).click();
+    const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
+    await expect(editor).toContainText("Local draft before another editor saves");
     await page.getByRole("button", { name: "Save" }).click();
     const conflict = page
       .getByRole("alert")
@@ -165,8 +244,9 @@ test.describe("document edit recovery mock contract", () => {
   }) => {
     const recovery = await fixture(request);
     await page.goto(recovery.identity!.start_url!);
-    const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
-    await editor.fill("Draft retained after a retryable server failure");
+    await page.getByRole("button", { name: "Source" }).click();
+    const source = page.getByRole("textbox", { name: "Document body (markdown)" });
+    await source.fill("Draft retained after a retryable server failure");
     await expect(page.getByText("Draft saved locally")).toBeVisible();
     await operate(request, recovery.operations!.retryable_save_failure);
     await page.getByRole("button", { name: "Save" }).click();
@@ -174,6 +254,7 @@ test.describe("document edit recovery mock contract", () => {
 
     await page.reload();
     await expect(page.getByText("Local draft restored")).toBeVisible();
+    const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
     await expect(editor).toContainText("Draft retained after a retryable server failure");
 
     const input = page.locator('input[type="file"]');
@@ -214,6 +295,7 @@ test.describe("document edit recovery mock contract", () => {
     const recovery = await fixture(request);
     await page.goto(recovery.identity!.start_url!);
     await page.getByRole("textbox", { name: "Document title" }).fill(draftTitle);
+    await page.getByRole("button", { name: "Source" }).click();
     const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
     await editor.fill(draftBody);
     await expect(page.getByText("Draft saved locally")).toBeVisible();

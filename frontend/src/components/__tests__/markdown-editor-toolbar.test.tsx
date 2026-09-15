@@ -11,6 +11,10 @@ describe("MarkdownEditor formatting toolbar", () => {
     render(<MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />);
 
     await user.tab();
+    expect(screen.getByRole("button", { name: "WYSIWYG" })).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole("button", { name: "Source" })).toHaveFocus();
+    await user.tab();
     expect(screen.getByRole("button", { name: "Paragraph" })).toHaveFocus();
     await user.keyboard("{ArrowRight}");
     expect(screen.getByRole("button", { name: "Heading 1" })).toHaveFocus();
@@ -41,6 +45,83 @@ describe("MarkdownEditor formatting toolbar", () => {
       const latest = onChange.mock.calls.at(-1)?.[0] as string | undefined;
       expect(latest).toContain("**Draft**");
     });
+  });
+
+  it("edits Markdown Source through the shared surface and tracks referenced attachments", async () => {
+    const user = userEvent.setup();
+    const previousAssetId = "00000000-0000-4000-8000-000000000001";
+    const nextAssetId = "00000000-0000-4000-8000-000000000002";
+    const onChange = vi.fn();
+    render(
+      <MarkdownEditor
+        value={`![Before](/api/assets/${previousAssetId})`}
+        vault="team"
+        ariaLabel="Document content"
+        onChange={onChange}
+      />,
+    );
+
+    await screen.findByRole("textbox", { name: "Document content" });
+    await user.click(screen.getByRole("button", { name: "Source" }));
+
+    const source = screen.getByRole("textbox", { name: "Document content" });
+    expect(source).toHaveValue(`![Before](/api/assets/${previousAssetId})`);
+    expect(screen.queryByRole("toolbar", { name: "Text formatting" })).not.toBeInTheDocument();
+
+    fireEvent.change(source, {
+      target: { value: `![After](/api/assets/${nextAssetId})` },
+    });
+    await waitFor(() => expect(source).toHaveValue(`![After](/api/assets/${nextAssetId})`));
+    await waitFor(() =>
+      expect(onChange).toHaveBeenLastCalledWith(`![After](/api/assets/${nextAssetId})`, [nextAssetId]),
+    );
+
+    await user.click(screen.getByRole("button", { name: "WYSIWYG" }));
+    expect(screen.getByRole("textbox", { name: "Document content" }).querySelector("img")).toHaveAttribute(
+      "data-markdown-target",
+      `/api/assets/${nextAssetId}`,
+    );
+  });
+
+  it("opens Source with the current unsaved WYSIWYG draft when the editor owns its value", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(
+      <MarkdownEditor
+        value="Draft"
+        vault="team"
+        ariaLabel="Document content"
+        onChange={onChange}
+      />,
+    );
+
+    const editor = await screen.findByRole("textbox", { name: "Document content" });
+    editor.focus();
+    await user.keyboard("{Control>}a{/Control}");
+    await user.click(screen.getByRole("button", { name: "Bold" }));
+    await user.click(screen.getByRole("button", { name: "Source" }));
+
+    expect(screen.getByRole("textbox", { name: "Document content" })).toHaveValue(
+      "**Draft**",
+    );
+    expect(onChange).toHaveBeenCalled();
+  });
+
+  it("applies a dynamic readOnly change to the Source field", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const { rerender } = render(
+      <MarkdownEditor value="Draft" vault="team" onChange={onChange} />,
+    );
+
+    await user.click(await screen.findByRole("button", { name: "Source" }));
+    const source = screen.getByRole("textbox", { name: "Markdown source" });
+    rerender(<MarkdownEditor value="Draft" vault="team" readOnly onChange={onChange} />);
+
+    expect(source).toHaveProperty("readOnly", true);
+    await user.type(source, " should stay unchanged");
+    expect(source).toHaveValue("Draft");
+    expect(onChange).not.toHaveBeenCalled();
   });
 
   it("loads multiline code through the shared Tiptap code block", () => {
