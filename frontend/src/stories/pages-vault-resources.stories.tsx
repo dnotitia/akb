@@ -228,7 +228,7 @@ export const FileReady: Story = {
     msw: {
       handlers: [
         ...resourceShellHandlers,
-        http.get(`${API}/files/akb`, () => HttpResponse.json({ items: storyFiles })),
+        http.get(`${API}/files/akb/f-storybook`, () => HttpResponse.json(storyFiles[0])),
         http.get(`${API}/files/akb/f-storybook/download`, () =>
           HttpResponse.json({
             download_url: storyFilePreviewUrl,
@@ -256,9 +256,9 @@ export const FileLoading: Story = {
     msw: {
       handlers: [
         ...resourceShellHandlers,
-        http.get(`${API}/files/akb`, async () => {
+        http.get(`${API}/files/akb/f-storybook`, async () => {
           await delay("infinite");
-          return HttpResponse.json({ items: storyFiles });
+          return HttpResponse.json(storyFiles[0]);
         }),
       ],
     },
@@ -278,7 +278,9 @@ export const FileNotFound: Story = {
     msw: {
       handlers: [
         ...resourceShellHandlers,
-        http.get(`${API}/files/akb`, () => HttpResponse.json({ items: storyFiles })),
+        http.get(`${API}/files/akb/f-missing`, () =>
+          HttpResponse.json({ detail: "File not found" }, { status: 404 }),
+        ),
       ],
     },
   },
@@ -290,14 +292,14 @@ export const FileNotFound: Story = {
   },
 };
 
-export const FileListError: Story = {
-  name: "File / list error",
+export const FileLoadError: Story = {
+  name: "File / load error",
   parameters: {
     router: { initialEntries: ["/vault/akb/file/f-storybook"] },
     msw: {
       handlers: [
         ...resourceShellHandlers,
-        http.get(`${API}/files/akb`, () =>
+        http.get(`${API}/files/akb/f-storybook`, () =>
           HttpResponse.json({ detail: "File service unavailable" }, { status: 500 }),
         ),
       ],
@@ -306,7 +308,7 @@ export const FileListError: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("Couldn't load the file list (500).")).toBeInTheDocument();
+    await expect(await canvas.findByText("Couldn't load the file (500).")).toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
 };

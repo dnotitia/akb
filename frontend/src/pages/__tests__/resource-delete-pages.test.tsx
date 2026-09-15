@@ -140,14 +140,11 @@ describe("resource viewer deletion", () => {
           mime_type: "image/png",
         }));
       }
+      // The viewer resolves the File by id, so this is one record, not a page.
       return Promise.resolve(jsonResponse({
-        items: [
-          {
-            uri: "akb://v/file/file-1",
-            name: "diagram.png",
-            mime_type: "image/png",
-          },
-        ],
+        uri: "akb://v/file/file-1",
+        name: "diagram.png",
+        mime_type: "image/png",
       }));
     });
     const user = userEvent.setup();

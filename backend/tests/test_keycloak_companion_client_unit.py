@@ -20,6 +20,9 @@ from app.services.keycloak_oidc import KeycloakOIDC
 
 @pytest.mark.asyncio
 async def test_begin_browser_login_is_nonce_pkce_and_browser_bound(monkeypatch):
+    from app.services import sso_browser_session_service
+    from unittest.mock import AsyncMock
+    monkeypatch.setattr(sso_browser_session_service, "next_browser_login_sequence", AsyncMock(return_value=42))
     issued: dict[str, object] = {}
 
     async def capture_issue(key, kind, payload, ttl_secs):
@@ -59,7 +62,9 @@ async def test_begin_browser_login_is_nonce_pkce_and_browser_bound(monkeypatch):
         "code_verifier",
         "nonce",
         "browser_binding_hash",
+        "login_sequence",
     }
+    assert payload["login_sequence"] == "42"
     assert payload["redirect_path"] == "/vaults?selected=one"
     assert payload["provider_alias"] == "workforce"
     assert payload["client_id"] == "akb-web"

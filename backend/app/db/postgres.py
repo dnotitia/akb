@@ -352,6 +352,9 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "098_native_revision_nul_payload.py",  # permit UTF-8 NUL bytes in Native text payloads while retaining DB validation
         "099_personal_notifications.py",  # independent durable personal inbox and watches
         "100_native_revision_cutover_file_applied_path.py",  # record the native path each cutover File was published at
+        "101_local_session_generation.py",  # monotonic local session revocation
+        "102_account_self_lifecycle.py",  # independent deletion cleanup and confirmation budget
+        "103_sso_account_lifecycle.py",  # SSO browser logout and managed account sync
     ):
         if filename in applied:
             continue

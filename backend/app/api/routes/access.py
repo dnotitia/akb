@@ -2,9 +2,10 @@
 
 from datetime import datetime
 from typing import Literal
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from pydantic import ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from app.api.deps import get_current_user
 from app.config import settings
@@ -36,7 +37,7 @@ from app.services.access_service import (
     add_vault_write_grant,
     archive_vault,
     bootstrap_vault_write_policy,
-    delete_user_account,
+    delete_other_user_account,
     delete_vault,
     get_vault_info,
     explain_vault_access,
@@ -354,12 +355,58 @@ async def delete_vault_route(
     return await delete_vault(user.user_id, vault)
 
 
-@router.delete("/my/account", summary="Delete my account and all owned vaults")
+class SessionRevocationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_user_id: uuid.UUID
+
+
+class AccountDeletionRequest(SessionRevocationRequest, NFCModel):
+    # Match registration/login normalization before wrapping the password in SecretStr.
+    confirm_username: str = Field(min_length=1, max_length=255)
+    current_password: SecretStr = Field(min_length=1, max_length=1024)
+
+
+@router.get("/my/account/lifecycle", summary="Inspect my account lifecycle capabilities and effects")
+async def my_account_lifecycle(response: Response, user: AuthenticatedUser = Depends(get_current_user)):
+    from app.services.account_self_service import lifecycle
+    response.headers["Cache-Control"] = "no-store"
+    return await lifecycle(user)
+
+
+@router.get("/my/account/deletion-blockers", summary="Page through my owned vaults")
+async def my_account_deletion_blockers(
+    response: Response,
+    cursor: uuid.UUID | None = None,
+    limit: int = Query(20, ge=1, le=100),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    from app.services.account_self_service import deletion_blockers
+    response.headers["Cache-Control"] = "no-store"
+    return await deletion_blockers(user, cursor=cursor, limit=limit)
+
+
+@router.post("/my/account/session-revocations", summary="End all my local login sessions")
+async def revoke_my_account_sessions(
+    req: SessionRevocationRequest, user: AuthenticatedUser = Depends(get_current_user),
+):
+    from app.services.account_self_service import revoke_sessions
+    return await revoke_sessions(user, req.expected_user_id)
+
+
+@router.post("/my/account/deletion", summary="Delete my account without deleting owned vaults")
+async def delete_my_account_safely(
+    req: AccountDeletionRequest, user: AuthenticatedUser = Depends(get_current_user),
+):
+    from app.services.account_self_service import delete_account
+    return await delete_account(user, req.expected_user_id, req.confirm_username, req.current_password.get_secret_value())
+
+
+@router.delete("/my/account", summary="Retired unsafe self-delete contract", deprecated=True)
 async def delete_my_account(user: AuthenticatedUser = Depends(get_current_user)):
-    """Self-delete: removes all owned vaults (cascading to chunks, Git repo,
-    the vector store, S3 files, etc.), detaches residual FK references in other
-    users' vaults, then deletes the user row."""
-    return await delete_user_account(user.user_id)
+    raise HTTPException(410, detail={
+        "code": "account_deletion_contract_required",
+        "message": "Review GET /my/account/lifecycle and confirm through POST /my/account/deletion.",
+    })
 
 
 @router.get("/users/search", summary="Search users")
@@ -843,9 +890,11 @@ async def admin_delete_user(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     _require_admin(user)
-    if user_id == user.user_id:
-        raise HTTPException(status_code=400, detail="Use DELETE /my/account to delete your own account")
-    return await delete_user_account(user_id)
+    try:
+        target_id = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(422, "Invalid user ID") from None
+    return await delete_other_user_account(str(target_id), actor_id=user.user_id)
 
 
 @router.post(

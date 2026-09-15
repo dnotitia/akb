@@ -1086,6 +1086,10 @@ class Settings(BaseModel):
     )
     sso_browser_session_refresh_skew_secs: int = Field(default=30, ge=0, le=300)
     keycloak_verify_ssl: bool = True  # set false only for local self-signed Keycloak
+    # Optional read-only Keycloak account reconciliation. Each tick checks at most
+    # 25 existing identities; suspension preserves accounts, bindings, and Vaults.
+    sso_account_sync_enabled: bool = False
+    sso_account_sync_interval_secs: int = Field(default=30, ge=10, le=3600)
     # Exact identity is issuer/subject and does not require email. Open-mode
     # JIT requires a verified email only when creating a brand-new AKB user;
     # otherwise email is never an account lookup or adoption key — the one
@@ -1339,6 +1343,9 @@ class Settings(BaseModel):
     # DDL online; this timer is the belt-and-suspenders that catches
     # any silent hook failure (logged + counted in metrics_snapshot
     # but otherwise not auto-recovered). Set to 0 to disable.
+    # Enable only after every local-session issuer/verifier supports generation claims.
+    account_self_service_enabled: bool = False
+
     role_sync_reconcile_interval_secs: int = 3600
 
     # Event stream — optional Redis Streams fanout. PG outbox (`events`

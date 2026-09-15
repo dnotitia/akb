@@ -147,7 +147,7 @@ N=$(echo "$R" | jget "d.get('chunks_indexed', 'err')")
 # ── I4. ACL — non-grantee can't see private content ──────────
 echo ""
 echo "▸ I4. ACL cross-user isolation"
-OTHER="other-$(date +%s)"
+OTHER="hybrid-inv-other-$(date +%s)"
 rcurl -X POST "$BASE/api/v1/auth/register" -H 'Content-Type: application/json' \
   -d "{\"username\":\"$OTHER\",\"email\":\"$OTHER@t.dev\",\"password\":\"test1234\"}" >/dev/null
 OJWT=$(rcurl -X POST "$BASE/api/v1/auth/login" -H 'Content-Type: application/json' \
@@ -268,8 +268,10 @@ if [ -n "$SID2" ]; then
 fi
 
 # Self-delete test user to avoid accumulating in DB
-curl -sk --max-time 15 -X DELETE "$BASE/api/v1/my/account" -H "Authorization: Bearer $JWT" >/dev/null 2>&1
-pass "cleanup attempted"
+python3 "$(dirname "${BASH_SOURCE[0]}")/helpers/cleanup_hybrid_account.py" "$BASE" "$USER_NAME" <<<'test1234' \
+  && pass "fixture account cleanup confirmed" || fail "cleanup" "safe account cleanup failed"
+python3 "$(dirname "${BASH_SOURCE[0]}")/helpers/cleanup_hybrid_account.py" "$BASE" "$OTHER" <<<'test1234' \
+  && pass "fixture account cleanup confirmed" || fail "cleanup" "safe account cleanup failed"
 
 # ── Summary ──────────────────────────────────────────────────
 echo ""

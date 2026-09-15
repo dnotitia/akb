@@ -70,7 +70,7 @@ beforeEach(() => {
   vaultInfo.mockResolvedValue({ role: "reader", is_archived: false, is_external_git: false } as Awaited<ReturnType<typeof getVaultInfo>>);
   fileFetch.mockImplementation((path) => String(path).endsWith("/download")
     ? response({ name: firstFile.name, download_url: "https://files.example/first" })
-    : response({ items: [firstFile] }));
+    : response(firstFile));
 });
 afterEach(cleanup);
 
@@ -105,7 +105,7 @@ describe("file reading workspace", () => {
     fileFetch.mockImplementation((path) => {
       if (String(path).includes("f-first/download")) return oldPreview.promise;
       if (String(path).includes("f-second/download")) return response({ download_url: "https://files.example/second" });
-      return ++listCount === 1 ? response({ items: [firstFile] }) : nextList.promise;
+      return ++listCount === 1 ? response(firstFile) : nextList.promise;
     });
     render(<FileHarness />);
     await screen.findByRole("button", { name: "Info" });
@@ -114,7 +114,7 @@ describe("file reading workspace", () => {
     expect(screen.queryByRole("heading", { name: firstFile.name })).not.toBeInTheDocument();
     await act(async () => oldPreview.resolve(await response({ download_url: "https://files.example/first" })));
     expect(screen.queryByRole("link", { name: "Download file" })).not.toBeInTheDocument();
-    await act(async () => nextList.resolve(await response({ items: [{ ...firstFile, name: "Second.pdf", uri: "akb://ops/file/f-second", collection: undefined }] })));
+    await act(async () => nextList.resolve(await response({ ...firstFile, name: "Second.pdf", uri: "akb://ops/file/f-second", collection: undefined })));
     expect(await screen.findByRole("link", { name: "Download file" })).toHaveAttribute("href", "https://files.example/second");
     expect(screen.getByTestId("location")).toHaveTextContent('"title":"Second.pdf"');
     expect(screen.getByTestId("location")).not.toHaveTextContent("guides");
@@ -129,7 +129,7 @@ describe("file reading workspace", () => {
     view.rerender(<FileHarness identity="beta" />);
     expect(screen.getByTestId("location")).toHaveTextContent("No resource");
     expect(screen.queryByRole("heading", { name: firstFile.name })).not.toBeInTheDocument();
-    await act(async () => nextList.resolve(await response({ items: [] })));
+    await act(async () => nextList.resolve(await response({ detail: "File not found" }, 404)));
     expect(await screen.findByText("File not found in vault.")).toBeInTheDocument();
     await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("No resource"));
     expect(screen.queryByRole("link", { name: "Download file" })).not.toBeInTheDocument();

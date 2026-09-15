@@ -821,10 +821,10 @@ for (const width of [375, 1440]) for (const kind of ["file", "table"] as const) 
     await page.emulateMedia({ reducedMotion: "reduce" });
     await fixture(page);
     await page.route("**/reading-file.txt", route => route.fulfill({ contentType: "text/plain", body: "A readable attachment." }));
-    await page.route("**/api/v1/files/fixture", route => route.fulfill({ json: { items: [{
+    await page.route("**/api/v1/files/fixture/f-reading", route => route.fulfill({ json: {
       uri: "akb://fixture/coll/guides/team/operations/file/f-reading",
       name: "Reading notes.txt", collection: "guides/team/operations", mime_type: "text/plain", size_bytes: 22,
-    }] } }));
+    } }));
     await page.route("**/api/v1/files/fixture/f-reading/download", route => route.fulfill({ json: {
       name: "Reading notes.txt", mime_type: "text/plain", download_url: "/reading-file.txt", size_bytes: 22,
     } }));

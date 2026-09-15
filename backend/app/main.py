@@ -208,6 +208,9 @@ async def http_error_handler(request: Request, exc: StarletteHTTPException):
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
     details = exc.errors()
+    if request.url.path == "/api/v1/my/account/deletion":
+        # Validation must never echo the password (including malformed request bodies).
+        details = [{k: e[k] for k in ("loc", "msg", "type") if k in e} for e in details]
     return JSONResponse(
         status_code=422,
         content=_error_payload(
@@ -558,6 +561,10 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
             result["rbac"] = get_role_sync().metrics_snapshot()
         except Exception as e:  # noqa: BLE001
             result["rbac"] = {"error": str(e)}
+        from app.services.account_deletion_worker import pending_stats as account_cleanup_stats
+        result["account_deletion_cleanup"] = await _safe(account_cleanup_stats)
+        from app.services.sso_account_sync import pending_stats as sso_account_sync_stats
+        result["sso_account_sync"] = await _safe(sso_account_sync_stats)
         result["audit"] = audit_log.stats()
         result["tool_usage"] = tool_usage.stats()
 
