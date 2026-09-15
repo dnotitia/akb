@@ -233,8 +233,12 @@ sso_account_sync_interval_secs: 30
 The worker needs the configured direct Keycloak management connection with realm
 and user read permissions. It reads at most 25 identities per tick. Detection is
 **eventual**, not immediate: a full population sweep spans multiple intervals, and
-an outage delays it further. Health reports the latest page, freshness and error
-state. For urgent revocation, an AKB administrator can suspend the account directly.
+an outage delays it further. A failed page preserves its account state and advances
+the cursor. Subsequent reads use one identity at a time, so the next sweep retries
+the failed page without allowing one subject to block its neighbors. A fully clean
+sweep restores batches of 25. Health retains errors across successful pages and
+process restarts; only a fully clean sweep clears them. For urgent revocation, an
+AKB administrator can suspend the account directly.
 
 Synchronization is suspend-only. Re-enabling a Keycloak user does not automatically
 activate its AKB account or recreate PATs. After explicit AKB reactivation, existing

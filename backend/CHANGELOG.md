@@ -32,7 +32,9 @@ PATs. Migration 103 fences in-flight login callbacks. SSO accounts have a manage
 account notice instead of self-deletion. Optional `sso_account_sync_enabled` polling
 suspends AKB accounts when the configured Keycloak broker disables/deletes them,
 revoking PATs/browser handles while preserving Vaults and identity bindings. Polling
-is eventual and suspend-only; failures do not mutate accounts. See the
+is eventual and suspend-only; failures do not mutate accounts. Failed pages advance
+the scan and trigger individual retries, preventing one failed subject from blocking
+other accounts. Health errors clear only after a fully successful sweep. See the
 [implementation and rollout design](../docs/design/accepted/2026-09-15-account-self-service-lifecycle/README.md).
 
 ### Every document counter follows the active authority (akb#525)

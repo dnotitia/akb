@@ -18,6 +18,10 @@ async def fixture(monkeypatch):
         monkeypatch.setattr(sync, "get_pool", AsyncMock(return_value=pool))
         monkeypatch.setattr(sync, "cleanup_token_roles", AsyncMock())
         monkeypatch.setattr(sync, "_cursor", None)
+        monkeypatch.setattr(sync, "_cursor_issuer", None)
+        monkeypatch.setattr(sync, "_scan_page_size", sync._PAGE_SIZE)
+        monkeypatch.setattr(sync, "_sweep_error", None)
+        monkeypatch.setattr(sync, "_last_sweep_error", None)
         monkeypatch.setattr(sync.settings, "auth_mode", "sso")
         monkeypatch.setattr(sync.settings, "keycloak_server_url", "https://sso.example.test")
         monkeypatch.setattr(sync.settings, "keycloak_realm", "akb")
@@ -26,6 +30,7 @@ async def fixture(monkeypatch):
                                   read_managed_account_states=AsyncMock())
         monkeypatch.setattr(sync, "get_keycloak_provider_control", lambda: control)
         uid, eid, tid, vid, epoch = (uuid.uuid4() for _ in range(5))
+        eid = uuid.UUID(int=1)
         monkeypatch.setattr(sync.settings, "auth_runtime_generation", 1)
         monkeypatch.setattr(sync.settings, "sso_session_epoch", epoch)
         await pool.execute("""INSERT INTO users(id,username,email,password_hash,auth_provider)
@@ -118,3 +123,76 @@ async def test_audit_failure_rolls_back_account_and_all_credentials(fixture, mon
     for table in ("tokens", "sso_browser_sessions", "admin_browser_sessions"):
         assert await pool.fetchval(f"SELECT count(*) FROM {table} WHERE user_id=$1", uid) == 1
     assert (await sync.pending_stats())["last_error_code"] == "RuntimeError"
+
+
+@pytest.mark.parametrize("failure", [ProviderControlError("account_sync_user_unavailable"), TimeoutError()])
+async def test_failed_page_does_not_starve_later_or_neighbor_accounts(fixture, failure):
+    pool, control, uid, eid, tid, vid = fixture
+    targets = []
+    for number in range(2, 27):
+        target = uuid.uuid4()
+        targets.append(target)
+        await pool.execute("""INSERT INTO users(id,username,email,password_hash,auth_provider)
+            VALUES($1,$2,$3,'!keycloak-sso!','keycloak')""", target, f"user-{number}", f"user-{number}@example.test")
+        await pool.execute("INSERT INTO external_identities(id,user_id,issuer,subject) VALUES($1,$2,$3,$4)",
+                           uuid.UUID(int=number), target, sync.settings.keycloak_issuer, f"subject-{number}")
+
+    async def read(subjects):
+        if "subject" in subjects:
+            raise failure
+        return {subject: "disabled" for subject in subjects}
+    control.read_managed_account_states.side_effect = read
+    await sync.process_once()  # Failed first 25 identities: no mutation.
+    assert sync._scan_page_size == 1
+    assert await pool.fetchval("SELECT account_status FROM users WHERE id=$1", targets[0]) == "active"
+    await sync.process_once()  # The 26th identity must be reached despite the error.
+    assert await pool.fetchval("SELECT account_status FROM users WHERE id=$1", targets[-1]) == "suspended"
+    assert not (await sync.pending_stats())["ready"]
+    await sync.process_once()  # End of sweep.
+    await sync.process_once()  # Retry the poison identity, by itself.
+    await sync.process_once()  # Its neighbor in the original failed page now succeeds.
+    assert await pool.fetchval("SELECT account_status FROM users WHERE id=$1", targets[0]) == "suspended"
+    assert await pool.fetchval("SELECT account_status FROM users WHERE id=$1", uid) == "active"
+    assert await pool.fetchval("SELECT count(*) FROM tokens WHERE id=$1", tid) == 1
+    assert not (await sync.pending_stats())["ready"]
+    control.read_managed_account_states.side_effect = lambda subjects: {subject: "active" for subject in subjects}
+    for _ in range(60):
+        await sync.process_once()
+        if (await sync.pending_stats())["ready"]:
+            break
+    assert (await sync.pending_stats())["ready"]
+    assert sync._scan_page_size == 25
+    assert any(call.args[0] == ("subject",) for call in control.read_managed_account_states.call_args_list)
+
+
+async def test_restart_keeps_durable_error_until_full_clean_sweep(fixture, monkeypatch):
+    pool, control, uid, eid, tid, vid = fixture
+    monkeypatch.setattr(sync, "_PAGE_SIZE", 1)
+    await sync._record(error="account_sync_user_unavailable", checked=0, suspended=0)
+    control.read_managed_account_states.return_value = {"subject": "active"}
+    await sync.process_once()  # Fresh process, one healthy page is not a full sweep.
+    assert not (await sync.pending_stats())["ready"]
+    assert (await sync.pending_stats())["last_error_code"] == "account_sync_user_unavailable"
+    await sync.process_once()  # End of a fully clean sweep clears the durable error.
+    assert (await sync.pending_stats())["ready"]
+
+
+async def test_failed_partial_final_page_restarts_in_individual_mode(fixture, monkeypatch):
+    pool, control, uid, eid, tid, vid = fixture
+    monkeypatch.setattr(sync, "_PAGE_SIZE", 2)
+    for number in (2, 3):
+        await pool.execute("INSERT INTO external_identities(id,user_id,issuer,subject) VALUES($1,$2,$3,$4)",
+                           uuid.UUID(int=number), uid, sync.settings.keycloak_issuer, f"subject-{number}")
+
+    async def read(subjects):
+        if "subject-3" in subjects:
+            raise ProviderControlError("account_sync_user_unavailable")
+        return {subject: "active" for subject in subjects}
+    control.read_managed_account_states.side_effect = read
+    await sync.process_once()
+    await sync.process_once()  # A partial final page fails and closes this sweep.
+    assert sync._cursor is None
+    assert sync._scan_page_size == 1
+    await sync.process_once()  # Next sweep starts at the first identity, individually.
+    assert control.read_managed_account_states.call_args.args[0] == ("subject",)
+    assert not (await sync.pending_stats())["ready"]

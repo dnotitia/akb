@@ -20,13 +20,34 @@ from app.sso.keycloak_admin import ProviderControlError, get_keycloak_provider_c
 _cursor: uuid.UUID | None = None
 _cursor_issuer: str | None = None
 _PAGE_SIZE = 25
+_scan_page_size = _PAGE_SIZE
+_sweep_error: str | None = None
+_last_sweep_error: str | None = None
+
+
+def _finish_page(rows, page_size: int, error: str | None) -> str | None:
+    """Retry failures on the next sweep without starving unrelated identities."""
+    global _cursor, _scan_page_size, _sweep_error, _last_sweep_error
+    if error is not None:
+        _sweep_error = error
+        # Isolate failed pages into individual reads on subsequent ticks/sweeps.
+        # This also avoids repeatedly exceeding the adapter's whole-page timeout.
+        _scan_page_size = 1
+    _cursor = rows[-1]["id"] if len(rows) == page_size else None
+    if _cursor is None:
+        _last_sweep_error = _sweep_error
+        _sweep_error = None
+        if _last_sweep_error is None:
+            _scan_page_size = _PAGE_SIZE
+    # A healthy page cannot hide an unresolved failure elsewhere in the sweep.
+    return _sweep_error or _last_sweep_error
 
 
 def _enabled() -> bool:
     return settings.sso_account_sync_enabled and settings.require_auth_mode() == "sso"
 
 
-async def _record(*, error: str | None, checked: int, suspended: int) -> None:
+async def _record(*, error: str | None, checked: int, suspended: int, clear_error: bool = False) -> None:
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute("""INSERT INTO sso_account_sync_state
@@ -34,12 +55,14 @@ async def _record(*, error: str | None, checked: int, suspended: int) -> None:
             VALUES(true,CASE WHEN $1::text IS NULL THEN clock_timestamp() END,$1,$2,$3)
             ON CONFLICT(singleton) DO UPDATE SET
                 last_completed_at=COALESCE(EXCLUDED.last_completed_at,sso_account_sync_state.last_completed_at),
-                last_error_code=EXCLUDED.last_error_code,checked=EXCLUDED.checked,suspended=EXCLUDED.suspended""",
-            error, checked, suspended)
+                last_error_code=CASE WHEN $4 THEN EXCLUDED.last_error_code
+                    ELSE COALESCE(EXCLUDED.last_error_code,sso_account_sync_state.last_error_code) END,
+                checked=EXCLUDED.checked,suspended=EXCLUDED.suspended""",
+            error, checked, suspended, clear_error)
 
 
 async def process_once() -> int:
-    global _cursor, _cursor_issuer
+    global _cursor, _cursor_issuer, _scan_page_size, _sweep_error, _last_sweep_error
     if not _enabled():
         return 0
     checked = suspended = 0
@@ -47,6 +70,11 @@ async def process_once() -> int:
     if issuer != _cursor_issuer:
         _cursor = None
         _cursor_issuer = issuer
+        _scan_page_size = _PAGE_SIZE
+        _sweep_error = _last_sweep_error = None
+    rows = None
+    page_finished = False
+    page_size = min(_scan_page_size, _PAGE_SIZE)
     try:
         authority = current_sso_session_authority()
         control = get_keycloak_provider_control()
@@ -60,10 +88,11 @@ async def process_once() -> int:
                     AND u.account_status='active' AND NOT u.is_recovery_admin
                     AND u.password_hash NOT LIKE '!retired-recovery-admin:%'
                     AND ($2::uuid IS NULL OR e.id>$2)
-                ORDER BY e.id LIMIT $3""", issuer, _cursor, _PAGE_SIZE)
+                ORDER BY e.id LIMIT $3""", issuer, _cursor, page_size)
         if not rows:
-            _cursor = None
-            await _record(error=None, checked=0, suspended=0)
+            error = _finish_page(rows, page_size, None)
+            page_finished = True
+            await _record(error=error, checked=0, suspended=0, clear_error=error is None)
             return 0
         states = await control.read_managed_account_states(tuple(r["subject"] for r in rows))
         for identity in rows:
@@ -97,10 +126,16 @@ async def process_once() -> int:
                                  "subject": identity["subject"], "external_state": state})
                 suspended += 1
             await cleanup_token_roles(pool, identity["user_id"], token_ids)
-        _cursor = rows[-1]["id"] if len(rows) == _PAGE_SIZE else None
-        await _record(error=None, checked=checked, suspended=suspended)
+        error = _finish_page(rows, page_size, None)
+        page_finished = True
+        await _record(error=error, checked=checked, suspended=suspended,
+                      clear_error=_cursor is None and error is None)
     except Exception as exc:
         code = exc.code if isinstance(exc, ProviderControlError) else type(exc).__name__
+        if rows is not None and not page_finished:
+            code = _finish_page(rows, page_size, code) or code
+        else:
+            _sweep_error = code
         await _record(error=code, checked=checked, suspended=suspended)
     # Always use the configured idle cadence, including full pages and errors.
     return 0
