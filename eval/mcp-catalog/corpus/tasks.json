@@ -125,14 +125,20 @@
     "category": "multi_step",
     "locale": "ko-KR",
     "pair_id": "multi-step",
-    "prompt": "catalog-bench-multi 보관함을 만든 다음 그 안에 team-notes 모음과 짧은 문서 하나를 차례로 준비해 줘. 모든 단계가 끝난 뒤 결과를 알려 줘.",
+    "prompt": "`catalog-bench-multi` 보관함을 만든 뒤 그 안에 `team-notes` 모음을 만들고, 제목이 `quick-update`이며 본문이 `A short note for the team.`인 짧은 문서를 추가해 줘. 이 순서대로 진행하고 모든 단계가 끝난 뒤 결과를 알려 줘.",
     "fixture": {"scenario": "app-control-plane", "credential_profile": "default", "transports": ["http", "stdio"]},
     "allowed_preparatory_operations": ["identity", "list", "read"],
     "allowed_material_operations": ["create"],
     "allowed_first_operations": ["create"],
     "forbidden_operations": ["delete"],
     "required_attempted_operations": ["create"],
+    "material_attempt_limits": {"create": 3},
     "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}],
+    "expected_material_attempts": [
+      {"logical_operation": "create", "tool_name": "akb_create_vault", "arguments": {"name": "catalog-bench-multi", "public_access": "none"}, "outcome": "success"},
+      {"logical_operation": "create", "tool_name": "akb_create_collection", "arguments": {"vault": "catalog-bench-multi", "path": "team-notes"}, "outcome": "success"},
+      {"logical_operation": "create", "tool_name": "akb_put", "arguments": {"vault": "catalog-bench-multi", "collection": "team-notes", "title": "quick-update", "content": "A short note for the team.", "type": "note", "status": "draft"}, "outcome": "success"}
+    ],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
       "must": [{"pointer": "/vaults", "operator": "contains", "value": {"name": "catalog-bench-multi"}}]
@@ -145,14 +151,20 @@
     "category": "multi_step",
     "locale": "en-US",
     "pair_id": "multi-step",
-    "prompt": "Create the catalog-bench-multi vault, then prepare a team-notes collection and one short document inside it in order. Report only after every step is complete.",
+    "prompt": "Create the `catalog-bench-multi` vault, then create the `team-notes` collection and add a short document titled `quick-update` with the exact content `A short note for the team.`. Do these in order and report after all steps are complete.",
     "fixture": {"scenario": "app-control-plane", "credential_profile": "default", "transports": ["http", "stdio"]},
     "allowed_preparatory_operations": ["identity", "list", "read"],
     "allowed_material_operations": ["create"],
     "allowed_first_operations": ["create"],
     "forbidden_operations": ["delete"],
     "required_attempted_operations": ["create"],
+    "material_attempt_limits": {"create": 3},
     "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}],
+    "expected_material_attempts": [
+      {"logical_operation": "create", "tool_name": "akb_create_vault", "arguments": {"name": "catalog-bench-multi", "public_access": "none"}, "outcome": "success"},
+      {"logical_operation": "create", "tool_name": "akb_create_collection", "arguments": {"vault": "catalog-bench-multi", "path": "team-notes"}, "outcome": "success"},
+      {"logical_operation": "create", "tool_name": "akb_put", "arguments": {"vault": "catalog-bench-multi", "collection": "team-notes", "title": "quick-update", "content": "A short note for the team.", "type": "note", "status": "draft"}, "outcome": "success"}
+    ],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
       "must": [{"pointer": "/vaults", "operator": "contains", "value": {"name": "catalog-bench-multi"}}]
@@ -275,8 +287,8 @@
     "material_attempt_limits": {"create": 2},
     "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}],
     "expected_material_attempts": [
-      {"logical_operation": "create", "arguments": {"name": "bad/name"}, "outcome": "rejected", "error_code": "invalid_argument"},
-      {"logical_operation": "create", "arguments": {"name": "catalog-bench-recovery"}, "outcome": "success"}
+      {"logical_operation": "create", "tool_name": "akb_create_vault", "arguments": {"name": "bad/name", "public_access": "none"}, "outcome": "rejected", "error_code": "invalid_argument"},
+      {"logical_operation": "create", "tool_name": "akb_create_vault", "arguments": {"name": "catalog-bench-recovery", "public_access": "none"}, "outcome": "success"}
     ],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
@@ -301,8 +313,8 @@
     "material_attempt_limits": {"create": 2},
     "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}],
     "expected_material_attempts": [
-      {"logical_operation": "create", "arguments": {"name": "bad/name"}, "outcome": "rejected", "error_code": "invalid_argument"},
-      {"logical_operation": "create", "arguments": {"name": "catalog-bench-recovery"}, "outcome": "success"}
+      {"logical_operation": "create", "tool_name": "akb_create_vault", "arguments": {"name": "bad/name", "public_access": "none"}, "outcome": "rejected", "error_code": "invalid_argument"},
+      {"logical_operation": "create", "tool_name": "akb_create_vault", "arguments": {"name": "catalog-bench-recovery", "public_access": "none"}, "outcome": "success"}
     ],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},

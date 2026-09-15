@@ -179,6 +179,7 @@ class ExpectedMaterialOutcome(ContractModel):
 
 class ExpectedMaterialAttempt(ContractModel):
     logical_operation: str
+    tool_name: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z][A-Za-z0-9_.-]*$")
     arguments: dict[str, JsonValue] = Field(default_factory=dict)
     outcome: Literal["success", "permission_denied", "rejected"]
     status_code: int | None = Field(default=None, ge=100, le=599)
@@ -516,6 +517,17 @@ class BenchmarkRunManifest(ContractModel):
         }
         if unknown_operations:
             raise ValueError(f"logical operations are missing from operation_map: {sorted(unknown_operations)}")
+        unregistered_attempt_tools = sorted(
+            f"{task.id}:{attempt.tool_name}"
+            for task in tasks
+            for attempt in task.expected_material_attempts
+            if attempt.tool_name not in self.operation_map.get(attempt.logical_operation, [])
+        )
+        if unregistered_attempt_tools:
+            raise ValueError(
+                "expected material attempt tools must be registered for their logical operation: "
+                f"{unregistered_attempt_tools}"
+            )
         if any(task.fixture.scenario != self.fixture_scenario for task in tasks):
             raise ValueError("every task must use the registered fixture scenario")
         self._validate_locale_pairs(tasks)

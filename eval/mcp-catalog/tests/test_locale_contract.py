@@ -276,6 +276,9 @@ async def test_public_mcp_envelopes_score_recovery_sequence_and_reject_success_b
     recovery_task = next(task for task in tasks if task.id == "invalid-recovery-b")
     auth_task = next(task for task in tasks if task.id == "authorization-readonly-b")
     recovery_recorder = ToolCallRecorder(operation_map={"create": ["akb_create_vault"]}, secrets=())
+    recovery_recorder.set_input_schemas(
+        {"akb_create_vault": {"properties": {"public_access": {"default": "none"}}}}
+    )
 
     async def recovery_call(_name: str, arguments: dict[str, object]) -> dict[str, str]:
         if arguments["name"] == "bad/name":
@@ -302,6 +305,7 @@ async def test_public_mcp_envelopes_score_recovery_sequence_and_reject_success_b
         recovery_recorder.calls,
         recovery_recorder.operation_map,
         (),
+        input_schemas=recovery_recorder.input_schemas,
     )
     recovery_outcome = TrialOutcome(
         task_id=recovery_task.id,
@@ -440,6 +444,7 @@ def test_invalid_recovery_requires_the_rejected_attempt_before_success() -> None
             logical_operation="create",
             raw_model_args={"name": name},
             server_args={"name": name},
+            effective_server_args={"name": name, "public_access": "none"},
             raw_args_valid=True,
             server_args_equal_raw=True,
             server_succeeded=succeeded,

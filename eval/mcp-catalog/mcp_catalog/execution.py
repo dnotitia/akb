@@ -319,10 +319,14 @@ class TrialOutcome(BaseModel):
             for call in self.tool_calls
             if call.operation_kind == "material"
         }
-        self.required_attempts_completed = set(task.required_attempted_operations) <= attempted_operations
         self.tool_outcome_match, self.expected_error_match = material_outcome_matches(
             task,
             self.tool_calls,
+        )
+        self.required_attempts_completed = (
+            self.tool_outcome_match
+            if task.expected_material_attempts
+            else set(task.required_attempted_operations) <= attempted_operations
         )
         forbidden_hit = any(call.logical_operation in task.forbidden_operations for call in self.tool_calls)
         unchanged_checks_passed = all(
@@ -1461,9 +1465,13 @@ def _arguments_include(actual: dict[str, Any] | None, expected: dict[str, Any]) 
 
 
 def _material_attempt_matches(call: ToolCallRecord, expected: ExpectedMaterialAttempt) -> bool:
-    if call.logical_operation != expected.logical_operation or not _arguments_include(
-        call.effective_server_args or call.server_args,
-        expected.arguments,
+    actual_arguments = call.effective_server_args
+    if actual_arguments is None:
+        actual_arguments = call.server_args
+    if (
+        call.tool_name != expected.tool_name
+        or call.logical_operation != expected.logical_operation
+        or actual_arguments != expected.arguments
     ):
         return False
     if expected.outcome == "success":
