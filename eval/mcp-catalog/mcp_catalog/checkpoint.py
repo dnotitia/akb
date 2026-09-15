@@ -8,6 +8,7 @@ import tempfile
 import contextlib
 from pathlib import Path
 from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
 from typing import Literal
 
 from pydantic import Field
@@ -178,14 +179,31 @@ def valid_smoke_outcome(outcome: TrialOutcome) -> bool:
         outcome.error is None
         and valid_completed_outcome(outcome)
         and len(outcome.provider_evidence) == outcome.model_requests
-        and all(item.get("model") == outcome.model_id for item in outcome.provider_evidence)
         and all(
-            isinstance(item.get("usage"), dict) and item["usage"].get("cost") is not None
+            _smoke_response_has_usage(item, outcome.model_id)
             for item in outcome.provider_evidence
         )
         and outcome.successful_mcp_tool_calls > 0
         and outcome.model_requests >= 2
         and outcome.follow_up_terminal_response
+    )
+
+
+def _smoke_response_has_usage(evidence: dict[str, object], model_id: str) -> bool:
+    usage = evidence.get("usage")
+    if evidence.get("model") != model_id or not isinstance(usage, dict):
+        return False
+    try:
+        cost = Decimal(str(usage.get("cost")))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    if not cost.is_finite() or cost <= 0:
+        return False
+    input_tokens = usage.get("prompt_tokens", usage.get("input_tokens"))
+    output_tokens = usage.get("completion_tokens", usage.get("output_tokens"))
+    return any(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in (input_tokens, output_tokens)
     )
 
 
@@ -260,6 +278,12 @@ class CheckpointStore:
         return record.status if record is not None else None
 
     def budget_failure_reason(self) -> str | None:
+        terminal_markers = (
+            "max_model_requests",
+            "max_total_cost_usd",
+            "max_wall_seconds",
+            "preregistered worst-case trial cost",
+        )
         outcomes = (
             *(record.outcome for record in self.document.records.values() if record.status != "completed"),
             *(record.outcome for record in self.document.smoke_gate.values() if record.status != "completed"),
@@ -269,6 +293,8 @@ class CheckpointStore:
                 outcome.error or "a prior checkpoint outcome exceeded the registered budget"
                 for outcome in outcomes
                 if outcome.failure_kind == "budget"
+                and outcome.error is not None
+                and any(marker in outcome.error.casefold() for marker in terminal_markers)
             ),
             None,
         )

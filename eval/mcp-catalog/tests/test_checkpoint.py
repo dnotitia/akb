@@ -121,7 +121,7 @@ async def test_checkpoint_restores_terminal_budget_failure(
 ) -> None:
     path = tmp_path / ("smoke.json" if record_as_smoke else "trial.json")
     store, key = _store(path)
-    outcome = _outcome(key, error="benchmark incomplete: max_cost_per_trial_usd exceeded").model_copy(
+    outcome = _outcome(key, error="benchmark incomplete: max_total_cost_usd exceeded").model_copy(
         update={"failure_kind": "budget"}
     )
     if record_as_smoke:
@@ -132,7 +132,7 @@ async def test_checkpoint_restores_terminal_budget_failure(
     resumed, _ = _store(path, resume=True)
 
     budget_failure = resumed.budget_failure_reason()
-    assert budget_failure == "benchmark incomplete: max_cost_per_trial_usd exceeded"
+    assert budget_failure == "benchmark incomplete: max_total_cost_usd exceeded"
     manifest, _tasks, _header, _key, _expected = _inputs()
     ledger = BudgetLedger(manifest)
     ledger.restore(
@@ -144,8 +144,37 @@ async def test_checkpoint_restores_terminal_budget_failure(
         model_work_seconds=resumed.document.spent.model_work_seconds,
         budget_failure=budget_failure,
     )
-    with pytest.raises(BudgetExceeded, match="max_cost_per_trial_usd"):
+    with pytest.raises(BudgetExceeded, match="max_total_cost_usd"):
         await ledger.reserve_trial(manifest.budget.max_cost_per_trial_usd)
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_does_not_promote_per_trial_failure_to_global_stop(tmp_path: Path) -> None:
+    path = tmp_path / "per-trial-budget.json"
+    store, key = _store(path)
+    store.record_trial(
+        key,
+        _outcome(key, error="benchmark incomplete: max_cost_per_trial_usd exceeded").model_copy(
+            update={"failure_kind": "budget"}
+        ),
+        status="failed",
+    )
+    resumed, _ = _store(path, resume=True)
+    assert resumed.budget_failure_reason() is None
+
+    manifest, _tasks, _header, _key, _expected = _inputs()
+    ledger = BudgetLedger(manifest)
+    ledger.restore(
+        model_requests=resumed.document.spent.model_requests,
+        input_tokens=resumed.document.spent.input_tokens,
+        output_tokens=resumed.document.spent.output_tokens,
+        cost_usd=resumed.document.spent.cost_usd,
+        wall_seconds=resumed.document.spent.wall_seconds,
+        model_work_seconds=resumed.document.spent.model_work_seconds,
+        budget_failure=resumed.budget_failure_reason(),
+    )
+    await ledger.reserve_trial(manifest.budget.max_cost_per_trial_usd)
+    await ledger.release_trial(manifest.budget.max_cost_per_trial_usd)
 
 
 def test_resume_fails_closed_for_header_mismatch_corruption_and_secret(tmp_path: Path) -> None:

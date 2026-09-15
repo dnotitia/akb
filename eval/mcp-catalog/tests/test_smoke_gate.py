@@ -163,6 +163,39 @@ async def test_smoke_gate_requires_provider_evidence_for_each_model_request(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_usage",
+    [
+        {"prompt_tokens": 5, "completion_tokens": 1, "cost": 0},
+        {"prompt_tokens": 0, "completion_tokens": 0, "cost": 0.000005},
+    ],
+)
+async def test_smoke_gate_rejects_response_without_positive_usage_and_cost(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_usage: dict[str, float | int],
+) -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    runner = BenchmarkRunner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
+    monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
+
+    async def incomplete_usage_smoke(task, *, model_spec, transport, **_kwargs):
+        outcome = _smoke_outcome(task, model_spec, transport)
+        evidence = list(outcome.provider_evidence)
+        evidence[1] = {**evidence[1], "usage": invalid_usage}
+        return outcome.model_copy(update={"provider_evidence": evidence})
+
+    monkeypatch.setattr(runner_module, "execute_smoke", incomplete_usage_smoke)
+
+    with pytest.raises(RuntimeContractError, match="smoke gate cell"):
+        await runner._run_smoke_gate(
+            fixture=_SmokeFixture(),
+            resolver=_SmokeResolver(),
+            ledger=BudgetLedger(manifest),
+        )
+
+
+@pytest.mark.asyncio
 async def test_smoke_gate_blocks_when_cell_has_no_successful_mcp_call(monkeypatch: pytest.MonkeyPatch) -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
