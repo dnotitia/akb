@@ -21,6 +21,7 @@ from app.services.file_service import (
     content_disposition_inline,
     head_object,
     iter_object_chunks,
+    store_object_stream,
 )
 from app.services.raw_mime_policy import is_inert_raw_mime
 from app.util.text import normalize_content_type, to_nfc
@@ -28,9 +29,17 @@ from app.util.text import normalize_content_type, to_nfc
 router = APIRouter()
 file_service = FileService()
 _measurement_transfer_slots = asyncio.Semaphore(2)
-# Bounded like its sibling above. botocore's shared pool is 10 connections
-# and a stream holds one for the whole object.
+# Bounded like its sibling above. A download streams one GET response for the
+# whole object, so it holds a botocore connection and an anyio thread from the
+# first byte to the last.
 _download_capability_slots = asyncio.Semaphore(4)
+# An upload bounds something different, and the number reflects that. Each
+# part is a discrete request, so the connection and the thread go back between
+# parts; what is held for the whole transfer is the part buffer. Eight of them
+# is a modest fixed cost, and the extra slots matter because here it is the
+# *client* that sets the pace — a handful of slow senders must not be able to
+# block every other upload.
+_upload_capability_slots = asyncio.Semaphore(8)
 
 
 @router.api_route("/files/transfer/{token}", methods=["PUT", "GET"], include_in_schema=False)
@@ -57,7 +66,58 @@ async def measurement_file_transfer(token: str, request: Request):
         return Response(content=data or b"", media_type="application/octet-stream")
 
 
-@router.post("/files/{vault}/upload", summary="Upload a file (presigned URL flow)")
+@router.api_route(
+    "/files/upload/{token}", methods=["PUT"], include_in_schema=False,
+)
+async def upload_by_capability(token: str, request: Request):
+    """Accept File bytes from a holder of an upload capability.
+
+    No user-token dependency: the short-lived capability is the authorization,
+    exactly as a presigned signature was, and it names the one key these bytes
+    may land on. The public contract is the `upload_url` field, not this path,
+    so it stays out of the schema.
+
+    Registered ahead of every `/files/{vault}/...` route. Nothing can collide
+    with it today — a capability token cannot spell `upload` — but the order
+    is what makes that true regardless of what a vault is called.
+    """
+    grant = await file_service.resolve_write_capability(token)
+    max_bytes = settings.file_upload_max_bytes
+
+    # Reject an oversized upload before reading any of it. The streaming
+    # counter inside `store_object_stream` is the authority — a header can be
+    # absent or wrong — but honouring it here saves transferring bytes that
+    # are going to be refused.
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            declared_size = int(declared)
+        except ValueError as exc:
+            raise AKBError("Invalid Content-Length", status_code=400) from exc
+        if declared_size < 0:
+            raise AKBError("Invalid Content-Length", status_code=400)
+        if declared_size > max_bytes:
+            raise AKBError(
+                "Upload exceeds the maximum accepted size", status_code=413,
+            )
+
+    # Held for the whole transfer. Unlike the download route this is a plain
+    # `async with`: the response is sent after the body has been consumed, so
+    # the slot's lifetime really is this function's.
+    async with _upload_capability_slots:
+        await store_object_stream(
+            grant["object_key"],
+            request.stream(),
+            content_type=grant["mime_type"],
+            max_bytes=max_bytes,
+        )
+    # No ETag header: the presigned PUT returned the object store's and no
+    # caller read it. AKB certifies these bytes at `confirm`, from the stored
+    # object rather than from anything the client was told here.
+    return Response(status_code=200)
+
+
+@router.post("/files/{vault}/upload", summary="Reserve an upload and get its URL")
 async def upload_file(
     request: Request,
     vault: str,
@@ -77,7 +137,7 @@ async def upload_file(
     ),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
-    """Returns a presigned PUT URL. Client uploads directly to S3."""
+    """Reserve a file and return the absolute URL its bytes are PUT to."""
     access, actor_id, _delegated_actor = await _resolve_file_write_context(
         request, vault, user,
     )
@@ -102,7 +162,7 @@ async def confirm_upload(
     hash_algorithm: str = Query("sha256", description="Hash algorithm for content_hash"),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
-    """Called after presigned URL upload. Updates size and byte hash from S3."""
+    """Called once the bytes are uploaded. Certifies size and hash from storage."""
     access, actor_id, delegated_actor = await _resolve_file_write_context(
         request, vault, user,
     )
@@ -133,14 +193,15 @@ async def replace_file(
     ),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
-    """Return an isolated presigned PUT URL, or ``unchanged=true``."""
-    access, _actor_id, _delegated_actor = await _resolve_file_write_context(
+    """Return an isolated upload URL for the replacement, or ``unchanged=true``."""
+    access, actor_id, _delegated_actor = await _resolve_file_write_context(
         request, vault, user,
     )
     return await file_service.initiate_replace(
         vault_name=vault,
         vault_id=access["vault_id"],
         file_id=file_id,
+        actor_id=actor_id,
         content_hash=content_hash,
         mime_type=mime_type,
         expected_content_hash=expected_content_hash,

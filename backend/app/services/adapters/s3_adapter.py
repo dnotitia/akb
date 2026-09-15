@@ -84,9 +84,20 @@ _STREAM_CHUNK_SIZE = 64 * 1024
 _PRESIGN_CLOCK_MARGIN = 60
 
 
+# botocore's default is 10, which was ample while every byte moved directly
+# between the client and the object store. Both transfer directions now go
+# through this service: a download holds one connection for the whole object,
+# and concurrent uploads each take one per part. The bounded slots in the file
+# routes can reach twelve between them before any ordinary head/get/put asks
+# for one, and exceeding the pool does not fail — urllib3 quietly opens and
+# discards a connection per call instead, which is worse than sizing it.
+_MAX_POOL_CONNECTIONS = 32
+
+
 def _boto_config(*, endpoint_url: str = ""):
     return BotoConfig(
         signature_version="s3v4",
+        max_pool_connections=_MAX_POOL_CONNECTIONS,
         connect_timeout=settings.s3_connect_timeout_secs,
         read_timeout=settings.s3_read_timeout_secs,
         retries={"max_attempts": settings.s3_max_attempts, "mode": "standard"},
@@ -266,6 +277,57 @@ def put_bytes(
         )
     except ClientError as e:
         raise StorageError(wrap_error(e, f"write {key}").message) from e
+
+
+# Multipart primitives. The upload route receives a request body it cannot
+# size in advance and must not hold in memory — the largest stored File is
+# multi-gigabyte. Each call is one blocking boto3 operation; the service layer
+# sequences them off the event loop.
+MULTIPART_MIN_PART_BYTES = 8 * 1024 * 1024
+
+
+def multipart_create(key: str, content_type: str) -> str:
+    try:
+        r = client().create_multipart_upload(
+            Bucket=settings.s3_bucket, Key=key, ContentType=content_type,
+        )
+    except ClientError as e:
+        raise StorageError(wrap_error(e, f"begin write {key}").message) from e
+    return str(r["UploadId"])
+
+
+def multipart_part(key: str, upload_id: str, part_number: int, body: bytes) -> str:
+    try:
+        r = client().upload_part(
+            Bucket=settings.s3_bucket, Key=key, UploadId=upload_id,
+            PartNumber=part_number, Body=body,
+        )
+    except ClientError as e:
+        raise StorageError(wrap_error(e, f"write part {part_number} of {key}").message) from e
+    return str(r["ETag"])
+
+
+def multipart_complete(key: str, upload_id: str, parts: list[dict[str, Any]]) -> dict[str, Any]:
+    try:
+        client().complete_multipart_upload(
+            Bucket=settings.s3_bucket, Key=key, UploadId=upload_id,
+            MultipartUpload={"Parts": parts},
+        )
+    except ClientError as e:
+        raise StorageError(wrap_error(e, f"finish write {key}").message) from e
+    return head(key)
+
+
+def multipart_abort(key: str, upload_id: str) -> None:
+    """Best effort. An abandoned multipart upload is billable storage that no
+    listing shows, so it is worth attempting even while handling another
+    failure — but never worth masking that failure with this one."""
+    try:
+        client().abort_multipart_upload(
+            Bucket=settings.s3_bucket, Key=key, UploadId=upload_id,
+        )
+    except Exception as e:  # noqa: BLE001 — abort runs on an error path
+        logger.warning("abandoned multipart upload %s (%s): %s", key, upload_id, e)
 
 
 def copy(source_key: str, destination_key: str) -> dict[str, Any]:

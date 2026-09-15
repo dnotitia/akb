@@ -929,7 +929,6 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                 "description": _nullable_string(),
                 "upload_url": {"type": "string"},
                 "download_url": {"type": "string"},
-                "s3_key": {"type": "string"},
                 "content_hash": _nullable_string(),
                 "hash_algorithm": _nullable_string(),
                 "etag": _nullable_string(),

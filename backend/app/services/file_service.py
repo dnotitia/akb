@@ -1,7 +1,10 @@
 """File service — S3-backed binary file storage for vaults.
 
 AKB does not store file bytes in the application database. It:
-1. Generates presigned URLs for direct client ↔ S3 transfer.
+1. Issues capability URLs — this service plus an opaque token — that a client
+   PUTs to or GETs from with no Authorization header, the way it used to use a
+   presigned URL. Bytes stream through this service; the object store's
+   endpoint, bucket and keys stay private to it.
 2. Manages file metadata in PostgreSQL (`vault_files_repo`).
 3. Streams uploaded object bytes once at confirmation to certify sha256.
 
@@ -21,7 +24,7 @@ import logging
 import re
 import secrets
 import uuid
-from typing import Iterator
+from typing import Any, AsyncIterator, Iterator
 from urllib.parse import quote
 
 from app.config import settings
@@ -310,6 +313,140 @@ def _capability_url(token: str) -> str:
     return f"{base}/api/v1/files/download/{token}"
 
 
+def _write_capability_url(token: str) -> str:
+    base = (settings.public_base_url or "").rstrip("/")
+    return f"{base}/api/v1/files/upload/{token}"
+
+
+async def _issue_write_capability(
+    conn,
+    *,
+    file_id: uuid.UUID,
+    vault_id: uuid.UUID,
+    object_key: str,
+    filename: str,
+    mime_type: str,
+    actor_id: str,
+    collection_id: uuid.UUID | None = None,
+    declared_content_hash: str | None = None,
+    intent_id: uuid.UUID | None = None,
+    ttl: int = _PRESIGN_UPLOAD_TTL,
+) -> str:
+    """Grant one PUT to one object key and return the bearer token.
+
+    Only the digest is stored, exactly as for a download grant: the URL handed
+    back to the caller is the only copy of the token that will ever exist.
+    Naming the key is what keeps a capability issued for a replacement's
+    staging key from being redeemable against the live object.
+    """
+    token = _new_capability_token()
+    await conn.execute(
+        """
+        INSERT INTO m1_file_transfer_intents (
+            id, file_id, vault_id, collection_id, method, filename, mime_type,
+            actor_id, declared_content_hash, object_key, token_digest, expires_at
+        ) VALUES (
+            $1, $2, $3, $4, 'PUT', $5, $6, $7, $8, $9, $10,
+            NOW() + ($11 * INTERVAL '1 second')
+        )
+        """,
+        intent_id or uuid.uuid4(), file_id, vault_id, collection_id,
+        filename, mime_type, actor_id, declared_content_hash, object_key,
+        _capability_digest(token), ttl,
+    )
+    return token
+
+
+async def store_object_stream(
+    object_key: str,
+    chunks: AsyncIterator[bytes],
+    *,
+    content_type: str,
+    max_bytes: int,
+) -> int:
+    """Write a request body of unknown length to one key; return its size.
+
+    Buffers up to one part before deciding how to store. A body that fits in
+    that buffer is a single PUT — which is the overwhelming majority of Files —
+    so the common case costs one round trip rather than three. Only a body that
+    outgrows the buffer becomes a multipart upload, and then no more than one
+    part is ever held in memory at a time. A File can be multi-gigabyte, so
+    holding the body was never an option.
+
+    Parts are sent one at a time. Overlapping them would read from the client
+    while a part is in flight, but it would also double the resident buffer
+    and leave a part in flight to reason about on the abort path; the transfer
+    is bounded by how fast the client sends in any case.
+    """
+    part_size = s3_adapter.MULTIPART_MIN_PART_BYTES
+    buf = bytearray()
+    received = 0
+    upload_id: str | None = None
+    parts: list[dict[str, Any]] = []
+
+    async def _send_part() -> None:
+        nonlocal upload_id, buf
+        if upload_id is None:
+            upload_id = await asyncio.to_thread(
+                s3_adapter.multipart_create, object_key, content_type,
+            )
+        number = len(parts) + 1
+        etag = await asyncio.to_thread(
+            s3_adapter.multipart_part, object_key, upload_id, number, bytes(buf),
+        )
+        parts.append({"PartNumber": number, "ETag": etag})
+        buf = bytearray()
+
+    try:
+        async for chunk in chunks:
+            if not chunk:
+                continue
+            received += len(chunk)
+            if received > max_bytes:
+                raise AKBError(
+                    "Upload exceeds the maximum accepted size", status_code=413,
+                )
+            buf.extend(chunk)
+            if len(buf) >= part_size:
+                await _send_part()
+        if upload_id is None:
+            # Never grew past one part. A zero-byte body stores a zero-byte
+            # object, which is what a presigned PUT of the same body did.
+            await asyncio.to_thread(
+                s3_adapter.put_bytes, object_key, bytes(buf),
+                content_type=content_type,
+            )
+            return received
+        if buf:
+            await _send_part()
+        await asyncio.to_thread(
+            s3_adapter.multipart_complete, object_key, upload_id, parts,
+        )
+        return received
+    except BaseException:
+        # An abandoned multipart upload is billable storage that no object
+        # listing shows and nothing garbage-collects, so it has to be
+        # abandoned explicitly.
+        if upload_id is not None:
+            _abandon_multipart(object_key, upload_id)
+        raise
+
+
+def _abandon_multipart(object_key: str, upload_id: str) -> None:
+    """Abandon a multipart upload without waiting for the result.
+
+    Deliberately not awaited. The exception that brings us here is most often
+    the cancellation raised when a client disconnects mid-body, and awaiting
+    anything inside a cancelled scope raises again immediately — so an
+    `await`ed cleanup would be skipped in exactly the case it exists for.
+    `multipart_abort` returns nothing and logs its own failures, so there is
+    nothing to wait for.
+    """
+    asyncio.get_running_loop().run_in_executor(
+        None, s3_adapter.multipart_abort, object_key, upload_id,
+    )
+
+
 def _file_envelope(row: dict, vault_name: str) -> dict:
     """The File metadata envelope, shared by the list and single-File reads.
 
@@ -415,9 +552,9 @@ class FileService:
         description: str = "",
         content_hash: str | None = None,
     ) -> dict:
-        """Create a file record and return a presigned PUT URL.
+        """Create a file record and return the URL its bytes are PUT to.
 
-        Client (akb-mcp proxy) uploads directly to S3, then calls
+        The client PUTs the bytes to that absolute URL, then calls
         confirm_upload(). `collection` is a path string (empty / None
         for vault root); a matching `collections` row is auto-created
         if needed so files share the same FK-normalized hierarchy as
@@ -429,8 +566,8 @@ class FileService:
         the same vault/collection/filename resolves to the file that is
         already there instead of creating a second row for the same content.
         The returned envelope is unchanged in shape and still carries a usable
-        `upload_url` — an unaware client can re-PUT the identical bytes to the
-        identical key and confirm as usual; the net effect is one row, not two.
+        `upload_url` — an unaware client can re-PUT the identical bytes and
+        confirm as usual; the net effect is one row, not two.
         `deduplicated` says which happened, for clients that would rather skip
         the redundant transfer.
 
@@ -507,10 +644,20 @@ class FileService:
                     created_by=actor_id,
                     collection_id=collection_id,
                 )
-
-        presigned_url = s3_adapter.presign_put(
-            s3_key, content_type=mime_type, ttl=_PRESIGN_UPLOAD_TTL,
-        )
+                # Issued inside the same transaction as the reservation it
+                # authorizes: a capability that outlived a rolled-back
+                # reservation would name a key nothing owns.
+                token = await _issue_write_capability(
+                    conn,
+                    file_id=stored_id,
+                    vault_id=vault_id,
+                    collection_id=collection_id,
+                    object_key=s3_key,
+                    filename=filename,
+                    mime_type=mime_type,
+                    actor_id=actor_id,
+                    declared_content_hash=content_hash,
+                )
 
         deduplicated = stored_id != file_id
         file_id = stored_id
@@ -524,9 +671,13 @@ class FileService:
             "uri": file_uri(vault_name, str(file_id), collection=collection_path),
             "vault": vault_name,
             "collection": collection_path or None,
-            "upload_url": presigned_url.url,
-            "s3_key": s3_key,
-            "expires_in": presigned_url.expires_in,
+            # Names this service and an opaque token — never the object
+            # store's endpoint, bucket or key. What a caller does with it is
+            # unchanged: PUT the bytes to this absolute URL, no Authorization
+            # header. `s3_key` is gone; it was a storage locator in a public
+            # response and nothing ever read it.
+            "upload_url": _write_capability_url(token),
+            "expires_in": _PRESIGN_UPLOAD_TTL,
             "deduplicated": deduplicated,
         }
 
@@ -536,6 +687,7 @@ class FileService:
         vault_id: uuid.UUID,
         file_id: str,
         *,
+        actor_id: str,
         content_hash: str,
         mime_type: str | None = None,
         expected_content_hash: str | None = None,
@@ -543,9 +695,10 @@ class FileService:
     ) -> dict:
         """Prepare an isolated upload that can replace one logical file.
 
-        No live object key is exposed for PUT.  The caller uploads to a
-        replacement-specific staging key and ``confirm_replace`` publishes a
-        fresh object only after re-checking the optimistic-concurrency pins.
+        The capability is bound to a replacement-specific staging key, so it
+        cannot be redeemed against the live object.  ``confirm_replace``
+        publishes a fresh object only after re-checking the
+        optimistic-concurrency pins.
         """
         if not is_sha256_hex(content_hash):
             raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
@@ -594,20 +747,28 @@ class FileService:
         upload_mime_type = _normalize_content_type(
             mime_type or row.get("mime_type")
         )
-        upload_url = s3_adapter.presign_put(
-            staging_key,
-            content_type=upload_mime_type,
-            ttl=_PRESIGN_UPLOAD_TTL,
-        )
         # An abandoned replacement has no vault_files row from which a normal
         # delete can discover its staging key.  Schedule cleanup just after the
-        # presigned URL expires; successful confirmation also enqueues an
+        # capability expires; successful confirmation also enqueues an
         # immediate delete, and duplicate S3 deletes are intentionally safe.
         async with pool.acquire() as conn:
             await _enqueue_s3_delete(
                 conn,
                 staging_key,
                 delay_seconds=_REPLACEMENT_STAGING_DELETE_DELAY,
+            )
+            # The capability names the staging key, so it cannot be redeemed
+            # against the live object this replacement is meant to supersede.
+            token = await _issue_write_capability(
+                conn,
+                file_id=fid,
+                vault_id=vault_id,
+                object_key=staging_key,
+                filename=row["name"],
+                mime_type=upload_mime_type,
+                actor_id=actor_id,
+                declared_content_hash=content_hash,
+                intent_id=replacement_id,
             )
         return {
             "kind": "file",
@@ -617,8 +778,8 @@ class FileService:
             "name": row["name"],
             "mime_type": upload_mime_type,
             "replacement_id": str(replacement_id),
-            "upload_url": upload_url.url,
-            "expires_in": upload_url.expires_in,
+            "upload_url": _write_capability_url(token),
+            "expires_in": _PRESIGN_UPLOAD_TTL,
             "current_content_hash": row.get("content_hash"),
             "current_version": current_version,
             "unchanged": False,
@@ -1152,6 +1313,56 @@ class FileService:
         ):
             raise NotFoundError("File", "capability")
         return row
+
+    async def resolve_write_capability(self, token: str) -> dict:
+        """Resolve an upload capability to the single key it may write.
+
+        Not single-use, for the same reason the download grant is not: a
+        transfer that dropped at 90% has to be startable again, which is
+        exactly what re-PUTting a presigned URL did. Expiry is the bound.
+
+        Whether the bytes ever arrived is deliberately not recorded here. The
+        object store is the authority on that and `confirm_upload` asks it
+        directly; a second record of the same fact could only disagree.
+
+        A row without `object_key` belongs to the measurement lane, which
+        carries its bytes in the database and addresses no object store. It is
+        refused rather than having a key inferred for it — and like every
+        other rejection here it is the same 404, so an expired token, a token
+        that was never issued and a token for another lane stay
+        indistinguishable.
+
+        The join is what a presigned URL could not do: if the File was deleted
+        between the reservation and the transfer, the capability stops working
+        instead of writing bytes to a key nothing references any more. One
+        query, because the grant alone was never the whole answer.
+        """
+        if not _is_capability_token_shaped(token):
+            raise NotFoundError("File", "capability")
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            grant = await conn.fetchrow(
+                """
+                SELECT i.file_id, i.vault_id, i.object_key, i.mime_type
+                  FROM m1_file_transfer_intents AS i
+                  JOIN vault_files AS f
+                    ON f.id = i.file_id AND f.vault_id = i.vault_id
+                 WHERE i.token_digest = $1 AND i.method = 'PUT'
+                   AND i.object_key IS NOT NULL AND i.expires_at > NOW()
+                """,
+                _capability_digest(token),
+            )
+        if grant is None:
+            raise NotFoundError("File", "capability")
+        return {
+            "file_id": grant["file_id"],
+            "vault_id": grant["vault_id"],
+            "object_key": grant["object_key"],
+            # The type the bytes will be stored and later served under is the
+            # one AKB normalized when the capability was issued, not one the
+            # uploading client restates at PUT time.
+            "mime_type": _normalize_content_type(grant["mime_type"]),
+        }
 
     async def list_files(
         self,

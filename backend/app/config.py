@@ -618,6 +618,14 @@ class Settings(BaseModel):
     native_revision_m1_file_fscas_root: str = ""
     native_revision_m1_file_transfer_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1, le=128 * 1024 * 1024)
 
+    # Ceiling on one capability upload. The bytes stream straight through to
+    # the object store, so this bounds the transfer rather than any buffer —
+    # the default clears the largest File AKB is known to hold. The reverse
+    # proxy in front of this service has its own body limit and will reject an
+    # oversized upload earlier and more cheaply; this is the backstop for when
+    # it does not.
+    file_upload_max_bytes: int = Field(default=5 * 1024 * 1024 * 1024, ge=1)
+
     # External-git mirror — network timeouts (seconds) for the poller's
     # three remote-aware git ops. A hanging TCP session otherwise stalls
     # the entire poller task forever since asyncio.to_thread can't cancel

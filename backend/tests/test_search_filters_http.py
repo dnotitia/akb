@@ -104,8 +104,13 @@ async def test_live_login_search_filters_and_vault_isolation():
                     "filename": f"fixture-{number}.txt", "collection": collection,
                     "description": "DeploymentNeedle", "mime_type": "text/plain",
                 })
-                # The isolated runtime exposes its own local MinIO endpoint.
-                assert urlparse(upload["upload_url"]).hostname in {"localhost", "127.0.0.1"}
+                # The URL names AKB itself, not the object store: no host of
+                # its own, no signature, and a path this service answers.
+                parsed = urlparse(upload["upload_url"])
+                assert parsed.path.startswith("/api/v1/files/upload/"), upload["upload_url"]
+                assert not parsed.query, "a capability carries no signature"
+                if parsed.hostname is not None:
+                    assert parsed.hostname in {"localhost", "127.0.0.1"}
                 uploaded = await client.put(upload["upload_url"], content=b"DeploymentNeedle", headers={"Content-Type": "text/plain"})
                 assert uploaded.is_success
                 file_id = upload["uri"].rsplit("/", 1)[1]

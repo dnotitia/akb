@@ -355,6 +355,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "101_local_session_generation.py",  # monotonic local session revocation
         "102_account_self_lifecycle.py",  # independent deletion cleanup and confirmation budget
         "103_sso_account_lifecycle.py",  # SSO browser logout and managed account sync
+        "104_file_write_capability_key.py",  # the one object key a file write capability grants
     ):
         if filename in applied:
             continue
