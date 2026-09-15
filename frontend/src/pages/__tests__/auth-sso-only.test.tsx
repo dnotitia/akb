@@ -241,3 +241,27 @@ describe("AuthPage mode gate", () => {
     expect(screen.queryByLabelText(/Username/i)).toBeNull();
   });
 });
+
+
+describe("Account lifecycle completion notices", () => {
+  it("explains AKB-only browser sign-out and offers SSO sign-in again", async () => {
+    window.history.replaceState({}, "", "/auth?reason=sso-sessions-revoked");
+    vi.mocked(getAuthConfig).mockResolvedValue({
+      ...stagedSsoConfig,
+      keycloak: { enabled: true, browser_session_ready: true },
+      providers: [{ ...stagedSsoConfig.providers[0], login_url: "/api/v1/auth/sso/workforce/login" }],
+    });
+    renderAuth();
+    expect(await screen.findByText(/Your AKB browser sessions have been signed out/)).toHaveTextContent("identity provider session and personal access tokens remain active");
+    expect(screen.getByText(/Your AKB browser sessions have been signed out/)).toHaveTextContent("account and Vault data are preserved");
+    expect(screen.getByRole("button", { name: /Sign in with Company SSO/i })).toBeInTheDocument();
+    expect(screen.queryByText(/Your local login sessions have been signed out/)).not.toBeInTheDocument();
+  });
+
+  it("retains the local session completion notice", async () => {
+    window.history.replaceState({}, "", "/auth?reason=sessions-revoked");
+    vi.mocked(getAuthConfig).mockResolvedValue(localConfig);
+    renderAuth();
+    expect(await screen.findByText(/Your local login sessions have been signed out/)).toHaveTextContent("Personal access tokens remain active");
+  });
+});

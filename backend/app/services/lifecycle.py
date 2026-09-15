@@ -18,6 +18,8 @@ from app.process_role import runtime_process_role
 from app.services._backfill import request_stop_all, runner_snapshots
 from app.services import (
     asset_gc_worker,
+    account_deletion_worker,
+    sso_account_sync,
     audit_log,
     app_rollout_worker,
     delete_worker,
@@ -327,6 +329,8 @@ def start_workers(*, include_api_local: bool = True) -> None:
     embed_worker.start()
     delete_worker.start()
     notification_worker.start()
+    account_deletion_worker.start()
+    sso_account_sync.start()
     # ``start_workers`` is normally called from the FastAPI lifespan loop.
     # Keep direct, loop-free lifecycle probes (and import-time diagnostics)
     # side-effect free; the rollout runner owns asyncio tasks and cannot be
@@ -455,6 +459,8 @@ async def stop_workers(*, include_api_local: bool = True) -> None:
         ("m1_file_transfer_reaper", m1_file_transfer_reaper.stop),
         ("events_publisher", events_publisher.stop),
         ("notification_worker", notification_worker.stop),
+        ("account_deletion_worker", account_deletion_worker.stop),
+        ("sso_account_sync", sso_account_sync.stop),
         ("metadata_worker", metadata_worker.stop),
         ("external_git_poller", external_git_poller.stop),
         ("asset_gc_worker", asset_gc_worker.stop),

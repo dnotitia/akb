@@ -502,7 +502,7 @@ async def keycloak_callback(
         state,
         request.cookies.get(_sso_oidc_binding_cookie_name(), ""),
     )
-    if not isinstance(transient, dict) or set(transient) != {
+    if not isinstance(transient, dict) or set(transient) - {"login_sequence"} != {
         "redirect_path",
         "provider_alias",
         "client_id",
@@ -510,6 +510,14 @@ async def keycloak_callback(
         "nonce",
     }:
         return _sso_sign_in_failed()
+    login_sequence = None
+    if "login_sequence" in transient:
+        raw_sequence = transient["login_sequence"]
+        if not isinstance(raw_sequence, str) or not raw_sequence.isascii() or not raw_sequence.isdecimal() or len(raw_sequence) > 19:
+            return _sso_sign_in_failed()
+        login_sequence = int(raw_sequence)
+        if not 0 < login_sequence < 2**63:
+            return _sso_sign_in_failed()
     if transient.get("client_id") != settings.keycloak_client_id:
         return _sso_sign_in_failed()
     provider_alias = transient.get("provider_alias")
@@ -554,12 +562,16 @@ async def keycloak_callback(
         # The one place the reason is repeated, and only for the refusal the
         # allowlist above admits.
         return _sso_sign_in_failed(outcome.refusal_code)
-    issued = await create_sso_browser_session(
-        user,
-        principal,
-        id_claims,
-        tokens,
-    )
+    try:
+        issued = await create_sso_browser_session(
+            user,
+            principal,
+            id_claims,
+            tokens,
+            login_sequence=login_sequence,
+        )
+    except AuthenticationError:
+        return _sso_sign_in_failed()
     response = RedirectResponse(redirect_path, status_code=status.HTTP_303_SEE_OTHER)
     _set_sso_session_cookies(response, issued)
     _clear_sso_oidc_binding_cookie(response)

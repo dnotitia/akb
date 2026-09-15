@@ -108,8 +108,8 @@ export function Layout() {
           queryClient.clear();
         }
         setSession({ status: "authenticated", user: verified });
-      } catch {
-        if (disposed) return;
+      } catch (error) {
+        if (disposed || (error instanceof Error && error.name === "DeferredSessionError")) return;
         queryClient.clear();
         clearPrivateAssetCache();
         setSession({ status: "unauthenticated", user: null });

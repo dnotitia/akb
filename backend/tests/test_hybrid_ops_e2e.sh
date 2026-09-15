@@ -197,10 +197,10 @@ rcurl -X POST "$BASE/mcp/" -H "Authorization: Bearer $PAT_C" \
   -H "mcp-session-id: $SID" \
   -d "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"tools/call\",\"params\":{\"name\":\"akb_delete_vault\",\"arguments\":{\"vault\":\"$VAULT\"}}}" >/dev/null
 # Self-delete all 3 test users
-for P in "$PAT_A" "$PAT_B" "$PAT_C"; do
-  curl -sk --max-time 15 -X DELETE "$BASE/api/v1/my/account" -H "Authorization: Bearer $P" >/dev/null 2>&1
+for FIXTURE_USER in "$A" "$B" "$C"; do
+  python3 "$(dirname "${BASH_SOURCE[0]}")/helpers/cleanup_hybrid_account.py" "$BASE" "$FIXTURE_USER" <<<'test1234' \
+    && pass "fixture account cleanup confirmed" || fail "cleanup" "safe account cleanup failed"
 done
-pass "cleanup attempted"
 
 echo ""
 echo "═══════════════════════════════════════════"

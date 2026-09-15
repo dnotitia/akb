@@ -2,6 +2,7 @@
 
 Run with AKB_NOTIFICATION_E2E_URL=http://127.0.0.1:18000. Accounts and the
 private Vault are unique to this run and deleted in finally. No token is logged.
+The runtime must enable account_self_service_enabled and run its cleanup worker.
 """
 import ipaddress
 import os
@@ -55,6 +56,7 @@ def test_personal_inbox_http_and_background_worker():
     vault = f"notify-e2e-{suffix}"
     title = f"Private notification fixture {suffix}"
     clients = []
+    cleanup_credentials = {}
     cleanup_errors = []
     owner = None
     vault_created = False
@@ -70,6 +72,7 @@ def test_personal_inbox_http_and_background_worker():
                 client = httpx.Client(base_url=origin, timeout=30, follow_redirects=False,
                                       trust_env=False, headers={"Authorization": f"Bearer {login['token']}"})
                 clients.append(client)
+                cleanup_credentials[client] = (login["user"]["id"], username, password)
                 usernames.append(username)
                 del login, password
             owner, reader = clients
@@ -129,11 +132,18 @@ def test_personal_inbox_http_and_background_worker():
                         cleanup_errors.append("Vault cleanup transport error")
             for client in reversed(clients):
                 try:
-                    response = client.delete("/api/v1/my/account")
+                    uid, username, password = cleanup_credentials.pop(client)
+                    response = client.post("/api/v1/my/account/deletion", json={
+                        "expected_user_id": uid, "confirm_username": username, "current_password": password,
+                    })
                     if not response.is_success:
-                        cleanup_errors.append(f"Account cleanup HTTP {response.status_code}")
-                except httpx.HTTPError:
-                    cleanup_errors.append("Account cleanup transport error")
+                        cleanup_errors.append(f"Account cleanup HTTP {response.status_code}; "
+                                              "runtime requires account_self_service_enabled and cleanup worker")
+                    elif response.json() != {"deleted": True, "user_id": uid}:
+                        cleanup_errors.append("Account cleanup response did not confirm fixture identity")
+                    del password
+                except (httpx.HTTPError, ValueError):
+                    cleanup_errors.append("Account cleanup result unconfirmed")
                 finally:
                     client.close()
             if cleanup_errors:

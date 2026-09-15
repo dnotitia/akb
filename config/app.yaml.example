@@ -503,3 +503,15 @@ notification_retention_days: 90
 #   host: "0.0.0.0"               # the NetworkPolicy, not the bind address, is what makes this safe
 #   sampler_interval_secs: 300    # the only thing that decides what this surface costs
 #   activity_grace_minutes: 5     # settling time after a UTC day closes, before its volume is folded (permanently)
+
+# Enable after the session-generation backend rollout is complete on every pod.
+# Account deletion also requires the cleanup worker heartbeat to be healthy.
+account_self_service_enabled: false
+
+# Optional Keycloak-owned account disable/delete detection (read-only management
+# client needs realm and user read access). Checks 25 existing identities per tick;
+# detection latency includes a full paginated sweep and upstream availability.
+# Suspends AKB access and revokes AKB PAT/browser sessions, preserving all Vaults.
+# Never automatically reactivates accounts or logs out other Keycloak clients.
+sso_account_sync_enabled: false
+sso_account_sync_interval_secs: 30

@@ -757,6 +757,40 @@ class KeycloakProviderControl:
             broker_username=username,
         )
 
+    async def read_managed_account_states(self, subjects: tuple[str, ...]) -> dict[str, str]:
+        """Read one bounded page; missing users are authoritative only in a live realm.
+
+        This uses read-only management permissions. No account, upstream session,
+        or provider configuration is changed. A failed page returns no partial result.
+        """
+        self._require_direct()
+        if not 1 <= len(subjects) <= 25 or len(set(subjects)) != len(subjects):
+            raise _fail("account_sync_page_invalid")
+        for subject in subjects:
+            _opaque_subject(subject)
+        async with asyncio.timeout(20), self._client() as client:
+            token = await self._token(client)
+            realm_path = f"/admin/realms/{_path(self.config.realm)}"
+            response = await self._request(client, "GET", realm_path, token=token,
+                expected=frozenset({200}), code="account_sync_realm_unavailable")
+            realm = _object(self._json(response, code="account_sync_realm_invalid"),
+                            code="account_sync_realm_invalid")
+            if realm.get("realm") != self.config.realm or realm.get("enabled") is not True:
+                raise _fail("account_sync_realm_invalid")
+            states: dict[str, str] = {}
+            for subject in subjects:
+                response = await self._request(client, "GET", f"{realm_path}/users/{_path(subject)}",
+                    token=token, expected=frozenset({200, 404}), code="account_sync_user_unavailable")
+                if response.status_code == 404:
+                    states[subject] = "missing"
+                    continue
+                user = _object(self._json(response, code="account_sync_user_invalid"),
+                               code="account_sync_user_invalid")
+                if user.get("id") != subject or type(user.get("enabled")) is not bool:
+                    raise _fail("account_sync_user_invalid")
+                states[subject] = "active" if user["enabled"] else "disabled"
+            return states
+
 
 def _runtime_config() -> KeycloakAdminConfig:
     from app.config import settings

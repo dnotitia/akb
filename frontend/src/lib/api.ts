@@ -6,6 +6,7 @@ export type PublicAuthMode = AuthMode | "hybrid";
 let _token: string | null = null;
 let _authMode: AuthMode | null = null;
 let _authSessionGeneration = 0;
+let _ssoCsrfToken: string | null = null;
 const SAFE_AUTH_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 const LOCAL_TOKEN_STORAGE_KEY = "akb_token";
 const LEGACY_SSO_SESSION_KEY = "akb_legacy_sso";
@@ -187,6 +188,47 @@ export function getToken(): string | null {
   return _token;
 }
 
+export type AuthSessionSnapshot = Readonly<{ generation: number; token: string | null; mode: AuthMode | null; csrfToken: string | null }>;
+
+export function authSessionSnapshot(): AuthSessionSnapshot {
+  const token = getToken();
+  // The readable CSRF cookie changes with every SSO browser session. It binds
+  // a reviewed action to that session without exposing its HttpOnly credential.
+  const csrfToken = _authMode === "sso" ? cookieValue(ssoCsrfCookieName()) : null;
+  if (csrfToken !== _ssoCsrfToken) {
+    _ssoCsrfToken = csrfToken;
+    _authSessionGeneration += 1;
+    clearPrivateAssetCache();
+  }
+  return { generation: _authSessionGeneration, token, mode: _authMode, csrfToken };
+}
+
+export function isCurrentAuthSession(snapshot: AuthSessionSnapshot): boolean {
+  const current = authSessionSnapshot();
+  return current.generation === snapshot.generation && current.token === snapshot.token && current.mode === snapshot.mode && current.csrfToken === snapshot.csrfToken;
+}
+
+let lifecycleAttempt: { snapshot: AuthSessionSnapshot } | null = null;
+export function beginAccountLifecycle(snapshot: AuthSessionSnapshot): () => void {
+  if (!isCurrentAuthSession(snapshot) || lifecycleAttempt) {
+    throw new ApiError("Your session changed. Review this action again.", 409, { code: "account_identity_changed" });
+  }
+  const attempt = { snapshot };
+  lifecycleAttempt = attempt;
+  return () => { if (lifecycleAttempt === attempt) lifecycleAttempt = null; };
+}
+
+export function clearCompletedAccountSession(snapshot: AuthSessionSnapshot): boolean {
+  if (!isCurrentAuthSession(snapshot)) return false;
+  clearPrivateAssetCache();
+  clearLegacySsoSession();
+  setToken(null);
+  // SSO credentials are already revoked server-side. Leave the inert cookies
+  // alone so a late response cannot erase a newer login, and invalidate old work.
+  if (snapshot.mode === "sso") _authSessionGeneration += 1;
+  return true;
+}
+
 function ssoCsrfCookieName(): string {
   return window.location.protocol === "https:"
     ? "__Host-akb_sso_csrf"
@@ -218,7 +260,7 @@ function withAuthCarrier(headers: HeadersInit | undefined, method: string): Head
       const token = getToken();
       if (token) merged.set("Authorization", `Bearer ${token}`);
     }
-    if (_authMode === "sso" && unsafeMethod && !merged.has("Authorization")) {
+    if (_authMode === "sso" && unsafeMethod && !merged.has("Authorization") && !merged.has("X-AKB-CSRF")) {
       const csrf = cookieValue(ssoCsrfCookieName());
       if (csrf) merged.set("X-AKB-CSRF", csrf);
     }
@@ -231,7 +273,7 @@ function withAuthCarrier(headers: HeadersInit | undefined, method: string): Head
     const token = getToken();
     if (token) merged.Authorization = `Bearer ${token}`;
   }
-  if (_authMode === "sso" && unsafeMethod && !hasHeader("Authorization")) {
+  if (_authMode === "sso" && unsafeMethod && !hasHeader("Authorization") && !hasHeader("X-AKB-CSRF")) {
     const csrf = cookieValue(ssoCsrfCookieName());
     if (csrf) merged["X-AKB-CSRF"] = csrf;
   }
@@ -271,16 +313,21 @@ export async function authenticatedFetch(
   }
   const requestMethod = init?.method || (input instanceof Request ? input.method : "GET");
   const requestHeaders = init?.headers || (input instanceof Request ? input.headers : undefined);
+  const requestSession = authSessionSnapshot();
   const res = await fetch(input, {
     ...init,
     credentials: "same-origin",
     headers: withAuthCarrier(requestHeaders, requestMethod),
   });
   if (res.status === 401) {
-    if (unauthorized !== "preserve-session") {
+    const deferred = !isCurrentAuthSession(requestSession) ||
+      (lifecycleAttempt !== null && lifecycleAttempt.snapshot.generation === requestSession.generation);
+    if (unauthorized !== "preserve-session" && !deferred) {
       expireUnauthorizedSession(unauthorized === "expire-and-redirect");
     }
-    throw new Error("Unauthorized");
+    const error = new ApiError("Unauthorized", 401, null);
+    if (deferred) error.name = "DeferredSessionError";
+    throw error;
   }
   return res;
 }
@@ -295,7 +342,7 @@ async function throwJsonApiError(res: Response): Promise<never> {
       body.detail,
     );
   }
-  throw new Error(body.error || body.detail || `${res.status} ${res.statusText}`);
+  throw new ApiError(typeof body?.error === "string" ? body.error : typeof body?.detail === "string" ? body.detail : `${res.status} ${res.statusText}`, res.status, body?.detail ?? null);
 }
 
 async function api<T>(

@@ -228,6 +228,8 @@ class KeycloakOIDC:
         nonce = secrets.token_urlsafe(32)
         verifier = self._make_code_verifier()
         browser_binding = secrets.token_urlsafe(32)
+        from app.services.sso_browser_session_service import next_browser_login_sequence
+        login_sequence = await next_browser_login_sequence()
         payload: dict[str, str] = {
             "redirect_path": redirect_path,
             "provider_alias": provider_alias,
@@ -235,6 +237,7 @@ class KeycloakOIDC:
             "code_verifier": verifier,
             "nonce": nonce,
             "browser_binding_hash": hashlib.sha256(browser_binding.encode("ascii")).hexdigest(),
+            "login_sequence": str(login_sequence),
         }
         params: dict[str, str] = {
             "client_id": selected_client_id,
