@@ -9,7 +9,7 @@ import os
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable, Literal, cast
 from urllib.parse import urlsplit
 
@@ -49,7 +49,7 @@ MODEL_RESPONSES: contextvars.ContextVar[list[ModelResponse] | None] = contextvar
     "mcp_catalog_model_responses",
     default=None,
 )
-PROVIDER_REQUEST_GUARD: contextvars.ContextVar[Callable[[], Awaitable[None]] | None] = contextvars.ContextVar(
+PROVIDER_REQUEST_GUARD: contextvars.ContextVar[ProviderRequestGuard | None] = contextvars.ContextVar(
     "mcp_catalog_provider_request_guard",
     default=None,
 )
@@ -156,6 +156,8 @@ class OpenRouterChatModel(OpenAIChatModel):
         captured = MODEL_RESPONSES.get()
         if captured is not None:
             captured.append(response)
+        if guard is not None:
+            await guard.record_response(response)
         return response
 
     def _process_provider_details(self, response: Any) -> dict[str, Any] | None:
@@ -661,8 +663,8 @@ class BudgetLedger:
             raise GlobalWallDeadlineExceeded("global wall deadline exceeded")
         return min(float(self.manifest.budget.request_timeout_seconds), remaining)
 
-    def new_provider_request_guard(self) -> ProviderRequestGuard:
-        return ProviderRequestGuard(self)
+    def new_provider_request_guard(self, *, reserved_cost_usd: float = 0.0) -> ProviderRequestGuard:
+        return ProviderRequestGuard(self, reserved_cost_usd=reserved_cost_usd)
 
     async def reserve_trial(self, worst_case_cost_usd: float) -> None:
         async with self._lock:
@@ -695,6 +697,34 @@ class BudgetLedger:
                 raise BudgetExceeded(f"benchmark incomplete: {self._budget_failure}")
             self.requests += 1
 
+    async def block_provider_requests(self, reason: str) -> None:
+        async with self._lock:
+            self._budget_failure = reason
+
+    async def record_provider_response_cost(
+        self,
+        guard: ProviderRequestGuard,
+        cost_usd: Decimal,
+    ) -> None:
+        async with self._lock:
+            trial_cost = guard.provider_cost_usd + cost_usd
+            consumed_reservation = min(cost_usd, Decimal(str(guard.reserved_cost_usd)))
+            next_reserved = Decimal(str(self.reserved_cost_usd)) - consumed_reservation
+            next_cost = Decimal(str(self.cost_usd)) + cost_usd
+            guard.provider_cost_usd = trial_cost
+            guard.reserved_cost_usd = float(Decimal(str(guard.reserved_cost_usd)) - consumed_reservation)
+            self.reserved_cost_usd = float(next_reserved)
+            self.cost_usd = float(next_cost)
+
+            failure = None
+            if trial_cost > Decimal(str(self.manifest.budget.max_cost_per_trial_usd)):
+                failure = "max_cost_per_trial_usd exceeded"
+            elif next_cost + next_reserved > Decimal(str(self.manifest.budget.max_total_cost_usd)):
+                failure = "max_total_cost_usd exceeded"
+            if failure is not None:
+                self._budget_failure = failure
+                raise BudgetExceeded(f"benchmark incomplete: {failure}")
+
     async def release_all_reservations(self) -> float:
         async with self._lock:
             released = self.reserved_cost_usd
@@ -707,6 +737,7 @@ class BudgetLedger:
         *,
         reserved_cost_usd: float = 0.0,
         request_admissions: int = 0,
+        provider_cost_admissions: Decimal | float = 0.0,
     ) -> None:
         async with self._lock:
             if request_admissions < 0 or request_admissions > self.requests:
@@ -715,7 +746,11 @@ class BudgetLedger:
             next_requests = self.requests + max(0, outcome.model_requests - request_admissions)
             next_input = self.input_tokens + outcome.input_tokens
             next_output = self.output_tokens + outcome.output_tokens
-            next_cost = float(Decimal(str(self.cost_usd)) + Decimal(str(outcome.cost_usd)))
+            provider_cost_admissions = Decimal(str(provider_cost_admissions))
+            if provider_cost_admissions < 0:
+                raise BudgetExceeded("provider cost accounting cannot be negative")
+            unrecorded_cost = max(Decimal("0"), Decimal(str(outcome.cost_usd)) - provider_cost_admissions)
+            next_cost = float(Decimal(str(self.cost_usd)) + unrecorded_cost)
             next_wall = self.current_wall_seconds()
             next_model_work = float(
                 Decimal(str(self.model_work_seconds)) + Decimal(str(outcome.latency_seconds))
@@ -748,11 +783,27 @@ class BudgetLedger:
 @dataclass(slots=True)
 class ProviderRequestGuard:
     ledger: BudgetLedger
+    reserved_cost_usd: float
     requests: int = 0
+    provider_cost_usd: Decimal = field(default_factory=lambda: Decimal("0"))
 
     async def __call__(self) -> None:
         await self.ledger.admit_provider_request(self.requests)
         self.requests += 1
+
+    async def record_response(self, response: ModelResponse) -> None:
+        details = getattr(response, "provider_details", None)
+        usage = details.get("openrouter_usage") if isinstance(details, dict) else None
+        cost = usage.get("cost") if isinstance(usage, dict) else None
+        try:
+            provider_cost = Decimal(str(cost))
+        except (InvalidOperation, TypeError, ValueError):
+            provider_cost = Decimal("NaN")
+        if not provider_cost.is_finite() or provider_cost < 0:
+            reason = "max_total_cost_usd cannot be enforced without provider response cost"
+            await self.ledger.block_provider_requests(reason)
+            raise BudgetExceeded(f"benchmark incomplete: {reason}")
+        await self.ledger.record_provider_response_cost(self, provider_cost)
 
 
 async def run_agent_with_deadline(
@@ -764,7 +815,7 @@ async def run_agent_with_deadline(
     usage_limits: Any,
     request_timeout_seconds: float,
     remaining_wall_seconds: float,
-    request_guard: Callable[[], Awaitable[None]] | None = None,
+    request_guard: ProviderRequestGuard | None = None,
 ) -> Any:
     """Run one agent turn under both request and global monotonic deadlines."""
     if request_timeout_seconds <= 0 or remaining_wall_seconds <= 0:
@@ -854,7 +905,7 @@ class TrialExecutor:
             self._record_outcome(outcome)
             return outcome
         settled = False
-        request_guard = self.ledger.new_provider_request_guard()
+        request_guard = self.ledger.new_provider_request_guard(reserved_cost_usd=reservation)
         try:
             partial_messages: list[ModelResponse] = []
             capture_token = MODEL_RESPONSES.set(partial_messages)
@@ -930,8 +981,9 @@ class TrialExecutor:
             try:
                 await self.ledger.charge(
                     outcome,
-                    reserved_cost_usd=reservation,
+                    reserved_cost_usd=request_guard.reserved_cost_usd,
                     request_admissions=request_guard.requests,
+                    provider_cost_admissions=request_guard.provider_cost_usd,
                 )
             except BudgetExceeded as exc:
                 outcome.error = f"benchmark incomplete: {exc}"
@@ -943,7 +995,7 @@ class TrialExecutor:
             return outcome
         finally:
             if not settled:
-                await self.ledger.release_trial(reservation)
+                await self.ledger.release_trial(request_guard.reserved_cost_usd)
 
     def _record_outcome(self, outcome: TrialOutcome) -> None:
         if self.outcome_sink is not None:

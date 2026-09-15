@@ -505,6 +505,60 @@ async def test_provider_request_admission_enforces_global_request_limit() -> Non
 
 
 @pytest.mark.asyncio
+async def test_provider_response_cost_blocks_followup_request_before_the_trial_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registered = load_run_manifest(ROOT / "config" / "run.json")
+    budget = registered.budget.model_copy(
+        update={"max_total_cost_usd": 0.05, "max_cost_per_trial_usd": 0.01}
+    )
+    manifest = registered.model_copy(update={"budget": budget})
+    spec = manifest.models[0]
+    ledger = BudgetLedger(manifest)
+    reservation = 0.01
+    await ledger.reserve_trial(reservation)
+    model = OpenRouterChatModel(
+        spec.model_id,
+        provider=OpenAIProvider(
+            base_url=OPENROUTER_BASE_URL,
+            **{"api_" + "key": "fixture-provider-key"},
+        ),
+    )
+    response = ChatCompletion.model_validate(
+        {
+            "id": "response-over-trial-cap",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
+            "created": 1,
+            "model": spec.model_id,
+            "object": "chat.completion",
+            "openrouter_metadata": {
+                "endpoints": {"available": [{"provider": "OpenInference", "selected": True}]},
+            },
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cost": 0.006},
+        }
+    )
+    wire_request = AsyncMock(side_effect=[response, response])
+    monkeypatch.setattr(model.client.chat.completions, "create", wire_request)
+    request_guard = ledger.new_provider_request_guard(reserved_cost_usd=reservation)
+    guard_token = execution_module.PROVIDER_REQUEST_GUARD.set(request_guard)
+    call = [ModelRequest(parts=[UserPromptPart("hello")])]
+    try:
+        await model.request(call, model.settings, ModelRequestParameters())
+        with pytest.raises(BudgetExceeded, match="max_cost_per_trial_usd"):
+            await model.request(call, model.settings, ModelRequestParameters())
+        with pytest.raises(BudgetExceeded, match="max_cost_per_trial_usd"):
+            await model.request(call, model.settings, ModelRequestParameters())
+    finally:
+        execution_module.PROVIDER_REQUEST_GUARD.reset(guard_token)
+
+    assert wire_request.await_count == 2
+    assert ledger.cost_usd == pytest.approx(0.012)
+    assert ledger.reserved_cost_usd == 0
+    assert request_guard.requests == 2
+    assert float(request_guard.provider_cost_usd) == pytest.approx(0.012)
+
+
+@pytest.mark.asyncio
 async def test_model_request_guard_blocks_followup_calls_after_restored_budget_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

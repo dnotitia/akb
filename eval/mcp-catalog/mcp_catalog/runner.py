@@ -880,7 +880,7 @@ class BenchmarkRunner:
                     stage="smoke_gate",
                 ) from exc
 
-            request_guard = ledger.new_provider_request_guard()
+            request_guard = ledger.new_provider_request_guard(reserved_cost_usd=reservation)
             settled = False
             try:
                 await cell_fixture.reset()
@@ -927,8 +927,9 @@ class BenchmarkRunner:
                         )
                 await ledger.charge(
                     outcome,
-                    reserved_cost_usd=reservation,
+                    reserved_cost_usd=request_guard.reserved_cost_usd,
                     request_admissions=request_guard.requests,
+                    provider_cost_admissions=request_guard.provider_cost_usd,
                 )
                 settled = True
             except Exception as exc:
@@ -953,7 +954,7 @@ class BenchmarkRunner:
                     outcome.failure_kind = "budget"
             finally:
                 if not settled:
-                    await ledger.release_trial(reservation)
+                    await ledger.release_trial(request_guard.reserved_cost_usd)
 
             assert outcome is not None
             identity_matches = (
