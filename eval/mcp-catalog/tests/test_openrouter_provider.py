@@ -449,6 +449,46 @@ async def test_budget_reserves_preregistered_worst_case_before_a_trial() -> None
 
 
 @pytest.mark.asyncio
+async def test_over_trial_cost_is_recorded_and_blocks_followup_provider_reservations() -> None:
+    registered = load_run_manifest(ROOT / "config" / "run.json")
+    budget = registered.budget.model_copy(
+        update={"max_total_cost_usd": 0.05, "max_cost_per_trial_usd": 0.01}
+    )
+    manifest = registered.model_copy(update={"budget": budget})
+    ledger = BudgetLedger(manifest)
+    await ledger.reserve_trial(0.01)
+    outcome = TrialOutcome(
+        task_id="over-limit-cost",
+        category="single_operation",
+        arm="baseline",
+        model_class="primary",
+        model_id=manifest.models[0].model_id,
+        transport="http",
+        input_tokens=10,
+        output_tokens=2,
+        total_tokens=12,
+        model_requests=1,
+        cost_usd=0.02,
+        provider_evidence=[
+            {"model": manifest.models[0].model_id, "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.02}}
+        ],
+        provider_cost_usd=0.02,
+        cost_source="provider_response",
+    )
+
+    with pytest.raises(BudgetExceeded, match="max_cost_per_trial_usd"):
+        await ledger.charge(outcome, reserved_cost_usd=0.01)
+
+    assert ledger.cost_usd == pytest.approx(0.02)
+    assert ledger.requests == 1
+    assert ledger.input_tokens == 10
+    assert ledger.output_tokens == 2
+    await ledger.release_trial(0.01)
+    with pytest.raises(BudgetExceeded, match="max_cost_per_trial_usd"):
+        await ledger.reserve_trial(0.01)
+
+
+@pytest.mark.asyncio
 async def test_large_token_outcome_is_recorded_without_a_token_budget_gate() -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     ledger = BudgetLedger(manifest)

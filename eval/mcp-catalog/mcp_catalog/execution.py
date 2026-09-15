@@ -602,6 +602,7 @@ class BudgetLedger:
     wall_seconds: float = 0.0
     model_work_seconds: float = 0.0
     reserved_cost_usd: float = 0.0
+    _budget_failure: str | None = None
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def restore(
@@ -654,6 +655,8 @@ class BudgetLedger:
     async def reserve_trial(self, worst_case_cost_usd: float) -> None:
         async with self._lock:
             budget = self.manifest.budget
+            if self._budget_failure is not None:
+                raise BudgetExceeded(f"{self._budget_failure}; no further provider requests are allowed")
             if self.requests >= budget.max_model_requests:
                 raise BudgetExceeded("max_model_requests exceeded")
             if self.current_wall_seconds() >= budget.max_wall_seconds:
@@ -685,21 +688,27 @@ class BudgetLedger:
                 Decimal(str(self.model_work_seconds)) + Decimal(str(outcome.latency_seconds))
             )
             budget = self.manifest.budget
+            failure: str | None = None
             if outcome.model_requests > budget.max_requests_per_trial:
-                raise BudgetExceeded("max_requests_per_trial exceeded")
-            if outcome.cost_usd > budget.max_cost_per_trial_usd:
-                raise BudgetExceeded("max_cost_per_trial_usd exceeded")
-            if next_requests > budget.max_model_requests:
-                raise BudgetExceeded("max_model_requests exceeded")
+                failure = "max_requests_per_trial exceeded"
+            elif outcome.cost_usd > budget.max_cost_per_trial_usd:
+                failure = "max_cost_per_trial_usd exceeded"
+            elif next_requests > budget.max_model_requests:
+                failure = "max_model_requests exceeded"
             remaining_reserved = self.reserved_cost_usd - reserved_cost_usd
-            if remaining_reserved < 0 or next_cost + remaining_reserved > budget.max_total_cost_usd:
-                raise BudgetExceeded("max_total_cost_usd exceeded")
+            if remaining_reserved < 0:
+                raise BudgetExceeded("trial cost reservation accounting is inconsistent")
+            if failure is None and next_cost + remaining_reserved > budget.max_total_cost_usd:
+                failure = "max_total_cost_usd exceeded"
             self.requests = next_requests
             self.input_tokens = next_input
             self.output_tokens = next_output
             self.cost_usd = next_cost
             self.wall_seconds = next_wall
             self.model_work_seconds = next_model_work
+            if failure is not None:
+                self._budget_failure = failure
+                raise BudgetExceeded(failure)
             self.reserved_cost_usd = remaining_reserved
 
 
