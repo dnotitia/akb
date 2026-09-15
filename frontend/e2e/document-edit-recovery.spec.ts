@@ -119,6 +119,39 @@ test.describe("document edit recovery mock contract", () => {
     expect(state.document.content).toBe(editedMarkdown);
   });
 
+  test("creates a Source draft and reopens the saved document", async ({ page, request }) => {
+    const recovery = await fixture(request);
+    const title = "Source created note";
+    const sourceMarkdown = "## Created from Source\n\n- [x] persisted\n\n<!-- fixture preservation -->";
+    await page.goto("/vault/fixture/doc/new?collection=notes");
+    await expect(page.getByRole("heading", { name: "New document" })).toBeVisible();
+    await page.getByRole("textbox", { name: "Title *" }).fill(title);
+    await page.getByRole("button", { name: "Source", exact: true }).click();
+
+    const source = page.getByRole("textbox", { name: /Markdown source/ });
+    await source.fill(sourceMarkdown);
+    await expect(source).toHaveValue(sourceMarkdown);
+    await expect(page.getByRole("toolbar", { name: "Text formatting" })).toHaveCount(0);
+
+    await page.getByRole("button", { name: "WYSIWYG" }).click();
+    await expect(page.getByRole("textbox", { name: /Content/ })).toContainText("Created from Source");
+    await page.getByRole("button", { name: "Create document" }).click();
+    await expect(page.getByRole("heading", { name: title })).toBeVisible();
+    await expect(page.getByText("persisted", { exact: true })).toBeVisible();
+
+    await page.getByRole("button", { name: "Edit" }).click();
+    await page.getByRole("button", { name: "Source", exact: true }).click();
+    await expect(
+      page.getByRole("textbox", { name: "Document body (markdown)" }),
+    ).toHaveValue(sourceMarkdown);
+    const state = await operate(request, recovery.operations!.state);
+    expect(state.created_documents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ title, content: sourceMarkdown, path: "notes/source-created-note.md" }),
+      ]),
+    );
+  });
+
   test("keeps a dirty body through refetch and exposes a three-way OCC conflict", async ({
     page,
     request,
