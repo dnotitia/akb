@@ -969,10 +969,13 @@ class BudgetLedger:
             outcome_cost = Decimal(str(outcome.cost_usd))
             if not outcome_cost.is_finite() or outcome_cost < 0:
                 raise BudgetExceeded("provider outcome cost cannot be negative or non-finite")
-            if guard.provider_cost_usd > 0 and outcome.cost_source == "provider_response":
-                unrecorded_cost = Decimal("0")
-            else:
-                unrecorded_cost = max(Decimal("0"), outcome_cost - guard.provider_cost_usd)
+            reported_provider_cost = (
+                Decimal(str(outcome.provider_cost_usd))
+                if outcome.provider_cost_usd is not None
+                else outcome_cost
+            )
+            reported_cost = max(outcome_cost, reported_provider_cost)
+            unrecorded_cost = max(Decimal("0"), reported_cost - guard.provider_cost_usd)
             next_cost = self.cost_usd + unrecorded_cost
             next_wall = self.current_wall_seconds()
             next_model_work = self.model_work_seconds + outcome.latency_seconds

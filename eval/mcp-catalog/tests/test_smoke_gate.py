@@ -242,8 +242,8 @@ async def test_smoke_accounting_failure_is_checkpointed_and_resume_reuses_other_
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
     checkpoint_path = tmp_path / "smoke-checkpoint.json"
-    secret = "fixture-smoke-secret"
-    resolver = _SmokeResolver((secret,))
+    marker = "fixture-smoke-marker"
+    resolver = _SmokeResolver((marker,))
     failed_cell = "lightweight:stdio"
     source_revision = "a" * 40
     required_cells = [
@@ -303,7 +303,7 @@ async def test_smoke_accounting_failure_is_checkpointed_and_resume_reuses_other_
             except BudgetExceeded:
                 base = _smoke_outcome(task, model_spec, transport)
                 evidence = dict(base.provider_evidence[0])
-                evidence["diagnostic"] = secret
+                evidence["diagnostic"] = marker
                 evidence["usage"] = {
                     "prompt_tokens": 5,
                     "completion_tokens": 1,

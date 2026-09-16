@@ -781,6 +781,46 @@ async def test_response_admission_interleaves_with_sibling_charge_and_cancellati
 
 
 @pytest.mark.asyncio
+async def test_terminal_charge_accounts_provider_response_missing_from_cancelled_callback() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    model_spec = manifest.models[0]
+    ledger = BudgetLedger(manifest)
+    guard = await ledger.reserve_trial(Decimal("0.1"))
+    first_receipt = await guard()
+    await ledger.record_provider_response_cost(guard, first_receipt, Decimal("0.01"))
+
+    # The second response is present in the terminal usage snapshot, but its
+    # callback was interrupted before the guard could admit its cost.
+    await guard()
+    outcome = TrialOutcome(
+        task_id="cancelled-response-callback",
+        category="single_operation",
+        arm="baseline",
+        model_class=model_spec.class_name,
+        model_id=model_spec.model_id,
+        transport="http",
+        input_tokens=20,
+        output_tokens=4,
+        total_tokens=24,
+        model_requests=2,
+        cost_usd=0.03,
+        provider_cost_usd=0.03,
+        cost_source="provider_response",
+        provider_evidence=[
+            {"model": model_spec.model_id, "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.01}},
+            {"model": model_spec.model_id, "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.02}},
+        ],
+    )
+
+    await ledger.charge(outcome, guard=guard)
+
+    assert ledger.cost_usd == Decimal("0.03")
+    assert ledger.requests == 2
+    assert ledger.reserved_cost_usd == Decimal("0")
+    assert not guard.is_open
+
+
+@pytest.mark.asyncio
 async def test_restored_budget_failure_blocks_new_trial_reservations() -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     ledger = BudgetLedger(manifest)
