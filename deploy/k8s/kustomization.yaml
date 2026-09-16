@@ -12,5 +12,11 @@ resources:
 # PostgreSQL includes pgvector and remains the default derived vector index.
 # Redis and Qdrant are optional resources; add redis.yaml or qdrant.yaml from
 # an operator-owned overlay only when the matching runtime configuration is set.
+#
+# file-gateway.yaml is optional in the same way. Without it the API streams
+# file bytes itself, which is correct and simpler; with it the API only
+# authorizes and nginx carries the bytes. It changes no address, so adding or
+# removing it is not a migration. Read the header of that file first — it
+# needs a matching `file_gateway_key` and a Secret.
 
 # Secrets are intentionally absent. Provision Secret/akb-secret before apply.
