@@ -161,6 +161,15 @@ spec:
       # to outlast the longest transfer worth finishing. Past it, SIGKILL
       # cuts the body.
       terminationGracePeriodSeconds: 900
+      # Two replicas on one node are two replicas until that node reboots.
+      # `ScheduleAnyway` rather than a hard constraint: a gateway that cannot
+      # be scheduled serves nothing, and one node is still better than none.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {app: akb-file-gateway}
       securityContext:
         runAsNonRoot: true
         runAsUser: 101
@@ -198,6 +207,18 @@ spec:
         - {name: conf, configMap: {name: akb-file-gateway-conf}}
         - {name: key, secret: {secretName: akb-file-gateway}}  # pragma: allowlist secret
         - {name: tmp, emptyDir: {}}
+---
+# Voluntary disruption — a drain, an upgrade — must leave one gateway
+# serving. Without this a node drain can take both at once.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: akb-file-gateway
+  namespace: akb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: akb-file-gateway}
 ---
 apiVersion: v1
 kind: Service
