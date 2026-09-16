@@ -231,9 +231,9 @@ export default function SearchPage() {
           setArchiveUnsupported(Boolean(options.archive_scope && response.archive_scope !== options.archive_scope));
           setLiteralResults(response.results);
           setDenseResults([]);
-          setTotal(response.total_docs ?? response.results.length);
+          setTotal(response.total_resources ?? response.total_docs ?? response.results.length);
           setTotalMatches(response.total_matches);
-          setReturnedDocs(response.returned_docs ?? response.total_docs);
+          setReturnedDocs(response.returned_resources ?? response.returned_docs ?? response.results.length);
           setReturnedMatches(
             response.returned_matches ?? response.total_matches,
           );
@@ -442,10 +442,13 @@ export default function SearchPage() {
   const hasResults = resultCount > 0;
 
   const denseCountSummary = `${returnedDocs} top results loaded`;
+  const literalUnit = options.include_text_files
+    ? (total === 1 ? "resource" : "resources")
+    : (total === 1 ? "doc" : "docs");
   const literalCountSummary =
     returnedDocs !== total || returnedMatches !== totalMatches
-      ? `${returnedDocs} of ${total} ${total === 1 ? "doc" : "docs"} · ${returnedMatches} of ${totalMatches} ${totalMatches === 1 ? "match" : "matches"}`
-      : `${total} ${total === 1 ? "doc" : "docs"} · ${totalMatches} ${totalMatches === 1 ? "match" : "matches"}`;
+      ? `${returnedDocs} of ${total} ${literalUnit} · ${returnedMatches} of ${totalMatches} ${totalMatches === 1 ? "match" : "matches"}`
+      : `${total} ${literalUnit} · ${totalMatches} ${totalMatches === 1 ? "match" : "matches"}`;
   const allVaultParams = new URLSearchParams(searchParams);
   allVaultParams.delete("v");
   const allVaultsHref = `/search?${allVaultParams}`;
@@ -457,7 +460,8 @@ export default function SearchPage() {
     Number(Boolean(options.collection)) +
     Number(archiveScope !== "unarchived") +
     Number(options.regex) +
-    Number(options.case_sensitive);
+    Number(options.case_sensitive) +
+    Number(mode === "literal" && options.include_text_files);
   const accessibleVaultNames = new Set(
     scopedVault ? [scopedVault] : vaults.map((vault) => vault.name),
   );
@@ -841,6 +845,15 @@ export default function SearchPage() {
                         <input
                           type="checkbox"
                           className="accent-primary focus-visible:outline-ring"
+                          checked={Boolean(options.include_text_files)}
+                          onChange={(event) => setFilter("include_text_files", event.target.checked ? ["true"] : [])}
+                        />
+                        Include text Files
+                      </label>
+                      <label className="flex min-h-9 items-center gap-2">
+                        <input
+                          type="checkbox"
+                          className="accent-primary focus-visible:outline-ring"
                           checked={Boolean(options.regex)}
                           onChange={(event) =>
                             setFilter(
@@ -872,7 +885,7 @@ export default function SearchPage() {
               <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
                 <p className="text-xs text-foreground-muted">
                   {mode === "literal"
-                    ? "Literal search searches document bodies only. Content-kind selection is retained for Semantic search."
+                    ? "Literal search includes text Files when enabled. Document type, tag, and archived-only filters exclude Files. Content-kind selection is retained for Semantic search."
                     : "Document type and tag filters search documents only. Filters apply on the server before the result limit."}
                 </p>
                 <Button
@@ -1389,10 +1402,10 @@ function LiteralResultList({ items }: { items: GrepDoc[] }) {
         <li key={result.uri}>
           <Link
             id={`search-literal-result-${index}`}
-            to={`/vault/${result.vault}/doc/${encodeURIComponent(
+            to={`/vault/${result.vault}/${result.resource_type === "file" ? "file" : "doc"}/${encodeURIComponent(
               parseUri(result.uri)?.id ?? result.path,
             )}`}
-            state={documentPreviewState(
+            state={result.resource_type === "file" ? undefined : documentPreviewState(
               location,
               `search-literal-result-${index}`,
             )}
@@ -1419,7 +1432,7 @@ function LiteralResultList({ items }: { items: GrepDoc[] }) {
                 </span>
               </div>
               <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-foreground-muted">
-                <span>Document</span>
+                <span>{result.resource_type === "file" ? "File" : "Document"}</span>
                 <span aria-hidden>·</span>
                 <span>{result.vault}</span>
                 <span aria-hidden>·</span>
@@ -1428,6 +1441,9 @@ function LiteralResultList({ items }: { items: GrepDoc[] }) {
                 </span>
               </div>
 
+              {result.revision && (
+                <p className="mt-1 text-xs text-foreground-muted" title={result.revision}>Revision {result.revision}</p>
+              )}
               {result.matches.length > 0 && (
                 <div className="mt-2 space-y-1">
                   {result.matches.slice(0, 2).map((match, matchIndex) => (
@@ -1435,6 +1451,7 @@ function LiteralResultList({ items }: { items: GrepDoc[] }) {
                       key={`${match.section || "match"}-${matchIndex}`}
                       className="rounded-[var(--radius-sm)] border border-border bg-surface-2 px-3 py-1.5"
                     >
+                      {match.line != null && <span className="text-xs tabular-nums text-foreground-muted">Body line {match.line}</span>}
                       {match.section && (
                         <div className="text-xs font-medium text-foreground">
                           {match.section}

@@ -249,7 +249,7 @@ test("search facade scopes search, drill-down, grep, and forwards actingAs claim
     sourceUris: ["akb://reef/doc/readme.md"],
   });
   const drillResult = await client.search.drillDown("akb://reef/doc/readme.md", { section: "Intro" });
-  const grepResult = await client.search.grep("needle", { regex: true, filesWithMatches: true });
+  const grepResult = await client.search.grep("needle", { regex: true, filesWithMatches: true, includeTextFiles: true, docTypes: ["report"], tags: ["ops", "한글"], archiveScope: "all" });
 
   const searchUrl = new URL(seen[0].url);
   assert.equal(searchUrl.pathname, "/api/v1/search");
@@ -273,6 +273,10 @@ test("search facade scopes search, drill-down, grep, and forwards actingAs claim
 
   const grepUrl = new URL(seen[2].url);
   assert.equal(grepUrl.pathname, "/api/v1/grep");
+  assert.equal(grepUrl.searchParams.get("include_text_files"), "true");
+  assert.equal(grepUrl.searchParams.get("archive_scope"), "all");
+  assert.deepEqual(grepUrl.searchParams.getAll("doc_types"), ["report"]);
+  assert.deepEqual(grepUrl.searchParams.getAll("tags"), ["ops", "한글"]);
   assert.deepEqual(grepUrl.searchParams.getAll("vault"), ["reef"]);
   assert.equal(grepUrl.searchParams.get("q"), "needle");
   assert.equal(grepUrl.searchParams.get("regex"), "true");

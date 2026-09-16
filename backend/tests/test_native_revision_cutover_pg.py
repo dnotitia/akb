@@ -2475,3 +2475,80 @@ async def test_apply_disambiguates_file_paths_that_are_already_live(tmp_path):
         # verified clean still dies at the last gate.
         authority = await cutover.commit(planned.cutover_id, identity=_identity("file-path-collision"))
         assert authority.cutover_id == planned.cutover_id
+
+
+async def test_grep_accepts_verified_cutover_paths_and_binary_exclusions_only_while_current(tmp_path):
+    from app.exceptions import AKBError
+    from app.services.m1_native_grep_service import M1NativeGrepService
+
+    async with _fresh_schema() as pool:
+        async with pool.acquire() as conn:
+            await _load("055_native_revision_m1_file_storage.py").migrate(conn=conn)
+        git = GitService(storage_path=str(tmp_path / "grep-cutover"))
+        vault = await _manual_vault(pool, git, label="grep-cutover")
+        bodies = {}
+        file_ids = []
+        for name, data in (("document.md", b"needle\n"), ("nul.txt", b"needle\x00"), ("invalid.txt", b"\xff")):
+            file_id, key = await _confirmed_file(
+                pool, namespace_id=vault.namespace_id, label=name,
+                data=data, mime_type="text/plain",
+            )
+            file_ids.append(file_id)
+            bodies[key] = data
+        async with pool.acquire() as conn:
+            user = await conn.fetchval("""
+                INSERT INTO users(username, email, password_hash, is_admin)
+                VALUES ('grep-review', 'grep@example.test', 'unused', TRUE) RETURNING id
+            """)
+        cutover = NativeRevisionCutover(
+            pool, backfill=NativeRevisionBackfill(pool, git=git),
+            verifier=_FixtureVerifier(pool), file_reader=bodies.__getitem__,
+        )
+        planned = await cutover.plan(vaults=[vault], coverage_version="grep-cutover-v1")
+        await cutover.apply(planned.cutover_id)
+        service = M1NativeGrepService(pool)
+
+        async def scan():
+            return await service.grep(
+                "needle", user_id=user, include_text_files=True, case_sensitive=True,
+            )
+
+        # An applied receipt is insufficient until verification closes the run.
+        with pytest.raises(AKBError, match="not ready"):
+            await scan()
+        await cutover.verify(planned.cutover_id)
+        result = await scan()
+        assert result["total_resources"] == 1
+        assert result["results"][0]["path"] == f"document-{file_ids[0].hex[:8]}.md"
+        assert result["results"][0]["resource_type"] == "file"
+
+        # A receipt must bind the current catalogue, including optional object
+        # generation hints. Restoring each field restores the proof.
+        for file_id in file_ids[:2]:
+            for field, value in (("name", "moved.txt"), ("etag", "new-etag"),
+                                 ("storage_version", "new-version"), ("s3_key", "new-key")):
+                async with pool.acquire() as conn:
+                    before = await conn.fetchval(f"SELECT {field} FROM vault_files WHERE id = $1", file_id)
+                    await conn.execute(f"UPDATE vault_files SET {field} = $2 WHERE id = $1", file_id, value)
+                with pytest.raises(AKBError, match="not ready"):
+                    await scan()
+                async with pool.acquire() as conn:
+                    await conn.execute(f"UPDATE vault_files SET {field} = $2 WHERE id = $1", file_id, before)
+        assert (await scan())["total_resources"] == 1
+
+        # A new uncompleted projection intent supersedes the old receipt even
+        # when its bytes are identical. It cannot resurrect an old exclusion.
+        for file_id in file_ids[:2]:
+            async with pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO native_file_projection_outbox
+                        (file_id, intent_id, namespace_id, source_present, logical_path,
+                         mime_type, content_hash, byte_size, s3_key, actor)
+                    SELECT id, uuid_generate_v4(), vault_id, TRUE, name, mime_type,
+                           content_hash, size_bytes, s3_key, 'grep-test'
+                      FROM vault_files WHERE id = $1
+                """, file_id)
+            with pytest.raises(AKBError, match="not ready"):
+                await scan()
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM native_file_projection_outbox WHERE file_id = $1", file_id)

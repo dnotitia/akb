@@ -29,7 +29,7 @@ def test_akb_grep_schema_exposes_guarded_text_file_measurement_argument():
     )
     assert "does not limit replacement writes" in grep.input_schema["properties"]["limit"]["description"]
     assert argument["type"] == "boolean"
-    assert argument["default"] is False
+    assert "default" not in argument
     assert "native mode" in argument["description"].lower()
 
 
@@ -110,8 +110,8 @@ async def test_public_native_grep_file_identity_and_default_exclusion(monkeypatc
         path="notes/readme.md",
         revision_id="a" * 40,
         digest="b" * 64,
-        byte_size=len(b"document needle\n"),
-        canonical_bytes=b"document needle\n",
+        byte_size=len(b"intro\ndocument needle\n"),
+        canonical_bytes=b"intro\ndocument needle\n",
     )
     file_bytes = b"file needle\n"
     file = HeadBody(
@@ -138,17 +138,20 @@ async def test_public_native_grep_file_identity_and_default_exclusion(monkeypatc
     )
 
     assert [row["uri"] for row in legacy["results"]] == [document.uri]
-    assert "resource_type" not in legacy["results"][0]
-    # Placement is not part of the File-only additive head identity: it rides
-    # on every native row, so a Document-only native grep still reports which
-    # placement its bytes came from.
+    assert legacy["results"][0]["resource_type"] == "document"
+    assert legacy["results"][0]["revision"] == document.revision_id
+    assert legacy["results"][0]["content_hash"] == document.digest
+    assert legacy["results"][0]["matches"] == [
+        {"section": None, "line": 2, "text": "document needle"},
+    ]
     assert legacy["results"][0]["payload_placement"] == M1PgBodyStore.selected_placement
+    assert with_files["results"][0] == legacy["results"][0]
     assert with_files["results"][1] == {
         "uri": file.uri,
         "vault": "measurement",
         "path": "src/example.txt",
         "title": "example.txt",
-        "matches": [{"section": None, "text": "file needle"}],
+        "matches": [{"section": None, "line": 1, "text": "file needle"}],
         "resource_type": "file",
         "revision": file.revision_id,
         "content_hash": file.digest,
@@ -215,3 +218,49 @@ def test_text_file_measurement_body_rejects_binary_bytes():
 
     with pytest.raises(ValidationError):
         M1PgBodyStore._verified_bytes(b"needle\x00\xff")
+
+
+def test_rest_grep_serialization_preserves_native_identity_and_line_numbers():
+    from app.models.document import GrepResponse
+    from app.services.m1_native_grep_service import M1NativeGrepService
+
+    native_rows = [
+        {
+            "uri": f"akb://test/{surface}/example.txt",
+            "vault": "test",
+            "path": "example.txt",
+            "title": "example.txt",
+            "resource_type": surface,
+            "revision": "a" * 40,
+            "content_hash": "b" * 64,
+            "matches": [{"line": 42, "text": "needle"}],
+        }
+        for surface in ("document", "file")
+    ]
+    public = M1NativeGrepService._public_response(
+        pattern="needle", regex=False, native={"results": native_rows},
+    )
+    serialized = GrepResponse.model_validate(public).model_dump(exclude_none=True)
+
+    for row, source in zip(serialized["results"], native_rows, strict=True):
+        assert row["resource_type"] == source["resource_type"]
+        assert row["revision"] == source["revision"]
+        assert row["content_hash"] == source["content_hash"]
+        assert row["matches"] == [{"line": 42, "text": "needle"}]
+
+
+def test_rest_legacy_grep_serialization_omits_unavailable_native_fields():
+    from app.models.document import GrepResponse
+
+    legacy_row = {
+        "uri": "akb://test/notes/example.md",
+        "vault": "test",
+        "path": "notes/example.md",
+        "title": "example",
+        "matches": [{"section": "intro", "text": "needle"}],
+    }
+    serialized = GrepResponse.model_validate({
+        "pattern": "needle", "regex": False, "results": [legacy_row],
+    }).model_dump(exclude_none=True)
+
+    assert serialized["results"] == [legacy_row]

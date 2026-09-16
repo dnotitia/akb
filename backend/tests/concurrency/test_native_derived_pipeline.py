@@ -64,7 +64,7 @@ async def _fresh_database():
     pool = None
     try:
         await conn.execute((_BACKEND / "app" / "db" / "init.sql").read_text())
-        for number in (5, 6, 48, 53, 54, 57, 59):
+        for number in (5, 6, 48, 53, 54, 55, 56, 57, 59, 89):
             path = next((_BACKEND / "app" / "db" / "migrations").glob(f"{number:03d}_*.py"))
             spec = importlib.util.spec_from_file_location(f"native_derived_{number}", path)
             assert spec is not None and spec.loader is not None
@@ -319,6 +319,35 @@ async def test_text_file_intent_applies_the_document_parity_derived_path():
             assert {row["chunk_id"] for row in queued} == prior_chunk_ids
 
 
+async def _bind_native_file_catalogue(pool, *, namespace_id, path, payload, created):
+    """Admit the native Head through the same catalogue identity grep verifies."""
+    collection, _, name = path.rpartition("/")
+    async with pool.acquire() as conn:
+        collection_id = None
+        if collection:
+            collection_id = await conn.fetchval(
+                """
+                INSERT INTO collections (vault_id, path, name) VALUES ($1, $2, $2)
+                ON CONFLICT (vault_id, path) DO UPDATE SET path = EXCLUDED.path
+                RETURNING id
+                """, namespace_id, collection,
+            )
+        await conn.execute(
+            """
+            INSERT INTO vault_files (
+                id, vault_id, collection_id, kind, upload_state, name, s3_key,
+                mime_type, size_bytes, content_hash, hash_algorithm, hash_verified_at,
+                storage_driver, storage_locator, native_resource_id, native_revision_id
+            ) VALUES ($1, $2, $3, 'file', 'confirmed', $4, $5, 'text/plain', $6,
+                      $7, 'sha256', NOW(), 'native_text', $5, $1, $8)
+            """,
+            created.resource_id, namespace_id, collection_id, name,
+            f"native-text/{created.resource_id}/{created.revision_id}",
+            len(payload.encode("utf-8")), hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            created.revision_id,
+        )
+
+
 async def test_file_grep_reads_the_head_even_when_derived_chunks_disagree():
     """Derived output is never an exact-grep oracle.
 
@@ -337,6 +366,10 @@ async def test_file_grep_reads_the_head_even_when_derived_chunks_disagree():
             payload="head_truth_token\n",
             actor="derived-test",
             mutation_id=uuid.uuid4(),
+        )
+        await _bind_native_file_catalogue(
+            pool, namespace_id=vault_id, path="src/main.py",
+            payload="head_truth_token\n", created=created,
         )
         assert await NativeDerivedWorker(pool).process_once() == 1
 
@@ -703,7 +736,7 @@ async def test_direct_pg_grep_default_and_additive_modes_preserve_acl_and_collec
         service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
 
         async def create(namespace_id, surface, path):
-            return await service.create_text(
+            created = await service.create_text(
                 namespace_id=namespace_id,
                 surface=surface,
                 path=path,
@@ -711,6 +744,13 @@ async def test_direct_pg_grep_default_and_additive_modes_preserve_acl_and_collec
                 actor="grep-test",
                 mutation_id=uuid.uuid4(),
             )
+
+            if surface == "file":
+                await _bind_native_file_catalogue(
+                    pool, namespace_id=namespace_id, path=path,
+                    payload="needle-boundary\n", created=created,
+                )
+            return created
 
         await create(allowed_vault, "document", "src/a.md")
         await create(allowed_vault, "document", "src2/b.md")

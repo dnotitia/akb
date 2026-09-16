@@ -442,10 +442,13 @@ TOOLS = [
         description=(
             "Search for exact text or regex patterns across document content. "
             "On a native Document backend, optionally include admitted "
-            "searchable text Files with `measurement_include_text_files=true`; binary "
+            "searchable text Files with `include_text_files=true`; binary "
             "Files remain excluded. "
             "Unlike akb_search (semantic/meaning-based), this finds exact string matches — "
             "use it for specific terms, URLs, code snippets, version numbers, etc. "
+            "Native matching and replacement use per-line Python regex semantics; "
+            "case-insensitive literals use the same Unicode rules as replacement. "
+            "Native results include body-relative line numbers and searched revision identity. "
             "Returns matching documents (each with its `uri`) and matched lines. "
             "Optionally pass `replace` to find-and-replace across all matching documents; "
             "the call writes nothing if the scope exceeds `max_replacements`. "
@@ -460,10 +463,20 @@ TOOLS = [
         input_schema={
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "minLength": 1, "description": "Non-empty search pattern. By default matched as literal text (ILIKE) — metacharacters like |, ., *, (), [], +, ? are treated as literal characters. Set regex=true to enable PostgreSQL regex (required for alternation and wildcards)."},
-                "vault": {"type": "string", "description": "Limit to a specific vault"},
+                "pattern": {"type": "string", "minLength": 1, "description": "Non-empty search pattern. By default matched as literal text — metacharacters like |, ., *, (), [], +, ? are treated as literal characters. Set regex=true for regex matching (native: Python regex per line; legacy: PostgreSQL candidate matching)."},
+                "vault": {
+                    "oneOf": [
+                        {"type": "string", "minLength": 1},
+                        {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1},
+                    ],
+                    "description": "Limit to one or more vaults. Omit to search accessible vaults; replace requires an explicit nonempty scope with writer access to every vault.",
+                },
+                "doc_types": {"type": "array", "items": {"type": "string"}, "description": "Document types (OR); intersects other filters. Excludes Files when nonempty."},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Document tags (OR); intersects other filters. Excludes Files when nonempty."},
+                "include_archived": {"type": "boolean", "default": True, "description": "Include archived Documents; defaults to true for compatibility."},
+                "archive_scope": {"type": "string", "enum": ["unarchived", "archived", "all"], "description": "Overrides include_archived. Archived scope excludes Files."},
                 "collection": {"type": "string", "description": "Limit to a specific collection"},
-                "regex": {"type": "boolean", "default": False, "description": "Treat pattern as PostgreSQL regex. REQUIRED to use alternation (|), wildcards (.*), character classes, anchors, etc. When false (default), the entire pattern including any metacharacters is matched literally."},
+                "regex": {"type": "boolean", "default": False, "description": "Treat pattern as regex (native: Python per line; legacy: PostgreSQL candidates). REQUIRED to use alternation (|), wildcards (.*), character classes, anchors, etc. When false (default), the entire pattern including any metacharacters is matched literally."},
                 "case_sensitive": {"type": "boolean", "default": False, "description": "Case-sensitive matching (default: case-insensitive)"},
                 "replace": {"type": "string", "description": "Replacement string. If provided and the full scope fits max_replacements, replaces all matches in EVERY matching document (git commit + re-index per doc); otherwise writes nothing. Treated literally when regex=false; supports regex backreferences (\\1, \\2) only when regex=true. For precise edits to a single known document, prefer akb_edit instead."},
                 "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 50, "description": "Max documents to return; does not limit replacement writes"},
@@ -481,18 +494,25 @@ TOOLS = [
                 },
                 "count_only": {"type": "boolean", "default": False, "description": "Return counts only (grep -c semantics). Response: {pattern, total_matches, total_docs, by_doc:{uri:count,...}}. Use for 'how many X are there?' questions — much cheaper than fetching every line."},
                 "files_with_matches": {"type": "boolean", "default": False, "description": "Return only the URIs that contain matches (grep -l semantics). Response: {pattern, n_files, files:[uri,...]}. Use for 'which documents mention X?' questions."},
-                "measurement_include_text_files": {
+                "include_text_files": {
                     "type": "boolean",
-                    "default": False,
                     "description": (
                         "Native mode: include admitted searchable "
                         "text Files as well as Documents. File results include resource_type=file, "
                         "their canonical akb:// URI, revision, and content_hash; native results "
                         "also report payload_placement, the body placement their bytes were read "
-                        "from. Binary Files are "
-                        "never searchable. Rejected unless postgres_native or the exact guarded "
+                        "from. With this option, total_resources counts all matches and "
+                        "returned_resources counts returned rows; count_only adds by_resource, "
+                        "and files_with_matches adds resources with resource_type and n_resources. "
+                        "The total_docs, returned_docs, by_doc, and files fields remain Document-only. "
+                        "Binary Files are "
+                        "never searchable. Cannot be combined with replace. Omitted means Documents only. Rejected unless postgres_native or the exact guarded "
                         "native measurement backend is active."
                     ),
+                },
+                "measurement_include_text_files": {
+                    "type": "boolean",
+                    "description": "Native mode: deprecated alias for include_text_files. If both are supplied they must agree.",
                 },
             },
             "required": ["pattern"],

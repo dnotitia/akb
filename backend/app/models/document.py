@@ -338,20 +338,21 @@ class GrepMatch(BaseModel):
     """Single matched line within a grep result."""
 
     section: str | None = None
+    # One-based searched-body line; Documents exclude parsed frontmatter.
+    line: int | None = Field(default=None, ge=1)
     text: str
 
 
 class GrepResult(BaseModel):
-    """Single document returned by grep."""
+    """Single Document or text File returned by grep."""
 
     uri: str
     vault: str
     path: str
     title: str
     status: str | None = None
-    # Additive native measurement identity. Legacy Document grep leaves these
-    # unset, preserving its frozen response; W3b needs them to distinguish an
-    # admitted searchable text File and bind the result to its current Head.
+    # Native Document and text File results identify the Head that was read.
+    # Legacy chunk-based grep leaves this additive identity unset.
     resource_type: str | None = None
     revision: str | None = None
     content_hash: str | None = None
@@ -408,12 +409,17 @@ class GrepResponse(BaseModel):
     returned_docs: int | None = None
     returned_matches: int | None = None
     total_docs: int | None = None
+    total_resources: int | None = None
+    returned_resources: int | None = None
     total_matches: int | None = None
     truncated: bool | None = None
     truncation: GrepTruncation | None = None
     hint: str | None = None
     results: list[GrepResult] | None = None
     by_doc: dict[str, int] | None = None
+    by_resource: dict[str, int] | None = None
+    resources: list[dict[str, str]] | None = None
+    n_resources: int | None = None
     n_files: int | None = None
     files: list[str] | None = None
     replace: str | None = None

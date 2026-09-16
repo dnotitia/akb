@@ -7,6 +7,27 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Native grep consistency
+
+- Native grep supports explicit `include_text_files` reads across REST, MCP,
+  SDK and Search UI. The previous measurement option remains an alias; explicit
+  conflicting values fail validation. Resource aggregates accompany Document
+  counts, and File synchronization gaps return a readiness error instead of a
+  misleading empty or stale result.
+- MCP accepts multiple Vaults and the same metadata/lifecycle filters as REST.
+  REST/MCP output limits are aligned at 50. Document replacement rechecks write
+  access per mutation and retains partial receipts on CAS conflicts.
+
+- Native grep now uses the same Unicode case-insensitive matching rules for
+  literal reads and replacements. Full casefold expansions such as `ß`/`ss`
+  no longer match. Regex replacements operate on the same body lines as reads,
+  so anchors and whitespace cannot rewrite unpreviewed cross-line matches.
+- Case-insensitive literal scans and replacements use the existing bounded
+  process worker, including its execution deadline and result-size limits.
+- Native Document and File results retain body-relative line numbers and
+  resource type, searched revision, and content hash through REST/MCP responses.
+  Legacy execution and the prohibition on File grep replacement are unchanged.
+
 ### Safe account lifecycle
 
 Add identity-bound account lifecycle preview, paginated deletion blockers,
