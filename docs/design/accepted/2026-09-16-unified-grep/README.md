@@ -207,3 +207,12 @@ fixture 환경과 구현 결함을 구분했다.
 OPEN은 미구현과 동의어가 아니다. 위 수정은 코드 확인이며, 모든 배포에 적용됐다는
 의미도 아니다. 이 계획 작성에서는 이슈를 수정하거나 닫지 않았다.
 
+
+## PR 통합 검증 피드백
+
+로컬 검증 후 PR 전체 CI에서 추가 fixture 간극을 발견했다. Native 결과의
+Document identity/line 보존을 반영하지 않은 두 unit fixture와, File Head만
+만들고 catalogue/outbox를 생략한 두 DB fixture다. 기대값과 fixture를 실제
+계약에 맞게 수정하며 제품의 최신성 검사를 완화하지 않는다. #339의 정확한
+TITLE/URI 사용자 본문도 strip·drill-down 회귀에 추가했다. PR의 전체 gate와
+병합 소스 기반 격리 HTTP/MCP/S3 검증은 별도의 완료 근거로 기록한다.
