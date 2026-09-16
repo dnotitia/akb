@@ -219,6 +219,7 @@ export interface AkbDrillDownEnvelope {
 
 export interface AkbGrepMatch {
   text: string;
+  line?: number | null;
   section?: string | null;
   [key: string]: unknown;
 }
@@ -228,6 +229,10 @@ export interface AkbGrepResult {
   vault: string;
   path: string;
   title: string;
+  resource_type?: string | null;
+  revision?: string | null;
+  content_hash?: string | null;
+  payload_placement?: string | null;
   matches?: AkbGrepMatch[];
   [key: string]: unknown;
 }
@@ -237,6 +242,8 @@ export interface AkbGrepEnvelope {
   pattern: string;
   regex: boolean;
   error?: string | null;
+  total_resources?: number | null;
+  returned_resources?: number | null;
   returned_docs?: number | null;
   returned_matches?: number | null;
   total_docs?: number | null;
@@ -244,6 +251,8 @@ export interface AkbGrepEnvelope {
   truncated?: boolean | null;
   hint?: string | null;
   results?: AkbGrepResult[] | null;
+  by_resource?: Record<string, number> | null;
+  resources?: Pick<AkbGrepResult, "uri" | "resource_type" | "revision" | "path">[] | null;
   by_doc?: Record<string, number> | null;
   n_files?: number | null;
   files?: string[] | null;

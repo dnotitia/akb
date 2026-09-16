@@ -297,6 +297,11 @@ export interface AkbDrillDownOptions {
 }
 
 export interface AkbGrepOptions {
+  includeTextFiles?: boolean;
+  docTypes?: readonly string[];
+  tags?: readonly string[];
+  includeArchived?: boolean;
+  archiveScope?: "unarchived" | "archived" | "all";
   vault?: string | readonly string[];
   collection?: string | null;
   regex?: boolean;
@@ -1583,6 +1588,11 @@ function makeSearchFacade(
         appendOptional(params, "limit", options.limit);
         appendOptional(params, "count_only", options.countOnly);
         appendOptional(params, "files_with_matches", options.filesWithMatches);
+        appendOptional(params, "include_text_files", options.includeTextFiles);
+        appendOptional(params, "include_archived", options.includeArchived);
+        appendOptional(params, "archive_scope", options.archiveScope);
+        for (const type of options.docTypes ?? []) params.append("doc_types", type);
+        for (const tag of options.tags ?? []) params.append("tags", tag);
         return request(`/grep?${params}`);
       },
       enumerable: true,

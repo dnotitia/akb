@@ -64,6 +64,7 @@ async def pool():
             "056_native_revision_m1_file_constraints.py",
             "057_native_revision_m1_payload_placement.py",
             "059_native_file_searchable_derived.py",
+            "089_native_file_projection_outbox.py",
         ):
             await _migration(filename).migrate(conn)
     try:
@@ -1722,3 +1723,130 @@ async def test_body_placement_route_is_reader_guarded_and_absent_without_measure
     with pytest.raises(NotFoundError) as missing:
         await files_routes.get_body_placements(vault=vault_name, user=user)
     assert missing.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_native_grep_preview_replace_and_collection_receipts(context):
+    pool, vault_id, _, vault_name = context
+    async with pool.acquire() as conn:
+        owner_id = await conn.fetchval("SELECT owner_id FROM vaults WHERE id = $1", vault_id)
+    native = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
+    originals = {}
+    for path in ("core/a.md", "core/b.md", "core-extra/c.md"):
+        originals[path] = await native.create_text(
+            namespace_id=vault_id, surface="document", path=path,
+            payload="first\nTODO\nTODO\n", actor="grep-test", mutation_id=uuid.uuid4(),
+        )
+    grep = M1NativeGrepService(pool)
+    preview = await grep.grep_public(
+        "^TODO$", regex=True, user_id=owner_id, vaults=[vault_name],
+        collection="core", limit=1,
+    )
+    assert preview["total_docs"] == 2
+    assert preview["total_matches"] == 4
+    assert [m["line"] for m in preview["results"][0]["matches"]] == [2, 3]
+    rejected = await grep.grep_public(
+        "^TODO$", regex=True, user_id=owner_id, vaults=[vault_name],
+        collection="core", limit=1, replace="DONE", max_replacements=1, actor="grep-test",
+    )
+    assert rejected["replacement_complete"] is False
+    assert rejected["replacements"] == []
+    for path, original in originals.items():
+        current = await native.get_current(namespace_id=vault_id, surface="document", path=path)
+        assert current.revision_id == original.revision_id
+    result = await grep.grep_public(
+        "^TODO$", regex=True, user_id=owner_id, vaults=[vault_name],
+        collection="core", limit=1, replace="DONE", max_replacements=2, actor="grep-test",
+    )
+    assert result["replacement_complete"] is True
+    assert result["replaced_docs"] == 2
+    assert result["returned_docs"] == 1
+    assert {r["previous_commit"] for r in result["replacements"]} == {
+        originals["core/a.md"].revision_id, originals["core/b.md"].revision_id,
+    }
+    after = await grep.grep_public("^DONE$", regex=True, user_id=owner_id, vaults=[vault_name])
+    assert after["total_matches"] == 4
+    sibling = await native.get_current(
+        namespace_id=vault_id, surface="document", path="core-extra/c.md",
+    )
+    assert sibling.revision_id == originals["core-extra/c.md"].revision_id
+
+
+@pytest.mark.asyncio
+async def test_native_grep_cas_conflict_preserves_partial_receipts(context, monkeypatch):
+    pool, vault_id, _, vault_name = context
+    async with pool.acquire() as conn:
+        owner_id = await conn.fetchval("SELECT owner_id FROM vaults WHERE id=$1", vault_id)
+    native = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
+    originals = {}
+    for path in ("race/a.md", "race/b.md", "race/c.md"):
+        originals[path] = await native.create_text(
+            namespace_id=vault_id, surface="document", path=path,
+            payload="TODO", actor="fixture", mutation_id=uuid.uuid4(),
+        )
+    original_replace = NativeRevisionService.replace_text
+
+    async def concurrent_replace(self, **kwargs):
+        if kwargs["path"] == "race/b.md":
+            await original_replace(self, **{
+                **kwargs, "payload": "concurrent content", "mutation_id": uuid.uuid4(),
+            })
+        return await original_replace(self, **kwargs)
+
+    monkeypatch.setattr(NativeRevisionService, "replace_text", concurrent_replace)
+    result = await M1NativeGrepService(pool).grep_public(
+        "TODO", user_id=owner_id, vaults=[vault_name], collection="race",
+        replace="DONE", actor="fixture", case_sensitive=True,
+    )
+    assert result["replacement_complete"] is False
+    assert result["replaced_docs"] == 1
+    assert result["replacements"][0]["previous_commit"] == originals["race/a.md"].revision_id
+    assert result["details"]["committed_replacements"] == 1
+    assert "/coll/race/doc/b.md" in result["details"]["failed_uri"]
+    untouched = await native.get_current(namespace_id=vault_id, surface="document", path="race/c.md")
+    assert untouched.revision_id == originals["race/c.md"].revision_id
+    after = await M1NativeGrepService(pool).grep_public(
+        "concurrent content", user_id=owner_id, vaults=[vault_name], case_sensitive=True,
+    )
+    assert after["total_docs"] == 1
+
+
+@pytest.mark.asyncio
+async def test_native_grep_rechecks_revoked_write_access_between_documents(context, monkeypatch):
+    pool, vault_id, _, vault_name = context
+    native = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
+    originals = {}
+    for path in ("revoke/a.md", "revoke/b.md"):
+        originals[path] = await native.create_text(
+            namespace_id=vault_id, surface="document", path=path,
+            payload="TODO", actor="fixture", mutation_id=uuid.uuid4(),
+        )
+    async with pool.acquire() as conn:
+        caller = await conn.fetchval(
+            "INSERT INTO users (username, email, password_hash) VALUES ($1,$2,'disabled') RETURNING id",
+            f"grep-writer-{uuid.uuid4().hex}", f"{uuid.uuid4().hex}@invalid.example",
+        )
+        await conn.execute("UPDATE vaults SET public_access='writer' WHERE id=$1", vault_id)
+    original_replace = NativeRevisionService.replace_text
+
+    async def revoke_after_first(self, **kwargs):
+        result = await original_replace(self, **kwargs)
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE vaults SET public_access='reader' WHERE id=$1", vault_id)
+        return result
+
+    monkeypatch.setattr(NativeRevisionService, "replace_text", revoke_after_first)
+    try:
+        result = await M1NativeGrepService(pool).grep_public(
+            "TODO", user_id=caller, vaults=[vault_name], collection="revoke",
+            replace="DONE", actor="fixture", case_sensitive=True,
+        )
+        assert result["replacement_complete"] is False
+        assert result["replaced_docs"] == 1
+        assert result["details"]["committed_replacements"] == 1
+        assert "/coll/revoke/doc/b.md" in result["details"]["failed_uri"]
+        untouched = await native.get_current(namespace_id=vault_id, surface="document", path="revoke/b.md")
+        assert untouched.revision_id == originals["revoke/b.md"].revision_id
+    finally:
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM users WHERE id=$1", caller)

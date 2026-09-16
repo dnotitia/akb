@@ -1812,11 +1812,12 @@ class SearchService:
         max_replacements: int = DEFAULT_MAX_REPLACEMENTS,
         count_only: bool = False,
         files_with_matches: bool = False,
-        measurement_include_text_files: bool = False,
+        measurement_include_text_files: bool | None = None,
         doc_types: list[str] | None = None,
         tags: list[str] | None = None,
         include_archived: bool = True,
         archive_scope: ArchiveScope | None = None,
+        include_text_files: bool | None = None,
     ) -> dict:
         """Exact text / regex search across document content.
 
@@ -1833,6 +1834,17 @@ class SearchService:
         valid with the default response shape).
         """
         import re as _re
+
+        resource_output = include_text_files is True
+        if (include_text_files is not None and measurement_include_text_files is not None
+                and include_text_files != measurement_include_text_files):
+            raise ValidationError("include_text_files conflicts with measurement_include_text_files")
+        include_text_files = (
+            include_text_files if include_text_files is not None
+            else bool(measurement_include_text_files)
+        )
+        if include_text_files and replace is not None:
+            raise ValidationError("native grep replace does not support File resources")
 
         scope = resolve_archive_scope(archive_scope, include_archived)
         include_archived = scope != "unarchived"
@@ -1872,13 +1884,13 @@ class SearchService:
         limit = clamp_search_limit(limit)
 
         document_source = _configured_document_source_type()
-        if measurement_include_text_files and (
+        if include_text_files and (
             settings.document_revision_backend
             not in {"postgres_native", "native_ledger_m1"}
             or document_source != NATIVE_DOCUMENT_SOURCE
         ):
             raise ValidationError(
-                "measurement_include_text_files requires a native Document backend "
+                "include_text_files requires a native Document backend "
                 "(postgres_native or guarded native_ledger_m1)"
             )
         if document_source == NATIVE_DOCUMENT_SOURCE:
@@ -1899,7 +1911,8 @@ class SearchService:
                 max_replacements=max_replacements,
                 count_only=count_only,
                 files_with_matches=files_with_matches,
-                include_text_files=measurement_include_text_files,
+                include_text_files=include_text_files,
+                resource_output=resource_output,
                 doc_types=doc_types, tags=tags, include_archived=include_archived,
                 archive_scope=scope,
             )
