@@ -1338,6 +1338,14 @@ class FileService:
         object store is the authority on that and `confirm_upload` asks it
         directly; a second record of the same fact could only disagree.
 
+        `already_confirmed` is carried because a deduplicating reservation
+        adopts the File that already holds the key — including one whose
+        bytes are final. Writing to that key is how a caller could replace
+        another File's content, and the damage does not stop at replacement:
+        `confirm_upload` re-derives the digest, finds it disagrees with the
+        content-addressed key, and deletes the row. The route uses this to
+        keep the body away from storage in that case.
+
         A row without `object_key` belongs to the measurement lane, which
         carries its bytes in the database and addresses no object store. It is
         refused rather than having a key inferred for it — and like every
@@ -1356,7 +1364,8 @@ class FileService:
         async with pool.acquire() as conn:
             grant = await conn.fetchrow(
                 """
-                SELECT i.file_id, i.vault_id, i.object_key, i.mime_type
+                SELECT i.file_id, i.vault_id, i.object_key, i.mime_type,
+                       f.upload_state
                   FROM m1_file_transfer_intents AS i
                   JOIN vault_files AS f
                     ON f.id = i.file_id AND f.vault_id = i.vault_id
@@ -1375,6 +1384,10 @@ class FileService:
             # one AKB normalized when the capability was issued, not one the
             # uploading client restates at PUT time.
             "mime_type": _normalize_content_type(grant["mime_type"]),
+            # Whether this reservation adopted a File that is already
+            # confirmed. It changes what the route may do with the body —
+            # see `upload_by_capability`.
+            "already_confirmed": grant["upload_state"] == "confirmed",
         }
 
     async def list_files(

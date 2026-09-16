@@ -450,6 +450,7 @@ async def test_a_grant_resolves_to_its_key_and_the_stored_type(monkeypatch):
         "vault_id": uuid.uuid4(),
         "object_key": _KEY,
         "mime_type": "IMAGE/PNG; charset=utf-8",
+        "upload_state": "pending",
     }
     service, _pool = await _service(monkeypatch, row=row)
 
@@ -580,7 +581,8 @@ async def test_an_oversized_declared_length_is_refused_before_any_body(monkeypat
     from app.config import settings
 
     async def _grant(_token):
-        return {"object_key": _KEY, "mime_type": "application/pdf"}
+        return {"object_key": _KEY, "mime_type": "application/pdf",
+                "already_confirmed": False}
 
     monkeypatch.setattr(route_mod.file_service, "resolve_write_capability", _grant)
     monkeypatch.setattr(
@@ -606,7 +608,8 @@ async def test_the_stored_type_is_the_grants_not_the_clients_header(monkeypatch)
     seen: dict = {}
 
     async def _grant(_token):
-        return {"object_key": _KEY, "mime_type": "image/png"}
+        return {"object_key": _KEY, "mime_type": "image/png",
+                "already_confirmed": False}
 
     async def _store(key, chunks, *, content_type, max_bytes, declared_bytes=None):
         seen.update(
@@ -753,3 +756,116 @@ async def test_the_grant_names_the_key_the_reservation_actually_took(monkeypatch
     assert attempts["n"] == 2, "the preferred key must have been refused once"
     assert granted != preferred, "the grant must not name the key that was refused"
     assert granted.endswith("_report.bin")
+
+
+# --- a deduplicating reservation must not become a way to destroy a File ---
+
+
+async def test_a_confirmed_file_never_receives_the_body(monkeypatch):
+    """The reservation that deduplicates adopts a File whose bytes are final.
+
+    Chain, if the body were stored: the key is content-addressed, so bytes
+    that are not the File's content make the stored digest disagree with the
+    key — and `confirm` answers that by deleting the row, its publications
+    and the object. Everything the caller needs is readable: the collection,
+    the name, and the hash all appear in a listing.
+
+    So the body is read and thrown away. `store_object_stream` must not be
+    reached at all."""
+    from app.api.routes import files as route_mod
+    from app.config import settings
+
+    async def _grant(_token):
+        return {
+            "object_key": _KEY,
+            "mime_type": "application/pdf",
+            "already_confirmed": True,
+        }
+
+    monkeypatch.setattr(route_mod.file_service, "resolve_write_capability", _grant)
+    monkeypatch.setattr(
+        route_mod, "store_object_stream",
+        _never("a confirmed File's object must not be written"),
+    )
+    monkeypatch.setattr(settings, "file_upload_max_bytes", 1 << 20, raising=False)
+
+    response = await route_mod.upload_by_capability(
+        "A" * 43,
+        _Request({"content-length": "4"}, body=b"evil", content_type="application/pdf"),
+    )
+
+    assert response.status_code == 200
+
+
+async def test_the_discarded_body_is_still_consumed(monkeypatch):
+    """Answering before the body is read leaves a client mid-`PUT` looking at
+    a connection error instead of its 200 — and two shipped clients send the
+    body whatever `deduplicated` said."""
+    from app.api.routes import files as route_mod
+    from app.config import settings
+
+    consumed: list[bytes] = []
+
+    class _WatchedRequest(_Request):
+        async def stream(self):
+            consumed.append(self._body)
+            yield self._body
+
+    async def _grant(_token):
+        return {"object_key": _KEY, "mime_type": "application/pdf",
+                "already_confirmed": True}
+
+    monkeypatch.setattr(route_mod.file_service, "resolve_write_capability", _grant)
+    monkeypatch.setattr(settings, "file_upload_max_bytes", 1 << 20, raising=False)
+
+    await route_mod.upload_by_capability(
+        "A" * 43, _WatchedRequest({"content-length": "4"}, body=b"evil"),
+    )
+
+    assert consumed == [b"evil"]
+
+
+async def test_a_pending_reservation_still_stores_its_body(monkeypatch):
+    """The ordinary path must be untouched: a fresh reservation writes."""
+    from app.api.routes import files as route_mod
+    from app.config import settings
+
+    stored: dict = {}
+
+    async def _grant(_token):
+        return {"object_key": _KEY, "mime_type": "application/pdf",
+                "already_confirmed": False}
+
+    async def _store(key, chunks, *, content_type, max_bytes, declared_bytes=None):
+        stored["key"] = key
+        return sum([len(c) async for c in chunks])
+
+    monkeypatch.setattr(route_mod.file_service, "resolve_write_capability", _grant)
+    monkeypatch.setattr(route_mod, "store_object_stream", _store)
+    monkeypatch.setattr(settings, "file_upload_max_bytes", 1 << 20, raising=False)
+
+    response = await route_mod.upload_by_capability(
+        "A" * 43, _Request({"content-length": "4"}, body=b"good"),
+    )
+
+    assert response.status_code == 200
+    assert stored["key"] == _KEY
+
+
+async def test_the_resolver_reports_whether_the_file_is_already_final(monkeypatch):
+    """The route cannot make that decision without being told, and the
+    statement is where it has to come from — the File row, not the grant."""
+    row = {
+        "file_id": uuid.uuid4(),
+        "vault_id": uuid.uuid4(),
+        "object_key": _KEY,
+        "mime_type": "application/pdf",
+        "upload_state": "confirmed",
+    }
+    service, pool = await _service(monkeypatch, row=row)
+
+    grant = await service.resolve_write_capability("A" * 43)
+    assert grant["already_confirmed"] is True
+
+    sql, _params = pool.conn.queries[0]
+    assert "f.upload_state" in sql, "the state must come from the File row"

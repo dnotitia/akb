@@ -39,6 +39,7 @@ from pydantic import ConfigDict
 
 from app.api.deps import get_current_user, get_optional_user
 from app.api.routes import assets
+from app.api.routes.files import _download_capability_slots
 from app.exceptions import ForbiddenError, NotFoundError
 from app.config import settings
 from app.db.postgres import get_pool
@@ -990,8 +991,27 @@ async def publication_download(slug: str, request: Request):
         except Exception as e:  # noqa: BLE001 — any storage failure → 502
             logger.warning("download storage error for %s: %s", slug, e)
             raise HTTPException(status_code=502, detail="File content is temporarily unavailable")
+        # Bounded like the capability download, and with the same budget:
+        # both hold a botocore connection and an anyio thread for the length
+        # of the transfer, and they draw on one pool. This path had no limit
+        # at all, which made the only unauthenticated byte route the one that
+        # could exhaust the others.
+        #
+        # The slot is released from the generator's `finally` so a client
+        # that disconnects mid-stream returns it too. `Semaphore.release` is
+        # not thread-safe and the generator runs in anyio's threadpool, so
+        # the release is marshalled back to the loop.
+        loop = asyncio.get_running_loop()
+        await _download_capability_slots.acquire()
+
+        def _bounded_chunks():
+            try:
+                yield from file_service.iter_object_chunks(file_storage["s3_key"])
+            finally:
+                loop.call_soon_threadsafe(_download_capability_slots.release)
+
         return StreamingResponse(
-            file_service.iter_object_chunks(file_storage["s3_key"]),
+            _bounded_chunks(),
             media_type=file_storage.get("mime_type") or "application/octet-stream",
             headers={
                 "Content-Disposition": file_service.content_disposition_attachment(
