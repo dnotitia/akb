@@ -846,12 +846,12 @@ class BudgetLedger:
         guard.reserved_cost_usd = balance
         self._assert_reservation_invariant()
 
-    def _close_guard(self, guard: ProviderRequestGuard, state: Literal["charged", "released"]) -> bool:
+    def _close_guard(self, guard: ProviderRequestGuard) -> bool:
         if guard not in self._open_reservations:
             return False
         self._open_reservations.remove(guard)
         guard.reserved_cost_usd = Decimal("0")
-        guard._state = state
+        guard._is_open = False
         guard._pending_requests.clear()
         self._assert_reservation_invariant()
         return True
@@ -879,7 +879,7 @@ class BudgetLedger:
         async with self._lock:
             if guard.ledger is not self:
                 raise BudgetExceeded("provider request reservation belongs to another ledger")
-            released = self._close_guard(guard, "released")
+            released = self._close_guard(guard)
             return released
 
     async def admit_provider_request(self, guard: ProviderRequestGuard) -> ProviderRequestReceipt:
@@ -948,7 +948,7 @@ class BudgetLedger:
         async with self._lock:
             released = self.reserved_cost_usd
             for guard in tuple(self._open_reservations):
-                self._close_guard(guard, "released")
+                self._close_guard(guard)
             self._assert_reservation_invariant()
             return released
 
@@ -1001,7 +1001,7 @@ class BudgetLedger:
             self.model_work_seconds = next_model_work
             if global_failure is not None:
                 self._budget_failure = global_failure
-            self._close_guard(guard, "charged")
+            self._close_guard(guard)
             if global_failure is not None:
                 raise BudgetExceeded(f"benchmark incomplete: {global_failure}")
             if trial_failure is not None:
@@ -1014,13 +1014,13 @@ class ProviderRequestGuard:
     reserved_cost_usd: Decimal
     requests: int = 0
     provider_cost_usd: Decimal = field(default_factory=lambda: Decimal("0"))
-    _state: Literal["open", "charged", "released"] = "open"
+    _is_open: bool = True
     _next_request_id: int = 0
     _pending_requests: set[int] = field(default_factory=set)
 
     @property
     def is_open(self) -> bool:
-        return self._state == "open"
+        return self._is_open
 
     async def __call__(self) -> ProviderRequestReceipt:
         return await self.ledger.admit_provider_request(self)
