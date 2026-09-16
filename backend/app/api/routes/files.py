@@ -1,6 +1,7 @@
 """REST API routes for vault file storage (S3-backed)."""
 
 import asyncio
+import hmac
 import re
 
 from fastapi import APIRouter, Depends, Query, Request, Response
@@ -12,10 +13,11 @@ from app.api.file_write_context import (
     resolve_file_write_context as _resolve_file_write_context,
 )
 from app.config import settings
-from app.exceptions import AKBError
+from app.exceptions import AKBError, NotFoundError
 from app.models.file import BodyPlacementObservation
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
+from app.services.adapters.s3_adapter import presign_internal_get
 from app.services.file_service import (
     FileService,
     content_disposition_inline,
@@ -27,6 +29,9 @@ from app.services.raw_mime_policy import is_inert_raw_mime
 from app.util.text import normalize_content_type, to_nfc
 
 router = APIRouter()
+# Mounted under a prefix no ingress routes, so it is unreachable from outside
+# even before the shared key is checked. See `authorize_gateway_download`.
+internal_router = APIRouter()
 file_service = FileService()
 _measurement_transfer_slots = asyncio.Semaphore(2)
 # Bounded like its sibling above. A download streams one GET response for the
@@ -280,18 +285,17 @@ def _parse_single_range(header: str | None, size: int) -> tuple[int, int] | None
     return start, end
 
 
-@router.api_route(
-    "/files/download/{token}", methods=["GET"], include_in_schema=False,
-)
-async def download_by_capability(token: str, request: Request):
-    """Serve File bytes to a holder of a download capability.
+def _raw_download_policy(row: dict) -> dict[str, str]:
+    """The response headers one File's bytes are served under.
 
-    No user-token dependency: the short-lived capability is the authorization,
-    exactly as a presigned signature was. The public contract is the
-    `download_url` field, not this path, so it stays out of the schema."""
-    row = await file_service.resolve_download_capability(token)
+    One function because there are now two ways those bytes reach a client —
+    streamed by this process, or carried by the byte gateway — and a policy
+    that exists in two copies is a policy that will disagree with itself. The
+    gateway gets these same values through the signature it is handed.
+    """
     mime = normalize_content_type(row["mime_type"])
     headers = {
+        "Content-Type": mime,
         "X-Content-Type-Options": "nosniff",
         "Cache-Control": "private, no-store",
         "Content-Disposition": content_disposition_inline(
@@ -302,6 +306,26 @@ async def download_by_capability(token: str, request: Request):
         # Fail CLOSED. These bytes were uploaded by someone; a type we cannot
         # prove inert must not run as a document in this origin.
         headers["Content-Security-Policy"] = "sandbox allow-same-origin"
+    return headers
+
+
+@router.api_route(
+    "/files/download/{token}", methods=["GET"], include_in_schema=False,
+)
+async def download_by_capability(token: str, request: Request):
+    """Serve File bytes to a holder of a download capability.
+
+    No user-token dependency: the short-lived capability is the authorization,
+    exactly as a presigned signature was. The public contract is the
+    `download_url` field, not this path, so it stays out of the schema.
+
+    Still the only byte path in a deployment without the gateway — the
+    all-in-one compose file and the Helm chart both route this prefix
+    straight here — so it keeps its own range handling and streaming.
+    """
+    row = await file_service.resolve_download_capability(token)
+    headers = _raw_download_policy(row)
+    mime = headers.pop("Content-Type")
 
     if request.method == "HEAD":
         # Defensive, and measured: FastAPI's APIRoute does NOT add HEAD to a
@@ -366,6 +390,55 @@ async def download_by_capability(token: str, request: Request):
     return StreamingResponse(
         _bounded_chunks(), status_code=status, media_type=mime, headers=headers,
     )
+
+
+@internal_router.get(
+    "/files/download/{token}", include_in_schema=False,
+)
+async def authorize_gateway_download(token: str, request: Request):
+    """Answer the byte gateway's authorization subrequest.
+
+    Returns no body. On success it hands back a signed URL the gateway may
+    fetch the object with, plus the response headers that URL will produce —
+    the policy is decided here, as it always was, and travels in the
+    signature rather than being re-applied downstream.
+
+    Reachability: no ingress maps this prefix, and `file_gateway_key` is the
+    second lock. Unset, the route answers 404 — a deployment without a
+    gateway has nothing here to find. A wrong key fails every download at
+    once rather than leaking quietly, which is the failure worth having.
+
+    Every refusal is 401 with no body. The gateway maps that to the 404 a
+    client sees today. It must not be 403: the gateway reads 403 from its
+    upstream as a storage failure and would answer 502.
+    """
+    expected = settings.file_gateway_key
+    presented = request.headers.get("x-akb-gateway-key") or ""
+    if not expected or not hmac.compare_digest(presented, expected):
+        # 404, not 401: the gateway maps 401 to the client-facing 404 for a
+        # refused capability, and a misconfigured key must not look like one.
+        # This path becomes a 503 at the gateway — every download fails at
+        # once, which is how a wrong shared secret should announce itself.
+        return Response(status_code=404)
+
+    try:
+        row = await file_service.resolve_download_capability(token)
+    except NotFoundError:
+        # Shape, expiry, never-issued and since-deleted stay one answer.
+        return Response(status_code=401)
+
+    headers = _raw_download_policy(row)
+    signed = await asyncio.to_thread(
+        presign_internal_get,
+        row["s3_key"],
+        ttl=settings.file_gateway_presign_ttl,
+        content_type=headers["Content-Type"],
+        content_disposition=headers["Content-Disposition"],
+        cache_control=headers["Cache-Control"],
+    )
+    # The gateway reads only this. The rest of `headers` is what the object
+    # store will emit because it is what was signed.
+    return Response(status_code=204, headers={"X-AKB-S3": signed})
 
 
 @router.get("/files/{vault}/{file_id}/download", summary="Get download URL")
