@@ -2200,6 +2200,50 @@ class SearchService:
 
     async def drill_down(self, vault: str, doc_id: str, section: str | None = None) -> list[dict]:
         """Get L3 section-level content for a document."""
+        if _configured_document_source_type() == NATIVE_DOCUMENT_SOURCE:
+            from app.services.native_document_service import NativeDocumentService
+            from app.services.index_service import MAX_CHUNK_SIZE, _HEADING_RE
+
+            # Read verified current authority, not a possibly absent/stale derived
+            # chunk or a legacy catalogue row. The adapter resolves IDs/paths/aliases.
+            document = await NativeDocumentService(pool=await get_pool()).get(vault, doc_id)
+
+            def native_sections() -> list[dict]:
+                body = document.content or ""
+                headings = list(_HEADING_RE.finditer(body))
+                spans: list[tuple[str, int, int]] = []
+                if not headings:
+                    spans.append(("", 0, len(body)))
+                elif headings[0].start():
+                    spans.append(("", 0, headings[0].start()))
+                hierarchy: list[tuple[int, str]] = []
+                for index, heading in enumerate(headings):
+                    level = len(heading.group(1))
+                    while hierarchy and hierarchy[-1][0] >= level:
+                        hierarchy.pop()
+                    hierarchy.append((level, f"{'#' * level} {heading.group(2).strip()}"))
+                    path = " > ".join(label for _, label in hierarchy)
+                    start = heading.end()
+                    if body[start:start + 1] == "\n":
+                        start += 1  # Only the heading's line terminator belongs to its syntax.
+                    end = headings[index + 1].start() if index + 1 < len(headings) else len(body)
+                    spans.append((path, start, end))
+
+                rows: list[dict] = []
+                chunk_index = 0
+                for path, start, end in spans:
+                    # Index chunks insert nested overlap and synthetic context.
+                    # Current-body reads instead slice source spans directly:
+                    # no content guessing, no duplicate bytes, bounded rows.
+                    for offset in range(start, max(start + 1, end), MAX_CHUNK_SIZE):
+                        if not section or section.casefold() in path.casefold():
+                            rows.append({"section_path": path,
+                                         "content": body[offset:min(offset + MAX_CHUNK_SIZE, end)],
+                                         "chunk_index": chunk_index})
+                        chunk_index += 1
+                return rows
+
+            return await asyncio.to_thread(native_sections)
         from app.repositories.document_repo import DocumentRepository
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -2249,6 +2293,10 @@ class SearchService:
         SQL, before the LIMIT, and the Python pass keeps the contract true
         regardless of how the rows arrive.
         """
+        if _configured_document_source_type() == NATIVE_DOCUMENT_SOURCE:
+            rows = await self.drill_down(vault, doc_id)
+            native_headings = list(dict.fromkeys(row["section_path"] for row in rows if row["section_path"]))
+            return native_headings[:limit] if isinstance(limit, int) and limit > 0 else native_headings
         from app.repositories.document_repo import DocumentRepository
         pool = await get_pool()
         async with pool.acquire() as conn:
