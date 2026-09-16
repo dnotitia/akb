@@ -626,6 +626,19 @@ class Settings(BaseModel):
     # it does not.
     file_upload_max_bytes: int = Field(default=5 * 1024 * 1024 * 1024, ge=1)
 
+    # Shared secret between this service and the byte gateway that fronts file
+    # downloads. Blank disables the internal authorization route entirely —
+    # it answers 404, exactly as if it did not exist — so a deployment without
+    # a gateway never exposes it. The route is already unreachable from
+    # outside because no ingress maps its prefix; this is the second lock, and
+    # a mismatch fails every download loudly rather than leaking quietly.
+    file_gateway_key: str = ""
+    # How long the gateway has to start fetching. The object store checks the
+    # signature once, when the request begins, so this bounds the hop between
+    # this service and the gateway — not the transfer, which may run for
+    # minutes afterwards.
+    file_gateway_presign_ttl: int = Field(default=60, ge=5, le=3600)
+
     # External-git mirror — network timeouts (seconds) for the poller's
     # three remote-aware git ops. A hanging TCP session otherwise stalls
     # the entire poller task forever since asyncio.to_thread can't cancel

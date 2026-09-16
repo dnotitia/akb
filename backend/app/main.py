@@ -357,6 +357,11 @@ app.include_router(agent_sessions.router, prefix="/api/v1", tags=["agent-session
 app.include_router(tables.router, prefix="/api/v1", tags=["tables"])
 app.include_router(knowledge_io.router, prefix="/api/v1", tags=["export-import"])
 app.include_router(files.router, prefix="/api/v1", tags=["files"])
+# `/internal` is deliberately not `/api`: every ingress in the deployment maps
+# `/api`, `/mcp`, `/.well-known` and the probes to this service and everything
+# else to the frontend, so this prefix has no route from outside. The byte
+# gateway reaches it over the cluster network with a shared key.
+app.include_router(files.internal_router, prefix="/internal", include_in_schema=False)
 app.include_router(assets.router, prefix="/api/v1", tags=["assets"])
 app.include_router(assets.stable_router, prefix="/api", tags=["assets"])
 app.include_router(public.router, prefix="/api/v1", tags=["public"])

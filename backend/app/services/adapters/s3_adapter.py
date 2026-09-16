@@ -153,6 +153,35 @@ def client():
     return _internal_client
 
 
+_internal_presign_client = None
+
+
+def internal_presign_client():
+    """A signer bound to the INTERNAL endpoint.
+
+    `presign_client` signs against `s3_public_url`, which is correct for a URL
+    handed to a browser and wrong for one handed to the byte gateway: the
+    gateway sits inside the cluster, and a URL naming the public host would
+    send it back out through the ingress it exists to replace.
+
+    It carries the same `before-sign` snapshot so a temporary session's
+    remaining lifetime still bounds the signature. This deployment uses static
+    keys and never exercises that, which is exactly why it has to be wired
+    here rather than noticed later.
+    """
+    global _internal_presign_client
+    if _internal_presign_client is None:
+        with _client_lock:
+            if _internal_presign_client is None:
+                _internal_presign_client = session_client(
+                    settings.s3_endpoint_url, settings.s3_region,
+                )
+                _internal_presign_client.meta.events.register(
+                    "before-sign.s3", _bind_signing_snapshot,
+                )
+    return _internal_presign_client
+
+
 def presign_client():
     """boto3 S3 client targeting the public endpoint. Used to sign URLs
     that clients reach from outside the cluster. Falls back to the
@@ -370,6 +399,39 @@ def delete(key: str) -> None:
 
 
 # ── Presign ──────────────────────────────────────────────────────
+
+
+def presign_internal_get(
+    key: str,
+    *,
+    ttl: int,
+    content_type: str,
+    content_disposition: str,
+    cache_control: str,
+) -> str:
+    """Sign one object read for the byte gateway, policy included.
+
+    The response headers travel in the signature rather than being re-applied
+    downstream. The object store honours `response-content-*` on a signed
+    request (measured against the deployed RGW), so the gateway needs no
+    `add_header` of its own for them — and that matters more than it sounds:
+    a single `add_header` inside an nginx location silently drops every header
+    inherited from the server block, which is where the unconditional security
+    headers live.
+    """
+    params = {
+        "Bucket": settings.s3_bucket,
+        "Key": key,
+        "ResponseContentType": content_type,
+        "ResponseContentDisposition": content_disposition,
+        "ResponseCacheControl": cache_control,
+    }
+    try:
+        return internal_presign_client().generate_presigned_url(
+            "get_object", Params=params, ExpiresIn=ttl,
+        )
+    except ClientError as e:
+        raise StorageError(wrap_error(e, f"sign read {key}").message) from e
 
 
 def presign_get(
