@@ -22,7 +22,7 @@ embed_dimensions: 1536
 
 s3_auth_mode: default_chain
 s3_endpoint_url: https://storage.example
-s3_public_url: https://files.example
+s3_public_url: "" # retained and ignored
 s3_bucket: tenant-files
 s3_region: us-east-1
 s3_sts_endpoint_url: https://storage.example
@@ -81,9 +81,9 @@ credentials for empty configured keys.
 For native cloud credentials, set `s3_auth_mode: default_chain` and remove both
 static key fields. Leave all three explicit WebIdentity fields blank to use
 the [native Boto3 credential providers](https://docs.aws.amazon.com/boto3/latest/guide/credentials.html),
-including cloud roles and AWS WebIdentity configuration. `s3_endpoint_url` and
-`s3_public_url` may both be blank for AWS S3; set `s3_region` to the bucket's
-region. This explicitly enables storage and cleanup workers without requiring
+including cloud roles and AWS WebIdentity configuration. `s3_endpoint_url` may
+be blank for AWS S3; set `s3_region` to the bucket's region. `s3_public_url` is
+retained and ignored, and can be left blank everywhere. This explicitly enables storage and cleanup workers without requiring
 a custom endpoint. Buckets must already exist. Temporary credentials refresh
 through the same provider chain; because no client-facing URL is signed
 against them, a session's remaining lifetime no longer bounds how long a

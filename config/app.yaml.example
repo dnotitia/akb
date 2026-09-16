@@ -144,7 +144,7 @@ vault_filter_enabled: false
 # cloud storage even without an endpoint; never set static key fields with it.
 s3_auth_mode: static # static | default_chain
 s3_endpoint_url: "http://minio:9000" # local Compose; blank disables object storage
-s3_public_url: "http://localhost:9000" # browser endpoint; change for remote access
+s3_public_url: "" # retained and ignored; nothing signs a URL for a browser any more
 s3_bucket: akb-files
 s3_region: ""
 # Explicit WebIdentity (required in platform_hard): configured token → STS only,
