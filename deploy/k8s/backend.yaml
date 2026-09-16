@@ -1,3 +1,8 @@
+# The single-node shape: one pod running the API and the workers as two
+# containers. It is what a straightforward Kubernetes install wants, and it is
+# not what every deployment runs — a larger one splits the two into separate
+# Deployments so they scale and restart independently.
+#
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -95,6 +100,17 @@ spec:
   # avoids the race. Caught when an AWS demo rollout left the new pod
   # Pending for 10+ minutes while the old one held the volume.
   strategy:
+    # Recreate, not RollingUpdate, and deliberately: the vault volume is
+    # ReadWriteOnce, so a surge pod cannot mount it while the old one still
+    # holds it. On EBS that surfaces as a Multi-Attach error and the rollout
+    # stalls; on a shared filesystem it would work, but this manifest cannot
+    # know which it got.
+    #
+    # The cost is real — a deploy that fails to start has already stopped the
+    # old pod, so a bad image or an unreadable config is downtime rather than
+    # a stalled rollout. A deployment on shared storage can take
+    # `RollingUpdate` with `maxUnavailable: 0` and avoid that; one on EBS
+    # cannot.
     type: Recreate
   selector:
     matchLabels:
