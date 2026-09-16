@@ -105,7 +105,7 @@ data:
           proxy_pass_request_body off;
           proxy_set_header Content-Length "";
           proxy_set_header X-Original-URI $request_uri;
-          # Secret: one line setting X-AKB-Gateway-Key.
+          # Mounted from the cluster: one line setting the shared header.
           include /etc/akb-file-gateway/key.conf;
           proxy_connect_timeout 1s;
           # Authorization is a database lookup and a signature — about a
@@ -196,7 +196,7 @@ spec:
             - {name: tmp, mountPath: /tmp}
       volumes:
         - {name: conf, configMap: {name: akb-file-gateway-conf}}
-        - {name: key, secret: {secretName: akb-file-gateway}}
+        - {name: key, secret: {secretName: akb-file-gateway}}  # pragma: allowlist secret
         - {name: tmp, emptyDir: {}}
 ---
 apiVersion: v1
