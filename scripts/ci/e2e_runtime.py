@@ -73,6 +73,7 @@ DEFAULT_PROFILE = "tool-only"
 SOURCE_REVISION_ENV = "AKB_E2E_SOURCE_REVISION"
 MINIO_RESET_MAX_ATTEMPTS = 3
 MINIO_RESET_BACKOFF_SECONDS = (0.05, 0.1)
+MINIO_DELETE_BATCH_SIZE = 1000
 MINIO_RETRYABLE_ERROR_CODES = frozenset(
     {
         "InternalError",
@@ -1931,11 +1932,12 @@ class E2ERuntime:
 
     def _minio_reset_pass(self, client) -> None:
         keys = self._minio_list_keys(client)
-        if keys:
+        for offset in range(0, len(keys), MINIO_DELETE_BATCH_SIZE):
+            batch = keys[offset : offset + MINIO_DELETE_BATCH_SIZE]
             try:
                 response = client.delete_objects(
                     Bucket="akb-files",
-                    Delete={"Objects": [{"Key": key} for key in keys], "Quiet": True},
+                    Delete={"Objects": [{"Key": key} for key in batch], "Quiet": True},
                 )
             except Exception as exc:  # noqa: BLE001 - classify and redact below
                 raise self._minio_operation_error("delete", exc) from None

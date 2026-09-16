@@ -161,6 +161,21 @@ def test_minio_reset_retries_partial_delete_and_verifies_empty(monkeypatch, tmp_
     assert sleeps == [e2e_runtime.MINIO_RESET_BACKOFF_SECONDS[0]]
 
 
+def test_minio_reset_chunks_large_delete_requests_to_s3_limit(monkeypatch, tmp_path):
+    runtime = E2ERuntime(make_config(tmp_path))
+    keys = [{"Key": f"object-{index}"} for index in range(e2e_runtime.MINIO_DELETE_BATCH_SIZE + 1)]
+    client = _FakeMinioClient(
+        [[{"Contents": keys}], [{"Contents": []}]],
+        delete_results=[{}, {}],
+    )
+    _install_fake_minio(monkeypatch, client)
+
+    evidence = runtime._clear_minio_objects()
+
+    assert evidence["status"] == "success"
+    assert [len(batch) for batch in client.delete_calls] == [1000, 1]
+
+
 def test_minio_reset_rejects_non_retryable_delete_error_without_retry(monkeypatch, tmp_path):
     runtime = E2ERuntime(make_config(tmp_path))
     runtime._fixture_private_values = ("fixture-password",)
