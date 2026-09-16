@@ -813,7 +813,7 @@ async def publication_document_asset(slug: str, file_id: str, request: Request):
         row = await assets.load_asset_row(file_id, to_uuid(publication["vault_id"]))
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail="Asset not found") from exc
-    return await assets.image_asset_response(row, public=True)
+    return await assets.image_asset_response(row, public=True, request=request)
 
 
 @router.get(
