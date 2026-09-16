@@ -9,6 +9,35 @@ test.describe("shared Markdown link search in the document composer", () => {
     "The reference adapter scenario is selected by AKB_FE_E2E_SCENARIO",
   );
 
+  test("opens an existing image-bearing document from Rendered into Edit", async ({ page, request }) => {
+    test.setTimeout(18_000);
+    const fixtureResponse = await request.get("/__akb_mock__/fixture/state");
+    expect(fixtureResponse.ok()).toBeTruthy();
+    const fixture = await fixtureResponse.json() as { document?: { content?: string } };
+    const markdown = fixture.document?.content ?? "";
+    expect(markdown).toContain("[Available document](akb://fixture/doc/available.md)");
+    expect(markdown).toContain("[Available file](akb://fixture/file/123e4567-e89b-42d3-a456-426614174001)");
+    expect(markdown).toContain("[Unavailable file](akb://fixture/file/123e4567-e89b-42d3-a456-426614174099)");
+    expect(markdown).toContain("![Fixture attachment](/api/assets/123e4567-e89b-42d3-a456-426614174000)");
+
+    await page.goto("/vault/fixture/doc/notes%2Freferences.md");
+    const image = page.getByRole("img", { name: "Fixture attachment" });
+    await expect(image).toBeVisible({ timeout: 5_000 });
+    const renderedImage = await image.evaluate(element => {
+      const image = element as HTMLImageElement;
+      return { complete: image.complete, naturalWidth: image.naturalWidth };
+    });
+    expect(renderedImage.complete).toBe(true);
+    expect(renderedImage.naturalWidth).toBeGreaterThan(0);
+
+    await page.getByRole("group", { name: "Document actions" })
+      .getByRole("button", { name: "Edit", exact: true })
+      .click({ timeout: 4_000 });
+
+    await expect(page.getByRole("textbox", { name: "Document body (markdown)" })).toBeVisible({ timeout: 6_000 });
+    await expect(page.getByRole("img", { name: "Fixture attachment" })).toBeVisible();
+  });
+
   test("saves and reopens a searched File link only after explicit Create", async ({ page, request }) => {
     await request.post("/__akb_mock__/reset", {
       data: { scenario: "markdown-reference-adapters" },

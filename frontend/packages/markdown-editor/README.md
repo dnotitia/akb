@@ -103,6 +103,22 @@ other tables stay disabled. “Continue below” focuses the paragraph immediate
 after that table, creating one before the next block when needed. Table deletion
 leaves an editable cursor position and is part of the editor undo history.
 
+`MarkdownEditingSurface` and `MarkdownEditor` accept `imageMenu` to attach the
+shared description and body-removal controls to each eligible image occurrence.
+The menu selects by editor document position, so repeated occurrences of the
+same target remain independent. `MarkdownCommands.setImageAltAt(position, alt)`
+and `deleteImageAt(position)` expose the same undoable operations. Removing an
+image edits Markdown only; the product still decides whether an uploaded asset
+is discarded, retained, or claimed.
+
+Products pass their target eligibility rule, replacement upload callback,
+accessible labels, and theme classes through `MarkdownImageMenuOptions`. The
+callback receives the selected image's ProseMirror document position. The
+package defaults use the shared `surface`, `border`, `foreground`, and
+`destructive` theme tokens; pass `classNames` to adapt them to another product.
+Read-only surfaces do not render image controls. Closing or cancelling the
+description dialog returns focus to the editor.
+
 `MarkdownToolbar` owns the default Paragraph, Heading 1–3, bold, italic,
 strikethrough, inline code, list, blockquote, code block, horizontal rule,
 table insertion, link, and undo/redo controls. It reads the same editor state
@@ -208,6 +224,12 @@ directory outside this package. The scripted composition check is not a substitu
 with a physical OS IME.
 
 ## Versioning
+
+The `0.7.0` public contract adds shared image description editing and body
+removal by document position, with per-occurrence menus, product target and
+replacement adapters, read-only handling, and independent undo steps. It also
+normalizes top-level images in the shared editing surface while preserving the
+serialized Markdown meaning.
 
 The `0.6.0` public contract adds shared GFM table insertion, selection-aware
 row/column commands, table-local controls, and continuation immediately below

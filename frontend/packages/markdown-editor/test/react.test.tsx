@@ -1,9 +1,10 @@
-import { act, fireEvent, render, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { userEvent } from '@testing-library/user-event'
 import { useEffect, useState } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
 import {
+  createMarkdownEditor,
   EditorContent,
   MarkdownEditor,
   MarkdownEditingSurface,
@@ -68,6 +69,38 @@ describe('React surfaces', () => {
     await waitFor(() => expect(getByTestId('hook-state')).toHaveTextContent('초안'))
     await userEvent.setup().click(getByRole('button', { name: 'set' }))
     await waitFor(() => expect(getByTestId('hook-state')).toHaveTextContent('명령'))
+  })
+
+  it('keeps runtime link attributes out of the canonical Markdown model', async () => {
+    const target = 'akb://fixture/doc/available.md'
+    const markdown = `[Available document](${target})`
+    const onChange = vi.fn()
+    let activeEditor: ReturnType<typeof useMarkdownEditor> = null
+
+    function LinkSurface() {
+      const editor = useMarkdownEditor({ initialMarkdown: markdown, onChange })
+      useEffect(() => {
+        activeEditor = editor
+      }, [editor])
+      return editor ? <EditorContent editor={editor} /> : null
+    }
+
+    const { container } = render(<LinkSurface />)
+    await waitFor(() => expect(activeEditor?.view).toBeTruthy())
+    const link = container.querySelector<HTMLAnchorElement>('.ProseMirror a[href]')!
+
+    await act(async () => {
+      link.setAttribute('data-markdown-target', target)
+      link.setAttribute('data-markdown-resolution', 'pending')
+      link.setAttribute('aria-disabled', 'true')
+      link.setAttribute('href', '#')
+      await new Promise(resolve => setTimeout(resolve, 20))
+    })
+
+    expect(link).toHaveAttribute('href', '#')
+    expect(link).toHaveAttribute('data-markdown-resolution', 'pending')
+    expect(activeEditor!.getMarkdown()).toBe(markdown)
+    expect(onChange).not.toHaveBeenCalled()
   })
 
   it('supports controlled Markdown updates without replacing an unchanged editor', async () => {
@@ -285,5 +318,112 @@ describe('React surfaces', () => {
       expect(link).toHaveAttribute('href', '#')
       expect(link).toHaveAttribute('data-markdown-target', target)
     })
+  })
+
+  it('provides per-image controls, undo, serialization, and focus return through the public surface', async () => {
+    const user = userEvent.setup()
+    const target = 'https://example.com/shared.png'
+    const initialMarkdown = [
+      `![First](${target})`,
+      `![Second](${target})`,
+      '![Other](https://example.com/other.png)',
+    ].join('\n\n')
+    let activeEditor: ReturnType<typeof useMarkdownEditor> = null
+
+    function ImageSurface() {
+      const [markdown, setMarkdown] = useState(initialMarkdown)
+      const editor = useMarkdownEditor({
+        initialMarkdown,
+        onChange: setMarkdown,
+      })
+      useEffect(() => {
+        activeEditor = editor
+      }, [editor])
+
+      return (
+        <MarkdownEditingSurface
+          editor={editor}
+          markdown={markdown}
+          imageMenu={{}}
+          onSourceChange={setMarkdown}
+        >
+          {editor ? <EditorContent editor={editor} /> : null}
+        </MarkdownEditingSurface>
+      )
+    }
+
+    const { container } = render(<ImageSurface />)
+    await waitFor(() => {
+      expect(activeEditor?.view).toBeTruthy()
+      expect(container.querySelectorAll('[data-markdown-image-controls="true"]')).toHaveLength(3)
+    })
+
+    const editor = activeEditor!
+    const editSecond = screen.getByRole('button', { name: 'Edit image description: Second' })
+    editSecond.focus()
+    await user.keyboard('{Enter}')
+    const description = screen.getByRole('textbox', { name: 'Description' })
+    await user.clear(description)
+    await user.type(description, 'Second updated')
+    await user.keyboard('{Escape}')
+
+    await waitFor(() => expect(document.activeElement).toBe(editor.view.dom))
+    expect(editor.getMarkdown()).toContain(`![Second](${target})`)
+    await user.click(editSecond)
+    const cancelledDescription = screen.getByRole('textbox', { name: 'Description' })
+    await user.clear(cancelledDescription)
+    await user.type(cancelledDescription, 'Discarded edit')
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+
+    await waitFor(() => expect(document.activeElement).toBe(editor.view.dom))
+    expect(editor.getMarkdown()).toContain(`![Second](${target})`)
+    await user.click(editSecond)
+    const savedDescription = screen.getByRole('textbox', { name: 'Description' })
+    await user.clear(savedDescription)
+    await user.type(savedDescription, 'Second updated')
+    await user.click(screen.getByRole('button', { name: 'Save description' }))
+
+    await waitFor(() => expect(editor.getMarkdown()).toContain(`![Second updated](${target})`))
+    expect(editor.getMarkdown()).toContain(`![First](${target})`)
+    expect(editor.getMarkdown()).toContain('![Other](https://example.com/other.png)')
+
+    const savedMarkdown = editor.getMarkdown()
+    const reopenedEditor = createMarkdownEditor({ initialMarkdown: savedMarkdown })
+    const reopenedAlts: string[] = []
+    reopenedEditor.state.doc.descendants(node => {
+      if (node.type.name === 'image') reopenedAlts.push(String(node.attrs.alt ?? ''))
+    })
+    expect(reopenedAlts).toEqual(['First', 'Second updated', 'Other'])
+    reopenedEditor.destroy()
+
+    expect(editor.can().undo()).toBe(true)
+    await act(async () => editor.commands.undo())
+    expect(editor.getMarkdown()).toContain(`![Second](${target})`)
+    await act(async () => editor.commands.redo())
+    expect(editor.getMarkdown()).toContain(`![Second updated](${target})`)
+
+    await user.click(screen.getByRole('button', { name: 'Remove image: First' }))
+    await waitFor(() => expect(editor.getMarkdown()).not.toContain(`![First](${target})`))
+    expect(editor.getMarkdown()).toContain(`![Second updated](${target})`)
+    await act(async () => editor.commands.undo())
+    expect(editor.getMarkdown()).toContain(`![First](${target})`)
+
+    expect(editor.getMarkdown()).toContain(`![First](${target})`)
+    expect(editor.getMarkdown()).toContain(`![Second updated](${target})`)
+  })
+
+  it('does not expose image mutation controls in read-only mode', async () => {
+    const target = 'https://example.com/image.png'
+    const { container } = render(
+      <MarkdownEditor
+        markdown={`![Image](${target})`}
+        readOnly
+        imageMenu={{}}
+      />,
+    )
+
+    await waitFor(() => expect(container.querySelector('.ProseMirror')).toHaveAttribute('contenteditable', 'false'))
+    expect(container.querySelectorAll('[data-markdown-image-controls="true"]')).toHaveLength(0)
+    expect(within(container).queryAllByRole('button', { name: /image description|remove image/i })).toHaveLength(0)
   })
 })

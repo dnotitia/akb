@@ -172,6 +172,10 @@ export interface MarkdownCommands extends MarkdownTableCommands {
   setMarkdown(markdown: string): boolean
   insertMarkdown(markdown: string): boolean
   insertImage(target: string, alt?: string, title?: string): boolean
+  /** Update only the image node at this ProseMirror document position. */
+  setImageAltAt(position: number, alt: string): boolean
+  /** Remove only the image node at this ProseMirror document position. */
+  deleteImageAt(position: number): boolean
   setLink(href: string): boolean
   insertLink(text: string, href: string): boolean
   unsetLink(): boolean

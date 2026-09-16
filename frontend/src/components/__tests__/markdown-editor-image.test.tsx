@@ -170,7 +170,9 @@ describe("MarkdownEditor image insertion", () => {
     await screen.findByRole("img", { name: "diagram" });
     const removeButton = screen.getByRole("button", { name: "Remove image: diagram" });
     expect(removeButton.querySelector(".lucide-x")).not.toBeNull();
-    expect(removeButton.parentElement).toHaveClass("absolute", "right-2", "top-2");
+    expect(removeButton.parentElement).toHaveClass("absolute", "z-20");
+    expect(removeButton.parentElement?.style.top).not.toBe("");
+    expect(removeButton.parentElement?.style.left).not.toBe("");
     expect(removeButton).not.toHaveClass("opacity-0");
     fireEvent.click(removeButton);
 
@@ -222,6 +224,43 @@ describe("MarkdownEditor image insertion", () => {
         ),
       ).toBe(true),
     );
+  });
+
+  it("edits and removes only the selected location when the target is repeated", async () => {
+    const otherId = "3e17f5aa-0953-4dce-9042-5cd714a839da";
+    const markdown = [
+      `![first](/api/assets/${ASSET_ID})`,
+      `![second](/api/assets/${ASSET_ID})`,
+      `![other](/api/assets/${otherId})`,
+    ].join("\n\n");
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    const { container } = render(
+      <MarkdownEditor value={markdown} vault="team" onChange={onChange} />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('[data-markdown-image-controls="true"]')).toHaveLength(3);
+    });
+    await user.click(await screen.findByRole("button", { name: "Edit image description: second" }));
+    const description = screen.getByLabelText("Description");
+    await user.clear(description);
+    await user.type(description, "second updated");
+    await user.click(screen.getByRole("button", { name: "Save description" }));
+
+    expect(await screen.findByRole("img", { name: "second updated" })).toBeVisible();
+    expect(screen.getByRole("img", { name: "first" })).toBeVisible();
+    expect(screen.getByRole("img", { name: "other" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Remove image: first" }));
+
+    await waitFor(() => expect(screen.queryByRole("img", { name: "first" })).toBeNull());
+    expect(screen.getByRole("img", { name: "second updated" })).toBeVisible();
+    expect(screen.getByRole("img", { name: "other" })).toBeVisible();
+    await waitFor(() => expect(onChange.mock.calls.some(([next]) =>
+      next.includes(`![second updated](/api/assets/${ASSET_ID})`) &&
+      !next.includes(`![first](/api/assets/${ASSET_ID})`) &&
+      next.includes(`![other](/api/assets/${otherId})`),
+    )).toBe(true));
   });
 
   it("replaces an image in place instead of inserting a duplicate", async () => {

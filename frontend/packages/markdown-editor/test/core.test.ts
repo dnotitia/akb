@@ -178,6 +178,55 @@ describe('Markdown conformance core', () => {
     expect(editor.getMarkdown()).toBe('초안')
   })
 
+  it('edits and deletes one image occurrence by document position with undo', () => {
+    const target = 'https://example.com/shared.png'
+    const editor = createMarkdownEditor({ initialMarkdown: '' })
+    editors.push(editor)
+    const commands = markdownCommands(editor)
+    expect(commands.insertImage(target, 'First')).toBe(true)
+    expect(commands.insertImage(target, 'Second')).toBe(true)
+    expect(commands.insertImage('https://example.com/other.png', 'Other')).toBe(true)
+    const positions: number[] = []
+    editor.state.doc.descendants((node, position) => {
+      if (node.type.name === 'image') positions.push(position)
+    })
+
+    expect(positions).toHaveLength(3)
+    expect(commands.setImageAltAt(positions[1]!, 'Second updated')).toBe(true)
+    expect(editor.getMarkdown()).toContain(`![First](${target})`)
+    expect(editor.getMarkdown()).toContain(`![Second updated](${target})`)
+    expect(editor.getMarkdown()).toContain('![Other](https://example.com/other.png)')
+
+    expect(commands.undo()).toBe(true)
+    expect(editor.getMarkdown()).toContain(`![Second](${target})`)
+    expect(commands.deleteImageAt(positions[1]!)).toBe(true)
+    expect(editor.getMarkdown()).not.toContain(`![Second](${target})`)
+    expect(editor.getMarkdown()).toContain(`![First](${target})`)
+    expect(editor.getMarkdown()).toContain('![Other](https://example.com/other.png)')
+    expect(commands.undo()).toBe(true)
+    expect(editor.getMarkdown()).toContain(`![Second](${target})`)
+  })
+
+  it('rejects image mutations outside the editable image node', () => {
+    const editor = createMarkdownEditor({ initialMarkdown: 'Text' })
+    editors.push(editor)
+    const commands = markdownCommands(editor)
+    expect(commands.insertImage('https://example.com/image.png', 'Image')).toBe(true)
+    const imagePositions: number[] = []
+    editor.state.doc.descendants((node, position) => {
+      if (node.type.name === 'image') imagePositions.push(position)
+    })
+
+    expect(commands.setImageAltAt(-1, 'Updated')).toBe(false)
+    expect(commands.deleteImageAt(-1)).toBe(false)
+    const position = imagePositions[0]
+    expect(position).toBeDefined()
+    editor.setEditable(false)
+    expect(commands.setImageAltAt(position!, 'Updated')).toBe(false)
+    expect(commands.deleteImageAt(position!)).toBe(false)
+    expect(editor.getMarkdown()).toContain('![Image](https://example.com/image.png)')
+  })
+
   it('routes every default formatting command through the shared contract', () => {
     const editor = createMarkdownEditor({ initialMarkdown: 'text' })
     editors.push(editor)

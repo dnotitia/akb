@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.0
+
+- Add position-based image alt and body-delete commands. Each operation targets
+  one Markdown image occurrence and forms its own undo step.
+- Add shared per-image edit, optional replace-callback, and remove controls to
+  `MarkdownEditingSurface` and `MarkdownEditor`, with product-provided labels,
+  target policy, and styling.
+- Normalize parsed top-level images and retain an editable paragraph in the
+  shared editing surface; image removal leaves the referenced bytes to the
+  product's attachment policy.
+- Ignore product-owned runtime link attributes in the editable DOM so target
+  resolution does not turn into Markdown document changes.
+
 ## 0.6.0
 
 - Add the shared WYSIWYG / Markdown Source editing surface. It keeps one editor
