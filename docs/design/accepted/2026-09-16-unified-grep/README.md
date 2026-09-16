@@ -113,7 +113,7 @@ File 치환을 추가한다면 이 텍스트 분류는 필요조건일 뿐이다
 | G2 | 원문 literal/regex/count/list/Document 치환 의미 일치 | Unicode·행 경계·literal 역슬래시·bounded worker 회귀 |
 | G3 | File opt-in, identity·revision, catalogue와 projection 검증 | 실제 PG 생성·수정·실패·삭제·binary 제외·ACL·REST/MCP 응답 |
 | G4 | SDK와 Search UI 필터·리소스 집계·위치·오류 | SDK 60, frontend 1,250, Chromium 4 시나리오 |
-| G5 | 작은 파일/긴 문서/count/악성 regex 측정, 호환 안내 | 아래 측정과 최종 회귀 결과; 로컬 검증이며 미배포 |
+| G5 | 작은 파일/긴 문서/count/악성 regex 측정, 호환 안내 | 아래 측정과 최종 회귀 결과; 병합 후 격리 runtime 검증은 후속 기록 참조 |
 
 구현 중 피드백으로 세 가지를 수정했다. 첫째, case-insensitive literal도 반복
 접두사 입력에서 비싼 연산이 될 수 있어 bounded worker로 옮겼다. 둘째, live Head만
@@ -185,9 +185,9 @@ fixture 환경과 구현 결함을 구분했다.
 |---|---|---|
 | [#41](https://github.com/dnotitia/akb/issues/41) count/list 모드 | CLOSED | `count_only`, `files_with_matches` 제공 중. 신규 도구를 만들지 않고 기존 모드의 정확성과 응답 호환을 보존한다. |
 | [#315](https://github.com/dnotitia/akb/issues/315) 출력 limit이 치환 범위를 자름 | CLOSED | [#348](https://github.com/dnotitia/akb/pull/348)에 전체 집합 치환, 독립 budget, CAS와 복구 receipt 반영. 회귀 기준이다. |
-| [#338](https://github.com/dnotitia/akb/issues/338) collection 경계 초과 치환 | OPEN | native의 anchored/escaped 조건과 실제 PG 대상·sibling 무변경을 확인했다. legacy 종료 판단은 별도다. |
-| [#339](https://github.com/dnotitia/akb/issues/339) 사용자 TITLE/URI 행 제거 | OPEN | 현재 stripper는 builder 형태와 필수 PATH를 확인한다. native 원문 조회에서 해당 문단이 보존되는지 확인한다. legacy chunk stripper와 search/drill_down 개선은 이번 범위에서 제외한다. |
-| [#341](https://github.com/dnotitia/akb/issues/341) literal 치환의 역슬래시 해석 | OPEN | 공유 `apply_grep_replacement`가 callable replacement를 사용한다. native의 대소문자 옵션 양쪽을 회귀 검증한다. legacy를 포함한 이슈 전체 종료 판단은 별도로 남긴다. |
+| [#338](https://github.com/dnotitia/akb/issues/338) collection 경계 초과 치환 | OPEN | native의 anchored/escaped 조건과 실제 PG 대상·sibling 무변경을 확인했다. 실제 HTTP/MCP에서도 경계와 sibling 무변경을 확인했다. |
+| [#339](https://github.com/dnotitia/akb/issues/339) 사용자 TITLE/URI 행 제거 | OPEN | 공유 stripper 회귀와 Native grep/search의 본문 보존을 확인했다. 병합 후 Native drill_down의 legacy 의존을 발견하여 현재 Head를 읽도록 수정한다. legacy 구현 자체는 확장하지 않는다. |
+| [#341](https://github.com/dnotitia/akb/issues/341) literal 치환의 역슬래시 해석 | OPEN | 공유 `apply_grep_replacement`가 callable replacement를 사용한다. native의 대소문자 옵션 양쪽을 실제 HTTP/MCP에서 회귀 검증했다. |
 | [#342](https://github.com/dnotitia/akb/issues/342) native 치환 출력 제한 | OPEN | 현재 native도 전체 일치 집합과 독립 `max_replacements`를 사용한다. 옛 구현을 전제로 재구현하지 않는다. |
 
 관련 이슈는 동일 기능의 신규 요구와 구분한다.
@@ -205,7 +205,7 @@ fixture 환경과 구현 결함을 구분했다.
   적용할 수 있지만 이 기능의 release 선행조건으로 묶지 않는다.
 
 OPEN은 미구현과 동의어가 아니다. 위 수정은 코드 확인이며, 모든 배포에 적용됐다는
-의미도 아니다. 이 계획 작성에서는 이슈를 수정하거나 닫지 않았다.
+의미도 아니다. 이슈 종료는 수정 PR의 병합과 병합된 소스의 실제 runtime 검증 이후에 진행한다.
 
 
 ## PR 통합 검증 피드백
@@ -216,3 +216,23 @@ Document identity/line 보존을 반영하지 않은 두 unit fixture와, File H
 계약에 맞게 수정하며 제품의 최신성 검사를 완화하지 않는다. #339의 정확한
 TITLE/URI 사용자 본문도 strip·drill-down 회귀에 추가했다. PR의 전체 gate와
 병합 소스 기반 격리 HTTP/MCP/S3 검증은 별도의 완료 근거로 기록한다.
+
+
+## 병합 후 runtime 피드백
+
+[#569](https://github.com/dnotitia/akb/pull/569)는 전체 CI를 통과하여 병합됐다.
+병합 소스로 만든 backend/frontend 이미지로 격리된 PostgreSQL, S3 호환 저장소,
+실제 로그인·PAT·MCP transport를 검증했다. Embedding은 결정적인 fixture 서버를
+사용하므로 semantic ranking 품질이나 외부 embedding provider를 평가한 결과는 아니다.
+UUID/path resolver의 실제 PostgreSQL 4개 회귀도 병합 소스에서 통과했다.
+브라우저에서는 실제 로그인, File opt-in과 URL 복원, 리소스 집계·revision·행 위치,
+File 상세와 원문 preview를 확인했고 desktop/mobile에서 console 오류가 없었다.
+
+이 과정에서 Native `drill_down`과 outline이 legacy `documents`를 조회하는
+미검출 결함을 발견했다. grep에서 보이는 새 문서가 drill-down에서는 빈 결과였다.
+Native 경로는 검증된 현재 Document Head를 기존 adapter로 읽고, section 본문을
+겹치지 않는 크기 제한 slice로 반환하도록 수정한다. 사용자 metadata처럼 보이는
+행이나 반복 본문을 지우지 않으며 heading 앞 본문과 본문 없는 heading도 보존한다.
+검색용 overlap chunk를 원문으로 역변환하지 않는다. legacy 읽기 경로는 유지한다.
+이 수정의 병합 소스로 실제 MCP drill-down·outline과 최신 revision을 재검증한 뒤
+관련 이슈를 종료한다. 최초의 실패나 제한적인 탐색 검증을 전체 성공으로 계산하지 않는다.

@@ -7,6 +7,13 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Native Document drill-down
+
+- Native drill-down and section outlines read the verified current Document
+  Head instead of the legacy document/chunk tables. Preserve pre-heading prose,
+  user-authored metadata-shaped text, empty headings, and repeated content in
+  bounded, non-overlapping sections.
+
 ### Native grep consistency
 
 - Native grep supports explicit `include_text_files` reads across REST, MCP,
