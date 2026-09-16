@@ -79,3 +79,34 @@ def test_a_missing_vault_is_reported_as_usage_not_a_crash(monkeypatch, capsys) -
     monkeypatch.setattr(bridge_body_backfill, "backfill_bridge_bodies", fake)
     assert cli.main(["bridge-body-backfill", "--vault", "nope"]) == 2
     assert "Vault not found" in capsys.readouterr().err
+
+
+def test_verify_reports_and_exits_zero_when_every_body_still_agrees(monkeypatch, capsys) -> None:
+    from app.services.bridge_body_backfill import BridgeBodyVerifyReport
+
+    async def fake(**kwargs):
+        return BridgeBodyVerifyReport(vault="one-vault", checked=665, matched=665)
+
+    monkeypatch.setattr(bridge_body_backfill, "verify_bridge_bodies", fake)
+    assert cli.main(["bridge-body-backfill", "--vault", "one-vault", "--verify"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["ok"] is True
+    assert printed["matched"] == 665
+
+
+def test_verify_exits_nonzero_on_a_body_that_no_longer_agrees(monkeypatch, capsys) -> None:
+    """The one result that must not pass quietly."""
+    from app.services.bridge_body_backfill import BridgeBodyVerifyReport
+
+    async def fake(**kwargs):
+        return BridgeBodyVerifyReport(checked=665, matched=664, mismatched=1)
+
+    monkeypatch.setattr(bridge_body_backfill, "verify_bridge_bodies", fake)
+    assert cli.main(["bridge-body-backfill", "--verify"]) == 1
+    assert json.loads(capsys.readouterr().out)["ok"] is False
+
+
+def test_dry_run_and_verify_are_not_the_same_question(monkeypatch, capsys) -> None:
+    calls = _capture(monkeypatch, BridgeBodyBackfillReport(dry_run=False))
+    assert cli.main(["bridge-body-backfill", "--dry-run", "--verify"]) == 2
+    assert calls == []

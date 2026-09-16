@@ -33,7 +33,10 @@ from app.services.legacy_revision_bridge import (
     SelectorInvalidError,
     SelectorUnknownError,
 )
-from app.services.bridge_body_backfill import backfill_bridge_bodies
+from app.services.bridge_body_backfill import (
+    backfill_bridge_bodies,
+    verify_bridge_bodies,
+)
 from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.native_document_service import NativeDocumentService
 from app.services.native_revision_backfill import (
@@ -2215,3 +2218,90 @@ async def test_one_unreadable_body_does_not_block_the_ones_behind_it(tmp_path):
         assert report.migrated == pending_before - 1
         assert report.stalled is False
         assert report.pending_after == 1
+
+
+async def test_verify_re_derives_every_migrated_body_from_git(tmp_path):
+    """Whole-population, not a sample.
+
+    The migration copies; verify re-reads the source and hashes it again. It
+    is only possible because nothing was deleted — which is the same property
+    that makes the migration reversible.
+    """
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-verify")
+        moved = await backfill_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1000
+        )
+        assert moved.pending_after == 0
+
+        report = await verify_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"]
+        )
+        assert report.checked == moved.migrated
+        assert report.matched == moved.migrated
+        assert report.mismatched == 0
+        assert report.payload_missing == 0
+        assert report.ok is True
+
+
+async def test_verify_names_a_body_that_stopped_agreeing_with_git(tmp_path):
+    """The finding the command exists to produce.
+
+    Repointing a mapping at a payload holding different bytes is the shape of
+    every way this could go wrong, whatever the cause. Verify has to call it,
+    and has to say which revision.
+    """
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-verify-bad")
+        await backfill_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1000
+        )
+        wrong = hashlib.sha256(b"not what git holds\n").hexdigest()
+        async with pool.acquire() as conn, conn.transaction():
+            await M1PgBodyStore(pool).prepare_text_in_conn(
+                conn, namespace_id=fixture["namespace_id"], payload=b"not what git holds\n"
+            )
+        async with pool.acquire() as conn:
+            victim = await conn.fetchval(
+                """
+                UPDATE legacy_revision_mappings SET body_digest = $2
+                 WHERE namespace_id = $1 AND resolution = 'bridge'
+                   AND legacy_git_oid = (
+                       SELECT legacy_git_oid FROM legacy_revision_mappings
+                        WHERE namespace_id = $1 AND resolution = 'bridge'
+                        ORDER BY legacy_git_oid LIMIT 1)
+                RETURNING legacy_git_oid
+                """,
+                fixture["namespace_id"], wrong,
+            )
+
+        report = await verify_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"]
+        )
+        assert report.mismatched == 1
+        assert report.ok is False
+        assert any(victim[:8] in line for line in report.findings)
+
+
+async def test_verify_reports_a_digest_whose_payload_is_gone(tmp_path):
+    """Distinct from a mismatch: the comparison has nothing to compare."""
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-verify-orphan")
+        await backfill_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1000
+        )
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE legacy_revision_mappings SET body_digest = $2
+                 WHERE namespace_id = $1 AND resolution = 'bridge'
+                """,
+                fixture["namespace_id"], "0" * 64,
+            )
+
+        report = await verify_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"]
+        )
+        assert report.payload_missing == report.checked
+        assert report.mismatched == 0
+        assert report.ok is False

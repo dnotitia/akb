@@ -1655,6 +1655,46 @@ class NativeRevisionMigrationRepository:
                 rows = await acquired.fetch(sql, limit, namespace_id, *cursor)
         return [_mapping(row) for row in rows]
 
+    async def list_migrated_bridge_bodies(
+        self,
+        *,
+        limit: int,
+        namespace_id: uuid.UUID | None = None,
+        after: tuple[uuid.UUID, uuid.UUID, int, str] | None = None,
+        conn: asyncpg.Connection | None = None,
+    ) -> list[LegacyRevisionMapping]:
+        """The mirror of the claim: bridged mappings whose body has moved.
+
+        This is what makes the migration checkable after the fact.  git still
+        holds every one of these bodies, so the digest a mapping was filed
+        under can be recomputed from the source at any time — and a run over
+        the whole population is the only thing that answers "did all of them
+        survive", as opposed to "did the handful I sampled".
+        """
+        sql = """
+            SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
+                   m.path_at_revision, m.resolution, m.native_revision_id,
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
+              FROM legacy_revision_mappings m
+              JOIN native_revision_migration_runs r
+                ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
+             WHERE m.resolution = 'bridge'
+               AND m.body_digest IS NOT NULL
+               AND ($2::uuid IS NULL OR m.namespace_id = $2)
+               AND ($3::uuid IS NULL OR
+                    (m.namespace_id, m.resource_id, m.lineage_ordinal, m.legacy_git_oid)
+                    > ($3::uuid, $4::uuid, $5::int, $6::text))
+             ORDER BY m.namespace_id, m.resource_id, m.lineage_ordinal, m.legacy_git_oid
+             LIMIT $1
+        """
+        cursor = after or (None, None, None, None)
+        if conn is not None:
+            rows = await conn.fetch(sql, limit, namespace_id, *cursor)
+        else:
+            async with self.pool.acquire() as acquired:
+                rows = await acquired.fetch(sql, limit, namespace_id, *cursor)
+        return [_mapping(row) for row in rows]
+
     @staticmethod
     async def attach_bridge_body_digest(
         conn: asyncpg.Connection,

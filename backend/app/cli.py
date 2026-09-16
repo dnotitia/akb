@@ -76,7 +76,7 @@ STANDALONE_SSO_BOOTSTRAP_USAGE = (
 
 BRIDGE_BODY_BACKFILL_USAGE = (
     "Usage: python -m app.cli bridge-body-backfill "
-    "[--vault NAME] [--limit N] [--batch-size N] [--dry-run]"
+    "[--vault NAME] [--limit N] [--batch-size N] [--dry-run|--verify]"
 )
 
 MIGRATE_REVISION_BACKEND_USAGE = (
@@ -847,17 +847,24 @@ async def _bridge_body_backfill(args: list[str]) -> int:
     """
     from app.db.postgres import close_pool
     from app.exceptions import ValidationError
-    from app.services.bridge_body_backfill import DEFAULT_BATCH_SIZE, backfill_bridge_bodies
+    from app.services.bridge_body_backfill import (
+        DEFAULT_BATCH_SIZE,
+        backfill_bridge_bodies,
+        verify_bridge_bodies,
+    )
 
     vault = None
     limit = 1000
     batch_size = DEFAULT_BATCH_SIZE
     dry_run = False
+    verify = False
     index = 0
     while index < len(args):
         arg = args[index]
         if arg == "--dry-run":
             dry_run = True
+        elif arg == "--verify":
+            verify = True
         elif arg in ("--vault", "--limit", "--batch-size"):
             index += 1
             if index >= len(args):
@@ -880,7 +887,19 @@ async def _bridge_body_backfill(args: list[str]) -> int:
             return 2
         index += 1
 
+    if dry_run and verify:
+        print("--dry-run and --verify ask different questions", file=sys.stderr)
+        return 2
+
     try:
+        if verify:
+            checked = await verify_bridge_bodies(
+                vault=vault, limit=limit, batch_size=batch_size
+            )
+            print(json.dumps(checked.to_dict(), sort_keys=True))
+            # A body that no longer agrees with the git it came from is the
+            # one result that must not be exited over quietly.
+            return 0 if checked.ok else 1
         report = await backfill_bridge_bodies(
             vault=vault, limit=limit, batch_size=batch_size, dry_run=dry_run
         )
