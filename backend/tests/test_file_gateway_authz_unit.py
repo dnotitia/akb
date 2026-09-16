@@ -12,6 +12,7 @@ import pytest
 from starlette.routing import Match
 
 from app.exceptions import NotFoundError
+from app.services.adapters.s3_adapter import PresignedURL
 from app.services.file_service import FileService
 
 
@@ -151,7 +152,10 @@ async def test_a_grant_returns_a_signed_url_and_no_body(route, monkeypatch):
             key=key, ttl=ttl, content_type=content_type,
             content_disposition=content_disposition, cache_control=cache_control,
         )
-        return "http://10.0.0.1:8080/bucket/team/coll/abc_report.pdf?X-Amz-Signature=x"
+        return PresignedURL(
+            "http://10.0.0.1:8080/bucket/team/coll/abc_report.pdf?X-Amz-Signature=x",
+            ttl,
+        )
 
     monkeypatch.setattr(FileService, "resolve_download_capability", _resolve)
     monkeypatch.setattr(route, "presign_internal_get", _sign)
@@ -163,6 +167,9 @@ async def test_a_grant_returns_a_signed_url_and_no_body(route, monkeypatch):
     assert response.headers["X-AKB-S3"].startswith("http://10.0.0.1:8080/")
     assert captured["key"] == "team/coll/abc_report.pdf"
     assert captured["ttl"] == 60
+    # The granted lifetime, not the requested one — they differ when a
+    # temporary session expires first.
+    assert response.headers["X-AKB-Expires-In"] == "60"
 
 
 async def test_the_policy_travels_in_the_signature(route, monkeypatch):
@@ -184,7 +191,7 @@ async def test_the_policy_travels_in_the_signature(route, monkeypatch):
 
     def _sign(key, **kwargs):
         captured.update(kwargs)
-        return "http://10.0.0.1:8080/b/k?X-Amz-Signature=x"
+        return PresignedURL("http://10.0.0.1:8080/b/k?X-Amz-Signature=x", 60)
 
     monkeypatch.setattr(FileService, "resolve_download_capability", _resolve)
     monkeypatch.setattr(route, "presign_internal_get", _sign)
@@ -216,3 +223,28 @@ def _never(message: str):
     async def _fail(*_a, **_k):
         pytest.fail(message)
     return _fail
+
+
+async def test_the_granted_lifetime_is_reported_not_the_requested_one(route, monkeypatch):
+    """A temporary session can run out before the lifetime that was asked
+    for, and the signer clamps to whichever is shorter. Reporting the clamped
+    value is what makes that bound observable — the first version of the
+    internal signer dropped it, and with it the clamp itself."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "file_gateway_key", "k", raising=False)
+    monkeypatch.setattr(settings, "file_gateway_presign_ttl", 600, raising=False)
+
+    async def _resolve(_self, _token):
+        return {"s3_key": "v/k", "name": "x.pdf", "mime_type": "application/pdf"}
+
+    def _sign(_key, **_kwargs):
+        # The signer clamped 600 down to 45.
+        return PresignedURL("http://10.0.0.1:8080/b/k?X-Amz-Signature=x", 45)
+
+    monkeypatch.setattr(FileService, "resolve_download_capability", _resolve)
+    monkeypatch.setattr(route, "presign_internal_get", _sign)
+
+    response = await route.authorize_gateway_download("A" * 43, _Request("k"))
+
+    assert response.headers["X-AKB-Expires-In"] == "45"

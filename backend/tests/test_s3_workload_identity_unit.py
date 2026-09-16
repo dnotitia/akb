@@ -35,7 +35,7 @@ def storage(monkeypatch, tmp_path):
     ))
     monkeypatch.setattr(s3_adapter, "settings", configured)
     monkeypatch.setattr(audit_log, "settings", configured)
-    for name in ("_internal_client", "_presign_client", "_session"):
+    for name in ("_internal_client", "_internal_presign_client", "_session"):
         monkeypatch.setattr(s3_adapter, name, None, raising=False)
     monkeypatch.setattr(s3_adapter, "_bucket_verified", set())
     monkeypatch.setattr(audit_log, "_s3", None)
@@ -90,32 +90,52 @@ def storage(monkeypatch, tmp_path):
     return state
 
 
+def _sign(key: str, *, ttl: int = 3600):
+    """The one signing entry point left, with this file's defaults.
+
+    `presign_get`/`presign_put` signed against the public endpoint for a
+    browser to use. Nothing does that any more — bytes reach a client through
+    the API or the byte gateway, never straight from the store — so the only
+    signer is the internal one, and it is what these assertions have to run
+    against. The credential handling under test is unchanged; only the entry
+    point moved."""
+    return s3_adapter.presign_internal_get(
+        key,
+        ttl=ttl,
+        content_type="application/octet-stream",
+        content_disposition="inline",
+        cache_control="private, no-store",
+    )
+
+
 def _query(signed):
     return parse_qs(urlsplit(signed.url).query)
 
 
 def test_managed_server_and_public_signer_share_refreshable_session(storage):
     private = s3_adapter.client()
-    public = s3_adapter.presign_client()
-    assert private._request_signer._credentials is public._request_signer._credentials
+    signer = s3_adapter.internal_presign_client()
+    assert private._request_signer._credentials is signer._request_signer._credentials
     s3_adapter.head("hello.bin")
     assert storage.exchanges[0]["WebIdentityToken"] == ["projected-first"]
     request = storage.requests[-1]
     assert b"ASIAFIXTURE000001" in request.headers["Authorization"]
     assert request.headers["X-Amz-Security-Token"] == b"temporary-session-1"
-    signed = s3_adapter.presign_put("hello.bin")
+    signed = _sign("hello.bin")
     assert _query(signed)["X-Amz-Security-Token"] == ["temporary-session-1"]
     assert urlsplit(signed.url).path == "/tenant-files/hello.bin"
-    assert urlsplit(signed.url).hostname == "public.example"
+    # The internal endpoint, not the public one: the signature is handed
+    # to the byte gateway inside the cluster and never to a browser.
+    assert urlsplit(signed.url).hostname == "storage.example"
     assert len(storage.exchanges) == 1
 
 
 def test_rotated_token_refreshes_both_existing_clients(storage):
-    s3_adapter.presign_get("before")
+    _sign("before")
     credentials = s3_adapter.client()._request_signer._credentials
     storage.token_path.write_text("projected-second\n")
     credentials._expiry_time = datetime.now(timezone.utc) - timedelta(seconds=1)
-    signed = s3_adapter.presign_put("after")
+    signed = _sign("after")
     s3_adapter.head("after")
     assert len(storage.exchanges) == 2
     assert storage.exchanges[1]["WebIdentityToken"] == ["projected-second"]
@@ -124,24 +144,24 @@ def test_rotated_token_refreshes_both_existing_clients(storage):
 
 
 def test_presign_clamps_ttl_and_returns_actual_expiry(storage):
-    signed = s3_adapter.presign_get("download", ttl=7200)
+    signed = _sign("download", ttl=7200)
     assert 3500 <= signed.expires_in <= 3540
     assert _query(signed)["X-Amz-Expires"] == [str(signed.expires_in)]
-    assert s3_adapter.presign_put("upload", ttl=30).expires_in == 30
+    assert _sign("upload", ttl=30).expires_in == 30
 
 
 def test_signing_keeps_exact_snapshot_when_another_request_refreshes(storage):
-    public = s3_adapter.presign_client()
-    s3_adapter.presign_get("seed")
-    credentials = public._request_signer._credentials
+    signer = s3_adapter.internal_presign_client()
+    _sign("seed")
+    credentials = signer._request_signer._credentials
 
     def refresh_shared_generation(**_kwargs):
         storage.token_path.write_text("projected-second")
         credentials._expiry_time = datetime.now(timezone.utc) - timedelta(seconds=1)
         credentials.get_frozen_credentials()
 
-    public.meta.events.register_first("before-sign.s3.GetObject", refresh_shared_generation)
-    signed = s3_adapter.presign_get("snapshot", ttl=7200)
+    signer.meta.events.register_first("before-sign.s3.GetObject", refresh_shared_generation)
+    signed = _sign("snapshot", ttl=7200)
     assert len(storage.exchanges) == 2
     assert _query(signed)["X-Amz-Security-Token"] == ["temporary-session-1"]
     assert 3500 <= signed.expires_in <= 3540
@@ -150,7 +170,7 @@ def test_signing_keeps_exact_snapshot_when_another_request_refreshes(storage):
 
 def test_concurrent_first_signers_share_one_exchange(storage):
     with ThreadPoolExecutor(max_workers=8) as pool:
-        signed = list(pool.map(lambda i: s3_adapter.presign_get(f"object-{i}"), range(16)))
+        signed = list(pool.map(lambda i: _sign(f"object-{i}"), range(16)))
     assert len(storage.exchanges) == 1
     assert all(_query(url)["X-Amz-Security-Token"] == ["temporary-session-1"] for url in signed)
 
@@ -164,7 +184,7 @@ def test_unusable_identity_never_falls_back_to_ambient_keys(storage, failure):
     else:
         storage.duration = 30 if failure == "near-expiry" else -1
     with pytest.raises(AKBError):
-        s3_adapter.presign_get("denied")
+        _sign("denied")
 
 
 def test_managed_audit_upload_uses_the_same_session(storage):
@@ -230,9 +250,9 @@ def test_standalone_native_chain_uses_standard_environment(monkeypatch, tmp_path
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "cloud-fixture-secret")
     monkeypatch.setenv("AWS_SESSION_TOKEN", "cloud-session")
     monkeypatch.setattr(s3_adapter, "settings", Settings(s3_auth_mode="default_chain", s3_region="us-east-1"))
-    for name in ("_internal_client", "_presign_client", "_session"):
+    for name in ("_internal_client", "_internal_presign_client", "_session"):
         monkeypatch.setattr(s3_adapter, name, None, raising=False)
-    signed = s3_adapter.presign_get("native-cloud")
+    signed = _sign("native-cloud")
     assert _query(signed)["X-Amz-Security-Token"] == ["cloud-session"]
     assert signed.expires_in == 3600
 
@@ -244,9 +264,9 @@ def test_standalone_static_presign_keeps_existing_keys(monkeypatch):
         s3_endpoint_url="http://minio:9000", s3_access_key="local-key",
         s3_secret_key="local-fixture",  # pragma: allowlist secret -- offline test fixture
     ))
-    for name in ("_internal_client", "_presign_client", "_session"):
+    for name in ("_internal_client", "_internal_presign_client", "_session"):
         monkeypatch.setattr(s3_adapter, name, None, raising=False)
-    signed = s3_adapter.presign_put("static")
+    signed = _sign("static")
     assert _query(signed)["X-Amz-Credential"][0].startswith("local-key/")
     assert "X-Amz-Security-Token" not in _query(signed)
     assert signed.expires_in == 3600
@@ -256,7 +276,7 @@ def test_standalone_rgw_identity_needs_no_model_gateway(storage):
     storage.settings.model_api_governance_mode = "external_metering"
     storage.settings.platform_gateway_base_url = ""
     storage.settings.platform_gateway_token_file = ""
-    signed = s3_adapter.presign_put("standalone-rgw")
+    signed = _sign("standalone-rgw")
     assert _query(signed)["X-Amz-Security-Token"] == ["temporary-session-1"]
 
 
@@ -271,13 +291,13 @@ def test_standalone_native_webidentity_provider_is_preserved(storage, monkeypatc
     monkeypatch.setenv("AWS_ENDPOINT_URL_STS", "https://sts.example")
     monkeypatch.setenv("AWS_ENDPOINT_URL_S3", "https://storage.example")
     monkeypatch.setattr(s3_adapter, "settings", Settings(s3_auth_mode="default_chain", s3_region="us-east-1"))
-    signed = s3_adapter.presign_get("native-webidentity")
+    signed = _sign("native-webidentity")
     assert _query(signed)["X-Amz-Security-Token"] == ["temporary-session-1"]
     assert 3500 <= signed.expires_in <= 3540
 
 
 def test_failed_mandatory_refresh_does_not_use_expired_session(storage):
-    s3_adapter.presign_get("before")
+    _sign("before")
     credentials = s3_adapter.client()._request_signer._credentials
     credentials._expiry_time = datetime.now(timezone.utc) - timedelta(seconds=1)
     storage.reject = True

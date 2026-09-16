@@ -468,9 +468,18 @@ async def authorize_gateway_download(token: str, request: Request):
         content_disposition=headers["Content-Disposition"],
         cache_control=headers["Cache-Control"],
     )
-    # The gateway reads only this. The rest of `headers` is what the object
-    # store will emit because it is what was signed.
-    return Response(status_code=204, headers={"X-AKB-S3": signed})
+    # The gateway reads only the URL. The rest of `headers` is what the object
+    # store will emit, because it is what was signed. `signed.expires_in` is
+    # the lifetime actually granted — shorter than asked for when a temporary
+    # session runs out first — and is reported so the bound is visible rather
+    # than assumed.
+    return Response(
+        status_code=204,
+        headers={
+            "X-AKB-S3": signed.url,
+            "X-AKB-Expires-In": str(signed.expires_in),
+        },
+    )
 
 
 @router.get("/files/{vault}/{file_id}/download", summary="Get download URL")
