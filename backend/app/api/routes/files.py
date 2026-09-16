@@ -37,6 +37,10 @@ _measurement_transfer_slots = asyncio.Semaphore(2)
 # Bounded like its sibling above. A download streams one GET response for the
 # whole object, so it holds a botocore connection and an anyio thread from the
 # first byte to the last.
+#
+# Shared with the public publication download, which streams the same way from
+# the same pool. They are one budget because they are one resource, and that
+# path answers the open internet with no credential at all.
 _download_capability_slots = asyncio.Semaphore(4)
 # An upload bounds something different, and the number reflects that. Each
 # part is a discrete request, so the connection and the thread go back between
@@ -106,6 +110,23 @@ async def upload_by_capability(token: str, request: Request):
             raise AKBError(
                 "Upload exceeds the maximum accepted size", status_code=413,
             )
+
+    if grant["already_confirmed"]:
+        # This reservation deduplicated onto a File whose bytes are final.
+        # The key is content-addressed, so bytes that belong there are
+        # already there and re-sending them changes nothing; bytes that do
+        # not belong there must never reach it. Writing them would not merely
+        # replace the File's content — `confirm` would then find the stored
+        # digest disagreeing with the key it is stored under and DELETE the
+        # row, its publications and the object. A caller who knows a File's
+        # collection, name and hash, all of which a reader can see, could
+        # destroy it.
+        #
+        # The body is read and discarded rather than refused, because two
+        # shipped clients ignore `deduplicated` and PUT unconditionally. They
+        # get the 200 they expect and the File is untouched either way.
+        await _drain(request)
+        return Response(status_code=200)
 
     # Held for the whole transfer. Unlike the download route this is a plain
     # `async with`: the response is sent after the body has been consumed, so
@@ -251,6 +272,17 @@ async def confirm_file_replace(
         expected_content_hash=expected_content_hash,
         expected_version=expected_version,
     )
+
+
+async def _drain(request: Request) -> None:
+    """Consume a request body without storing it.
+
+    Not skipped: a client that is mid-`PUT` when the response arrives sees a
+    connection error rather than its 200, and two shipped clients send the
+    body unconditionally.
+    """
+    async for _chunk in request.stream():
+        pass
 
 
 _SINGLE_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
