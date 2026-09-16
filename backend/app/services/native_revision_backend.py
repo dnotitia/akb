@@ -588,11 +588,11 @@ class NativeRevisionBackend:
             if not matches:
                 return None
             mapping = matches[0]
-            raw = await asyncio.to_thread(
-                self._legacy_git_reader().read_file,
-                vault,
-                mapping.path_at_revision,
-                mapping.legacy_git_oid,
+            # One reader for bridged bodies, not two. This path had its own
+            # copy of the git read, so a body that had been migrated into the
+            # payload store was still fetched from the git volume here.
+            raw = await self.document_service.read_bridge_body(
+                vault, vault_id, mapping, git=self._legacy_git_reader()
             )
             if raw is None:
                 return None

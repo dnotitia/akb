@@ -220,6 +220,16 @@ jobs:
           tests/test_index_order_unit.py
           tests/concurrency/test_alter_unique_race_unit.py
           tests/test_native_revision_reconcile_pg.py
+          # The bridged-body migration is a claim about two stores:
+          # a body moves out of the git working volume into the
+          # payload table and the same bytes come back. Both halves
+          # are PostgreSQL facts — the payload row, the mapping's
+          # digest, the partial index the backfill pages on — so a
+          # fake proves nothing, and off this list the file skips in
+          # the unit job too and the migration ships ungated.
+          tests/test_native_revision_migration_bridge_pg.py
+          tests/test_native_revision_cutover_pg.py
+          tests/test_native_revision_shadow_reader.py
           tests/concurrency/test_native_ledger_b_core.py
           tests/concurrency/test_native_derived_pipeline.py
           tests/test_m1_file_measurement_pg.py

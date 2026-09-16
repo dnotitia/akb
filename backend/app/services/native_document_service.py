@@ -43,6 +43,7 @@ from app.models.document import (
 from app.repositories import table_data_repo, table_registry_repo, vault_files_repo
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.native_revision_migration_repo import (
+    BridgeBodyIntegrityError,
     NativeRevisionMigrationRepository,
 )
 from app.repositories.native_revision_repo import (
@@ -84,6 +85,8 @@ from app.util.text import (
     to_nfc,
 )
 from app.utils import ensure_list
+
+logger = logging.getLogger("akb.native_documents")
 
 
 class NativeRevisionUnsupportedSurfaceError(AKBError):
@@ -425,6 +428,51 @@ class NativeDocumentService(DocumentService):
                 resource_uri=doc_uri(vault, path),
             )
 
+    async def read_bridge_body(
+        self, vault: str, vault_id: uuid.UUID, mapping, *, git: GitService | None = None,
+    ) -> str | None:
+        """Read one bridged revision's body, from wherever it lives.
+
+        A mapping that names a digest has had its body copied into the
+        payload store and no longer needs the git working volume — which is
+        the point, because that volume is ReadWriteOnce and pins the serving
+        tier to a single node.
+
+        git stays the fallback in two cases, and both matter: a mapping that
+        has not been migrated yet, and one whose payload cannot be found. The
+        second should not happen — the digest and the payload are written in
+        one transaction — but a read that git could still answer must not
+        fail because a newer path came up empty.  Bytes that are present and
+        do not hash to their digest are the same decision for the same
+        reason, and both say so in the log rather than passing silently.
+        """
+        digest = getattr(mapping, "body_digest", None)
+        if digest:
+            pool = await self._pool()
+            reason = None
+            try:
+                async with pool.acquire() as conn:
+                    text = await NativeRevisionMigrationRepository.read_bridge_body(
+                        conn, namespace_id=vault_id, digest=digest,
+                    )
+                if text is not None:
+                    return text
+                reason = "names a payload that is missing"
+            except BridgeBodyIntegrityError:
+                reason = "names a payload that does not match its digest"
+            logger.warning(
+                "bridged body %s %s; reading git",
+                mapping.legacy_git_oid,
+                reason,
+            )
+        legacy_git = git or self._legacy_git or GitService()
+        return await asyncio.to_thread(
+            legacy_git.read_file,
+            vault,
+            mapping.path_at_revision,
+            mapping.legacy_git_oid,
+        )
+
     async def _response(
         self,
         *,
@@ -631,13 +679,7 @@ class NativeDocumentService(DocumentService):
                     revision_id=mapping.native_revision_id,
                 )
             elif mapping.resolution == "bridge" and mapping.legacy_git_oid is not None:
-                legacy_git = self._legacy_git or GitService()
-                raw = await asyncio.to_thread(
-                    legacy_git.read_file,
-                    vault,
-                    mapping.path_at_revision,
-                    mapping.legacy_git_oid,
-                )
+                raw = await self.read_bridge_body(vault, vault_id, mapping)
                 if raw is None:
                     raise NotFoundError(
                         "Legacy bridge body",
