@@ -7,6 +7,16 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Native public links
+
+- Native Document publications bind to vault-scoped Resource identity and read
+  the verified current revision. Moves preserve the selected document; soft
+  deletion revokes its links atomically. Existing verified cutover mappings
+  transfer old links without publishing a new occupant of a reused path.
+- Native section publications return no body or image grants when their section
+  disappears. Public status, unpublish, and oEmbed follow the same identity.
+  Migration 106 adds Native publication bindings and lifecycle enforcement.
+
 ### Native Document drill-down
 
 - Native drill-down and section outlines read the verified current Document

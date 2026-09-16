@@ -1016,6 +1016,9 @@ async def finalize_existing_database_authority(
                 "native_authority_fence_conflict",
                 "Existing-database authority could not commit the exact Legacy fence",
             )
+        from app.services.native_publication_binding import rebind_verified_native_publications
+
+        await rebind_verified_native_publications(conn)
         await _drop_transient_cutover_guards(conn, tables)
         return authority_id
 

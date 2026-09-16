@@ -1326,7 +1326,15 @@ async def oembed(url: str, format: str = "json"):
         parsed = parse_uri(publication.get("resource_uri") or "")
         title = publication.get("title")
         if not title:
-            if rt == ResourceType.DOCUMENT:
+            if rt == ResourceType.DOCUMENT and (
+                publication.get("native_document_id") or publication_service._native_documents_enabled()
+            ):
+                try:
+                    doc_row = await publication_service._find_published_document(publication)
+                    title = doc_row["title"]
+                except (NotFoundError, PublicationError):
+                    title = None
+            elif rt == ResourceType.DOCUMENT:
                 doc_path = parsed.identifier if parsed and parsed.kind == "doc" else None
                 uri_vault = parsed.vault if parsed and parsed.kind == "doc" else None
                 raw_doc_id = publication.get("document_id")

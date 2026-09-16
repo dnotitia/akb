@@ -401,25 +401,10 @@ class NativeDocumentService(DocumentService):
             )
 
     async def _public_slug(
-        self, vault_id: uuid.UUID, vault: str, path: str
+        self, vault_id: uuid.UUID, vault: str, path: str,
+        native_document_id: uuid.UUID | None = None,
     ) -> str | None:
-        """Newest publication slug for the document at ``path``, or None.
-
-        Shares one query with the legacy arm (``newest_public_slug``) instead
-        of keeping a second copy — the two copies had drifted into the same
-        defect, a ``resource_uri`` match with no ``vault_id`` predicate, which
-        told a reader that another vault carries a publication for the same
-        path and handed over its slug.
-
-        ``vault_id`` is passed in rather than resolved here: every caller has
-        already resolved it through ``_current``, and ``_vault_id`` is an
-        uncached pool checkout plus a query.
-
-        ``document_id=None`` is passed deliberately. This arm does not write
-        the legacy ``documents`` projection, so there is no id to name here;
-        the vault-scoped ``resource_uri`` fallback is what answers, and it is
-        scoped either way.
-        """
+        """Find the current Resource's publication across moves and path reuse."""
         pool = await self._pool()
         async with pool.acquire() as conn:
             return await newest_public_slug(
@@ -427,6 +412,7 @@ class NativeDocumentService(DocumentService):
                 vault_id=vault_id,
                 document_id=None,
                 resource_uri=doc_uri(vault, path),
+                native_document_id=native_document_id,
             )
 
     async def read_bridge_body(
@@ -500,7 +486,9 @@ class NativeDocumentService(DocumentService):
         # changes failure behaviour: under `gather` a raise in one no longer
         # stops the other, which runs on to completion with its result (or its
         # own exception) discarded. Not worth either, for zero live gain.
-        public_slug = await self._public_slug(vault_id, vault, current.path)
+        public_slug = await self._public_slug(
+            vault_id, vault, current.path, native_document_id=current.resource_id,
+        )
         created_by_name = await self._created_by_name(created_by)
         return DocumentResponse(
             uri=doc_uri(vault, current.path),
@@ -629,6 +617,15 @@ class NativeDocumentService(DocumentService):
 
     async def get(self, vault: str, doc_ref: str) -> DocumentResponse:
         vault_id, current = await self._current(vault, doc_ref)
+        return await self._response(vault=vault, vault_id=vault_id, current=current)
+
+    async def get_by_resource_id(self, vault: str, resource_id: uuid.UUID) -> DocumentResponse:
+        """Read a publication's exact live Resource without resolving a path."""
+        vault_id = await self._vault_id(vault)
+        native = await self._native()
+        current = await native.get_current_resource(
+            namespace_id=vault_id, surface="document", resource_id=resource_id,
+        )
         return await self._response(vault=vault, vault_id=vault_id, current=current)
 
     async def get_at_commit(
