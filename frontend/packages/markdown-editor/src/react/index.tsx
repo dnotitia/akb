@@ -31,6 +31,9 @@ import { resolveMarkdownTargets } from '../adapters.js'
 import { MarkdownLinkSearch } from './markdown-link-search.js'
 import type { MarkdownLinkSearchLabels } from './markdown-link-search.js'
 export type { MarkdownLinkSearchLabels } from './markdown-link-search.js'
+import { MarkdownImageMenuControls } from './markdown-image-menu.js'
+import type { MarkdownImageMenuOptions } from './markdown-image-menu.js'
+export type { MarkdownImageMenuClassNames, MarkdownImageMenuLabels, MarkdownImageMenuOptions } from './markdown-image-menu.js'
 import { MarkdownTableControls, DEFAULT_MARKDOWN_TABLE_LABELS } from './markdown-table.js'
 import type { MarkdownTableLabels, MarkdownTableOptions } from './markdown-table.js'
 export type { MarkdownTableLabels, MarkdownTableOptions } from './markdown-table.js'
@@ -92,6 +95,8 @@ export function useMarkdownCommands(editor: Editor | null): MarkdownCommands {
             setMarkdown: () => false,
             insertMarkdown: () => false,
             insertImage: () => false,
+            setImageAltAt: () => false,
+            deleteImageAt: () => false,
             setLink: () => false,
             insertLink: () => false,
             unsetLink: () => false,
@@ -311,6 +316,21 @@ export interface MarkdownEditingSurfaceLabels {
   sourceField: string
 }
 
+function normalizeEditorBody(editor: Editor): void {
+  const document = editor.getJSON()
+  if (document.content?.some(node => node.type === 'image')) {
+    const content = document.content.map(node =>
+      node.type === 'image' ? { type: 'paragraph', content: [node] } : node,
+    )
+    editor.commands.setContent({ ...document, content }, { emitUpdate: false })
+  }
+
+  const last = editor.state.doc.lastChild
+  if (!last || last.type.name !== 'paragraph') {
+    editor.commands.insertContentAt(editor.state.doc.content.size, { type: 'paragraph' })
+  }
+}
+
 const DEFAULT_EDITING_SURFACE_LABELS: MarkdownEditingSurfaceLabels = {
   group: 'Editor mode',
   wysiwyg: 'WYSIWYG',
@@ -328,6 +348,7 @@ export interface MarkdownEditingSurfaceProps extends Omit<ComponentPropsWithoutR
   modeSwitchDisabled?: boolean
   toolbar?: ReactNode
   table?: MarkdownTableOptions
+  imageMenu?: MarkdownImageMenuOptions
   sourcePlaceholder?: string
   sourceLabel?: string
   sourceAriaLabel?: string
@@ -355,6 +376,7 @@ export function MarkdownEditingSurface({
   modeSwitchDisabled = false,
   toolbar,
   table,
+  imageMenu,
   sourcePlaceholder = 'Write Markdown source…',
   sourceLabel,
   sourceAriaLabel,
@@ -378,6 +400,7 @@ export function MarkdownEditingSurface({
   const sourceInputRef = useRef<HTMLTextAreaElement>(null)
   const sourceInputId = useId()
   const sourceInputLabelId = `${sourceInputId}-label`
+  const surfaceRef = useRef<HTMLDivElement>(null)
   const resolvedSourceLabel = sourceLabel ?? labels.sourceField
 
   useLayoutEffect(() => {
@@ -396,9 +419,14 @@ export function MarkdownEditingSurface({
         contentType: 'markdown',
         emitUpdate: false,
       })
+      normalizeEditorBody(editor)
       onMarkdownApplied?.(editor)
     }
   }, [editor, markdown, mode, onMarkdownApplied])
+
+  useLayoutEffect(() => {
+    if (editor) normalizeEditorBody(editor)
+  }, [editor])
 
   useEffect(() => {
     if (editor && editor.isEditable !== !readOnly) editor.setEditable(!readOnly, false)
@@ -427,6 +455,7 @@ export function MarkdownEditingSurface({
           contentType: 'markdown',
           emitUpdate: false,
         })
+        normalizeEditorBody(editor)
         onMarkdownApplied?.(editor)
       }
       sourceDirtyRef.current = false
@@ -455,7 +484,8 @@ export function MarkdownEditingSurface({
   return (
     <div
       {...props}
-      className={joinClasses('min-w-0', className)}
+      ref={surfaceRef}
+      className={joinClasses('relative min-w-0', className)}
       data-markdown-mode={mode}
     >
       <div className="flex justify-end border-b border-border bg-surface px-2 py-1.5">
@@ -512,6 +542,12 @@ export function MarkdownEditingSurface({
         />
       </div>
       <MarkdownTableControls editor={editor} readOnly={readOnly} options={table} />
+      <MarkdownImageMenuControls
+        editor={editor}
+        rootRef={surfaceRef}
+        readOnly={readOnly}
+        options={imageMenu}
+      />
     </div>
   )
 }
@@ -524,6 +560,7 @@ export interface MarkdownEditorProps extends Omit<MarkdownSurfaceProps, 'editor'
   onSlash?: (context: MarkdownSlashContext) => void
   adapters?: MarkdownAdapters
   resolverContext?: MarkdownTargetResolverContext
+  imageMenu?: MarkdownImageMenuOptions
 }
 
 export function MarkdownEditor({
@@ -534,6 +571,7 @@ export function MarkdownEditor({
   onSlash,
   adapters,
   resolverContext,
+  imageMenu,
   ...props
 }: MarkdownEditorProps) {
   const editor = useMarkdownEditor({
@@ -556,6 +594,7 @@ export function MarkdownEditor({
       markdown={markdown}
       profile={profile}
       readOnly={readOnly}
+      imageMenu={imageMenu}
       onSourceChange={(next, sourceEditor) => onChange?.(next, sourceEditor)}
     >
       <MarkdownSurface

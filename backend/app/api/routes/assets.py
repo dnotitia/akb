@@ -197,10 +197,61 @@ async def load_asset_row(file_id: str, vault_id: uuid.UUID) -> dict:
     return row
 
 
-async def image_asset_response(row: dict, *, public: bool = False) -> Response:
+def _asset_cache_headers(row: dict, *, public: bool) -> dict[str, str]:
+    """Let the browser keep the bytes, but never the decision.
+
+    `no-cache` is not "do not cache" — it is "cache, and revalidate every
+    time". Every request still reaches this service and still passes the same
+    authorization it does today; what changes is that a revalidation answers
+    304 instead of re-sending the object. An asset's id names one immutable
+    upload, so its digest is a complete validator.
+
+    A longer `max-age` would drop the request too, but it would also let a
+    viewer keep reading an image after their access was revoked. Bytes are
+    the scaling problem here, not requests, so this buys the part that
+    matters and leaves permissions exact."""
+    headers = {
+        "Content-Disposition": "inline",
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "no-cache" if public else "private, no-cache",
+    }
+    if not public:
+        headers["Vary"] = "Authorization"
+    digest = row.get("content_hash")
+    if digest:
+        headers["ETag"] = f'"{digest}"'
+    return headers
+
+
+def _etag_matches(if_none_match: str | None, etag: str | None) -> bool:
+    """Compare per RFC 9110: a list, possibly weak, possibly `*`."""
+    if not if_none_match or not etag:
+        return False
+    candidates = [c.strip() for c in if_none_match.split(",")]
+    if "*" in candidates:
+        return True
+    # A weak validator compares equal to its strong form for If-None-Match,
+    # which is the only comparison this route needs.
+    def _normalize(value: str) -> str:
+        return value[2:] if value.startswith("W/") else value
+    return any(_normalize(c) == _normalize(etag) for c in candidates)
+
+
+async def image_asset_response(
+    row: dict, *, public: bool = False, request: Request | None = None,
+) -> Response:
     size = row.get("size_bytes")
     if size is None or size < 1 or size > asset_service.IMAGE_ASSET_MAX_BYTES:
         raise NotFoundError("Asset", str(row.get("id", "")))
+
+    headers = _asset_cache_headers(row, public=public)
+    # Answered before the object store is touched at all: a revalidation that
+    # is going to end in 304 has no reason to cost a HEAD.
+    if request is not None and _etag_matches(
+        request.headers.get("if-none-match"), headers.get("ETag"),
+    ):
+        return Response(status_code=304, headers=headers)
+
     try:
         # Fail before committing a 200 response when the immutable object is
         # missing or disagrees with its verified metadata. The body itself is
@@ -214,13 +265,6 @@ async def image_asset_response(row: dict, *, public: bool = False) -> Response:
         logger.warning("asset storage read failed for %s: %s", row.get("id"), exc)
         raise AKBError("Image content is temporarily unavailable", status_code=502) from exc
 
-    headers = {
-        "Content-Disposition": "inline",
-        "X-Content-Type-Options": "nosniff",
-        "Cache-Control": "no-store" if public else "private, no-store",
-    }
-    if not public:
-        headers["Vary"] = "Authorization"
     return StreamingResponse(
         file_service.iter_object_chunks(
             row["s3_key"], max_bytes=asset_service.IMAGE_ASSET_MAX_BYTES,
@@ -291,7 +335,7 @@ async def read_document_image(
             )
     if row is None:
         raise NotFoundError("Asset", file_id)
-    return await image_asset_response(row)
+    return await image_asset_response(row, request=request)
 
 
 @router.delete(

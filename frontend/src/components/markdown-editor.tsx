@@ -1,5 +1,4 @@
 import * as React from "react";
-import { createPortal } from "react-dom";
 import {
   EditorContent,
   MarkdownEditingSurface,
@@ -9,6 +8,7 @@ import {
   useMarkdownCommands,
   useMarkdownEditor,
   useMarkdownTargetResolutions,
+  type MarkdownImageMenuOptions,
   type MarkdownLinkSearchLabels,
 } from "@akb/markdown-editor/react";
 import {
@@ -18,23 +18,11 @@ import {
 import {
   ImagePlus,
   Loader2,
-  Pencil,
-  Replace,
   RotateCcw,
   X,
 } from "lucide-react";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { discardAsset, getAssetBlob } from "@/lib/api";
 import { normalizeEditorLinkUrl } from "@/lib/editor-link";
 import {
@@ -55,6 +43,30 @@ import { cn } from "@/lib/utils";
 type MarkdownEditorInstance = NonNullable<ReturnType<typeof useMarkdownEditor>>;
 
 type EditorCommand = (...args: unknown[]) => boolean;
+
+const AKB_MARKDOWN_IMAGE_MENU_OPTIONS: Omit<MarkdownImageMenuOptions, "onReplace"> = {
+  labels: {
+    editDescription: (alt) => alt ? `Edit image description: ${alt}` : "Edit image description",
+    replaceImage: (alt) => alt ? `Replace image: ${alt}` : "Replace image",
+    removeImage: (alt) => alt ? `Remove image: ${alt}` : "Remove image",
+    dialogTitle: "Image description",
+    dialogDescription: "This text is used as the image alt text and visible caption.",
+    description: "Description",
+    cancel: "Cancel",
+    saveDescription: "Save description",
+    descriptionRequired: "Describe the image so it remains understandable without sight.",
+    closeDialog: "Close dialog",
+  },
+  classNames: {
+    host: "flex items-center gap-1 rounded-[var(--radius-md)] border border-border bg-surface/90 p-1 shadow-sm backdrop-blur-sm",
+    action: "h-7 w-7 text-foreground-muted hover:bg-surface-hover hover:text-foreground",
+    destructiveAction: "h-7 w-7 text-foreground-muted hover:bg-destructive/10 hover:text-destructive",
+    dialog: "sm:max-w-md",
+    field: "rounded-[var(--radius-md)] focus-visible:ring-offset-background aria-[invalid=true]:border-destructive aria-[invalid=true]:focus-visible:ring-destructive",
+    error: "text-xs text-destructive",
+  },
+  isEditableTarget: (target) => canonicalAkbMarkdownTarget(target) !== null,
+};
 
 function invokeCommand(
   editor: MarkdownEditorInstance,
@@ -104,31 +116,6 @@ function imageAssetIdsFromMarkdown(markdown: string): string[] {
     if (id) ids.add(id);
   }
   return [...ids];
-}
-
-function ensureTrailingParagraph(editor: MarkdownEditorInstance): void {
-  const last = editor.state.doc.lastChild;
-  if (!last || last.type.name !== "paragraph") {
-    try {
-      editor.commands.insertContentAt(editor.state.doc.content.size, {
-        type: "paragraph",
-      });
-    } catch {
-      // The shared image schema accepts a legacy top-level image node. If that
-      // parsed document cannot accept a trailing block, preserve its source
-      // instead of tearing down the editor; the next user edit can still be
-      // serialized through the common core.
-    }
-  }
-}
-
-function normalizeTopLevelImages(editor: MarkdownEditorInstance): void {
-  const document = editor.getJSON();
-  if (!document.content?.some((node) => node.type === "image")) return;
-  const content = document.content.map((node) =>
-    node.type === "image" ? { type: "paragraph", content: [node] } : node,
-  );
-  editor.commands.setContent({ ...document, content });
 }
 
 function editorContentElement(root: HTMLDivElement | null): HTMLElement | null {
@@ -359,268 +346,6 @@ function usePrivateImageSources(
       entries.clear();
     };
   }, [commit, document, editor, rootRef, vault]);
-}
-
-interface ImageHost {
-  image: HTMLImageElement;
-  host: HTMLDivElement;
-  target: string;
-  alt: string;
-}
-
-function useImageHosts(
-  rootRef: React.RefObject<HTMLDivElement | null>,
-  editor: MarkdownEditorInstance | null,
-  readOnly: boolean,
-): ImageHost[] {
-  const [hosts, setHosts] = React.useState<ImageHost[]>([]);
-  const hostsRef = React.useRef<ImageHost[]>([]);
-
-  React.useLayoutEffect(() => {
-    const hostRoot = rootRef.current;
-    if (!hostRoot || !editor || readOnly) {
-      for (const current of hostsRef.current) current.host.remove();
-      hostsRef.current = [];
-      setHosts([]);
-      return;
-    }
-    const root = editor.view.dom as HTMLElement;
-
-    const sync = () => {
-      const next: ImageHost[] = [];
-      root
-        .querySelectorAll<HTMLImageElement>("img[data-markdown-target]")
-        .forEach((image) => {
-          const target = canonicalAkbMarkdownTarget(
-            image.dataset.markdownTarget ?? "",
-          );
-          if (!target) return;
-          let host = [...hostRoot.children].find(
-            (child) =>
-              child instanceof HTMLDivElement &&
-              child.dataset.markdownImageTarget === target,
-          ) as HTMLDivElement | undefined;
-          if (!host) {
-            host = window.document.createElement("div");
-            host.dataset.markdownImageControls = "true";
-            host.dataset.markdownImageTarget = target;
-            host.contentEditable = "false";
-            host.className =
-              "absolute right-2 top-2 flex items-center gap-1 rounded-[var(--radius-md)] border border-border bg-surface/90 p-1 shadow-sm backdrop-blur-sm";
-            hostRoot.append(host);
-          }
-          const rootRect = hostRoot.getBoundingClientRect();
-          const imageRect = image.getBoundingClientRect();
-          host.style.top = `${Math.max(0, imageRect.top - rootRect.top + 4)}px`;
-          host.style.left = `${Math.max(0, imageRect.right - rootRect.left - 112)}px`;
-          next.push({
-            image,
-            host,
-            target,
-            alt: image.getAttribute("alt") ?? "",
-          });
-        });
-
-      const nextHosts = new Set(next.map((entry) => entry.host));
-      for (const current of hostsRef.current) {
-        if (!nextHosts.has(current.host)) current.host.remove();
-      }
-      const unchanged =
-        next.length === hostsRef.current.length &&
-        next.every(
-          (entry, index) =>
-            entry.image === hostsRef.current[index]?.image &&
-            entry.alt === hostsRef.current[index]?.alt,
-        );
-      hostsRef.current = next;
-      if (!unchanged) setHosts(next);
-    };
-
-    sync();
-    editor.on("transaction", sync);
-    const observer =
-      typeof MutationObserver === "undefined"
-        ? null
-        : new MutationObserver(sync);
-    observer?.observe(root, {
-      childList: true,
-      subtree: true,
-      characterData: true,
-    });
-
-    return () => {
-      editor.off("transaction", sync);
-      observer?.disconnect();
-      for (const current of hostsRef.current) current.host.remove();
-      hostsRef.current = [];
-    };
-  }, [editor, readOnly, rootRef]);
-
-  return hosts;
-}
-
-function imagePosition(
-  editor: MarkdownEditorInstance,
-  image: HTMLImageElement,
-): number | null {
-  try {
-    return editor.view.posAtDOM(image, 0);
-  } catch {
-    return null;
-  }
-}
-
-function ImageControls({
-  editor,
-  image,
-  alt,
-  onReplace,
-}: {
-  editor: MarkdownEditorInstance;
-  image: HTMLImageElement;
-  target: string;
-  alt: string;
-  onReplace: (position: number) => void;
-}) {
-  const [descriptionOpen, setDescriptionOpen] = React.useState(false);
-  const [description, setDescription] = React.useState(alt);
-  const [descriptionError, setDescriptionError] = React.useState("");
-  const descriptionId = React.useId();
-
-  React.useEffect(() => setDescription(alt), [alt]);
-
-  const selectImage = (): number | null => {
-    const position = imagePosition(editor, image);
-    if (position === null) return null;
-    invokeCommand(editor, "setNodeSelection", position);
-    return position;
-  };
-
-  const removeImage = () => {
-    if (selectImage() === null) return;
-    invokeCommand(editor, "focus");
-    invokeCommand(editor, "deleteSelection");
-    ensureTrailingParagraph(editor);
-  };
-
-  const saveDescription = () => {
-    const next = description.trim();
-    if (!next) {
-      setDescriptionError(
-        "Describe the image so it remains understandable without sight.",
-      );
-      return;
-    }
-    const position = selectImage();
-    if (position === null) return;
-    invokeCommand(editor, "focus");
-    invokeCommand(editor, "updateAttributes", "image", { alt: next });
-    setDescriptionError("");
-    setDescriptionOpen(false);
-  };
-
-  return (
-    <>
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon"
-        aria-label={
-          alt ? `Edit image description: ${alt}` : "Edit image description"
-        }
-        title="Edit image description"
-        className="h-7 w-7 text-foreground-muted hover:bg-surface-hover hover:text-foreground"
-        onMouseDown={(event) => event.preventDefault()}
-        onClick={() => {
-          setDescription(alt);
-          setDescriptionError("");
-          setDescriptionOpen(true);
-        }}
-      >
-        <Pencil className="h-3.5 w-3.5" aria-hidden />
-      </Button>
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon"
-        aria-label={alt ? `Replace image: ${alt}` : "Replace image"}
-        title="Replace image"
-        className="h-7 w-7 text-foreground-muted hover:bg-surface-hover hover:text-foreground"
-        onMouseDown={(event) => event.preventDefault()}
-        onClick={() => {
-          const position = imagePosition(editor, image);
-          if (position !== null) onReplace(position);
-        }}
-      >
-        <Replace className="h-3.5 w-3.5" aria-hidden />
-      </Button>
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon"
-        aria-label={alt ? `Remove image: ${alt}` : "Remove image"}
-        title="Remove image"
-        className="h-7 w-7 text-foreground-muted hover:bg-destructive/10 hover:text-destructive"
-        onMouseDown={(event) => event.preventDefault()}
-        onClick={removeImage}
-      >
-        <X className="h-3.5 w-3.5" aria-hidden />
-      </Button>
-      <Dialog open={descriptionOpen} onOpenChange={setDescriptionOpen}>
-        <DialogContent
-          className="sm:max-w-md"
-          onCloseAutoFocus={(event) => {
-            event.preventDefault();
-            if (!editor.isDestroyed) editor.commands.focus();
-          }}
-        >
-          <DialogHeader>
-            <DialogTitle>Image description</DialogTitle>
-            <DialogDescription>
-              This text is used as the image alt text and visible caption.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-2">
-            <Label htmlFor={descriptionId}>Description</Label>
-            <Input
-              id={descriptionId}
-              value={description}
-              onChange={(event) => {
-                setDescription(event.target.value);
-                if (descriptionError) setDescriptionError("");
-              }}
-              aria-invalid={descriptionError ? true : undefined}
-              aria-describedby={
-                descriptionError ? `${descriptionId}-error` : undefined
-              }
-              autoFocus
-            />
-            {descriptionError && (
-              <p
-                id={`${descriptionId}-error`}
-                role="alert"
-                className="text-xs text-destructive"
-              >
-                {descriptionError}
-              </p>
-            )}
-          </div>
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => setDescriptionOpen(false)}
-            >
-              Cancel
-            </Button>
-            <Button type="button" onClick={saveDescription}>
-              Save description
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-    </>
-  );
 }
 
 interface EditorToolbarProps {
@@ -939,18 +664,9 @@ export function MarkdownEditor({
 
   React.useEffect(() => {
     if (!editor) return;
-    normalizeTopLevelImages(editor);
-    ensureTrailingParagraph(editor);
     if (autoFocus && !readOnly)
       requestAnimationFrame(() => editor.commands.focus());
   }, [autoFocus, editor, readOnly]);
-  const handleMarkdownApplied = React.useCallback(
-    (currentEditor: MarkdownEditorInstance) => {
-      normalizeTopLevelImages(currentEditor);
-      ensureTrailingParagraph(currentEditor);
-    },
-    [],
-  );
   useTargetResolutionDom(
     rootRef,
     editor,
@@ -958,8 +674,6 @@ export function MarkdownEditor({
     Boolean(adapters.targetResolver),
   );
   usePrivateImageSources(rootRef, editor, vault, document, commit);
-  const imageHosts = useImageHosts(rootRef, editor, readOnly);
-
   const uploadImages = React.useCallback(
     async (files: File[], replacementPosition?: number) => {
       if (
@@ -1180,9 +894,15 @@ export function MarkdownEditor({
         editor={editor}
         markdown={value}
         onSourceChange={handleSourceChange}
-        onMarkdownApplied={handleMarkdownApplied}
         readOnly={readOnly}
         table={AKB_MARKDOWN_TABLE_OPTIONS}
+        imageMenu={{
+          ...AKB_MARKDOWN_IMAGE_MENU_OPTIONS,
+          onReplace: (position) => {
+            replacementPositionRef.current = position;
+            imageInputRef.current?.click();
+          },
+        }}
         modeSwitchDisabled={uploadingImage}
         onWysiwygDragOverCapture={handleImageDragOver}
         onWysiwygDropCapture={handleImageDrop}
@@ -1317,23 +1037,6 @@ export function MarkdownEditor({
               Loading editor…
             </div>
           )}
-          {editor &&
-            imageHosts.map((host, index) =>
-              createPortal(
-                <ImageControls
-                  key={`${host.target}-${index}`}
-                  editor={editor}
-                  image={host.image}
-                  target={host.target}
-                  alt={host.alt}
-                  onReplace={(position) => {
-                    replacementPositionRef.current = position;
-                    imageInputRef.current?.click();
-                  }}
-                />,
-                host.host,
-              ),
-            )}
         </div>
       </MarkdownEditingSurface>
     </div>

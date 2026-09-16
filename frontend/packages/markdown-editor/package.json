@@ -1,6 +1,6 @@
 {
   "name": "@akb/markdown-editor",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Product-neutral Tiptap Markdown editor, viewer, and conformance contract for AKB and Reef.",
   "type": "module",
   "sideEffects": false,
@@ -39,6 +39,7 @@
   "dependencies": {
     "@radix-ui/react-dialog": "1.1.15",
     "@tiptap/core": "3.31.3",
+    "@tiptap/extension-link": "3.31.3",
     "@tiptap/extension-mathematics": "3.31.3",
     "@tiptap/extension-table": "3.31.3",
     "@tiptap/extension-table-cell": "3.31.3",

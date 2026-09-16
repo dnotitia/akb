@@ -1,5 +1,6 @@
 import { Editor, type JSONContent } from '@tiptap/core'
 import { MarkdownManager } from '@tiptap/markdown'
+import { closeHistory } from '@tiptap/pm/history'
 
 import { createMarkdownExtensions } from './extensions.js'
 import { markdownTableCommands } from './table.js'
@@ -144,6 +145,49 @@ export function markdownCommands(editor: Editor): MarkdownCommands {
         type: 'image',
         attrs: { target, alt, title: title ?? null },
       }),
+    setImageAltAt: (position, alt) => {
+      if (
+        !editor.isEditable ||
+        !Number.isInteger(position) ||
+        position < 0 ||
+        typeof alt !== 'string' ||
+        editor.state.doc.nodeAt(position)?.type.name !== 'image'
+      ) {
+        return false
+      }
+
+      return editor
+        .chain()
+        .command(({ tr }) => {
+          closeHistory(tr)
+          return true
+        })
+        .setNodeSelection(position)
+        .updateAttributes('image', { alt })
+        .focus()
+        .run()
+    },
+    deleteImageAt: position => {
+      if (
+        !editor.isEditable ||
+        !Number.isInteger(position) ||
+        position < 0 ||
+        editor.state.doc.nodeAt(position)?.type.name !== 'image'
+      ) {
+        return false
+      }
+
+      return editor
+        .chain()
+        .command(({ tr }) => {
+          closeHistory(tr)
+          return true
+        })
+        .setNodeSelection(position)
+        .deleteSelection()
+        .focus()
+        .run()
+    },
     setLink: href =>
       editor.chain().focus().extendMarkRange('link').setLink({ href }).run(),
     insertLink: (text, href) =>
