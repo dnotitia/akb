@@ -67,6 +67,9 @@ class BridgeBodyVerifyReport:
 
     vault: str | None = None
     checked: int = 0
+    # How many migrated mappings are in scope at all. A survey that looked at
+    # a fraction and said `ok` is the failure this field exists to prevent.
+    total: int = 0
     matched: int = 0
     # The digest on the mapping is not the hash of what git holds. This is
     # the finding the command exists to produce, and it names the revisions.
@@ -83,9 +86,15 @@ class BridgeBodyVerifyReport:
     def ok(self) -> bool:
         return self.mismatched == 0 and self.payload_missing == 0
 
+    @property
+    def complete(self) -> bool:
+        """Whether every migrated body in scope was actually looked at."""
+        return self.checked >= self.total
+
     def to_dict(self) -> dict:
         data = asdict(self)
         data["ok"] = self.ok
+        data["complete"] = self.complete
         return data
 
 
@@ -330,6 +339,11 @@ async def verify_bridge_bodies(
         if namespace_id is None:
             raise ValidationError(f"Vault not found: {vault}")
 
+    async with pool.acquire() as conn:
+        _, report.total = await repo.count_unmigrated_bridge_bodies(
+            conn, namespace_id=namespace_id
+        )
+
     cursor: tuple[uuid.UUID, uuid.UUID, int, str] | None = None
     while report.checked < limit:
         want = min(batch_size, limit - report.checked)
@@ -404,8 +418,9 @@ async def verify_bridge_bodies(
                 )
 
     logger.info(
-        "bridge body verify: checked=%d matched=%d mismatched=%d ungraded=%d",
+        "bridge body verify: checked=%d/%d matched=%d mismatched=%d ungraded=%d",
         report.checked,
+        report.total,
         report.matched,
         report.mismatched,
         report.ungraded,

@@ -110,3 +110,44 @@ def test_dry_run_and_verify_are_not_the_same_question(monkeypatch, capsys) -> No
     calls = _capture(monkeypatch, BridgeBodyBackfillReport(dry_run=False))
     assert cli.main(["bridge-body-backfill", "--dry-run", "--verify"]) == 2
     assert calls == []
+
+
+def test_verify_without_a_limit_surveys_the_whole_population(monkeypatch, capsys) -> None:
+    """The backfill's batch default is the wrong default for a survey.
+
+    A verify that stops at the backfill's 1000 and still prints `ok` is a
+    check that passed by not looking — measured live, it reported ok after
+    seeing 1,000 of 2,191.
+    """
+    from app.services.bridge_body_backfill import BridgeBodyVerifyReport
+
+    seen: list[int] = []
+
+    async def fake(**kwargs):
+        seen.append(kwargs["limit"])
+        return BridgeBodyVerifyReport(checked=2191, total=2191, matched=2191)
+
+    monkeypatch.setattr(bridge_body_backfill, "verify_bridge_bodies", fake)
+    assert cli.main(["bridge-body-backfill", "--vault", "v", "--verify"]) == 0
+    assert seen[0] > 1000
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["complete"] is True
+
+
+def test_a_backfill_without_a_limit_keeps_its_batch_default(monkeypatch, capsys) -> None:
+    calls = _capture(monkeypatch, BridgeBodyBackfillReport(dry_run=False))
+    assert cli.main(["bridge-body-backfill", "--vault", "v"]) == 0
+    assert calls[0]["limit"] == 1000
+
+
+def test_a_partial_survey_says_so_instead_of_looking_complete(monkeypatch, capsys) -> None:
+    from app.services.bridge_body_backfill import BridgeBodyVerifyReport
+
+    async def fake(**kwargs):
+        return BridgeBodyVerifyReport(checked=1000, total=2191, matched=1000)
+
+    monkeypatch.setattr(bridge_body_backfill, "verify_bridge_bodies", fake)
+    assert cli.main(["bridge-body-backfill", "--verify", "--limit", "1000"]) == 0
+    out = capsys.readouterr()
+    assert json.loads(out.out)["complete"] is False
+    assert "surveyed 1000 of 2191" in out.err
