@@ -382,11 +382,6 @@ async def test_file_initiation_serializes_with_a_concurrent_vault_delete(
     monkeypatch.setattr(fs, "measurement_enabled", lambda: False)
     monkeypatch.setattr(fs, "lock_vault_for_child_write", gated_lock)
     monkeypatch.setattr(fs.s3_adapter, "ensure_bucket", lambda _bucket: None)
-    monkeypatch.setattr(
-        fs.s3_adapter,
-        "presign_put",
-        lambda *_a, **_k: pytest.fail("an upload must not be signed against the store"),
-    )
 
     upload = asyncio.create_task(fs.FileService().initiate_upload(
         vault_name=vault_name,
@@ -614,11 +609,6 @@ async def test_file_initiation_does_not_wait_for_same_key_cleanup(
     monkeypatch.setattr(fs, "get_pool", fake_get_pool)
     monkeypatch.setattr(fs, "measurement_enabled", lambda: False)
     monkeypatch.setattr(fs.s3_adapter, "ensure_bucket", lambda _bucket: None)
-    monkeypatch.setattr(
-        fs.s3_adapter,
-        "presign_put",
-        lambda *_a, **_k: pytest.fail("an upload must not be signed against the store"),
-    )
 
     async with pool.acquire() as cleanup_conn:
         assert await vault_files_repo.try_lock_s3_key_for_cleanup(

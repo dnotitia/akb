@@ -898,7 +898,13 @@ class Settings(BaseModel):
 
     # S3-compatible object storage (for vault files)
     s3_endpoint_url: str = ""  # Internal endpoint (server → S3)
-    s3_public_url: str = ""  # External endpoint for presigned URLs (client → S3). Falls back to s3_endpoint_url.
+    # Retained and ignored. It named the endpoint a browser would have been
+    # sent to with a signature; nothing signs for a browser any more, because
+    # bytes reach a client through the API or the byte gateway and never
+    # straight from the store. Removing the field would make every existing
+    # deployment's config fail to load — `Settings` forbids unknown keys —
+    # so it stays until a release that can take that break.
+    s3_public_url: str = ""
     s3_access_key: str = ""
     s3_secret_key: str = ""
     s3_bucket: str = "akb-files"
