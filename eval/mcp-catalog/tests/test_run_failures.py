@@ -167,7 +167,9 @@ async def test_incomplete_artifact_keeps_completed_trials_budget_and_redaction()
     )
     runner._record_trial("primary:http", outcome)
     ledger = BudgetLedger(manifest)
-    await ledger.charge(outcome)
+    guard = await ledger.reserve_trial(0.1)
+    await guard()
+    await ledger.charge(outcome, guard=guard)
     failure = RuntimeContractError("fixture failed fixture-marker", stage="fixture_readiness")
 
     artifact = runner._build_artifact(

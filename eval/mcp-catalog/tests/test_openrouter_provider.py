@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -23,6 +24,7 @@ from mcp_catalog.execution import (
     MODEL_RESPONSES,
     ModelConfigurationError,
     OpenRouterChatModel,
+    ProviderRequestReceipt,
     ProviderRequestTimeout,
     TrialContext,
     TrialExecutor,
@@ -441,12 +443,14 @@ async def test_budget_reserves_preregistered_worst_case_before_a_trial() -> None
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     ledger = BudgetLedger(manifest)
 
-    await ledger.reserve_trial(manifest.budget.max_total_cost_usd)
+    owner = await ledger.reserve_trial(Decimal(str(manifest.budget.max_total_cost_usd)))
     with pytest.raises(BudgetExceeded, match="worst-case"):
         await ledger.reserve_trial(0.01)
 
-    await ledger.release_trial(manifest.budget.max_total_cost_usd)
-    assert worst_case_cost(manifest.models[1], manifest.budget) == manifest.budget.max_cost_per_trial_usd
+    await owner.release()
+    assert worst_case_cost(manifest.models[1], manifest.budget) == Decimal(
+        str(manifest.budget.max_cost_per_trial_usd)
+    )
 
 
 @pytest.mark.asyncio
@@ -457,7 +461,7 @@ async def test_over_trial_cost_is_recorded_and_blocks_followup_provider_reservat
     )
     manifest = registered.model_copy(update={"budget": budget})
     ledger = BudgetLedger(manifest)
-    await ledger.reserve_trial(0.01)
+    guard = await ledger.reserve_trial(Decimal("0.01"))
     outcome = TrialOutcome(
         task_id="over-limit-cost",
         category="single_operation",
@@ -478,13 +482,14 @@ async def test_over_trial_cost_is_recorded_and_blocks_followup_provider_reservat
     )
 
     with pytest.raises(BudgetExceeded, match="max_cost_per_trial_usd"):
-        await ledger.charge(outcome, reserved_cost_usd=0.01)
+        await ledger.charge(outcome, guard=guard)
 
-    assert ledger.cost_usd == pytest.approx(0.02)
+    assert ledger.cost_usd == Decimal("0.02")
     assert ledger.requests == 1
     assert ledger.input_tokens == 10
     assert ledger.output_tokens == 2
-    await ledger.release_trial(0.01)
+    assert guard.is_open is False
+    assert await guard.release() is False
     with pytest.raises(BudgetExceeded, match="worst-case"):
         await ledger.reserve_trial(0.01)
 
@@ -495,8 +500,7 @@ async def test_provider_request_admission_enforces_global_request_limit() -> Non
     budget = registered.budget.model_copy(update={"max_model_requests": 1})
     manifest = registered.model_copy(update={"budget": budget})
     ledger = BudgetLedger(manifest)
-    await ledger.reserve_trial(0.01)
-    guard = ledger.new_provider_request_guard(reserved_cost_usd=0.01)
+    guard = await ledger.reserve_trial(Decimal("0.01"))
 
     await guard()
     with pytest.raises(BudgetExceeded, match="max_model_requests"):
@@ -523,8 +527,8 @@ async def test_provider_response_cost_blocks_followup_request_before_the_trial_f
     manifest = registered.model_copy(update={"budget": budget})
     spec = manifest.models[0]
     ledger = BudgetLedger(manifest)
-    reservation = 0.01
-    await ledger.reserve_trial(reservation)
+    reservation = Decimal("0.01")
+    request_guard = await ledger.reserve_trial(reservation)
     model = OpenRouterChatModel(
         spec.model_id,
         provider=OpenAIProvider(
@@ -550,7 +554,6 @@ async def test_provider_response_cost_blocks_followup_request_before_the_trial_f
     followup = make_response(second_cost)
     wire_request = AsyncMock(side_effect=[response, followup])
     monkeypatch.setattr(model.client.chat.completions, "create", wire_request)
-    request_guard = ledger.new_provider_request_guard(reserved_cost_usd=reservation)
     guard_token = execution_module.PROVIDER_REQUEST_GUARD.set(request_guard)
     call = [ModelRequest(parts=[UserPromptPart("hello")])]
     try:
@@ -566,29 +569,220 @@ async def test_provider_response_cost_blocks_followup_request_before_the_trial_f
         execution_module.PROVIDER_REQUEST_GUARD.reset(guard_token)
 
     assert wire_request.await_count == 2
-    assert ledger.cost_usd == pytest.approx(expected_spend)
-    assert ledger.reserved_cost_usd == 0
+    assert ledger.cost_usd == Decimal(str(expected_spend))
+    assert ledger.reserved_cost_usd == Decimal("0")
     assert request_guard.requests == 2
-    assert float(request_guard.provider_cost_usd) == pytest.approx(expected_spend)
-    await ledger.reserve_trial(reservation)
-    await ledger.release_trial(reservation)
+    assert request_guard.provider_cost_usd == Decimal(str(expected_spend))
+    await request_guard.release()
+    next_guard = await ledger.reserve_trial(reservation)
+    await next_guard.release()
 
 
 @pytest.mark.asyncio
-async def test_model_request_guard_blocks_followup_calls_after_restored_budget_failure(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("settlement_order", "cancelled_cells"),
+    [
+        ((0, 1, 2, 3), {1}),
+        ((3, 2, 1, 0), {2}),
+        ((1, 3, 0, 2), set()),
+    ],
+)
+async def test_four_smoke_cells_settle_exact_provider_costs_without_orphan_reservations(
+    settlement_order: tuple[int, int, int, int],
+    cancelled_cells: set[int],
 ) -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
-    spec = manifest.models[0]
-    model = OpenRouterChatModel(
-        spec.model_id,
-        provider=OpenAIProvider(
-            base_url=OPENROUTER_BASE_URL,
-            **{"api_" + "key": "fixture-provider-key"},
-        ),
+    ledger = BudgetLedger(manifest)
+    reservation = Decimal("0.1")
+    response_costs = (
+        (Decimal("0.00308504"), Decimal("0.00396760")),
+        (Decimal("0.00174552"), Decimal("0.00192584")),
+        (Decimal("0.00221522"), Decimal("0.00239988")),
+        (Decimal("0.00290518"), Decimal("0.00290518")),
     )
-    request = AsyncMock()
-    monkeypatch.setattr(model, "_completions_create", request)
+
+    guards = [await ledger.reserve_trial(reservation) for _ in range(4)]
+
+    def assert_reserved_matches_open_owners() -> None:
+        assert ledger.reserved_cost_usd == sum(
+            (guard.reserved_cost_usd for guard in guards if guard.is_open),
+            Decimal("0"),
+        )
+
+    assert_reserved_matches_open_owners()
+
+    async def admit_and_record(guard, costs) -> None:
+        for cost in costs:
+            receipt = await guard()
+            await asyncio.sleep(0)
+            assert await ledger.record_provider_response_cost(guard, receipt, cost)
+            assert not await ledger.record_provider_response_cost(guard, receipt, cost)
+            assert_reserved_matches_open_owners()
+
+    await asyncio.gather(
+        *(admit_and_record(guard, costs) for guard, costs in zip(guards, response_costs))
+    )
+
+    settlement_turns = [asyncio.Event() for _ in guards]
+    settlement_turns[settlement_order[0]].set()
+
+    async def settle_cell(cell_index: int) -> None:
+        await settlement_turns[cell_index].wait()
+        guard = guards[cell_index]
+        if cell_index in cancelled_cells:
+            assert await guard.release()
+            assert not await guard.release()
+            assert_reserved_matches_open_owners()
+        else:
+            model_spec = manifest.models[cell_index % len(manifest.models)]
+            cell_cost = sum(response_costs[cell_index], Decimal("0"))
+            outcome = TrialOutcome(
+                task_id=f"smoke-cell-{cell_index}",
+                category="single_operation",
+                arm="baseline",
+                model_class=model_spec.class_name,
+                model_id=model_spec.model_id,
+                transport="stdio" if cell_index % 2 else "http",
+                input_tokens=10,
+                output_tokens=2,
+                total_tokens=12,
+                model_requests=len(response_costs[cell_index]),
+                cost_usd=float(cell_cost),
+                provider_cost_usd=float(cell_cost),
+                cost_source="provider_response",
+            )
+            await ledger.charge(outcome, guard=guard)
+            assert not await guard.release()
+            assert_reserved_matches_open_owners()
+        next_position = settlement_order.index(cell_index) + 1
+        if next_position < len(settlement_order):
+            settlement_turns[settlement_order[next_position]].set()
+
+    await asyncio.gather(*(settle_cell(index) for index in range(4)))
+
+    assert ledger.cost_usd == Decimal("0.02114946")
+    assert ledger.reserved_cost_usd == Decimal("0")
+    assert all(not guard.is_open for guard in guards)
+
+
+@pytest.mark.asyncio
+async def test_response_admission_interleaves_with_sibling_charge_and_cancellation() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    ledger = BudgetLedger(manifest)
+    guards = [await ledger.reserve_trial(Decimal("0.1")) for _ in range(4)]
+    admitted = asyncio.Event()
+    record_response = asyncio.Event()
+    response_recorded = asyncio.Event()
+    charge_first = asyncio.Event()
+    first_receipt: list[ProviderRequestReceipt] = []
+
+    async def finish_first_cell() -> None:
+        receipt = await guards[0]()
+        first_receipt.append(receipt)
+        admitted.set()
+        await record_response.wait()
+        assert await ledger.record_provider_response_cost(guards[0], receipt, Decimal("0.004"))
+        response_recorded.set()
+        await charge_first.wait()
+        outcome = TrialOutcome(
+            task_id="interleaved-smoke-0",
+            category="single_operation",
+            arm="baseline",
+            model_class=manifest.models[0].class_name,
+            model_id=manifest.models[0].model_id,
+            transport="http",
+            model_requests=1,
+            cost_usd=0.004,
+            provider_cost_usd=0.004,
+            cost_source="provider_response",
+        )
+        await ledger.charge(outcome, guard=guards[0])
+
+    first_task = asyncio.create_task(finish_first_cell())
+    await admitted.wait()
+
+    # A sibling settles two provider responses while the first admitted request
+    # is still waiting for its provider response callback.
+    for cost in (Decimal("0.003"), Decimal("0.002")):
+        receipt = await guards[1]()
+        await ledger.record_provider_response_cost(guards[1], receipt, cost)
+    sibling_one = TrialOutcome(
+        task_id="interleaved-smoke-1",
+        category="single_operation",
+        arm="baseline",
+        model_class=manifest.models[1].class_name,
+        model_id=manifest.models[1].model_id,
+        transport="http",
+        model_requests=2,
+        cost_usd=0.005,
+        provider_cost_usd=0.005,
+        cost_source="provider_response",
+    )
+    await ledger.charge(sibling_one, guard=guards[1])
+
+    # A different sibling completes provider-cost admission but is cancelled
+    # before terminal charge.
+    late_receipt = None
+    for index, cost in enumerate((Decimal("0.002"), Decimal("0.001"))):
+        receipt = await guards[2]()
+        if index == 0:
+            await ledger.record_provider_response_cost(guards[2], receipt, cost)
+        else:
+            late_receipt = receipt
+    assert await guards[2].release()
+    cost_before_late_response = ledger.cost_usd
+    assert late_receipt is not None
+    assert not await ledger.record_provider_response_cost(guards[2], late_receipt, Decimal("0.001"))
+    assert not await ledger.record_provider_response_cost(guards[2], late_receipt, Decimal("NaN"))
+    assert ledger.cost_usd == cost_before_late_response
+
+    # Admit and record the last sibling, then hold it open until after the first
+    # response callback has been admitted but before its terminal charge.
+    sibling_three_costs = (Decimal("0.001"), Decimal("0.003"))
+    for cost in sibling_three_costs:
+        receipt = await guards[3]()
+        await ledger.record_provider_response_cost(guards[3], receipt, cost)
+    record_response.set()
+    await response_recorded.wait()
+    assert ledger.cost_usd == Decimal("0.015")
+    assert ledger.reserved_cost_usd == sum(
+        (guard.reserved_cost_usd for guard in guards if guard.is_open),
+        Decimal("0"),
+    )
+
+    sibling_three = TrialOutcome(
+        task_id="interleaved-smoke-3",
+        category="single_operation",
+        arm="baseline",
+        model_class=manifest.models[1].class_name,
+        model_id=manifest.models[1].model_id,
+        transport="stdio",
+        model_requests=2,
+        cost_usd=0.004,
+        provider_cost_usd=0.004,
+        cost_source="provider_response",
+    )
+    await ledger.charge(sibling_three, guard=guards[3])
+    charge_first.set()
+    await first_task
+
+    assert await ledger.record_provider_response_cost(
+        guards[0],
+        first_receipt[0],
+        Decimal("0.004"),
+    ) is False
+    assert await guards[0].release() is False
+    assert ledger.cost_usd == Decimal("0.015")
+    assert ledger.requests == 7
+    assert ledger.reserved_cost_usd == Decimal("0")
+    assert all(not guard.is_open and guard.reserved_cost_usd == 0 for guard in guards)
+    reopened = await ledger.reserve_trial(Decimal("0.1"))
+    await reopened.release()
+
+
+@pytest.mark.asyncio
+async def test_restored_budget_failure_blocks_new_trial_reservations() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
     ledger = BudgetLedger(manifest)
     ledger.restore(
         model_requests=0,
@@ -598,18 +792,10 @@ async def test_model_request_guard_blocks_followup_calls_after_restored_budget_f
         wall_seconds=0.0,
         budget_failure="max_total_cost_usd exceeded",
     )
-    guard_token = execution_module.PROVIDER_REQUEST_GUARD.set(ledger.new_provider_request_guard())
-    try:
-        with pytest.raises(BudgetExceeded, match="max_total_cost_usd"):
-            await model.request(
-                [ModelRequest(parts=[UserPromptPart("hello")])],
-                model.settings,
-                ModelRequestParameters(),
-            )
-    finally:
-        execution_module.PROVIDER_REQUEST_GUARD.reset(guard_token)
-
-    request.assert_not_awaited()
+    with pytest.raises(BudgetExceeded, match="max_total_cost_usd"):
+        await ledger.reserve_trial(Decimal("0.1"))
+    assert ledger.requests == 0
+    assert ledger.reserved_cost_usd == Decimal("0")
 
 
 @pytest.mark.asyncio
@@ -630,11 +816,13 @@ async def test_large_token_outcome_is_recorded_without_a_token_budget_gate() -> 
         cost_usd=0.01,
     )
 
-    await ledger.charge(outcome)
+    guard = await ledger.reserve_trial(Decimal("0.1"))
+    await guard()
+    await ledger.charge(outcome, guard=guard)
 
     assert ledger.input_tokens == 10_000_000
     assert ledger.output_tokens == 8_000_000
-    assert ledger.cost_usd == 0.01
+    assert ledger.cost_usd == Decimal("0.01")
 
 
 @pytest.mark.asyncio
@@ -662,9 +850,10 @@ async def test_parallel_lane_work_does_not_trip_the_actual_wall_guard() -> None:
             latency_seconds=4.0,
             cost_usd=0.001,
         )
-        await ledger.reserve_trial(0.001)
+        guard = await ledger.reserve_trial(Decimal("0.001"))
+        await guard()
         provider_calls += 1
-        await ledger.charge(outcome, reserved_cost_usd=0.001)
+        await ledger.charge(outcome, guard=guard)
 
     await asyncio.gather(*(lane() for _ in range(4)))
 
@@ -718,7 +907,7 @@ async def test_trial_does_not_create_a_provider_client_after_budget_reservation_
         ),
     )
     ledger = BudgetLedger(manifest)
-    await ledger.reserve_trial(manifest.budget.max_total_cost_usd)
+    full_reservation = await ledger.reserve_trial(Decimal(str(manifest.budget.max_total_cost_usd)))
     monkeypatch.setattr("mcp_catalog.execution.create_client", lambda _spec: pytest.fail("client must not be created"))
     token = CURRENT_TRIAL.set(
         TrialContext(
@@ -746,6 +935,7 @@ async def test_trial_does_not_create_a_provider_client_after_budget_reservation_
 
     assert outcome.error is not None and outcome.error.startswith("benchmark incomplete:")
     assert outcome.failure_kind == "budget"
+    await full_reservation.release()
 
 
 def test_routing_evidence_requires_the_requested_model_and_one_selected_provider() -> None:

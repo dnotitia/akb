@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import json
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 import mcp_catalog.runner as runner_module
 from mcp_catalog.contracts import load_run_manifest, load_task_corpus
-from mcp_catalog.execution import BudgetLedger, TrialOutcome
+from mcp_catalog.execution import BudgetExceeded, BudgetLedger, TrialOutcome
 from mcp_catalog.runner import BenchmarkRunner, RuntimeContractError
 from mcp_catalog.runtime import RuntimeDescriptor
 from test_runtime_contract import descriptor_dict
@@ -15,8 +18,11 @@ ROOT = Path(__file__).parents[1]
 
 
 class _SmokeResolver:
+    def __init__(self, secrets: tuple[str, ...] = ()) -> None:
+        self._secrets = secrets
+
     def secret_values(self) -> tuple[str, ...]:
-        return ()
+        return self._secrets
 
     async def refresh_after_reset(self, _fixture, _profile: str) -> str:
         return "smoke-token"
@@ -70,6 +76,13 @@ def _smoke_outcome(
         routing_observed=True,
         routing_valid=True,
     )
+
+
+def _parallel_descriptor() -> RuntimeDescriptor:
+    descriptor = descriptor_dict()
+    cell_names = ("primary:http", "primary:stdio", "lightweight:http", "lightweight:stdio")
+    descriptor["benchmark_cells"] = {name: descriptor_dict() for name in cell_names}
+    return RuntimeDescriptor.from_dict(descriptor)
 
 
 @pytest.mark.asyncio
@@ -219,3 +232,178 @@ async def test_smoke_gate_blocks_when_cell_has_no_successful_mcp_call(monkeypatc
             resolver=_SmokeResolver(),
             ledger=BudgetLedger(manifest),
         )
+
+
+@pytest.mark.asyncio
+async def test_smoke_accounting_failure_is_checkpointed_and_resume_reuses_other_cells(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    checkpoint_path = tmp_path / "smoke-checkpoint.json"
+    secret = "fixture-smoke-secret"
+    resolver = _SmokeResolver((secret,))
+    failed_cell = "lightweight:stdio"
+    source_revision = "a" * 40
+    required_cells = [
+        f"{model.class_name}:{transport}"
+        for model in manifest.models
+        for transport in manifest.transports
+    ]
+
+    first_runner = BenchmarkRunner(
+        manifest,
+        tasks,
+        _parallel_descriptor(),
+        checkpoint_path=checkpoint_path,
+    )
+    first_runner._checkpoint_store = first_runner._checkpoint_store_for(
+        source_revision=source_revision,
+        resolver=resolver,
+        planned_keys={},
+    )
+    first_ledger = BudgetLedger(manifest)
+    first_runner._ledger = first_ledger
+    monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
+    first_calls: list[str] = []
+    failure_recorded_for_sibling = asyncio.Event()
+    first_store = first_runner._checkpoint_store
+    assert first_store is not None
+
+    async def wait_for_failed_cell_checkpoint() -> None:
+        while True:
+            if checkpoint_path.is_file():
+                payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+                if failed_cell in payload.get("smoke_gate", {}):
+                    return
+            await asyncio.sleep(0.001)
+
+    async def smoke_with_accounting_failure(
+        task,
+        *,
+        model_spec,
+        transport,
+        request_guard,
+        **_kwargs,
+    ):
+        cell = f"{model_spec.class_name}:{transport}"
+        first_calls.append(cell)
+        if cell == "primary:http":
+            await asyncio.wait_for(wait_for_failed_cell_checkpoint(), timeout=2.0)
+            failure_recorded_for_sibling.set()
+        if cell == failed_cell:
+            receipt = await request_guard()
+            try:
+                await first_ledger.record_provider_response_cost(
+                    request_guard,
+                    receipt,
+                    Decimal("0.101"),
+                )
+            except BudgetExceeded:
+                base = _smoke_outcome(task, model_spec, transport)
+                evidence = dict(base.provider_evidence[0])
+                evidence["diagnostic"] = secret
+                evidence["usage"] = {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 1,
+                    "cost": 0.101,
+                }
+                return base.model_copy(
+                    update={
+                        "input_tokens": 5,
+                        "output_tokens": 1,
+                        "total_tokens": 6,
+                        "model_requests": 1,
+                        "cost_usd": 0.101,
+                        "provider_cost_usd": 0.101,
+                        "provider_evidence": [evidence],
+                        "failure_kind": "budget",
+                    }
+                )
+            raise AssertionError("overspend response should fail provider cost admission")
+
+        for _ in range(2):
+            receipt = await request_guard()
+            await first_ledger.record_provider_response_cost(
+                request_guard,
+                receipt,
+                Decimal("0.000005"),
+            )
+        return _smoke_outcome(task, model_spec, transport)
+
+    monkeypatch.setattr(runner_module, "execute_smoke", smoke_with_accounting_failure)
+    with pytest.raises(RuntimeContractError, match="smoke gate cell"):
+        await first_runner._run_smoke_gate(
+            fixture=_SmokeFixture(),
+            resolver=resolver,
+            ledger=first_ledger,
+        )
+
+    assert set(first_calls) == set(required_cells)
+    assert failure_recorded_for_sibling.is_set()
+    assert first_store.document.smoke_status == "failed"
+    assert set(first_store.document.smoke_gate) == set(required_cells)
+    failed = first_store.document.smoke_gate[failed_cell]
+    assert failed.status == "incomplete"
+    assert failed.outcome.model_requests == 1
+    assert failed.outcome.provider_cost_usd == pytest.approx(0.101)
+    assert failed.outcome.provider_evidence[0]["usage"]["cost"] == pytest.approx(0.101)
+    assert failed.outcome.provider_evidence[0]["diagnostic"] == "[redacted]"
+    assert first_store.document.spent.model_requests == 7
+    assert first_store.document.spent.cost_usd == pytest.approx(0.10103)
+    assert first_store.document.reserved_cost_usd == 0
+    assert first_ledger.reserved_cost_usd == Decimal("0")
+
+    resumed_runner = BenchmarkRunner(
+        manifest,
+        tasks,
+        _parallel_descriptor(),
+        resume_path=checkpoint_path,
+    )
+    resumed_runner._checkpoint_store = resumed_runner._checkpoint_store_for(
+        source_revision=source_revision,
+        resolver=resolver,
+        planned_keys={},
+    )
+    resumed_store = resumed_runner._checkpoint_store
+    assert resumed_store is not None
+    spent = resumed_store.document.spent
+    resumed_ledger = BudgetLedger(manifest)
+    resumed_ledger.restore(
+        model_requests=spent.model_requests,
+        input_tokens=spent.input_tokens,
+        output_tokens=spent.output_tokens,
+        cost_usd=spent.cost_usd,
+        wall_seconds=spent.wall_seconds,
+        model_work_seconds=spent.model_work_seconds,
+        budget_failure=resumed_store.budget_failure_reason(),
+    )
+    resumed_runner._ledger = resumed_ledger
+    resumed_calls: list[str] = []
+
+    async def retry_accounting_cell(task, *, model_spec, transport, request_guard, **_kwargs):
+        cell = f"{model_spec.class_name}:{transport}"
+        resumed_calls.append(cell)
+        for _ in range(2):
+            receipt = await request_guard()
+            await resumed_ledger.record_provider_response_cost(
+                request_guard,
+                receipt,
+                Decimal("0.000005"),
+            )
+        return _smoke_outcome(task, model_spec, transport)
+
+    monkeypatch.setattr(runner_module, "execute_smoke", retry_accounting_cell)
+    result = await resumed_runner._run_smoke_gate(
+        fixture=_SmokeFixture(),
+        resolver=resolver,
+        ledger=resumed_ledger,
+    )
+
+    assert result["status"] == "passed"
+    assert resumed_calls == [failed_cell]
+    assert {cell["cell"] for cell in result["cells"] if cell["reused"]} == set(required_cells) - {failed_cell}
+    assert all(record.status == "completed" for record in resumed_store.document.smoke_gate.values())
+    assert resumed_store.document.smoke_status == "passed"
+    assert resumed_ledger.reserved_cost_usd == Decimal("0")

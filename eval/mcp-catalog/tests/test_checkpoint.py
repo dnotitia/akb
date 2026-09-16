@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -173,8 +174,8 @@ async def test_checkpoint_does_not_promote_per_trial_failure_to_global_stop(tmp_
         model_work_seconds=resumed.document.spent.model_work_seconds,
         budget_failure=resumed.budget_failure_reason(),
     )
-    await ledger.reserve_trial(manifest.budget.max_cost_per_trial_usd)
-    await ledger.release_trial(manifest.budget.max_cost_per_trial_usd)
+    reservation = await ledger.reserve_trial(Decimal(str(manifest.budget.max_cost_per_trial_usd)))
+    await reservation.release()
 
 
 def test_resume_fails_closed_for_header_mismatch_corruption_and_secret(tmp_path: Path) -> None:

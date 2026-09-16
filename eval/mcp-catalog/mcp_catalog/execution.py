@@ -155,14 +155,14 @@ class OpenRouterChatModel(OpenAIChatModel):
 
     async def request(self, messages: list[Any], model_settings: Any, model_request_parameters: Any) -> ModelResponse:
         guard = PROVIDER_REQUEST_GUARD.get()
-        if guard is not None:
-            await guard()
+        receipt = await guard() if guard is not None else None
         response = await super().request(messages, model_settings, model_request_parameters)
         captured = MODEL_RESPONSES.get()
         if captured is not None:
             captured.append(response)
         if guard is not None:
-            await guard.record_response(response)
+            assert receipt is not None
+            await guard.record_response(response, receipt=receipt)
         return response
 
     def _process_provider_details(self, response: Any) -> dict[str, Any] | None:
@@ -749,6 +749,12 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
             return ()
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderRequestReceipt:
+    guard: ProviderRequestGuard
+    request_id: int
+
+
 @dataclass(slots=True)
 class BudgetLedger:
     manifest: BenchmarkRunManifest
@@ -756,10 +762,11 @@ class BudgetLedger:
     requests: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
-    cost_usd: float = 0.0
+    cost_usd: Decimal = Decimal("0")
     wall_seconds: float = 0.0
     model_work_seconds: float = 0.0
-    reserved_cost_usd: float = 0.0
+    reserved_cost_usd: Decimal = Decimal("0")
+    _reservations: dict[ProviderRequestGuard, Decimal] = field(default_factory=dict, repr=False)
     _budget_failure: str | None = None
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -769,29 +776,35 @@ class BudgetLedger:
         model_requests: int,
         input_tokens: int,
         output_tokens: int,
-        cost_usd: float,
+        cost_usd: float | Decimal,
         wall_seconds: float,
         model_work_seconds: float = 0.0,
         budget_failure: str | None = None,
     ) -> None:
         """Restore already-spent usage from a checkpoint before new calls."""
 
-        if min(model_requests, input_tokens, output_tokens, cost_usd, wall_seconds, model_work_seconds) < 0:
+        restored_cost = Decimal(str(cost_usd))
+        if min(model_requests, input_tokens, output_tokens, wall_seconds, model_work_seconds) < 0:
             raise BudgetExceeded("checkpoint budget totals cannot be negative")
+        if not restored_cost.is_finite() or restored_cost < 0:
+            raise BudgetExceeded("checkpoint budget totals cannot be negative")
+        if self._reservations or self.reserved_cost_usd != 0:
+            raise BudgetExceeded("cannot restore budget accounting while reservations are open")
         budget = self.manifest.budget
         if (
             model_requests > budget.max_model_requests
-            or cost_usd > budget.max_total_cost_usd
+            or restored_cost > Decimal(str(budget.max_total_cost_usd))
             or wall_seconds > budget.max_wall_seconds
         ):
             raise BudgetExceeded("checkpoint budget totals already exceed the registered run limits")
         self.requests = model_requests
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
-        self.cost_usd = cost_usd
+        self.cost_usd = restored_cost
         self.wall_seconds = wall_seconds
         self.model_work_seconds = model_work_seconds
         self._budget_failure = budget_failure
+        self._assert_reservation_invariant()
 
     def current_wall_seconds(self) -> float:
         observed = self.wall_clock() if self.wall_clock is not None else self.wall_seconds
@@ -812,10 +825,40 @@ class BudgetLedger:
             raise GlobalWallDeadlineExceeded("global wall deadline exceeded")
         return min(float(self.manifest.budget.request_timeout_seconds), remaining)
 
-    def new_provider_request_guard(self, *, reserved_cost_usd: float = 0.0) -> ProviderRequestGuard:
-        return ProviderRequestGuard(self, reserved_cost_usd=reserved_cost_usd)
+    def _assert_reservation_invariant(self) -> None:
+        owner_total = sum(self._reservations.values(), Decimal("0"))
+        if owner_total != self.reserved_cost_usd or any(
+            balance < 0 or guard.reserved_cost_usd != balance or not guard.is_open
+            for guard, balance in self._reservations.items()
+        ):
+            raise BudgetExceeded("provider reservation ownership is inconsistent")
 
-    async def reserve_trial(self, worst_case_cost_usd: float) -> None:
+    def _replace_guard_reservation(self, guard: ProviderRequestGuard, balance: Decimal) -> None:
+        if guard not in self._reservations:
+            raise BudgetExceeded("provider request reservation is not open")
+        if not balance.is_finite() or balance < 0:
+            raise BudgetExceeded("provider reservation remainder cannot be negative")
+        previous = self._reservations[guard]
+        self._reservations[guard] = balance
+        self.reserved_cost_usd += balance - previous
+        guard.reserved_cost_usd = balance
+        self._assert_reservation_invariant()
+
+    def _close_guard(self, guard: ProviderRequestGuard, state: Literal["charged", "released"]) -> bool:
+        balance = self._reservations.pop(guard, None)
+        if balance is None:
+            return False
+        self.reserved_cost_usd -= balance
+        guard.reserved_cost_usd = Decimal("0")
+        guard._state = state
+        guard._pending_requests.clear()
+        self._assert_reservation_invariant()
+        return True
+
+    async def reserve_trial(self, worst_case_cost_usd: Decimal | float) -> ProviderRequestGuard:
+        reservation = Decimal(str(worst_case_cost_usd))
+        if not reservation.is_finite() or reservation < 0:
+            raise BudgetExceeded("preregistered worst-case trial cost cannot be negative")
         async with self._lock:
             budget = self.manifest.budget
             if self._budget_failure is not None:
@@ -824,18 +867,26 @@ class BudgetLedger:
                 raise BudgetExceeded("max_model_requests exceeded")
             if self.current_wall_seconds() >= budget.max_wall_seconds:
                 raise BudgetExceeded("max_wall_seconds exceeded")
-            if worst_case_cost_usd < 0 or self.cost_usd + self.reserved_cost_usd + worst_case_cost_usd > budget.max_total_cost_usd:
+            if self.cost_usd + self.reserved_cost_usd + reservation > Decimal(str(budget.max_total_cost_usd)):
                 raise BudgetExceeded("preregistered worst-case trial cost would exceed max_total_cost_usd")
-            self.reserved_cost_usd += worst_case_cost_usd
+            guard = ProviderRequestGuard(self, reservation)
+            self._reservations[guard] = reservation
+            self.reserved_cost_usd += reservation
+            self._assert_reservation_invariant()
+            return guard
 
-    async def release_trial(self, reserved_cost_usd: float) -> None:
+    async def release_reservation(self, guard: ProviderRequestGuard) -> bool:
         async with self._lock:
-            if reserved_cost_usd > self.reserved_cost_usd:
-                raise BudgetExceeded("trial cost reservation accounting is inconsistent")
-            self.reserved_cost_usd -= reserved_cost_usd
+            if guard.ledger is not self:
+                raise BudgetExceeded("provider request reservation belongs to another ledger")
+            released = self._close_guard(guard, "released")
+            self._assert_reservation_invariant()
+            return released
 
-    async def admit_provider_request(self, guard: ProviderRequestGuard) -> None:
+    async def admit_provider_request(self, guard: ProviderRequestGuard) -> ProviderRequestReceipt:
         async with self._lock:
+            if guard.ledger is not self or guard not in self._reservations or not guard.is_open:
+                raise BudgetExceeded("provider request reservation is not open")
             if self._budget_failure is not None:
                 raise BudgetExceeded(f"benchmark incomplete: {self._budget_failure}")
             if guard.requests >= self.manifest.budget.max_requests_per_trial:
@@ -848,77 +899,98 @@ class BudgetLedger:
             if self.requests >= self.manifest.budget.max_model_requests:
                 self._budget_failure = "max_model_requests exceeded"
                 raise BudgetExceeded(f"benchmark incomplete: {self._budget_failure}")
+            request_id = guard._next_request_id
+            guard._next_request_id += 1
+            guard._pending_requests.add(request_id)
+            guard.requests += 1
             self.requests += 1
-
-    async def block_provider_requests(self, reason: str) -> None:
-        async with self._lock:
-            self._budget_failure = reason
+            return ProviderRequestReceipt(guard, request_id)
 
     async def record_provider_response_cost(
         self,
         guard: ProviderRequestGuard,
+        receipt: ProviderRequestReceipt,
         cost_usd: Decimal,
-    ) -> None:
+    ) -> bool:
         async with self._lock:
+            if receipt.guard is not guard:
+                raise BudgetExceeded("provider response receipt belongs to another request")
+            if guard.ledger is not self or guard not in self._reservations or not guard.is_open:
+                return False
+            if receipt.request_id not in guard._pending_requests:
+                return False
+            if not cost_usd.is_finite() or cost_usd < 0:
+                reason = "max_total_cost_usd cannot be enforced without provider response cost"
+                guard._pending_requests.remove(receipt.request_id)
+                self._budget_failure = reason
+                self._assert_reservation_invariant()
+                raise BudgetExceeded(f"benchmark incomplete: {reason}")
             trial_cost = guard.provider_cost_usd + cost_usd
-            consumed_reservation = min(cost_usd, Decimal(str(guard.reserved_cost_usd)))
-            next_reserved = Decimal(str(self.reserved_cost_usd)) - consumed_reservation
-            next_cost = Decimal(str(self.cost_usd)) + cost_usd
+            consumed_reservation = min(cost_usd, guard.reserved_cost_usd)
             guard.provider_cost_usd = trial_cost
-            guard.reserved_cost_usd = float(Decimal(str(guard.reserved_cost_usd)) - consumed_reservation)
-            self.reserved_cost_usd = float(next_reserved)
-            self.cost_usd = float(next_cost)
+            guard._pending_requests.remove(receipt.request_id)
+            self._replace_guard_reservation(guard, guard.reserved_cost_usd - consumed_reservation)
+            self.cost_usd += cost_usd
 
-            if next_cost + next_reserved > Decimal(str(self.manifest.budget.max_total_cost_usd)):
+            global_failure: str | None = None
+            trial_failure: str | None = None
+            if self.cost_usd + self.reserved_cost_usd > Decimal(str(self.manifest.budget.max_total_cost_usd)):
                 self._budget_failure = "max_total_cost_usd exceeded"
-                raise BudgetExceeded(f"benchmark incomplete: {self._budget_failure}")
+                global_failure = self._budget_failure
             if trial_cost > Decimal(str(self.manifest.budget.max_cost_per_trial_usd)):
-                raise BudgetExceeded("benchmark incomplete: max_cost_per_trial_usd exceeded")
+                trial_failure = "max_cost_per_trial_usd exceeded"
+            self._assert_reservation_invariant()
+            if global_failure is not None:
+                raise BudgetExceeded(f"benchmark incomplete: {global_failure}")
+            if trial_failure is not None:
+                raise BudgetExceeded(f"benchmark incomplete: {trial_failure}")
+            return True
 
-    async def release_all_reservations(self) -> float:
+    async def release_all_reservations(self) -> Decimal:
         async with self._lock:
             released = self.reserved_cost_usd
-            self.reserved_cost_usd = 0.0
+            for guard in tuple(self._reservations):
+                self._close_guard(guard, "released")
+            self._assert_reservation_invariant()
             return released
 
-    async def charge(
-        self,
-        outcome: TrialOutcome,
-        *,
-        reserved_cost_usd: float = 0.0,
-        request_admissions: int = 0,
-        provider_cost_admissions: Decimal | float = 0.0,
-    ) -> None:
+    async def charge(self, outcome: TrialOutcome, *, guard: ProviderRequestGuard) -> None:
         async with self._lock:
-            if request_admissions < 0 or request_admissions > self.requests:
+            if guard.ledger is not self or guard not in self._reservations or not guard.is_open:
+                raise BudgetExceeded("provider request reservation is already settled")
+            self._assert_reservation_invariant()
+            if guard.requests > self.requests:
                 raise BudgetExceeded("provider request accounting is inconsistent")
-            trial_requests = max(outcome.model_requests, request_admissions)
-            next_requests = self.requests + max(0, outcome.model_requests - request_admissions)
+
+            trial_requests = max(outcome.model_requests, guard.requests)
+            next_requests = self.requests + max(0, outcome.model_requests - guard.requests)
             next_input = self.input_tokens + outcome.input_tokens
             next_output = self.output_tokens + outcome.output_tokens
-            provider_cost_admissions = Decimal(str(provider_cost_admissions))
-            if provider_cost_admissions < 0:
-                raise BudgetExceeded("provider cost accounting cannot be negative")
-            unrecorded_cost = max(Decimal("0"), Decimal(str(outcome.cost_usd)) - provider_cost_admissions)
-            next_cost = float(Decimal(str(self.cost_usd)) + unrecorded_cost)
+            outcome_cost = Decimal(str(outcome.cost_usd))
+            if not outcome_cost.is_finite() or outcome_cost < 0:
+                raise BudgetExceeded("provider outcome cost cannot be negative or non-finite")
+            if guard.provider_cost_usd > 0 and outcome.cost_source == "provider_response":
+                unrecorded_cost = Decimal("0")
+            else:
+                unrecorded_cost = max(Decimal("0"), outcome_cost - guard.provider_cost_usd)
+            next_cost = self.cost_usd + unrecorded_cost
             next_wall = self.current_wall_seconds()
-            next_model_work = float(
-                Decimal(str(self.model_work_seconds)) + Decimal(str(outcome.latency_seconds))
-            )
+            next_model_work = self.model_work_seconds + outcome.latency_seconds
             budget = self.manifest.budget
             trial_failure: str | None = None
             global_failure: str | None = None
             if trial_requests > budget.max_requests_per_trial:
                 trial_failure = "max_requests_per_trial exceeded"
-            elif outcome.cost_usd > budget.max_cost_per_trial_usd:
+            elif guard.provider_cost_usd + unrecorded_cost > Decimal(str(budget.max_cost_per_trial_usd)):
                 trial_failure = "max_cost_per_trial_usd exceeded"
             elif next_requests > budget.max_model_requests:
                 global_failure = "max_model_requests exceeded"
-            remaining_reserved = self.reserved_cost_usd - reserved_cost_usd
+            remaining_reserved = self.reserved_cost_usd - guard.reserved_cost_usd
             if remaining_reserved < 0:
-                raise BudgetExceeded("trial cost reservation accounting is inconsistent")
-            if next_cost + remaining_reserved > budget.max_total_cost_usd:
+                raise BudgetExceeded("provider reservation ownership is inconsistent")
+            if next_cost + remaining_reserved > Decimal(str(budget.max_total_cost_usd)):
                 global_failure = "max_total_cost_usd exceeded"
+
             self.requests = next_requests
             self.input_tokens = next_input
             self.output_tokens = next_output
@@ -927,24 +999,39 @@ class BudgetLedger:
             self.model_work_seconds = next_model_work
             if global_failure is not None:
                 self._budget_failure = global_failure
-                raise BudgetExceeded(global_failure)
+            self._close_guard(guard, "charged")
+            self._assert_reservation_invariant()
+            if global_failure is not None:
+                raise BudgetExceeded(f"benchmark incomplete: {global_failure}")
             if trial_failure is not None:
-                raise BudgetExceeded(trial_failure)
-            self.reserved_cost_usd = remaining_reserved
+                raise BudgetExceeded(f"benchmark incomplete: {trial_failure}")
 
 
-@dataclass(slots=True)
+@dataclass(eq=False, slots=True)
 class ProviderRequestGuard:
     ledger: BudgetLedger
-    reserved_cost_usd: float
+    reserved_cost_usd: Decimal
     requests: int = 0
     provider_cost_usd: Decimal = field(default_factory=lambda: Decimal("0"))
+    _state: Literal["open", "charged", "released"] = "open"
+    _next_request_id: int = 0
+    _pending_requests: set[int] = field(default_factory=set)
 
-    async def __call__(self) -> None:
-        await self.ledger.admit_provider_request(self)
-        self.requests += 1
+    @property
+    def is_open(self) -> bool:
+        return self._state == "open"
 
-    async def record_response(self, response: ModelResponse) -> None:
+    async def __call__(self) -> ProviderRequestReceipt:
+        return await self.ledger.admit_provider_request(self)
+
+    async def record_response(
+        self,
+        response: ModelResponse,
+        *,
+        receipt: ProviderRequestReceipt,
+    ) -> bool:
+        if receipt.guard is not self:
+            raise BudgetExceeded("provider response receipt belongs to another request")
         details = getattr(response, "provider_details", None)
         usage = details.get("openrouter_usage") if isinstance(details, dict) else None
         cost = usage.get("cost") if isinstance(usage, dict) else None
@@ -952,11 +1039,10 @@ class ProviderRequestGuard:
             provider_cost = Decimal(str(cost))
         except (InvalidOperation, TypeError, ValueError):
             provider_cost = Decimal("NaN")
-        if not provider_cost.is_finite() or provider_cost < 0:
-            reason = "max_total_cost_usd cannot be enforced without provider response cost"
-            await self.ledger.block_provider_requests(reason)
-            raise BudgetExceeded(f"benchmark incomplete: {reason}")
-        await self.ledger.record_provider_response_cost(self, provider_cost)
+        return await self.ledger.record_provider_response_cost(self, receipt, provider_cost)
+
+    async def release(self) -> bool:
+        return await self.ledger.release_reservation(self)
 
 
 async def run_agent_with_deadline(
@@ -1046,7 +1132,7 @@ class TrialExecutor:
         error: str | None = None
         reservation = worst_case_cost(self.model_spec, self.manifest.budget)
         try:
-            await self.ledger.reserve_trial(reservation)
+            request_guard = await self.ledger.reserve_trial(reservation)
         except BudgetExceeded as exc:
             outcome = TrialOutcome(
                 task_id=task.id,
@@ -1061,8 +1147,6 @@ class TrialExecutor:
             )
             self._record_outcome(outcome)
             return outcome
-        settled = False
-        request_guard = self.ledger.new_provider_request_guard(reserved_cost_usd=reservation)
         try:
             partial_messages: list[ModelResponse] = []
             capture_token = MODEL_RESPONSES.set(partial_messages)
@@ -1136,23 +1220,16 @@ class TrialExecutor:
             ):
                 self.timing_sink("provider_wait", started, started + latency)
             try:
-                await self.ledger.charge(
-                    outcome,
-                    reserved_cost_usd=request_guard.reserved_cost_usd,
-                    request_admissions=request_guard.requests,
-                    provider_cost_admissions=request_guard.provider_cost_usd,
-                )
+                await self.ledger.charge(outcome, guard=request_guard)
             except BudgetExceeded as exc:
                 outcome.error = f"benchmark incomplete: {exc}"
                 outcome.failure_kind = "budget"
                 self._record_outcome(outcome)
                 return outcome
-            settled = True
             self._record_outcome(outcome)
             return outcome
         finally:
-            if not settled:
-                await self.ledger.release_trial(request_guard.reserved_cost_usd)
+            await request_guard.release()
 
     def _record_outcome(self, outcome: TrialOutcome) -> None:
         if self.outcome_sink is not None:
@@ -1822,10 +1899,10 @@ def estimate_cost(spec: ModelSpec, input_tokens: int, output_tokens: int) -> flo
     )
 
 
-def worst_case_cost(_spec: ModelSpec, budget: Any) -> float:
+def worst_case_cost(_spec: ModelSpec, budget: Any) -> Decimal:
     """Use the preregistered per-trial cost reservation before each call."""
 
-    return budget.max_cost_per_trial_usd
+    return Decimal(str(budget.max_cost_per_trial_usd))
 
 
 def outcome_metrics(outcome: TrialOutcome) -> dict[str, float | int]:

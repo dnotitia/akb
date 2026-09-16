@@ -9,6 +9,7 @@ import time
 from collections.abc import Mapping
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, cast
 
@@ -632,16 +633,16 @@ class BenchmarkRunner:
                 incomplete_reasons.add("benchmark incomplete: checkpoint and artifact trial counts differ")
             if checkpoint_doc.reserved_cost_usd != 0:
                 incomplete_reasons.add("benchmark incomplete: checkpoint has an orphaned reservation")
-        if ledger.reserved_cost_usd != 0:
+        if ledger.reserved_cost_usd != Decimal("0"):
             incomplete_reasons.add("benchmark incomplete: artifact has an orphaned reservation")
         if checkpoint_doc is not None:
             budget_model_requests = checkpoint_doc.spent.model_requests
             budget_input_tokens = checkpoint_doc.spent.input_tokens
             budget_output_tokens = checkpoint_doc.spent.output_tokens
-            budget_cost_usd = checkpoint_doc.spent.cost_usd
+            budget_cost_usd = Decimal(str(checkpoint_doc.spent.cost_usd))
             budget_wall_seconds = checkpoint_doc.spent.wall_seconds
             budget_model_work_seconds = checkpoint_doc.spent.model_work_seconds
-            budget_reserved = checkpoint_doc.reserved_cost_usd
+            budget_reserved = Decimal(str(checkpoint_doc.reserved_cost_usd))
         else:
             budget_model_requests = ledger.requests
             budget_input_tokens = ledger.input_tokens
@@ -650,6 +651,8 @@ class BenchmarkRunner:
             budget_wall_seconds = ledger.wall_seconds
             budget_model_work_seconds = ledger.model_work_seconds
             budget_reserved = ledger.reserved_cost_usd
+        budget_cost_value = float(budget_cost_usd)
+        budget_reserved_value = float(budget_reserved)
         timing_payload = timing or {
             "attempt_index": 1,
             "wall_seconds": end_to_end_wall_seconds,
@@ -690,10 +693,10 @@ class BenchmarkRunner:
                 "input_tokens": budget_input_tokens,
                 "output_tokens": budget_output_tokens,
                 "total_tokens": budget_input_tokens + budget_output_tokens,
-                "cost_usd": budget_cost_usd,
+                "cost_usd": budget_cost_value,
                 "wall_seconds": budget_wall_seconds,
                 "model_work_seconds": budget_model_work_seconds,
-                "reserved_cost_usd": budget_reserved,
+                "reserved_cost_usd": budget_reserved_value,
                 "request_timeout_seconds": self.manifest.budget.request_timeout_seconds,
             },
         }
@@ -745,7 +748,7 @@ class BenchmarkRunner:
                         if self._ledger is not None
                         else None
                     ),
-                    reserved_cost_usd=(self._ledger.reserved_cost_usd if self._ledger is not None else 0.0),
+                    reserved_cost_usd=(float(self._ledger.reserved_cost_usd) if self._ledger is not None else 0.0),
                 )
                 if self._timing is not None:
                     self._timing.record("checkpoint", checkpoint_started)
@@ -817,7 +820,7 @@ class BenchmarkRunner:
             reservation = worst_case_cost(model_spec, self.manifest.budget)
             outcome: TrialOutcome | None = None
             try:
-                await ledger.reserve_trial(reservation)
+                request_guard = await ledger.reserve_trial(reservation)
             except Exception as exc:
                 outcome = TrialOutcome(
                     task_id=task.id,
@@ -844,15 +847,13 @@ class BenchmarkRunner:
                                 if self._ledger is not None
                                 else None
                             ),
-                            reserved_cost_usd=(self._ledger.reserved_cost_usd if self._ledger is not None else 0.0),
+                            reserved_cost_usd=(float(self._ledger.reserved_cost_usd) if self._ledger is not None else 0.0),
                         )
                 raise RuntimeContractError(
                     f"smoke gate cell {cell_key} could not reserve its registered budget",
                     stage="smoke_gate",
                 ) from exc
 
-            request_guard = ledger.new_provider_request_guard(reserved_cost_usd=reservation)
-            settled = False
             try:
                 await cell_fixture.reset()
                 self._resolver = resolver
@@ -896,13 +897,7 @@ class BenchmarkRunner:
                             request_guard=request_guard,
                             timing_sink=self._timing.record if self._timing is not None else None,
                         )
-                await ledger.charge(
-                    outcome,
-                    reserved_cost_usd=request_guard.reserved_cost_usd,
-                    request_admissions=request_guard.requests,
-                    provider_cost_admissions=request_guard.provider_cost_usd,
-                )
-                settled = True
+                await ledger.charge(outcome, guard=request_guard)
             except Exception as exc:
                 with_context = exc if isinstance(exc, RuntimeContractError) else RuntimeContractError(
                     f"smoke gate cell {cell_key} failed: {redact_exception(exc, self.secrets)}",
@@ -924,8 +919,7 @@ class BenchmarkRunner:
                     outcome.error = f"benchmark incomplete: {redact_exception(exc, self.secrets)}"
                     outcome.failure_kind = "budget"
             finally:
-                if not settled:
-                    await ledger.release_trial(request_guard.reserved_cost_usd)
+                await request_guard.release()
 
             assert outcome is not None
             identity_matches = (
@@ -965,7 +959,7 @@ class BenchmarkRunner:
                             if self._ledger is not None
                             else None
                         ),
-                        reserved_cost_usd=(self._ledger.reserved_cost_usd if self._ledger is not None else 0.0),
+                        reserved_cost_usd=(float(self._ledger.reserved_cost_usd) if self._ledger is not None else 0.0),
                     )
             return {
                 "cell": cell_key,
@@ -1384,7 +1378,7 @@ class BenchmarkRunner:
         finally:
             try:
                 orphaned_reservation = await ledger.release_all_reservations()
-                if orphaned_reservation > 1e-12:
+                if orphaned_reservation > Decimal("1e-12"):
                     lifecycle_cleanup_errors.append(
                         BudgetExceeded(
                             f"checkpoint finalization released orphaned reservation ${orphaned_reservation:.8f}"
