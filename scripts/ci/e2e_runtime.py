@@ -71,6 +71,20 @@ DEFAULT_COMPOSE_PROJECT = "akb-e2e"
 DEFAULT_TIMEOUT_SECONDS = 180.0
 DEFAULT_PROFILE = "tool-only"
 SOURCE_REVISION_ENV = "AKB_E2E_SOURCE_REVISION"
+MINIO_RESET_MAX_ATTEMPTS = 3
+MINIO_RESET_BACKOFF_SECONDS = (0.05, 0.1)
+MINIO_RETRYABLE_ERROR_CODES = frozenset(
+    {
+        "InternalError",
+        "InternalFailure",
+        "OperationAborted",
+        "RequestTimeout",
+        "ServiceUnavailable",
+        "SlowDown",
+        "Throttling",
+        "ThrottlingException",
+    }
+)
 
 
 def _canonical_fixture_json(value: object) -> bytes:
@@ -357,6 +371,33 @@ def select_capability_profile(
 
 class ProvisioningFailure(RuntimeError):
     """A dependency, process, or fixture precondition failed."""
+
+
+class MinioResetFailure(ProvisioningFailure):
+    """A bounded MinIO reset failed with sanitized operation evidence."""
+
+    def __init__(self, detail: str, evidence: dict[str, object]) -> None:
+        super().__init__(detail)
+        self.evidence = evidence
+
+
+class _MinioResetOperationError(RuntimeError):
+    """An S3 reset operation failed, with an explicit retry classification."""
+
+    def __init__(
+        self,
+        operation: str,
+        code: str,
+        message: str,
+        *,
+        retryable: bool,
+        exception_type: str = "S3ResponseError",
+    ) -> None:
+        super().__init__(message)
+        self.operation = operation
+        self.code = code
+        self.retryable = retryable
+        self.exception_type = exception_type
 
 
 class BlockedRuntimeConfig(ProvisioningFailure):
@@ -1812,9 +1853,127 @@ class E2ERuntime:
                 f"PostgreSQL in-place fixture reset failed: {detail}"
             ) from None
 
-    def _clear_minio_objects(self) -> None:
-        """Delete scenario objects without deleting the MinIO bucket or volume."""
+    def _minio_exception_code(self, error: BaseException) -> tuple[str, int | None]:
+        response = getattr(error, "response", None)
+        if isinstance(response, dict):
+            error_payload = response.get("Error")
+            code = error_payload.get("Code") if isinstance(error_payload, dict) else None
+            metadata = response.get("ResponseMetadata")
+            status = metadata.get("HTTPStatusCode") if isinstance(metadata, dict) else None
+            return (
+                str(code) if code is not None else type(error).__name__,
+                status if isinstance(status, int) else None,
+            )
+        return type(error).__name__, None
 
+    def _minio_retryable_exception(self, error: BaseException) -> bool:
+        try:
+            from botocore.exceptions import (
+                ConnectTimeoutError,
+                ConnectionClosedError,
+                EndpointConnectionError,
+                ProxyConnectionError,
+                ReadTimeoutError,
+            )
+
+            if isinstance(
+                error,
+                (
+                    ConnectTimeoutError,
+                    ConnectionClosedError,
+                    EndpointConnectionError,
+                    ProxyConnectionError,
+                    ReadTimeoutError,
+                ),
+            ):
+                return True
+        except ImportError:
+            pass
+        code, status = self._minio_exception_code(error)
+        return code in MINIO_RETRYABLE_ERROR_CODES or (status is not None and status >= 500)
+
+    def _redact_minio_message(self, message: str) -> str:
+        redacted = message
+        for private in self._fixture_private_values:
+            if private:
+                redacted = redacted.replace(private, "[REDACTED]")
+        return redacted[:500]
+
+    def _minio_operation_error(self, operation: str, error: BaseException) -> _MinioResetOperationError:
+        code, status = self._minio_exception_code(error)
+        if status is not None:
+            code = f"{code} http={status}"
+        return _MinioResetOperationError(
+            operation,
+            code,
+            self._redact_minio_message(str(error)),
+            retryable=self._minio_retryable_exception(error),
+            exception_type=type(error).__name__,
+        )
+
+    def _minio_list_keys(self, client) -> list[str]:
+        try:
+            paginator = client.get_paginator("list_objects_v2")
+            keys: list[str] = []
+            for page in paginator.paginate(Bucket="akb-files"):
+                contents = page.get("Contents", [])
+                if not isinstance(contents, list):
+                    raise ValueError("Contents is not a list")
+                for item in contents:
+                    if not isinstance(item, dict) or not isinstance(item.get("Key"), str):
+                        raise ValueError("object listing contains an invalid key")
+                    keys.append(item["Key"])
+            return keys
+        except _MinioResetOperationError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - classify and redact below
+            raise self._minio_operation_error("list", exc) from None
+
+    def _minio_reset_pass(self, client) -> None:
+        keys = self._minio_list_keys(client)
+        if keys:
+            try:
+                response = client.delete_objects(
+                    Bucket="akb-files",
+                    Delete={"Objects": [{"Key": key} for key in keys], "Quiet": True},
+                )
+            except Exception as exc:  # noqa: BLE001 - classify and redact below
+                raise self._minio_operation_error("delete", exc) from None
+            errors = response.get("Errors", []) if isinstance(response, dict) else None
+            if not isinstance(errors, list):
+                raise _MinioResetOperationError(
+                    "delete", "InvalidResponse", "delete response Errors is not a list", retryable=False
+                )
+            if errors:
+                first = errors[0] if isinstance(errors[0], dict) else {}
+                code = str(first.get("Code", "UnknownError"))
+                message = self._redact_minio_message(str(first.get("Message", "delete response returned an error")))
+                status = first.get("HTTPStatusCode")
+                retryable = code in MINIO_RETRYABLE_ERROR_CODES or (
+                    isinstance(status, int) and status >= 500
+                )
+                raise _MinioResetOperationError(
+                    "delete", code, message, retryable=retryable, exception_type="S3ResponseError"
+                )
+        remaining = self._minio_list_keys(client)
+        if remaining:
+            raise _MinioResetOperationError(
+                "verify",
+                "BucketNotEmpty",
+                f"bucket still contains {len(remaining)} object(s)",
+                retryable=True,
+            )
+
+    def _clear_minio_objects(self) -> dict[str, object]:
+        """Delete scenario objects, preserving the bucket and volume identities."""
+
+        started = time.perf_counter()
+        evidence: dict[str, object] = {
+            "status": "failed",
+            "attempts": 0,
+            "retry_count": 0,
+            "wall_seconds": 0.0,
+        }
         try:
             import boto3
 
@@ -1824,22 +1983,49 @@ class E2ERuntime:
                 aws_access_key_id="akb-ci",
                 aws_secret_access_key="akb-ci-secret",
             )
-            paginator = client.get_paginator("list_objects_v2")
-            for page in paginator.paginate(Bucket="akb-files"):
-                objects = [
-                    {"Key": item["Key"]}
-                    for item in page.get("Contents", [])
-                    if isinstance(item, dict) and isinstance(item.get("Key"), str)
-                ]
-                if objects:
-                    response = client.delete_objects(
-                        Bucket="akb-files",
-                        Delete={"Objects": objects, "Quiet": True},
-                    )
-                    if response.get("Errors"):
-                        raise RuntimeError("object deletion returned errors")
-        except Exception:
-            raise ProvisioningFailure("MinIO in-place fixture reset failed") from None
+        except Exception as exc:  # noqa: BLE001 - classify and redact below
+            operation_error = self._minio_operation_error("list", exc)
+            evidence.update({"attempts": 1, "last_failure": str(operation_error)})
+            evidence["wall_seconds"] = time.perf_counter() - started
+            raise MinioResetFailure(
+                f"MinIO in-place fixture reset failed: operation=list attempt=1/{MINIO_RESET_MAX_ATTEMPTS} "
+                f"exception={type(exc).__name__} s3_code={operation_error.code}: {operation_error}",
+                evidence,
+            ) from None
+
+        for attempt in range(1, MINIO_RESET_MAX_ATTEMPTS + 1):
+            evidence["attempts"] = attempt
+            try:
+                self._minio_reset_pass(client)
+                evidence["status"] = "recovered" if attempt > 1 else "success"
+                evidence["retry_count"] = attempt - 1
+                evidence["wall_seconds"] = time.perf_counter() - started
+                return evidence
+            except _MinioResetOperationError as exc:
+                detail = (
+                    f"MinIO in-place fixture reset failed: operation={exc.operation} "
+                    f"attempt={attempt}/{MINIO_RESET_MAX_ATTEMPTS} exception={exc.exception_type} "
+                    f"s3_code={exc.code}: {exc}"
+                )
+                evidence["last_failure"] = detail
+                if not exc.retryable or attempt >= MINIO_RESET_MAX_ATTEMPTS:
+                    evidence["retry_count"] = attempt - 1
+                    evidence["wall_seconds"] = time.perf_counter() - started
+                    raise MinioResetFailure(detail, evidence) from None
+                evidence["retry_count"] = attempt
+                time.sleep(MINIO_RESET_BACKOFF_SECONDS[min(attempt - 1, len(MINIO_RESET_BACKOFF_SECONDS) - 1)])
+            except Exception as exc:  # noqa: BLE001 - bounded diagnostic fallback
+                operation_error = self._minio_operation_error("list", exc)
+                detail = (
+                    f"MinIO in-place fixture reset failed: operation=list "
+                    f"attempt={attempt}/{MINIO_RESET_MAX_ATTEMPTS} exception={type(exc).__name__} "
+                    f"s3_code={operation_error.code}: {operation_error}"
+                )
+                evidence["last_failure"] = detail
+                evidence["retry_count"] = attempt - 1
+                evidence["wall_seconds"] = time.perf_counter() - started
+                raise MinioResetFailure(detail, evidence) from None
+        raise AssertionError("MinIO reset retry loop did not terminate")
 
     def _process_identity_snapshot(self) -> dict[str, object]:
         """Capture managed process identities that a fixture reset must preserve."""
@@ -3704,6 +3890,12 @@ class E2ERuntime:
             identity_after: dict[str, object] | None = None
             process_before: dict[str, object] = {}
             process_after: dict[str, object] = {}
+            minio_reset_evidence: dict[str, object] = {
+                "status": "not_run",
+                "attempts": 0,
+                "retry_count": 0,
+                "wall_seconds": 0.0,
+            }
             preserved = False
             self._lifecycle_generation += 1
             self._resetting = True
@@ -3716,7 +3908,11 @@ class E2ERuntime:
                 self._stdio_read_call_observed = False
                 self._stdio_next_id = 2
                 await self._reset_postgres_in_place()
-                await asyncio.to_thread(self._clear_minio_objects)
+                try:
+                    minio_reset_evidence = await asyncio.to_thread(self._clear_minio_objects)
+                except MinioResetFailure as exc:
+                    minio_reset_evidence = dict(exc.evidence)
+                    raise
                 if self.config.vault_dir.exists():
                     shutil.rmtree(self.config.vault_dir)
                 self.config.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -3762,6 +3958,7 @@ class E2ERuntime:
                     "count": self._dependency_reset_count,
                     "wall_seconds": self._dependency_reset_wall_seconds,
                     "last_preserved": preserved,
+                    "minio_reset": minio_reset_evidence,
                     "process_identity_before": process_before,
                     "process_identity_after": process_after,
                 }

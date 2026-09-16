@@ -28,6 +28,7 @@ from e2e_runtime import (  # noqa: E402
     E2ERuntime,
     ManagedProcess,
     ProvisioningFailure,
+    MinioResetFailure,
     SOURCE_REVISION_ENV,
     RuntimeConfig,
     _parse_args,
@@ -60,6 +61,42 @@ WORKFLOW = REPO_ROOT / ".github" / "workflows" / "e2e.yml"
 LOCAL_CANONICAL_RUNNER = REPO_ROOT / "scripts" / "run_canonical_e2e.sh"
 
 
+class _FakeMinioPaginator:
+    def __init__(self, client) -> None:
+        self.client = client
+
+    def paginate(self, *, Bucket: str):
+        return self.client.pages(Bucket)
+
+
+class _FakeMinioClient:
+    def __init__(self, pages, delete_results=None) -> None:
+        self._pages = pages
+        self._delete_results = list(delete_results or [])
+        self.delete_calls: list[list[str]] = []
+        self.paginate_calls = 0
+
+    def get_paginator(self, _name: str) -> _FakeMinioPaginator:
+        return _FakeMinioPaginator(self)
+
+    def pages(self, _bucket: str):
+        self.paginate_calls += 1
+        result = self._pages[self.paginate_calls - 1]
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def delete_objects(self, *, Bucket: str, Delete: dict[str, object]):
+        keys = [item["Key"] for item in Delete["Objects"]]
+        self.delete_calls.append(keys)
+        if self._delete_results:
+            result = self._delete_results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+        return {}
+
+
 def test_stdio_sample_image_fixture_is_a_small_decodable_png() -> None:
     path = REPO_ROOT / "eval" / "mcp-catalog" / "fixtures" / "sample-image.png"
 
@@ -68,6 +105,152 @@ def test_stdio_sample_image_fixture_is_a_small_decodable_png() -> None:
         assert image.format == "PNG"
         image.load()
         assert image.size == (400, 400)
+
+
+def _install_fake_minio(monkeypatch: pytest.MonkeyPatch, client: object) -> None:
+    monkeypatch.setitem(sys.modules, "boto3", SimpleNamespace(client=lambda *_args, **_kwargs: client))
+
+
+def test_minio_reset_retries_endpoint_failure_and_reports_recovery(monkeypatch, tmp_path):
+    from botocore.exceptions import EndpointConnectionError
+
+    runtime = E2ERuntime(make_config(tmp_path))
+    client = _FakeMinioClient(
+        [
+            EndpointConnectionError(endpoint_url="http://minio.invalid"),
+            [{"Contents": []}],
+            [{"Contents": []}],
+        ]
+    )
+    sleeps: list[float] = []
+    _install_fake_minio(monkeypatch, client)
+    monkeypatch.setattr(e2e_runtime.time, "sleep", sleeps.append)
+
+    evidence = runtime._clear_minio_objects()
+
+    assert evidence["status"] == "recovered"
+    assert evidence["attempts"] == 2
+    assert evidence["retry_count"] == 1
+    assert evidence["wall_seconds"] >= 0
+    assert sleeps == [e2e_runtime.MINIO_RESET_BACKOFF_SECONDS[0]]
+    assert client.delete_calls == []
+
+
+def test_minio_reset_retries_partial_delete_and_verifies_empty(monkeypatch, tmp_path):
+    runtime = E2ERuntime(make_config(tmp_path))
+    client = _FakeMinioClient(
+        [
+            [{"Contents": [{"Key": "a"}, {"Key": "b"}]}],
+            [{"Contents": [{"Key": "b"}]}],
+            [{"Contents": []}],
+        ],
+        delete_results=[
+            {"Errors": [{"Key": "b", "Code": "SlowDown", "Message": "retry"}]},
+            {},
+        ],
+    )
+    sleeps: list[float] = []
+    _install_fake_minio(monkeypatch, client)
+    monkeypatch.setattr(e2e_runtime.time, "sleep", sleeps.append)
+
+    evidence = runtime._clear_minio_objects()
+
+    assert evidence["status"] == "recovered"
+    assert evidence["attempts"] == 2
+    assert client.delete_calls == [["a", "b"], ["b"]]
+    assert sleeps == [e2e_runtime.MINIO_RESET_BACKOFF_SECONDS[0]]
+
+
+def test_minio_reset_rejects_non_retryable_delete_error_without_retry(monkeypatch, tmp_path):
+    runtime = E2ERuntime(make_config(tmp_path))
+    runtime._fixture_private_values = ("fixture-password",)
+    client = _FakeMinioClient(
+        [[{"Contents": [{"Key": "a"}]}]],
+        delete_results=[
+            {
+                "Errors": [
+                    {
+                        "Key": "a",
+                        "Code": "AccessDenied",
+                        "Message": "fixture-password is not allowed",
+                    }
+                ]
+            }
+        ],
+    )
+    sleeps: list[float] = []
+    _install_fake_minio(monkeypatch, client)
+    monkeypatch.setattr(e2e_runtime.time, "sleep", sleeps.append)
+
+    with pytest.raises(MinioResetFailure) as raised:
+        runtime._clear_minio_objects()
+
+    assert "operation=delete" in str(raised.value)
+    assert "s3_code=AccessDenied" in str(raised.value)
+    assert "attempt=1/" in str(raised.value)
+    assert "fixture-password" not in str(raised.value)
+    assert sleeps == []
+    assert raised.value.evidence["retry_count"] == 0
+
+
+def test_minio_reset_reports_exhausted_retryable_failure(monkeypatch, tmp_path):
+    from botocore.exceptions import EndpointConnectionError
+
+    runtime = E2ERuntime(make_config(tmp_path))
+    client = _FakeMinioClient(
+        [EndpointConnectionError(endpoint_url="http://minio.invalid")] * e2e_runtime.MINIO_RESET_MAX_ATTEMPTS
+    )
+    sleeps: list[float] = []
+    _install_fake_minio(monkeypatch, client)
+    monkeypatch.setattr(e2e_runtime.time, "sleep", sleeps.append)
+
+    with pytest.raises(MinioResetFailure) as raised:
+        runtime._clear_minio_objects()
+
+    assert "operation=list" in str(raised.value)
+    assert "attempt=3/3" in str(raised.value)
+    assert raised.value.evidence["status"] == "failed"
+    assert raised.value.evidence["attempts"] == e2e_runtime.MINIO_RESET_MAX_ATTEMPTS
+    assert raised.value.evidence["retry_count"] == e2e_runtime.MINIO_RESET_MAX_ATTEMPTS - 1
+    assert len(sleeps) == e2e_runtime.MINIO_RESET_MAX_ATTEMPTS - 1
+
+
+@pytest.mark.asyncio
+async def test_same_runtime_reset_attempts_are_serialized_and_evidence_is_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = E2ERuntime(make_config(tmp_path))
+    runtime._prepared = True
+    runtime.config.vault_dir.mkdir(parents=True)
+    state = {"active": 0, "max_active": 0, "calls": 0}
+
+    async def postgres_reset() -> None:
+        state["active"] += 1
+        state["max_active"] = max(state["max_active"], state["active"])
+        await asyncio.sleep(0)
+        state["active"] -= 1
+
+    def minio_reset() -> dict[str, object]:
+        state["calls"] += 1
+        return {"status": "recovered", "attempts": 2, "retry_count": 1, "wall_seconds": 0.01}
+
+    identity = {"services": {"minio": {"container_id": "m"}, "postgres": {"container_id": "p"}}}
+    monkeypatch.setattr(runtime, "_dependency_identity_snapshot", lambda: identity)
+    monkeypatch.setattr(runtime, "_process_identity_snapshot", lambda: {"backend": {"pid": 1, "running": True}})
+    monkeypatch.setattr(runtime, "_reset_postgres_in_place", postgres_reset)
+    monkeypatch.setattr(runtime, "_clear_minio_objects", minio_reset)
+    monkeypatch.setattr(runtime, "_seed_external_credential", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(runtime, "_mint_runtime_pat", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(runtime, "_ensure_minio_bucket", lambda: None)
+    monkeypatch.setattr(runtime, "_wait_tcp", lambda *_args, **_kwargs: asyncio.sleep(0))
+    monkeypatch.setattr(runtime, "_wait_http", lambda *_args, **_kwargs: asyncio.sleep(0))
+
+    await asyncio.gather(runtime.reset_scenario(), runtime.reset_scenario())
+
+    assert state["max_active"] == 1
+    assert state["calls"] == 2
+    assert runtime._dependency_reset_evidence["minio_reset"]["retry_count"] == 1
 
 
 def make_config(tmp_path: Path, *, mode: str = "serve") -> RuntimeConfig:
