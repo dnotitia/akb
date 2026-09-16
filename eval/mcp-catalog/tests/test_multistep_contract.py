@@ -323,6 +323,21 @@ def test_public_schema_valid_optional_metadata_does_not_block_multistep_completi
     assert outcome.success is True
 
 
+def test_malformed_parent_uri_is_a_scoring_mismatch() -> None:
+    _manifest, tasks = _multistep_tasks()
+    calls = _exact_calls()
+    calls[2] = _call(
+        3,
+        "akb_put",
+        {"parent": "akb://[", "title": TITLE, "content": CONTENT},
+    )
+
+    outcome = _score(tasks[0], calls)
+
+    assert outcome.tool_outcome_match is False
+    assert outcome.success is False
+
+
 def test_manifest_rejects_attempt_tool_not_registered_for_its_logical_operation() -> None:
     manifest, tasks = _multistep_tasks()
     changed_by_id = {}

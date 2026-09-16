@@ -1755,7 +1755,10 @@ def _normalize_public_location(arguments: dict[str, Any] | None) -> dict[str, An
     parent = result.get("parent")
     if not isinstance(parent, str):
         return result
-    parsed = urlsplit(parent)
+    try:
+        parsed = urlsplit(parent)
+    except ValueError:
+        return None
     path = unquote(parsed.path)
     if parsed.scheme != "akb" or not parsed.netloc or parsed.query or parsed.fragment:
         return result

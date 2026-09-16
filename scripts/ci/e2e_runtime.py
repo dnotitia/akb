@@ -2409,6 +2409,7 @@ class E2ERuntime:
                 role,
                 granted_by,
             )
+        await asyncio.to_thread(self._ensure_fixture_git_repository, name)
         return vault_id, name
 
     def _ensure_fixture_git_repository(self, vault_name: str) -> str:
@@ -3089,7 +3090,6 @@ class E2ERuntime:
             grants=[(reader_id, "reader")],
             granted_by=system_admin_id,
         )
-        await asyncio.to_thread(self._ensure_fixture_git_repository, authorization_vault_name)
         vaults = self._fixture_catalog.setdefault("vaults", {})
         if isinstance(vaults, dict):
             vaults["authorization"] = {
