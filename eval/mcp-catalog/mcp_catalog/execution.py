@@ -765,10 +765,13 @@ class BudgetLedger:
     cost_usd: Decimal = Decimal("0")
     wall_seconds: float = 0.0
     model_work_seconds: float = 0.0
-    reserved_cost_usd: Decimal = Decimal("0")
-    _reservations: dict[ProviderRequestGuard, Decimal] = field(default_factory=dict, repr=False)
+    _open_reservations: set[ProviderRequestGuard] = field(default_factory=set, repr=False)
     _budget_failure: str | None = None
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    @property
+    def reserved_cost_usd(self) -> Decimal:
+        return sum((guard.reserved_cost_usd for guard in self._open_reservations), Decimal("0"))
 
     def restore(
         self,
@@ -788,7 +791,7 @@ class BudgetLedger:
             raise BudgetExceeded("checkpoint budget totals cannot be negative")
         if not restored_cost.is_finite() or restored_cost < 0:
             raise BudgetExceeded("checkpoint budget totals cannot be negative")
-        if self._reservations or self.reserved_cost_usd != 0:
+        if self._open_reservations:
             raise BudgetExceeded("cannot restore budget accounting while reservations are open")
         budget = self.manifest.budget
         if (
@@ -826,29 +829,27 @@ class BudgetLedger:
         return min(float(self.manifest.budget.request_timeout_seconds), remaining)
 
     def _assert_reservation_invariant(self) -> None:
-        owner_total = sum(self._reservations.values(), Decimal("0"))
-        if owner_total != self.reserved_cost_usd or any(
-            balance < 0 or guard.reserved_cost_usd != balance or not guard.is_open
-            for guard, balance in self._reservations.items()
+        if any(
+            not guard.reserved_cost_usd.is_finite()
+            or guard.reserved_cost_usd < 0
+            or not guard.is_open
+            or guard.ledger is not self
+            for guard in self._open_reservations
         ):
             raise BudgetExceeded("provider reservation ownership is inconsistent")
 
     def _replace_guard_reservation(self, guard: ProviderRequestGuard, balance: Decimal) -> None:
-        if guard not in self._reservations:
+        if guard not in self._open_reservations:
             raise BudgetExceeded("provider request reservation is not open")
         if not balance.is_finite() or balance < 0:
             raise BudgetExceeded("provider reservation remainder cannot be negative")
-        previous = self._reservations[guard]
-        self._reservations[guard] = balance
-        self.reserved_cost_usd += balance - previous
         guard.reserved_cost_usd = balance
         self._assert_reservation_invariant()
 
     def _close_guard(self, guard: ProviderRequestGuard, state: Literal["charged", "released"]) -> bool:
-        balance = self._reservations.pop(guard, None)
-        if balance is None:
+        if guard not in self._open_reservations:
             return False
-        self.reserved_cost_usd -= balance
+        self._open_reservations.remove(guard)
         guard.reserved_cost_usd = Decimal("0")
         guard._state = state
         guard._pending_requests.clear()
@@ -870,8 +871,7 @@ class BudgetLedger:
             if self.cost_usd + self.reserved_cost_usd + reservation > Decimal(str(budget.max_total_cost_usd)):
                 raise BudgetExceeded("preregistered worst-case trial cost would exceed max_total_cost_usd")
             guard = ProviderRequestGuard(self, reservation)
-            self._reservations[guard] = reservation
-            self.reserved_cost_usd += reservation
+            self._open_reservations.add(guard)
             self._assert_reservation_invariant()
             return guard
 
@@ -880,12 +880,11 @@ class BudgetLedger:
             if guard.ledger is not self:
                 raise BudgetExceeded("provider request reservation belongs to another ledger")
             released = self._close_guard(guard, "released")
-            self._assert_reservation_invariant()
             return released
 
     async def admit_provider_request(self, guard: ProviderRequestGuard) -> ProviderRequestReceipt:
         async with self._lock:
-            if guard.ledger is not self or guard not in self._reservations or not guard.is_open:
+            if guard.ledger is not self or guard not in self._open_reservations or not guard.is_open:
                 raise BudgetExceeded("provider request reservation is not open")
             if self._budget_failure is not None:
                 raise BudgetExceeded(f"benchmark incomplete: {self._budget_failure}")
@@ -915,7 +914,7 @@ class BudgetLedger:
         async with self._lock:
             if receipt.guard is not guard:
                 raise BudgetExceeded("provider response receipt belongs to another request")
-            if guard.ledger is not self or guard not in self._reservations or not guard.is_open:
+            if guard.ledger is not self or guard not in self._open_reservations or not guard.is_open:
                 return False
             if receipt.request_id not in guard._pending_requests:
                 return False
@@ -939,7 +938,6 @@ class BudgetLedger:
                 global_failure = self._budget_failure
             if trial_cost > Decimal(str(self.manifest.budget.max_cost_per_trial_usd)):
                 trial_failure = "max_cost_per_trial_usd exceeded"
-            self._assert_reservation_invariant()
             if global_failure is not None:
                 raise BudgetExceeded(f"benchmark incomplete: {global_failure}")
             if trial_failure is not None:
@@ -949,14 +947,14 @@ class BudgetLedger:
     async def release_all_reservations(self) -> Decimal:
         async with self._lock:
             released = self.reserved_cost_usd
-            for guard in tuple(self._reservations):
+            for guard in tuple(self._open_reservations):
                 self._close_guard(guard, "released")
             self._assert_reservation_invariant()
             return released
 
     async def charge(self, outcome: TrialOutcome, *, guard: ProviderRequestGuard) -> None:
         async with self._lock:
-            if guard.ledger is not self or guard not in self._reservations or not guard.is_open:
+            if guard.ledger is not self or guard not in self._open_reservations or not guard.is_open:
                 raise BudgetExceeded("provider request reservation is already settled")
             self._assert_reservation_invariant()
             if guard.requests > self.requests:
@@ -988,9 +986,10 @@ class BudgetLedger:
                 trial_failure = "max_cost_per_trial_usd exceeded"
             elif next_requests > budget.max_model_requests:
                 global_failure = "max_model_requests exceeded"
-            remaining_reserved = self.reserved_cost_usd - guard.reserved_cost_usd
-            if remaining_reserved < 0:
-                raise BudgetExceeded("provider reservation ownership is inconsistent")
+            remaining_reserved = sum(
+                (owner.reserved_cost_usd for owner in self._open_reservations if owner is not guard),
+                Decimal("0"),
+            )
             if next_cost + remaining_reserved > Decimal(str(budget.max_total_cost_usd)):
                 global_failure = "max_total_cost_usd exceeded"
 
@@ -1003,7 +1002,6 @@ class BudgetLedger:
             if global_failure is not None:
                 self._budget_failure = global_failure
             self._close_guard(guard, "charged")
-            self._assert_reservation_invariant()
             if global_failure is not None:
                 raise BudgetExceeded(f"benchmark incomplete: {global_failure}")
             if trial_failure is not None:
