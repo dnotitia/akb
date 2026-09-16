@@ -42,6 +42,7 @@ import asyncpg
 from app.db.postgres import get_pool
 from app.exceptions import ValidationError
 from app.repositories.native_revision_migration_repo import (
+    BridgeBodyIntegrityError,
     LegacyMappingAlreadyMigratedError,
     NativeRevisionMigrationRepository,
 )
@@ -350,10 +351,22 @@ async def verify_bridge_bodies(
                 report.ungraded += 1
                 continue
 
-            async with pool.acquire() as conn:
-                stored = await repo.read_bridge_body(
-                    conn, namespace_id=mapping.namespace_id, digest=digest
+            try:
+                async with pool.acquire() as conn:
+                    stored = await repo.read_bridge_body(
+                        conn, namespace_id=mapping.namespace_id, digest=digest
+                    )
+            except BridgeBodyIntegrityError:
+                # The payload's own bytes do not hash to the digest they are
+                # filed under. That is the corruption this command exists to
+                # find, so it has to be reported — a crash here would take
+                # the rest of the population's verdict with it.
+                report.mismatched += 1
+                _note(
+                    report,
+                    f"{mapping.legacy_git_oid[:8]}: payload does not hash to its own digest",
                 )
+                continue
             if stored is None:
                 report.payload_missing += 1
                 _note(report, f"{mapping.legacy_git_oid[:8]}: digest names no payload")

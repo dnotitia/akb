@@ -2305,3 +2305,54 @@ async def test_verify_reports_a_digest_whose_payload_is_gone(tmp_path):
         assert report.payload_missing == report.checked
         assert report.mismatched == 0
         assert report.ok is False
+
+
+async def test_verify_reports_a_payload_that_does_not_hash_to_its_own_digest(tmp_path):
+    """Corruption is the finding, not a reason to stop reporting.
+
+    `read_bridge_body` raises on bytes that do not match their digest — the
+    right answer for a read, and the wrong one for a command whose whole job
+    is to survey the population and say what it found.
+    """
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-verify-corrupt")
+        moved = await backfill_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1000
+        )
+        assert moved.migrated >= 2
+
+        async with pool.acquire() as conn:
+            digest = await conn.fetchval(
+                """
+                SELECT body_digest FROM legacy_revision_mappings
+                 WHERE namespace_id = $1 AND resolution = 'bridge'
+                   AND body_digest IS NOT NULL
+                 ORDER BY legacy_git_oid LIMIT 1
+                """,
+                fixture["namespace_id"],
+            )
+            await conn.execute(
+                """
+                DROP TRIGGER trg_m1_reference_payloads_immutable
+                    ON m1_reference_payloads;
+                ALTER TABLE m1_reference_payloads
+                    DROP CONSTRAINT m1_reference_payloads_digest_matches;
+                """
+            )
+            await conn.execute(
+                """
+                UPDATE m1_reference_payloads
+                   SET canonical_bytes = $3::bytea, byte_size = octet_length($3::bytea)
+                 WHERE namespace_id = $1 AND digest = $2
+                """,
+                fixture["namespace_id"], digest, b"corrupted\n",
+            )
+
+        report = await verify_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"]
+        )
+        # The survey completes and names it, rather than dying on the first one.
+        assert report.checked == moved.migrated
+        assert report.mismatched >= 1
+        assert report.ok is False
+        assert any("does not hash to its own digest" in line for line in report.findings)
