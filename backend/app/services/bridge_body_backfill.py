@@ -23,6 +23,11 @@ Three properties make this safe to run against a live vault:
   not moved, or whose payload cannot be found, still reads from git.
 * **Rollback is one statement.**  ``UPDATE ... SET body_digest = NULL``
   returns every affected revision to the git read path.
+
+This does not by itself free the serving tier from the volume.  A bridged
+revision's *metadata* — author, time, message, changed files — is still read
+from git by history, activity and diff, and the mapping table has no column
+for any of it.  That is a second migration; this one moves bodies.
 """
 
 from __future__ import annotations
@@ -66,8 +71,8 @@ class BridgeBodyBackfillReport:
     pending_before: int = 0
     pending_after: int = 0
     migrated_total: int = 0
-    # True when every remaining mapping is one this run could not move, so
-    # running again would do the same nothing.
+    # True when the run looked at mappings and moved none of them, so running
+    # it again with the same arguments would do the same nothing.
     stalled: bool = False
     samples: list[str] = field(default_factory=list)
 

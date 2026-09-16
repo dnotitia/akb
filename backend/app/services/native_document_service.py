@@ -44,6 +44,7 @@ from app.repositories import table_data_repo, table_registry_repo, vault_files_r
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.native_revision_migration_repo import (
     BridgeBodyIntegrityError,
+    LegacyRevisionMapping,
     NativeRevisionMigrationRepository,
 )
 from app.repositories.native_revision_repo import (
@@ -429,7 +430,12 @@ class NativeDocumentService(DocumentService):
             )
 
     async def read_bridge_body(
-        self, vault: str, vault_id: uuid.UUID, mapping, *, git: GitService | None = None,
+        self,
+        vault: str,
+        vault_id: uuid.UUID,
+        mapping: LegacyRevisionMapping,
+        *,
+        git: GitService | None = None,
     ) -> str | None:
         """Read one bridged revision's body, from wherever it lives.
 
@@ -446,7 +452,7 @@ class NativeDocumentService(DocumentService):
         do not hash to their digest are the same decision for the same
         reason, and both say so in the log rather than passing silently.
         """
-        digest = getattr(mapping, "body_digest", None)
+        digest = mapping.body_digest
         if digest:
             pool = await self._pool()
             reason = None
