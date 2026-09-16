@@ -854,7 +854,12 @@ async def _bridge_body_backfill(args: list[str]) -> int:
     )
 
     vault = None
-    limit = 1000
+    # Unset until the operator says otherwise: the two modes want different
+    # defaults. A backfill is a bounded amount of work, so 1000 is a sane
+    # batch. A survey that stops at 1000 and still reports `ok` is the exact
+    # shape of a check that passes by not looking, so verify defaults to the
+    # whole population.
+    limit = None
     batch_size = DEFAULT_BATCH_SIZE
     dry_run = False
     verify = False
@@ -894,14 +899,19 @@ async def _bridge_body_backfill(args: list[str]) -> int:
     try:
         if verify:
             checked = await verify_bridge_bodies(
-                vault=vault, limit=limit, batch_size=batch_size
+                vault=vault, limit=limit or 100_000_000, batch_size=batch_size
             )
             print(json.dumps(checked.to_dict(), sort_keys=True))
+            if not checked.complete:
+                print(
+                    f"surveyed {checked.checked} of {checked.total} migrated bodies",
+                    file=sys.stderr,
+                )
             # A body that no longer agrees with the git it came from is the
             # one result that must not be exited over quietly.
             return 0 if checked.ok else 1
         report = await backfill_bridge_bodies(
-            vault=vault, limit=limit, batch_size=batch_size, dry_run=dry_run
+            vault=vault, limit=limit or 1000, batch_size=batch_size, dry_run=dry_run
         )
     except ValidationError as error:
         print(f"bridge_body_backfill_failed: {error}", file=sys.stderr)

@@ -2356,3 +2356,35 @@ async def test_verify_reports_a_payload_that_does_not_hash_to_its_own_digest(tmp
         assert report.mismatched >= 1
         assert report.ok is False
         assert any("does not hash to its own digest" in line for line in report.findings)
+
+
+async def test_verify_reports_the_share_of_the_population_it_actually_saw(tmp_path):
+    """`ok` on a fraction is the failure this reports against.
+
+    Measured live before this existed: a survey stopped at the backfill's
+    batch default, saw 1,000 of 2,191, and printed `ok: true` with nothing
+    saying it had looked at less than half.
+    """
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-verify-coverage")
+        moved = await backfill_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1000
+        )
+        assert moved.migrated >= 2
+
+        whole = await verify_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"]
+        )
+        assert whole.total == moved.migrated
+        assert whole.checked == whole.total
+        assert whole.complete is True
+
+        partial = await verify_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1
+        )
+        assert partial.checked == 1
+        assert partial.total == moved.migrated
+        assert partial.complete is False
+        # Still `ok` — nothing it looked at was wrong. `complete` is the field
+        # that keeps that from being read as "everything is fine".
+        assert partial.ok is True
