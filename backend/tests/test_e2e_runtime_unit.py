@@ -107,6 +107,20 @@ def test_stdio_sample_image_fixture_is_a_small_decodable_png() -> None:
         assert image.size == (400, 400)
 
 
+def test_authorization_fixture_vault_repository_is_initialized_idempotently(tmp_path: Path) -> None:
+    runtime = E2ERuntime(make_config(tmp_path))
+    runtime.config.vault_dir.mkdir(parents=True)
+
+    first = runtime._ensure_fixture_git_repository("catalog-bench-vault-authorization")
+    second = runtime._ensure_fixture_git_repository("catalog-bench-vault-authorization")
+
+    assert first == second
+    bare = Path(first)
+    assert bare.is_dir()
+    assert (bare / "HEAD").is_file()
+    assert (bare / "objects").is_dir()
+
+
 def _install_fake_minio(monkeypatch: pytest.MonkeyPatch, client: object) -> None:
     monkeypatch.setitem(sys.modules, "boto3", SimpleNamespace(client=lambda *_args, **_kwargs: client))
 

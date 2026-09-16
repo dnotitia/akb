@@ -152,7 +152,10 @@ The supervisor has two modes:
   PostgreSQL/MinIO containers, Compose network/volumes, and managed backend,
   embedding, and stdio process identities while clearing application rows,
   objects, and Git fixture data, then waits for backend readiness again; the
-  frontend process remains owned by the same serve lifecycle.
+  frontend process remains owned by the same serve lifecycle. Transient
+  MinIO list/delete/empty-verification failures receive a bounded idempotent
+  retry; reset discovery records the attempt count, retry count, elapsed time,
+  and redacted operation diagnostic.
 
 The native catalog benchmark launcher is separate from this generic runtime;
 its interface and descriptor composition are documented in

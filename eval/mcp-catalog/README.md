@@ -57,11 +57,17 @@ code. A correctly formed expected denial has valid arguments and a matching
 tool outcome; provider, transport, wrong-target, missing-attempt, and bypass
 errors do not pass.
 
-Expected material payloads are compared against the server's public
-`tools/list` input schema after applying declared JSON-schema defaults. Raw
-model arguments and raw server arguments remain preserved separately for
-argument-validity evidence; defaults do not relax required or non-default
-fields.
+Expected material payloads are compared against the exact captured server
+`tools/list` input schema stored in the catalog snapshot, after applying its
+declared JSON-schema defaults. Expected arguments are required canonical
+subsets: public-schema-valid optional metadata may be present unless a task
+declares it as significant, while target and core payload fields remain strict.
+Equivalent public write locations (a `parent` URI versus its `vault` and
+`collection` fields) share one canonical form. Raw model arguments and raw
+server arguments remain preserved separately for argument-validity evidence.
+The stdio proxy's `vault_skill_required` response is preparatory only when its
+immediate retry uses the same tool, semantic arguments, and returned
+acknowledgement; unrelated calls are never folded into that operation.
 
 The models are fixed to `deepseek/deepseek-v4-flash-0731` and
 `qwen/qwen3.8-27b`. Requests prefer the OpenRouter `parasail` upstream but set
@@ -324,7 +330,8 @@ Each run artifact includes:
 - the actual unfiltered `tools/list` per transport and credential profile,
   tool count, canonical catalog hash, UTF-8 byte count, and four-token estimate;
 - model class/id/version/settings, Pydantic Evals report, raw model arguments,
-  server-facing arguments, literal first tool, material action, preparatory
+  server-facing arguments canonicalized from the captured server `tools/list`
+  schema, literal first tool, material action, preparatory
   call count, tool outcome/status, only the bounded structured result fields
   declared by cross-call bindings, usage, latency, and cost;
 - final response, fixture before/after state, and deterministic state checks;

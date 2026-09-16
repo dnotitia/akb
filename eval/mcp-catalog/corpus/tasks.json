@@ -135,9 +135,9 @@
     "material_attempt_limits": {"create": 3},
     "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}],
     "expected_material_attempts": [
-      {"logical_operation": "create", "tool_name": "akb_create_vault", "arguments": {"name": "catalog-bench-multi", "public_access": "none"}, "outcome": "success"},
+      {"logical_operation": "create", "tool_name": "akb_create_vault", "arguments": {"name": "catalog-bench-multi"}, "outcome": "success"},
       {"logical_operation": "create", "tool_name": "akb_create_collection", "arguments": {"vault": "catalog-bench-multi", "path": "team-notes"}, "outcome": "success"},
-      {"logical_operation": "create", "tool_name": "akb_put", "arguments": {"vault": "catalog-bench-multi", "collection": "team-notes", "title": "quick-update", "content": "A short note for the team.", "type": "note", "status": "draft"}, "outcome": "success"}
+      {"logical_operation": "create", "tool_name": "akb_put", "arguments": {"vault": "catalog-bench-multi", "collection": "team-notes", "title": "quick-update", "content": "A short note for the team."}, "outcome": "success"}
     ],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
@@ -161,9 +161,9 @@
     "material_attempt_limits": {"create": 3},
     "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}],
     "expected_material_attempts": [
-      {"logical_operation": "create", "tool_name": "akb_create_vault", "arguments": {"name": "catalog-bench-multi", "public_access": "none"}, "outcome": "success"},
+      {"logical_operation": "create", "tool_name": "akb_create_vault", "arguments": {"name": "catalog-bench-multi"}, "outcome": "success"},
       {"logical_operation": "create", "tool_name": "akb_create_collection", "arguments": {"vault": "catalog-bench-multi", "path": "team-notes"}, "outcome": "success"},
-      {"logical_operation": "create", "tool_name": "akb_put", "arguments": {"vault": "catalog-bench-multi", "collection": "team-notes", "title": "quick-update", "content": "A short note for the team.", "type": "note", "status": "draft"}, "outcome": "success"}
+      {"logical_operation": "create", "tool_name": "akb_put", "arguments": {"vault": "catalog-bench-multi", "collection": "team-notes", "title": "quick-update", "content": "A short note for the team."}, "outcome": "success"}
     ],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
@@ -231,7 +231,7 @@
     "forbidden_operations": ["delete", "grant"],
     "required_attempted_operations": ["create"],
     "material_attempt_limits": {"create": 1},
-    "expected_material_arguments": {"create": {"vault": "catalog-bench-vault-authorization", "collection": "", "title": "authorization-probe", "content": "permission probe", "type": "note", "status": "draft"}},
+    "expected_material_arguments": {"create": {"vault": "catalog-bench-vault-authorization", "collection": "", "title": "authorization-probe", "content": "permission probe"}},
     "expected_material_outcomes": [{"logical_operation": "create", "outcome": "permission_denied", "error_code": "permission_denied"}],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
@@ -258,7 +258,7 @@
     "forbidden_operations": ["delete", "grant"],
     "required_attempted_operations": ["create"],
     "material_attempt_limits": {"create": 1},
-    "expected_material_arguments": {"create": {"vault": "catalog-bench-vault-authorization", "collection": "", "title": "authorization-probe", "content": "permission probe", "type": "note", "status": "draft"}},
+    "expected_material_arguments": {"create": {"vault": "catalog-bench-vault-authorization", "collection": "", "title": "authorization-probe", "content": "permission probe"}},
     "expected_material_outcomes": [{"logical_operation": "create", "outcome": "permission_denied", "error_code": "permission_denied"}],
     "expected_final_state": {
       "probe": {"service": "app", "method": "GET", "path": "/api/v1/vaults"},
@@ -341,7 +341,7 @@
     "expected_material_attempts": [
       {"logical_operation": "file_upload", "tool_name": "akb_put_file", "arguments": {"parent": "akb://catalog-bench-vault-authorization", "collection": ""}, "local_file_arguments": {"file_path": "sample-note.txt"}, "outcome": "success"},
       {"logical_operation": "image_upload", "tool_name": "akb_put_image", "arguments": {"parent": "akb://catalog-bench-vault-authorization", "alt_text": "benchmark sample image"}, "local_file_arguments": {"file_path": "sample-image.png"}, "outcome": "success"},
-      {"logical_operation": "create", "tool_name": "akb_put", "arguments": {"parent": "akb://catalog-bench-vault-authorization", "title": "catalog-bench-stdio-document", "type": "note", "status": "draft"}, "outcome": "success"}
+      {"logical_operation": "create", "tool_name": "akb_put", "arguments": {"parent": "akb://catalog-bench-vault-authorization", "title": "catalog-bench-stdio-document"}, "outcome": "success"}
     ],
     "expected_result_bindings": [{"source_attempt": 2, "source_field": "markdown", "target_attempt": 3, "target_argument": "content", "relation": "contains"}],
     "expected_material_outcomes": [{"logical_operation": "file_upload", "outcome": "success"}, {"logical_operation": "image_upload", "outcome": "success"}, {"logical_operation": "create", "outcome": "success"}],
@@ -369,7 +369,7 @@
     "expected_material_attempts": [
       {"logical_operation": "file_upload", "tool_name": "akb_put_file", "arguments": {"parent": "akb://catalog-bench-vault-authorization", "collection": ""}, "local_file_arguments": {"file_path": "sample-note.txt"}, "outcome": "success"},
       {"logical_operation": "image_upload", "tool_name": "akb_put_image", "arguments": {"parent": "akb://catalog-bench-vault-authorization", "alt_text": "benchmark sample image"}, "local_file_arguments": {"file_path": "sample-image.png"}, "outcome": "success"},
-      {"logical_operation": "create", "tool_name": "akb_put", "arguments": {"parent": "akb://catalog-bench-vault-authorization", "title": "catalog-bench-stdio-document", "type": "note", "status": "draft"}, "outcome": "success"}
+      {"logical_operation": "create", "tool_name": "akb_put", "arguments": {"parent": "akb://catalog-bench-vault-authorization", "title": "catalog-bench-stdio-document"}, "outcome": "success"}
     ],
     "expected_result_bindings": [{"source_attempt": 2, "source_field": "markdown", "target_attempt": 3, "target_argument": "content", "relation": "contains"}],
     "expected_material_outcomes": [{"logical_operation": "file_upload", "outcome": "success"}, {"logical_operation": "image_upload", "outcome": "success"}, {"logical_operation": "create", "outcome": "success"}],

@@ -13,7 +13,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, cast
 
-from .catalog import capture_catalog
+from .catalog import capture_catalog, input_schemas_from_catalog
 from .checkpoint import (
     CheckpointHeader,
     CheckpointDocument,
@@ -779,6 +779,7 @@ class BenchmarkRunner:
         fixtures: Mapping[str, RuntimeFixture] | None = None,
         resolver: CredentialResolver,
         ledger: BudgetLedger,
+        catalog_input_schemas: Mapping[str, dict[str, dict[str, Any]]] | None = None,
     ) -> dict[str, Any]:
         self._resolver = resolver
         required_cells = [
@@ -817,6 +818,16 @@ class BenchmarkRunner:
 
             task = self._smoke_task(transport)
             model = build_model(model_spec)
+            catalog_key = f"{transport}:{task.fixture.credential_profile}"
+            if catalog_input_schemas is None:
+                input_schemas = None
+            else:
+                input_schemas = catalog_input_schemas.get(catalog_key)
+                if input_schemas is None:
+                    raise RuntimeContractError(
+                        f"captured catalog is missing input schemas for {catalog_key}",
+                        stage="catalog_capture",
+                    )
             reservation = worst_case_cost(model_spec, self.manifest.budget)
             outcome: TrialOutcome | None = None
             try:
@@ -878,6 +889,7 @@ class BenchmarkRunner:
                         request_timeout_seconds=request_timeout_seconds,
                         remaining_wall_seconds=remaining_wall_seconds,
                         request_guard=request_guard,
+                        input_schemas=input_schemas,
                         timing_sink=self._timing.record if self._timing is not None else None,
                     )
                 else:
@@ -895,6 +907,7 @@ class BenchmarkRunner:
                             request_timeout_seconds=request_timeout_seconds,
                             remaining_wall_seconds=remaining_wall_seconds,
                             request_guard=request_guard,
+                            input_schemas=input_schemas,
                             timing_sink=self._timing.record if self._timing is not None else None,
                         )
                 await ledger.charge(outcome, guard=request_guard)
@@ -1087,6 +1100,7 @@ class BenchmarkRunner:
         lifecycle_cleanup_errors: list[Exception],
         incomplete_reasons: set[str],
         reports: dict[str, Any],
+        catalog_input_schemas: Mapping[str, dict[str, dict[str, Any]]] | None = None,
     ) -> None:
         model = build_model(model_spec)
         executor = TrialExecutor(
@@ -1099,6 +1113,14 @@ class BenchmarkRunner:
             token_for=resolver.token_for,
             secrets_for=resolver.secrets_for,
             ledger=ledger,
+            input_schemas_by_profile=(
+                {
+                    profile: dict(catalog_input_schemas[f"{transport}:{profile}"])
+                    for profile in profiles
+                }
+                if catalog_input_schemas is not None
+                else None
+            ),
             timing_sink=self._timing.record if self._timing is not None else None,
         )
         report_fragments: list[dict[str, Any]] = []
@@ -1312,7 +1334,16 @@ class BenchmarkRunner:
 
             if any(pending_by_run.values()) or self._checkpoint_store is not None:
                 current_stage = "smoke_gate"
-                await self._run_smoke_gate(fixtures=fixtures, resolver=resolver, ledger=ledger)
+                catalog_input_schemas = {
+                    key: input_schemas_from_catalog(snapshot)
+                    for key, snapshot in catalogs.items()
+                }
+                await self._run_smoke_gate(
+                    fixtures=fixtures,
+                    resolver=resolver,
+                    ledger=ledger,
+                    catalog_input_schemas=catalog_input_schemas,
+                )
             else:
                 self._smoke_gate = {
                     "status": "not_required",
@@ -1343,6 +1374,7 @@ class BenchmarkRunner:
                                 lifecycle_cleanup_errors=lifecycle_cleanup_errors,
                                 incomplete_reasons=incomplete_reasons,
                                 reports=reports,
+                                catalog_input_schemas=catalog_input_schemas,
                             )
                         )
             else:
@@ -1360,6 +1392,7 @@ class BenchmarkRunner:
                         lifecycle_cleanup_errors=lifecycle_cleanup_errors,
                         incomplete_reasons=incomplete_reasons,
                         reports=reports,
+                        catalog_input_schemas=catalog_input_schemas,
                     )
         except asyncio.CancelledError:
             primary_error = RuntimeContractError(

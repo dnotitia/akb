@@ -116,3 +116,17 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
+
+
+def input_schemas_from_catalog(snapshot: CatalogSnapshot) -> dict[str, dict[str, Any]]:
+    """Project the exact raw ``tools/list`` input schemas used by the scorer."""
+
+    schemas: dict[str, dict[str, Any]] = {}
+    for tool in snapshot.tools:
+        name = tool.get("name")
+        schema = tool.get("inputSchema")
+        if isinstance(name, str) and isinstance(schema, dict):
+            schemas[name] = schema
+    if len(schemas) != snapshot.tool_count:
+        raise RuntimeContractError("captured tools/list is missing an input schema")
+    return schemas

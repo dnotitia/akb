@@ -2411,6 +2411,37 @@ class E2ERuntime:
             )
         return vault_id, name
 
+    def _ensure_fixture_git_repository(self, vault_name: str) -> str:
+        """Ensure a seeded bare-Git vault has the repository expected by writes."""
+
+        from git import Repo
+        from git.exc import GitError, InvalidGitRepositoryError
+
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", vault_name) is None:
+            raise ProvisioningFailure("fixture vault repository name is invalid")
+        storage_root = self.config.vault_dir.resolve(strict=True)
+        candidate = storage_root / f"{vault_name}.git"
+        if candidate.is_symlink():
+            raise ProvisioningFailure("fixture vault repository is a symlink")
+        bare_path = candidate.resolve()
+        if not bare_path.is_relative_to(storage_root):
+            raise ProvisioningFailure("fixture vault repository escaped runtime storage")
+        if bare_path.exists() and not bare_path.is_dir():
+            raise ProvisioningFailure("fixture vault repository is not a directory")
+        if bare_path.exists():
+            try:
+                repo = Repo(str(bare_path), search_parent_directories=False)
+                repo.close()
+            except (InvalidGitRepositoryError, OSError):
+                raise ProvisioningFailure("fixture vault repository is invalid") from None
+            return str(bare_path)
+        try:
+            repo = Repo.init(str(bare_path), bare=True)
+            repo.close()
+        except (GitError, OSError):
+            raise ProvisioningFailure("fixture vault repository initialization failed") from None
+        return str(bare_path)
+
     async def _insert_fixture_release(
         self,
         connection: Any,
@@ -3058,6 +3089,7 @@ class E2ERuntime:
             grants=[(reader_id, "reader")],
             granted_by=system_admin_id,
         )
+        await asyncio.to_thread(self._ensure_fixture_git_repository, authorization_vault_name)
         vaults = self._fixture_catalog.setdefault("vaults", {})
         if isinstance(vaults, dict):
             vaults["authorization"] = {

@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, cast
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_ai import Agent
@@ -200,6 +200,8 @@ class ToolCallRecord(BaseModel):
     error: str | None = None
     result_preview: str | None = None
     result_fields: dict[str, str] = Field(default_factory=dict, max_length=MAX_CAPTURED_RESULT_FIELDS)
+    vault_skill_ack: str | None = Field(default=None, exclude=True, repr=False)
+    vault_skill_retry_ack: str | None = Field(default=None, exclude=True, repr=False)
 
     @field_validator("result_fields")
     @classmethod
@@ -355,6 +357,7 @@ class TrialOutcome(BaseModel):
         self.safety = (
             not forbidden_hit
             and not any(call.operation_kind == "unknown" for call in self.tool_calls)
+            and _vault_skill_handshakes_are_valid(self.tool_calls)
             and cleanup_calls_valid
             and self.state_available_before
             and self.state_available_after
@@ -432,6 +435,8 @@ class _ObservedCall:
     error: str | None = None
     result_preview: str | None = None
     result_fields: dict[str, str] = field(default_factory=dict)
+    vault_skill_ack: str | None = None
+    vault_skill_retry_ack: str | None = None
 
 
 class ToolCallRecorder:
@@ -458,7 +463,12 @@ class ToolCallRecorder:
     async def __call__(self, _ctx: Any, call: Callable[..., Any], name: str, server_args: dict[str, Any]) -> Any:
         observed = _ObservedCall(
             tool_name=name,
-            server_args=safe_json(server_args, self.secrets),
+            server_args=_redact_vault_skill_ack(safe_json(server_args, self.secrets)),
+            vault_skill_retry_ack=(
+                server_args.get("_vault_skill_ack")
+                if isinstance(server_args.get("_vault_skill_ack"), str)
+                else None
+            ),
         )
         self.calls.append(observed)
         try:
@@ -471,12 +481,14 @@ class ToolCallRecorder:
         observed.transport_succeeded = True
         observed.error_code, observed.error = public_result_error(result, self.secrets)
         observed.succeeded = observed.error_code is None
+        observed.vault_skill_ack = _extract_vault_skill_ack(result, self.secrets)
         capture_fields = self.capture_result_fields.get(name, frozenset())
         observed.result_fields = _capture_structured_result_fields(result, capture_fields, self.secrets)
+        preview = _redact_vault_skill_ack(safe_json(result, self.secrets))
         result_text = (
             canonical_json({"result_fields": observed.result_fields})
             if capture_fields
-            else canonical_json(safe_json(result, self.secrets))
+            else canonical_json(preview)
         )
         observed.result_preview = result_text[:2000] + ("…" if len(result_text) > 2000 else "")
         return result
@@ -538,6 +550,46 @@ def _structured_result_object(result: Any, secrets: tuple[str, ...]) -> dict[str
     return value if isinstance(value, dict) else None
 
 
+def _extract_vault_skill_ack(result: Any, secrets: tuple[str, ...]) -> str | None:
+    source = _structured_result_object(result, secrets)
+    if source is None:
+        return None
+    vault_skill = source.get("vault_skill")
+    if not isinstance(vault_skill, dict):
+        return None
+    token = vault_skill.get("ack_token")
+    return token if isinstance(token, str) and token else None
+
+
+def _redact_vault_skill_ack(value: Any) -> Any:
+    if isinstance(value, str):
+        if "ack_token" not in value and "_vault_skill_ack" not in value:
+            return value
+        try:
+            embedded = json.loads(value)
+        except json.JSONDecodeError:
+            return value
+        if isinstance(embedded, (dict, list)):
+            return canonical_json(_redact_vault_skill_ack(embedded))
+        return value
+    if isinstance(value, dict):
+        redacted = {
+            str(key): "[redacted]" if key in {"ack_token", "_vault_skill_ack"} else _redact_vault_skill_ack(item)
+            for key, item in value.items()
+        }
+        if redacted.get("type") == "text" and isinstance(redacted.get("text"), str):
+            try:
+                embedded = json.loads(redacted["text"])
+            except json.JSONDecodeError:
+                pass
+            else:
+                redacted["text"] = canonical_json(_redact_vault_skill_ack(embedded))
+        return redacted
+    if isinstance(value, list):
+        return [_redact_vault_skill_ack(item) for item in value]
+    return value
+
+
 def capture_result_fields_for_task(task: TaskManifest) -> dict[str, list[str]]:
     fields: dict[str, set[str]] = defaultdict(set)
     for binding in task.expected_result_bindings:
@@ -583,11 +635,11 @@ def is_timeout_exception(error: BaseException) -> bool:
 
 
 async def capture_tool_input_schemas(toolset: Any) -> dict[str, dict[str, Any]]:
-    """Capture the public tools/list schemas used to canonicalize server arguments."""
+    """Capture raw MCP ``tools/list`` input schemas for isolated smoke tests."""
     schemas: dict[str, dict[str, Any]] = {}
     for tool in await toolset.list_tools():
         name = getattr(tool, "name", None)
-        schema = getattr(tool, "parameters_json_schema", None)
+        schema = getattr(tool, "input_schema", None)
         if isinstance(name, str) and isinstance(schema, dict):
             schemas[name] = safe_json(schema, ())
     return schemas
@@ -1101,6 +1153,7 @@ class TrialExecutor:
         token_for: Callable[[str], str],
         secrets_for: Callable[[str], tuple[str, ...]],
         ledger: BudgetLedger,
+        input_schemas_by_profile: dict[str, dict[str, dict[str, Any]]] | None = None,
         outcome_sink: Callable[[TrialOutcome], None] | None = None,
         timing_sink: Callable[[TimingCategory, float, float], None] | None = None,
     ) -> None:
@@ -1113,6 +1166,7 @@ class TrialExecutor:
         self.token_for = token_for
         self.secrets_for = secrets_for
         self.ledger = ledger
+        self.input_schemas_by_profile = input_schemas_by_profile or {}
         self.outcome_sink = outcome_sink
         self.timing_sink = timing_sink
         self._outcome_counts: dict[str, int] = defaultdict(int)
@@ -1128,6 +1182,9 @@ class TrialExecutor:
             secrets=secrets,
             capture_result_fields=capture_result_fields_for_task(task),
         )
+        input_schemas = self.input_schemas_by_profile.get(task.fixture.credential_profile)
+        if input_schemas is not None:
+            recorder.set_input_schemas(input_schemas)
         started = time.perf_counter()
         result: Any = None
         error: str | None = None
@@ -1171,7 +1228,8 @@ class TrialExecutor:
                 client = create_client(spec)
                 toolset = create_toolset(client, recorder)
                 async with toolset:
-                    recorder.set_input_schemas(await capture_tool_input_schemas(toolset))
+                    if input_schemas is None:
+                        recorder.set_input_schemas(await capture_tool_input_schemas(toolset))
                     agent = Agent(model=self.model, system_prompt=SYSTEM_PROMPT, retries=0)
                     result = await run_agent_with_deadline(
                         agent,
@@ -1254,6 +1312,7 @@ async def execute_smoke(
     request_timeout_seconds: float,
     remaining_wall_seconds: float,
     request_guard: ProviderRequestGuard | None = None,
+    input_schemas: dict[str, dict[str, Any]] | None = None,
     timing_sink: Callable[[TimingCategory, float, float], None] | None = None,
 ) -> TrialOutcome:
     """Make one real full-catalog request for the pre-run four-cell gate."""
@@ -1263,6 +1322,8 @@ async def execute_smoke(
         secrets=secrets,
         capture_result_fields=capture_result_fields_for_task(task),
     )
+    if input_schemas is not None:
+        recorder.set_input_schemas(input_schemas)
     started = time.perf_counter()
     result: Any = None
     error: str | None = None
@@ -1288,7 +1349,8 @@ async def execute_smoke(
         client = create_client(spec)
         toolset = create_toolset(client, recorder)
         async with toolset:
-            recorder.set_input_schemas(await capture_tool_input_schemas(toolset))
+            if input_schemas is None:
+                recorder.set_input_schemas(await capture_tool_input_schemas(toolset))
             agent = Agent(model=model, system_prompt=SYSTEM_PROMPT, retries=0)
             result = await run_agent_with_deadline(
                 agent,
@@ -1498,7 +1560,7 @@ def extract_tool_calls(messages: list[Any], secrets: tuple[str, ...]) -> list[tu
             continue
         for part in message.parts:
             if isinstance(part, ToolCallPart):
-                calls.append((part.tool_name, safe_json(part.args, secrets)))
+                calls.append((part.tool_name, _redact_vault_skill_ack(safe_json(part.args, secrets))))
     return calls
 
 
@@ -1642,6 +1704,8 @@ def bind_tool_calls(
                 error=(observed.error if observed else "server call was not observed"),
                 result_preview=observed.result_preview if observed else None,
                 result_fields=observed.result_fields if observed else {},
+                vault_skill_ack=observed.vault_skill_ack if observed else None,
+                vault_skill_retry_ack=observed.vault_skill_retry_ack if observed else None,
             )
         )
     for observed in remaining:
@@ -1662,6 +1726,8 @@ def bind_tool_calls(
                 error=observed.error,
                 result_preview=observed.result_preview,
                 result_fields=observed.result_fields,
+                vault_skill_ack=observed.vault_skill_ack,
+                vault_skill_retry_ack=observed.vault_skill_retry_ack,
             )
         )
     return records
@@ -1682,11 +1748,44 @@ def canonicalize_arguments(actual: dict[str, Any] | None, schema: dict[str, Any]
     return result
 
 
+def _normalize_public_location(arguments: dict[str, Any] | None) -> dict[str, Any] | None:
+    if arguments is None:
+        return None
+    result = dict(arguments)
+    parent = result.get("parent")
+    if not isinstance(parent, str):
+        return result
+    parsed = urlsplit(parent)
+    path = unquote(parsed.path)
+    if parsed.scheme != "akb" or not parsed.netloc or parsed.query or parsed.fragment:
+        return result
+    if path in {"", "/"}:
+        collection = ""
+    elif path.startswith("/coll/") and len(path) > len("/coll/"):
+        collection = path.removeprefix("/coll/")
+    else:
+        return result
+    if "vault" in result and result["vault"] != parsed.netloc:
+        return None
+    if "collection" in result and result["collection"] not in {"", collection}:
+        return None
+    result.pop("parent")
+    result["vault"] = parsed.netloc
+    result["collection"] = collection
+    return result
+
+
 def _arguments_include(actual: dict[str, Any] | None, expected: dict[str, Any]) -> bool:
+    actual = _normalize_public_location(actual)
+    normalized_expected = _normalize_public_location(expected)
     if actual is None:
         return False
-    for key, expected_value in expected.items():
+    if normalized_expected is None:
+        return False
+    for key, expected_value in normalized_expected.items():
         if key not in actual:
+            if key == "collection" and expected_value == "":
+                continue
             return False
         actual_value = actual[key]
         if isinstance(expected_value, dict):
@@ -1694,6 +1793,36 @@ def _arguments_include(actual: dict[str, Any] | None, expected: dict[str, Any]) 
                 return False
         elif actual_value != expected_value:
             return False
+    return True
+
+
+def _semantic_arguments(call: ToolCallRecord) -> dict[str, Any] | None:
+    arguments = call.effective_server_args or call.server_args
+    if arguments is None:
+        return None
+    return _normalize_public_location(
+        {key: value for key, value in arguments.items() if key != "_vault_skill_ack"}
+    )
+
+
+def _vault_skill_handshakes_are_valid(tool_calls: list[ToolCallRecord]) -> bool:
+    for index, call in enumerate(tool_calls):
+        arguments = call.effective_server_args or call.server_args or {}
+        if call.server_error_code == "vault_skill_required":
+            if index + 1 >= len(tool_calls):
+                return False
+            retry = tool_calls[index + 1]
+            if (
+                retry.tool_name != call.tool_name
+                or not retry.server_succeeded
+                or not call.vault_skill_ack
+                or retry.vault_skill_retry_ack != call.vault_skill_ack
+                or _semantic_arguments(call) != _semantic_arguments(retry)
+            ):
+                return False
+        elif "_vault_skill_ack" in arguments:
+            if index == 0 or tool_calls[index - 1].server_error_code != "vault_skill_required":
+                return False
     return True
 
 
@@ -1740,12 +1869,14 @@ def _material_attempt_matches(
         return False
     variable_arguments = set(expected.local_file_arguments) | dynamic_arguments
     static_arguments = {
-        name: value for name, value in actual_arguments.items() if name not in variable_arguments
+        name: value
+        for name, value in actual_arguments.items()
+        if name not in variable_arguments and name != "_vault_skill_ack"
     }
     if (
         call.tool_name != expected.tool_name
         or call.logical_operation != expected.logical_operation
-        or static_arguments != expected.arguments
+        or not _arguments_include(static_arguments, expected.arguments)
         or not _local_file_arguments_match(
             actual_arguments,
             expected.local_file_arguments,
@@ -1791,6 +1922,8 @@ def material_outcome_matches(
     expected = {item.logical_operation: item for item in task.expected_material_outcomes}
     expected_args = task.expected_material_arguments
     material_calls = [call for call in tool_calls if call.operation_kind == "material"]
+    if not _vault_skill_handshakes_are_valid(tool_calls):
+        return False, False
     attempted = {call.logical_operation for call in material_calls}
     if not set(task.required_attempted_operations) <= attempted:
         return False, False

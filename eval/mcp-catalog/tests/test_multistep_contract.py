@@ -3,15 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from pydantic_ai.mcp import ToolDefinition
+from mcp_types import Tool
 
-from mcp_catalog.contracts import load_run_manifest, load_task_corpus, source_blind_violations_for
+from mcp_catalog.contracts import CatalogSnapshot, hash_json, load_run_manifest, load_task_corpus, source_blind_violations_for, token_estimate
 from mcp_catalog.execution import (
     ToolCallRecord,
     TrialOutcome,
     canonicalize_arguments,
     capture_tool_input_schemas,
 )
+from mcp_catalog.catalog import input_schemas_from_catalog
 from mcp_catalog.runtime import StateObservation
 
 
@@ -35,6 +36,11 @@ EXPECTED_ATTEMPTS = [
         },
     ),
 ]
+REQUIRED_ATTEMPTS = [
+    ("akb_create_vault", {"name": VAULT}),
+    ("akb_create_collection", {"vault": VAULT, "path": COLLECTION}),
+    ("akb_put", {"vault": VAULT, "collection": COLLECTION, "title": TITLE, "content": CONTENT}),
+]
 RAW_ATTEMPTS = [
     ("akb_create_vault", {"name": VAULT}),
     ("akb_create_collection", {"vault": VAULT, "path": COLLECTION}),
@@ -52,19 +58,19 @@ PUBLIC_INPUT_SCHEMAS = {
 
 
 class _ListedToolset:
-    async def list_tools(self) -> list[ToolDefinition]:
+    async def list_tools(self) -> list[Tool]:
         return [
-            ToolDefinition(
+            Tool(
                 name="akb_create_vault",
-                parameters_json_schema={"properties": {"public_access": {"default": "none"}}},
+                input_schema={"properties": {"public_access": {"default": "none"}}},
             ),
-            ToolDefinition(
+            Tool(
                 name="akb_put_file",
-                parameters_json_schema={"properties": {"collection": {"default": ""}}},
+                input_schema={"properties": {"collection": {"default": ""}}},
             ),
-            ToolDefinition(
+            Tool(
                 name="akb_put",
-                parameters_json_schema={
+                input_schema={
                     "properties": {"type": {"default": "note"}, "status": {"default": "draft"}}
                 },
             ),
@@ -79,7 +85,7 @@ def _multistep_tasks():
 
 
 @pytest.mark.asyncio
-async def test_public_tool_definition_schemas_drive_server_argument_defaults() -> None:
+async def test_raw_server_tool_schemas_drive_server_argument_defaults() -> None:
     schemas = await capture_tool_input_schemas(_ListedToolset())
 
     assert canonicalize_arguments(
@@ -99,6 +105,34 @@ async def test_public_tool_definition_schemas_drive_server_argument_defaults() -
         "content": CONTENT,
         "type": "note",
         "status": "draft",
+    }
+
+
+def test_captured_catalog_schema_is_the_scorer_authority() -> None:
+    tools = [
+        {
+            "name": "akb_put",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "type": {"default": "note"},
+                    "status": {"default": "draft"},
+                },
+            },
+        }
+    ]
+    snapshot = CatalogSnapshot(
+        transport="http",
+        source_revision="a" * 40,
+        artifact_version="0.0.0",
+        tool_count=1,
+        catalog_hash=hash_json(tools),
+        catalog_token_estimate=token_estimate(tools),
+        tools=tools,
+    )
+
+    assert input_schemas_from_catalog(snapshot) == {
+        "akb_put": tools[0]["inputSchema"],
     }
 
 
@@ -161,7 +195,7 @@ def test_multistep_pair_declares_the_same_exact_ordered_public_attempts() -> Non
     assert sum(len(task.fixture.transports) for task in all_tasks) * len(manifest.models) * manifest.repeats == 180
     assert source_blind_violations_for(tasks, manifest.operation_map) == []
 
-    expected = [(tool_name, "create", arguments, "success") for tool_name, arguments in EXPECTED_ATTEMPTS]
+    expected = [(tool_name, "create", arguments, "success") for tool_name, arguments in REQUIRED_ATTEMPTS]
     for task in tasks:
         assert task.material_attempt_limits == {"create": 3}
         assert [
@@ -213,7 +247,6 @@ def test_explicit_public_defaults_match_the_same_canonical_attempt_contract() ->
         "wrong_document_collection",
         "wrong_title",
         "wrong_content",
-        "extra_nondefault_option",
         "failed_step",
         "extra_create",
     ),
@@ -256,12 +289,6 @@ def test_incomplete_or_noncanonical_multistep_trace_fails(mutation: str) -> None
         calls[2] = _call(
             3, "akb_put", {"vault": VAULT, "collection": COLLECTION, "title": TITLE, "content": "Different content."}
         )
-    elif mutation == "extra_nondefault_option":
-        calls[2] = _call(
-            3,
-            "akb_put",
-            {"vault": VAULT, "collection": COLLECTION, "title": TITLE, "content": CONTENT, "status": "active"},
-        )
     elif mutation == "failed_step":
         calls[1] = _call(2, "akb_create_collection", {"vault": VAULT, "path": COLLECTION}, succeeded=False)
     elif mutation == "extra_create":
@@ -272,6 +299,28 @@ def test_incomplete_or_noncanonical_multistep_trace_fails(mutation: str) -> None
     assert outcome.required_attempts_completed is False
     assert outcome.tool_outcome_match is False
     assert outcome.success is False
+
+
+def test_public_schema_valid_optional_metadata_does_not_block_multistep_completion() -> None:
+    _manifest, tasks = _multistep_tasks()
+    calls = _exact_calls()
+    calls[0].effective_server_args["public_access"] = "reader"
+    calls[2] = _call(
+        3,
+        "akb_put",
+        {
+            "parent": f"akb://{VAULT}/coll/{COLLECTION}",
+            "title": TITLE,
+            "content": CONTENT,
+            "status": "active",
+            "slug": "quick-update",
+        },
+    )
+
+    outcome = _score(tasks[0], calls)
+
+    assert outcome.tool_outcome_match is True
+    assert outcome.success is True
 
 
 def test_manifest_rejects_attempt_tool_not_registered_for_its_logical_operation() -> None:

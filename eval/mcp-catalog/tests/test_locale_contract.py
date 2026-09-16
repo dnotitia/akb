@@ -235,7 +235,7 @@ async def test_public_mcp_error_envelope_is_operation_failure_not_transport_fail
 
 
 @pytest.mark.asyncio
-async def test_authorization_arguments_use_public_schema_defaults_without_relaxing_fields() -> None:
+async def test_authorization_arguments_use_public_schema_defaults_and_keep_core_fields_strict() -> None:
     _manifest, tasks = _loaded()
     task = next(task for task in tasks if task.id == "authorization-readonly-b")
     schema = AUTHORIZATION_PUT_SCHEMAS
@@ -289,8 +289,8 @@ async def test_authorization_arguments_use_public_schema_defaults_without_relaxi
     assert wrong_vault.tool_outcome_match is False
     assert wrong_title.tool_outcome_match is False
     assert wrong_content.tool_outcome_match is False
-    assert wrong_type.tool_outcome_match is False
-    assert wrong_status.tool_outcome_match is False
+    assert wrong_type.argument_validity is True and wrong_type.tool_outcome_match is True
+    assert wrong_status.argument_validity is True and wrong_status.tool_outcome_match is True
 
 
 @pytest.mark.asyncio
@@ -312,18 +312,18 @@ async def test_public_mcp_envelopes_score_recovery_sequence_and_reject_success_b
         None,
         recovery_call,
         "akb_create_vault",
-        {"name": "bad/name"},
+        {"name": "bad/name", "description": "Test vault with invalid name"},
     )
     await recovery_recorder(
         None,
         recovery_call,
         "akb_create_vault",
-        {"name": "catalog-bench-recovery"},
+        {"name": "catalog-bench-recovery", "description": "Test vault with invalid name"},
     )
     recovery_records = bind_tool_calls(
         [
-            ("akb_create_vault", '{"name":"bad/name"}'),
-            ("akb_create_vault", '{"name":"catalog-bench-recovery"}'),
+            ("akb_create_vault", '{"name":"bad/name","description":"Test vault with invalid name"}'),
+            ("akb_create_vault", '{"name":"catalog-bench-recovery","description":"Test vault with invalid name"}'),
         ],
         recovery_recorder.calls,
         recovery_recorder.operation_map,

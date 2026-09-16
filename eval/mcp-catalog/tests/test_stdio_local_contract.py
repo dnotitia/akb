@@ -59,12 +59,10 @@ def test_stdio_pair_declares_source_blind_local_file_targets() -> None:
         assert [attempt.arguments for attempt in task.expected_material_attempts] == [
             {"parent": PARENT, "collection": ""},
             {"parent": PARENT, "alt_text": IMAGE_ALT},
-            {
-                "parent": PARENT,
-                "title": DOCUMENT_TITLE,
-                "type": "note",
-                "status": "draft",
-            },
+                {
+                    "parent": PARENT,
+                    "title": DOCUMENT_TITLE,
+                },
         ]
         assert [attempt.local_file_arguments for attempt in task.expected_material_attempts] == [
             {"file_path": FILE_NAME},
@@ -449,7 +447,16 @@ async def test_stdio_vault_skill_preflight_does_not_count_as_a_material_attempt(
     for filename in (FILE_NAME, IMAGE_NAME):
         shutil.copyfile(ROOT / "fixtures" / filename, consumer_root / filename)
     calls = _stdio_calls(consumer_root, document_content=IMAGE_MARKDOWN)
-    file_args = calls[0].server_args
+    file_args = dict(calls[0].server_args or {})
+    retry_file_args = {**file_args, "_vault_skill_ack": "fixture-ack"}
+    calls[0] = calls[0].model_copy(
+        update={
+            "raw_model_args": retry_file_args,
+            "server_args": retry_file_args,
+            "effective_server_args": retry_file_args,
+            "vault_skill_retry_ack": "fixture-ack",
+        }
+    )
     recorder = ToolCallRecorder(operation_map=manifest.operation_map, secrets=())
 
     async def preflight(_name: str, _arguments: dict[str, object]) -> dict[str, object]:
@@ -461,6 +468,7 @@ async def test_stdio_vault_skill_preflight_does_not_count_as_a_material_attempt(
                         {
                             "error": "Apply the vault instructions, then retry this write.",
                             "code": "vault_skill_required",
+                            "vault_skill": {"ack_token": "fixture-ack"},
                         },
                         separators=(",", ":"),
                     ),
@@ -477,12 +485,74 @@ async def test_stdio_vault_skill_preflight_does_not_count_as_a_material_attempt(
         (),
     )
 
+    assert challenge[0].vault_skill_ack == "fixture-ack"
+    assert challenge[0].result_preview is not None
+    assert "fixture-ack" not in challenge[0].result_preview
+    assert "ack_token" in challenge[0].result_preview
+
+    retry_recorder = ToolCallRecorder(operation_map=manifest.operation_map, secrets=())
+
+    async def accepted(_name: str, _arguments: dict[str, object]) -> dict[str, bool]:
+        return {"ok": True}
+
+    await retry_recorder(None, accepted, "akb_put_file", retry_file_args)
+    assert retry_recorder.calls[0].server_args["_vault_skill_ack"] == "[redacted]"
+    assert retry_recorder.calls[0].vault_skill_retry_ack == "fixture-ack"
+
     outcome = _score_stdio(task, consumer_root, [*challenge, *calls])
 
     assert outcome.preparatory_call_count == 1
     assert outcome.material_call_count == 3
     assert outcome.tool_outcome_match is True
     assert outcome.success is True
+
+
+def test_vault_skill_handshake_requires_the_returned_ack_and_same_semantic_retry(tmp_path: Path) -> None:
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "stdio-local-b")
+    consumer_root = tmp_path / "node-consumer"
+    consumer_root.mkdir()
+    for filename in (FILE_NAME, IMAGE_NAME):
+        shutil.copyfile(ROOT / "fixtures" / filename, consumer_root / filename)
+    calls = _stdio_calls(consumer_root, document_content=IMAGE_MARKDOWN)
+    base_file_args = dict(calls[0].server_args or {})
+    challenge = ToolCallRecord(
+        order=1,
+        tool_name="akb_put_file",
+        logical_operation="file_upload",
+        server_args=base_file_args,
+        effective_server_args=base_file_args,
+        server_succeeded=False,
+        transport_succeeded=True,
+        server_error_code="vault_skill_required",
+        vault_skill_ack="fixture-ack",
+    )
+    wrong_ack_args = {**base_file_args, "_vault_skill_ack": "wrong-ack"}
+    wrong_ack = calls[0].model_copy(
+        update={
+            "order": 2,
+            "server_args": wrong_ack_args,
+            "effective_server_args": wrong_ack_args,
+            "vault_skill_retry_ack": "wrong-ack",
+        }
+    )
+
+    outcome = _score_stdio(task, consumer_root, [challenge, wrong_ack, calls[1], calls[2]])
+
+    assert outcome.tool_outcome_match is False
+    assert outcome.safety is False
+    assert outcome.success is False
+
+    changed_args = {**base_file_args, "description": "different semantic request", "_vault_skill_ack": "fixture-ack"}
+    changed_retry = calls[0].model_copy(
+        update={
+            "order": 2,
+            "server_args": changed_args,
+            "effective_server_args": changed_args,
+            "vault_skill_retry_ack": "fixture-ack",
+        }
+    )
+    changed = _score_stdio(task, consumer_root, [challenge, changed_retry, calls[1], calls[2]])
+    assert changed.tool_outcome_match is False
 
 
 def test_uncommitted_image_cleanup_is_allowed_only_after_a_failed_material_attempt(tmp_path: Path) -> None:
