@@ -157,10 +157,11 @@ _internal_presign_client = None
 def internal_presign_client():
     """A signer bound to the INTERNAL endpoint.
 
-    `presign_client` signs against `s3_public_url`, which is correct for a URL
-    handed to a browser and wrong for one handed to the byte gateway: the
-    gateway sits inside the cluster, and a URL naming the public host would
-    send it back out through the ingress it exists to replace.
+    There used to be a second signer here, bound to `s3_public_url`, for URLs
+    handed to a browser. It was retired along with the browser-facing presign,
+    and the internal endpoint is the only one left for a reason: the byte
+    gateway sits inside the cluster, so a URL naming the public host would
+    send it back out through the ingress the gateway exists to replace.
 
     It registers the `before-sign` hook that pins a frozen credential to one
     signature. Registering it is only half the wiring — the hook reads a

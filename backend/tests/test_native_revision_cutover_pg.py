@@ -109,6 +109,7 @@ async def _fresh_schema(*, cutover_migrations: bool = True):
             "053_native_revision_m1_pg_body.py",
             "060_native_revision_migration_bridge.py",
             "061_native_revision_authority.py",
+            "105_bridge_body_digest.py",
         ]
         if cutover_migrations:
             filenames.extend(

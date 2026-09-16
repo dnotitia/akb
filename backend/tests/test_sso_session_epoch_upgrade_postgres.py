@@ -41,6 +41,7 @@ _EXACT_BASE_NATIVE_MIGRATIONS = (
     "059_native_file_searchable_derived.py",
     "060_native_revision_migration_bridge.py",
     "061_native_revision_authority.py",
+    "105_bridge_body_digest.py",
 )
 _DSN = os.environ.get(
     "AKB_TEST_DSN",

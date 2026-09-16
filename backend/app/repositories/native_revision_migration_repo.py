@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 import secrets
 import json
+import hashlib
 import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -72,6 +73,14 @@ class MigrationItem:
     error_code: str | None
 
 
+class LegacyMappingAlreadyMigratedError(RuntimeError):
+    """Raised when a mapping's body was moved by another pass in between."""
+
+
+class BridgeBodyIntegrityError(RuntimeError):
+    """A stored bridged body does not hash to the digest it is filed under."""
+
+
 @dataclass(frozen=True, slots=True)
 class LegacyRevisionMapping:
     namespace_id: uuid.UUID
@@ -83,6 +92,9 @@ class LegacyRevisionMapping:
     run_id: uuid.UUID
     lineage_ordinal: int
     fixed_git_oid: str
+    # Set once this revision's body has been copied into the payload store.
+    # While it is None the body is only in git, and the read falls back there.
+    body_digest: str | None = None
 
 
 def _require_oid(value: str, field: str) -> str:
@@ -139,6 +151,8 @@ def _mapping(row: asyncpg.Record) -> LegacyRevisionMapping:
         run_id=row["run_id"],
         lineage_ordinal=row["lineage_ordinal"],
         fixed_git_oid=row["fixed_git_oid"],
+        # Absent from the older projections that do not select it.
+        body_digest=(row["body_digest"] if "body_digest" in row.keys() else None),
     )
 
 
@@ -1027,7 +1041,7 @@ class NativeRevisionMigrationRepository:
             """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
               JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -1074,7 +1088,7 @@ class NativeRevisionMigrationRepository:
             """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
               JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -1104,7 +1118,7 @@ class NativeRevisionMigrationRepository:
         sql = """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
               JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -1131,7 +1145,7 @@ class NativeRevisionMigrationRepository:
         sql = """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
               JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -1158,7 +1172,7 @@ class NativeRevisionMigrationRepository:
         sql = """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
               JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -1192,7 +1206,7 @@ class NativeRevisionMigrationRepository:
         sql = """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
               JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -1232,7 +1246,7 @@ class NativeRevisionMigrationRepository:
         sql = """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
               JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -1264,7 +1278,7 @@ class NativeRevisionMigrationRepository:
         sql = """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
               JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -1364,7 +1378,7 @@ class NativeRevisionMigrationRepository:
         select_sql = """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid, r.status
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid, r.status
               FROM legacy_revision_mappings m
               JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -1499,7 +1513,7 @@ class NativeRevisionMigrationRepository:
         sql = """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
              JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -1528,7 +1542,7 @@ class NativeRevisionMigrationRepository:
         sql = """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
               JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -1576,7 +1590,7 @@ class NativeRevisionMigrationRepository:
         sql = """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
              JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -1591,3 +1605,181 @@ class NativeRevisionMigrationRepository:
             async with self.pool.acquire() as acquired:
                 rows = await acquired.fetch(sql, resource_id, legacy_git_prefix)
         return [_mapping(row) for row in rows]
+
+    # ── bridged bodies: from the git volume into the payload store ──────
+
+    async def claim_unmigrated_bridge_bodies(
+        self,
+        *,
+        limit: int,
+        namespace_id: uuid.UUID | None = None,
+        after: tuple[uuid.UUID, uuid.UUID, int, str] | None = None,
+        conn: asyncpg.Connection | None = None,
+    ) -> list[LegacyRevisionMapping]:
+        """Return bridged mappings whose body is still only in git.
+
+        Ordered by the partial index that exists for exactly this question, so
+        the scan does not walk the migrated majority. `namespace_id` narrows
+        it to one vault, which is how the first run is kept small enough to
+        inspect by hand.
+
+        `after` resumes from a previous page, and the backfill needs it: a row
+        it could not move stays at the head of this order forever, so without
+        a cursor one unreadable body would be re-read once per batch for the
+        rest of the run. The tuple is the full sort key, including
+        `legacy_git_oid` — the first three columns are not unique under any
+        constraint, so a shorter cursor could skip a row.
+        """
+        sql = """
+            SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
+                   m.path_at_revision, m.resolution, m.native_revision_id,
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
+              FROM legacy_revision_mappings m
+              JOIN native_revision_migration_runs r
+                ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
+             WHERE m.resolution = 'bridge'
+               AND m.body_digest IS NULL
+               AND r.status = 'complete'
+               AND ($2::uuid IS NULL OR m.namespace_id = $2)
+               AND ($3::uuid IS NULL OR
+                    (m.namespace_id, m.resource_id, m.lineage_ordinal, m.legacy_git_oid)
+                    > ($3::uuid, $4::uuid, $5::int, $6::text))
+             ORDER BY m.namespace_id, m.resource_id, m.lineage_ordinal, m.legacy_git_oid
+             LIMIT $1
+        """
+        cursor = after or (None, None, None, None)
+        if conn is not None:
+            rows = await conn.fetch(sql, limit, namespace_id, *cursor)
+        else:
+            async with self.pool.acquire() as acquired:
+                rows = await acquired.fetch(sql, limit, namespace_id, *cursor)
+        return [_mapping(row) for row in rows]
+
+    async def list_migrated_bridge_bodies(
+        self,
+        *,
+        limit: int,
+        namespace_id: uuid.UUID | None = None,
+        after: tuple[uuid.UUID, uuid.UUID, int, str] | None = None,
+        conn: asyncpg.Connection | None = None,
+    ) -> list[LegacyRevisionMapping]:
+        """The mirror of the claim: bridged mappings whose body has moved.
+
+        This is what makes the migration checkable after the fact.  git still
+        holds every one of these bodies, so the digest a mapping was filed
+        under can be recomputed from the source at any time — and a run over
+        the whole population is the only thing that answers "did all of them
+        survive", as opposed to "did the handful I sampled".
+        """
+        sql = """
+            SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
+                   m.path_at_revision, m.resolution, m.native_revision_id,
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
+              FROM legacy_revision_mappings m
+              JOIN native_revision_migration_runs r
+                ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
+             WHERE m.resolution = 'bridge'
+               AND m.body_digest IS NOT NULL
+               AND ($2::uuid IS NULL OR m.namespace_id = $2)
+               AND ($3::uuid IS NULL OR
+                    (m.namespace_id, m.resource_id, m.lineage_ordinal, m.legacy_git_oid)
+                    > ($3::uuid, $4::uuid, $5::int, $6::text))
+             ORDER BY m.namespace_id, m.resource_id, m.lineage_ordinal, m.legacy_git_oid
+             LIMIT $1
+        """
+        cursor = after or (None, None, None, None)
+        if conn is not None:
+            rows = await conn.fetch(sql, limit, namespace_id, *cursor)
+        else:
+            async with self.pool.acquire() as acquired:
+                rows = await acquired.fetch(sql, limit, namespace_id, *cursor)
+        return [_mapping(row) for row in rows]
+
+    @staticmethod
+    async def attach_bridge_body_digest(
+        conn: asyncpg.Connection,
+        *,
+        namespace_id: uuid.UUID,
+        resource_id: uuid.UUID,
+        legacy_git_oid: str,
+        digest: str,
+    ) -> None:
+        """Point one bridged mapping at a body already in the payload store.
+
+        The payload write is the caller's, on the caller's transaction, and it
+        goes through the store that owns the placement — this only records
+        which digest that mapping's body now has.  The two halves must share a
+        transaction: a payload nothing references is waste, and a mapping
+        naming a digest that was never written is a revision that cannot be
+        read at all.
+
+        ``body_digest IS NULL`` in the predicate is the claim.  Two passes can
+        run at once and the loser finds nothing to update, which is the only
+        concurrency control this needs.
+        """
+        _require_digest(digest, "digest")
+        updated = await conn.execute(
+            """
+            UPDATE legacy_revision_mappings
+               SET body_digest = $4
+             WHERE namespace_id = $1
+               AND resource_id = $2
+               AND legacy_git_oid = $3
+               AND resolution = 'bridge'
+               AND body_digest IS NULL
+            """,
+            namespace_id, resource_id, _require_oid(legacy_git_oid, "legacy_git_oid"), digest,
+        )
+        if updated.rsplit(" ", 1)[-1] == "0":
+            # Another pass took it, or it is not a bridged mapping. Either way
+            # this transaction has nothing left to claim.
+            raise LegacyMappingAlreadyMigratedError(legacy_git_oid)
+
+    @staticmethod
+    async def read_bridge_body(
+        conn: asyncpg.Connection,
+        *,
+        namespace_id: uuid.UUID,
+        digest: str,
+    ) -> str | None:
+        """Read a migrated bridged body back as text.
+
+        Returns None rather than raising when the payload is missing, so the
+        caller can fall back to git instead of failing a read that git could
+        still answer.  Bytes that are present but do not hash to the digest
+        they were stored under are a different thing entirely — that is
+        corruption, and it raises rather than being served.
+        """
+        row = await conn.fetchrow(
+            """
+            SELECT canonical_bytes FROM m1_reference_payloads
+             WHERE namespace_id = $1 AND digest = $2
+             LIMIT 1
+            """,
+            namespace_id, _require_digest(digest, "digest"),
+        )
+        if row is None:
+            return None
+        canonical = bytes(row["canonical_bytes"])
+        if hashlib.sha256(canonical).hexdigest() != digest:
+            raise BridgeBodyIntegrityError(digest)
+        return canonical.decode("utf-8")
+
+    @staticmethod
+    async def count_unmigrated_bridge_bodies(
+        conn: asyncpg.Connection,
+        *,
+        namespace_id: uuid.UUID | None = None,
+    ) -> tuple[int, int]:
+        """(still in git only, already in the payload store)."""
+        row = await conn.fetchrow(
+            """
+            SELECT count(*) FILTER (WHERE body_digest IS NULL) AS pending,
+                   count(*) FILTER (WHERE body_digest IS NOT NULL) AS migrated
+              FROM legacy_revision_mappings
+             WHERE resolution = 'bridge'
+               AND ($1::uuid IS NULL OR namespace_id = $1)
+            """,
+            namespace_id,
+        )
+        return int(row["pending"]), int(row["migrated"])
