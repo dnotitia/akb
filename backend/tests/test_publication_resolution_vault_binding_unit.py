@@ -180,13 +180,26 @@ def _git_content(monkeypatch):
     """
     from app.services import publication_service
 
-    class _Git:
-        @staticmethod
-        def read_file(vault_name: str, path: str, commit: str | None = None) -> str:
-            return f"# body\n\nvault={vault_name} path={path} commit={commit}\n"
+    class _Doc:
+        def __init__(self, content: str, commit: str | None):
+            self.content = content
+            self.current_commit = commit
 
     class _DocService:
-        git = _Git()
+        """Only what the service interface offers.
+
+        Deliberately no `.git`. The previous stub carried one, so it modelled
+        the legacy arm's storage handle rather than the interface — and a
+        publication path that reached for that attribute passed here while
+        failing on every PostgreSQL-authoritative deployment, where the
+        service does not have one.
+        """
+
+        async def get_at_commit(self, vault_name: str, path: str, commit: str):
+            return _Doc(f"# body\n\nvault={vault_name} path={path} commit={commit}\n", commit)
+
+        async def get(self, vault_name: str, path: str):
+            return _Doc(f"# body\n\nvault={vault_name} path={path} commit=None\n", None)
 
     monkeypatch.setattr(publication_service, "_get_doc_service", lambda: _DocService())
 

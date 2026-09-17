@@ -113,6 +113,12 @@ class NativeDocumentService(DocumentService):
     ):
         # Deliberately do not call DocumentService.__init__: that would create
         # the legacy Git adapter before a request is even served.
+        # No `super().__init__()` on purpose: the base builds a GitService
+        # and binds it to `self.git`, and this arm must not carry one. Bodies
+        # are read from PostgreSQL, with Git a fallback for bridged revisions
+        # that have not moved yet — `read_bridge_body` holds that decision.
+        # The absent attribute is the contract, not an oversight; see the note
+        # on `DocumentService.__init__`.
         self._injected_pool = pool
         # ``failpoint`` carries the native service's deterministic test-only
         # hook down to the substrate this facade composes; production

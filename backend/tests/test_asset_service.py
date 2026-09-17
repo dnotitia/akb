@@ -590,15 +590,27 @@ async def test_public_asset_manifest_cache_does_not_retain_document_body(
     hidden = uuid.uuid4()
     reads = 0
 
-    class _Git:
-        def read_file(self, vault, path, commit):
+    class _DocService:
+        """Only the document-service interface — deliberately no `.git`.
+
+        The previous stub was a `SimpleNamespace(git=...)`, which modelled the
+        Git arm's storage handle instead of the interface. The publication
+        path reached for that attribute and passed here while failing on every
+        PostgreSQL-authoritative deployment, where the composed service has
+        none. `.content` is the frontmatter-stripped body, as both real
+        services return.
+        """
+
+        async def get_at_commit(self, vault, path, commit):
             nonlocal reads
             reads += 1
             assert (vault, path, commit) == ("team", "weekly.md", "a" * 40)
-            return (
-                "---\ntitle: Weekly\n---\n"
-                f"# Public\n\n![shown](/api/assets/{visible})\n\n"
-                f"# Private\n\n![hidden](/api/assets/{hidden})\n"
+            return SimpleNamespace(
+                content=(
+                    f"# Public\n\n![shown](/api/assets/{visible})\n\n"
+                    f"# Private\n\n![hidden](/api/assets/{hidden})\n"
+                ),
+                current_commit="a" * 40,
             )
 
     row = {
@@ -626,7 +638,7 @@ async def test_public_asset_manifest_cache_does_not_retain_document_body(
     monkeypatch.setattr(
         publication_service,
         "_get_doc_service",
-        lambda: SimpleNamespace(git=_Git()),
+        lambda: _DocService(),
     )
     monkeypatch.setattr(publication_service, "_find_published_document", fake_find)
     try:
@@ -662,18 +674,30 @@ async def test_legacy_public_document_resolves_head_into_pinned_cache(
     reads = 0
     heads = 0
 
-    class _Git:
-        def current_commit(self, vault):
+    class _DocService:
+        """Interface-shaped stub; see the note on the sibling test.
+
+        A row with a NULL `current_commit` used to send the publication path
+        to `.git.current_commit` for a vault-wide HEAD. It now asks the
+        service for the document, so `get` is what resolves the commit and
+        `heads` counts those calls.
+        """
+
+        async def get(self, vault, path):
             nonlocal heads
             heads += 1
-            assert vault == "team"
-            return "c" * 40
+            assert (vault, path) == ("team", "legacy.md")
+            return SimpleNamespace(
+                content=f"![shown](/api/assets/{visible})", current_commit="c" * 40,
+            )
 
-        def read_file(self, vault, path, commit):
+        async def get_at_commit(self, vault, path, commit):
             nonlocal reads
             reads += 1
             assert (vault, path, commit) == ("team", "legacy.md", "c" * 40)
-            return f"---\ntitle: Legacy\n---\n![shown](/api/assets/{visible})"
+            return SimpleNamespace(
+                content=f"![shown](/api/assets/{visible})", current_commit="c" * 40,
+            )
 
     row = {
         "path": "legacy.md",
@@ -700,7 +724,7 @@ async def test_legacy_public_document_resolves_head_into_pinned_cache(
     monkeypatch.setattr(
         publication_service,
         "_get_doc_service",
-        lambda: SimpleNamespace(git=_Git()),
+        lambda: _DocService(),
     )
     monkeypatch.setattr(publication_service, "_find_published_document", fake_find)
     try:
