@@ -17,6 +17,15 @@ specifically; the proxy has its own log in
   disappears. Public status, unpublish, and oEmbed follow the same identity.
   Migration 106 adds Native publication bindings and lifecycle enforcement.
 
+### Section-scoped publications
+
+- A section filter that no longer matches resolves to an empty body and an empty
+  image manifest on **every** revision backend, not only the
+  PostgreSQL-authoritative one. The two resolution paths previously disagreed,
+  so the same link disclosed a different amount depending on which backend
+  served it; they now share one rule. The viewer notice says the section is gone
+  rather than announcing a fallback that no longer happens.
+
 ### Native Document drill-down
 
 - Native drill-down and section outlines read the verified current Document
