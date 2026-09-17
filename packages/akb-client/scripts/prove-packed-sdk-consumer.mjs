@@ -60,7 +60,7 @@ try {
   if (installedContract.operations.length !== 20) {
     throw new Error(`installed matrix has ${installedContract.operations.length} operations`);
   }
-  if (installedContract.controlPlane?.length !== 31) {
+  if (installedContract.controlPlane?.length !== 32) {
     throw new Error(`installed control-plane matrix has ${installedContract.controlPlane?.length ?? 0} operations`);
   }
   for (const item of installedContract.operations) {

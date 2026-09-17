@@ -572,6 +572,22 @@
     "packedProof": "controlPlane.appsUninstallInstallation"
   },
   {
+    "operationId": "appsApproveInitialGrant",
+    "method": "post",
+    "path": "/api/v1/apps/{app_id}/installations/{vault_id}/grant",
+    "successSchema": "InstallationProjection",
+    "requestSchema": "InitialGrantApprovalRequest",
+    "facade": {
+      "namespace": "installations",
+      "method": "approveInitialGrant"
+    },
+    "entrypoints": [
+      "./control-plane"
+    ],
+    "rawPrefix": "/apps",
+    "packedProof": "controlPlane.appsApproveInitialGrant"
+  },
+  {
     "operationId": "appsListInventory",
     "method": "get",
     "path": "/api/v1/apps/{app_id}/inventory",

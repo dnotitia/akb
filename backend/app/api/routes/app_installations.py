@@ -6,7 +6,11 @@ import uuid
 
 from fastapi import APIRouter, Depends, Request, Response, status
 
-from app.api.control_plane_models import InstallationCommandRequest, InstallationProjection
+from app.api.control_plane_models import (
+    InitialGrantApprovalRequest,
+    InstallationCommandRequest,
+    InstallationProjection,
+)
 
 from app.api.deps import get_current_app, get_current_user, request_correlation_id
 from app.services.app_identity_service import AppPrincipal
@@ -14,6 +18,7 @@ from app.services.app_installation_service import (
     command_installation,
     get_admin_installation_status,
     get_app_installation_status,
+    approve_initial_installation_grant,
     uninstall_installation,
 )
 from app.services.auth_service import AuthenticatedUser
@@ -57,6 +62,38 @@ async def put_installation(
     else:
         response.status_code = status.HTTP_202_ACCEPTED
     return result
+
+
+@router.post(
+    "/apps/{app_id}/installations/{vault_id}/grant",
+    response_model=InstallationProjection,
+    operation_id="appsApproveInitialGrant",
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={200: {"model": InstallationProjection}},
+    summary="Approve the initial grant for a legacy-adopted app installation",
+)
+async def post_initial_grant(
+    app_id: uuid.UUID,
+    vault_id: uuid.UUID,
+    req: InitialGrantApprovalRequest,
+    request: Request,
+    response: Response,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    result = await approve_initial_installation_grant(
+        app_id,
+        vault_id,
+        baseline_release_id=req.baseline_release_id,
+        capabilities=req.capabilities,
+        user=user,
+        correlation_id=request_correlation_id(request),
+    )
+    _mark_no_store(response)
+    response.status_code = (
+        status.HTTP_200_OK if result["replayed"] else status.HTTP_202_ACCEPTED
+    )
+    return result
+
 
 @router.get(
     "/apps/{app_id}/installations/{vault_id}",

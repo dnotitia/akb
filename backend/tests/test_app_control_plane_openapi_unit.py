@@ -70,7 +70,7 @@ def test_control_plane_fixture_matches_live_operation_contract():
                     == {"$ref": "#/components/schemas/AkbError"}
                 ), f"{operation['operationId']} {status}"
 
-    assert len(operations) == 34
+    assert len(operations) == 35
     assert len(set(operations)) == len(operations)
     for schema_name, expected_schema in fixture["components"]["schemas"].items():
         assert live["components"]["schemas"].get(schema_name) == expected_schema
@@ -110,3 +110,18 @@ def test_registry_openapi_advertises_manifest_shape_and_natural_key_replay_contr
     assert "version" in release_create["description"]
     assert "replayed" in release_create["description"]
     assert "409" in release_create["description"]
+
+
+def test_initial_grant_openapi_advertises_explicit_legacy_approval_contract():
+    schema = app.openapi()
+    operation = schema["paths"][
+        "/api/v1/apps/{app_id}/installations/{vault_id}/grant"
+    ]["post"]
+    assert operation["operationId"] == "appsApproveInitialGrant"
+    assert operation["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/InitialGrantApprovalRequest"
+    }
+    assert schema["components"]["schemas"]["InitialGrantApprovalRequest"]["required"] == [
+        "baseline_release_id",
+        "capabilities",
+    ]

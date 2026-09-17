@@ -151,6 +151,7 @@ const controlResults = [
   await admin.installations.apply(controlApp, controlVault, { release_id: controlRelease, capabilities: ["inventory:read"] }),
   await admin.installations.get(controlApp, controlVault),
   await admin.installations.uninstall(controlApp, controlVault),
+  await admin.installations.approveInitialGrant(controlApp, controlVault, { baseline_release_id: controlRelease, capabilities: ["installation:read"] }),
   await admin.inventory.list(controlApp, { limit: 5 }),
   await admin.inventory.reportObserved(controlApp, { installation_id: "installation-control", observed_generation: 1 }),
   await admin.releases.create(controlApp, { version: "1.0.0", manifest: { steps: [] }, manifest_checksum: "a".repeat(64) }),
@@ -172,7 +173,7 @@ assert.equal(calls[controlStart].headers.authorization, "Bearer packed-app-token
 assert.equal(calls[controlStart + 10].headers.authorization, "Bearer packed-admin-token");
 assert.equal(calls[controlStart + 7].headers["idempotency-key"], "key-app-request");
 assert.equal(calls[controlStart + 9].headers["idempotency-key"], "key-app-resume");
-assert.equal(calls[controlStart + 27].headers["idempotency-key"], "key-admin-request");
+assert.equal(calls[controlStart + 28].headers["idempotency-key"], "key-admin-request");
 
 const rawAt = calls.length;
 await client.graph.request("/raw");
