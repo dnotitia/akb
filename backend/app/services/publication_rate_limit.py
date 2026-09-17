@@ -16,6 +16,45 @@ password-protected publications, and there are none. It stops being tolerable th
 moment one exists, which is the trigger for moving these counters into shared
 storage rather than a rewrite anyone should do speculatively.
 
+Sharing them is not automatically the safer side, which is the other half of why
+this still counts in memory. What it buys is one thing — thresholds that stop
+widening with the replica count. What it costs, and what a port has to answer
+for:
+
+  - **It puts a dependency on a public request path.** `reserve()` is currently a
+    dict operation that cannot fail or stall; it runs before bcrypt on every
+    attempt. Backed by a network store it must choose between failing open (the
+    protection disappears exactly when infrastructure is degraded) and failing
+    closed (a blip becomes "nobody can open a protected publication"). Note that
+    Redis is deliberately NOT on any request path here — `events_publisher` is a
+    background drain and says so: PG stays the source of truth and an outage just
+    accumulates rows. A throttle is a thin reason to cross that line.
+  - **A naive port is worse than per-process.** The atomicity the first design
+    note relies on comes free from the event loop: read-and-bump cannot
+    interleave. Distributed, read-then-write reopens exactly the race that note
+    exists to close. It has to be an atomic increment-and-test — Redis
+    `INCR`/Lua, or an `UPSERT ... RETURNING`.
+  - **It turns the throttle into an amplifier.** One attacker request becomes one
+    round trip to the shared store, and `_by_slug` is a single key per
+    publication, so a flood concentrates on one hot key — row-lock contention on
+    a public path if that store is PostgreSQL.
+  - **Decay and eviction have to be rebuilt.** `_DECAY_SECS` and `_MAX_ENTRIES`
+    live in one place today. Getting their replacement wrong gives back either
+    the permanent lockout the decay exists to prevent, or unbounded growth.
+  - **Restart stops being an escape hatch.** A wrong lockout — from a bug or a
+    misbehaving client — currently dies with the process. Shared and durable, it
+    survives, so an operator needs a way to clear one.
+  - **Tightening has its own false-lockout cost.** The per-slug backstop is
+    effectively 30xN today and would become a real 30. That is the point, but a
+    link opened by several people who each mistype once trips it sooner than it
+    does now, and part of why false lockouts are rare today is that looseness.
+
+If it is done: prefer PostgreSQL over Redis. It is already a request-path
+dependency, so no new availability coupling appears; `UPSERT ... RETURNING`
+gives the atomicity above directly; and the decay logic ports almost unchanged
+as a comparison on stored `last` / `locked_until` columns. The hot-key
+contention is the one cost no store avoids.
+
 Design notes (both from the F2 Codex review):
   - Attempts are counted in `reserve()` BEFORE the (slow, awaited) bcrypt verify,
     so a concurrent burst can't all slip past a stale counter — the Nth in-flight
