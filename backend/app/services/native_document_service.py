@@ -1107,24 +1107,26 @@ class NativeDocumentService(DocumentService):
             break
         # A move changes the path, not the body, so the live set is carried
         # over unchanged; the previous path/revision is what gives the old
-        # HEAD its retention window.
-        move_owner = DocumentAssetOwner(
-            vault_id=vault_id, native_document_id=result.resource_id,
-        )
-        pool = await self._pool()
-        async with pool.acquire() as conn:
-            live_asset_ids = await asset_service.list_live_document_asset_ids(
-                conn, owner=move_owner,
+        # HEAD its retention window. A body naming no image has no live set to
+        # carry, so the same short-circuit as the other write paths applies.
+        if self._mentions_assets(body):
+            move_owner = DocumentAssetOwner(
+                vault_id=vault_id, native_document_id=result.resource_id,
             )
-        await self._sync_body_assets(
-            vault_id=vault_id,
-            resource_id=result.resource_id,
-            path=result.path,
-            revision_id=result.revision_id,
-            asset_ids=live_asset_ids,
-            previous_revision=result.parent_revision_id,
-            previous_path=current.path,
-        )
+            pool = await self._pool()
+            async with pool.acquire() as conn:
+                live_asset_ids = await asset_service.list_live_document_asset_ids(
+                    conn, owner=move_owner,
+                )
+            await self._sync_body_assets(
+                vault_id=vault_id,
+                resource_id=result.resource_id,
+                path=result.path,
+                revision_id=result.revision_id,
+                asset_ids=live_asset_ids,
+                previous_revision=result.parent_revision_id,
+                previous_path=current.path,
+            )
         return DocumentPutResponse(
             uri=doc_uri(vault, result.path),
             vault=vault,

@@ -108,6 +108,9 @@ async def _fresh_schema(tmp_path: Path):
             "097_native_revision_migration_inventory.py",
             "098_native_revision_nul_payload.py",
             "105_bridge_body_digest.py",
+            # The document write path publishes image references, and 107
+            # is what gives a Native document a column to publish into.
+            "107_native_document_asset_refs.py",
         ):
             await _load(filename).migrate(conn=conn)
         await conn.close()
