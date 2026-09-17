@@ -819,6 +819,7 @@ CREATE TABLE IF NOT EXISTS publications (
     -- rule each write has to remember. Match type is the default (MATCH
     -- SIMPLE) so a NULL document_id is exempt even though vault_id is NOT
     -- NULL — MATCH FULL would forbid the NULL and is wrong here.
+    native_document_id UUID,
     document_id UUID,
     CONSTRAINT publications_document_fk
         FOREIGN KEY (document_id, vault_id) REFERENCES documents(id, vault_id)

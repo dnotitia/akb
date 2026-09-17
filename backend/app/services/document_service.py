@@ -320,33 +320,9 @@ def _certified_content_hash(md_content: str) -> str:
     return _body_content_hash(canonical_body)
 
 
-# Newest publication slug for one document — the reverse of publication
-# resolution, and the query behind `is_public` / `public_slug`.
-#
-# Keyed on `publications.document_id`, which since migration 058 is the
-# binding for a document publication: a UUID under a composite
-# FK (document_id, vault_id) → documents(id, vault_id). Matching that
-# cannot answer with a publication belonging to some other document, and
-# cannot answer with one belonging to some other vault.
-#
-# The `resource_uri` branch is a FALLBACK, and only for rows the 058
-# backfill could not bind unambiguously (`document_id IS NULL`). It is kept
-# on purpose: without it those publications would report `is_public: false`
-# on a document whose slug still serves its body — telling an author their
-# document is private while it is reachable is a worse answer than the
-# imprecision the fallback carries. It disappears on its own as those rows
-# are re-published or removed; nothing new lands in it, because
-# `create_publication` refuses a document publication without an id.
-#
-# `vault_id = $1` scopes BOTH branches, and is the part that was missing:
-# the previous query matched `resource_uri` with no vault predicate at all,
-# so its answer was not scoped to the vault being asked about.
-# `document_id = $2` alone would have been enough for the primary branch (the
-# composite FK pins the vault), but the predicate sits on the query so the
-# fallback cannot be wrong either.
-#
-# ORDER BY created_at DESC matches `publishDoc()` in the frontend, which
-# reuses the first entry `listPublications` returns.
+# Reverse publication discovery stays vault scoped. Migration 106 binds Native
+# publications to a stable Resource. Only legacy discovery retains an unbound
+# URI fallback; native public reads require an exact Resource binding.
 _PUBLIC_SLUG_SQL = """
     SELECT slug
       FROM publications
@@ -354,8 +330,19 @@ _PUBLIC_SLUG_SQL = """
        AND resource_type = 'document'
        AND (
              document_id = $2::uuid
-          OR (document_id IS NULL AND resource_uri = $3)
+          OR (document_id IS NULL AND native_document_id IS NULL AND resource_uri = $3)
        )
+     ORDER BY created_at DESC
+     LIMIT 1
+"""
+
+
+_NATIVE_PUBLIC_SLUG_SQL = """
+    SELECT slug
+      FROM publications
+     WHERE vault_id = $1
+       AND resource_type = 'document'
+       AND native_document_id = $2::uuid
      ORDER BY created_at DESC
      LIMIT 1
 """
@@ -367,17 +354,11 @@ async def newest_public_slug(
     vault_id: uuid.UUID,
     document_id: uuid.UUID | None,
     resource_uri: str,
+    native_document_id: uuid.UUID | None = None,
 ) -> str | None:
-    """Newest publication slug bound to one document, or None.
-
-    ``document_id`` may be None for a caller that has no ``documents`` row to
-    name (the native-ledger arm keeps no legacy projection). The primary
-    branch then matches nothing — ``document_id = NULL`` is NULL, not true —
-    and the vault-scoped URI fallback answers. See ``_PUBLIC_SLUG_SQL``.
-
-    One function rather than one query per service on purpose: these were two
-    copies, and both carried the same missing ``vault_id`` predicate.
-    """
+    """Discover a bound publication; only legacy discovery permits URI fallback."""
+    if native_document_id is not None:
+        return await conn.fetchval(_NATIVE_PUBLIC_SLUG_SQL, vault_id, native_document_id)
     return await conn.fetchval(_PUBLIC_SLUG_SQL, vault_id, document_id, resource_uri)
 
 

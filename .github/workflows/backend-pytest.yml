@@ -242,6 +242,8 @@ jobs:
             tests/test_native_revision_m1_payload_placement_migration.py
             tests/concurrency/test_invariants_unit.py
             tests/test_publication_resolution_vault_binding_unit.py
+            tests/test_native_publication_pg.py
+            tests/test_native_publication_binding_pg.py
             tests/test_publication_path_claim_guard_unit.py
             tests/test_external_git_cascade_unit.py
             tests/test_file_idempotent_upload_unit.py
