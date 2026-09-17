@@ -123,15 +123,19 @@ async def init_db(max_retries: int = 10, delay: float = 2.0) -> None:
     PostgreSQL — no extension prerequisites, no dimension placeholder
     substitution.
     """
+    sql = (Path(__file__).parent / "init.sql").read_text()
     for attempt in range(max_retries):
         try:
-            pool = await get_pool()
-            init_sql = Path(__file__).parent / "init.sql"
-            sql = init_sql.read_text()
-            async with pool.acquire() as conn:
-                await conn.execute(sql)
+            # One connection, one lock, both halves. `init.sql` used to run on
+            # the request pool outside the migration lock, and two pods booting
+            # at once deadlocked on the `chunks`/`documents` pair — observed on
+            # a rolling deploy as exit 3, recovered only by the restart.
+            #
+            # It runs on the migration pool now, so the DDL is not subject to
+            # the request pool's 30-second statement timeout either.
             async with _migration_pool() as migration_pool:
-                await _apply_migrations(migration_pool)
+                async with migration_pool.acquire() as conn:
+                    await _run_boot_schema(conn, init_sql=sql)
             return
         except ConnectionRefusedError, asyncpg.CannotConnectNowError, OSError:
             if attempt < max_retries - 1:
@@ -238,17 +242,32 @@ async def _apply_migrations(pool=None) -> None:
     if pool is None:
         pool = await get_pool()
     async with pool.acquire() as conn:
-        # Session lock serializes the read-of-ledger + apply + ledger-write
-        # sequence across API/worker pods during a rolling deployment.
-        await conn.execute("SELECT pg_advisory_lock($1)", _MIGRATION_LOCK_KEY)
-        try:
-            applied = {
-                r["filename"]
-                for r in await conn.fetch("SELECT filename FROM schema_migrations")
-            }
-            await _apply_pending_migrations(conn, applied)
-        finally:
-            await conn.execute("SELECT pg_advisory_unlock($1)", _MIGRATION_LOCK_KEY)
+        await _run_boot_schema(conn)
+
+
+async def _run_boot_schema(conn, *, init_sql: str | None = None) -> None:
+    """Everything a boot does to the schema, on one connection under one lock.
+
+    Session lock serializes the read-of-ledger + apply + ledger-write sequence
+    across API/worker pods during a rolling deployment, and — when the caller
+    passes it — the `init.sql` that runs first.
+
+    The lock must be taken once. `pg_advisory_lock` is re-entrant within a
+    session but not across them, so a caller that held it on one connection and
+    then called a helper that took it on another would wait on itself forever.
+    That is why this is a single function rather than two nested ones.
+    """
+    await conn.execute("SELECT pg_advisory_lock($1)", _MIGRATION_LOCK_KEY)
+    try:
+        if init_sql is not None:
+            await conn.execute(init_sql)
+        applied = {
+            r["filename"]
+            for r in await conn.fetch("SELECT filename FROM schema_migrations")
+        }
+        await _apply_pending_migrations(conn, applied)
+    finally:
+        await conn.execute("SELECT pg_advisory_unlock($1)", _MIGRATION_LOCK_KEY)
 
 
 async def _apply_pending_migrations(conn, applied: set[str]) -> None:

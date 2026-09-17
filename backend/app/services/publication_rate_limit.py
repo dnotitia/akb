@@ -1,11 +1,20 @@
 """In-memory throttle for public-publication password attempts (publish-hardening F2).
 
-The backend runs single-replica (one process, one event loop), so a module-global
-dict is authoritative without cross-process coordination. It resets on restart —
-acceptable, because bcrypt (~250 ms/try, offloaded) *plus* this lockout make
-online brute force of a share password infeasible, and a restart is far rarer than
-a lockout window. Redis is optional here (only the event stream uses it), so we
-deliberately do NOT depend on it.
+A module-global dict counts attempts. It resets on restart — acceptable, because
+bcrypt (~250 ms/try, offloaded) *plus* this lockout make online brute force of a
+share password infeasible, and a restart is far rarer than a lockout window.
+Redis is optional here (only the event stream uses it), so we deliberately do NOT
+depend on it.
+
+**This was written for a single-replica backend, and the backend is no longer
+one.** Each process counts independently, so with N replicas an attacker gets up
+to N times the thresholds below before backing off — the numbers are per process,
+not per deployment. Nothing here detects that; the limits simply widen.
+
+That is tolerable today only because the exposure is empty: the throttle guards
+password-protected publications, and there are none. It stops being tolerable the
+moment one exists, which is the trigger for moving these counters into shared
+storage rather than a rewrite anyone should do speculatively.
 
 Design notes (both from the F2 Codex review):
   - Attempts are counted in `reserve()` BEFORE the (slow, awaited) bcrypt verify,
