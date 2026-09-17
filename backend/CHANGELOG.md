@@ -7,6 +7,17 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### BM25 statistics
+
+- A recompute that cannot take the advisory lock retries briefly instead of
+  waiting a full refresh interval. A rolling restart leaves the replaced pod
+  holding the lock until it drains, so the replacement's first tick could find
+  it held by a process already leaving and then sleep six hours — three
+  restarts in a day left one deployment's statistics fifteen hours stale while
+  the corpus moved on. The retry is bounded and short: a lock still held after
+  it belongs to a recompute that is really running elsewhere, and skipping that
+  one is correct, because it publishes the statistics the tick wanted.
+
 ### MCP transport
 
 - The legacy MCP transport is stateless. Its session lived in a per-process
