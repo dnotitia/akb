@@ -1263,7 +1263,7 @@ class Settings(BaseModel):
     # Vector store (hybrid dense + BM25). Driver-pluggable.
     #
     # The two `seahorse-*` drivers are intentionally separate:
-    #   - `seahorse-cloud` talks to the managed Seahorse Cloud BFF +
+    #   - `seahorse-cloud` talks to the managed Seahorse Cloud management API +
     #     per-table data-plane host (zero infrastructure to run).
     #   - `seahorse-db`    talks to a self-hosted SeahorseDB Coral
     #     coordinator (single HTTP URL; you run Coral + Writer +
@@ -1295,11 +1295,15 @@ class Settings(BaseModel):
     vector_api_key: str = ""
     vector_collection: str = "chunks"
 
-    # Seahorse Cloud driver settings. Two-plane API: management (BFF)
+    # Seahorse Cloud driver settings. Two-plane API: management
     # for table lifecycle + per-table data-plane host. The driver
     # discovers the data-plane host from the management lookup; only
     # set the management URL + token + tenant + table identifier.
-    seahorse_cloud_management_url: str = "https://console.seahorse.dnotitia.ai/bff"
+    # The management prefix is `/api`: the legacy `/bff` prefix no
+    # longer routes (every path under it answers an unconditional 401,
+    # #524), so a default pointing there fails in `ensure_collection`
+    # with a message about a missing authorization header.
+    seahorse_cloud_management_url: str = "https://console.seahorse.dnotitia.ai/api"
     seahorse_cloud_token: str = ""  # secret.yaml — Bearer (shsk_...)
     seahorse_cloud_tenant_uuid: str = ""
     seahorse_cloud_table_name: str = ""  # one of (table_name, table_uuid) required
