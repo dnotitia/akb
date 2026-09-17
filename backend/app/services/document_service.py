@@ -406,6 +406,20 @@ def validate_vault_name(name: str) -> None:
 
 class DocumentService:
     def __init__(self, git: GitService | None = None):
+        # The Git arm's storage handle, NOT part of the service interface.
+        # `NativeDocumentService` subclasses this and deliberately does not
+        # call `super().__init__()`, so it has no `self.git` — its bodies live
+        # in PostgreSQL and Git is only a fallback for unmigrated bridged
+        # revisions. Reaching for `.git` through a composed document service
+        # therefore raises on a `postgres_native` deployment; that is how
+        # every public document publication became a 500 for a long time.
+        #
+        # Giving the Native subclass a handle to silence that would be worse:
+        # an inherited write path would then commit to a store the deployment
+        # does not read from, quietly. A loud AttributeError is the better
+        # failure, and callers outside this module should use the interface
+        # (`get`, `get_at_commit`, ...) instead.
+        # Pinned by tests/test_publication_document_service_contract_unit.py.
         self.git = git or GitService()
 
     async def _repos(self):

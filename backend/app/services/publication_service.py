@@ -27,7 +27,6 @@ from typing import Any
 
 import asyncpg
 import bcrypt
-import frontmatter
 
 from app.config import settings
 from app.db.postgres import get_pool
@@ -1166,20 +1165,35 @@ class _UncacheableDocumentBody(Exception):
         self.resolved = resolved
 
 
-def _read_document_body_uncached(
+async def _read_document_body_uncached(
     vault_name: str,
     path: str,
     commit_hash: str | None,
     section_filter: str | None,
 ) -> _ResolvedDocumentBody:
-    """Resolve one exact public representation on a worker thread."""
+    """Resolve one exact public representation through the document service.
+
+    This asks the service for a body, not the storage the service happens to
+    sit on. It used to reach for `.git` and read the working tree directly,
+    which broke in three ways at once on a PostgreSQL-authoritative
+    deployment: the attribute is not there (the Native service does not carry
+    one), the bytes it wanted have moved into the payload store, and a vault
+    whose external Git has been retired has no working tree left to read.
+
+    Going through the service also inherits `_parse_markdown`, which recovers
+    a body from the malformed leading YAML that the retired importer could
+    persist — a strict `frontmatter.loads` raised on those.
+    """
+    service = _get_doc_service()
     body = ""
     content_unavailable = False
     try:
-        raw = _get_doc_service().git.read_file(vault_name, path, commit_hash)
-        if raw:
-            body = frontmatter.loads(raw).content
-    except (FileNotFoundError, OSError) as exc:
+        if commit_hash:
+            document = await service.get_at_commit(vault_name, path, commit_hash)
+        else:
+            document = await service.get(vault_name, path)
+        body = document.content or ""
+    except (NotFoundError, FileNotFoundError, OSError) as exc:
         logger.warning("Document content unavailable for publication: %s", exc)
         content_unavailable = True
         body = "*Document content is no longer available.*"
@@ -1234,7 +1248,7 @@ class _PinnedDocumentAssetCache:
 _PINNED_DOCUMENT_ASSET_CACHE = _PinnedDocumentAssetCache(maxsize=64)
 
 
-def _read_pinned_document_asset_ids(
+async def _read_pinned_document_asset_ids(
     vault_name: str,
     path: str,
     commit_hash: str,
@@ -1245,7 +1259,7 @@ def _read_pinned_document_asset_ids(
     cached = _PINNED_DOCUMENT_ASSET_CACHE.get(key)
     if cached is not None:
         return cached
-    resolved = _read_document_body_uncached(
+    resolved = await _read_document_body_uncached(
         vault_name, path, commit_hash, section_filter,
     )
     if resolved.content_unavailable:
@@ -1262,10 +1276,13 @@ async def _resolve_document_commit(doc_row) -> str | None:
     if commit_hash is None:
         # Legacy rows used floating HEAD. Resolve it once per request so both
         # body and manifest helpers can address an immutable representation.
-        commit_hash = await asyncio.to_thread(
-            _get_doc_service().git.current_commit,
-            doc_row["vault_name"],
+        # The document's own commit, not the vault tip. Reaching for
+        # `.git.current_commit` asked the storage for a vault-wide HEAD and
+        # is not available on a PostgreSQL-authoritative service at all.
+        document = await _get_doc_service().get(
+            doc_row["vault_name"], doc_row["path"],
         )
+        commit_hash = document.current_commit
     return commit_hash
 
 
@@ -1274,12 +1291,8 @@ async def _resolve_document_body(
     section_filter: str | None,
 ) -> _ResolvedDocumentBody:
     commit_hash = await _resolve_document_commit(doc_row)
-    resolved = await asyncio.to_thread(
-        _read_document_body_uncached,
-        doc_row["vault_name"],
-        doc_row["path"],
-        commit_hash,
-        section_filter,
+    resolved = await _read_document_body_uncached(
+        doc_row["vault_name"], doc_row["path"], commit_hash, section_filter,
     )
     if commit_hash is not None and not resolved.content_unavailable:
         _PINNED_DOCUMENT_ASSET_CACHE.put(
@@ -1295,21 +1308,13 @@ async def _resolve_document_asset_ids(
 ) -> frozenset[uuid.UUID]:
     commit_hash = await _resolve_document_commit(doc_row)
     if commit_hash is None:
-        resolved = await asyncio.to_thread(
-            _read_document_body_uncached,
-            doc_row["vault_name"],
-            doc_row["path"],
-            None,
-            section_filter,
+        resolved = await _read_document_body_uncached(
+            doc_row["vault_name"], doc_row["path"], None, section_filter,
         )
         return resolved.asset_ids
     try:
-        return await asyncio.to_thread(
-            _read_pinned_document_asset_ids,
-            doc_row["vault_name"],
-            doc_row["path"],
-            commit_hash,
-            section_filter,
+        return await _read_pinned_document_asset_ids(
+            doc_row["vault_name"], doc_row["path"], commit_hash, section_filter,
         )
     except _UncacheableDocumentBody as exc:
         return exc.resolved.asset_ids
