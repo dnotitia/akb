@@ -379,6 +379,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "106_native_document_publications.py",  # bind Native public links to vault-scoped Document identity
         "107_native_document_asset_refs.py",  # let an inline image be owned by a Native document
         "108_table_row_commit_cas.py",  # row_commit CAS token + bump trigger on vt_* tables
+        "109_users_email_lower_uniq.py",  # case-insensitive uniqueness on users.email (#551)
     ):
         if filename in applied:
             continue
