@@ -7,6 +7,18 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Indexing
+
+- A NUL byte in a body no longer costs the document its place in ranked search.
+  Bodies live in the payload store, which accepts the byte; PostgreSQL `text`
+  does not, so indexing raised `CharacterNotInRepertoireError` on every attempt
+  until the retry ceiling abandoned the intent, leaving the document readable
+  and greppable but absent from ranked search. The byte is now removed where
+  every request model already normalizes user text, and again where chunks are
+  built — the second boundary is what lets bodies stored before this be indexed
+  without anyone finding and rewriting them. Nothing else about the text
+  changes, and a write is never refused for carrying one.
+
 ### MCP transport
 
 - The legacy MCP transport is stateless. Its session lived in a per-process

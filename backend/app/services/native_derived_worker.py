@@ -74,6 +74,22 @@ def source_type_for_surface(surface: str) -> str:
         raise ValueError(f"unsupported native derived surface: {surface}") from None
 
 
+def _indexable(canonical_text: str) -> str:
+    """Drop what PostgreSQL `text` cannot hold from a body already at rest.
+
+    The write boundary removes NUL now (`to_nfc`), so nothing new arrives
+    carrying one. Bodies stored before that do, and they live in the payload
+    store, which accepts the byte -- so the document reads back intact while
+    every indexing attempt raises `CharacterNotInRepertoireError`, retries to
+    the ceiling and is abandoned (akb#527). Sanitising here is what lets those
+    documents be indexed without anyone having to find and rewrite them.
+
+    Only the byte goes. An index missing eight NULs and a document missing its
+    whole entry in ranked search are not comparable losses.
+    """
+    return canonical_text.replace("\x00", "")
+
+
 def build_native_document_chunks(
     *,
     vault_name: str,
@@ -81,7 +97,7 @@ def build_native_document_chunks(
     canonical_text: str,
 ) -> list[Chunk]:
     """Build the real AKB chunk representation from one verified native body."""
-    metadata, body = _parse_markdown(canonical_text)
+    metadata, body = _parse_markdown(_indexable(canonical_text))
     if not body.strip():
         return []
     title = str(metadata.get("title") or path.rsplit("/", 1)[-1])
@@ -110,6 +126,7 @@ def build_native_file_chunks(
     so the whole verified body is chunked on size alone. The header carries
     File addressing (``akb://…/file/<uuid>``), not a Document path.
     """
+    canonical_text = _indexable(canonical_text)
     if not canonical_text.strip():
         return []
     collection = path.rsplit("/", 1)[0] if "/" in path else None
