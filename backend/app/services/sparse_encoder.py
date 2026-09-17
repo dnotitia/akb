@@ -867,12 +867,41 @@ async def _should_recompute() -> bool:
     return False
 
 
-async def _refresh_tick() -> int:
+# A skip costs a whole `idle_secs` (six hours), and there is exactly one case
+# where that is the wrong price: a rolling restart. The replaced pod keeps its
+# PostgreSQL session -- and therefore the advisory lock -- until it finishes
+# draining, so the replacement's first tick can find the lock held by a process
+# that is already leaving. Retrying across that window costs a few seconds and
+# saves an interval.
+#
+# It is deliberately bounded and short. A lock still held after this is held by
+# a recompute that is genuinely running on another replica, and skipping THAT is
+# correct -- it will publish the stats this tick wanted. We are outlasting a
+# handover, not waiting out a peer's work.
+_SKIPPED_RETRY_SECS = 20.0
+_SKIPPED_RETRIES = 3
+
+
+async def _refresh_tick(retry_secs: float = _SKIPPED_RETRY_SECS) -> int:
     """One refresher iteration. Returns 0 so `BackfillRunner` always
     treats us as idle and respects the configured `idle_secs` cadence
-    rather than busy-looping."""
-    if await _should_recompute():
-        await recompute_stats()
+    rather than busy-looping.
+
+    `BackfillRunner` has two outcomes: 0 sleeps for the configured interval,
+    anything else drains immediately. Neither fits "could not run, try again
+    shortly", and `configure_idle_secs` refuses while the runner is live, so
+    the wait belongs here.
+    """
+    if not await _should_recompute():
+        return 0
+    for attempt in range(_SKIPPED_RETRIES + 1):
+        if not (await recompute_stats()).get("skipped"):
+            return 0
+        if attempt < _SKIPPED_RETRIES:
+            await asyncio.sleep(retry_secs)
+    logger.info(
+        "BM25 recompute deferred: the lock is held by a running recompute"
+    )
     return 0
 
 
