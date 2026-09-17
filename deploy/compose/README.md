@@ -15,11 +15,13 @@ query tokenizer. An unexpectedly exited worker restarts automatically via
 `unless-stopped`; an explicit operator stop remains respected. A health check
 reports a stalled process but does not itself restart an unhealthy container.
 
-The example configuration connects the bundled MinIO service internally and
-uses `localhost:9000` for browser-signed URLs. For remote access, change
-`public_base_url` and `s3_public_url` to the actual browser-reachable origins.
-Replace the example credentials outside local development. Set both S3 URLs
-blank to disable object storage, or supply your external S3 settings.
+The example configuration connects the bundled MinIO service internally. For
+remote access, change `public_base_url` to the actual browser-reachable origin.
+`s3_public_url` is retained and ignored: bytes reach a client through the API,
+never straight from the store, so no URL is signed for a browser to follow.
+Replace the example credentials outside local development. Object storage is
+off when `s3_endpoint_url` is blank and `s3_auth_mode` is not `default_chain`;
+otherwise supply your external S3 settings.
 
 ## Existing installations
 

@@ -93,9 +93,10 @@ docker run --rm --stop-timeout 120 -p 8080:8080 \
 The bundled database, MinIO credentials/bucket, Redis endpoint, Git path and
 local-auth signer paths are owned by the demo bootstrap; conflicting overrides
 are rejected. Use Compose or Kubernetes for externally managed infrastructure
-and SSO. `s3_public_url` defaults to `public_base_url`, so downloads use the
-public nginx endpoint rather than the container's internal MinIO address.
-For remote access, configure the actual public origin.
+and SSO. Downloads are served by the API, not by the object store, so the
+store needs no browser-reachable address; `s3_public_url` is retained and
+ignored. For remote access, configure `public_base_url` as the actual public
+origin.
 
 API and worker have separate processes and 45-second shutdown windows.
 `tokenizer_processes` in app.yaml controls the worker pool; the API has one
