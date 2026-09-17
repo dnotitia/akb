@@ -41,9 +41,14 @@ def test_update_with_matching_row_commit_applies() -> None:
     assert "aaa" in compiled.params
 
 
-def test_update_with_stale_row_commit_is_rejected_at_compile() -> None:
-    # Missing expected_row_commit on a CAS-guarded table is a caller
-    # error at compile time (fail closed, never a broad silent write).
+def test_update_without_a_token_compiles_unguarded() -> None:
+    """Opt-in: the guard is what the caller asks for, not what it must supply.
+
+    A caller that sends no token gets the statement this endpoint has always
+    produced — its own filter, no `row_commit` predicate, and no 409 on a
+    zero-row match. The token buys lost-update detection; its absence costs
+    only that.
+    """
     compiled = compile_update_rows(
         vault_name="eng",
         table_name="incidents",
@@ -51,16 +56,18 @@ def test_update_with_stale_row_commit_is_rejected_at_compile() -> None:
         body={"title": "fixed"},
         query_params=[("id", "eq.00000000-0000-0000-0000-000000000001")],
     )
-    assert isinstance(compiled, dict)
-    assert compiled["code"] == "row_commit_required"
+    assert not isinstance(compiled, dict), compiled
+    assert compiled.cas_guarded is False
+    assert "row_commit" not in compiled.sql
 
 
-def test_delete_with_stale_row_commit_is_rejected_at_compile() -> None:
+def test_delete_without_a_token_compiles_unguarded() -> None:
     compiled = compile_delete_rows(
         vault_name="eng",
         table_name="incidents",
         columns=COLUMNS,
         query_params=[("id", "eq.00000000-0000-0000-0000-000000000001")],
     )
-    assert isinstance(compiled, dict)
-    assert compiled["code"] == "row_commit_required"
+    assert not isinstance(compiled, dict), compiled
+    assert compiled.cas_guarded is False
+    assert "row_commit" not in compiled.sql

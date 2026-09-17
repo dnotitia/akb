@@ -33,7 +33,6 @@ from app.util.errors import (
     INVALID_ARGUMENT,
     NO_UNIQUE_CONSTRAINT,
     PERMISSION_DENIED,
-    ROW_COMMIT_REQUIRED,
     SQL_ERROR,
     UNFILTERED_MUTATION,
     UNIQUE_VIOLATION,
@@ -403,27 +402,32 @@ def compile_update_rows(
         return where_or_error
     where_sql = where_or_error
 
-    # Row CAS: pin the mutation to the caller's observed token. Absent
-    # token = caller error (fail closed, never a broad silent write);
-    # wrong token = zero matched rows → 409 at execution (see
-    # _execute_mutation's affected_rows check). NOTE (forgeability):
-    # per-user roles hold table-level UPDATE (no column REVOKEs), so a
-    # caller CAN set row_commit via raw akb_sql today. That writes a
-    # token nobody else holds (trigger overwrites it on next UPDATE
-    # anyway) — it can only deny oneself, never forge another writer's
-    # match. Compiled paths (REST/AST) reject row_commit outright
-    # (reserved + immutable sets above).
+    # Row CAS is opt-in. A caller that sends `expected_row_commit` pins the
+    # mutation to the row it observed: a stale token matches nothing and
+    # surfaces as 409 (see `_execute_mutation`'s affected_rows check) instead
+    # of silently winning a lost update. A caller that sends none gets the
+    # unguarded mutation this endpoint has always performed — its own filter,
+    # unchanged, with last-write-wins semantics.
+    #
+    # Requiring the token instead would be the stronger contract, and it is
+    # where this should end up. It cannot start there: the first-party web UI
+    # and the generated client both call PATCH/DELETE without a token, so
+    # requiring it makes row editing return 400 for every existing caller. The
+    # order is UI first, then the client, then this. Flipping it back is
+    # re-adding a rejection here once nothing reaches it without a token.
+    #
+    # NOTE (forgeability): per-user roles hold table-level UPDATE (no column
+    # REVOKEs), so a caller CAN set row_commit via raw akb_sql today. That
+    # writes a token nobody else holds (the trigger overwrites it on the next
+    # UPDATE anyway) — it can only deny oneself, never forge another writer's
+    # match. Compiled paths (REST/AST) reject row_commit outright (reserved +
+    # immutable sets above).
     cas_or_error = _extract_expected_row_commit(query_params)
     if isinstance(cas_or_error, dict):
         return cas_or_error
-    if cas_or_error is None:
-        return err(
-            "UPDATE requires expected_row_commit (row CAS): re-read the row "
-            "and retry with its current row_commit.",
-            code=ROW_COMMIT_REQUIRED,
-            hint="Add ?expected_row_commit=<token> (or eq.<token>) alongside the row filter.",
-        )
-    where_sql = f"({where_sql}) AND row_commit = {_add_param(params, cas_or_error)}"
+    cas_guarded = cas_or_error is not None
+    if cas_guarded:
+        where_sql = f"({where_sql}) AND row_commit = {_add_param(params, cas_or_error)}"
 
     fetch = _prefer_return_representation(prefer_header)
     projections: list[Any] = []
@@ -444,7 +448,7 @@ def compile_update_rows(
         fetch=fetch,
         status_code=200 if fetch else 204,
         projections=projections,
-        cas_guarded=True,
+        cas_guarded=cas_guarded,
     )
 
 
@@ -469,15 +473,11 @@ def _compile_update_ast(
     where_or_error = _compile_ast_mutation_where(ast, column_meta, params)
     if isinstance(where_or_error, dict):
         return where_or_error
+    # Opt-in, as on the REST paths.
     cas_token = ast.get("cas", ast.get("expected_row_commit"))
-    if not isinstance(cas_token, str) or not cas_token:
-        return err(
-            "AST update requires cas (row CAS): re-read the row and retry "
-            "with its current row_commit.",
-            code=ROW_COMMIT_REQUIRED,
-            hint="Add {\"cas\": \"<token>\"} alongside the AST filter.",
-        )
-    where_or_error = f"({where_or_error}) AND row_commit = {_add_param(params, cas_token)}"
+    cas_guarded = isinstance(cas_token, str) and bool(cas_token)
+    if cas_guarded:
+        where_or_error = f"({where_or_error}) AND row_commit = {_add_param(params, cas_token)}"
     fetch = _prefer_return_representation(prefer_header)
     projections: list[Any] = []
     returning_sql = ""
@@ -496,7 +496,7 @@ def _compile_update_ast(
         fetch=fetch,
         status_code=200 if fetch else 204,
         projections=projections,
-        cas_guarded=True,
+        cas_guarded=cas_guarded,
     )
 
 
@@ -515,17 +515,13 @@ def compile_delete_rows(
         return where_or_error
     where_sql = where_or_error
 
+    # Opt-in, as on the UPDATE path above.
     cas_or_error = _extract_expected_row_commit(query_params)
     if isinstance(cas_or_error, dict):
         return cas_or_error
-    if cas_or_error is None:
-        return err(
-            "DELETE requires expected_row_commit (row CAS): re-read the row "
-            "and retry with its current row_commit.",
-            code=ROW_COMMIT_REQUIRED,
-            hint="Add ?expected_row_commit=<token> (or eq.<token>) alongside the row filter.",
-        )
-    where_sql = f"({where_sql}) AND row_commit = {_add_param(params, cas_or_error)}"
+    cas_guarded = cas_or_error is not None
+    if cas_guarded:
+        where_sql = f"({where_sql}) AND row_commit = {_add_param(params, cas_or_error)}"
 
     fetch = _prefer_return_representation(prefer_header)
     projections: list[Any] = []
@@ -543,7 +539,7 @@ def compile_delete_rows(
         fetch=fetch,
         status_code=200 if fetch else 204,
         projections=projections,
-        cas_guarded=True,
+        cas_guarded=cas_guarded,
     )
 
 
@@ -561,15 +557,11 @@ def _compile_delete_ast(
     where_or_error = _compile_ast_mutation_where(ast, column_meta, params)
     if isinstance(where_or_error, dict):
         return where_or_error
+    # Opt-in, as on the REST paths.
     cas_token = ast.get("cas", ast.get("expected_row_commit"))
-    if not isinstance(cas_token, str) or not cas_token:
-        return err(
-            "AST delete requires cas (row CAS): re-read the row and retry "
-            "with its current row_commit.",
-            code=ROW_COMMIT_REQUIRED,
-            hint="Add {\"cas\": \"<token>\"} alongside the AST filter.",
-        )
-    where_or_error = f"({where_or_error}) AND row_commit = {_add_param(params, cas_token)}"
+    cas_guarded = isinstance(cas_token, str) and bool(cas_token)
+    if cas_guarded:
+        where_or_error = f"({where_or_error}) AND row_commit = {_add_param(params, cas_token)}"
     fetch = _prefer_return_representation(prefer_header)
     projections: list[Any] = []
     returning_sql = ""
@@ -585,7 +577,7 @@ def _compile_delete_ast(
         fetch=fetch,
         status_code=200 if fetch else 204,
         projections=projections,
-        cas_guarded=True,
+        cas_guarded=cas_guarded,
     )
 
 
