@@ -930,6 +930,20 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Row-CAS token mint (migration 107 + create-time DDL). Every UPDATE on a
+-- vault data table gets a fresh `row_commit`, so a concurrent writer
+-- holding a stale token fails its `expected_row_commit` match (409)
+-- instead of silently winning a lost update. SECURITY INVOKER, same
+-- reasoning as akb_set_updated_at above (gen_random_uuid needs no
+-- privilege beyond pgcrypto, already installed).
+CREATE OR REPLACE FUNCTION akb_bump_row_commit()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.row_commit = gen_random_uuid()::TEXT;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
 -- Personal notifications: durable delivery work is independent of event retention.
 CREATE TABLE IF NOT EXISTS notification_work (
  id BIGSERIAL PRIMARY KEY, source_key TEXT UNIQUE NOT NULL, kind TEXT NOT NULL,
