@@ -12,7 +12,35 @@ from mcp_catalog.runner import _build_artifact_hash_input, compare_artifacts, pl
 ROOT = Path(__file__).parents[1]
 
 
-def _trials(*, candidate: bool) -> list[dict]:
+def _execution_evidence(manifest: dict) -> dict:
+    events: list[dict] = []
+    sequence = 0
+    for repeat_index in range(1, 3):
+        for task_id in ("task-a", "task-b"):
+            for order_position, arm in enumerate(
+                planned_arm_order(task_id, repeat_index, manifest["paired_order_seed"])
+            ):
+                sequence += 1
+                events.append(
+                    {
+                        "sequence": sequence,
+                        "cell": "primary:http",
+                        "task_id": task_id,
+                        "repeat_index": repeat_index,
+                        "arm": arm,
+                        "order_position": order_position,
+                    }
+                )
+    return {
+        "mode": "counterbalanced_task_repeat",
+        "seed": manifest["paired_order_seed"],
+        "complete": True,
+        "events": events,
+        "reused": [],
+    }
+
+
+def _trials(manifest: dict, *, candidate: bool) -> list[dict]:
     result: list[dict] = []
     task_ids = ("task-a", "task-b")
     for task_id in task_ids:
@@ -25,6 +53,18 @@ def _trials(*, candidate: bool) -> list[dict]:
                 model_id="model",
                 transport="http",
                 repeat_index=repeat_index,
+                paired_order_position=planned_arm_order(
+                    task_id,
+                    repeat_index,
+                    manifest["paired_order_seed"],
+                ).index("candidate" if candidate else "baseline"),
+                paired_execution_sequence=next(
+                    item["sequence"]
+                    for item in _execution_evidence(manifest)["events"]
+                    if item["task_id"] == task_id
+                    and item["repeat_index"] == repeat_index
+                    and item["arm"] == ("candidate" if candidate else "baseline")
+                ),
                 first_logical_operation="read",
                 first_action_accuracy=True,
                 argument_validity=True,
@@ -73,8 +113,19 @@ def _artifact(manifest: dict, *, candidate: bool) -> dict:
         },
         "runs": {
             "primary:http": {
-                "trials": _trials(candidate=candidate),
+                "trials": _trials(manifest, candidate=candidate),
             }
+        },
+        "paired_execution": _execution_evidence(manifest),
+        "paired_budget_used": {
+            "model_requests": 8,
+            "input_tokens": 720,
+            "output_tokens": 80,
+            "total_tokens": 800,
+            "cost_usd": 0.01,
+            "wall_seconds": 1.0,
+            "model_work_seconds": 1.0,
+            "max_total_cost_usd": 50.0,
         },
     }
     artifact["artifact_hash_input"] = deepcopy(_build_artifact_hash_input(artifact, trial_order=[]))
@@ -118,6 +169,19 @@ def test_incomplete_arm_artifact_cannot_be_paired() -> None:
         compare_artifacts(baseline, candidate)
 
 
+def test_comparison_rejects_independent_arm_runs_without_execution_order_evidence() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json").model_dump(mode="json")
+    baseline = _artifact(manifest, candidate=False)
+    candidate = _artifact(manifest, candidate=True)
+    baseline.pop("paired_execution")
+    candidate.pop("paired_execution")
+    _seal(baseline)
+    _seal(candidate)
+
+    with pytest.raises(ValueError, match="shared execution evidence"):
+        compare_artifacts(baseline, candidate)
+
+
 def test_preregistered_arm_order_is_counterbalanced_across_repeats() -> None:
     first = planned_arm_order("read-vaults-en", 1, "registered-seed")
     second = planned_arm_order("read-vaults-en", 2, "registered-seed")
@@ -142,3 +206,20 @@ def test_provider_distribution_imbalance_downgrades_comparison_to_inconclusive()
     assert result["gate"]["status"] == "inconclusive"
     assert result["gate"]["checks"]["provider_distribution_balanced"] is False
     assert result["gate"]["provider_sensitivity"]["maximum_share_difference"] == 1.0
+
+
+def test_discouraged_preflight_is_a_paired_semantic_behavior_metric() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json").model_dump(mode="json")
+    baseline = _artifact(manifest, candidate=False)
+    candidate = _artifact(manifest, candidate=True)
+    for trial in baseline["runs"]["primary:http"]["trials"]:
+        trial["discouraged_preflight_calls"] = 1
+    _seal(baseline)
+    _seal(candidate)
+
+    result = compare_artifacts(baseline, candidate)
+    metric = result["paired"]["primary:http"]["metrics"]["discouraged_preflight_calls"]
+
+    assert metric["baseline_mean"] == 1.0
+    assert metric["candidate_mean"] == 0.0
+    assert result["paired"]["primary:http"]["gate"]["semantic_behavior_improvement"] is True

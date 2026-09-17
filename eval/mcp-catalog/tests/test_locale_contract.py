@@ -11,7 +11,7 @@ import pytest
 from mcp_catalog.checkpoint import CheckpointError, CheckpointHeader, CheckpointKey, CheckpointStore
 from mcp_catalog.contracts import hash_json, load_run_manifest, load_task_corpus
 from mcp_catalog.execution import ToolCallRecord, ToolCallRecorder, TrialOutcome, bind_tool_calls, response_matches_rubric
-from mcp_catalog.runner import _build_artifact_hash_input, compare_artifacts
+from mcp_catalog.runner import _build_artifact_hash_input, compare_artifacts, planned_arm_order
 from mcp_catalog.runtime import StateObservation
 
 
@@ -763,6 +763,24 @@ def test_keyword_match_cannot_override_a_failed_deterministic_state_contract() -
 
 def _comparison_artifact(manifest: dict, *, candidate: bool) -> dict:
     arm = "candidate" if candidate else "baseline"
+    events: list[dict] = []
+    sequence = 0
+    for repeat_index in range(1, 4):
+        for task_id in ("read-vaults-ko", "read-vaults-en"):
+            for order_position, planned_arm in enumerate(
+                planned_arm_order(task_id, repeat_index, manifest["paired_order_seed"])
+            ):
+                sequence += 1
+                events.append(
+                    {
+                        "sequence": sequence,
+                        "cell": "primary:http",
+                        "task_id": task_id,
+                        "repeat_index": repeat_index,
+                        "arm": planned_arm,
+                        "order_position": order_position,
+                    }
+                )
     trials: list[dict] = []
     for task_id, locale in (("read-vaults-ko", "ko-KR"), ("read-vaults-en", "en-US")):
         for repeat_index in range(1, 4):
@@ -776,6 +794,18 @@ def _comparison_artifact(manifest: dict, *, candidate: bool) -> dict:
                     model_id="model",
                     transport="http",
                     repeat_index=repeat_index,
+                    paired_order_position=planned_arm_order(
+                        task_id,
+                        repeat_index,
+                        manifest["paired_order_seed"],
+                    ).index(arm),
+                    paired_execution_sequence=next(
+                        item["sequence"]
+                        for item in events
+                        if item["task_id"] == task_id
+                        and item["repeat_index"] == repeat_index
+                        and item["arm"] == arm
+                    ),
                     first_logical_operation="list",
                     first_material_operation="list",
                     first_action_accuracy=True,
@@ -812,6 +842,23 @@ def _comparison_artifact(manifest: dict, *, candidate: bool) -> dict:
         "locale_metrics": {},
         "catalogs": {"http:default": {"catalog_token_estimate": 100 if not candidate else 50}},
         "runs": {"primary:http": {"trials": trials}},
+        "paired_execution": {
+            "mode": "counterbalanced_task_repeat",
+            "seed": manifest["paired_order_seed"],
+            "complete": True,
+            "events": events,
+            "reused": [],
+        },
+        "paired_budget_used": {
+            "model_requests": 12,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.01,
+            "wall_seconds": 1.0,
+            "model_work_seconds": 1.0,
+            "max_total_cost_usd": 50.0,
+        },
     }
     _seal_comparison_artifact(artifact)
     return artifact

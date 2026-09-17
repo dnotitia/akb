@@ -9,10 +9,11 @@ import os
 import time
 from collections.abc import Mapping
 from collections import Counter, defaultdict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Literal, cast
+from typing import Any, AsyncIterator, Awaitable, Callable, Literal, cast
 
 from .catalog import capture_catalog, input_schemas_from_catalog
 from .checkpoint import (
@@ -314,6 +315,174 @@ class CredentialResolver:
         return tuple(dict.fromkeys(value for value in values if value))
 
 
+@dataclass(frozen=True, slots=True)
+class PairedExecutionTurn:
+    cell: str
+    task_id: str
+    repeat_index: int
+    arm: ArmName
+    order_position: int
+    execution_sequence: int
+
+
+class PairedArmCoordinator:
+    """Gate real trial execution by the preregistered per-cell arm order."""
+
+    def __init__(self, manifest: BenchmarkRunManifest, tasks: list[TaskManifest]) -> None:
+        self.manifest = manifest
+        self.tasks = tasks
+        self._schedule: dict[str, list[tuple[str, int, ArmName]]] = {}
+        for model in manifest.models:
+            for transport in manifest.transports:
+                cell = f"{model.class_name}:{transport}"
+                self._schedule[cell] = [
+                    (task.id, repeat_index, arm)
+                    for repeat_index in range(1, manifest.repeats + 1)
+                    for task in tasks
+                    if transport in task.fixture.transports
+                    for arm in planned_arm_order(task.id, repeat_index, manifest.paired_order_seed)
+                ]
+        self._positions = {cell: 0 for cell in self._schedule}
+        self._registered: set[ArmName] = set()
+        self._reused: dict[ArmName, set[tuple[str, str, int]]] = {
+            "baseline": set(),
+            "candidate": set(),
+        }
+        self._events: list[dict[str, Any]] = []
+        self._sequence = 0
+        self._condition = asyncio.Condition()
+
+    async def register_arm(
+        self,
+        arm: ArmName,
+        reused: Mapping[tuple[str, str, int], TrialOutcome],
+    ) -> None:
+        async with self._condition:
+            if arm in self._registered:
+                raise RuntimeContractError(f"paired arm {arm} registered twice")
+            for identity, outcome in reused.items():
+                cell, task_id, repeat_index = identity
+                expected = planned_arm_order(task_id, repeat_index, self.manifest.paired_order_seed)
+                if outcome.paired_order_position != expected.index(arm):
+                    raise RuntimeContractError(
+                        f"paired resume evidence is missing or invalid for {cell}:{task_id}:{repeat_index}:{arm}"
+                    )
+                self._reused[arm].add(identity)
+            self._registered.add(arm)
+            if self._registered == {"baseline", "candidate"}:
+                self._validate_reused_prefixes()
+                for cell in self._schedule:
+                    self._advance_reused(cell)
+            self._condition.notify_all()
+
+    def _validate_reused_prefixes(self) -> None:
+        for cell, schedule in self._schedule.items():
+            gap_seen = False
+            for task_id, repeat_index, arm in schedule:
+                reused = (cell, task_id, repeat_index) in self._reused[arm]
+                if not reused:
+                    gap_seen = True
+                elif gap_seen:
+                    raise RuntimeContractError(
+                        f"paired resume checkpoint order is not a completed prefix for {cell}"
+                    )
+
+    async def wait_until_registered(self) -> None:
+        async with self._condition:
+            await self._condition.wait_for(lambda: self._registered == {"baseline", "candidate"})
+
+    def _advance_reused(self, cell: str) -> None:
+        schedule = self._schedule[cell]
+        while self._positions[cell] < len(schedule):
+            task_id, repeat_index, arm = schedule[self._positions[cell]]
+            if (cell, task_id, repeat_index) not in self._reused[arm]:
+                break
+            self._positions[cell] += 1
+
+    @asynccontextmanager
+    async def turn(
+        self,
+        *,
+        cell: str,
+        task_id: str,
+        repeat_index: int,
+        arm: ArmName,
+    ) -> AsyncIterator[PairedExecutionTurn]:
+        async with self._condition:
+            await self._condition.wait_for(lambda: self._registered == {"baseline", "candidate"})
+            self._advance_reused(cell)
+            expected_position = planned_arm_order(
+                task_id,
+                repeat_index,
+                self.manifest.paired_order_seed,
+            ).index(arm)
+            await self._condition.wait_for(
+                lambda: self._positions[cell] < len(self._schedule[cell])
+                and self._schedule[cell][self._positions[cell]] == (task_id, repeat_index, arm)
+            )
+            self._sequence += 1
+            turn = PairedExecutionTurn(
+                cell=cell,
+                task_id=task_id,
+                repeat_index=repeat_index,
+                arm=arm,
+                order_position=expected_position,
+                execution_sequence=self._sequence,
+            )
+            self._events.append(
+                {
+                    "sequence": turn.execution_sequence,
+                    "cell": cell,
+                    "task_id": task_id,
+                    "repeat_index": repeat_index,
+                    "arm": arm,
+                    "order_position": expected_position,
+                }
+            )
+        completed = False
+        try:
+            yield turn
+            completed = True
+        finally:
+            async with self._condition:
+                if completed:
+                    self._positions[cell] += 1
+                    self._advance_reused(cell)
+                self._condition.notify_all()
+
+    def evidence(self) -> dict[str, Any]:
+        complete = all(
+            position == len(self._schedule[cell])
+            for cell, position in self._positions.items()
+        )
+        return {
+            "mode": "counterbalanced_task_repeat",
+            "seed": self.manifest.paired_order_seed,
+            "complete": complete,
+            "events": list(self._events),
+            "reused": [
+                {
+                    "cell": cell,
+                    "task_id": task_id,
+                    "repeat_index": repeat_index,
+                    "arm": arm,
+                    "order_position": planned_arm_order(
+                        task_id,
+                        repeat_index,
+                        self.manifest.paired_order_seed,
+                    ).index(arm),
+                }
+                for arm in (cast(ArmName, "baseline"), cast(ArmName, "candidate"))
+                for cell, task_id, repeat_index in sorted(self._reused[arm])
+            ],
+        }
+
+
+@asynccontextmanager
+async def _uncoordinated_turn() -> AsyncIterator[None]:
+    yield None
+
+
 class BenchmarkRunner:
     def __init__(
         self,
@@ -324,6 +493,8 @@ class BenchmarkRunner:
         arm: str = "baseline",
         checkpoint_path: Path | None = None,
         resume_path: Path | None = None,
+        paired_coordinator: PairedArmCoordinator | None = None,
+        shared_ledger: BudgetLedger | None = None,
     ) -> None:
         if checkpoint_path is not None and resume_path is not None and checkpoint_path != resume_path:
             raise ValueError("--checkpoint and --resume must reference the same path")
@@ -333,6 +504,8 @@ class BenchmarkRunner:
         self.arm = arm
         self.checkpoint_path = checkpoint_path or resume_path
         self.resume_path = resume_path
+        self.paired_coordinator = paired_coordinator
+        self.shared_ledger = shared_ledger
         self.secrets: tuple[str, ...] = ()
         self._completed_trials: dict[str, list[TrialOutcome]] = defaultdict(list)
         self._checkpoint_store: CheckpointStore | None = None
@@ -1154,10 +1327,19 @@ class BenchmarkRunner:
             timing_sink=self._timing.record if self._timing is not None else None,
         )
         report_fragments: list[dict[str, Any]] = []
-        for repeat_index in sorted({item[1] for item in pending}):
-            repeat_trials = [item for item in pending if item[1] == repeat_index]
-            selected_tasks = [item[0] for item in repeat_trials]
+        batches = (
+            [[item] for item in pending]
+            if self.paired_coordinator is not None
+            else [
+                [item for item in pending if item[1] == repeat_index]
+                for repeat_index in sorted({item[1] for item in pending})
+            ]
+        )
+        for batch in batches:
+            selected_tasks = [item[0] for item in batch]
+            repeat_index = batch[0][1]
             repeat_indices = {task.id: repeat_index for task in selected_tasks}
+            paired_task = selected_tasks[0]
 
             async def checkpoint_sink(
                 outcome: TrialOutcome,
@@ -1176,65 +1358,84 @@ class BenchmarkRunner:
                     status=status,
                 )
 
-            local_failures: list[Exception] = []
-            if self._timing is None:
-                report = await evaluate_dataset(
-                    selected_tasks,
-                    manifest=self.manifest,
-                    executor=executor,
-                    fixture=fixture,
-                    failure_sink=local_failures,
-                    cleanup_sink=lifecycle_cleanup_errors,
-                    refresh_token=self._refresh_token,
-                    mark_reset_complete=resolver.mark_reset_complete,
-                    repeat=1,
-                    repeat_indices=repeat_indices,
-                    checkpoint_sink=checkpoint_sink,
+            turn_context = (
+                self.paired_coordinator.turn(
+                    cell=run_key,
+                    task_id=paired_task.id,
+                    repeat_index=repeat_index,
+                    arm=cast(ArmName, self.arm),
                 )
-            else:
-                with self._timing.measure("model_execution"):
-                    report = await evaluate_dataset(
-                        selected_tasks,
-                        manifest=self.manifest,
-                        executor=executor,
-                        fixture=fixture,
-                        failure_sink=local_failures,
-                        cleanup_sink=lifecycle_cleanup_errors,
-                        refresh_token=self._refresh_token,
-                        mark_reset_complete=resolver.mark_reset_complete,
-                        repeat=1,
-                        repeat_indices=repeat_indices,
-                        checkpoint_sink=checkpoint_sink,
+                if self.paired_coordinator is not None
+                else _uncoordinated_turn()
+            )
+            async with turn_context as paired_turn:
+                if paired_turn is not None:
+                    executor.set_paired_turn(
+                        order_position=paired_turn.order_position,
+                        execution_sequence=paired_turn.execution_sequence,
                     )
-            if local_failures:
-                raise local_failures[0]
-            outcomes = outcomes_from_report(
-                report,
-                1,
-                repeat_indices=repeat_indices,
-            )
-            for outcome in outcomes:
-                self._record_trial(run_key, outcome)
-            report_fragments.append(serialize_report(report, self.secrets))
-            self._refresh_secrets(resolver)
-            incomplete_reasons.update(
-                outcome.error
-                for outcome in outcomes
-                if outcome.error and outcome.error.startswith("benchmark incomplete:")
-            )
-            termination = next(
-                (
-                    outcome
-                    for outcome in outcomes
-                    if outcome.failure_kind in {"request_timeout", "global_deadline", "interrupted"}
-                ),
-                None,
-            )
-            if termination is not None:
-                raise RuntimeContractError(
-                    termination.error or "benchmark incomplete: model request terminated",
-                    stage="model_request",
+                local_failures: list[Exception] = []
+                try:
+                    if self._timing is None:
+                        report = await evaluate_dataset(
+                            selected_tasks,
+                            manifest=self.manifest,
+                            executor=executor,
+                            fixture=fixture,
+                            failure_sink=local_failures,
+                            cleanup_sink=lifecycle_cleanup_errors,
+                            refresh_token=self._refresh_token,
+                            mark_reset_complete=resolver.mark_reset_complete,
+                            repeat=1,
+                            repeat_indices=repeat_indices,
+                            checkpoint_sink=checkpoint_sink,
+                        )
+                    else:
+                        with self._timing.measure("model_execution"):
+                            report = await evaluate_dataset(
+                                selected_tasks,
+                                manifest=self.manifest,
+                                executor=executor,
+                                fixture=fixture,
+                                failure_sink=local_failures,
+                                cleanup_sink=lifecycle_cleanup_errors,
+                                refresh_token=self._refresh_token,
+                                mark_reset_complete=resolver.mark_reset_complete,
+                                repeat=1,
+                                repeat_indices=repeat_indices,
+                                checkpoint_sink=checkpoint_sink,
+                            )
+                finally:
+                    executor.clear_paired_turn()
+                if local_failures:
+                    raise local_failures[0]
+                outcomes = outcomes_from_report(
+                    report,
+                    1,
+                    repeat_indices=repeat_indices,
                 )
+                for outcome in outcomes:
+                    self._record_trial(run_key, outcome)
+                report_fragments.append(serialize_report(report, self.secrets))
+                self._refresh_secrets(resolver)
+                incomplete_reasons.update(
+                    outcome.error
+                    for outcome in outcomes
+                    if outcome.error and outcome.error.startswith("benchmark incomplete:")
+                )
+                termination = next(
+                    (
+                        outcome
+                        for outcome in outcomes
+                        if outcome.failure_kind in {"request_timeout", "global_deadline", "interrupted"}
+                    ),
+                    None,
+                )
+                if termination is not None:
+                    raise RuntimeContractError(
+                        termination.error or "benchmark incomplete: model request terminated",
+                        stage="model_request",
+                    )
         reports[run_key] = {
             "catalog_keys": sorted(
                 f"{transport}:{profile}"
@@ -1261,7 +1462,8 @@ class BenchmarkRunner:
         source_revision = runtime["source_revision"]
         artifact_versions = runtime["artifact_versions"]
         prior_elapsed = 0.0
-        ledger = BudgetLedger(
+        owns_ledger = self.shared_ledger is None
+        ledger = self.shared_ledger or BudgetLedger(
             self.manifest,
             wall_clock=lambda: prior_elapsed + max(0.0, time.perf_counter() - started),
         )
@@ -1287,15 +1489,26 @@ class BenchmarkRunner:
             self._timing_attempt_index = self._checkpoint_store.next_timing_attempt_index()
             prior_elapsed = self._checkpoint_store.document.spent.wall_seconds
             spent = self._checkpoint_store.document.spent
-            ledger.restore(
-                model_requests=spent.model_requests,
-                input_tokens=spent.input_tokens,
-                output_tokens=spent.output_tokens,
-                cost_usd=spent.cost_usd,
-                wall_seconds=spent.wall_seconds,
-                model_work_seconds=spent.model_work_seconds,
-                budget_failure=self._checkpoint_store.budget_failure_reason(),
-            )
+            if owns_ledger:
+                ledger.restore(
+                    model_requests=spent.model_requests,
+                    input_tokens=spent.input_tokens,
+                    output_tokens=spent.output_tokens,
+                    cost_usd=spent.cost_usd,
+                    wall_seconds=spent.wall_seconds,
+                    model_work_seconds=spent.model_work_seconds,
+                    budget_failure=self._checkpoint_store.budget_failure_reason(),
+                )
+            else:
+                await ledger.restore_additive(
+                    model_requests=spent.model_requests,
+                    input_tokens=spent.input_tokens,
+                    output_tokens=spent.output_tokens,
+                    cost_usd=spent.cost_usd,
+                    wall_seconds=spent.wall_seconds,
+                    model_work_seconds=spent.model_work_seconds,
+                    budget_failure=self._checkpoint_store.budget_failure_reason(),
+                )
             initial_timing = self._timing_snapshot()
             assert initial_timing is not None
             await asyncio.to_thread(self._checkpoint_store.update_timing, initial_timing)
@@ -1306,6 +1519,15 @@ class BenchmarkRunner:
                     self._checkpoint_reused_trials += 1
                 elif self._checkpoint_store.status_for(planned_key) is not None:
                     self._checkpoint_rerun_trials += 1
+        if self.paired_coordinator is not None:
+            reused = {
+                (f"{key.model_class}:{key.transport}", key.task_id, key.repeat_index): outcome
+                for key in planned_keys.values()
+                if self._checkpoint_store is not None
+                and (outcome := self._checkpoint_store.completed_outcome_for(key)) is not None
+            }
+            await self.paired_coordinator.register_arm(cast(ArmName, self.arm), reused)
+            await self.paired_coordinator.wait_until_registered()
         planned_by_run = self._planned_trials_by_run(planned_keys)
         pending_by_run = {
             run_key: [
@@ -1440,7 +1662,11 @@ class BenchmarkRunner:
                         pass
         finally:
             try:
-                orphaned_reservation = await ledger.release_all_reservations()
+                orphaned_reservation = (
+                    await ledger.release_all_reservations()
+                    if owns_ledger
+                    else Decimal("0")
+                )
                 if orphaned_reservation > Decimal("1e-12"):
                     lifecycle_cleanup_errors.append(
                         BudgetExceeded(
@@ -1782,6 +2008,8 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
         "run_manifest_hash": baseline["run_manifest_hash"],
         "task_corpus_hash": baseline["task_corpus_hash"],
         "paired_order_plan": baseline.get("paired_order_plan", []),
+        "paired_execution": baseline.get("paired_execution"),
+        "paired_budget_used": baseline.get("paired_budget_used"),
         "repeated_trials_are_averaged_per_task": True,
         "independent_task_count": len(baseline["task_ids"]),
         "repeat_count": baseline["manifest"]["repeats"],
@@ -1890,6 +2118,7 @@ def _paired_dimension(
             "stopping_accuracy",
             "multi_step_ordering",
             "result_binding_accuracy",
+            "accepted_behavior_matched",
             "tool_outcome_match",
             "semantic_error_count",
             "nonexistent_tool_attempts",
@@ -1899,6 +2128,7 @@ def _paired_dimension(
             "fabricated_resource_claims",
             "unsupported_success_claims",
             "post_completion_overshoot",
+            "discouraged_preflight_calls",
             "input_tokens",
             "total_tokens",
             "latency_seconds",
@@ -1947,6 +2177,7 @@ def _mean_metric(outcomes: list[TrialOutcome], metric: str) -> float:
         "stopping_accuracy",
         "multi_step_ordering",
         "result_binding_accuracy",
+        "accepted_behavior_matched",
         "user_outcome_completed",
         "tool_outcome_match",
     }:
@@ -1960,6 +2191,7 @@ def _mean_metric(outcomes: list[TrialOutcome], metric: str) -> float:
             + outcome.fabricated_resource_claims
             + outcome.unsupported_success_claims
             + outcome.post_completion_overshoot
+            + outcome.discouraged_preflight_calls
             for outcome in outcomes
         ) / len(outcomes)
     return sum(float(getattr(outcome, metric)) for outcome in outcomes) / len(outcomes)
@@ -2048,6 +2280,8 @@ def _build_artifact_hash_input(artifact: dict[str, Any], *, trial_order: list[di
         "task_locales": artifact["task_locales"],
         "task_contracts": artifact.get("task_contracts", []),
         "paired_order_plan": artifact.get("paired_order_plan", []),
+        "paired_execution": artifact.get("paired_execution"),
+        "paired_budget_used": artifact.get("paired_budget_used"),
         "category_counts": artifact["category_counts"],
         "suite_counts": artifact.get("suite_counts", {}),
         "locale_counts": artifact["locale_counts"],
@@ -2067,6 +2301,95 @@ def _build_artifact_hash_input(artifact: dict[str, Any], *, trial_order: list[di
         "locale_metrics": artifact["locale_metrics"],
         "smoke_gate_status": smoke_gate.get("status"),
     }
+
+
+def attach_paired_execution_evidence(
+    artifact: dict[str, Any],
+    *,
+    evidence: dict[str, Any],
+    budget_used: dict[str, Any],
+) -> dict[str, Any]:
+    """Seal shared execution-order and global-budget evidence into one arm artifact."""
+
+    trial_order = artifact.get("artifact_hash_input", {}).get("trial_order")
+    if not isinstance(trial_order, list):
+        raise ValueError("arm artifact is missing its registered trial order")
+    artifact["paired_execution"] = evidence
+    artifact["paired_budget_used"] = budget_used
+    artifact["artifact_hash_input"] = _build_artifact_hash_input(artifact, trial_order=trial_order)
+    artifact["artifact_hash"] = hash_json(artifact["artifact_hash_input"])
+    return artifact
+
+
+def _validate_paired_execution_evidence(baseline: dict[str, Any], candidate: dict[str, Any]) -> None:
+    evidence = baseline.get("paired_execution")
+    if not isinstance(evidence, dict) or evidence != candidate.get("paired_execution"):
+        raise ValueError("paired artifacts are missing shared execution evidence")
+    manifest = baseline["manifest"]
+    if (
+        evidence.get("mode") != manifest.get("paired_order")
+        or evidence.get("seed") != manifest.get("paired_order_seed")
+        or evidence.get("complete") is not True
+    ):
+        raise ValueError("paired execution evidence does not match preregistration")
+    events = evidence.get("events")
+    reused = evidence.get("reused")
+    if not isinstance(events, list) or not isinstance(reused, list):
+        raise ValueError("paired execution records are invalid")
+    event_sequences = [item.get("sequence") for item in events if isinstance(item, dict)]
+    if event_sequences != list(range(1, len(events) + 1)):
+        raise ValueError("paired execution sequence is not contiguous")
+    records: dict[tuple[str, str, int, str], tuple[str, int | None]] = {}
+    for status, items in (("executed", events), ("reused", reused)):
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError("paired execution record is invalid")
+            identity = (
+                item.get("cell"),
+                item.get("task_id"),
+                item.get("repeat_index"),
+                item.get("arm"),
+            )
+            if not (
+                isinstance(identity[0], str)
+                and isinstance(identity[1], str)
+                and isinstance(identity[2], int)
+                and identity[3] in {"baseline", "candidate"}
+            ) or identity in records:
+                raise ValueError("paired execution identity is invalid or duplicated")
+            records[cast(tuple[str, str, int, str], identity)] = (
+                status,
+                item.get("sequence") if status == "executed" else None,
+            )
+    outcomes: dict[tuple[str, str, int, str], TrialOutcome] = {}
+    for artifact in (baseline, candidate):
+        for cell, run in artifact["runs"].items():
+            for raw in run.get("trials", []):
+                outcome = TrialOutcome.model_validate(raw)
+                identity = (cell, outcome.task_id, outcome.repeat_index, artifact["arm"])
+                outcomes[identity] = outcome
+    if set(records) != set(outcomes):
+        raise ValueError("paired execution evidence does not cover every trial")
+    for identity, outcome in outcomes.items():
+        cell, task_id, repeat_index, arm = identity
+        expected = planned_arm_order(task_id, repeat_index, manifest["paired_order_seed"])
+        if outcome.paired_order_position != expected.index(cast(ArmName, arm)):
+            raise ValueError("trial paired order position does not match preregistration")
+        status, sequence = records[identity]
+        if status == "executed" and outcome.paired_execution_sequence != sequence:
+            raise ValueError("trial execution sequence does not match paired evidence")
+        counterpart = "candidate" if arm == "baseline" else "baseline"
+        counterpart_identity = (cell, task_id, repeat_index, counterpart)
+        if counterpart_identity not in records:
+            raise ValueError("paired execution counterpart is missing")
+    for cell, task_id, repeat_index, _arm in records:
+        expected = planned_arm_order(task_id, repeat_index, manifest["paired_order_seed"])
+        first = records[(cell, task_id, repeat_index, expected[0])]
+        second = records[(cell, task_id, repeat_index, expected[1])]
+        if first[0] == "executed" and second[0] == "executed" and not cast(int, first[1]) < cast(int, second[1]):
+            raise ValueError("paired execution violated the preregistered arm order")
+        if first[0] == "executed" and second[0] == "reused":
+            raise ValueError("paired resume reused the second arm before the first arm completed")
 
 
 def _validate_artifact_pair(baseline: dict[str, Any], candidate: dict[str, Any]) -> None:
@@ -2106,6 +2429,8 @@ def _validate_artifact_pair(baseline: dict[str, Any], candidate: dict[str, Any])
         "task_locales",
         "task_contracts",
         "paired_order_plan",
+        "paired_execution",
+        "paired_budget_used",
         "locale_counts",
     ):
         if baseline.get(key) != candidate.get(key):
@@ -2144,6 +2469,21 @@ def _validate_artifact_pair(baseline: dict[str, Any], candidate: dict[str, Any])
                     outcome = TrialOutcome.model_validate(raw_outcome)
                     if declared.get(outcome.task_id) != outcome.locale:
                         raise ValueError("artifact trial locale does not match its task declaration")
+    baseline_repeats = {
+        (cell, outcome.task_id, outcome.repeat_index)
+        for cell, run in baseline.get("runs", {}).items()
+        for raw in run.get("trials", [])
+        for outcome in (TrialOutcome.model_validate(raw),)
+    }
+    candidate_repeats = {
+        (cell, outcome.task_id, outcome.repeat_index)
+        for cell, run in candidate.get("runs", {}).items()
+        for raw in run.get("trials", [])
+        for outcome in (TrialOutcome.model_validate(raw),)
+    }
+    if baseline_repeats != candidate_repeats:
+        raise ValueError("paired repeat indices differ")
+    _validate_paired_execution_evidence(baseline, candidate)
     baseline_fixture = baseline.get("fixture", {})
     candidate_fixture = candidate.get("fixture", {})
     if (

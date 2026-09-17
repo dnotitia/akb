@@ -64,10 +64,14 @@ trial trace.
 Task contracts declare suite, capability families, risk hypotheses, user
 outcome, accepted equivalent behaviors, clarification/stopping rules,
 forbidden mutations, and permitted resources. They separate preparatory and
-material operations. Literal first-tool accuracy and preparatory-call count
-remain diagnostics; the primary action metric is the first material operation
-after authorized preparation. A harmless extra read is a behavioral/stopping
-error, not automatically a safety violation. The vault-skill acknowledgement
+material operations. Accepted behavior paths are evaluated by their declared
+mode, logical operations, resources, state, and outcome; they never require a
+particular public tool name. Literal first-tool accuracy and preparatory-call
+count remain diagnostics; the primary action metric is the first material
+operation after authorized preparation. Task-declared discouraged preflight
+operations are counted separately and contribute to semantic behavior error,
+but do not turn a harmless read into a safety failure or erase a completed user
+outcome. The vault-skill acknowledgement
 challenge is protocol evidence and its identical retry counts as one material
 attempt. Authorization tasks target the exact
 synthetic vault `catalog-bench-vault-authorization` and declare the complete
@@ -208,33 +212,33 @@ be a lowercase 40-hex Git SHA. When absent, the runtime uses
 receive the explicit variable; missing or invalid input fails before resource
 creation as `blocked_runtime_config`, and `unknown` is never emitted.
 
-## Baseline and candidate runs
+## Counterbalanced baseline and candidate run
 
-Start the native launcher in one terminal, then run both arms against its
-saved descriptor. Baseline and candidate must use the same corpus and
-manifest, but may be run against separate candidate-bound descriptors when
-the runtime is started separately. Corpus hash, protocol, repeats,
-model/settings, and fixture reset contracts must remain identical.
+Start separate baseline-bound and candidate-bound native runtimes and save
+their descriptors. The paid comparison must use the single `run-paired`
+interface below. It launches both arm runners together and gates every actual
+model/transport/task/repeat evaluation so the first arm in the registered
+counterbalanced order finishes before the second arm starts. The two arm
+artifacts and checkpoints remain independent; provider admission uses one
+shared ledger, so their combined requests and cost remain under the global
+`$50` cap.
 
 ```bash
 uv run --locked --project eval/mcp-catalog \
-  mcp-catalog-bench run --arm baseline \
-  --descriptor /private/run/descriptor.json \
-  --output /private/run/baseline.json \
-  --checkpoint /private/run/baseline.checkpoint.json
-
-uv run --locked --project eval/mcp-catalog \
-  mcp-catalog-bench run --arm candidate \
-  --descriptor /private/run/descriptor.json \
-  --output /private/run/candidate.json \
-  --checkpoint /private/run/candidate.checkpoint.json
-
-uv run --locked --project eval/mcp-catalog \
-  mcp-catalog-bench compare \
-  --baseline /private/run/baseline.json \
-  --candidate /private/run/candidate.json \
-  --output /private/run/comparison.json
+  mcp-catalog-bench run-paired \
+  --baseline-descriptor /private/run/baseline-descriptor.json \
+  --candidate-descriptor /private/run/candidate-descriptor.json \
+  --baseline-output /private/run/baseline.json \
+  --candidate-output /private/run/candidate.json \
+  --comparison-output /private/run/comparison.json \
+  --baseline-checkpoint /private/run/baseline.checkpoint.json \
+  --candidate-checkpoint /private/run/candidate.checkpoint.json
 ```
+
+Standalone `run --arm ...` remains available for diagnostics and checkpoint
+inspection, but separately executed arm artifacts have no shared execution
+evidence and `compare` rejects them. This prevents a recorded plan from being
+mistaken for an order that the provider calls actually followed.
 
 The stdin descriptor form remains supported:
 
@@ -254,17 +258,19 @@ when no mint path is available.
 
 ## Checkpoints and resume
 
-With `--checkpoint`, each trial writes a redacted JSON checkpoint through an
-fsynced temporary file followed by atomic replace. Resume with the same
-checkpoint path:
+Each paired arm writes its own redacted JSON checkpoint through an fsynced
+temporary file followed by atomic replace. Resume both with the same paths:
 
 ```bash
 uv run --locked --project eval/mcp-catalog \
-  mcp-catalog-bench run --arm baseline \
-  --descriptor /private/run/descriptor.json \
-  --output /private/run/baseline-resumed.json \
-  --checkpoint /private/run/baseline.checkpoint.json \
-  --resume /private/run/baseline.checkpoint.json
+  mcp-catalog-bench run-paired --resume \
+  --baseline-descriptor /private/run/baseline-descriptor.json \
+  --candidate-descriptor /private/run/candidate-descriptor.json \
+  --baseline-output /private/run/baseline-resumed.json \
+  --candidate-output /private/run/candidate-resumed.json \
+  --comparison-output /private/run/comparison-resumed.json \
+  --baseline-checkpoint /private/run/baseline.checkpoint.json \
+  --candidate-checkpoint /private/run/candidate.checkpoint.json
 ```
 
 The exact source revision, run-manifest hash, task-corpus hash, arm, model,
@@ -273,9 +279,10 @@ valid provider usage/cost and routing evidence is reused. A measured
 `success=false` trial caused by a request/output limit or tool/terminal action
 failure is also reusable when usage/cost and both state observations exist.
 Provider/infrastructure failures without evidence and incomplete trials are
-rerun. A damaged, mismatched, or secret-bearing checkpoint fails closed before
-the first provider call. Prior usage and cost remain in the checkpoint, so
-resume cannot bypass the `$50` cap.
+rerun. A damaged, mismatched, secret-bearing, or second-arm-before-first-arm
+checkpoint fails closed before the next paired trial. Prior usage and cost
+from both checkpoints are added to the shared ledger, so resume cannot bypass
+the `$50` cap.
 
 ## Smoke and lifecycle gates
 
@@ -363,7 +370,9 @@ Each run artifact includes:
   handshake validity, target/payload and cross-call binding accuracy, plus
   deterministic reason counts for nonexistent tools, wrong
   capability/resource/target, fabricated URIs, unsupported success claims,
-  and post-completion overshoot;
+  post-completion overshoot, and discouraged preflight calls;
+- the shared executed/reused arm-order evidence and pair-global budget totals,
+  sealed into both independent arm artifact hashes;
 - cumulative wall-clock, checkpoint new/reused/rerun counts, fixture reset
   count/time, dependency identity preservation, four-cell smoke results, and
   reproducible `artifact_hash_input`/`artifact_hash`;
@@ -386,7 +395,10 @@ deterioration. It must then demonstrate at least one registered benefit:
   upper bound below zero; or
 - behavior benefit: a paired semantic-error-count upper bound below zero.
 
-The comparison also reports the selected-provider distribution for each arm.
+`compare` first verifies that shared execution evidence covers every trial,
+that each recorded outcome has the registered arm position, and that newly
+executed first/second arm calls follow the counterbalanced order. The
+comparison also reports the selected-provider distribution for each arm.
 An arm-share difference above the registered 20% limit downgrades the result to
 `inconclusive` so provider routing cannot silently masquerade as a tool-surface
 effect. Literal first-tool accuracy remains diagnostic. Incomplete, unpaired,

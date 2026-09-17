@@ -8,13 +8,23 @@ import contextlib
 import json
 import signal
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from .contracts import load_json
 from .evidence import write_json
-from .runner import BenchmarkRunFailure, BenchmarkRunner, NeedsUserInput, compare_artifacts, load_inputs
+from .execution import BudgetLedger
+from .runner import (
+    BenchmarkRunFailure,
+    BenchmarkRunner,
+    NeedsUserInput,
+    PairedArmCoordinator,
+    attach_paired_execution_evidence,
+    compare_artifacts,
+    load_inputs,
+)
 from .runtime import RuntimeContractError, RuntimeDescriptor
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +57,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="resume exact inputs from this existing checkpoint path",
     )
 
+    paired = subparsers.add_parser(
+        "run-paired",
+        help="run baseline and candidate in preregistered counterbalanced order",
+    )
+    paired.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    paired.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS)
+    paired.add_argument("--coverage", type=Path, default=DEFAULT_COVERAGE)
+    paired.add_argument("--baseline-descriptor", type=Path, required=True)
+    paired.add_argument("--candidate-descriptor", type=Path, required=True)
+    paired.add_argument("--baseline-output", type=Path, required=True)
+    paired.add_argument("--candidate-output", type=Path, required=True)
+    paired.add_argument("--comparison-output", type=Path, required=True)
+    paired.add_argument("--baseline-checkpoint", type=Path, required=True)
+    paired.add_argument("--candidate-checkpoint", type=Path, required=True)
+    paired.add_argument("--resume", action="store_true", help="resume both independent arm checkpoints")
+
     compare = subparsers.add_parser("compare", help="compare two completed arm artifacts")
     compare.add_argument("--baseline", type=Path, required=True)
     compare.add_argument("--candidate", type=Path, required=True)
@@ -68,6 +94,8 @@ def main() -> None:
             code = validate(args)
         elif args.command == "run":
             code = asyncio.run(run(args))
+        elif args.command == "run-paired":
+            code = asyncio.run(run_paired(args))
         else:
             code = compare(args)
     except (ValueError, RuntimeContractError) as exc:
@@ -192,6 +220,116 @@ async def run(args: argparse.Namespace) -> int:
         )
     )
     return 0 if artifact["status"] == "complete" else 1
+
+
+async def run_paired(args: argparse.Namespace) -> int:
+    baseline_manifest, baseline_tasks, baseline_descriptor = load_inputs(
+        args.manifest,
+        args.corpus,
+        args.baseline_descriptor,
+        args.coverage,
+    )
+    candidate_manifest, candidate_tasks, candidate_descriptor = load_inputs(
+        args.manifest,
+        args.corpus,
+        args.candidate_descriptor,
+        args.coverage,
+    )
+    if baseline_manifest != candidate_manifest or baseline_tasks != candidate_tasks:
+        raise ValueError("paired arms must use identical manifest and corpus inputs")
+    if args.baseline_checkpoint == args.candidate_checkpoint:
+        raise ValueError("paired arms require independent checkpoint paths")
+    output_paths = {args.baseline_output, args.candidate_output, args.comparison_output}
+    if len(output_paths) != 3:
+        raise ValueError("paired arm and comparison outputs must use distinct paths")
+
+    started = time.perf_counter()
+    coordinator = PairedArmCoordinator(baseline_manifest, baseline_tasks)
+    ledger = BudgetLedger(
+        baseline_manifest,
+        wall_clock=lambda: max(0.0, time.perf_counter() - started),
+    )
+    baseline_runner = BenchmarkRunner(
+        baseline_manifest,
+        baseline_tasks,
+        baseline_descriptor,
+        arm="baseline",
+        checkpoint_path=args.baseline_checkpoint,
+        resume_path=args.baseline_checkpoint if args.resume else None,
+        paired_coordinator=coordinator,
+        shared_ledger=ledger,
+    )
+    candidate_runner = BenchmarkRunner(
+        candidate_manifest,
+        candidate_tasks,
+        candidate_descriptor,
+        arm="candidate",
+        checkpoint_path=args.candidate_checkpoint,
+        resume_path=args.candidate_checkpoint if args.resume else None,
+        paired_coordinator=coordinator,
+        shared_ledger=ledger,
+    )
+    run_tasks = {
+        "baseline": asyncio.create_task(baseline_runner.run(), name="catalog-benchmark-baseline"),
+        "candidate": asyncio.create_task(candidate_runner.run(), name="catalog-benchmark-candidate"),
+    }
+    done, pending = await asyncio.wait(run_tasks.values(), return_when=asyncio.FIRST_EXCEPTION)
+    primary_failure = next(
+        (exception for task in done if (exception := task.exception()) is not None),
+        None,
+    )
+    if primary_failure is not None:
+        for task in pending:
+            task.cancel()
+    results = await asyncio.gather(*run_tasks.values(), return_exceptions=True)
+    await ledger.release_all_reservations()
+
+    artifacts: dict[str, dict[str, Any]] = {}
+    failures: list[BaseException] = []
+    for arm, result in zip(run_tasks, results, strict=True):
+        if isinstance(result, BenchmarkRunFailure):
+            artifacts[arm] = result.artifact
+            failures.append(result)
+        elif isinstance(result, BaseException):
+            failures.append(result)
+        else:
+            artifacts[arm] = result
+
+    evidence = coordinator.evidence()
+    paired_budget = {
+        "model_requests": ledger.requests,
+        "input_tokens": ledger.input_tokens,
+        "output_tokens": ledger.output_tokens,
+        "total_tokens": ledger.input_tokens + ledger.output_tokens,
+        "cost_usd": float(ledger.cost_usd),
+        "wall_seconds": ledger.observe_wall(),
+        "model_work_seconds": ledger.model_work_seconds,
+        "max_total_cost_usd": baseline_manifest.budget.max_total_cost_usd,
+    }
+    runners = {"baseline": baseline_runner, "candidate": candidate_runner}
+    outputs = {"baseline": args.baseline_output, "candidate": args.candidate_output}
+    for arm, artifact in artifacts.items():
+        attach_paired_execution_evidence(artifact, evidence=evidence, budget_used=paired_budget)
+        write_json(outputs[arm], artifact, runners[arm].secrets)
+    if failures:
+        raise primary_failure if primary_failure is not None else failures[0]
+
+    comparison = compare_artifacts(artifacts["baseline"], artifacts["candidate"])
+    write_json(args.comparison_output, comparison)
+    print(
+        json.dumps(
+            {
+                "status": comparison["gate"]["status"],
+                "baseline": str(args.baseline_output),
+                "candidate": str(args.candidate_output),
+                "comparison": str(args.comparison_output),
+                "cost_usd": paired_budget["cost_usd"],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if comparison["gate"]["status"] == "pass" else 1
 
 
 def compare(args: argparse.Namespace) -> int:

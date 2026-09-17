@@ -404,6 +404,7 @@ class TaskManifest(ContractModel):
     prompt: str = Field(min_length=1, max_length=4000)
     fixture: FixtureContract
     allowed_preparatory_operations: list[str] = Field(default_factory=list)
+    discouraged_preparatory_operations: list[str] = Field(default_factory=list)
     allowed_material_operations: list[str] = Field(min_length=1)
     allowed_first_operations: list[str] = Field(min_length=1)
     forbidden_operations: list[str] = Field(default_factory=list)
@@ -441,6 +442,7 @@ class TaskManifest(ContractModel):
 
     @field_validator(
         "allowed_preparatory_operations",
+        "discouraged_preparatory_operations",
         "allowed_material_operations",
         "allowed_first_operations",
         "forbidden_operations",
@@ -479,6 +481,13 @@ class TaskManifest(ContractModel):
             raise ValueError("an operation cannot be both allowed first and forbidden")
         if set(self.allowed_preparatory_operations) & set(self.allowed_material_operations):
             raise ValueError("an operation cannot be both preparatory and material")
+        if not set(self.discouraged_preparatory_operations) <= set(self.allowed_preparatory_operations):
+            raise ValueError("discouraged preparatory operations must be allowed preparatory operations")
+        if (
+            "unnecessary_identity_access_preflight" in self.risk_hypotheses
+            and not self.discouraged_preparatory_operations
+        ):
+            raise ValueError("unnecessary preflight risk tasks must declare discouraged preparatory operations")
         if self.category != "destructive_confirmation" and set(self.allowed_material_operations) & set(self.forbidden_operations):
             raise ValueError("a material operation cannot be forbidden")
         if set(self.required_operations) & set(self.forbidden_operations):
@@ -508,6 +517,25 @@ class TaskManifest(ContractModel):
         expected_attempt_operations = [item.logical_operation for item in self.expected_material_attempts]
         if not set(expected_attempt_operations) <= set(self.allowed_material_operations):
             raise ValueError("expected material attempts must be material operations")
+        accepted_operations = set(self.allowed_preparatory_operations) | set(self.allowed_material_operations)
+        if any(
+            not set(behavior.required_operations) <= accepted_operations
+            for behavior in self.accepted_behaviors
+        ):
+            raise ValueError("accepted behavior operations must be allowed by the task")
+        if any(
+            not set(behavior.required_resources) <= set(self.allowed_resources)
+            for behavior in self.accepted_behaviors
+        ):
+            raise ValueError("accepted behavior resources must be allowed by the task")
+        expected_behavior_mode = {
+            "final_user_outcome": "complete",
+            "clarification": "clarify",
+            "expected_error": "expected_error",
+            "immediate_response": "refuse",
+        }[self.stopping.completion]
+        if not any(behavior.mode == expected_behavior_mode for behavior in self.accepted_behaviors):
+            raise ValueError("accepted behaviors must cover the task stopping mode")
         if self.fixture.local_files and not self.expected_material_attempts:
             raise ValueError("fixture local_files require expected material attempts")
         for attempt in self.expected_material_attempts:
@@ -863,6 +891,7 @@ class BenchmarkRunManifest(ContractModel):
             for task in tasks
             for operation in [
                 *task.allowed_preparatory_operations,
+                *task.discouraged_preparatory_operations,
                 *task.allowed_material_operations,
                 *task.allowed_first_operations,
                 *task.forbidden_operations,
@@ -959,6 +988,7 @@ class BenchmarkRunManifest(ContractModel):
             "coverage_tools": sorted(task.coverage_tools),
             "fixture": task.fixture.model_dump(mode="json"),
             "allowed_preparatory_operations": sorted(task.allowed_preparatory_operations),
+            "discouraged_preparatory_operations": sorted(task.discouraged_preparatory_operations),
             "allowed_material_operations": sorted(task.allowed_material_operations),
             "allowed_first_operations": sorted(task.allowed_first_operations),
             "forbidden_operations": sorted(task.forbidden_operations),

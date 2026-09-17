@@ -235,6 +235,8 @@ class TrialOutcome(BaseModel):
     model_id: str
     transport: str
     repeat_index: int = Field(default=1, ge=1)
+    paired_order_position: int | None = Field(default=None, ge=0, le=1)
+    paired_execution_sequence: int | None = Field(default=None, ge=1)
     final_answer_text: str = ""
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
     successful_mcp_tool_calls: int = Field(default=0, ge=0)
@@ -242,6 +244,7 @@ class TrialOutcome(BaseModel):
     first_logical_operation: str = "none"
     first_material_operation: str = "none"
     preparatory_call_count: int = Field(default=0, ge=0)
+    discouraged_preflight_calls: int = Field(default=0, ge=0)
     material_call_count: int = Field(default=0, ge=0)
     state_before: Any = None
     state_after: Any = None
@@ -264,6 +267,8 @@ class TrialOutcome(BaseModel):
     target_payload_accuracy: bool = True
     multi_step_ordering: bool = True
     result_binding_accuracy: bool = True
+    accepted_behavior_matched: bool = False
+    accepted_behavior_ids: list[str] = Field(default_factory=list)
     nonexistent_tool_attempts: int = Field(default=0, ge=0)
     wrong_capability_calls: int = Field(default=0, ge=0)
     wrong_resource_calls: int = Field(default=0, ge=0)
@@ -385,6 +390,8 @@ class TrialOutcome(BaseModel):
             and unchanged_checks_passed
         )
         _finalize_semantic_metrics(self, task)
+        self.accepted_behavior_ids = _matching_accepted_behaviors(self, task)
+        self.accepted_behavior_matched = bool(self.accepted_behavior_ids)
         self.user_outcome_completed = (
             self.state_contract_passed
             and self.response_rubric_passed
@@ -395,6 +402,7 @@ class TrialOutcome(BaseModel):
             and self.multi_step_ordering
             and self.result_binding_accuracy
             and self.clarification_accuracy
+            and self.accepted_behavior_matched
         )
         self.success = (
             self.error is None
@@ -542,6 +550,12 @@ def _fabricated_resource_claim_count(outcome: TrialOutcome, task: TaskManifest) 
 
 def _finalize_semantic_metrics(outcome: TrialOutcome, task: TaskManifest) -> None:
     material_calls = [call for call in outcome.tool_calls if call.operation_kind == "material"]
+    first_material_order = material_calls[0].order if material_calls else len(outcome.tool_calls) + 1
+    outcome.discouraged_preflight_calls = sum(
+        call.order < first_material_order
+        and call.logical_operation in task.discouraged_preparatory_operations
+        for call in outcome.tool_calls
+    )
     outcome.nonexistent_tool_attempts = sum(not call.tool_exists for call in outcome.tool_calls)
     outcome.wrong_capability_calls = sum(
         call.tool_exists and call.operation_kind == "unknown" and call.logical_operation not in task.forbidden_operations
@@ -619,6 +633,7 @@ def _finalize_semantic_metrics(outcome: TrialOutcome, task: TaskManifest) -> Non
         ("fabricated_resource_claim", outcome.fabricated_resource_claims),
         ("unsupported_success_claim", outcome.unsupported_success_claims),
         ("post_completion_overshoot", outcome.post_completion_overshoot),
+        ("discouraged_preflight", outcome.discouraged_preflight_calls),
     ):
         if count:
             reasons.append(f"{code}:{count}")
@@ -631,6 +646,48 @@ def _finalize_semantic_metrics(outcome: TrialOutcome, task: TaskManifest) -> Non
     if not outcome.protocol_handshake_valid:
         reasons.append("protocol_handshake_invalid")
     outcome.semantic_reasons = reasons
+
+
+def _matching_accepted_behaviors(outcome: TrialOutcome, task: TaskManifest) -> list[str]:
+    """Match semantic user paths without coupling them to public tool names."""
+
+    successful_calls = [call for call in outcome.tool_calls if call.server_succeeded]
+    expected_error_calls = [
+        call
+        for call in outcome.tool_calls
+        if call.operation_kind == "material"
+        and not call.server_succeeded
+        and call.server_error_code is not None
+    ]
+    material_calls = [call for call in outcome.tool_calls if call.operation_kind == "material"]
+    matched: list[str] = []
+    for behavior in task.accepted_behaviors:
+        evidence_calls = (
+            [*successful_calls, *expected_error_calls]
+            if behavior.mode == "expected_error"
+            else successful_calls
+        )
+        observed_operations = {call.logical_operation for call in evidence_calls}
+        observed_resources = {
+            call.resource_type for call in evidence_calls if call.resource_type != "unknown"
+        }
+        has_unknown_resource = any(call.resource_type == "unknown" for call in evidence_calls)
+        operations_match = set(behavior.required_operations) <= observed_operations
+        resources_match = (
+            not behavior.required_operations
+            or set(behavior.required_resources) <= observed_resources
+            or has_unknown_resource
+        )
+        mode_matches = {
+            "complete": not outcome.expected_error_match,
+            "clarify": outcome.clarification_accuracy and not material_calls,
+            "refuse": not material_calls,
+            "expected_error": outcome.expected_error_match,
+        }[behavior.mode]
+        stopping_matches = outcome.stopping_accuracy or not task.stopping.enforce_for_task_success
+        if operations_match and resources_match and mode_matches and stopping_matches:
+            matched.append(behavior.id)
+    return matched
 
 
 def has_measured_evidence(outcome: TrialOutcome) -> bool:
@@ -1054,6 +1111,7 @@ class BudgetLedger:
     _open_reservations: set[ProviderRequestGuard] = field(default_factory=set, repr=False)
     _budget_failure: str | None = None
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _restored_wall_offset: float = field(default=0.0, repr=False)
 
     @property
     def reserved_cost_usd(self) -> Decimal:
@@ -1095,8 +1153,53 @@ class BudgetLedger:
         self._budget_failure = budget_failure
         self._assert_reservation_invariant()
 
+    async def restore_additive(
+        self,
+        *,
+        model_requests: int,
+        input_tokens: int,
+        output_tokens: int,
+        cost_usd: float | Decimal,
+        wall_seconds: float,
+        model_work_seconds: float = 0.0,
+        budget_failure: str | None = None,
+    ) -> None:
+        """Merge one independent arm checkpoint into a shared paired budget."""
+
+        restored_cost = Decimal(str(cost_usd))
+        if min(model_requests, input_tokens, output_tokens, wall_seconds, model_work_seconds) < 0:
+            raise BudgetExceeded("checkpoint budget totals cannot be negative")
+        if not restored_cost.is_finite() or restored_cost < 0:
+            raise BudgetExceeded("checkpoint budget totals cannot be negative")
+        async with self._lock:
+            if self._open_reservations:
+                raise BudgetExceeded("cannot restore paired budget while reservations are open")
+            next_requests = self.requests + model_requests
+            next_cost = self.cost_usd + restored_cost
+            next_wall = max(self.wall_seconds, wall_seconds)
+            budget = self.manifest.budget
+            if (
+                next_requests > budget.max_model_requests
+                or next_cost > Decimal(str(budget.max_total_cost_usd))
+                or next_wall > budget.max_wall_seconds
+            ):
+                raise BudgetExceeded("paired checkpoint totals already exceed the registered run limits")
+            self.requests = next_requests
+            self.input_tokens += input_tokens
+            self.output_tokens += output_tokens
+            self.cost_usd = next_cost
+            self.wall_seconds = next_wall
+            self.model_work_seconds += model_work_seconds
+            self._restored_wall_offset = max(self._restored_wall_offset, wall_seconds)
+            self._budget_failure = self._budget_failure or budget_failure
+            self._assert_reservation_invariant()
+
     def current_wall_seconds(self) -> float:
-        observed = self.wall_clock() if self.wall_clock is not None else self.wall_seconds
+        observed = (
+            self._restored_wall_offset + self.wall_clock()
+            if self.wall_clock is not None
+            else self.wall_seconds
+        )
         if observed < 0:
             raise BudgetExceeded("wall-clock observation cannot be negative")
         return max(self.wall_seconds, observed)
@@ -1404,6 +1507,21 @@ class TrialExecutor:
         self.outcome_sink = outcome_sink
         self.timing_sink = timing_sink
         self._outcome_counts: dict[str, int] = defaultdict(int)
+        self.paired_order_position: int | None = None
+        self.paired_execution_sequence: int | None = None
+
+    def set_paired_turn(self, *, order_position: int, execution_sequence: int) -> None:
+        self.paired_order_position = order_position
+        self.paired_execution_sequence = execution_sequence
+
+    def clear_paired_turn(self) -> None:
+        self.paired_order_position = None
+        self.paired_execution_sequence = None
+
+    def _tag_paired_turn(self, outcome: TrialOutcome) -> TrialOutcome:
+        outcome.paired_order_position = self.paired_order_position
+        outcome.paired_execution_sequence = self.paired_execution_sequence
+        return outcome
 
     async def execute(self, task: TaskManifest) -> TrialOutcome:
         context = CURRENT_TRIAL.get()
@@ -1437,6 +1555,7 @@ class TrialExecutor:
                 error=f"benchmark incomplete: {exc}",
                 failure_kind="budget",
             )
+            self._tag_paired_turn(outcome)
             self._record_outcome(outcome)
             return outcome
         try:
@@ -1508,6 +1627,7 @@ class TrialExecutor:
                 partial_messages=partial_messages,
                 request_count=request_guard.requests,
             )
+            self._tag_paired_turn(outcome)
             if self.timing_sink is not None and (
                 is_provider_wait_failure(outcome.error)
                 or outcome.failure_kind in {"request_timeout", "global_deadline"}
@@ -2312,6 +2432,7 @@ def outcome_metrics(outcome: TrialOutcome) -> dict[str, float | int]:
         "target_payload_accuracy": int(outcome.target_payload_accuracy),
         "multi_step_ordering": int(outcome.multi_step_ordering),
         "result_binding_accuracy": int(outcome.result_binding_accuracy),
+        "accepted_behavior_matched": int(outcome.accepted_behavior_matched),
         "nonexistent_tool_attempts": outcome.nonexistent_tool_attempts,
         "wrong_capability_calls": outcome.wrong_capability_calls,
         "wrong_resource_calls": outcome.wrong_resource_calls,
@@ -2320,6 +2441,7 @@ def outcome_metrics(outcome: TrialOutcome) -> dict[str, float | int]:
         "unsupported_success_claims": outcome.unsupported_success_claims,
         "post_completion_overshoot": outcome.post_completion_overshoot,
         "preparatory_call_count": outcome.preparatory_call_count,
+        "discouraged_preflight_calls": outcome.discouraged_preflight_calls,
         "material_call_count": outcome.material_call_count,
         "tool_calls": outcome.tool_call_count,
         "successful_mcp_tool_calls": outcome.successful_mcp_tool_calls,
@@ -2352,6 +2474,7 @@ class TrialEvaluator(Evaluator[TaskManifest, TrialOutcome, dict[str, Any]]):
             "target_payload_accuracy",
             "multi_step_ordering",
             "result_binding_accuracy",
+            "accepted_behavior_matched",
         ):
             metrics.pop(name, None)
         return {
@@ -2398,6 +2521,10 @@ class TrialEvaluator(Evaluator[TaskManifest, TrialOutcome, dict[str, Any]]):
                 outcome.result_binding_accuracy,
                 "cross-call results are passed to the declared later arguments",
             ),
+            "accepted_behavior_matched": EvaluationReason(
+                outcome.accepted_behavior_matched,
+                "one declared semantic behavior matched by mode, operation, and resource",
+            ),
             **metrics,
         }
 
@@ -2419,6 +2546,7 @@ class MetricsReportEvaluator(ReportEvaluator[TaskManifest, TrialOutcome, dict[st
                 ("First material action accuracy", summary["first_material_action_accuracy"], "ratio"),
                 ("Literal first-tool error rate", summary["literal_first_tool_error_rate"], "ratio"),
                 ("Preparatory calls", summary["preparatory_call_count"], "calls"),
+                ("Discouraged preflight calls", summary["discouraged_preflight_calls"], "calls"),
                 ("Argument validity", summary["argument_validity"], "ratio"),
                 ("Required operations", summary["required_operations_rate"], "ratio"),
                 ("Tool outcome match", summary["tool_outcome_match_rate"], "ratio"),
@@ -2436,6 +2564,7 @@ class MetricsReportEvaluator(ReportEvaluator[TaskManifest, TrialOutcome, dict[st
                     ("first material action accuracy", locale_summary["first_material_action_accuracy"], "ratio"),
                     ("literal first-tool error rate", locale_summary["literal_first_tool_error_rate"], "ratio"),
                     ("preparatory calls", locale_summary["preparatory_call_count"], "calls"),
+                    ("discouraged preflight calls", locale_summary["discouraged_preflight_calls"], "calls"),
                     ("argument validity", locale_summary["argument_validity"], "ratio"),
                     ("tool outcome match", locale_summary["tool_outcome_match_rate"], "ratio"),
                     ("total tokens", locale_summary["total_tokens"], "tokens"),
@@ -2520,6 +2649,7 @@ def summarize_outcomes(outcomes: list[TrialOutcome]) -> dict[str, float | int]:
             "first_material_action_accuracy": 0.0,
             "literal_first_tool_error_rate": 1.0,
             "preparatory_call_count": 0.0,
+            "discouraged_preflight_calls": 0,
             "material_call_count": 0.0,
             "argument_validity": 0.0,
             "required_operations_rate": 0.0,
@@ -2531,6 +2661,7 @@ def summarize_outcomes(outcomes: list[TrialOutcome]) -> dict[str, float | int]:
             "target_payload_accuracy": 0.0,
             "multi_step_ordering_rate": 0.0,
             "result_binding_accuracy": 0.0,
+            "accepted_behavior_match_rate": 0.0,
             "tool_surface_error_count": 0,
             "hallucination_count": 0,
             "post_completion_overshoot": 0,
@@ -2552,6 +2683,7 @@ def summarize_outcomes(outcomes: list[TrialOutcome]) -> dict[str, float | int]:
         "first_material_action_accuracy": sum(outcome.first_material_action_accuracy for outcome in outcomes) / count,
         "literal_first_tool_error_rate": sum(outcome.literal_first_tool_error for outcome in outcomes) / count,
         "preparatory_call_count": sum(outcome.preparatory_call_count for outcome in outcomes) / count,
+        "discouraged_preflight_calls": sum(outcome.discouraged_preflight_calls for outcome in outcomes),
         "material_call_count": sum(outcome.material_call_count for outcome in outcomes) / count,
         "argument_validity": sum(outcome.argument_validity for outcome in outcomes) / count,
         "required_operations_rate": sum(outcome.required_operations_completed for outcome in outcomes) / count,
@@ -2563,6 +2695,7 @@ def summarize_outcomes(outcomes: list[TrialOutcome]) -> dict[str, float | int]:
         "target_payload_accuracy": sum(outcome.target_payload_accuracy for outcome in outcomes) / count,
         "multi_step_ordering_rate": sum(outcome.multi_step_ordering for outcome in outcomes) / count,
         "result_binding_accuracy": sum(outcome.result_binding_accuracy for outcome in outcomes) / count,
+        "accepted_behavior_match_rate": sum(outcome.accepted_behavior_matched for outcome in outcomes) / count,
         "tool_surface_error_count": sum(
             outcome.nonexistent_tool_attempts
             + outcome.wrong_capability_calls
