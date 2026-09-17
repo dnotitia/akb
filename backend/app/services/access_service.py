@@ -731,7 +731,15 @@ async def revoke_access(
 # ── Vault members ────────────────────────────────────────────
 
 async def list_vault_members(user_id: str, vault_name: str) -> list[dict]:
-    """List all members of a vault. Requires at least reader access."""
+    """List all members of a vault. Requires at least reader access.
+
+    Each row carries the canonical ``id`` alongside the display fields, the
+    same projection ``search_users`` makes (#413, #430). A username can be
+    renamed, so a consumer that keys membership on the id — which is the
+    correct thing to store — needs the roster to be joinable without a
+    round trip per person. An opaque uuid discloses strictly less than the
+    email beside it, so this widens nothing about who can see whom.
+    """
     await check_vault_access(user_id, vault_name, required_role="reader")
 
     pool = await get_pool()
@@ -739,10 +747,11 @@ async def list_vault_members(user_id: str, vault_name: str) -> list[dict]:
         vault = await conn.fetchrow("SELECT id, owner_id FROM vaults WHERE name = $1", vault_name)
 
         # Get owner
-        owner = await conn.fetchrow("SELECT username, display_name, email FROM users WHERE id = $1", vault["owner_id"])
+        owner = await conn.fetchrow("SELECT id, username, display_name, email FROM users WHERE id = $1", vault["owner_id"])
         members = []
         if owner:
             members.append({
+                "id": str(owner["id"]),
                 "username": owner["username"],
                 "display_name": owner["display_name"],
                 "email": owner["email"],
@@ -752,7 +761,7 @@ async def list_vault_members(user_id: str, vault_name: str) -> list[dict]:
         # Get other members
         rows = await conn.fetch(
             """
-            SELECT u.username, u.display_name, u.email, va.role, va.created_at
+            SELECT u.id, u.username, u.display_name, u.email, va.role, va.created_at
             FROM vault_access va
             JOIN users u ON va.user_id = u.id
             WHERE va.vault_id = $1
@@ -762,6 +771,7 @@ async def list_vault_members(user_id: str, vault_name: str) -> list[dict]:
         )
         for r in rows:
             members.append({
+                "id": str(r["id"]),
                 "username": r["username"],
                 "display_name": r["display_name"],
                 "email": r["email"],
@@ -828,6 +838,10 @@ async def explain_vault_access(
     return {
         "vault": vault_name,
         "user": target["username"],
+        # The canonical id, same projection as the member roster (#430): the
+        # explanation is keyed by username but describes one person, and a
+        # consumer holding ids must be able to match it without a round trip.
+        "user_id": str(target["id"]),
         # What the member plane says, and what it is derived from. They are
         # reported separately rather than as one number: if they ever disagree
         # the recompute is broken, and collapsing them would hide exactly that.
