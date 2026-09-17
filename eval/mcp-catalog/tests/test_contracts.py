@@ -52,7 +52,18 @@ def test_registered_manifest_and_corpus_cover_every_category() -> None:
     assert (manifest.models[0].input_cost_per_million_usd, manifest.models[0].output_cost_per_million_usd) == (0.14, 0.28)
     assert (manifest.models[1].input_cost_per_million_usd, manifest.models[1].output_cost_per_million_usd) == (0.24, 2.2)
     assert manifest.budget.max_cost_per_trial_usd == 0.1
+    assert manifest.budget.max_requests_per_trial == 24
     assert {model.settings["max_tokens"] for model in manifest.models} == {8192}
+
+    absent_before_pairs = {
+        "knowledge-workflow",
+        "table-publication",
+        "import-export",
+        "overlapping-document",
+    }
+    for task in tasks:
+        expected_before = 404 if task.pair_id in absent_before_pairs else task.expected_final_state.probe.expected_status
+        assert task.expected_final_state.resolved_before_expected_status == expected_before
 
 
 def test_manifest_rejects_provider_or_price_drift() -> None:

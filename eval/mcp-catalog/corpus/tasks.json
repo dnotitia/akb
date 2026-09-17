@@ -84,7 +84,7 @@
           {"logical_operation": "read", "resource_type": "document", "arguments": {}, "outcome": "success"}
         ],
         "expected_result_bindings": [{"source_attempt": 3, "source_field": "uri", "target_attempt": 4, "target_argument": "uri", "relation": "equals"}, {"source_attempt": 3, "source_field": "uri", "target_attempt": 5, "target_argument": "uri", "relation": "equals"}],
-        "expected_final_state": {"probe": {"service": "app", "method": "GET", "path": "/api/v1/browse/catalog-bench-knowledge?depth=-1"}, "must": [{"pointer": "/items", "operator": "contains", "value": {"name": "quick-update.md"}}]}
+        "expected_final_state": {"probe": {"service": "app", "method": "GET", "path": "/api/v1/browse/catalog-bench-knowledge?depth=-1"}, "before_expected_status": 404, "must": [{"pointer": "/items", "operator": "contains", "value": {"name": "quick-update.md"}}]}
       },
       "locales": {
         "ko-KR": {"id": "knowledge-workflow-ko", "prompt": "`catalog-bench-knowledge` 보관함과 그 안의 `notes` 모음을 만든 뒤 제목 `quick-update`, 본문 `A short note for the team.`인 문서를 추가해 줘. 반환된 문서 주소로 현재 내용과 출처 정보를 확인하고 모든 단계가 끝난 뒤 알려 줘.", "response_rubric": {"required_any_of": [["quick-update"]], "require_non_empty": true, "success_claim_terms": ["성공", "완료", "확인"]}},
@@ -121,7 +121,7 @@
           {"logical_operation": "delete", "resource_type": "publication", "arguments": {}, "outcome": "success"}
         ],
         "expected_result_bindings": [{"source_attempt": 4, "source_field": "slug", "target_attempt": 6, "target_argument": "slug", "relation": "equals"}],
-        "expected_final_state": {"probe": {"service": "app", "method": "GET", "path": "/api/v1/browse/catalog-bench-data?depth=-1"}, "must": [{"pointer": "/items", "operator": "contains", "value": {"name": "scores"}}]}
+        "expected_final_state": {"probe": {"service": "app", "method": "GET", "path": "/api/v1/browse/catalog-bench-data?depth=-1"}, "before_expected_status": 404, "must": [{"pointer": "/items", "operator": "contains", "value": {"name": "scores"}}]}
       },
       "locales": {
         "ko-KR": {"id": "table-publication-ko", "prompt": "`catalog-bench-data` 보관함과 텍스트 열 `label`이 있는 `scores` 표를 만들어 줘. `SELECT * FROM scores LIMIT 5`를 실행하고 같은 제한 쿼리를 공개한 뒤 공개 목록에서 확인해. 마지막에는 반환된 공개 식별자로 공유만 해제하고 표와 보관함은 남겨 둬.", "response_rubric": {"require_non_empty": true, "success_claim_terms": ["성공", "완료", "해제"]}},
@@ -186,7 +186,7 @@
           {"logical_operation": "create", "resource_type": "archive", "arguments": {"vault": "catalog-bench-io", "format": "okf", "files": {"notes/imported.md": "---\ntype: note\n---\n# Imported\nportable"}}, "outcome": "success"},
           {"logical_operation": "read", "resource_type": "archive", "arguments": {"vault": "catalog-bench-io", "format": "okf"}, "outcome": "success"}
         ],
-        "expected_final_state": {"probe": {"service": "app", "method": "GET", "path": "/api/v1/browse/catalog-bench-io?depth=-1"}, "must": [{"pointer": "/items", "operator": "contains", "value": {"name": "imported.md"}}]}
+        "expected_final_state": {"probe": {"service": "app", "method": "GET", "path": "/api/v1/browse/catalog-bench-io?depth=-1"}, "before_expected_status": 404, "must": [{"pointer": "/items", "operator": "contains", "value": {"name": "imported.md"}}]}
       },
       "locales": {
         "ko-KR": {"id": "import-export-ko", "prompt": "`catalog-bench-io`를 만들고 `notes/imported.md` 경로에 `---\ntype: note\n---\n# Imported\nportable`인 OKF 파일 맵을 가져와. 성공하면 같은 보관함을 OKF로 내보내 그 경로가 포함됐는지 알려 줘.", "response_rubric": {"required_any_of": [["imported.md"]], "require_non_empty": true, "success_claim_terms": ["성공", "포함", "완료"]}},
@@ -392,7 +392,7 @@
         "expected_material_outcomes": [{"logical_operation": "create", "outcome": "success"}, {"logical_operation": "update", "outcome": "success"}, {"logical_operation": "read", "outcome": "success"}],
         "expected_material_attempts": [{"logical_operation": "create", "resource_type": "vault", "arguments": {"name": "catalog-bench-overlap"}, "outcome": "success"}, {"logical_operation": "create", "resource_type": "document", "arguments": {"vault": "catalog-bench-overlap", "title": "status-note", "content": "# Status\nDraft\n# Owner\nTeam A"}, "outcome": "success"}, {"logical_operation": "update", "resource_type": "document", "arguments": {}, "outcome": "success"}, {"logical_operation": "read", "resource_type": "document", "arguments": {"section": "Status"}, "outcome": "success"}],
         "expected_result_bindings": [{"source_attempt": 2, "source_field": "uri", "target_attempt": 3, "target_argument": "uri", "relation": "equals"}, {"source_attempt": 2, "source_field": "uri", "target_attempt": 4, "target_argument": "uri", "relation": "equals"}],
-        "expected_final_state": {"probe": {"service": "app", "method": "GET", "path": "/api/v1/browse/catalog-bench-overlap?depth=-1"}, "must": [{"pointer": "/items", "operator": "contains", "value": {"name": "status-note.md"}}]}
+        "expected_final_state": {"probe": {"service": "app", "method": "GET", "path": "/api/v1/browse/catalog-bench-overlap?depth=-1"}, "before_expected_status": 404, "must": [{"pointer": "/items", "operator": "contains", "value": {"name": "status-note.md"}}]}
       },
       "locales": {
         "ko-KR": {"id": "overlapping-document-ko", "prompt": "`catalog-bench-overlap`에 제목 `status-note`, 본문 `# Status\nDraft\n# Owner\nTeam A`인 문서를 만들어. 반환된 주소에서 `Draft`만 `Final`로 바꾸고 다른 내용은 보존한 다음 `Status` 섹션만 읽어 알려 줘. 범위를 다시 묻거나 다른 문서를 바꾸지 마.", "response_rubric": {"required_any_of": [["Final"]], "require_non_empty": true, "clarification_terms": ["어느", "선택", "지정"], "success_claim_terms": ["성공", "완료", "변경"]}},

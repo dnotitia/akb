@@ -1019,7 +1019,12 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
                 if task.fixture.local_files
                 else {}
             )
-            before = await self.fixture.observe(task.expected_final_state.probe, token=token)
+            before = await self.fixture.observe(
+                task.expected_final_state.probe.model_copy(
+                    update={"expected_status": task.expected_final_state.resolved_before_expected_status}
+                ),
+                token=token,
+            )
             self.context = TrialContext(
                 task=task,
                 token=token,

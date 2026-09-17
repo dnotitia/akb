@@ -171,9 +171,14 @@ class StateExpectation(ContractModel):
 
 class StateContract(ContractModel):
     probe: StateProbe
+    before_expected_status: int | None = Field(default=None, ge=100, le=599)
     must: list[StateExpectation] = Field(default_factory=list)
     must_not: list[StateExpectation] = Field(default_factory=list)
     unchanged: list[str] = Field(default_factory=list)
+
+    @property
+    def resolved_before_expected_status(self) -> int:
+        return self.before_expected_status or self.probe.expected_status
 
     @field_validator("unchanged")
     @classmethod

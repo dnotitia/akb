@@ -6,6 +6,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from mcp_catalog.contracts import StateProbe
 from mcp_catalog.runtime import RESET_TIMEOUT_SECONDS, RuntimeContractError, RuntimeDescriptor, RuntimeFixture
 
 
@@ -129,6 +130,14 @@ class _MintClient:
         return None
 
 
+class _ObserveClient:
+    async def get(self, _url: str, **_kwargs: object) -> _Response:
+        return _Response(404, {"detail": "resource does not exist yet"})
+
+    async def aclose(self) -> None:
+        return None
+
+
 def test_schema_v2_descriptor_resolves_exact_source_and_artifacts() -> None:
     descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
     discovery = {
@@ -182,6 +191,23 @@ def test_descriptor_rejects_cross_origin_reset() -> None:
 
     with pytest.raises(RuntimeContractError, match="declared origin"):
         RuntimeDescriptor.from_dict(raw)
+
+
+@pytest.mark.asyncio
+async def test_state_probe_can_treat_expected_absence_as_available_evidence() -> None:
+    descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
+    fixture = RuntimeFixture(descriptor)
+    fixture.client = _ObserveClient()  # type: ignore[assignment]
+
+    observation = await fixture.observe(
+        StateProbe(service="app", path="/api/v1/browse/not-created", expected_status=404),
+        token="fixture-token",
+    )
+
+    assert observation.available is True
+    assert observation.status_code == 404
+    assert observation.payload == {"detail": "resource does not exist yet"}
+    await fixture.close()
 
 
 def test_descriptor_rejects_revision_mismatch() -> None:
