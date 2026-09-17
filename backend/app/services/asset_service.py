@@ -19,6 +19,7 @@ from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import AKBError, NotFoundError, ValidationError
 from app.repositories import vault_files_repo
+from app.repositories.vault_files_repo import DocumentAssetOwner
 from app.repositories.vault_repo import lock_vault_for_child_write
 from app.services.adapters import s3_adapter
 from app.services.m1_file_measurement import measurement_enabled
@@ -236,19 +237,17 @@ def _revision_retain_until() -> datetime:
 async def sync_document_assets(
     conn,
     *,
-    document_id: uuid.UUID,
-    vault_id: uuid.UUID,
+    owner: DocumentAssetOwner,
     document_path: str,
     commit_hash: str,
     asset_ids: set[uuid.UUID],
     previous_commit: str | None = None,
     previous_path: str | None = None,
 ) -> None:
-    """Publish the current image set and its bounded Git manifest."""
+    """Publish the current image set and its bounded revision manifest."""
     await vault_files_repo.sync_document_asset_references(
         conn,
-        document_id=document_id,
-        vault_id=vault_id,
+        owner=owner,
         document_path=document_path,
         commit_hash=commit_hash,
         asset_ids=asset_ids,
@@ -261,30 +260,23 @@ async def sync_document_assets(
 async def list_live_document_asset_ids(
     conn,
     *,
-    document_id: uuid.UUID,
-    vault_id: uuid.UUID,
+    owner: DocumentAssetOwner,
 ) -> set[uuid.UUID]:
     """Return the current attachment set through the asset-service boundary."""
-    return await vault_files_repo.list_live_document_asset_ids(
-        conn,
-        document_id=document_id,
-        vault_id=vault_id,
-    )
+    return await vault_files_repo.list_live_document_asset_ids(conn, owner=owner)
 
 
 async def retain_document_assets_for_delete(
     conn,
     *,
-    document_id: uuid.UUID,
-    vault_id: uuid.UUID,
+    owner: DocumentAssetOwner,
     document_path: str,
     commit_hash: str | None,
 ) -> None:
     """Keep the deleted document's last image-bearing revision temporarily."""
     await vault_files_repo.retain_current_document_assets(
         conn,
-        document_id=document_id,
-        vault_id=vault_id,
+        owner=owner,
         document_path=document_path,
         commit_hash=commit_hash,
         retain_until=_revision_retain_until(),

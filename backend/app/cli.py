@@ -79,6 +79,11 @@ BRIDGE_BODY_BACKFILL_USAGE = (
     "[--vault NAME] [--limit N] [--batch-size N] [--dry-run|--verify]"
 )
 
+NATIVE_ASSET_REFS_USAGE = (
+    "Usage: python -m app.cli native-asset-refs-backfill "
+    "[--vault NAME] [--limit N] [--dry-run]"
+)
+
 MIGRATE_REVISION_BACKEND_USAGE = (
     "Usage: python -m app.cli migrate-revision-backend "
     "{plan --coverage-version VERSION|apply|verify|commit|abort --cutover-id UUID|"
@@ -838,6 +843,56 @@ async def _migrate_revision_backend(args: list[str]) -> int:
     return 0
 
 
+async def _native_asset_refs_backfill(args: list[str]) -> int:
+    """Publish live image references for Native documents written without them.
+
+    Re-runnable: the sync replaces a document's live set rather than appending,
+    so a second pass over an already-correct document changes nothing.
+    """
+    from app.db.postgres import close_pool
+    from app.services.native_asset_ref_backfill import backfill_native_asset_refs
+
+    vault = None
+    limit = None
+    dry_run = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--dry-run":
+            dry_run = True
+        elif arg in ("--vault", "--limit"):
+            index += 1
+            if index >= len(args):
+                print(NATIVE_ASSET_REFS_USAGE, file=sys.stderr)
+                return 2
+            if arg == "--vault":
+                vault = args[index]
+            else:
+                try:
+                    limit = int(args[index])
+                except ValueError:
+                    print("--limit must be an integer", file=sys.stderr)
+                    return 2
+        else:
+            print(f"Unknown native-asset-refs-backfill option: {arg}", file=sys.stderr)
+            return 2
+        index += 1
+
+    try:
+        report = await backfill_native_asset_refs(
+            vault=vault, limit=limit, dry_run=dry_run,
+        )
+        print(json.dumps(report.to_dict(), sort_keys=True))
+        # A run that stopped at --limit has not seen the population, so it
+        # must not read as a clean result.
+        return 0 if report.complete and not report.failed else 1
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    finally:
+        await close_pool()
+
+
 async def _bridge_body_backfill(args: list[str]) -> int:
     """Copy bridged revision bodies from the git volume into PostgreSQL.
 
@@ -1002,7 +1057,7 @@ def main(argv: list[str] | None = None) -> int:
             "bootstrap-standalone-sso, "
             "reset-password <username>, repair-resource-hashes, "
             "initialize-postgres-native, migrate-revision-backend, "
-            "bridge-body-backfill, "
+            "bridge-body-backfill, native-asset-refs-backfill, "
             "okf-validate <dir>, "
             "okf-export --from-git <worktree> --vault <name> --out <dir>",
             file=sys.stderr,
@@ -1030,6 +1085,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_migrate_revision_backend(argv[1:]))
     if cmd == "bridge-body-backfill":
         return asyncio.run(_bridge_body_backfill(argv[1:]))
+    if cmd == "native-asset-refs-backfill":
+        return asyncio.run(_native_asset_refs_backfill(argv[1:]))
     if cmd == "okf-validate":
         return _okf_validate(argv[1:])
     if cmd == "okf-export":

@@ -139,6 +139,7 @@ from app.repositories.document_repo import (
     acquire_path_lock,
 )
 from app.repositories.events_repo import emit_event
+from app.repositories.vault_files_repo import DocumentAssetOwner
 from app.repositories.vault_external_git_repo import VaultExternalGitRepository
 from app.repositories.vault_repo import VaultRepository, lock_vault_for_child_write
 from app.services.git_service import GitService
@@ -777,8 +778,7 @@ class DocumentService:
         )
         await asset_service.sync_document_assets(
             conn,
-            document_id=pg_doc_id,
-            vault_id=vault_id,
+            owner=DocumentAssetOwner(vault_id=vault_id, document_id=pg_doc_id),
             document_path=file_path,
             commit_hash=commit_hash,
             asset_ids=asset_ids,
@@ -1189,8 +1189,7 @@ class DocumentService:
         )
         await asset_service.sync_document_assets(
             conn,
-            document_id=pg_doc_id,
-            vault_id=vault_id,
+            owner=DocumentAssetOwner(vault_id=vault_id, document_id=pg_doc_id),
             document_path=file_path,
             commit_hash=commit_hash,
             asset_ids=asset_ids,
@@ -1384,7 +1383,7 @@ class DocumentService:
             )
             now = datetime.now(timezone.utc)
             live_asset_ids = await asset_service.list_live_document_asset_ids(
-                conn, document_id=pg_doc_id, vault_id=vault_id,
+                conn, owner=DocumentAssetOwner(vault_id=vault_id, document_id=pg_doc_id),
             )
             summary = message or f"{old_path} -> {new_path}"
             commit_msg = (
@@ -1418,8 +1417,7 @@ class DocumentService:
             )
             await asset_service.sync_document_assets(
                 conn,
-                document_id=pg_doc_id,
-                vault_id=vault_id,
+                owner=DocumentAssetOwner(vault_id=vault_id, document_id=pg_doc_id),
                 document_path=new_path,
                 commit_hash=commit_hash,
                 asset_ids=live_asset_ids,
@@ -1668,8 +1666,7 @@ class DocumentService:
         )
         await asset_service.sync_document_assets(
             conn,
-            document_id=pg_doc_id,
-            vault_id=vault_id,
+            owner=DocumentAssetOwner(vault_id=vault_id, document_id=pg_doc_id),
             document_path=file_path,
             commit_hash=commit_hash,
             asset_ids=asset_ids,

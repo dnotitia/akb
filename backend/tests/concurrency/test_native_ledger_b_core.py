@@ -59,6 +59,11 @@ _FILE_DERIVED_MIGRATION = (
     _BACKEND / "app" / "db" / "migrations" / "059_native_file_searchable_derived.py"
 )
 _WRITE_POLICY_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "044_vault_write_policy.py"
+# The document write path publishes image references; 107 is what gives a
+# Native document a column to publish into.
+_ASSET_REF_MIGRATION = (
+    _BACKEND / "app" / "db" / "migrations" / "107_native_document_asset_refs.py"
+)
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:5433/akb",  # pragma: allowlist secret
@@ -115,6 +120,7 @@ async def _fresh_database(*, with_derived: bool = False, pool_max_size: int = 8)
         await migration.migrate(conn=conn)  # idempotent startup/retry
         await _load_migration(_BODY_MIGRATION).migrate(conn=conn)
         await _load_migration(_PLACEMENT_MIGRATION).migrate(conn=conn)
+        await _load_migration(_ASSET_REF_MIGRATION).migrate(conn=conn)
         if with_derived:
             for path in _INDEXABLE_MIGRATIONS:
                 await _load_migration(path).migrate(conn=conn)
