@@ -33,7 +33,7 @@ _MIGRATION_085 = (
     _BACKEND / "app" / "db" / "migrations" / "085_vault_access_contributions.py"
 )
 _MIGRATION_HEAD = (
-    _BACKEND / "app" / "db" / "migrations" / "099_personal_notifications.py"
+    _BACKEND / "app" / "db" / "migrations" / "109_users_email_lower_uniq.py"
 )
 _MIGRATIONS_DIR = _BACKEND / "app" / "db" / "migrations"
 

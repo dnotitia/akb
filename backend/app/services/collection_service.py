@@ -230,6 +230,31 @@ class CollectionService:
 
         pool = await get_pool()
         doc_repo = DocumentRepository(pool)
+        # Native-authority emptiness check (#543): on `postgres_native` the
+        # native path never writes `documents`, so a collection whose live
+        # documents were all created after the cutover presents as empty to
+        # the legacy repository — and `delete(recursive=False)` would succeed
+        # instead of refusing with CollectionNotEmptyError. The native ledger
+        # (same query shape as the browse view) is the authority there.
+        # Module-level import (not function-local): tests patch this symbol
+        # and #525's counter module is the single authority selector.
+        from app.services import document_counters as _counters
+
+        async def _native_docs_under(
+            conn, vault_uuid: uuid.UUID, prefix: str,
+        ) -> list[dict]:
+            bare = prefix.rstrip("/")
+            rows = await conn.fetch(
+                "SELECT resource_id, current_path AS path "
+                "FROM native_resources "
+                "WHERE namespace_id = $1 AND surface = 'document' "
+                "AND lifecycle = 'live' "
+                "AND (current_path = $2 OR current_path LIKE $3 ESCAPE '\\')",
+                vault_uuid,
+                bare,
+                CollectionRepository._like_escape(bare) + "/%",
+            )
+            return [dict(r) for r in rows]
         docs_count = 0
         files_count = 0
         sub_count = 0
@@ -273,6 +298,8 @@ class CollectionService:
                 sub_rows = [dict(r) for r in sub_rows_locked]
 
                 docs = await coll_repo.list_docs_under(vault_id, norm, conn=conn)
+                if _counters.native_documents_are_authoritative():
+                    docs = docs + await _native_docs_under(conn, vault_id, norm)
                 files = await coll_repo.list_files_under(vault_id, norm, conn=conn)
                 # Tables living in this collection (FK collection_id is
                 # ON DELETE SET NULL, so deleting the collection rows
@@ -331,6 +358,39 @@ class CollectionService:
                 # onto that path would be reached through the old public
                 # link.
                 for d in docs:
+                    # Native-authority rows carry a resource_id, not a legacy
+                    # documents id (#543). They are deleted through the native
+                    # revision service (lifecycle + revision chain), not the
+                    # legacy repository — which would find no row and report
+                    # the delete as a no-op while the live document survives.
+                    if _counters.native_documents_are_authoritative() and "resource_id" in d:
+                        # Same delete the native document service performs
+                        # (revision chain + lifecycle), minus the body-asset
+                        # retention that belongs to single-document delete:
+                        # collection delete removes the whole prefix.
+                        from app.services.native_document_service import (
+                            NativeDocumentService,
+                        )
+
+                        native_svc = NativeDocumentService()
+                        vault_id_resolved, current = await native_svc._current(
+                            vault, str(d["resource_id"]),
+                        )
+                        native = await native_svc._native()
+                        await native.delete_resource(
+                            namespace_id=vault_id_resolved,
+                            surface="document",
+                            path=current.path,
+                            actor=agent_id or "unknown",
+                            mutation_id=uuid.uuid4(),
+                            expected_revision_id=current.revision_id,
+                            expected_resource_id=current.resource_id,
+                            message=f"[delete-collection] {norm}\n\nagent: {agent_id or 'unknown'}\naction: delete-collection",
+                            subject=f"[delete-collection] {norm}",
+                        )
+                        await delete_document_chunks(conn, str(d["resource_id"]))
+                        await delete_document_relations(conn, vault, d["path"])
+                        continue
                     await delete_document_chunks(conn, str(d["id"]))
                     await delete_document_relations(conn, vault, d["path"])
                     # The URI for the publication cleanup is derived from
