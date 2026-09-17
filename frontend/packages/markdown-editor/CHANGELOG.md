@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.0
+
+- Add the shared image upload surface for file selection, standalone image
+  paste, drop, serial progress, cancellation, partial outcomes, retry, and
+  read-only handling.
+- Map insertion and replacement through ProseMirror selection bookmarks so
+  edits and cursor movement during an upload do not move the target.
+- Add product-owned upload context and asset lifecycle callbacks while keeping
+  validation, storage, retention, and draft policy outside the package.
+- Add `MarkdownCommands.replaceImageAt` and progress callbacks to
+  `uploadMarkdownBatch`.
+
 ## 0.7.0
 
 - Add position-based image alt and body-delete commands. Each operation targets
