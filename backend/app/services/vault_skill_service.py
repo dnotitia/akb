@@ -130,6 +130,7 @@ def reset() -> None:
     _session_map.clear()
     _acknowledged_map.clear()
     _challenge_map.clear()
+    _last_forced_refresh.clear()
     _pending.clear()
 
 
@@ -176,6 +177,19 @@ _ACK_TOKEN_DOMAIN = "akb-vault-skill-ack-v1"
 # challenge needs.
 _ACK_TOKEN_CHARS = 32
 _warned_unsigned_challenge = False
+
+# A presented-but-wrong acknowledgement is the one signal that THIS replica's
+# cached guide may be behind the one that issued the token: the token is a
+# function of the guide version, so two replicas holding different versions
+# derive different tokens and the retry can never match until their caches
+# converge. Re-resolving on that signal closes the window in one round trip
+# instead of waiting out `_CACHE_TTL`.
+#
+# The floor is what stops it becoming an amplifier: a caller sending wrong
+# acknowledgements in a loop can force at most one guide read per key per
+# interval, and `_pending` already collapses concurrent reads for one key.
+_FORCED_REFRESH_MIN_INTERVAL = 5.0
+_last_forced_refresh: OrderedDict[tuple[str, str, str | None], float] = OrderedDict()
 
 
 def _bind(*parts: str) -> bytes:
@@ -236,6 +250,27 @@ def _challenge_token(key: tuple[str, str, str | None], version: str) -> str:
     ).digest()
     encoded = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
     return encoded[:_ACK_TOKEN_CHARS]
+
+
+def _token_matches(acknowledgement: str | None, token: str) -> bool:
+    """Constant-time compare that also rejects a non-string or wrong length."""
+    return (
+        isinstance(acknowledgement, str)
+        and len(acknowledgement) == len(token)
+        and hmac.compare_digest(acknowledgement, token)
+    )
+
+
+def _may_force_refresh(key: tuple[str, str, str | None]) -> bool:
+    now = time.monotonic()
+    last = _last_forced_refresh.get(key)
+    if last is not None and now - last < _FORCED_REFRESH_MIN_INTERVAL:
+        return False
+    _last_forced_refresh[key] = now
+    _last_forced_refresh.move_to_end(key)
+    while len(_last_forced_refresh) > _SESSION_MAP_MAX:
+        _last_forced_refresh.popitem(last=False)
+    return True
 
 
 def _format_payload(
@@ -477,10 +512,21 @@ async def preflight_payload(
         token = _challenge_token(key, version)
 
         if (
-            isinstance(acknowledgement, str)
-            and len(acknowledgement) == len(token)
-            and hmac.compare_digest(acknowledgement, token)
+            acknowledgement
+            and not _token_matches(acknowledgement, token)
+            and _may_force_refresh(key)
         ):
+            # Drop this replica's cached guide and read it again: if another
+            # replica has already moved to a newer version, the token the
+            # caller is presenting was derived from THAT one.
+            for cache_key in [k for k in _vault_cache if k[0] == vault]:
+                _vault_cache.pop(cache_key, None)
+            refreshed_version, refreshed_body = await _current(vault, vault_id)
+            if refreshed_version is not None and refreshed_body is not None:
+                version, body = refreshed_version, refreshed_body
+                token = _challenge_token(key, version)
+
+        if _token_matches(acknowledgement, token):
             _remember(_acknowledged_map, key, version)
             _remember(_session_map, key, version)
             _challenge_map.pop(key, None)
