@@ -223,8 +223,13 @@ def test_compile_write_ast_update_reuses_ast_filter() -> None:
     assert compiled.params == ["critical", "high", "tok-1"]
 
 
-def test_compile_write_ast_update_requires_cas() -> None:
-    missing = compile_ast_mutation(
+def test_compile_write_ast_update_without_cas_is_unguarded_not_rejected() -> None:
+    """Row CAS is opt-in: no token means the mutation this endpoint always did.
+
+    The caller's own filter still scopes it — the token is an extra predicate,
+    never the thing that narrows the statement.
+    """
+    compiled = compile_ast_mutation(
         vault_name="eng",
         table_name="incidents",
         columns=COLUMNS,
@@ -234,8 +239,10 @@ def test_compile_write_ast_update_requires_cas() -> None:
         },
         actor_id="alice",
     )
-    assert isinstance(missing, dict)
-    assert missing["code"] == "row_commit_required"
+    assert not isinstance(compiled, dict), compiled
+    assert compiled.cas_guarded is False
+    assert "row_commit" not in compiled.sql
+    assert "severity = $" in compiled.sql
 
 
 def test_compile_write_ast_delete_requires_filter_or_all_true() -> None:
@@ -260,16 +267,17 @@ def test_compile_write_ast_delete_requires_filter_or_all_true() -> None:
     assert all_rows.sql == "DELETE FROM vt_eng__incidents WHERE (TRUE) AND row_commit = $1"
 
 
-def test_compile_write_ast_delete_requires_cas() -> None:
-    missing = compile_ast_mutation(
+def test_compile_write_ast_delete_without_cas_is_unguarded_not_rejected() -> None:
+    compiled = compile_ast_mutation(
         vault_name="eng",
         table_name="incidents",
         columns=COLUMNS,
         ast={"delete": True, "all": True},
         actor_id="alice",
     )
-    assert isinstance(missing, dict)
-    assert missing["code"] == "row_commit_required"
+    assert not isinstance(compiled, dict), compiled
+    assert compiled.cas_guarded is False
+    assert "row_commit" not in compiled.sql
 
 
 def test_compile_update_reuses_filters_and_ignores_server_columns() -> None:
@@ -319,16 +327,18 @@ def test_compile_write_serializes_canonical_jsonb_values() -> None:
     assert updated.params == [json.dumps({"tier": "silver"}), "high", "tok-1"]
 
 
-def test_compile_update_requires_cas_token() -> None:
-    missing = compile_update_rows(
+def test_compile_update_without_cas_token_is_unguarded_not_rejected() -> None:
+    compiled = compile_update_rows(
         vault_name="eng",
         table_name="incidents",
         columns=COLUMNS,
         body={"severity": "critical"},
         query_params=[("severity", "eq.high")],
     )
-    assert isinstance(missing, dict)
-    assert missing["code"] == "row_commit_required"
+    assert not isinstance(compiled, dict), compiled
+    assert compiled.cas_guarded is False
+    assert "row_commit" not in compiled.sql
+    assert "severity = $" in compiled.sql
 
 
 def test_compile_update_requires_filter_or_all_true() -> None:
@@ -402,15 +412,17 @@ def test_compile_delete_requires_filter_and_can_return_representation() -> None:
     assert compiled.params == ["low", "tok-1"]
 
 
-def test_compile_delete_requires_cas_token() -> None:
-    missing = compile_delete_rows(
+def test_compile_delete_without_cas_token_is_unguarded_not_rejected() -> None:
+    compiled = compile_delete_rows(
         vault_name="eng",
         table_name="incidents",
         columns=COLUMNS,
         query_params=[("severity", "eq.low")],
     )
-    assert isinstance(missing, dict)
-    assert missing["code"] == "row_commit_required"
+    assert not isinstance(compiled, dict), compiled
+    assert compiled.cas_guarded is False
+    assert "row_commit" not in compiled.sql
+    assert "severity = $" in compiled.sql
 
 
 # A real column can share a name with a reserved write-control param
