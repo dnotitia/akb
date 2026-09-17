@@ -1242,14 +1242,9 @@ async def _read_document_body_uncached(
         content_unavailable = True
         body = "*Document content is no longer available.*"
 
-    section_not_found = False
-    if section_filter and body:
-        filtered, found = _filter_section(body, section_filter)
-        if found:
-            body = filtered
-        else:
-            section_not_found = True
-            logger.info("section_filter %r did not match any heading", section_filter)
+    body, section_not_found = _apply_section_filter(body, section_filter)
+    if section_not_found:
+        logger.info("section_filter %r did not match any heading", section_filter)
 
     return _ResolvedDocumentBody(
         content=body,
@@ -1335,12 +1330,7 @@ async def _resolve_document_body(
     section_filter: str | None,
 ) -> _ResolvedDocumentBody:
     if "_native_body" in doc_row:
-        body = doc_row["_native_body"]
-        missing = False
-        if section_filter:
-            body, found = _filter_section(body, section_filter)
-            if not found:
-                body, missing = "", True
+        body, missing = _apply_section_filter(doc_row["_native_body"], section_filter)
         return _ResolvedDocumentBody(
             content=body, content_unavailable=False, section_not_found=missing,
             asset_ids=frozenset(asset_service.extract_asset_ids(body)),
@@ -1493,6 +1483,28 @@ async def resolve_document_publication_asset_ids(publication: dict) -> frozenset
 
 
 _HEADING_RE = re.compile(r"^(#+)\s+(.*)$")
+
+
+def _apply_section_filter(body: str, section_filter: str | None) -> tuple[str, bool]:
+    """Narrow a body to one section, or hand back nothing when it is gone.
+
+    A section-scoped publication is a capability for THAT section, not for the
+    document it happens to live in. When the heading stops matching -- renamed,
+    demoted, deleted -- the answer is an empty body, never the whole document:
+    the link holder was never granted the rest of it. `asset_ids` is derived
+    from whatever this returns, so the image manifest narrows with the body.
+
+    Both resolution paths call this. They are here because they had already
+    drifted: one blanked the body on a miss and the other returned the full
+    markdown, so the same publication disclosed different amounts depending on
+    which revision backend served it.
+    """
+    if not section_filter or not body:
+        return body, False
+    filtered, found = _filter_section(body, section_filter)
+    if not found:
+        return "", True
+    return filtered, False
 
 
 def _filter_section(markdown: str, section_path: str) -> tuple[str, bool]:

@@ -917,12 +917,18 @@ DELV=$(acurl -X DELETE "$BASE_URL/api/v1/vaults/${VAULT}-empty")
 DELOK=$(echo "$DELV" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("deleted"))' 2>/dev/null)
 [ "$DELOK" = "True" ] && pass "Empty vault deleted" || fail "Empty vault delete" "$DELV"
 
-# section_not_found field is True when filter missing
+# A section filter that no longer matches must report itself AND serve nothing.
+# Asserting only the flag is what let the two revision backends drift: one
+# blanked the body on a miss and the other returned the whole document, and
+# this check was green for both. The flag is not the property; the body is.
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
   -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"section_filter\":\"NoSuchHeading\"}")
 SNF_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
-SNF=$(curl -sk "$BASE_URL/api/v1/public/$SNF_SLUG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("section_not_found"))' 2>/dev/null)
+SNF_RESP=$(curl -sk "$BASE_URL/api/v1/public/$SNF_SLUG")
+SNF=$(echo "$SNF_RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("section_not_found"))' 2>/dev/null)
+SNF_LEN=$(echo "$SNF_RESP" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("content") or ""))' 2>/dev/null)
 [ "$SNF" = "True" ] && pass "section_not_found=true when filter missing" || fail "section_not_found" "$SNF"
+[ "$SNF_LEN" = "0" ] && pass "a missing section serves no body" || fail "a missing section served the document" "$SNF_LEN bytes"
 
 echo ""
 
