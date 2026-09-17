@@ -2,8 +2,9 @@
 
 Talks to Seahorse Cloud's two-plane API:
 
-- **Management (BFF)** at `seahorse_cloud_management_url` for table
-  lifecycle (list / get / create / delete).
+- **Management** at `seahorse_cloud_management_url` for table
+  lifecycle (list / get / create / delete). The prefix is `/api`; the
+  legacy `/bff` prefix no longer routes (#524).
 - **Per-table data plane host** for upsert / search / delete-row /
   schema. The host is discovered from the management response (each
   table gets its own subdomain) and cached on `ensure_collection`.
@@ -87,11 +88,11 @@ def _sparse_to_str(indices: list[int], values: list[float]) -> str:
 
 
 class SeahorseCloudStore:
-    """VectorStore impl over Seahorse Cloud's TABLE_V2 + BFF API."""
+    """VectorStore impl over Seahorse Cloud's TABLE_V2 + management API."""
 
     # Stores vault_id and filters on it in hybrid_search (issue #189 Phase 2).
-    # Like the gRPC driver, exposes no vault_backfill_pending(): the managed BFF
-    # host API has no documented count/scan primitive here, so the readiness
+    # Like the gRPC driver, exposes no vault_backfill_pending(): the managed
+    # management host API has no documented count/scan primitive here, so the readiness
     # worker keeps this driver on the safe source-id path until a count is wired
     # (recreate+reindex, then it auto-activates). Storage + filtering are correct
     # meanwhile.
@@ -146,7 +147,7 @@ class SeahorseCloudStore:
             self._client = None
 
     async def _bff_get_table(self) -> dict | None:
-        """Look up the configured table via BFF. Returns the table
+        """Look up the configured table via the management API. Returns the table
         descriptor dict (with `table_uuid`, `host_name`, `schema`, ...)
         or None when not found."""
         client = await self._http()
@@ -157,7 +158,8 @@ class SeahorseCloudStore:
                 return None
             r.raise_for_status()
             return r.json().get("data") or {}
-        # Lookup by name: list + filter (BFF doesn't expose by-name endpoint).
+        # Lookup by name: list + filter (the management API doesn't expose
+        # a by-name endpoint).
         url = f"{self._mgmt_url}/tenants/{self._tenant_uuid}/tables"
         r = await client.get(url)
         r.raise_for_status()
@@ -196,7 +198,7 @@ class SeahorseCloudStore:
         except VectorStoreUnavailable:
             raise
         except httpx.HTTPError as e:
-            raise VectorStoreUnavailable(f"Seahorse BFF unreachable: {e}") from e
+            raise VectorStoreUnavailable(f"Seahorse management API unreachable: {e}") from e
         self._ensured = True
 
     async def _create_table(self) -> dict:

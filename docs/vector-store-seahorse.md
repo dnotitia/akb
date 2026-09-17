@@ -10,7 +10,7 @@ When this is the right pick:
 - You don't want to operate a vector store yourself (no extra
   container, no scaling decisions, no upgrades).
 - Your AKB deployment is on a network that can reach
-  `console.seahorse.dnotitia.ai` (BFF) **and** the per-table data-plane
+  `console.seahorse.dnotitia.ai` (management API) **and** the per-table data-plane
   host that Seahorse provisions per table.
 - You're OK with the embedding model being constrained to dimensions
   that match a Seahorse table you've already created (or that the
@@ -24,7 +24,7 @@ If those don't apply, prefer `pgvector` (default) or `qdrant`.
 2. After login, the console drops you into a tenant. The tenant UUID
    appears in the URL of the database/tables page, e.g.
    `…/main/database/tables?tenant=<your-tenant-uuid>`.
-   Copy this — it's the `seahorse_tenant_uuid` you'll set later.
+   Copy this — it's the `seahorse_cloud_tenant_uuid` you'll set later.
 
 ## 2. Issue an API token
 
@@ -43,8 +43,8 @@ You have two options.
 
 ### Option A — Auto-create (recommended for first-time setup)
 
-Set `seahorse_auto_create: true` in `app.yaml` and pick a
-`seahorse_table_name`. On first boot AKB calls the BFF and
+Set `seahorse_cloud_auto_create: true` in `app.yaml` and pick a
+`seahorse_cloud_table_name`. On first boot AKB calls the management API and
 provisions a table with exactly the schema it needs (columns,
 indexes, segmentation). No manual schema work.
 
@@ -67,10 +67,11 @@ Required columns (all `STRING` unless noted):
 
 | Column | Type | Nullable | Notes |
 |---|---|---|---|
-| `id` | STRING | NO | Primary key. Seahorse-format `<source_id>\x1e<chunk_index>` (record separator + uint64). The driver builds it; you only need to declare the column as PK. |
-| `external_chunk_id` | STRING | NO | AKB's own chunk UUID. The driver deletes by this column. |
+| `id` | STRING | NO | Primary key. The AKB chunk UUID as a string. The driver builds it; you only need to declare the column as PK. |
+| `external_chunk_id` | STRING | NO | AKB's own chunk UUID (same value as `id`). The driver deletes by this column. |
 | `source_type` | STRING | NO | `document` / `table` / `file`. |
 | `source_id` | STRING | NO | AKB document/source identifier. Used for `WHERE source_id IN (…)` filters at search time. |
+| `vault_id` | STRING | YES | Per-vault ACL filter key. Nullable so a recreate-and-reindex upgrade lands the column before rows carry their value. |
 | `section_path` | STRING | YES | Heading path (e.g. `# Intro > ## Background`). |
 | `content` | STRING | NO | Chunk text; returned in search projection. |
 | `chunk_index` | INT64 | NO | 0-based position of the chunk inside its source. |
@@ -79,8 +80,8 @@ Required columns (all `STRING` unless noted):
 
 Segmentation: hash on `id`, 1 bucket, single composition.
 The exact JSON the auto-create path posts is in
-`backend/app/services/vector_store/seahorse.py` (`_create_table`) if
-you want to mirror it via the console or BFF directly.
+`backend/app/services/vector_store/seahorse_cloud.py` (`_create_table`) if
+you want to mirror it via the console or management API directly.
 
 The dense dim **must equal** your `embed_dimensions` in `app.yaml`.
 Mismatches are caught at startup (`ensure_collection` fails with a
@@ -93,7 +94,7 @@ correctly the first time.
 
 ```yaml
 # Switch the driver
-vector_store_driver: seahorse
+vector_store_driver: seahorse-cloud
 
 # Embedding dim must match the table's dense_vector dim
 embed_base_url: https://api.openai.com/v1   # or your provider
@@ -101,17 +102,17 @@ embed_model: text-embedding-3-small
 embed_dimensions: 1536
 
 # Seahorse driver settings
-seahorse_management_url: "https://console.seahorse.dnotitia.ai/bff"
-seahorse_tenant_uuid: "<your-tenant-uuid>"    # from step 1
-seahorse_table_name: "akb_chunks"             # one of (name, uuid)
-# seahorse_table_uuid: ""                     # alternative to name
-seahorse_auto_create: false                   # true on first boot if going Option A
+seahorse_cloud_management_url: "https://console.seahorse.dnotitia.ai/api"
+seahorse_cloud_tenant_uuid: "<your-tenant-uuid>"    # from step 1
+seahorse_cloud_table_name: "akb_chunks"             # one of (name, uuid)
+# seahorse_cloud_table_uuid: ""                     # alternative to name
+seahorse_cloud_auto_create: false                   # true on first boot if going Option A
 ```
 
 `config/secret.yaml`:
 
 ```yaml
-seahorse_token: "shsk_…"   # from step 2
+seahorse_cloud_token: "shsk_…"   # from step 2
 ```
 
 You don't need any extra docker-compose container for Seahorse — the
@@ -126,7 +127,7 @@ docker compose up -d
 docker compose logs -f backend | grep -i seahorse
 ```
 
-On boot you should see (only when `auto_create: true` and the table
+On boot you should see (only when `seahorse_cloud_auto_create: true` and the table
 doesn't yet exist):
 
 ```
@@ -148,7 +149,7 @@ AKB product vault doc:
 > `seahorse-cloud/engineering/seahorse-cloud-hybrid-vector-table-api-사용법` —
 > doc id `d-f25fb2f7`.
 
-Driver source: `backend/app/services/vector_store/seahorse.py`.
+Driver source: `backend/app/services/vector_store/seahorse_cloud.py`.
 
 ## Caveats / known gotchas
 
@@ -166,7 +167,7 @@ Driver source: `backend/app/services/vector_store/seahorse.py`.
   inserted chunk surfaces in `akb_search`. This is a server-side
   property, not the driver's behaviour.
 - **Per-table data-plane host.** Each table gets its own subdomain
-  (returned in the BFF table descriptor as `host_name`). The driver
+  (returned in the management table descriptor as `host_name`). The driver
   caches it on `ensure_collection`; if Seahorse rotates a host, a
   pod restart picks up the new value.
 - **Bearer-only auth.** The spec mentions an `api-key` header — that
