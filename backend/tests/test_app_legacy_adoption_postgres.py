@@ -34,6 +34,7 @@ _BACKEND = Path(__file__).resolve().parents[1]
 _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
 _MIGRATIONS = [
     _BACKEND / "app" / "db" / "migrations" / "042_vault_migrations.py",
+    _BACKEND / "app" / "db" / "migrations" / "044_vault_write_policy.py",
     _BACKEND / "app" / "db" / "migrations" / "047_app_registry.py",
     _BACKEND / "app" / "db" / "migrations" / "052_app_inventory.py",
     _BACKEND / "app" / "db" / "migrations" / "077_legacy_adoptions.py",
