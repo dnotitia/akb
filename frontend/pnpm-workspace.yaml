@@ -3,5 +3,3 @@ packages:
 allowBuilds:
   esbuild: true
   msw: true
-overrides:
-  fflate: 0.8.3
