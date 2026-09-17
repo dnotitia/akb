@@ -15,7 +15,7 @@ import type {
 } from 'react'
 import type { Editor } from '@tiptap/core'
 import { NodeSelection, TextSelection } from '@tiptap/pm/state'
-import { ImagePlus, Loader2, RotateCcw, X } from 'lucide-react'
+import { AlertCircle, ImagePlus, Loader2, RotateCcw, X } from 'lucide-react'
 
 import { uploadMarkdownBatch } from '../adapters.js'
 import { markdownCommands } from '../core.js'
@@ -130,8 +130,12 @@ export const DEFAULT_MARKDOWN_IMAGE_UPLOAD_LABELS: MarkdownImageUploadLabels = {
 
 const DEFAULT_STATUS_CLASS_NAME =
   'flex flex-wrap items-center justify-between gap-3 border-x border-b border-border bg-surface-2 px-4 py-3 text-sm text-foreground'
+const DEFAULT_ERROR_STATUS_CLASS_NAME =
+  'flex flex-wrap items-center justify-between gap-3 border-x border-b border-destructive/30 bg-destructive-soft px-4 py-3 text-sm text-destructive-soft-foreground'
 const DEFAULT_ACTION_CLASS_NAME =
-  'inline-flex min-h-9 items-center justify-center gap-1.5 rounded-[var(--radius-sm)] border border-border bg-surface px-3 text-sm font-medium text-foreground transition-token hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:cursor-not-allowed disabled:opacity-50'
+  'inline-flex min-h-9 items-center justify-center gap-1.5 rounded-[var(--radius-sm)] border border-border bg-surface px-3 text-sm font-medium text-foreground transition-token focus-ring-instant hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:cursor-not-allowed disabled:opacity-50'
+const DEFAULT_DISMISS_ACTION_CLASS_NAME =
+  'inline-flex min-h-9 items-center justify-center rounded-[var(--radius-sm)] px-3 text-sm font-medium text-foreground-muted transition-token focus-ring-instant hover:bg-surface-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface'
 
 const UploadContext = createContext<MarkdownImageUploadController | null>(null)
 
@@ -666,22 +670,38 @@ export function MarkdownImageUploadStatus({
   }
 
   if (!failure) return null
+  const isError = failure.kind === 'error'
   return (
     <div
-      className={[DEFAULT_STATUS_CLASS_NAME, classNames?.status].filter(Boolean).join(' ')}
-      role="alert"
+      className={[isError ? DEFAULT_ERROR_STATUS_CLASS_NAME : DEFAULT_STATUS_CLASS_NAME, classNames?.status].filter(Boolean).join(' ')}
+      role={isError ? 'alert' : 'status'}
       data-markdown-image-upload-status
+      data-markdown-image-upload-state={failure.kind}
     >
-      <div className="min-w-0 flex-1">
-        <div className="font-medium">{failure.kind === 'queued' ? labels.queued : labels.failed}</div>
-        <div className={classNames?.message ?? 'text-foreground-muted'}>
-          {failure.message || labels.previousBatchFinished}
-          {failure.retryFiles.length + failure.queuedFiles.length > 0
-            ? ` ${labels.remaining(failure.retryFiles.length + failure.queuedFiles.length)}`
-            : ''}
+      <div className="flex min-w-0 flex-1 items-start gap-2">
+        {isError && (
+          <AlertCircle
+            className="mt-0.5 h-4 w-4 shrink-0"
+            aria-hidden
+            data-markdown-image-upload-error-icon
+          />
+        )}
+        <div className="min-w-0 flex-1">
+          <div className="font-medium">{failure.kind === 'queued' ? labels.queued : labels.failed}</div>
+          <div
+            className={
+              classNames?.message ??
+              (isError ? 'text-destructive-soft-foreground' : 'text-foreground-muted')
+            }
+          >
+            {failure.message || labels.previousBatchFinished}
+            {failure.retryFiles.length + failure.queuedFiles.length > 0
+              ? ` ${labels.remaining(failure.retryFiles.length + failure.queuedFiles.length)}`
+              : ''}
+          </div>
         </div>
       </div>
-      <div className={["flex flex-wrap items-center gap-1.5", classNames?.actions].filter(Boolean).join(' ')}>
+      <div className={['flex flex-wrap items-center gap-1.5', classNames?.actions].filter(Boolean).join(' ')}>
         {failure.retryFiles.length > 0 && (
           <button type="button" className={actionClassName} onClick={controller.retry}>
             <RotateCcw className="h-3.5 w-3.5" aria-hidden />
@@ -698,7 +718,7 @@ export function MarkdownImageUploadStatus({
           <ImagePlus className="h-3.5 w-3.5" aria-hidden />
           {labels.chooseAnother}
         </button>
-        <button type="button" className="inline-flex min-h-9 items-center justify-center rounded-[var(--radius-sm)] px-3 text-sm font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface" onClick={controller.dismiss}>
+        <button type="button" className={DEFAULT_DISMISS_ACTION_CLASS_NAME} onClick={controller.dismiss}>
           {labels.dismiss}
         </button>
       </div>
