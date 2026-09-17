@@ -1759,8 +1759,16 @@ export class AKBProxy {
       } else if (method === "resources/read" && typeof outboundParams?.uri === "string") {
         headers["Mcp-Name"] = encodeMcpHeaderValue(outboundParams.uri);
       }
-    } else if (this.sessionId) {
-      headers["mcp-session-id"] = this.sessionId;
+    } else {
+      // Declare the legacy revision on every request. A stateless backend keeps
+      // no session to remember what was negotiated at `initialize`, so this
+      // header is the only thing that tells it (and its audit trail) which
+      // revision this exchange belongs to. The MCP spec already asks clients to
+      // send it after initializing.
+      headers["Mcp-Protocol-Version"] = LEGACY_PROTOCOL_VERSION;
+      if (this.sessionId) {
+        headers["mcp-session-id"] = this.sessionId;
+      }
     }
 
     let resp;
