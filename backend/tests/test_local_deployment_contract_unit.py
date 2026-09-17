@@ -62,7 +62,14 @@ def test_compose_defaults_connect_the_bundled_services():
     assert app["db_host"] in services
     assert secret["db_password"] == services["postgres"]["environment"]["POSTGRES_PASSWORD"]
     assert app["s3_endpoint_url"] == "http://minio:9000"
-    assert app["s3_public_url"] == "http://localhost:9000"
+    # `s3_public_url` is retained and ignored — nothing signs a URL for a
+    # browser to follow any more. The example must still ship the key, or a
+    # reader copying it would produce a config that an older build rejects;
+    # and it must ship it blank, or the example invites configuring a field
+    # that does nothing. Pinning it to a MinIO address would pin a contract
+    # that no longer exists.
+    assert "s3_public_url" in app
+    assert app["s3_public_url"] == ""
     assert app["public_base_url"] == "http://localhost:3000"
     assert secret["s3_access_key"] == services["minio"]["environment"]["MINIO_ROOT_USER"]
     assert secret["s3_secret_key"] == services["minio"]["environment"]["MINIO_ROOT_PASSWORD"]
