@@ -94,6 +94,16 @@ const preview: Preview = {
   },
   parameters: {
     layout: "centered",
+    viewport: {
+      defaultViewport: "akbDesktop",
+      options: {
+        akbDesktop: {
+          name: "AKB desktop",
+          styles: { width: "1600px", height: "1000px" },
+          type: "desktop",
+        },
+      },
+    },
     docs: {
       theme: themes.light,
     },

@@ -954,11 +954,14 @@ class DocumentService:
         Single source of truth behind both the ``akb_history`` MCP tool and
         ``GET /api/v1/history/{vault}/{doc}``. Each entry is a git commit.
 
-        The doc's ``created_at`` is passed to git as a lineage boundary so
-        commits from a *previous* document at the same path (deleted-and-
-        recreated) don't leak into this doc's history — git keys by path,
-        not by document identity. Each entry is annotated with a human
-        ``author_name`` resolved from the git author.
+        A manual/native doc's ``created_at`` is passed to git as a lineage
+        boundary so commits from a *previous* document at the same path
+        (deleted-and-recreated) don't leak into this doc's history — git keys
+        by path, not by document identity. External-Git rows are imported
+        after their upstream commits, so their local ``created_at`` is not a
+        valid boundary and the upstream path history remains visible. Each
+        entry is annotated with a human ``author_name`` resolved from the git
+        author.
 
         Raises ``NotFoundError`` for a missing vault or document; callers
         leave the HTTP/MCP mapping to the global error handlers.
@@ -976,7 +979,7 @@ class DocumentService:
 
         since_epoch = None
         created_at = row.get("created_at")
-        if created_at is not None:
+        if row.get("source") != "external_git" and created_at is not None:
             since_epoch = int(created_at.timestamp())
 
         entries = await asyncio.to_thread(

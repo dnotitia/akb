@@ -94,7 +94,7 @@ export const SemanticDegraded: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText(/Search is degraded/i)).toBeInTheDocument();
+    await expect(await canvas.findByText(/Search is incomplete/i)).toBeInTheDocument();
     await expect(await canvas.findByRole("navigation", { name: "Workspace navigation" })).toBeInTheDocument();
   },
 };
@@ -156,7 +156,7 @@ export const ScopedVaultSearch: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(await canvas.findByRole("navigation", { name: "Vaults" })).toBeInTheDocument();
-    await expect(await canvas.findByRole("navigation", { name: "Collections (collapsed)" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("tree", { name: "akb explorer" })).toBeInTheDocument();
     await expect(canvas.getByRole("link", { name: /All vaults/i })).toBeInTheDocument();
   },
 };
